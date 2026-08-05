@@ -1,0 +1,15 @@
+[workspace]
+default-members = [
+    "crates/shelterwood",
+]
+members = [
+    "crates/shelterwood",
+]
+resolver = "3"
+
+# The flake reads `name` to label Nix derivations — keep it in sync when
+# renaming the project.
+[workspace.metadata]
+name = "shelterwood"
+
+[workspace.dependencies]

@@ -18,3 +18,16 @@ workspace crates under `crates/` and list them in `Cargo.toml`.
 
 CI uses the `ralexstokes` Cachix cache. Publishing the development shell on
 pushes to `main` requires a `CACHIX_AUTH_TOKEN` repository secret.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project by you shall be dual licensed as above, without
+any additional terms or conditions.

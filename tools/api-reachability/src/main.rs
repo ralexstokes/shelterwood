@@ -1,0 +1,208 @@
+use std::{
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    env,
+    error::Error,
+    fs,
+    path::PathBuf,
+};
+
+use serde_json::Value;
+
+const FORBIDDEN_ROOTS: &[&str] = &["tokio", "tokio_util"];
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let path = env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .ok_or("usage: shelterwood-api-reachability <rustdoc-json>")?;
+    let document: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let leaks = find_leaks(&document)?;
+
+    if leaks.is_empty() {
+        println!("public API runtime reachability: clean");
+        return Ok(());
+    }
+
+    eprintln!("runtime types are reachable from public Shelterwood items:");
+    for leak in leaks {
+        eprintln!("  {leak}");
+    }
+    Err("public API runtime reachability check failed".into())
+}
+
+fn find_leaks(document: &Value) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let index = object_field(document, "index")?;
+    let paths = object_field(document, "paths")?;
+
+    let local_paths: HashMap<String, String> = paths
+        .iter()
+        .filter(|(_, summary)| summary.get("crate_id").and_then(Value::as_u64) == Some(0))
+        .map(|(id, summary)| (id.clone(), display_path(summary)))
+        .collect();
+    let known_ids: HashSet<String> = index.keys().chain(paths.keys()).cloned().collect();
+
+    let mut leaks = BTreeSet::new();
+    for (root_id, root_path) in &local_paths {
+        let mut queue = VecDeque::from([root_id.clone()]);
+        let mut visited = HashSet::new();
+
+        while let Some(id) = queue.pop_front() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let Some(item) = index.get(&id) else {
+                continue;
+            };
+            let mut references = Vec::new();
+            collect_references(item, &known_ids, &mut references);
+            for reference in references {
+                let Some(summary) = paths.get(&reference) else {
+                    if index.contains_key(&reference) {
+                        queue.push_back(reference);
+                    }
+                    continue;
+                };
+                if summary.get("crate_id").and_then(Value::as_u64) == Some(0) {
+                    queue.push_back(reference);
+                    continue;
+                }
+                let path = path_segments(summary);
+                if path
+                    .first()
+                    .is_some_and(|root| FORBIDDEN_ROOTS.contains(&root.as_str()))
+                {
+                    leaks.insert(format!("{root_path} -> {}", path.join("::")));
+                }
+            }
+        }
+    }
+
+    Ok(leaks)
+}
+
+fn object_field<'a>(
+    document: &'a Value,
+    name: &str,
+) -> Result<&'a serde_json::Map<String, Value>, Box<dyn Error>> {
+    document
+        .get(name)
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("rustdoc JSON has no object field `{name}`").into())
+}
+
+fn display_path(summary: &Value) -> String {
+    let path = path_segments(summary);
+    if path.is_empty() {
+        "<unnamed-local-item>".to_owned()
+    } else {
+        path.join("::")
+    }
+}
+
+fn path_segments(summary: &Value) -> Vec<String> {
+    summary
+        .get("path")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn collect_references(value: &Value, known_ids: &HashSet<String>, output: &mut Vec<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_references(value, known_ids, output);
+            }
+        }
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                if matches!(
+                    name.as_str(),
+                    "id" | "items" | "impls" | "fields" | "variants" | "implementations"
+                ) {
+                    collect_ids(value, known_ids, output);
+                } else {
+                    collect_references(value, known_ids, output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_ids(value: &Value, known_ids: &HashSet<String>, output: &mut Vec<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_ids(value, known_ids, output);
+            }
+        }
+        Value::Object(fields) => {
+            for value in fields.values() {
+                collect_ids(value, known_ids, output);
+            }
+        }
+        Value::Number(value) => push_known(value.to_string(), known_ids, output),
+        Value::String(value) => push_known(value.clone(), known_ids, output),
+        _ => {}
+    }
+}
+
+fn push_known(value: String, known_ids: &HashSet<String>, output: &mut Vec<String>) {
+    if known_ids.contains(&value) {
+        output.push(value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use serde_json::json;
+
+    use super::find_leaks;
+
+    #[test]
+    fn follows_public_type_ids_without_treating_every_number_as_an_id() {
+        let document = json!({
+            "index": {
+                "0": {
+                    "id": 0,
+                    "span": { "begin": [3, 1] },
+                    "inner": { "module": { "items": [1] } }
+                },
+                "1": {
+                    "id": 1,
+                    "span": { "begin": [3, 2] },
+                    "inner": {
+                        "function": {
+                            "sig": {
+                                "output": {
+                                    "resolved_path": { "id": 2 }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "paths": {
+                "0": { "crate_id": 0, "path": ["shelterwood"] },
+                "1": { "crate_id": 0, "path": ["shelterwood", "leak"] },
+                "2": { "crate_id": 7, "path": ["tokio", "time", "Instant"] },
+                "3": { "crate_id": 7, "path": ["tokio", "sync", "watch"] }
+            }
+        });
+
+        let leaks = find_leaks(&document).expect("fixture must be valid rustdoc-shaped JSON");
+        assert_eq!(
+            leaks,
+            BTreeSet::from([
+                "shelterwood -> tokio::time::Instant".to_owned(),
+                "shelterwood::leak -> tokio::time::Instant".to_owned(),
+            ])
+        );
+    }
+}

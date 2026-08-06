@@ -2,6 +2,16 @@
 name = "shelterwood"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97.1"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+fastrand.workspace = true
+slab.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+shelterwood-test-support = { path = "../test-support" }

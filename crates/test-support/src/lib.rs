@@ -221,19 +221,24 @@ pub async fn poll_until(
 
 /// Asserts that a predicate remains false for a bounded quiet window.
 pub async fn assert_quiet(duration: Duration, mut predicate: impl FnMut() -> bool) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(1);
+
     let deadline = tokio::time::Instant::now() + duration;
     loop {
         assert!(!predicate(), "quiet-window predicate became true");
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             return;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(POLL_INTERVAL.min(deadline - now)).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsumeCount, LiveFlag, ReleaseGate};
+    use std::time::Duration;
+
+    use super::{ConsumeCount, LiveFlag, ReleaseGate, assert_quiet};
 
     #[test]
     fn guards_report_drop_and_consumption() {
@@ -252,5 +257,15 @@ mod tests {
         let gate = ReleaseGate::default();
         gate.release();
         gate.wait().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quiet_window_completes_with_paused_time() {
+        let duration = Duration::from_secs(1);
+        let started_at = tokio::time::Instant::now();
+
+        assert_quiet(duration, || false).await;
+
+        assert_eq!(tokio::time::Instant::now() - started_at, duration);
     }
 }

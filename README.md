@@ -9,6 +9,8 @@ nix develop
 just test  # to run tests
 ```
 
+### Note
+
 The runtime-path and public-API-reachability checks are temporary guardrails
 for the initial implementation. Once the runtime boundary is clear from the
 surrounding source code, these checks can be removed rather than maintained as

@@ -10,26 +10,15 @@
 
   outputs =
     {
-      self,
       crane,
-      nixpkgs,
       rust-env,
-      rust-overlay,
+      ...
     }:
-    let
-      base = rust-env.lib.mkRustProject {
-        src = ./.;
-      };
-    in
-    base
-    // {
-      checks = builtins.mapAttrs (
-        system: baseChecks:
+    rust-env.lib.mkRustProject {
+      src = ./.;
+      extraChecks =
+        pkgs:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ (import rust-overlay) ];
-          };
           nightlyToolchain = pkgs.rust-bin.selectLatestNightlyWith (
             toolchain:
             toolchain.default.override {
@@ -55,8 +44,7 @@
           };
           cargoArtifacts = craneLibNightly.buildDepsOnly commonArgs;
         in
-        baseChecks
-        // {
+        {
           part0-enforcement = craneLibNightly.mkCargoDerivation (
             commonArgs
             // {
@@ -72,7 +60,6 @@
               doInstallCargoArtifacts = false;
             }
           );
-        }
-      ) base.checks;
+        };
     };
 }

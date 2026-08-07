@@ -489,6 +489,112 @@ enum PanicMessage {
     Delivery,
 }
 
+#[derive(Clone, Copy)]
+enum CancellationDropMode {
+    Cleanup,
+    PolledCancellation,
+    Actor,
+}
+
+struct PendingDropFuture {
+    drops: Arc<AtomicUsize>,
+    panic_on_drop: bool,
+    polled: Option<Arc<tokio::sync::Notify>>,
+    dropped: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl std::future::Future for PendingDropFuture {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if let Some(polled) = &self.polled {
+            polled.notify_one();
+        }
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for PendingDropFuture {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+        if let Some(dropped) = &self.dropped {
+            dropped.notify_one();
+        }
+        if self.panic_on_drop {
+            panic!("offload cancellation destructor panic");
+        }
+    }
+}
+
+struct CancellationDropActor;
+
+impl Actor for CancellationDropActor {
+    type Msg = ();
+    type Args = (CancellationDropMode, Arc<AtomicUsize>, Arc<AtomicBool>);
+
+    async fn init(
+        (mode, drops, signalled): Self::Args,
+        context: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        let polled = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let first = context
+            .offload_scoped(
+                PendingDropFuture {
+                    drops: Arc::clone(&drops),
+                    panic_on_drop: true,
+                    polled: Some(Arc::clone(&polled)),
+                    dropped: Some(Arc::clone(&dropped)),
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("first offload accepted");
+        let second = context
+            .offload_scoped(
+                PendingDropFuture {
+                    drops,
+                    panic_on_drop: false,
+                    polled: None,
+                    dropped: None,
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("second offload accepted");
+
+        match mode {
+            CancellationDropMode::Cleanup => {
+                context.stop();
+                signalled.store(
+                    first.is_finished() && second.is_finished(),
+                    Ordering::SeqCst,
+                );
+                first.detach();
+                second.detach();
+                Ok(Self)
+            }
+            CancellationDropMode::PolledCancellation => {
+                polled.notified().await;
+                first.cancel();
+                dropped.notified().await;
+                context.stop();
+                signalled.store(second.is_finished(), Ordering::SeqCst);
+                second.detach();
+                Ok(Self)
+            }
+            CancellationDropMode::Actor => panic!("primary actor panic"),
+        }
+    }
+
+    async fn handle(&mut self, (): Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
 struct PanicActor {
     mode: PanicMode,
 }
@@ -585,6 +691,64 @@ async fn assert_pre_ready_panic(mode: PanicMode, expected: &str, trigger: bool) 
         .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root shuts down");
+}
+
+async fn assert_cancellation_drop_panic(mode: CancellationDropMode, expected: &str) {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let signalled = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "cancellation-drop",
+        ActorOnceDef::<CancellationDropActor>::new((
+            mode,
+            Arc::clone(&drops),
+            Arc::clone(&signalled),
+        ))
+        .readiness(Readiness::Manual),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    let message = startup_panic_message(
+        system
+            .wait_started()
+            .await
+            .expect_err("the pre-ready panic fails startup"),
+    );
+    assert_eq!(message.as_deref(), Some(expected));
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    if !matches!(mode, CancellationDropMode::Actor) {
+        assert!(
+            signalled.load(Ordering::SeqCst),
+            "every cancellation signals completion despite one destructor panic"
+        );
+    }
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root shuts down");
+}
+
+#[tokio::test]
+async fn cancellation_destructor_panics_do_not_poison_or_short_circuit_cleanup() {
+    assert_cancellation_drop_panic(
+        CancellationDropMode::Cleanup,
+        "offload cancellation destructor panic",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn polled_cancellation_destructor_panic_does_not_poison_offload_state() {
+    assert_cancellation_drop_panic(
+        CancellationDropMode::PolledCancellation,
+        "offload cancellation destructor panic",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cancellation_destructor_panic_does_not_mask_actor_panic() {
+    assert_cancellation_drop_panic(CancellationDropMode::Actor, "primary actor panic").await;
 }
 
 #[tokio::test]

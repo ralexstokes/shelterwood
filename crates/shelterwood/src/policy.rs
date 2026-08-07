@@ -364,6 +364,15 @@ pub enum Mailbox {
     Latest,
 }
 
+/// Capacity selection for a keyed latest-value mailbox.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KeyedCapacity {
+    /// Use the resolved scope or library mailbox capacity.
+    Inherit,
+    /// Keep at most this many distinct pending keys.
+    Explicit(NonZeroUsize),
+}
+
 impl Mailbox {
     /// Constructs a FIFO mailbox with an explicit capacity.
     pub fn queue(capacity: usize) -> Result<Self, PolicyError> {
@@ -474,6 +483,7 @@ pub(crate) struct CommonOptions {
     pub(crate) restart: Option<RestartPolicy>,
     pub(crate) shutdown: Option<Shutdown>,
     pub(crate) mailbox: Option<Mailbox>,
+    pub(crate) keyed_capacity: Option<KeyedCapacity>,
     pub(crate) mailbox_shutdown: Option<MailboxShutdown>,
     pub(crate) readiness: Option<Readiness>,
     pub(crate) readiness_deadline: ReadinessDeadline,
@@ -532,6 +542,7 @@ pub(crate) struct ResolvedCommonOptions {
     pub(crate) restart: RestartPolicy,
     pub(crate) shutdown: Shutdown,
     pub(crate) mailbox: Mailbox,
+    pub(crate) keyed_capacity: Option<NonZeroUsize>,
     pub(crate) mailbox_shutdown: MailboxShutdown,
     pub(crate) readiness: Readiness,
     pub(crate) readiness_override: Option<Readiness>,
@@ -557,6 +568,10 @@ pub(crate) fn resolve_common(
         },
         shutdown: options.shutdown.unwrap_or(defaults.child_shutdown),
         mailbox: resolve_default_mailbox(options.mailbox, defaults.mailbox),
+        keyed_capacity: options.keyed_capacity.map(|capacity| match capacity {
+            KeyedCapacity::Explicit(capacity) => capacity,
+            KeyedCapacity::Inherit => mailbox_capacity(defaults.mailbox),
+        }),
         mailbox_shutdown: options
             .mailbox_shutdown
             .unwrap_or(defaults.mailbox_shutdown),
@@ -571,13 +586,22 @@ pub(crate) fn resolve_common(
     }
 }
 
+fn mailbox_capacity(mailbox: Mailbox) -> NonZeroUsize {
+    match mailbox {
+        Mailbox::Queue(Some(capacity)) => capacity,
+        Mailbox::Queue(None) => NonZeroUsize::new(DEFAULT_MAILBOX_CAPACITY)
+            .expect("library mailbox capacity is non-zero"),
+        Mailbox::Latest => NonZeroUsize::MIN,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{num::NonZeroUsize, time::Duration};
 
     use super::{
-        Backoff, BackoffFactor, Intensity, Jitter, Mailbox, PolicyError, ReadinessDeadline,
-        ResolvedDefaults, ScopeDefaults,
+        Backoff, BackoffFactor, CommonOptions, Intensity, Jitter, KeyedCapacity, Mailbox,
+        PolicyError, Readiness, ReadinessDeadline, ResolvedDefaults, ScopeDefaults, resolve_common,
     };
 
     #[test]
@@ -650,5 +674,23 @@ mod tests {
         assert_eq!(deferred_queue.mailbox, Mailbox::default());
         assert_eq!(deferred_queue.child_restart, latest.child_restart);
         assert_eq!(deferred_queue.child_shutdown, latest.child_shutdown);
+
+        let inherited_keyed = resolve_common(
+            &CommonOptions {
+                keyed_capacity: Some(KeyedCapacity::Inherit),
+                ..CommonOptions::default()
+            },
+            &ResolvedDefaults {
+                mailbox: Mailbox::queue(3).expect("non-zero capacity"),
+                ..ResolvedDefaults::default()
+            },
+            false,
+            Readiness::Immediate,
+        );
+        assert_eq!(
+            inherited_keyed.keyed_capacity,
+            NonZeroUsize::new(3),
+            "keyed kind inherits the resolved capacity without inheriting the mailbox kind"
+        );
     }
 }

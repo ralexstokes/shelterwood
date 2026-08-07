@@ -5,13 +5,18 @@
 #![allow(clippy::result_large_err)]
 
 use std::{
-    collections::VecDeque,
+    any::Any,
+    collections::{VecDeque, hash_map::DefaultHasher},
     fmt,
     future::Future,
     hash::{Hash, Hasher},
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -603,11 +608,79 @@ enum BindingStatus {
 enum MailboxKind {
     Queue(NonZeroUsize),
     Latest,
+    LatestByKey(NonZeroUsize),
 }
 
 struct Envelope<M> {
     message: M,
     accepted_sequence: u64,
+}
+
+trait ErasedMailboxKey: Send {
+    fn as_any(&self) -> &dyn Any;
+}
+
+struct StoredMailboxKey<K>(K);
+
+impl<K: Send + 'static> ErasedMailboxKey for StoredMailboxKey<K> {
+    fn as_any(&self) -> &dyn Any {
+        &self.0
+    }
+}
+
+pub(crate) struct MailboxKey {
+    hash: u64,
+    value: Box<dyn ErasedMailboxKey>,
+}
+
+pub(crate) trait MailboxKeyFn<M>: Send + Sync {
+    fn extract(&self, message: &M) -> MailboxKey;
+    fn equals(&self, left: &MailboxKey, right: &MailboxKey) -> bool;
+}
+
+struct TypedMailboxKeyFn<F, K> {
+    key_fn: F,
+    marker: std::marker::PhantomData<fn() -> K>,
+}
+
+impl<M, F, K> MailboxKeyFn<M> for TypedMailboxKeyFn<F, K>
+where
+    F: Fn(&M) -> K + Send + Sync,
+    K: Eq + Hash + Send + 'static,
+{
+    fn extract(&self, message: &M) -> MailboxKey {
+        let key = (self.key_fn)(message);
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        MailboxKey {
+            hash: hasher.finish(),
+            value: Box::new(StoredMailboxKey(key)),
+        }
+    }
+
+    fn equals(&self, left: &MailboxKey, right: &MailboxKey) -> bool {
+        left.hash == right.hash
+            && left.value.as_any().downcast_ref::<K>() == right.value.as_any().downcast_ref::<K>()
+    }
+}
+
+pub(crate) type MailboxKeyExtractor<M> = Arc<dyn MailboxKeyFn<M> + 'static>;
+
+pub(crate) fn mailbox_key_extractor<M, K, F>(key_fn: F) -> MailboxKeyExtractor<M>
+where
+    M: Send + 'static,
+    K: Eq + Hash + Send + 'static,
+    F: Fn(&M) -> K + Send + Sync + 'static,
+{
+    Arc::new(TypedMailboxKeyFn {
+        key_fn,
+        marker: std::marker::PhantomData,
+    })
+}
+
+struct KeyedEnvelope<M> {
+    envelope: Envelope<M>,
+    key: MailboxKey,
 }
 
 enum OperationOutcome<M> {
@@ -631,13 +704,17 @@ struct OperationState<M> {
 
 struct SendOperation<M> {
     pinned: Option<Incarnation>,
+    key: Mutex<Option<MailboxKey>>,
+    key_preparation_requested: AtomicBool,
     state: Mutex<OperationState<M>>,
 }
 
 impl<M> SendOperation<M> {
-    fn new(message: M, pinned: Option<Incarnation>) -> Arc<Self> {
+    fn new(message: M, pinned: Option<Incarnation>, key: Option<MailboxKey>) -> Arc<Self> {
         Arc::new(Self {
             pinned,
+            key: Mutex::new(key),
+            key_preparation_requested: AtomicBool::new(false),
             state: Mutex::new(OperationState {
                 outcome: OperationOutcome::Waiting {
                     message: Some(message),
@@ -658,17 +735,18 @@ impl<M> SendOperation<M> {
         }
     }
 
-    fn accept(&self, incarnation: Incarnation) -> Option<(M, Option<Waker>)> {
-        let (message, wake) = {
+    fn accept(&self, incarnation: Incarnation) -> Option<(M, Option<MailboxKey>, Option<Waker>)> {
+        let (message, key, wake) = {
             let mut state = self.state.lock().expect("send operation mutex poisoned");
             let OperationOutcome::Waiting { message, .. } = &mut state.outcome else {
                 return None;
             };
             let message = message.take()?;
+            let key = self.take_key();
             state.outcome = OperationOutcome::Accepted(incarnation);
-            (message, state.waker.take())
+            (message, key, state.waker.take())
         };
-        Some((message, wake))
+        Some((message, key, wake))
     }
 
     fn fail(&self, observed: Option<Incarnation>, kind: SendErrorKind) -> Option<Waker> {
@@ -694,6 +772,66 @@ impl<M> SendOperation<M> {
     fn pinned(&self) -> Option<Incarnation> {
         self.pinned
     }
+
+    fn take_key(&self) -> Option<MailboxKey> {
+        self.key
+            .lock()
+            .expect("send operation key mutex poisoned")
+            .take()
+    }
+
+    fn has_key(&self) -> bool {
+        self.key
+            .lock()
+            .expect("send operation key mutex poisoned")
+            .is_some()
+    }
+
+    fn request_key_preparation(&self) -> Option<Waker> {
+        self.key_preparation_requested
+            .store(true, Ordering::Release);
+        self.state
+            .lock()
+            .expect("send operation mutex poisoned")
+            .waker
+            .take()
+    }
+
+    fn prepare_key_if_missing(&self, extractor: &dyn MailboxKeyFn<M>) -> bool {
+        if self
+            .key
+            .lock()
+            .expect("send operation key mutex poisoned")
+            .is_some()
+        {
+            return false;
+        }
+        let key = {
+            let state = self.state.lock().expect("send operation mutex poisoned");
+            let OperationOutcome::Waiting {
+                message: Some(message),
+                ..
+            } = &state.outcome
+            else {
+                return false;
+            };
+            let extracted = catch_unwind(AssertUnwindSafe(|| extractor.extract(message)));
+            drop(state);
+            match extracted {
+                Ok(key) => key,
+                Err(payload) => resume_unwind(payload),
+            }
+        };
+        let mut stored = self.key.lock().expect("send operation key mutex poisoned");
+        if stored.is_none() {
+            *stored = Some(key);
+            self.key_preparation_requested
+                .store(false, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct MailboxState<M> {
@@ -702,10 +840,13 @@ struct MailboxState<M> {
     last_bound: Option<Incarnation>,
     queue: VecDeque<Envelope<M>>,
     latest: Option<Envelope<M>>,
+    keyed: VecDeque<KeyedEnvelope<M>>,
     waiters: VecDeque<Arc<SendOperation<M>>>,
     accepted: u64,
     delivered: u64,
+    local_delivered: u64,
     conflated: u64,
+    evicted: u64,
     sends_rejected: u64,
 }
 
@@ -713,7 +854,9 @@ struct MailboxState<M> {
 pub(crate) struct MailboxStats {
     pub(crate) accepted: u64,
     pub(crate) delivered: u64,
+    pub(crate) local_delivered: u64,
     pub(crate) conflated: u64,
+    pub(crate) evicted: u64,
     pub(crate) sends_rejected: u64,
     pub(crate) depth: usize,
     pub(crate) capacity: usize,
@@ -744,7 +887,7 @@ impl<M> Promotion<M> {
 
 /// Type-erased control used by the supervision driver.
 pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
-    fn configure(&self, mailbox: Mailbox);
+    fn configure(&self, mailbox: Mailbox, keyed_capacity: Option<NonZeroUsize>);
     fn bind(&self, incarnation: Incarnation);
     fn freeze(&self, incarnation: Incarnation);
     fn close(&self, incarnation: Incarnation);
@@ -755,6 +898,7 @@ pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
 pub(crate) struct MailboxCell<M> {
     actor_id: ChildId,
     state: Mutex<MailboxState<M>>,
+    key_extractor: Mutex<Option<MailboxKeyExtractor<M>>>,
     changed: Signal,
 }
 
@@ -777,14 +921,113 @@ impl<M: Send + 'static> MailboxCell<M> {
                 last_bound: None,
                 queue: VecDeque::new(),
                 latest: None,
+                keyed: VecDeque::new(),
                 waiters: VecDeque::new(),
                 accepted: 0,
                 delivered: 0,
+                local_delivered: 0,
                 conflated: 0,
+                evicted: 0,
                 sends_rejected: 0,
             }),
+            key_extractor: Mutex::new(None),
             changed: Signal::default(),
         })
+    }
+
+    pub(crate) fn install_key_extractor(&self, extractor: MailboxKeyExtractor<M>) {
+        let previous = self
+            .key_extractor
+            .lock()
+            .expect("mailbox key-extractor mutex poisoned")
+            .replace(extractor);
+        assert!(
+            previous.is_none(),
+            "a mailbox can own only one key extractor"
+        );
+        let waiters = self
+            .state
+            .lock()
+            .expect("mailbox mutex poisoned")
+            .waiters
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for waiter in waiters {
+            if let Some(waker) = waiter.request_key_preparation() {
+                waker.wake();
+            }
+        }
+    }
+
+    fn prepare_key(&self, message: &M) -> Option<MailboxKey> {
+        let extractor = self
+            .key_extractor
+            .lock()
+            .expect("mailbox key-extractor mutex poisoned")
+            .clone();
+        extractor.map(|extractor| extractor.extract(message))
+    }
+
+    fn prepare_operation_key(&self, operation: &SendOperation<M>) -> bool {
+        if let Some(extractor) = self.cloned_key_extractor() {
+            operation.prepare_key_if_missing(&*extractor)
+        } else {
+            false
+        }
+    }
+
+    fn promote_bound_waiters(&self) {
+        let mut state = self.state.lock().expect("mailbox mutex poisoned");
+        let extractor = self.cloned_key_extractor();
+        let promotion = promote_waiters(&mut state, extractor.as_deref());
+        drop(state);
+        self.changed.pulse();
+        promotion.finish();
+    }
+
+    fn keys_equal(&self, left: &MailboxKey, right: &MailboxKey) -> bool {
+        self.key_extractor
+            .lock()
+            .expect("mailbox key-extractor mutex poisoned")
+            .as_ref()
+            .expect("a keyed mailbox has a key extractor")
+            .equals(left, right)
+    }
+
+    fn cloned_key_extractor(&self) -> Option<MailboxKeyExtractor<M>> {
+        self.key_extractor
+            .lock()
+            .expect("mailbox key-extractor mutex poisoned")
+            .clone()
+    }
+
+    fn insert_keyed(
+        &self,
+        state: &mut MailboxState<M>,
+        capacity: NonZeroUsize,
+        envelope: Envelope<M>,
+        key: MailboxKey,
+    ) -> Option<Envelope<M>> {
+        if let Some(index) = state
+            .keyed
+            .iter()
+            .position(|entry| self.keys_equal(&entry.key, &key))
+        {
+            state.conflated = state.conflated.saturating_add(1);
+            return Some(std::mem::replace(
+                &mut state.keyed[index].envelope,
+                envelope,
+            ));
+        }
+        let displaced = if state.keyed.len() == capacity.get() {
+            state.evicted = state.evicted.saturating_add(1);
+            state.keyed.pop_front().map(|entry| entry.envelope)
+        } else {
+            None
+        };
+        state.keyed.push_back(KeyedEnvelope { envelope, key });
+        displaced
     }
 
     fn submit(&self, operation: &Arc<SendOperation<M>>) {
@@ -820,10 +1063,11 @@ impl<M: Send + 'static> MailboxCell<M> {
                         state.waiters.is_empty() && state.queue.len() < capacity.get()
                     }
                     Some(MailboxKind::Latest) => true,
+                    Some(MailboxKind::LatestByKey(_)) => true,
                     None => false,
                 };
                 if can_accept {
-                    let (message, wake) = operation
+                    let (message, key, wake) = operation
                         .accept(incarnation)
                         .expect("a newly submitted operation still owns its message");
                     state.accepted = state.accepted.saturating_add(1);
@@ -846,6 +1090,15 @@ impl<M: Send + 'static> MailboxCell<M> {
                                 .saturating_add(u64::from(displaced.is_some()));
                             displaced
                         }
+                        Some(MailboxKind::LatestByKey(capacity)) => self.insert_keyed(
+                            &mut state,
+                            capacity,
+                            Envelope {
+                                message,
+                                accepted_sequence,
+                            },
+                            key.expect("a keyed send has a prepared key"),
+                        ),
                         None => unreachable!(),
                     };
                     drop(state);
@@ -901,6 +1154,7 @@ impl<M: Send + 'static> MailboxCell<M> {
         message: M,
         pinned: Option<Incarnation>,
     ) -> Result<Incarnation, SendError<M>> {
+        let key = self.prepare_key(&message);
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         match state.status {
             BindingStatus::Terminal(final_incarnation) => {
@@ -994,6 +1248,23 @@ impl<M: Send + 'static> MailboxCell<M> {
                     drop(displaced);
                     Ok(incarnation)
                 }
+                Some(MailboxKind::LatestByKey(capacity)) => {
+                    state.accepted = state.accepted.saturating_add(1);
+                    let accepted_sequence = state.accepted;
+                    let displaced = self.insert_keyed(
+                        &mut state,
+                        capacity,
+                        Envelope {
+                            message,
+                            accepted_sequence,
+                        },
+                        key.expect("a keyed send has a prepared key"),
+                    );
+                    drop(state);
+                    self.changed.pulse();
+                    drop(displaced);
+                    Ok(incarnation)
+                }
                 None => {
                     state.sends_rejected = state.sends_rejected.saturating_add(1);
                     Err(SendError {
@@ -1041,10 +1312,22 @@ impl<M: Send + 'static> MailboxCell<M> {
                     .flatten()
                     .map(|item| item.message)
             }
+            Some(MailboxKind::LatestByKey(_)) => {
+                let eligible = accepted_through.map_or(Some(0), |limit| {
+                    state
+                        .keyed
+                        .iter()
+                        .position(|item| item.envelope.accepted_sequence <= limit)
+                });
+                eligible
+                    .and_then(|index| state.keyed.remove(index))
+                    .map(|item| item.envelope.message)
+            }
             None => None,
         };
         let promotion = if message.is_some() && matches!(state.status, BindingStatus::Bound(_)) {
-            promote_waiters(&mut state)
+            let extractor = self.cloned_key_extractor();
+            promote_waiters(&mut state, extractor.as_deref())
         } else {
             Promotion::default()
         };
@@ -1074,16 +1357,24 @@ impl<M: Send + 'static> MailboxCell<M> {
         let (depth, capacity) = match state.kind {
             Some(MailboxKind::Queue(capacity)) => (state.queue.len(), capacity.get()),
             Some(MailboxKind::Latest) => (usize::from(state.latest.is_some()), 1),
+            Some(MailboxKind::LatestByKey(capacity)) => (state.keyed.len(), capacity.get()),
             None => (0, 0),
         };
         MailboxStats {
             accepted: state.accepted,
             delivered: state.delivered,
+            local_delivered: state.local_delivered,
             conflated: state.conflated,
+            evicted: state.evicted,
             sends_rejected: state.sends_rejected,
             depth,
             capacity,
         }
+    }
+
+    pub(crate) fn record_local_delivery(&self) {
+        let mut state = self.state.lock().expect("mailbox mutex poisoned");
+        state.local_delivered = state.local_delivered.saturating_add(1);
     }
 }
 
@@ -1136,15 +1427,27 @@ impl<M> MailboxCell<M> {
 }
 
 impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
-    fn configure(&self, mailbox: Mailbox) {
-        let kind = match mailbox {
-            Mailbox::Queue(Some(capacity)) => MailboxKind::Queue(capacity),
-            Mailbox::Queue(None) => MailboxKind::Queue(
-                NonZeroUsize::new(crate::policy::DEFAULT_MAILBOX_CAPACITY)
-                    .expect("library mailbox capacity is non-zero"),
-            ),
-            Mailbox::Latest => MailboxKind::Latest,
-        };
+    fn configure(&self, mailbox: Mailbox, keyed_capacity: Option<NonZeroUsize>) {
+        let kind = keyed_capacity.map_or_else(
+            || match mailbox {
+                Mailbox::Queue(Some(capacity)) => MailboxKind::Queue(capacity),
+                Mailbox::Queue(None) => MailboxKind::Queue(
+                    NonZeroUsize::new(crate::policy::DEFAULT_MAILBOX_CAPACITY)
+                        .expect("library mailbox capacity is non-zero"),
+                ),
+                Mailbox::Latest => MailboxKind::Latest,
+            },
+            MailboxKind::LatestByKey,
+        );
+        if matches!(kind, MailboxKind::LatestByKey(_)) {
+            assert!(
+                self.key_extractor
+                    .lock()
+                    .expect("mailbox key-extractor mutex poisoned")
+                    .is_some(),
+                "a keyed mailbox requires a typed key extractor"
+            );
+        }
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         match state.kind {
             Some(existing) => debug_assert_eq!(existing, kind),
@@ -1159,7 +1462,8 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }
         state.status = BindingStatus::Bound(incarnation);
         state.last_bound = Some(incarnation);
-        let promotion = promote_waiters(&mut state);
+        let extractor = self.cloned_key_extractor();
+        let promotion = promote_waiters(&mut state, extractor.as_deref());
         drop(state);
         self.changed.pulse();
         promotion.finish();
@@ -1201,6 +1505,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         state.status = BindingStatus::Unbound;
         let queue = std::mem::take(&mut state.queue);
         let latest = state.latest.take();
+        let keyed = std::mem::take(&mut state.keyed);
         let mut retained = VecDeque::with_capacity(state.waiters.len());
         let mut wakers = Vec::new();
         while let Some(waiter) = state.waiters.pop_front() {
@@ -1226,6 +1531,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }
         drop(queue);
         drop(latest);
+        drop(keyed);
     }
 
     fn terminate(&self) {
@@ -1237,6 +1543,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         state.status = BindingStatus::Terminal(final_incarnation);
         let queue = std::mem::take(&mut state.queue);
         let latest = state.latest.take();
+        let keyed = std::mem::take(&mut state.keyed);
         let waiters = std::mem::take(&mut state.waiters);
         drop(state);
         let mut wakers = Vec::new();
@@ -1251,6 +1558,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }
         drop(queue);
         drop(latest);
+        drop(keyed);
     }
 
     fn stats(&self) -> MailboxStats {
@@ -1258,7 +1566,10 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
     }
 }
 
-fn promote_waiters<M>(state: &mut MailboxState<M>) -> Promotion<M> {
+fn promote_waiters<M>(
+    state: &mut MailboxState<M>,
+    key_extractor: Option<&dyn MailboxKeyFn<M>>,
+) -> Promotion<M> {
     let mut promotion = Promotion::default();
     let Some(kind) = state.kind else {
         return promotion;
@@ -1269,12 +1580,16 @@ fn promote_waiters<M>(state: &mut MailboxState<M>) -> Promotion<M> {
     let available = match kind {
         MailboxKind::Queue(capacity) => capacity.get().saturating_sub(state.queue.len()),
         MailboxKind::Latest => usize::MAX,
+        MailboxKind::LatestByKey(_) => usize::MAX,
     };
     let mut accepted = 0usize;
-    while accepted < available {
+    let candidates = state.waiters.len();
+    let mut examined = 0usize;
+    while accepted < available && examined < candidates {
         let Some(operation) = state.waiters.pop_front() else {
             break;
         };
+        examined += 1;
         if operation
             .pinned()
             .is_some_and(|pinned| pinned != incarnation)
@@ -1292,7 +1607,14 @@ fn promote_waiters<M>(state: &mut MailboxState<M>) -> Promotion<M> {
             continue;
         }
         operation.observe(incarnation);
-        let Some((message, wake)) = operation.accept(incarnation) else {
+        if matches!(kind, MailboxKind::LatestByKey(_)) && !operation.has_key() {
+            if let Some(waker) = operation.request_key_preparation() {
+                promotion.wakers.push(waker);
+            }
+            state.waiters.push_back(operation);
+            continue;
+        }
+        let Some((message, key, wake)) = operation.accept(incarnation) else {
             continue;
         };
         if let Some(waker) = wake {
@@ -1312,6 +1634,37 @@ fn promote_waiters<M>(state: &mut MailboxState<M>) -> Promotion<M> {
                 }) {
                     state.conflated = state.conflated.saturating_add(1);
                     promotion.displaced.push(displaced);
+                }
+            }
+            MailboxKind::LatestByKey(capacity) => {
+                if let Some(displaced) = state.keyed.iter().position(|entry| {
+                    let key = key.as_ref().expect("a keyed send has a prepared key");
+                    key_extractor
+                        .expect("a keyed mailbox has a key extractor")
+                        .equals(&entry.key, key)
+                }) {
+                    state.conflated = state.conflated.saturating_add(1);
+                    promotion.displaced.push(std::mem::replace(
+                        &mut state.keyed[displaced].envelope,
+                        Envelope {
+                            message,
+                            accepted_sequence,
+                        },
+                    ));
+                } else {
+                    if state.keyed.len() == capacity.get()
+                        && let Some(displaced) = state.keyed.pop_front()
+                    {
+                        state.evicted = state.evicted.saturating_add(1);
+                        promotion.displaced.push(displaced.envelope);
+                    }
+                    state.keyed.push_back(KeyedEnvelope {
+                        envelope: Envelope {
+                            message,
+                            accepted_sequence,
+                        },
+                        key: key.expect("a keyed send has a prepared key"),
+                    });
                 }
             }
         }
@@ -1423,6 +1776,10 @@ impl<M> Clone for Ingress<M> {
 }
 
 impl<M> ActorRef<M> {
+    pub(crate) fn member_cell(&self) -> Arc<MemberCell> {
+        Arc::clone(&self.member)
+    }
+
     /// Returns the actor's child id.
     #[must_use]
     pub fn id(&self) -> &ChildId {
@@ -1447,9 +1804,12 @@ impl<M: Send + 'static> ActorRef<M> {
     fn start_send(&self, message: M, pinned: Option<Incarnation>) -> SendFuture<M> {
         match &self.ingress {
             Ingress::Direct(mailbox) => SendFuture::from_direct(DirectSend {
+                operation: {
+                    let key = mailbox.prepare_key(&message);
+                    SendOperation::new(message, pinned, key)
+                },
                 actor_id: self.id().clone(),
                 mailbox: Arc::clone(mailbox),
-                operation: SendOperation::new(message, pinned),
                 submitted: false,
                 done: false,
             }),
@@ -2003,9 +2363,12 @@ impl<M: Send + 'static> SendDriver<M> for DirectSend<M> {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Result<Incarnation, SendError<M>>> {
+        let prepared_key = self.mailbox.prepare_operation_key(&self.operation);
         if !self.submitted {
             self.submitted = true;
             self.mailbox.submit(&self.operation);
+        } else if prepared_key {
+            self.mailbox.promote_bound_waiters();
         }
         let mut state = self
             .operation
@@ -2038,6 +2401,15 @@ impl<M: Send + 'static> SendDriver<M> for DirectSend<M> {
             }
             OperationOutcome::Waiting { .. } => {
                 state.waker = Some(context.waker().clone());
+                let wake_for_key = self
+                    .operation
+                    .key_preparation_requested
+                    .load(Ordering::Acquire)
+                    && !self.operation.has_key();
+                drop(state);
+                if wake_for_key {
+                    context.waker().wake_by_ref();
+                }
                 Poll::Pending
             }
             OperationOutcome::Withdrawn => panic!("a withdrawn send future was polled"),
@@ -2476,5 +2848,38 @@ impl<M: Send + 'static> MailboxReceiver<M> {
 
     pub(crate) async fn changed(&mut self) {
         self.watcher.changed().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{num::NonZeroUsize, sync::Arc};
+
+    use super::{MailboxCell, MailboxControl, mailbox_key_extractor};
+    use crate::{ChildId, Mailbox, identity::ScopeIdentity};
+
+    #[test]
+    fn keyed_eviction_has_a_dedicated_internal_counter() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let membership = identity.mint_membership().expect("membership available");
+        let mut incarnations = identity.incarnation_counter(membership);
+        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+            .expect("incarnation available");
+        let mailbox = MailboxCell::new(ChildId::from("keyed-counter"));
+        mailbox.install_key_extractor(mailbox_key_extractor(|message: &(usize, usize)| message.0));
+        mailbox.configure(Mailbox::latest(), NonZeroUsize::new(2));
+        mailbox.bind(incarnation);
+
+        mailbox.try_send((1, 1), None).expect("a accepted");
+        mailbox.try_send((2, 2), None).expect("b accepted");
+        mailbox.try_send((1, 3), None).expect("a replaced");
+        mailbox.try_send((3, 4), None).expect("c evicts a");
+
+        let stats = mailbox.stats();
+        assert_eq!(stats.accepted, 4);
+        assert_eq!(stats.conflated, 1);
+        assert_eq!(stats.evicted, 1);
+        assert_eq!(stats.depth, 2);
+        let _keep_type_inference_honest: Arc<MailboxCell<(usize, usize)>> = mailbox;
     }
 }

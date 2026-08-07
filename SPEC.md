@@ -2664,6 +2664,13 @@ Activates the pinning clause of invariant §13.2.
 first-class control/priority lane is *Evidence-gated (M12)* unless the trading-engine
 acceptance scenario produces contrary evidence.
 
+**M8 implementation evidence.** The typed raw and handler definition
+surfaces, inherited and explicit capacity resolution, sender-path key
+extraction, in-place conflation, oldest-key eviction, and the internal
+eviction counter are implemented and covered by `tests/m8.rs`. The public
+counter remains intentionally deferred to §20; the control/priority gate
+remains open for M12.
+
 `latest_by_key(capacity, key_fn)` — a typed extension on `ActorDef<A>` and
 `RawActorDef<M>`, with `K: Eq + Hash + Send + 'static` and
 `key_fn: impl Fn(&M) -> K + Send + Sync + 'static` — provides conflation per key with a bounded key
@@ -2780,6 +2787,11 @@ impl<'a, A: Actor + ?Sized> Context<'a, A> {
 
 **Status: Accepted (M8).** Watches target actor, task, and scope
 memberships. They are actor-loop input, never user-mailbox entries.
+
+**M8 implementation evidence.** The sealed three-handle target surface,
+incarnation-owned registration, immediate and transition edges, replacement,
+synchronous cancellation, bounded per-watch overflow, coalesced `Lagged`, and
+terminal `Removed` retention are implemented and covered by `tests/m8.rs`.
 
 `ctx.watch(&ref, wrap)` (and a cancel-on-drop `watch_scoped`) — where
 `wrap: impl Fn(MonitorEvent) -> A::Msg + Send + Sync + 'static`, the §17

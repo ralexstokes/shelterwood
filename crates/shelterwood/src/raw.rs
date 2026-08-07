@@ -14,11 +14,14 @@ use std::{
 };
 
 use crate::{
-    ActorRef, CancellationToken, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown,
-    PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef, SendPayload,
-    Shutdown,
+    ActorRef, CancellationToken, ChildId, ExitResult, Incarnation, KeyedCapacity, Mailbox,
+    MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef,
+    SendPayload, Shutdown, WatchTarget,
     driver::{ActorWork, Latch, Signal, SignalWatcher},
-    mailbox::{MailboxCell, MailboxControl, MailboxReceiver},
+    mailbox::{
+        MailboxCell, MailboxControl, MailboxKeyExtractor, MailboxReceiver, mailbox_key_extractor,
+    },
+    monitor::{MonitorDelivery, MonitorEvent, MonitorSink, MonitorSource, MonitorSubscriber},
     policy::CommonOptions,
 };
 
@@ -72,11 +75,12 @@ impl<T> Rejected<T> {
     }
 }
 
-/// An owned cancel-on-drop lease for a scoped offload.
-#[must_use = "dropping the guard cancels its offload; call detach to keep only incarnation ownership"]
+/// An owned cancel-on-drop lease for an incarnation-scoped resource.
+#[must_use = "dropping the guard cancels its resource; call detach to keep only incarnation ownership"]
 pub struct Guard {
     cancellation: Latch,
     finished: Latch,
+    cancel_action: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     armed: bool,
 }
 
@@ -90,6 +94,13 @@ impl fmt::Debug for Guard {
 }
 
 impl Guard {
+    fn request_cancel(&self) {
+        self.cancellation.fire();
+        if let Some(cancel) = &self.cancel_action {
+            cancel();
+        }
+    }
+
     /// Reports whether cancellation has been requested for this lease.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
@@ -107,9 +118,9 @@ impl Guard {
         self.finished.fired().await;
     }
 
-    /// Cancels the guarded offload immediately and consumes the guard.
+    /// Cancels the guarded resource immediately and consumes the guard.
     pub fn cancel(mut self) {
-        self.cancellation.fire();
+        self.request_cancel();
         self.armed = false;
     }
 
@@ -122,7 +133,7 @@ impl Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         if self.armed {
-            self.cancellation.fire();
+            self.request_cancel();
         }
     }
 }
@@ -328,6 +339,8 @@ struct FiredTimerBatch {
     mailbox_complete: bool,
     offloads_through: u64,
     offloads_complete: bool,
+    monitors_through: u64,
+    monitors_complete: bool,
 }
 
 struct SharedOffloadFuture(SharedWork);
@@ -356,6 +369,10 @@ struct OffloadResource {
     task: Option<ActorWork>,
 }
 
+struct WatchResource<M> {
+    sink: Arc<MonitorSink<M>>,
+}
+
 impl OffloadResource {
     fn cancel(&mut self) {
         self.cancellation.fire();
@@ -380,12 +397,18 @@ struct RawResources<M> {
     events: Arc<EventQueue<M>>,
     event_watcher: SignalWatcher,
     offloads: Vec<OffloadResource>,
+    monitors: Arc<MonitorSource>,
+    monitor_watcher: SignalWatcher,
+    watches: Vec<WatchResource<M>>,
+    next_watch: usize,
 }
 
 impl<M> Default for RawResources<M> {
     fn default() -> Self {
         let events = Arc::new(EventQueue::default());
         let event_watcher = events.signal.watcher();
+        let monitors = Arc::new(MonitorSource::default());
+        let monitor_watcher = monitors.watcher();
         Self {
             accepting: true,
             continuations: VecDeque::new(),
@@ -396,11 +419,32 @@ impl<M> Default for RawResources<M> {
             events,
             event_watcher,
             offloads: Vec::new(),
+            monitors,
+            monitor_watcher,
+            watches: Vec::new(),
+            next_watch: 0,
         }
     }
 }
 
 impl<M> RawResources<M> {
+    fn pop_monitor_through(&mut self, limit: u64) -> Option<MonitorDelivery<M>> {
+        self.watches.retain(|watch| watch.sink.is_active());
+        if self.watches.is_empty() {
+            self.next_watch = 0;
+            return None;
+        }
+        self.next_watch %= self.watches.len();
+        for offset in 0..self.watches.len() {
+            let index = (self.next_watch + offset) % self.watches.len();
+            if let Some(delivery) = self.watches[index].sink.pop_through(limit) {
+                self.next_watch = (index + 1) % self.watches.len();
+                return Some(delivery);
+            }
+        }
+        None
+    }
+
     fn freeze(&mut self) -> usize {
         if !self.accepting {
             return 0;
@@ -414,6 +458,11 @@ impl<M> RawResources<M> {
         for offload in &mut self.offloads {
             offload.cancel();
         }
+        for watch in &self.watches {
+            watch.sink.cancel();
+        }
+        self.watches.clear();
+        self.next_watch = 0;
         dropped_continuations
     }
 
@@ -663,6 +712,42 @@ impl<M: Send + 'static> RawContext<M> {
         true
     }
 
+    /// Watches a peer membership for this actor incarnation.
+    pub fn watch<T, W>(&mut self, target: &T, wrap: W) -> Result<(), Rejected<W>>
+    where
+        T: WatchTarget,
+        W: Fn(MonitorEvent) -> M + Send + Sync + 'static,
+    {
+        self.start_watch(target, wrap, false).map(|_| ())
+    }
+
+    /// Watches a peer membership with an additional cancel-on-drop lease.
+    pub fn watch_scoped<T, W>(&mut self, target: &T, wrap: W) -> Result<Guard, Rejected<W>>
+    where
+        T: WatchTarget,
+        W: Fn(MonitorEvent) -> M + Send + Sync + 'static,
+    {
+        self.start_watch(target, wrap, true)
+            .map(|guard| guard.expect("a scoped watch produces a guard"))
+    }
+
+    /// Cancels this incarnation's watch of `target`, discarding queued edges.
+    pub fn unwatch<T: WatchTarget>(&mut self, target: &T) -> bool {
+        let target = <T as crate::monitor::sealed::Sealed>::monitor_target(target);
+        let membership = target.member.membership();
+        let Some(index) = self
+            .resources
+            .watches
+            .iter()
+            .position(|watch| watch.sink.membership() == membership)
+        else {
+            return false;
+        };
+        let watch = self.resources.watches.swap_remove(index);
+        self.resources.next_watch = 0;
+        watch.sink.cancel()
+    }
+
     /// Starts incarnation-owned async work with one total deadline budget.
     pub fn offload<F, T, C>(
         &mut self,
@@ -799,6 +884,7 @@ impl<M: Send + 'static> RawContext<M> {
         let guard = scoped.then(|| Guard {
             cancellation: cancellation.clone(),
             finished: finished.clone(),
+            cancel_action: None,
             armed: true,
         });
         let events = Arc::clone(&self.resources.events);
@@ -864,6 +950,64 @@ impl<M: Send + 'static> RawContext<M> {
         Ok(guard)
     }
 
+    fn start_watch<T, W>(
+        &mut self,
+        target: &T,
+        wrap: W,
+        scoped: bool,
+    ) -> Result<Option<Guard>, Rejected<W>>
+    where
+        T: WatchTarget,
+        W: Fn(MonitorEvent) -> M + Send + Sync + 'static,
+    {
+        if self.is_stopping() || !self.resources.accepting {
+            return Err(Rejected::new(wrap));
+        }
+        let target = <T as crate::monitor::sealed::Sealed>::monitor_target(target);
+        let membership = target.member.membership();
+        self.resources
+            .watches
+            .retain(|watch| watch.sink.is_active());
+        if let Some(watch) = self
+            .resources
+            .watches
+            .iter()
+            .find(|watch| watch.sink.membership() == membership)
+        {
+            watch.sink.replace(wrap);
+            return Ok(scoped.then(|| Self::watch_guard(&watch.sink)));
+        }
+
+        let finished = Latch::default();
+        let sink = MonitorSink::new(
+            &target,
+            Arc::clone(&self.resources.monitors),
+            wrap,
+            finished.clone(),
+        );
+        self.resources.watches.push(WatchResource {
+            sink: Arc::clone(&sink),
+        });
+        let subscriber: Arc<dyn MonitorSubscriber> = sink.clone();
+        target.member.register_monitor(subscriber);
+
+        let guard = scoped.then(|| Self::watch_guard(&sink));
+        Ok(guard)
+    }
+
+    fn watch_guard(sink: &Arc<MonitorSink<M>>) -> Guard {
+        let cancellation = Latch::default();
+        let cancel_sink = Arc::clone(sink);
+        Guard {
+            cancellation,
+            finished: sink.finished_latch(),
+            cancel_action: Some(Arc::new(move || {
+                cancel_sink.cancel();
+            })),
+            armed: true,
+        }
+    }
+
     fn next_ready(&mut self, allow_frozen_mailbox: bool) -> Option<M> {
         loop {
             self.begin_fired_batch();
@@ -903,6 +1047,18 @@ impl<M: Send + 'static> RawContext<M> {
                         }
                     }
                     batch.offloads_complete = true;
+                }
+
+                if !batch.monitors_complete {
+                    if let Some(delivery) =
+                        self.resources.pop_monitor_through(batch.monitors_through)
+                    {
+                        self.mailbox.record_local_delivery();
+                        self.resources.continuation_needs_external = false;
+                        self.resources.fired_batch = Some(batch);
+                        return Some((delivery.wrap)(delivery.event));
+                    }
+                    batch.monitors_complete = true;
                 }
 
                 if batch.continuations_remaining > 0
@@ -948,6 +1104,12 @@ impl<M: Send + 'static> RawContext<M> {
                     self.resources.continuation_needs_external = false;
                     return Some(message);
                 }
+            }
+
+            if let Some(delivery) = self.resources.pop_monitor_through(u64::MAX) {
+                self.mailbox.record_local_delivery();
+                self.resources.continuation_needs_external = false;
+                return Some((delivery.wrap)(delivery.event));
             }
 
             if let Some(message) = self.resources.continuations.pop_front() {
@@ -1000,6 +1162,8 @@ impl<M: Send + 'static> RawContext<M> {
             mailbox_complete: false,
             offloads_through: self.resources.events.watermark(),
             offloads_complete: false,
+            monitors_through: self.resources.monitors.watermark(),
+            monitors_complete: false,
         });
     }
 
@@ -1047,10 +1211,14 @@ impl<M: Send + 'static> RawContext<M> {
         let local_stop = self.local_stop.clone();
         let mailbox = &mut self.receiver;
         let event_watcher = &mut self.resources.event_watcher;
+        let monitor_watcher = &mut self.resources.monitor_watcher;
         let delivery = async move {
             let _ = crate::driver::select(
                 mailbox.changed(),
-                crate::driver::select(event_watcher.changed(), sleep),
+                crate::driver::select(
+                    event_watcher.changed(),
+                    crate::driver::select(monitor_watcher.changed(), sleep),
+                ),
             )
             .await;
         };
@@ -1088,6 +1256,7 @@ impl<M: Send + 'static> RawContext<M> {
 pub struct RawDef<R: RawActor> {
     factory: Arc<Mutex<Box<dyn Fn() -> R + Send + 'static>>>,
     pub(crate) options: CommonOptions,
+    pub(crate) mailbox_key: Option<MailboxKeyExtractor<R::Msg>>,
 }
 
 impl<R: RawActor> fmt::Debug for RawDef<R> {
@@ -1105,6 +1274,7 @@ impl<R: RawActor> RawDef<R> {
         Self {
             factory: Arc::new(Mutex::new(Box::new(factory))),
             options: CommonOptions::default(),
+            mailbox_key: None,
         }
     }
 
@@ -1126,6 +1296,27 @@ impl<R: RawActor> RawDef<R> {
     #[must_use]
     pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
         self.options.mailbox = Some(mailbox);
+        self.options.keyed_capacity = None;
+        self.mailbox_key = None;
+        self
+    }
+
+    /// Selects bounded per-key latest-value conflation.
+    ///
+    /// A new key at capacity evicts the oldest pending key. Size capacity for
+    /// the expected key cardinality; this is not a priority/control lane.
+    #[must_use]
+    pub fn latest_by_key<K>(
+        mut self,
+        capacity: KeyedCapacity,
+        key_fn: impl Fn(&R::Msg) -> K + Send + Sync + 'static,
+    ) -> Self
+    where
+        K: Eq + Hash + Send + 'static,
+    {
+        self.options.mailbox = None;
+        self.options.keyed_capacity = Some(capacity);
+        self.mailbox_key = Some(mailbox_key_extractor(key_fn));
         self
     }
 
@@ -1160,6 +1351,9 @@ impl<R: RawActor> RawDef<R> {
     }
 
     pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
+        if let Some(extractor) = self.mailbox_key {
+            mailbox.install_key_extractor(extractor);
+        }
         let factory = self.factory;
         RawConstruction {
             source: RawSource::Restartable(Arc::new(Mutex::new(Box::new(move || {
@@ -1181,6 +1375,7 @@ impl<R: RawActor> RawDef<R> {
 pub struct RawOnceDef<R: RawActor> {
     actor: R,
     pub(crate) options: CommonOptions,
+    pub(crate) mailbox_key: Option<MailboxKeyExtractor<R::Msg>>,
 }
 
 impl<R: RawActor> fmt::Debug for RawOnceDef<R> {
@@ -1199,6 +1394,7 @@ impl<R: RawActor> RawOnceDef<R> {
         Self {
             actor,
             options: CommonOptions::default(),
+            mailbox_key: None,
         }
     }
 
@@ -1213,6 +1409,27 @@ impl<R: RawActor> RawOnceDef<R> {
     #[must_use]
     pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
         self.options.mailbox = Some(mailbox);
+        self.options.keyed_capacity = None;
+        self.mailbox_key = None;
+        self
+    }
+
+    /// Selects bounded per-key latest-value conflation.
+    ///
+    /// A new key at capacity evicts the oldest pending key. Size capacity for
+    /// the expected key cardinality; this is not a priority/control lane.
+    #[must_use]
+    pub fn latest_by_key<K>(
+        mut self,
+        capacity: KeyedCapacity,
+        key_fn: impl Fn(&R::Msg) -> K + Send + Sync + 'static,
+    ) -> Self
+    where
+        K: Eq + Hash + Send + 'static,
+    {
+        self.options.mailbox = None;
+        self.options.keyed_capacity = Some(capacity);
+        self.mailbox_key = Some(mailbox_key_extractor(key_fn));
         self
     }
 
@@ -1247,6 +1464,9 @@ impl<R: RawActor> RawOnceDef<R> {
     }
 
     pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
+        if let Some(extractor) = self.mailbox_key {
+            mailbox.install_key_extractor(extractor);
+        }
         RawConstruction {
             source: RawSource::OneShot(Some(Box::new(RawInstance {
                 actor: self.actor,

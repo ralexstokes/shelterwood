@@ -12,9 +12,12 @@ use std::{
 
 use crate::{
     ActorRef, Blocking, CancellationToken, ChildId, DeadlineElapsed, ExitError, ExitResult, Guard,
-    Incarnation, Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
-    ReadinessDeadline, Rejected, RestartPolicy, Retention, ScopeRef, Shutdown,
-    policy::CommonOptions, raw::CatchUnwindFuture,
+    Incarnation, KeyedCapacity, Mailbox, MailboxShutdown, MonitorEvent, RawActor, RawContext,
+    RawDef, RawOnceDef, Readiness, ReadinessDeadline, Rejected, RestartPolicy, Retention, ScopeRef,
+    Shutdown, WatchTarget,
+    mailbox::{MailboxKeyExtractor, mailbox_key_extractor},
+    policy::CommonOptions,
+    raw::CatchUnwindFuture,
 };
 
 /// Callback-oriented actor contract.
@@ -186,6 +189,37 @@ impl<'a, A: Actor> Context<'a, A> {
         } else {
             Ok(self.raw.clear_timer(key))
         }
+    }
+
+    /// Watches a peer membership for this actor incarnation.
+    pub fn watch<T, W>(&mut self, target: &T, wrap: W) -> Result<(), Rejected<W>>
+    where
+        T: WatchTarget,
+        W: Fn(MonitorEvent) -> A::Msg + Send + Sync + 'static,
+    {
+        if self.draining {
+            Err(Rejected::new(wrap))
+        } else {
+            self.raw.watch(target, wrap)
+        }
+    }
+
+    /// Watches a peer membership with an additional cancel-on-drop lease.
+    pub fn watch_scoped<T, W>(&mut self, target: &T, wrap: W) -> Result<Guard, Rejected<W>>
+    where
+        T: WatchTarget,
+        W: Fn(MonitorEvent) -> A::Msg + Send + Sync + 'static,
+    {
+        if self.draining {
+            Err(Rejected::new(wrap))
+        } else {
+            self.raw.watch_scoped(target, wrap)
+        }
+    }
+
+    /// Cancels this incarnation's watch of `target` and drops queued edges.
+    pub fn unwatch<T: WatchTarget>(&mut self, target: &T) -> bool {
+        self.raw.unwatch(target)
     }
 
     /// Starts incarnation-owned async work with one total deadline budget.
@@ -450,6 +484,7 @@ type ArgsFactory<A> = Arc<Mutex<Box<dyn Fn() -> <A as Actor>::Args + Send + 'sta
 pub struct ActorDef<A: Actor> {
     factory: ArgsFactory<A>,
     pub(crate) options: CommonOptions,
+    mailbox_key: Option<MailboxKeyExtractor<A::Msg>>,
 }
 
 impl<A: Actor> fmt::Debug for ActorDef<A> {
@@ -475,6 +510,7 @@ impl<A: Actor> ActorDef<A> {
         Self {
             factory: Arc::new(Mutex::new(Box::new(factory))),
             options: CommonOptions::default(),
+            mailbox_key: None,
         }
     }
 
@@ -496,6 +532,27 @@ impl<A: Actor> ActorDef<A> {
     #[must_use]
     pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
         self.options.mailbox = Some(mailbox);
+        self.options.keyed_capacity = None;
+        self.mailbox_key = None;
+        self
+    }
+
+    /// Selects bounded per-key latest-value conflation.
+    ///
+    /// A new key at capacity evicts the oldest pending key. Size capacity for
+    /// the expected key cardinality; this is not a priority/control lane.
+    #[must_use]
+    pub fn latest_by_key<K>(
+        mut self,
+        capacity: KeyedCapacity,
+        key_fn: impl Fn(&A::Msg) -> K + Send + Sync + 'static,
+    ) -> Self
+    where
+        K: Eq + Hash + Send + 'static,
+    {
+        self.options.mailbox = None;
+        self.options.keyed_capacity = Some(capacity);
+        self.mailbox_key = Some(mailbox_key_extractor(key_fn));
         self
     }
 
@@ -537,6 +594,7 @@ impl<A: Actor> ActorDef<A> {
             Handler::with_readiness(args, readiness)
         });
         raw.options = self.options;
+        raw.mailbox_key = self.mailbox_key;
         raw
     }
 }
@@ -548,6 +606,7 @@ impl<A: Actor> ActorDef<A> {
 pub struct ActorOnceDef<A: Actor> {
     args: A::Args,
     pub(crate) options: CommonOptions,
+    mailbox_key: Option<MailboxKeyExtractor<A::Msg>>,
 }
 
 impl<A: Actor> fmt::Debug for ActorOnceDef<A> {
@@ -566,6 +625,7 @@ impl<A: Actor> ActorOnceDef<A> {
         Self {
             args,
             options: CommonOptions::default(),
+            mailbox_key: None,
         }
     }
 
@@ -580,6 +640,27 @@ impl<A: Actor> ActorOnceDef<A> {
     #[must_use]
     pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
         self.options.mailbox = Some(mailbox);
+        self.options.keyed_capacity = None;
+        self.mailbox_key = None;
+        self
+    }
+
+    /// Selects bounded per-key latest-value conflation.
+    ///
+    /// A new key at capacity evicts the oldest pending key. Size capacity for
+    /// the expected key cardinality; this is not a priority/control lane.
+    #[must_use]
+    pub fn latest_by_key<K>(
+        mut self,
+        capacity: KeyedCapacity,
+        key_fn: impl Fn(&A::Msg) -> K + Send + Sync + 'static,
+    ) -> Self
+    where
+        K: Eq + Hash + Send + 'static,
+    {
+        self.options.mailbox = None;
+        self.options.keyed_capacity = Some(capacity);
+        self.mailbox_key = Some(mailbox_key_extractor(key_fn));
         self
     }
 
@@ -615,6 +696,7 @@ impl<A: Actor> ActorOnceDef<A> {
         let readiness = self.options.readiness.unwrap_or(Readiness::AfterInit);
         let mut raw = RawOnceDef::new(Handler::with_readiness(self.args, readiness));
         raw.options = self.options;
+        raw.mailbox_key = self.mailbox_key;
         raw
     }
 }

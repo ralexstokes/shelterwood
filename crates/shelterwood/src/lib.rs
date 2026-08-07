@@ -8,6 +8,7 @@ mod engine;
 mod exit;
 mod identity;
 mod mailbox;
+mod monitor;
 mod observe;
 mod policy;
 mod raw;
@@ -31,15 +32,18 @@ pub use mailbox::{
     PinnedRef, Replied, Reply, ReplyError, ReplyReceive, ReplyReceiver, RetryPolicy, SendError,
     SendErrorKind, SendFuture, SendPayload, SendTimeout,
 };
+pub use monitor::{
+    MONITOR_EVENT_CAPACITY, MonitorEvent, MonitorEventKind, MonitorMemberKind, WatchTarget,
+};
 pub use observe::{
     ChildSnapshot, ChildState, LIFECYCLE_EVENT_CAPACITY, LifecycleEvent, LifecycleEventKind,
     LifecycleEvents, LifecycleItem, LifecycleTryRecvError, MembershipStatus, ScopeKind,
     ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
 };
 pub use policy::{
-    Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, Jitter, Mailbox,
-    MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, RestartCondition, RestartPolicy,
-    Retention, ScopeDefaults, Shutdown, Strategy,
+    Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, Jitter, KeyedCapacity,
+    Mailbox, MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, RestartCondition,
+    RestartPolicy, Retention, ScopeDefaults, Shutdown, Strategy,
 };
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,

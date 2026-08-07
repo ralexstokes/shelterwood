@@ -24,6 +24,7 @@ use crate::{
     exit::{JoinVerdict, RecordedOutcome, classify_exit},
     identity::{FenceCounter, ScopeIdentity},
     mailbox::MailboxControl,
+    monitor::{MonitorEventKind, MonitorSubscriber},
     observe::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
         LifecycleHub, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
@@ -302,6 +303,7 @@ pub(crate) struct MemberCell {
     record: Mutex<MemberRecord>,
     changed: Signal,
     terminal_signals: Mutex<Vec<Signal>>,
+    monitors: Mutex<Vec<Weak<dyn MonitorSubscriber>>>,
     mailbox: Mutex<Option<Arc<dyn MailboxControl>>>,
     options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
     pub(crate) removal: Latch,
@@ -324,6 +326,7 @@ impl MemberCell {
             }),
             changed: Signal::default(),
             terminal_signals: Mutex::new(Vec::new()),
+            monitors: Mutex::new(Vec::new()),
             mailbox: Mutex::new(None),
             options: Mutex::new(None),
             removal: Latch::default(),
@@ -378,6 +381,41 @@ impl MemberCell {
             .push(signal);
     }
 
+    pub(crate) fn register_monitor(&self, subscriber: Arc<dyn MonitorSubscriber>) {
+        let mut monitors = self.monitors.lock().expect("member monitor mutex poisoned");
+        let record = self.record();
+        monitors.push(Arc::downgrade(&subscriber));
+        match record.stage {
+            MemberStage::Terminal(_) => subscriber.publish(MonitorEventKind::Removed {
+                last_incarnation: record.last_incarnation,
+            }),
+            _ => {
+                if let Some(incarnation) = record.incarnation {
+                    subscriber.publish(MonitorEventKind::Started { incarnation });
+                }
+            }
+        }
+    }
+
+    fn publish_monitor(&self, kind: MonitorEventKind) {
+        let mut monitors = self.monitors.lock().expect("member monitor mutex poisoned");
+        monitors.retain(|subscriber| {
+            let Some(subscriber) = subscriber.upgrade() else {
+                return false;
+            };
+            subscriber.publish(kind.clone());
+            true
+        });
+    }
+
+    fn publish_monitor_started(&self, incarnation: Incarnation) {
+        self.publish_monitor(MonitorEventKind::Started { incarnation });
+    }
+
+    fn publish_monitor_exited(&self, incarnation: Incarnation, exit: Exit) {
+        self.publish_monitor(MonitorEventKind::Exited { incarnation, exit });
+    }
+
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
         let previous = self
             .mailbox
@@ -411,13 +449,18 @@ impl MemberCell {
             return;
         }
         self.changed.pulse();
+        self.publish_monitor(MonitorEventKind::Removed {
+            last_incarnation: self.record().last_incarnation,
+        });
         if let Some(mailbox) = self.mailbox() {
             mailbox.terminate();
             let stats = mailbox.stats();
             debug_assert!(stats.delivered <= stats.accepted);
             debug_assert!(stats.conflated <= stats.accepted);
+            debug_assert!(stats.evicted <= stats.accepted);
             debug_assert!(stats.depth <= stats.capacity);
             let _ = stats.sends_rejected;
+            let _ = stats.local_delivered;
         }
         for signal in self
             .terminal_signals
@@ -538,6 +581,7 @@ pub(crate) struct ScopeCell {
     current_children: Mutex<Vec<Arc<SlotCell>>>,
     parent: Mutex<Option<Weak<ScopeCell>>>,
     lifecycle_sequence: Mutex<FenceCounter>,
+    root_incarnations: Mutex<FenceCounter>,
     lifecycle_seq: AtomicU64,
     lifecycle: LifecycleHub,
     snapshots: SnapshotHub,
@@ -586,6 +630,7 @@ impl ScopeCell {
             current_children: Mutex::new(Vec::new()),
             parent: Mutex::new(None),
             lifecycle_sequence: Mutex::new(FenceCounter::new(0)),
+            root_incarnations: Mutex::new(FenceCounter::new(0)),
             lifecycle_seq: AtomicU64::new(0),
             lifecycle: LifecycleHub::default(),
             snapshots: SnapshotHub::default(),
@@ -629,6 +674,9 @@ impl ScopeCell {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         member.update_locked(update);
+        if let Some(LifecycleEventKind::Started { incarnation, .. }) = &event {
+            member.publish_monitor_started(*incarnation);
+        }
         if let Some(event) = event {
             self.emit_locked(event);
         } else {
@@ -658,6 +706,12 @@ impl ScopeCell {
         scope.total_restarts = scope.total_restarts.saturating_add(1);
         drop(scope);
         member.update_locked(update);
+        if let LifecycleEventKind::Exited {
+            incarnation, exit, ..
+        } = &exited
+        {
+            member.publish_monitor_exited(*incarnation, exit.clone());
+        }
         self.emit_locked(exited);
         self.emit_locked(scheduled);
     }
@@ -676,6 +730,9 @@ impl ScopeCell {
             return false;
         }
         member.update_locked(|record| record.startup_aborted = startup_aborted);
+        if let Some(incarnation) = exited_incarnation {
+            member.publish_monitor_exited(incarnation, exit.clone());
+        }
         member.terminalize(exit.clone());
         if let Some(incarnation) = exited_incarnation {
             self.emit_locked(LifecycleEventKind::Exited {
@@ -902,6 +959,21 @@ impl ScopeCell {
     }
 
     fn begin_incarnation(&self) -> u64 {
+        if self.member.record().incarnation.is_none() {
+            let incarnation = ScopeIdentity::mint_incarnation(
+                self.member.membership(),
+                &mut self
+                    .root_incarnations
+                    .lock()
+                    .expect("root incarnation mutex poisoned"),
+            )
+            .expect("scope incarnation identity space exhausted");
+            self.member.update(|record| {
+                record.incarnation = Some(incarnation);
+                record.last_incarnation = Some(incarnation);
+            });
+            self.member.publish_monitor_started(incarnation);
+        }
         let mut control = self.control.lock().expect("scope control mutex poisoned");
         control.current_epoch = control.current_epoch.saturating_add(1);
         control.live = true;
@@ -934,6 +1006,10 @@ impl ScopeCell {
         self.record.lock().expect("scope mutex poisoned").state = state.clone();
         let terminal = terminal_exit.is_some();
         if let Some(exit) = terminal_exit {
+            if let Some(incarnation) = self.member.record().incarnation {
+                self.member
+                    .publish_monitor_exited(incarnation, exit.clone());
+            }
             self.member.terminalize(exit);
         }
         let mut control = self.control.lock().expect("scope control mutex poisoned");
@@ -971,6 +1047,10 @@ impl ScopeCell {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = ScopeState::Stopped { reason };
             self.record.lock().expect("scope mutex poisoned").state = state.clone();
+            if let Some(incarnation) = self.member.record().incarnation {
+                self.member
+                    .publish_monitor_exited(incarnation, exit.clone());
+            }
             self.member.terminalize(exit);
             self.changed.pulse();
             self.emit_locked(LifecycleEventKind::ScopeState { state });
@@ -1678,7 +1758,7 @@ impl ChildRuntime {
             .expect("scope identity mutex poisoned")
             .incarnation_counter(plan.slot.member.membership());
         if let Some(mailbox) = plan.slot.member.mailbox() {
-            mailbox.configure(plan.options.mailbox);
+            mailbox.configure(plan.options.mailbox, plan.options.keyed_capacity);
         }
         Self {
             slot: plan.slot,

@@ -3,6 +3,7 @@
 //! Structured supervision and actors for asynchronous Rust systems.
 
 mod actor;
+mod deadline;
 mod driver;
 mod engine;
 mod exit;

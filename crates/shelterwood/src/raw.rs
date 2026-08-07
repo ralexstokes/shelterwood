@@ -779,7 +779,7 @@ impl<M: Send + 'static> RawContext<M> {
         }
         self.resources.next_timer_order = self.resources.next_timer_order.saturating_add(1);
         let now = crate::driver::now();
-        let deadline = now.checked_add(after);
+        let deadline = crate::deadline::Deadline::after(now, after).instant();
         self.resources.timers.push(TimerEntry {
             key: Box::new(StoredTimerKey(key)),
             deadline,
@@ -838,7 +838,7 @@ impl<M: Send + 'static> RawContext<M> {
 
         let token = self.shutdown.child(cancellation.clone());
         let started_at = crate::driver::now();
-        let expires_at = started_at.checked_add(deadline);
+        let expires_at = crate::deadline::Deadline::after(started_at, deadline).instant();
         let event_cancellation = cancellation.clone();
         let event_finished = finished.clone();
         let operation = async move {
@@ -1031,7 +1031,7 @@ impl<M: Send + 'static> RawContext<M> {
             TimerMessage::Interval(make_message) => {
                 let period = period.expect("an interval timer must retain its period");
                 let now = crate::driver::now();
-                *deadline = now.checked_add(period);
+                *deadline = crate::deadline::Deadline::after(now, period).instant();
                 Some(make_message())
             }
         }

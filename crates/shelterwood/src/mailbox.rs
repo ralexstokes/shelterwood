@@ -347,6 +347,7 @@ impl<T: Send + 'static> Future for ReplyReceive<T> {
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.started {
             self.started = true;
+            let budget = crate::driver::deadline(self.deadline);
             if self.deadline.is_zero() {
                 self.done = true;
                 if let Some(shared) = &self.shared {
@@ -354,7 +355,7 @@ impl<T: Send + 'static> Future for ReplyReceive<T> {
                 }
                 return Poll::Ready(Err(ReplyError::Timeout));
             }
-            self.timer = Some(crate::driver::sleep(self.deadline));
+            self.timer = Some(crate::driver::sleep_deadline(budget));
         }
         let shared = Arc::clone(
             self.shared
@@ -1107,7 +1108,8 @@ impl<M: Send + 'static> ActorRef<M> {
 
     /// Sends a request built around one reply capability and awaits its reply.
     ///
-    /// One deadline covers binding, mailbox acceptance, and response. The
+    /// One deadline covers message construction, binding, mailbox acceptance,
+    /// and response, starting when the returned future is first polled. The
     /// returned [`Replied`] identifies the accepting incarnation; [`CallError`]
     /// distinguishes a guaranteed-unaccepted timeout from an accepted request
     /// with an unknown outcome. See [`CallError`] for the required retry
@@ -1285,6 +1287,7 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.started {
             self.started = true;
+            let budget = crate::driver::deadline(self.deadline);
             if self.deadline.is_zero() {
                 let actor_id = self
                     .send
@@ -1316,7 +1319,7 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
                     kind: SendErrorKind::TimedOut,
                 }));
             }
-            self.timer = Some(crate::driver::sleep(self.deadline));
+            self.timer = Some(crate::driver::sleep_deadline(budget));
         }
         let send = self.send.as_mut().expect("pending timed send retains send");
         if let Poll::Ready(result) = Pin::new(send).poll(context) {
@@ -1394,6 +1397,9 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.started {
             self.started = true;
+            // Capture the one overall budget before invoking user code. A
+            // slow message constructor consumes acceptance/response time.
+            let budget = crate::driver::deadline(self.deadline);
             if self.deadline.is_zero() {
                 self.done = true;
                 return Poll::Ready(Err(CallError {
@@ -1407,9 +1413,21 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
                 self.make_msg
                     .take()
                     .expect("unstarted call retains its message constructor")(reply);
+            // The normal polling order lets an acceptance already available
+            // at the exact deadline win. Construction is different: no send
+            // existed before it completed, so do not start one after the
+            // captured budget is strictly in the past.
+            if budget.is_overdue(crate::driver::now()) {
+                self.done = true;
+                return Poll::Ready(Err(CallError {
+                    actor_id: self.actor.id().clone(),
+                    incarnation_observed: self.actor.mailbox.current_observation(),
+                    kind: CallErrorKind::AcceptanceTimedOut,
+                }));
+            }
             self.reply = receiver.shared.take();
             self.send = Some(self.actor.send(message));
-            self.timer = Some(crate::driver::sleep(self.deadline));
+            self.timer = Some(crate::driver::sleep_deadline(budget));
         }
 
         if self.accepted.is_none() {

@@ -175,9 +175,9 @@ impl Backoff {
     #[must_use]
     pub fn next_delay(self, attempt: u64, jitter_sample: f64) -> Duration {
         let attempt = attempt.max(1);
-        let (delay, jitter) = match self {
+        let (delay, jitter, maximum) = match self {
             Self::Immediate => return Duration::ZERO,
-            Self::Fixed { delay, jitter } => (delay, jitter),
+            Self::Fixed { delay, jitter } => (delay, jitter, delay),
             Self::Exponential {
                 base,
                 factor,
@@ -187,10 +187,10 @@ impl Backoff {
                 let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
                 let nanos = duration_nanos(base) * factor.get().powi(exponent);
                 let clamped = nanos.min(duration_nanos(max));
-                (duration_from_nanos(clamped), jitter)
+                (duration_from_nanos(clamped), jitter, max)
             }
         };
-        match jitter {
+        let delay = match jitter {
             Jitter::None => delay,
             Jitter::Equal => {
                 let sample = if jitter_sample.is_finite() {
@@ -200,7 +200,11 @@ impl Backoff {
                 };
                 duration_from_nanos(duration_nanos(delay) * (0.5 + sample * 0.5))
             }
-        }
+        };
+        // Floating-point duration conversion can round an extreme value a
+        // few nanoseconds above the configured cap. Reapply the policy bound
+        // with exact Duration ordering after every conversion and jitter.
+        delay.min(maximum)
     }
 }
 
@@ -598,6 +602,34 @@ mod tests {
             Backoff::fixed(Duration::from_millis(10), Jitter::Equal).expect("valid backoff");
         assert_eq!(jittered.next_delay(1, 0.0), Duration::from_millis(5));
         assert_eq!(jittered.next_delay(1, 0.5), Duration::from_micros(7_500));
+    }
+
+    #[test]
+    fn extreme_backoffs_never_round_above_their_exact_maximum() {
+        let maximum = Duration::MAX - Duration::from_nanos(1);
+        for jitter in [Jitter::None, Jitter::Equal] {
+            let backoff = Backoff::exponential(
+                Duration::from_nanos(1),
+                BackoffFactor::new(f64::MAX).expect("finite factor"),
+                maximum,
+                jitter,
+            )
+            .expect("valid extreme backoff");
+            for sample in [
+                f64::NEG_INFINITY,
+                -1.0,
+                0.0,
+                1.0 - f64::EPSILON,
+                1.0,
+                f64::INFINITY,
+                f64::NAN,
+            ] {
+                assert!(backoff.next_delay(u64::MAX, sample) <= maximum);
+            }
+        }
+
+        let fixed = Backoff::fixed(maximum, Jitter::Equal).expect("valid fixed backoff");
+        assert!(fixed.next_delay(u64::MAX, 1.0) <= maximum);
     }
 
     #[test]

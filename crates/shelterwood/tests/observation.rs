@@ -973,7 +973,7 @@ async fn descendant_resolves_leaf_and_scope_path_endings() {
 
 /// A wait deadline too large for the clock is a deadline that never
 /// arrives — not one that is already due.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
     let gate = ReleaseGate::default();
     let mut tree = Tree::new();
@@ -1009,7 +1009,10 @@ async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
                 .await
         }
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!waiter.is_finished(), "the overflowing wait remains armed");
     gate.release();
     waiter
         .await

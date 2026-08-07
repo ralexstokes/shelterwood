@@ -401,10 +401,6 @@ fn panic_message(payload: Box<dyn std::any::Any + Send + 'static>) -> Option<Str
     }
 }
 
-pub(crate) async fn sleep(duration: Duration) {
-    time::sleep(duration).await;
-}
-
 #[cfg(test)]
 pub(crate) async fn yield_now() {
     task::yield_now().await;

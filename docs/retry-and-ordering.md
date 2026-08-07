@@ -1,10 +1,12 @@
 # Calls, retries, and message ordering
 
-`ActorRef::call` uses one deadline for both mailbox acceptance and the reply.
-Its result always carries identity evidence: `Replied<T>` identifies the
-incarnation that accepted a successful request, while `CallError` records the
-accepting or observed incarnation when one exists. Treat these tokens as part
-of the protocol, not merely diagnostic metadata.
+`ActorRef::call` uses one deadline for message construction, mailbox acceptance,
+and the reply. The budget starts when the call future is first polled, before
+the user-supplied message constructor runs, so slow construction consumes the
+same budget. Its result always carries identity evidence: `Replied<T>`
+identifies the incarnation that accepted a successful request, while
+`CallError` records the accepting or observed incarnation when one exists.
+Treat these tokens as part of the protocol, not merely diagnostic metadata.
 
 ## The retry decision
 

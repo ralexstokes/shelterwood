@@ -213,7 +213,8 @@ pub struct ChildSnapshot {
     pub restart_policy: RestartPolicy,
     /// Resolved terminal-retention policy.
     pub retention: Retention,
-    /// Absolute backoff deadline, present exactly while restarting.
+    /// Absolute backoff deadline while restarting, or `None` when the delay
+    /// is too distant for the clock to represent.
     pub restart_at: Option<Instant>,
     /// Recursive state of a scope child when its incarnation is live or terminal.
     pub nested: Option<Arc<ScopeSnapshot>>,

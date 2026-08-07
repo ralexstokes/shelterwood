@@ -1558,7 +1558,7 @@ impl SystemRun {
                 self.root
                     .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
             }
-            runtime::JoinOutcome::Cancelled { .. } => {
+            runtime::JoinOutcome::Cancelled => {
                 self.root.set_startup(Err(StartupError::ShutdownRequested));
                 self.root.finish_live_root_incarnation(
                     StopReason::ShutdownRequested,
@@ -1658,7 +1658,7 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
                 monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
                 StopReason::ShutdownRequested
             }
-            runtime::JoinOutcome::Cancelled { .. } => {
+            runtime::JoinOutcome::Cancelled => {
                 monitor_root.set_startup(Err(StartupError::ShutdownRequested));
                 monitor_root.finish_live_root_incarnation(
                     StopReason::ShutdownRequested,
@@ -2200,9 +2200,7 @@ impl ScopeRuntime {
             let join = match runtime::join(handle).await {
                 runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
                 runtime::JoinOutcome::Panic { message, .. } => JoinVerdict::Panicked { message },
-                runtime::JoinOutcome::Cancelled { .. } => {
-                    JoinVerdict::Cancelled { after_grace: false }
-                }
+                runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled { after_grace: false },
             };
             exit_ended.fire();
             let report = report_receiver.receive();

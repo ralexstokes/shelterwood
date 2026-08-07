@@ -10,8 +10,8 @@ use crate::common::{
     DestructorBlocker, DestructorGate, ReleaseGate, policy::never, poll_once, poll_until,
 };
 use shelterwood::{
-    Backoff, ExitError, ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef,
-    RestartCondition, RestartPolicy, SendErrorKind, Tree,
+    Backoff, CallErrorKind, ExitError, ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef,
+    Reply, RestartCondition, RestartPolicy, SendErrorKind, Tree,
 };
 
 struct RestartActor {
@@ -66,11 +66,124 @@ fn restarting_definition(
     .restart(restart)
 }
 
+enum EvidenceMessage {
+    Value,
+    Ask(Reply<usize>),
+}
+
+struct EvidenceRestartActor {
+    generation: usize,
+    fail_first: ReleaseGate,
+    hold_replacement: ReleaseGate,
+}
+
+impl RawActor for EvidenceRestartActor {
+    type Msg = EvidenceMessage;
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        if self.generation == 1 {
+            self.fail_first.wait().await;
+            return Err(ExitError::message("replace first incarnation"));
+        }
+        self.hold_replacement.wait().await;
+        while let Some(message) = context.recv().await {
+            match message {
+                EvidenceMessage::Value => {}
+                EvidenceMessage::Ask(reply) => reply.send(17),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn evidence_restarting_definition(
+    factories: &Arc<AtomicUsize>,
+    fail_first: &ReleaseGate,
+    hold_replacement: &ReleaseGate,
+) -> RawDef<EvidenceRestartActor> {
+    RawDef::factory({
+        let factories = Arc::clone(factories);
+        let fail_first = fail_first.clone();
+        let hold_replacement = hold_replacement.clone();
+        move || EvidenceRestartActor {
+            generation: factories.fetch_add(1, Ordering::SeqCst) + 1,
+            fail_first: fail_first.clone(),
+            hold_replacement: hold_replacement.clone(),
+        }
+    })
+    .mailbox(Mailbox::queue(1).expect("non-zero capacity"))
+    .restart(RestartPolicy::default())
+}
+
 async fn wait_for_destructor(destructor: &DestructorGate) {
     let destructor = destructor.clone();
     tokio::task::spawn_blocking(move || destructor.wait_entered())
         .await
         .expect("destructor waiter joins");
+}
+
+#[tokio::test(start_paused = true)]
+async fn rebind_refreshes_all_overflow_waiter_incarnation_evidence() {
+    let factories = Arc::new(AtomicUsize::new(0));
+    let fail_first = ReleaseGate::default();
+    let hold_replacement = ReleaseGate::default();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw(
+            "evidence-worker",
+            evidence_restarting_definition(&factories, &fail_first, &hold_replacement),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("first actor starts");
+    let first = actor
+        .try_send(EvidenceMessage::Value)
+        .expect("first incarnation queue fills");
+    let width = Duration::from_secs(10);
+
+    let mut promoted = Box::pin(actor.send_timeout(EvidenceMessage::Value, width));
+    let mut overflow = Box::pin(actor.send_timeout(EvidenceMessage::Value, width));
+    let mut call = Box::pin(actor.call(EvidenceMessage::Ask, width));
+    assert!(poll_once(promoted.as_mut()).is_pending());
+    assert!(poll_once(overflow.as_mut()).is_pending());
+    assert!(poll_once(call.as_mut()).is_pending());
+
+    fail_first.release();
+    let mut replacement = None;
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            if let std::task::Poll::Ready(result) = poll_once(promoted.as_mut()) {
+                replacement = Some(result.expect("first waiter enters replacement capacity"));
+                true
+            } else {
+                false
+            }
+        })
+        .await
+    );
+    let replacement = replacement.expect("replacement bind promotes the first waiter");
+    assert!(replacement.supersedes(first));
+    assert_eq!(factories.load(Ordering::SeqCst), 2);
+    assert!(poll_once(overflow.as_mut()).is_pending());
+    assert!(poll_once(call.as_mut()).is_pending());
+
+    tokio::time::advance(width).await;
+    let std::task::Poll::Ready(Err(send_error)) = poll_once(overflow.as_mut()) else {
+        panic!("overflow send times out");
+    };
+    assert_eq!(send_error.kind, SendErrorKind::TimedOut);
+    assert_eq!(send_error.incarnation_observed, Some(replacement));
+    let std::task::Poll::Ready(Err(call_error)) = poll_once(call.as_mut()) else {
+        panic!("overflow call times out before acceptance");
+    };
+    assert_eq!(call_error.kind, CallErrorKind::AcceptanceTimedOut);
+    assert_eq!(call_error.incarnation_observed, Some(replacement));
+
+    hold_replacement.release();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("actor stops");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

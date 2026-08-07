@@ -71,6 +71,54 @@ fn boundary_actor(
 }
 
 #[tokio::test(start_paused = true)]
+async fn prebind_overflow_timeouts_observe_the_bound_incarnation() {
+    let gate = ReleaseGate::default();
+    let values = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "prebind-overflow",
+            RawOnceDef::new(boundary_actor(Some(gate.clone()), &values, &calls, false))
+                .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
+        )
+        .expect("valid actor");
+    let width = Duration::from_secs(10);
+    let mut accepted = Box::pin(actor.send_timeout(Message::Value(1), width));
+    let mut overflow = Box::pin(actor.send_timeout(Message::Value(2), width));
+    let mut call = Box::pin(actor.call(Message::Ask, width));
+    assert!(poll_once(accepted.as_mut()).is_pending());
+    assert!(poll_once(overflow.as_mut()).is_pending());
+    assert!(poll_once(call.as_mut()).is_pending());
+
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    let Poll::Ready(Ok(incarnation)) = poll_once(accepted.as_mut()) else {
+        panic!("the first prebind operation must fill the queue");
+    };
+    assert!(poll_once(overflow.as_mut()).is_pending());
+    assert!(poll_once(call.as_mut()).is_pending());
+
+    advance_time(width).await;
+    let Poll::Ready(Err(send_error)) = poll_once(overflow.as_mut()) else {
+        panic!("overflow send must time out");
+    };
+    assert_eq!(send_error.kind, SendErrorKind::TimedOut);
+    assert_eq!(send_error.incarnation_observed, Some(incarnation));
+    let Poll::Ready(Err(call_error)) = poll_once(call.as_mut()) else {
+        panic!("overflow call must time out before acceptance");
+    };
+    assert_eq!(call_error.kind, CallErrorKind::AcceptanceTimedOut);
+    assert_eq!(call_error.incarnation_observed, Some(incarnation));
+
+    gate.release();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("actor stops");
+}
+
+#[tokio::test(start_paused = true)]
 async fn acceptance_winning_the_deadline_withdrawal_race_succeeds() {
     let gate = ReleaseGate::default();
     let values = Arc::new(Mutex::new(Vec::new()));
@@ -108,6 +156,45 @@ async fn acceptance_winning_the_deadline_withdrawal_race_succeeds() {
         })
         .await
     );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("actor stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn call_promotion_winning_the_deadline_race_reports_response_timeout() {
+    let gate = ReleaseGate::default();
+    let values = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "call-deadline-race",
+            RawOnceDef::new(boundary_actor(Some(gate.clone()), &values, &calls, true))
+                .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    let accepting = actor.try_send(Message::Value(1)).expect("queue fills");
+    let deadline = Duration::from_secs(10);
+    let mut call = Box::pin(actor.call(Message::Ask, deadline));
+    assert!(poll_once(call.as_mut()).is_pending());
+
+    advance_time(deadline).await;
+    gate.release();
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            calls.load(Ordering::SeqCst) == 1
+        })
+        .await
+    );
+    let Poll::Ready(Err(error)) = poll_once(call.as_mut()) else {
+        panic!("promotion must win before deadline withdrawal");
+    };
+    assert_eq!(error.kind, CallErrorKind::ResponseTimedOut);
+    assert_eq!(error.incarnation_observed, Some(accepting));
     system
         .shutdown(Duration::from_secs(1))
         .await

@@ -1,0 +1,308 @@
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use shelterwood::{
+    Actor, ActorDef, ActorOnceDef, Context, DynamicTree, ExitError, ExitResult, Handler, RawActor,
+    RawContext, RawOnceDef, Readiness, StopContext, TaskDef, Tree,
+};
+use shelterwood_test_support::{ReleaseGate, poll_until};
+
+#[derive(Clone)]
+struct BasicArgs {
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+enum BasicMessage {
+    Stop,
+}
+
+struct BasicActor {
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Actor for BasicActor {
+    type Msg = BasicMessage;
+    type Args = BasicArgs;
+
+    async fn init(args: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        assert!(!context.is_draining());
+        args.events
+            .lock()
+            .expect("events mutex poisoned")
+            .push("init");
+        Ok(Self {
+            events: args.events,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            BasicMessage::Stop => {
+                self.events
+                    .lock()
+                    .expect("events mutex poisoned")
+                    .push("handle");
+                context.stop();
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_stop(&mut self, context: &mut StopContext<'_, Self>) {
+        assert_eq!(context.id().as_str(), "actor");
+        self.events
+            .lock()
+            .expect("events mutex poisoned")
+            .push("stop");
+    }
+}
+
+#[tokio::test]
+async fn handler_actor_runs_init_handle_and_stop_through_the_raw_wrapper() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<BasicActor>::new(BasicArgs {
+                events: Arc::clone(&events),
+            }),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor initializes");
+    actor.send(BasicMessage::Stop).await.expect("actor is live");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(
+        *events.lock().expect("events mutex poisoned"),
+        ["init", "handle", "stop"]
+    );
+}
+
+struct ManualActor;
+
+impl Actor for ManualActor {
+    type Msg = ();
+    type Args = ();
+
+    async fn init(_: (), _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), context: &mut Context<'_, Self>) -> ExitResult {
+        context.mark_ready();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn manual_handler_readiness_is_not_released_automatically_after_init() {
+    let sibling_started = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<ManualActor>::new(()).readiness(Readiness::Manual),
+        )
+        .expect("valid actor");
+    let observed = Arc::clone(&sibling_started);
+    let _sibling = tree
+        .add_task_once(
+            "sibling",
+            shelterwood::TaskOnceDef::new(move |_| async move {
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .expect("valid sibling");
+    let system = tree.spawn().expect("runtime is available");
+    tokio::task::yield_now().await;
+    assert!(!sibling_started.load(Ordering::SeqCst));
+    actor
+        .send(())
+        .await
+        .expect("mailbox accepts during startup");
+    system.wait_started().await.expect("manual mark opens gate");
+    assert!(sibling_started.load(Ordering::SeqCst));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}
+
+struct GatedActor;
+
+impl Actor for GatedActor {
+    type Msg = ();
+    type Args = ReleaseGate;
+
+    async fn init(gate: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        gate.wait().await;
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
+struct AwaitingDecorator<R> {
+    inner: R,
+}
+
+impl<R: RawActor> RawActor for AwaitingDecorator<R> {
+    type Msg = R::Msg;
+
+    fn readiness(&self) -> Readiness {
+        self.inner.readiness()
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        tokio::task::yield_now().await;
+        self.inner.run(context).await
+    }
+}
+
+#[tokio::test]
+async fn raw_decorator_await_before_handler_delegate_preserves_declared_readiness() {
+    let gate = ReleaseGate::default();
+    let sibling_started = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "actor",
+        RawOnceDef::new(AwaitingDecorator {
+            inner: Handler::<GatedActor>::new(gate.clone()),
+        }),
+    )
+    .expect("valid decorated actor");
+    let observed = Arc::clone(&sibling_started);
+    tree.add_task(
+        "sibling",
+        TaskDef::new(move |context| {
+            let observed = Arc::clone(&observed);
+            async move {
+                observed.store(true, Ordering::SeqCst);
+                context.shutdown_token().cancelled().await;
+                Ok(())
+            }
+        }),
+    )
+    .expect("valid sibling");
+    let system = tree.spawn().expect("runtime is available");
+    tokio::task::yield_now().await;
+    assert!(!sibling_started.load(Ordering::SeqCst));
+    gate.release();
+    system
+        .wait_started()
+        .await
+        .expect("decorated actor becomes ready");
+    assert!(sibling_started.load(Ordering::SeqCst));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}
+
+#[tokio::test]
+async fn restartable_and_dynamic_actor_definition_surfaces_work() {
+    let inits = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = DynamicTree::new();
+    let count = Arc::clone(&inits);
+    let events_for_args = Arc::clone(&events);
+    tree.add_actor(
+        "initial",
+        ActorDef::<BasicActor>::factory(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            BasicArgs {
+                events: Arc::clone(&events_for_args),
+            }
+        }),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("initial actor starts");
+    assert_eq!(inits.load(Ordering::SeqCst), 1);
+
+    let dynamic_events = Arc::new(Mutex::new(Vec::new()));
+    let dynamic = system.scope();
+    let actor = dynamic
+        .add_actor_once(
+            "dynamic",
+            ActorOnceDef::<BasicActor>::new(BasicArgs {
+                events: Arc::clone(&dynamic_events),
+            }),
+        )
+        .await
+        .expect("dynamic actor admitted")
+        .into_handles();
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            dynamic_events
+                .lock()
+                .expect("events mutex poisoned")
+                .contains(&"init")
+        })
+        .await
+    );
+    actor
+        .send(BasicMessage::Stop)
+        .await
+        .expect("dynamic actor live");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}
+
+struct InertActor;
+
+impl Actor for InertActor {
+    type Msg = ();
+    type Args = ();
+
+    async fn init(_: (), _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        context.mark_ready();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn manual_readiness_override_on_a_wrapped_handler_stays_gated() {
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "gated",
+            RawOnceDef::new(Handler::<InertActor>::new(()))
+                .readiness(Readiness::Manual)
+                .expect("manual readiness override"),
+        )
+        .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+    // The engine gates on the Manual override; the blanket handler loop must
+    // consult the same resolved mode instead of auto-firing after init.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), system.wait_started())
+            .await
+            .is_err(),
+        "a Manual override must not be released by the handler's post-init mark_ready"
+    );
+    actor.send(()).await.expect("gated actor accepts messages");
+    system
+        .wait_started()
+        .await
+        .expect("an explicit mark_ready releases the gate");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}

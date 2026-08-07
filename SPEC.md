@@ -126,9 +126,9 @@ below is a reachable escape hatch:
 - **L4 — observation**: snapshots and lifecycle events over L1's single
   publication path.
 
-**Implementation shape.** Two cross-cutting constraints on *how* the layers
-are built — they determine testability and reviewability more than any
-single design rule:
+**Implementation shape.** Three cross-cutting constraints on *how* the
+layers are built — they determine testability and reviewability more than
+any single design rule:
 
 - **Policies are plain data.** Every policy and configuration surface —
   `RestartPolicy`, `Backoff`, `Shutdown`, `Readiness` and its deadline,
@@ -158,6 +158,25 @@ single design rule:
   and timer retraction): decide the next action as a function of observed
   loop state, then await it. User code — actor bodies — is of course
   effectful; the constraint binds the engine.
+- **Promises are owned completions.** Every cross-task promise — an
+  admission or removal awaiting resolution, an exit report awaiting
+  publication, a resident child awaiting its `Removed` edge, a member
+  cell awaiting terminality, a waiter awaiting a wake — is held as an
+  owned value whose destructor discharges it, fail-closed, with a
+  **synchronous** fallback: complete with the terminal rejection,
+  publish the coarse exit, emit the edge, pulse the signal — never an
+  await, never a join. The event loop that services the orderly path is
+  an optimization of these values' consumption, never the sole
+  guarantor: when a driver future is destroyed at any await point —
+  hard-abort cascade, panic, natural return with events still queued —
+  unwinding alone MUST discharge every outstanding promise (§10's
+  driver-death rule, §13.17's test anchor). Two corollaries are
+  normative. Residency in a scope's observed child set is itself such a
+  value — its drop emits `Removed`, making §3.2's exact pairing
+  structural rather than remembered. And each cell has exactly **one**
+  change signal from which every compound wait derives — a second wake
+  path is a lost wakeup waiting to be written. (Structural adoption is
+  tracked as #17; the discharge behavior is required now.)
 
 **Performance posture.** The decision layer is a control plane — its
 events are exits, restarts, commands, and deadlines, rare even in a
@@ -631,23 +650,23 @@ trait RawActor: Send + 'static {
   before `run` is called. The shared options record applies unchanged
   (mailbox settings included — honoring `mailbox_shutdown` is the raw
   loop's own obligation, §10/B.1); readiness defaults `Immediate` per §6.
-- *Open (§14.1), with the constraint set any resolution MUST satisfy:*
-  how `init` + `Args` thread through the raw layer. Provisional resolution
-  from the origin spike, to be validated:
-  1. `RawActor::run(&mut self, ctx)` stays untouched — construction is an
-     `Actor`-layer concept; the raw trait is construction-agnostic.
-  2. The casualty is the blanket `impl<H: Actor> RawActor for H`: with
-     `init(args)`, the actor value does not exist before `run`, so the
-     blanket moves to a wrapper type with `Uninit(Args) → Running(A)`
-     phases.
-  3. That wrapper replaces exactly the code where the origin's readiness
-     hack lived ("must be the first operation before any await"); declared
-     readiness (§6) MUST land with or before this change so the poll-order
-     trap cannot be reintroduced.
-  4. The unvalidated risk is **decorator ergonomics** — how wrappers around
-     handler actors compose after the change. This cannot be desk-checked;
-     the spike validates it by porting the two largest acceptance scenarios
-     (Appendix C) and the shutdown-race tests before committing.
+- **Resolved by the M3 §14.1 spike:** `init` and `Args` remain entirely an
+  `Actor`-layer concern. `RawActor::run(&mut self, ctx)` is unchanged and
+  construction-agnostic. The handler loop lives in the public `Handler<A>`
+  raw-actor wrapper, which owns the `Uninit(Args) → Running(A)` transition;
+  `ActorDef` and `ActorOnceDef` construct that wrapper rather than relying on
+  a blanket `impl<A: Actor> RawActor for A` (which cannot exist before
+  `init` produces `A`). The wrapper stores its declared readiness mode, the
+  engine reads it before `run` is first polled, and only `AfterInit` performs
+  the automatic post-init `mark_ready`; `Immediate` and `Manual` retain their
+  declared meanings. Raw decorators can wrap `Handler<A>` directly and may
+  await before delegation without changing readiness. Handler decorators use
+  the zero-cost same-message `Context::for_actor` / `StopContext::for_actor`
+  reborrow, sharing identity and incarnation-owned resources. Executable
+  shard-store and nested assistant-control-plane spike ports validate both
+  composition paths, readiness gating, exact-handle replacement, nested
+  dynamic teardown, and stage preservation. **Verdict: accept the provisional
+  wrapper design; no decorator-ergonomics blocker remains.**
 
 ## 5. Mailboxes, delivery, and the event loop
 
@@ -1780,6 +1799,19 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   advances to the next sibling. Dynamic scopes cancel the group at once and
   drain concurrently (grace clocks run in parallel, not summed). Aborting an
   ancestor arms a recursive hard-abort cascade.
+- **Driver death discharges; it never absolves.** A scope driver
+  destroyed with obligations outstanding resolves all of them on the way
+  down: still-active descendants publish the coarse kill verdict —
+  `Aborted { after_grace: false }` with `cancelled: true` — memberships
+  terminalize (sends fail `Terminated`, exit-awaiting surfaces resolve),
+  in-flight admissions and removals resolve their enumerated rejections,
+  and every `Added` is paired with its `Removed` before the scope's own
+  final event. First publication wins: an orderly post-join report that
+  already landed is never overwritten. §7's post-join precision is an
+  orderly-path property, deliberately traded for promptness on the kill
+  path — the future was destroyed, so "what would it have reported"
+  is unknowable in bounded time; this is the same trade `brutal_kill` →
+  `killed` makes, decided here once rather than per call site.
 - "Drained" has exactly one definition, derived from child state (no
   hand-maintained live counter).
 - Child exits are consumed through one funnel regardless of which await
@@ -2397,26 +2429,50 @@ integration toolkit for the driver shell and the end-to-end invariants.
     terminalized, and an ordered scope holding one `Always`-policy child
     all stay alive until the owner acts; a retained terminal sibling
     does not block completion.
+17. **Every pending completion resolves under driver death.** The
+    provocation is fault-shaped: provoke a hard abort of an ancestor
+    (grace-expiry escalation, `Shutdown::Abort`, forced shutdown) with
+    each obligation class provably outstanding — a stubborn descendant
+    holding exit-waiters and a parked send, an admission first-polled
+    but not yet dequeued, a removal latched mid-flight, a lifecycle
+    subscriber holding the stream, a `shutdown_and_wait` parked on a
+    restart-window membership — and assert, bounded, that every one
+    resolves: exit-awaiting surfaces yield `Aborted`, `try_send` fails
+    `Terminated` (never a permanent `NotRunning`), parked sends resolve
+    `Terminated`, add/remove futures yield their enumerated rejections,
+    the stream pairs every `Added` with `Exited`/`Removed` before the
+    final scope event, and no snapshot of a stopped scope carries a live
+    incarnation (§1's owned-completion constraint, §10's driver-death
+    rule). Where a fault-injection harness can destroy the driver at
+    arbitrary await points, run the same assertions there; the fixed
+    provocations above are the floor, not the ceiling.
 
-## 14. Open questions (resolve during the core spike)
+## 14. Core-spike decisions
 
-Two remain:
+Both questions are resolved:
 
-1. **`init`/`Args` threading through the raw-actor layer** — constraint set
-   and provisional resolution in §4.3; the spike's job is to validate
-   decorator ergonomics by porting the two largest acceptance scenarios,
-   not to revisit the constraints.
-2. **Engine event arbitration** — the deterministic processing order when
-   one wake makes several events eligible (shutdown/remove command, child
-   exit, readiness deadline, backoff-due restart, other deadlines).
-   Constraints any resolution MUST satisfy: deterministic under virtual
-   time; a shutdown or removal observed before an exit suppresses that
-   exit's restart scheduling and its intensity charge; the chosen order is
-   pinned by decision-layer table tests (§1 implementation shape), never
-   left to select-arm luck. **Resolution deadline: M1**, alongside the
-   ladder/funnel state machines it orders (`part_i.md`) — the order
-   changes intensity charges and emitted history, so it cannot ride past
-   the first milestone.
+1. **`init`/`Args` threading through the raw-actor layer — resolved in M3.**
+   The public `Handler<A>` wrapper and same-message context re-entry design
+   described in §4.3 passed the shard-store and assistant-control-plane
+   executable spikes, including a raw decorator that awaits before delegation.
+2. **Engine event arbitration — resolved in M1.** When one driver wake makes
+   several events eligible, the engine processes them in this order:
+   scope shutdown, membership removal, child exit, readiness signal,
+   readiness deadline, backoff-due restart, stop-ladder deadline, queued
+   admission. Items in one class retain their stable source order. Scope
+   shutdown precedes
+   removal because teardown owns all stops once it begins; both precede
+   child exits, so an already-observed stop suppresses restart scheduling
+   and its intensity charge. A readiness signal precedes its deadline, so
+   ready-at-deadline wins. Child exits precede both, making an incarnation
+   that has already ended in the same wake an exit rather than a spurious
+   readiness edge. Backoff work follows all newly observed terminal facts,
+   and ladder deadlines follow because the earlier facts can complete or
+   disarm them. Queued admissions run after all already-observed terminal and
+   temporal facts, so they cannot enter a scope that the same wake has made
+   non-admitting. The decision layer represents this as an ordered class and
+   pins the complete table without runtime selection; the driver drains all
+   currently eligible inputs into that table before applying effects.
 
 (Resolved elsewhere: stage-generic `handle` is rejected — drain-stage
 rejection stays value-level, §5.4; the conflating-mailbox control lane is
@@ -2826,7 +2882,7 @@ the same series during shutdown drain; **Stop** = `StopContext<'_, A>` in
 | `recv()` / `try_recv()` (the merged event source: mailbox, offload completions, fired timers, queued continuations, §5.2 priority; `recv` yields `None` on stop request, biased; `try_recv` ignores the stop token — the drain primitive for raw loops: under `Drain`, exhaust the frozen prefix via `try_recv` after `recv` yields `None`, §10's raw-loop obligation) | ✓ | — | — | — |
 | `mailbox_shutdown()` (the resolved §10 policy for this actor's mailbox — what a raw loop consults to honor `Drain` vs `Discard`) | ✓ | — | — | — |
 | `mark_ready()` (one-shot effect by construction; meaningful only under gated readiness, else a documented no-op — B.2's rule, uniformly; during drain always the no-op) | ✓ | ✓ | ✓ | — |
-| `stop()` (clean self-stop after current callback; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §10 ladder as the stop bound) | — | ✓ | ✓ | — |
+| `stop()` (clean self-stop; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §10 ladder as the stop bound. Live/Drain: effective after the current callback. Raw: freezes intake at the call — drain the frozen prefix via `try_recv` after `recv` yields `None`; §1 principle 5's public primitive for the blanket loop's `stop()`) | ✓ | ✓ | ✓ | — |
 | `is_draining()` | — | ✓ | ✓ | — |
 | `continue_with(msg)` (next-message continuation; no mailbox capacity; anti-starvation per §5.2) | ✓ | ✓ | **R** | — |
 | Keyed timers: `set_timeout` / `set_interval` / `clear_timer` (§5.3) | ✓ | ✓ | **R** | — |

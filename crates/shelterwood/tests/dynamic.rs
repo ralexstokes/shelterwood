@@ -126,6 +126,75 @@ async fn exact_handles_reject_cross_scope_and_same_id_successors() {
 }
 
 #[tokio::test]
+async fn nested_declared_membership_is_superseded_by_its_runtime_replacement() {
+    let mut nested = DynamicTree::new();
+    let declared = nested
+        .add_task("worker", waiting_task())
+        .expect("valid declared task");
+    let different_id = nested
+        .add_task("other", waiting_task())
+        .expect("valid unrelated task");
+    let declared_membership = declared.membership();
+
+    let mut unrelated = DynamicTree::new();
+    let unrelated_worker = unrelated
+        .add_task("worker", waiting_task())
+        .expect("valid task in unrelated scope");
+
+    let mut root = Tree::new();
+    let nested_scope = root
+        .add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid nested scope");
+    root.add_subtree_once("unrelated", SubtreeOnceDef::new(unrelated))
+        .expect("valid unrelated scope");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+
+    assert_eq!(
+        declared.membership(),
+        declared_membership,
+        "first lowering preserves the declared handle's identity"
+    );
+    assert_eq!(
+        nested_scope.remove_task(&declared).await,
+        RemoveOutcome::Removed
+    );
+    let replacement = nested_scope
+        .add_task("worker", waiting_task())
+        .await
+        .expect("runtime replacement is admitted")
+        .into_handles();
+
+    assert!(replacement.membership().supersedes(declared_membership));
+    assert!(!declared_membership.supersedes(replacement.membership()));
+    assert!(
+        !replacement
+            .membership()
+            .supersedes(different_id.membership())
+    );
+    assert!(
+        !different_id
+            .membership()
+            .supersedes(replacement.membership())
+    );
+    assert!(
+        !replacement
+            .membership()
+            .supersedes(unrelated_worker.membership())
+    );
+    assert!(
+        !unrelated_worker
+            .membership()
+            .supersedes(replacement.membership())
+    );
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}
+
+#[tokio::test]
 async fn exact_scope_removal_does_not_touch_a_same_id_successor() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");

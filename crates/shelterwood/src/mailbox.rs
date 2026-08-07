@@ -1632,9 +1632,10 @@ mod tests {
 
     fn actor() -> (Arc<MailboxCell<u8>>, ActorRef<u8>) {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from("actor");
         let member = MemberCell::new(
-            ChildId::from("actor"),
-            identity.mint_membership().expect("membership available"),
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
         );
         let mailbox = MailboxCell::new(member.id().clone());
         member.attach_mailbox(mailbox.clone());
@@ -1662,7 +1663,9 @@ mod tests {
         MailboxControl::configure(&*mailbox, Mailbox::default());
         let mut generations = {
             let mut identity = ScopeIdentity::new().expect("scope identity available");
-            let membership = identity.mint_membership().expect("membership available");
+            let membership = identity
+                .mint_membership(&ChildId::from("actor"))
+                .expect("membership available");
             (membership, identity.incarnation_counter(membership))
         };
         let incarnation = ScopeIdentity::mint_incarnation(generations.0, &mut generations.1)

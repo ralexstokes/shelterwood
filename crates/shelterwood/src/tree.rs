@@ -126,6 +126,12 @@ pub enum BuildError {
     },
 }
 
+#[derive(Debug)]
+pub(crate) enum LowerError {
+    Undefined(Vec<Vec<ChildId>>),
+    IdentityExhausted(ChildId),
+}
+
 /// Outcome of an idempotent dynamic removal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoveOutcome {
@@ -223,12 +229,15 @@ pub(crate) struct BuilderCore {
 
 impl BuilderCore {
     fn new(flavor: ScopeFlavor) -> Self {
-        let mut identity = ScopeIdentity::new().expect("global scope identity space exhausted");
-        let membership = identity
-            .mint_membership()
+        let root_id = ChildId::from("$root");
+        let mut root_identity =
+            ScopeIdentity::new().expect("global scope identity space exhausted");
+        let membership = root_identity
+            .mint_membership(&root_id)
             .expect("fresh scope identity must mint its root membership");
-        let member = MemberCell::new(ChildId::from("$root"), membership);
-        let root = ScopeCell::new(member, flavor, identity);
+        let member = MemberCell::new(root_id, membership);
+        let child_identity = ScopeIdentity::new().expect("global scope identity space exhausted");
+        let root = ScopeCell::new(member, flavor, child_identity);
         Self {
             root,
             flavor,
@@ -253,7 +262,7 @@ impl BuilderCore {
             .child_identity
             .lock()
             .expect("scope identity mutex poisoned")
-            .mint_membership()
+            .mint_membership(&id)
             .ok_or(ReserveError::IdentityExhausted)?;
         let member = MemberCell::new(id.clone(), membership);
         let scope = scope.map(|flavor| {
@@ -270,9 +279,8 @@ impl BuilderCore {
         mut self,
         inherited: ResolvedDefaults,
         root_override: Option<Arc<ScopeCell>>,
-    ) -> Result<ScopePlan, Vec<Vec<ChildId>>> {
+    ) -> Result<ScopePlan, LowerError> {
         let root = root_override.unwrap_or_else(|| Arc::clone(&self.root));
-        root.set_config(self.config.clone());
         let undefined: Vec<_> = self
             .slots
             .iter()
@@ -280,8 +288,23 @@ impl BuilderCore {
             .map(|slot| vec![slot.member.id().clone()])
             .collect();
         if !undefined.is_empty() {
-            return Err(undefined);
+            return Err(LowerError::Undefined(undefined));
         }
+        if !Arc::ptr_eq(&root, &self.root) {
+            let mut identity = root
+                .child_identity
+                .lock()
+                .expect("scope identity mutex poisoned");
+            for slot in &self.slots {
+                let membership = identity
+                    .adopt_or_mint_membership(slot.member.id(), slot.member.membership())
+                    .ok_or_else(|| LowerError::IdentityExhausted(slot.member.id().clone()))?;
+                if membership != slot.member.membership() {
+                    slot.member.rebase_membership(membership);
+                }
+            }
+        }
+        root.set_config(self.config.clone());
         let defaults = inherited.overlay(&self.config.defaults);
         let mut children = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
@@ -702,7 +725,12 @@ fn spawn_builder<R>(
     let root = Arc::clone(&core.root);
     let plan = core
         .lower(ResolvedDefaults::default(), None)
-        .map_err(|paths| BuildError::UnfilledReservations { paths })?;
+        .map_err(|error| match error {
+            LowerError::Undefined(paths) => BuildError::UnfilledReservations { paths },
+            LowerError::IdentityExhausted(_) => {
+                unreachable!("root lowering does not mint memberships")
+            }
+        })?;
     let scope_ref = ScopeRef { cell: root };
     let run = crate::driver::spawn_system(plan);
     Ok(System {

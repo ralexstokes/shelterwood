@@ -611,7 +611,11 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
             break membership;
         }
     };
-    assert_ne!(Some(second_child), first_child);
+    let first_child = first_child.expect("first incarnation admits its child");
+    assert!(
+        second_child.supersedes(first_child),
+        "corresponding descendants retain ordering across a scope restart"
+    );
     assert_eq!(nested.membership(), scope_membership);
     assert_eq!(nested.snapshot().total_restarts, 0);
     assert!(nested.snapshot().lifecycle_seq >= starting.seq);

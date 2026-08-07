@@ -34,8 +34,9 @@ use crate::{
     runtime::{self, Latch},
     task::{OnceTaskBody, TaskContext, TaskFactory},
     tree::{
-        BuilderCore, ChildConstruction, ChildPlan, NotAdmittingCause, RemoveOutcome, ReserveError,
-        ScopeFactory, ScopeFlavor, ScopePlan, ScopeSource, SlotCell, StartupError, StopReason,
+        BuilderCore, ChildConstruction, ChildPlan, LowerError, NotAdmittingCause, RemoveOutcome,
+        ReserveError, ScopeFactory, ScopeFlavor, ScopePlan, ScopeSource, SlotCell, StartupError,
+        StopReason,
     },
 };
 
@@ -307,7 +308,7 @@ pub(crate) struct MemberRecord {
 #[derive(Debug)]
 pub(crate) struct MemberCell {
     id: ChildId,
-    membership: Membership,
+    membership: Mutex<Membership>,
     record: runtime::WatchSender<MemberRecord>,
     mailbox: Mutex<MemberMailbox>,
     options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
@@ -346,7 +347,7 @@ impl MemberCell {
         });
         Arc::new(Self {
             id,
-            membership,
+            membership: Mutex::new(membership),
             record,
             mailbox: Mutex::new(MemberMailbox::default()),
             options: Mutex::new(None),
@@ -359,7 +360,24 @@ impl MemberCell {
     }
 
     pub(crate) fn membership(&self) -> Membership {
-        self.membership
+        *self
+            .membership
+            .lock()
+            .expect("member identity mutex poisoned")
+    }
+
+    pub(crate) fn rebase_membership(&self, membership: Membership) {
+        let record = self.record();
+        assert!(
+            matches!(record.stage, MemberStage::Reserved)
+                && record.incarnation.is_none()
+                && record.last_incarnation.is_none(),
+            "only an unstarted reservation can be rebased"
+        );
+        *self
+            .membership
+            .lock()
+            .expect("member identity mutex poisoned") = membership;
     }
 
     pub(crate) fn record(&self) -> MemberRecord {
@@ -1376,7 +1394,7 @@ pub(crate) fn reserve_dynamic(
         .child_identity
         .lock()
         .expect("scope identity mutex poisoned")
-        .mint_membership()
+        .mint_membership(&id)
         .ok_or(ReserveError::IdentityExhausted)?;
     let member = MemberCell::new(id.clone(), membership);
     let child_scope = child_scope.map(|flavor| {
@@ -2992,9 +3010,14 @@ async fn run_nested_tree(
     let epoch = scope.begin_incarnation();
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
-        Err(undefined) => {
+        Err(error) => {
             let failure = StartupFailure {
-                cause: StartupFailureCause::Lowering { undefined },
+                cause: match error {
+                    LowerError::Undefined(undefined) => StartupFailureCause::Lowering { undefined },
+                    LowerError::IdentityExhausted(id) => {
+                        StartupFailureCause::IdentityExhausted { id }
+                    }
+                },
             };
             scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
             scope.finish_incarnation(epoch, StopReason::StartupFailed(failure.clone()));
@@ -3386,9 +3409,10 @@ mod tests {
     #[crate::runtime::test]
     async fn attaching_after_terminality_closes_the_mailbox() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from("worker");
         let member = MemberCell::new(
-            ChildId::from("worker"),
-            identity.mint_membership().expect("membership available"),
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
         );
         let mailbox = MailboxCell::new(member.id().clone());
         let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
@@ -3672,9 +3696,10 @@ mod tests {
     #[test]
     fn terminality_signal_follows_mailbox_termination() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from("worker");
         let member = MemberCell::new(
-            ChildId::from("worker"),
-            identity.mint_membership().expect("membership available"),
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
         );
         let mailbox = MailboxCell::new(member.id().clone());
         let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
@@ -3925,10 +3950,11 @@ mod tests {
     #[test]
     fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let root_id = ChildId::from("root");
         let root_member = MemberCell::new(
-            ChildId::from("root"),
+            root_id.clone(),
             identity
-                .mint_membership()
+                .mint_membership(&root_id)
                 .expect("root membership available"),
         );
         let root = ScopeCell::new(
@@ -3936,12 +3962,13 @@ mod tests {
             ScopeFlavor::Dynamic,
             ScopeIdentity::new().expect("child identity available"),
         );
+        let child_id = ChildId::from("worker");
         let member = MemberCell::new(
-            ChildId::from("worker"),
+            child_id.clone(),
             root.child_identity
                 .lock()
                 .expect("scope identity mutex poisoned")
-                .mint_membership()
+                .mint_membership(&child_id)
                 .expect("child membership available"),
         );
         let slot = SlotCell::new(Arc::clone(&member), None);
@@ -4009,8 +4036,9 @@ mod tests {
     #[test]
     fn incarnation_exhaustion_terminalizes_the_membership_as_never_restart() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
-        let membership = identity.mint_membership().expect("membership available");
-        let member = MemberCell::new(ChildId::from("worker"), membership);
+        let id = ChildId::from("worker");
+        let membership = identity.mint_membership(&id).expect("membership available");
+        let member = MemberCell::new(id, membership);
         let previous = Exit::new(
             ExitKind::Failed(ExitError::message("last completed incarnation")),
             false,
@@ -4034,8 +4062,9 @@ mod tests {
     #[crate::runtime::test]
     async fn scope_incarnation_exhaustion_closes_nested_observation() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
-        let membership = identity.mint_membership().expect("membership available");
-        let member = MemberCell::new(ChildId::from("nested"), membership);
+        let id = ChildId::from("nested");
+        let membership = identity.mint_membership(&id).expect("membership available");
+        let member = MemberCell::new(id, membership);
         let scope = ScopeCell::new(
             Arc::clone(&member),
             ScopeFlavor::Ordered,
@@ -4084,8 +4113,9 @@ mod tests {
     #[test]
     fn lifecycle_sequence_exhaustion_poison_is_never_minted_and_becomes_lag() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
-        let membership = identity.mint_membership().expect("membership available");
-        let member = MemberCell::new(ChildId::from("scope"), membership);
+        let id = ChildId::from("scope");
+        let membership = identity.mint_membership(&id).expect("membership available");
+        let member = MemberCell::new(id, membership);
         let scope = ScopeCell::new(
             member,
             ScopeFlavor::Ordered,

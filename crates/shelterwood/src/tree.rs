@@ -2008,8 +2008,8 @@ impl<R: Clone> System<R> {
         match self.wait_started().await {
             Ok(()) => Ok(self),
             Err(startup) => {
-                self.armed = false;
                 let rollback_timeout = self.run.shutdown(timeout).await.err();
+                self.armed = false;
                 Err(StartOrShutdownError {
                     startup,
                     rollback_timeout,
@@ -2024,14 +2024,16 @@ impl<R: Clone> System<R> {
     /// wall-clock return: after escalation every actor future is still joined.
     /// Blocking threads created by `run_blocking` detach past hard abort.
     pub async fn shutdown(mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
+        let result = self.run.shutdown(timeout).await;
         self.armed = false;
-        self.run.shutdown(timeout).await
+        result
     }
 
     /// Waits for natural or externally requested terminal state.
     pub async fn wait(mut self) -> StopReason {
+        let reason = self.run.wait().await;
         self.armed = false;
-        self.run.wait().await
+        reason
     }
 }
 

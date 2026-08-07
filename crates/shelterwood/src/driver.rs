@@ -583,16 +583,30 @@ pub(crate) struct ScopeRecord {
     pub(crate) total_restarts: u64,
 }
 
+/// Shared scope state follows two distinct synchronization regimes.
+///
+/// `OBSERVATION_GATE` serializes compound, observation-visible transitions
+/// across `config`, `record`, `current_children`, and `parent`, including
+/// recursive snapshot projection and lifecycle-event staging. Their watch
+/// channels retain the latest independently readable value; they do not make
+/// that compound transition atomic, so every multi-field observation path must
+/// continue to hold the gate.
+///
+/// The remaining mutexes are deliberately not collapsed into one state lock.
+/// `control` is an epoch-tagged request plane with concurrent callers,
+/// `child_identity` and `lifecycle_sequence` mint monotonic identities, and
+/// `current_dynamic` owns the independently published dynamic request route.
+/// Scope state therefore has multiple writers and no single-writer invariant.
 pub(crate) struct ScopeCell {
     pub(crate) member: Arc<MemberCell>,
     pub(crate) flavor: ScopeFlavor,
     pub(crate) child_identity: Mutex<ScopeIdentity>,
-    config: Mutex<crate::tree::ScopeConfig>,
-    record: Mutex<ScopeRecord>,
+    config: runtime::WatchSender<crate::tree::ScopeConfig>,
+    record: runtime::WatchSender<ScopeRecord>,
     control: Mutex<ScopeControl>,
     current_dynamic: Mutex<Option<Arc<DynamicControl>>>,
-    current_children: Mutex<Vec<ResidentChild>>,
-    parent: Mutex<Option<Weak<ScopeCell>>>,
+    current_children: runtime::WatchSender<Vec<ResidentChild>>,
+    parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
     lifecycle_sequence: Mutex<FenceCounter>,
     lifecycle_seq: AtomicU64,
     lifecycle: LifecycleHub,
@@ -621,20 +635,24 @@ impl ScopeCell {
         flavor: ScopeFlavor,
         child_identity: ScopeIdentity,
     ) -> Arc<Self> {
+        let (config, _) = runtime::watch(crate::tree::ScopeConfig::default());
+        let (record, _) = runtime::watch(ScopeRecord {
+            state: ScopeState::Unstarted,
+            startup: None,
+            total_restarts: 0,
+        });
+        let (current_children, _) = runtime::watch(Vec::new());
+        let (parent, _) = runtime::watch(None);
         Arc::new(Self {
             member,
             flavor,
             child_identity: Mutex::new(child_identity),
-            config: Mutex::new(crate::tree::ScopeConfig::default()),
-            record: Mutex::new(ScopeRecord {
-                state: ScopeState::Unstarted,
-                startup: None,
-                total_restarts: 0,
-            }),
+            config,
+            record,
             control: Mutex::new(ScopeControl::default()),
             current_dynamic: Mutex::new(None),
-            current_children: Mutex::new(Vec::new()),
-            parent: Mutex::new(None),
+            current_children,
+            parent,
             lifecycle_sequence: Mutex::new(FenceCounter::new(0)),
             lifecycle_seq: AtomicU64::new(0),
             lifecycle: LifecycleHub::default(),
@@ -644,19 +662,19 @@ impl ScopeCell {
     }
 
     pub(crate) fn record(&self) -> ScopeRecord {
-        self.record.lock().expect("scope mutex poisoned").clone()
+        self.record.read_cloned()
     }
 
     pub(crate) fn set_state(&self, state: ScopeState) {
         let _gate = OBSERVATION_GATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut record = self.record.lock().expect("scope mutex poisoned");
-        if state == ScopeState::Starting {
-            record.total_restarts = 0;
-        }
-        record.state = state.clone();
-        drop(record);
+        self.record.send_modify(|record| {
+            if state == ScopeState::Starting {
+                record.total_restarts = 0;
+            }
+            record.state = state.clone();
+        });
         self.member.record.pulse();
         self.emit_locked(LifecycleEventKind::ScopeState { state });
     }
@@ -665,7 +683,7 @@ impl ScopeCell {
         let _gate = OBSERVATION_GATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *self.config.lock().expect("scope config mutex poisoned") = config;
+        self.config.replace(config);
         self.publish_snapshot_chain_locked();
     }
 
@@ -704,9 +722,9 @@ impl ScopeCell {
         let _gate = OBSERVATION_GATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut scope = self.record.lock().expect("scope mutex poisoned");
-        scope.total_restarts = scope.total_restarts.saturating_add(1);
-        drop(scope);
+        self.record.send_modify(|scope| {
+            scope.total_restarts = scope.total_restarts.saturating_add(1);
+        });
         member.update_locked(update);
         self.emit_locked(exited);
         self.emit_locked(scheduled);
@@ -735,14 +753,14 @@ impl ScopeCell {
                 exit: exit.clone(),
             });
         }
-        if let Some(scope) = self
-            .current_children
-            .lock()
-            .expect("scope children mutex poisoned")
-            .iter()
-            .find(|resident| resident.slot.member.membership() == member.membership())
-            .and_then(|resident| resident.slot.scope.as_ref())
-        {
+        let nested = self.current_children.read_with(|children| {
+            children
+                .iter()
+                .find(|resident| resident.slot.member.membership() == member.membership())
+                .and_then(|resident| resident.slot.scope.as_ref())
+                .cloned()
+        });
+        if let Some(scope) = nested {
             scope.close_observation_locked();
         }
         true
@@ -753,19 +771,21 @@ impl ScopeCell {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let membership = member.membership();
-        let resident = {
-            let mut children = self
-                .current_children
-                .lock()
-                .expect("scope children mutex poisoned");
+        let mut resident = None;
+        let removed = self.current_children.send_if_modified(|children| {
             let Some(index) = children
                 .iter()
                 .position(|child| child.slot.member.membership() == membership)
             else {
                 return false;
             };
-            children.remove(index)
-        };
+            resident = Some(children.remove(index));
+            true
+        });
+        if !removed {
+            return false;
+        }
+        let resident = resident.expect("a reported removal owns its resident entry");
         debug_assert_eq!(resident.slot.member.membership(), membership);
         // Dropping residency while the observation gate is held emits the
         // matching Removed edge through its owned completion.
@@ -804,18 +824,15 @@ impl ScopeCell {
 
     fn snapshot_locked(&self) -> Arc<ScopeSnapshot> {
         let record = self.record();
-        let config = self
-            .config
-            .lock()
-            .expect("scope config mutex poisoned")
-            .clone();
+        let config = self.config.read_cloned();
         let children = self
             .current_children
-            .lock()
-            .expect("scope children mutex poisoned")
-            .iter()
-            .map(|resident| Arc::clone(&resident.slot))
-            .collect::<Vec<_>>()
+            .read_with(|children| {
+                children
+                    .iter()
+                    .map(|resident| Arc::clone(&resident.slot))
+                    .collect::<Vec<_>>()
+            })
             .into_iter()
             .map(|slot| self.child_snapshot_locked(&slot))
             .collect::<Vec<_>>();
@@ -875,19 +892,9 @@ impl ScopeCell {
 
     fn ancestors_locked(&self) -> Vec<Arc<ScopeCell>> {
         let mut ancestors = Vec::new();
-        let mut current = self
-            .parent
-            .lock()
-            .expect("scope parent mutex poisoned")
-            .as_ref()
-            .and_then(Weak::upgrade);
+        let mut current = self.parent.read_cloned().as_ref().and_then(Weak::upgrade);
         while let Some(scope) = current {
-            current = scope
-                .parent
-                .lock()
-                .expect("scope parent mutex poisoned")
-                .as_ref()
-                .and_then(Weak::upgrade);
+            current = scope.parent.read_cloned().as_ref().and_then(Weak::upgrade);
             ancestors.push(scope);
         }
         ancestors
@@ -943,10 +950,13 @@ impl ScopeCell {
     }
 
     pub(crate) fn set_startup(&self, startup: Result<(), StartupError>) {
-        let mut record = self.record.lock().expect("scope mutex poisoned");
-        if record.startup.is_none() {
+        if self.record.send_if_modified(|record| {
+            if record.startup.is_some() {
+                return false;
+            }
             record.startup = Some(startup);
-            drop(record);
+            true
+        }) {
             self.member.record.pulse();
         }
     }
@@ -981,13 +991,12 @@ impl ScopeCell {
         let state = ScopeState::Stopped {
             reason: reason.clone(),
         };
-        {
-            let mut record = self.record.lock().expect("scope mutex poisoned");
+        self.record.send_modify(|record| {
             if record.startup.is_none() {
                 record.startup = Some(Err(StartupError::ShutdownRequested));
             }
             record.state = state.clone();
-        }
+        });
         let terminal = terminal_exit.is_some();
         if let Some(exit) = terminal_exit {
             self.member.terminalize(exit);
@@ -1026,13 +1035,12 @@ impl ScopeCell {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = ScopeState::Stopped { reason };
-            {
-                let mut record = self.record.lock().expect("scope mutex poisoned");
+            self.record.send_modify(|record| {
                 if record.startup.is_none() {
                     record.startup = Some(Err(StartupError::ShutdownRequested));
                 }
                 record.state = state.clone();
-            }
+            });
             self.member.terminalize(exit);
             self.member.record.pulse();
             self.emit_locked(LifecycleEventKind::ScopeState { state });
@@ -1107,16 +1115,14 @@ impl ScopeCell {
         self.clear_residents_locked();
         for child in children {
             if let Some(scope) = &child.scope {
-                *scope.parent.lock().expect("scope parent mutex poisoned") =
-                    Some(Arc::downgrade(self));
+                scope.parent.replace(Some(Arc::downgrade(self)));
             }
             child
                 .member
                 .update_locked(|record| record.stage = MemberStage::Admitted);
-            self.current_children
-                .lock()
-                .expect("scope children mutex poisoned")
-                .push(ResidentChild::new(self, Arc::clone(&child)));
+            self.current_children.send_modify(|children| {
+                children.push(ResidentChild::new(self, Arc::clone(&child)))
+            });
             self.emit_locked(LifecycleEventKind::Added {
                 id: child.member.id().clone(),
                 membership: child.member.membership(),
@@ -1129,12 +1135,10 @@ impl ScopeCell {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(scope) = &child.scope {
-            *scope.parent.lock().expect("scope parent mutex poisoned") = Some(Arc::downgrade(self));
+            scope.parent.replace(Some(Arc::downgrade(self)));
         }
         self.current_children
-            .lock()
-            .expect("scope children mutex poisoned")
-            .push(ResidentChild::new(self, Arc::clone(child)));
+            .send_modify(|children| children.push(ResidentChild::new(self, Arc::clone(child))));
         child
             .member
             .update_locked(|record| record.stage = MemberStage::Admitted);
@@ -1152,12 +1156,7 @@ impl ScopeCell {
     }
 
     fn clear_residents_locked(&self) {
-        let residents = std::mem::take(
-            &mut *self
-                .current_children
-                .lock()
-                .expect("scope children mutex poisoned"),
-        );
+        let residents = self.current_children.take();
         // Each entry's owned completion emits Removed. Drop the vector only
         // after releasing the child-set mutex so snapshot publication can
         // project the now-empty set while this observation gate stays held.
@@ -1184,9 +1183,9 @@ impl ScopeCell {
     }
 
     pub(crate) async fn wait_started(&self) -> Result<(), StartupError> {
-        let mut watcher = self.member.record.watcher();
+        let mut watcher = self.record.watcher();
         loop {
-            if let Some(result) = self.record().startup {
+            if let Some(result) = watcher.borrow_and_update_cloned().startup {
                 return result;
             }
             watcher.changed().await;
@@ -1213,15 +1212,14 @@ impl ScopeCell {
             return;
         }
         self.member.terminalize(Exit::never_started());
-        {
-            let mut record = self.record.lock().expect("scope mutex poisoned");
+        self.record.send_modify(|record| {
             if record.startup.is_none() {
                 record.startup = Some(Err(StartupError::ShutdownRequested));
             }
             record.state = ScopeState::Stopped {
                 reason: StopReason::NeverStarted,
             };
-        }
+        });
         self.member.record.pulse();
         self.emit_locked(LifecycleEventKind::ScopeState {
             state: ScopeState::Stopped {
@@ -1548,13 +1546,12 @@ pub(crate) fn runtime_available() -> bool {
 }
 
 fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<ShutdownStraggler>) {
-    let children = scope
-        .current_children
-        .lock()
-        .expect("scope children mutex poisoned")
-        .iter()
-        .map(|resident| Arc::clone(&resident.slot))
-        .collect::<Vec<_>>();
+    let children = scope.current_children.read_with(|children| {
+        children
+            .iter()
+            .map(|resident| Arc::clone(&resident.slot))
+            .collect::<Vec<_>>()
+    });
     for child in children {
         if matches!(child.member.record().stage, MemberStage::Terminal(_)) {
             continue;

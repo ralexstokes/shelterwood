@@ -888,6 +888,85 @@ async fn queued_offload_panic_survives_hard_abort() {
     assert_eq!(panic_message.as_deref(), Some("owned offload panic"));
 }
 
+struct HandlerOffloadDoublePanicActor {
+    queued: Arc<AtomicBool>,
+}
+
+impl Actor for HandlerOffloadDoublePanicActor {
+    type Msg = ();
+    type Args = Arc<AtomicBool>;
+
+    async fn init(queued: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self { queued })
+    }
+
+    async fn handle(&mut self, (): Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        let guard = context
+            .offload_scoped(
+                async {
+                    panic!("handler owned offload panic");
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("offload accepted");
+        guard.finished().await;
+        self.queued.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+impl Drop for HandlerOffloadDoublePanicActor {
+    fn drop(&mut self) {
+        panic!("handler destructor panic");
+    }
+}
+
+#[tokio::test]
+async fn hard_abort_preserves_owned_offload_panic_over_handler_destructor() {
+    let queued = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "handler-double-panic",
+            ActorOnceDef::<HandlerOffloadDoublePanicActor>::new(Arc::clone(&queued))
+                .shutdown(Shutdown::Abort),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    system.wait_started().await.expect("actor starts");
+    actor.send(()).await.expect("actor accepts trigger");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            queued.load(Ordering::SeqCst)
+        })
+        .await,
+        "offload panic is owned before hard abort"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the two panics remain contained");
+
+    let mut panic_message = None;
+    while let Some(item) = events.recv().await {
+        let LifecycleItem::Event(event) = item else {
+            panic!("small fixture must not lag");
+        };
+        if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+            && id.as_str() == "handler-double-panic"
+            && let ExitKind::Panicked { message } = exit.kind()
+        {
+            panic_message = message.clone();
+        }
+    }
+    assert_eq!(
+        panic_message.as_deref(),
+        Some("handler owned offload panic")
+    );
+}
+
 #[tokio::test]
 async fn run_blocking_panic_resumes_where_awaited() {
     assert_pre_ready_panic(PanicMode::Blocking, "blocking panic", true).await;

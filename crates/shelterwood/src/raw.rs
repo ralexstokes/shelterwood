@@ -41,6 +41,16 @@ fn keep_first_panic(first: &mut Option<PanicPayload>, candidate: Option<PanicPay
     }
 }
 
+fn resume_preferred_panic(primary: Option<PanicPayload>, cleanup: Option<PanicPayload>) {
+    if let Some(payload) = primary {
+        discard_panic(cleanup);
+        resume_unwind(payload);
+    }
+    if let Some(payload) = cleanup {
+        resume_unwind(payload);
+    }
+}
+
 /// Marker returned to an offload continuation when its one deadline expires.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("the offload deadline elapsed")]
@@ -250,36 +260,18 @@ impl PanicSlot {
     }
 }
 
-struct SequencedEvent<M> {
-    sequence: u64,
-    event: QueuedEvent<M>,
-}
-
-struct EventQueueState<M> {
-    queue: VecDeque<SequencedEvent<M>>,
-    next_sequence: u64,
-}
-
-impl<M> Default for EventQueueState<M> {
-    fn default() -> Self {
-        Self {
-            queue: VecDeque::new(),
-            next_sequence: 0,
-        }
-    }
-}
-
 struct EventQueue<M> {
-    // Timer batches use `next_sequence` as a watermark. Keeping it beside the
-    // queue makes allocation, insertion, and watermark capture one order.
-    state: Mutex<EventQueueState<M>>,
+    // Timer batches snapshot the number of currently queued events. Insertion
+    // and the snapshot share this lock, so FIFO order itself is the sequence
+    // and there is no integer counter whose saturation could blur a boundary.
+    queue: Mutex<VecDeque<QueuedEvent<M>>>,
     signal: Signal,
 }
 
 impl<M> Default for EventQueue<M> {
     fn default() -> Self {
         Self {
-            state: Mutex::new(EventQueueState::default()),
+            queue: Mutex::new(VecDeque::new()),
             signal: Signal::default(),
         }
     }
@@ -287,51 +279,69 @@ impl<M> Default for EventQueue<M> {
 
 impl<M> EventQueue<M> {
     fn push(&self, event: QueuedEvent<M>) {
-        self.push_with(event, || {});
+        self.queue
+            .lock()
+            .expect("actor event queue mutex poisoned")
+            .push_back(event);
         self.signal.pulse();
     }
 
-    fn push_with(&self, event: QueuedEvent<M>, before_insert: impl FnOnce()) {
-        let mut state = self.state.lock().expect("actor event queue mutex poisoned");
-        state.next_sequence = state.next_sequence.saturating_add(1);
-        let sequence = state.next_sequence;
+    #[cfg(test)]
+    fn insert_with(&self, event: QueuedEvent<M>, before_insert: impl FnOnce()) {
+        let mut queue = self.queue.lock().expect("actor event queue mutex poisoned");
         before_insert();
-        state.queue.push_back(SequencedEvent { sequence, event });
+        queue.push_back(event);
     }
 
-    fn watermark(&self) -> u64 {
-        self.state
+    #[cfg(test)]
+    fn push_with_hooks(
+        &self,
+        event: QueuedEvent<M>,
+        before_insert: impl FnOnce(),
+        after_insert: impl FnOnce(),
+    ) {
+        self.insert_with(event, before_insert);
+        after_insert();
+        self.signal.pulse();
+    }
+
+    fn watermark(&self) -> usize {
+        self.queue
             .lock()
             .expect("actor event queue mutex poisoned")
-            .next_sequence
+            .len()
     }
 
     fn pop(&self) -> Option<QueuedEvent<M>> {
-        self.state
+        self.queue
             .lock()
             .expect("actor event queue mutex poisoned")
-            .queue
             .pop_front()
-            .map(|item| item.event)
     }
 
-    fn pop_through(&self, sequence: u64) -> Option<QueuedEvent<M>> {
-        let mut state = self.state.lock().expect("actor event queue mutex poisoned");
-        if state
-            .queue
-            .front()
-            .is_some_and(|item| item.sequence <= sequence)
-        {
-            state.queue.pop_front().map(|item| item.event)
-        } else {
+    fn pop_through(&self, remaining: &mut usize) -> Option<QueuedEvent<M>> {
+        if *remaining == 0 {
             None
+        } else {
+            let event = self
+                .queue
+                .lock()
+                .expect("actor event queue mutex poisoned")
+                .pop_front();
+            debug_assert!(event.is_some(), "a timer watermark covers queued events");
+            if event.is_some() {
+                *remaining -= 1;
+            } else {
+                *remaining = 0;
+            }
+            event
         }
     }
 
     fn clear(&self) {
         let queue = {
-            let mut state = self.state.lock().expect("actor event queue mutex poisoned");
-            std::mem::take(&mut state.queue)
+            let mut queue = self.queue.lock().expect("actor event queue mutex poisoned");
+            std::mem::take(&mut *queue)
         };
         drop(queue);
     }
@@ -369,7 +379,7 @@ struct FiredTimerBatch {
     continuations_remaining: usize,
     mailbox_through: u64,
     mailbox_complete: bool,
-    offloads_through: u64,
+    offloads_remaining: usize,
     offloads_complete: bool,
 }
 
@@ -579,9 +589,16 @@ impl<M> RawResources<M> {
 
 impl<M> Drop for RawResources<M> {
     fn drop(&mut self) {
-        let _ = self.freeze();
-        if !std::thread::panicking() {
-            self.resume_pending_panic();
+        let freeze_panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = self.freeze();
+        }))
+        .err();
+        let mut cleanup_panic = self.panic.take();
+        keep_first_panic(&mut cleanup_panic, freeze_panic);
+        if std::thread::panicking() {
+            discard_panic(cleanup_panic);
+        } else if let Some(payload) = cleanup_panic {
+            resume_unwind(payload);
         }
     }
 }
@@ -1047,8 +1064,10 @@ impl<M: Send + 'static> RawContext<M> {
                 }
 
                 if !batch.offloads_complete {
-                    while let Some(event) =
-                        self.resources.events.pop_through(batch.offloads_through)
+                    while let Some(event) = self
+                        .resources
+                        .events
+                        .pop_through(&mut batch.offloads_remaining)
                     {
                         if let Some(message) = Self::materialize_event(event) {
                             self.resources.continuation_needs_external = false;
@@ -1142,7 +1161,7 @@ impl<M: Send + 'static> RawContext<M> {
             continuations_remaining: self.resources.continuations.len(),
             mailbox_through: self.receiver.accepted_sequence(),
             mailbox_complete: false,
-            offloads_through: self.resources.events.watermark(),
+            offloads_remaining: self.resources.events.watermark(),
             offloads_complete: false,
         });
     }
@@ -1418,6 +1437,7 @@ struct RawInstance<R: RawActor> {
 struct RawIncarnationOwner<R: RawActor> {
     raw: Option<RawContext<R::Msg>>,
     actor: Option<R>,
+    primary_panic: Option<PanicPayload>,
 }
 
 impl<R: RawActor> RawIncarnationOwner<R> {
@@ -1425,6 +1445,7 @@ impl<R: RawActor> RawIncarnationOwner<R> {
         Self {
             raw: Some(raw),
             actor: Some(actor),
+            primary_panic: None,
         }
     }
 
@@ -1446,9 +1467,13 @@ impl<R: RawActor> RawIncarnationOwner<R> {
         drop(self.actor.take());
     }
 
-    fn drop_actor_catching(&mut self) {
-        let actor = self.actor.take();
-        let _ = catch_unwind(AssertUnwindSafe(|| drop(actor)));
+    fn record_primary_panic(&mut self, payload: PanicPayload) {
+        debug_assert!(self.primary_panic.is_none());
+        self.primary_panic = Some(payload);
+    }
+
+    fn take_primary_panic(&mut self) -> Option<PanicPayload> {
+        self.primary_panic.take()
     }
 }
 
@@ -1459,12 +1484,15 @@ impl<R: RawActor> Drop for RawIncarnationOwner<R> {
         // put a boundary around each destructor so two panics cannot abort the
         // process. The resource panic is primary: it may be an owned offload
         // panic that completed before cancellation was requested.
-        let raw_panic = catch_unwind(AssertUnwindSafe(|| self.drop_raw())).err();
+        let primary_panic = self.take_primary_panic();
+        let mut cleanup_panic = catch_unwind(AssertUnwindSafe(|| self.drop_raw())).err();
         let actor_panic = catch_unwind(AssertUnwindSafe(|| self.drop_actor())).err();
-        if !std::thread::panicking()
-            && let Some(payload) = raw_panic.or(actor_panic)
-        {
-            resume_unwind(payload);
+        keep_first_panic(&mut cleanup_panic, actor_panic);
+        if std::thread::panicking() {
+            discard_panic(primary_panic);
+            discard_panic(cleanup_panic);
+        } else {
+            resume_preferred_panic(primary_panic, cleanup_panic);
         }
     }
 }
@@ -1486,6 +1514,16 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
                 let (actor, raw) = owner.parts();
                 CatchUnwindFuture::new(actor.run(raw)).await
             };
+            let result = match outcome {
+                Ok(result) => Some(result),
+                Err(payload) => {
+                    // Keep the actor's diagnostic in the owned epilogue so a
+                    // hard abort during async teardown cannot replace it with
+                    // a later cancellation or destructor panic.
+                    owner.record_primary_panic(payload);
+                    None
+                }
+            };
             let freeze_panic = catch_unwind(AssertUnwindSafe(|| {
                 mailbox.freeze(incarnation);
                 owner.raw().freeze_resources();
@@ -1501,23 +1539,12 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
             let raw_drop = catch_unwind(AssertUnwindSafe(|| owner.drop_raw())).err();
             keep_first_panic(&mut cleanup_panic, raw_drop);
 
-            match outcome {
-                Ok(result) => {
-                    let actor_drop = catch_unwind(AssertUnwindSafe(|| owner.drop_actor())).err();
-                    keep_first_panic(&mut cleanup_panic, actor_drop);
-                    if let Some(payload) = cleanup_panic {
-                        resume_unwind(payload);
-                    }
-                    result
-                }
-                Err(payload) => {
-                    // Once actor execution has panicked, teardown is secondary:
-                    // never replace the actor's original diagnostic.
-                    discard_panic(cleanup_panic);
-                    owner.drop_actor_catching();
-                    resume_unwind(payload)
-                }
-            }
+            let actor_drop = catch_unwind(AssertUnwindSafe(|| owner.drop_actor())).err();
+            keep_first_panic(&mut cleanup_panic, actor_drop);
+            // Once actor execution has panicked, teardown is secondary: never
+            // replace the actor's original diagnostic.
+            resume_preferred_panic(owner.take_primary_panic(), cleanup_panic);
+            result.expect("an incarnation without a primary panic returns a result")
         })
     }
 }
@@ -1583,11 +1610,22 @@ pub(crate) struct RawRunContext {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Barrier},
+        future::Future,
+        panic::{AssertUnwindSafe, catch_unwind},
+        pin::Pin,
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, Waker},
         thread,
+        time::Duration,
     };
 
-    use super::{EventQueue, QueuedEvent};
+    use super::{
+        EventQueue, OffloadResource, PanicPayload, PanicSlot, QueuedEvent, RawResources,
+        SharedOffloadFuture, SharedOffloadState, resume_preferred_panic,
+    };
     use crate::runtime::Latch;
 
     fn marker(value: usize) -> QueuedEvent<usize> {
@@ -1603,6 +1641,51 @@ mod tests {
         }
     }
 
+    fn panic_message(payload: &PanicPayload) -> Option<&str> {
+        payload
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+    }
+
+    #[test]
+    fn primary_panic_precedence_discards_a_secondary_cleanup_panic() {
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            resume_preferred_panic(
+                Some(Box::new("primary actor panic")),
+                Some(Box::new("secondary cleanup panic")),
+            );
+        }))
+        .expect_err("the primary panic is resumed");
+        assert_eq!(panic_message(&payload), Some("primary actor panic"));
+    }
+
+    struct BlockingPollDrop {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        drops: Arc<AtomicUsize>,
+        panic_on_drop: bool,
+    }
+
+    impl Future for BlockingPollDrop {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            self.entered.wait();
+            self.release.wait();
+            Poll::Pending
+        }
+    }
+
+    impl Drop for BlockingPollDrop {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            if self.panic_on_drop {
+                panic!("unit offload destructor panic");
+            }
+        }
+    }
+
     #[test]
     fn concurrent_pushes_and_timer_watermark_share_one_linearization_point() {
         let queue = Arc::new(EventQueue::default());
@@ -1613,7 +1696,7 @@ mod tests {
             let first_entered = Arc::clone(&first_entered);
             let release_first = Arc::clone(&release_first);
             thread::spawn(move || {
-                queue.push_with(marker(1), || {
+                queue.insert_with(marker(1), || {
                     first_entered.wait();
                     release_first.wait();
                 });
@@ -1622,8 +1705,8 @@ mod tests {
         first_entered.wait();
 
         assert!(
-            queue.state.try_lock().is_err(),
-            "the queue lock spans sequence allocation and insertion"
+            queue.queue.try_lock().is_err(),
+            "FIFO insertion and timer watermarking share one lock"
         );
 
         let race = Arc::new(Barrier::new(3));
@@ -1647,22 +1730,187 @@ mod tests {
         release_first.wait();
         first.join().expect("first producer completes");
         second.join().expect("second producer completes");
-        let watermark = watermark.join().expect("watermark reader completes");
+        let mut watermark = watermark.join().expect("watermark reader completes");
 
         assert!(matches!(watermark, 1 | 2));
         assert_eq!(
-            value(queue.pop_through(watermark).expect("first is covered")),
+            value(queue.pop_through(&mut watermark).expect("first is covered")),
             1
         );
         if watermark == 1 {
-            assert!(queue.pop_through(watermark).is_none());
-            assert_eq!(value(queue.pop().expect("second follows watermark")), 2);
-        } else {
             assert_eq!(
-                value(queue.pop_through(watermark).expect("second is covered")),
+                value(
+                    queue
+                        .pop_through(&mut watermark)
+                        .expect("second is covered")
+                ),
                 2
             );
+        } else {
+            assert!(queue.pop_through(&mut watermark).is_none());
+            assert_eq!(value(queue.pop().expect("second follows watermark")), 2);
         }
         assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn timer_watermark_drains_exactly_the_preexisting_fifo_prefix() {
+        let queue = EventQueue::default();
+        queue.push(marker(1));
+        queue.push(marker(2));
+        let mut watermark = queue.watermark();
+        queue.push(marker(3));
+
+        assert_eq!(
+            value(queue.pop_through(&mut watermark).expect("first is covered")),
+            1
+        );
+        assert_eq!(
+            value(
+                queue
+                    .pop_through(&mut watermark)
+                    .expect("second is covered")
+            ),
+            2
+        );
+        assert!(queue.pop_through(&mut watermark).is_none());
+        assert_eq!(
+            value(queue.pop().expect("post-watermark event remains queued")),
+            3
+        );
+    }
+
+    #[crate::runtime::test]
+    async fn event_visibility_precedes_signal_without_losing_the_wakeup() {
+        let queue = Arc::new(EventQueue::default());
+        let mut watcher = queue.signal.watcher();
+        let inserted = Arc::new(Barrier::new(2));
+        let release_signal = Arc::new(Barrier::new(2));
+        let producer = {
+            let queue = Arc::clone(&queue);
+            let inserted = Arc::clone(&inserted);
+            let release_signal = Arc::clone(&release_signal);
+            thread::spawn(move || {
+                queue.push_with_hooks(
+                    marker(7),
+                    || {},
+                    || {
+                        inserted.wait();
+                        release_signal.wait();
+                    },
+                );
+            })
+        };
+        inserted.wait();
+
+        let mut watermark = queue.watermark();
+        assert_eq!(watermark, 1);
+        assert_eq!(
+            value(
+                queue
+                    .pop_through(&mut watermark)
+                    .expect("inserted event is visible before its signal")
+            ),
+            7
+        );
+        release_signal.wait();
+        producer.join().expect("producer completes");
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(1), watcher.changed()).await,
+            crate::runtime::Timeout::Completed(())
+        ));
+    }
+
+    #[test]
+    fn polling_cancellation_drops_outside_the_mutex_and_is_idempotent() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let panic = Arc::new(PanicSlot::default());
+        let finished = Latch::default();
+        let state = SharedOffloadState::new(
+            Box::pin(BlockingPollDrop {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                drops: Arc::clone(&drops),
+                panic_on_drop: true,
+            }),
+            Arc::clone(&panic),
+            finished.clone(),
+        );
+        let poller = {
+            let state = Arc::clone(&state);
+            thread::spawn(move || {
+                let mut future = SharedOffloadFuture(state);
+                let waker = Waker::noop();
+                let mut context = Context::from_waker(waker);
+                assert!(Pin::new(&mut future).poll(&mut context).is_ready());
+            })
+        };
+        entered.wait();
+
+        state.cancel();
+        assert!(
+            finished.is_fired(),
+            "cancellation always signals completion"
+        );
+        state.cancel();
+        release.wait();
+        poller.join().expect("the destructor panic stays contained");
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(state.state.lock().is_ok(), "offload mutex is not poisoned");
+        let payload = panic.take().expect("destructor panic is retained");
+        assert_eq!(
+            panic_message(&payload),
+            Some("unit offload destructor panic")
+        );
+    }
+
+    #[test]
+    fn raw_resources_drop_cancels_every_offload_after_one_destructor_panics() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut resources = RawResources::<()>::default();
+        let mut states = Vec::new();
+        let mut finished = Vec::new();
+        for panic_on_drop in [true, false] {
+            let completion = Latch::default();
+            let state = SharedOffloadState::new(
+                Box::pin(BlockingPollDrop {
+                    entered: Arc::new(Barrier::new(1)),
+                    release: Arc::new(Barrier::new(1)),
+                    drops: Arc::clone(&drops),
+                    panic_on_drop,
+                }),
+                Arc::clone(&resources.panic),
+                completion.clone(),
+            );
+            resources.offloads.push(OffloadResource {
+                cancellation: Latch::default(),
+                finished: completion.clone(),
+                state: Some(Arc::clone(&state)),
+                task: None,
+            });
+            states.push(state);
+            finished.push(completion);
+        }
+
+        let payload = catch_unwind(AssertUnwindSafe(|| drop(resources)))
+            .expect_err("the first destructor panic is surfaced");
+        assert_eq!(
+            panic_message(&payload),
+            Some("unit offload destructor panic")
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(finished.iter().all(Latch::is_fired));
+        assert!(states.iter().all(|state| state.state.lock().is_ok()));
+        for state in states {
+            state.cancel();
+        }
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "repeat cancellation is inert"
+        );
     }
 }

@@ -1555,7 +1555,7 @@ type RawFactory = Arc<dyn Fn() -> Box<dyn ErasedRawInstance> + Send + Sync + 'st
 
 pub(crate) trait ErasedRawInstance: Send {
     fn readiness(&self) -> Readiness;
-    fn run(self: Box<Self>, context: RawRunContext) -> RawFuture;
+    fn run(self: Box<Self>, context: RawRunContext, readiness: Readiness) -> RawFuture;
 }
 
 struct RawInstance<R: RawActor> {
@@ -1631,12 +1631,11 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
         self.actor.readiness()
     }
 
-    fn run(self: Box<Self>, context: RawRunContext) -> RawFuture {
+    fn run(self: Box<Self>, context: RawRunContext, readiness: Readiness) -> RawFuture {
         Box::pin(async move {
             let Self { actor, mailbox } = *self;
             let incarnation = context.incarnation;
             let myself = ActorRef::new(Arc::clone(&context.member), Arc::clone(&mailbox));
-            let readiness = context.readiness_override.unwrap_or(actor.readiness());
             let raw = RawContext::new(context, myself, Arc::clone(&mailbox), readiness);
             let mut owner = RawIncarnationOwner::new(raw, actor);
             let outcome = {
@@ -1732,7 +1731,6 @@ pub(crate) struct RawRunContext {
     pub(crate) abort: Latch,
     pub(crate) ready: Latch,
     pub(crate) local_stop: Latch,
-    pub(crate) readiness_override: Option<Readiness>,
     pub(crate) mailbox_shutdown: MailboxShutdown,
 }
 

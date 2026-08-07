@@ -637,14 +637,44 @@ mod tests {
     use std::{
         future::Future,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::Poll,
         time::Duration,
     };
 
-    use super::{JoinOutcome, Latch, Timeout, join, spawn, timeout, yield_now};
+    use super::{DisposalJob, JoinOutcome, Latch, Timeout, join, spawn, timeout, yield_now};
+
+    struct PanickingDrop(Arc<AtomicUsize>);
+
+    impl Drop for PanickingDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("cancelled disposal job payload");
+        }
+    }
+
+    #[test]
+    fn dropping_an_unstarted_disposal_job_contains_panic_and_completes_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let diagnostic = Arc::new(Mutex::new(None));
+        let completion_diagnostic = Arc::clone(&diagnostic);
+        let job = DisposalJob::new(PanickingDrop(Arc::clone(&drops)), move |panic| {
+            *completion_diagnostic
+                .lock()
+                .expect("diagnostic mutex poisoned") = Some(panic);
+        });
+
+        drop(job);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let diagnostic = diagnostic.lock().expect("diagnostic mutex poisoned");
+        assert!(matches!(
+            diagnostic.as_ref(),
+            Some(Some(Some(message))) if message == "cancelled disposal job payload"
+        ));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn exactly_one_concurrent_fire_performs_the_transition() {

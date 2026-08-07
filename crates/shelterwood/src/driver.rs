@@ -260,6 +260,7 @@ pub(crate) struct MemberCell {
     id: ChildId,
     membership: Mutex<Membership>,
     record: runtime::WatchSender<MemberRecord>,
+    terminal_disposal_pending: AtomicBool,
     mailbox: Mutex<MemberMailbox>,
     options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
     pub(crate) removal: Latch,
@@ -299,6 +300,7 @@ impl MemberCell {
             id,
             membership: Mutex::new(membership),
             record,
+            terminal_disposal_pending: AtomicBool::new(false),
             mailbox: Mutex::new(MemberMailbox::default()),
             options: Mutex::new(None),
             removal: Latch::default(),
@@ -332,6 +334,15 @@ impl MemberCell {
 
     pub(crate) fn record(&self) -> MemberRecord {
         self.record.read_cloned()
+    }
+
+    fn terminal_disposal_pending(&self) -> bool {
+        self.terminal_disposal_pending.load(Ordering::Acquire)
+    }
+
+    fn set_terminal_disposal_pending(&self, pending: bool) {
+        self.terminal_disposal_pending
+            .store(pending, Ordering::Release);
     }
 
     pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
@@ -1679,7 +1690,9 @@ fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<Shutd
             .collect::<Vec<_>>()
     });
     for child in children {
-        if matches!(child.member.record().stage, MemberStage::Terminal(_)) {
+        if matches!(child.member.record().stage, MemberStage::Terminal(_))
+            || child.member.terminal_disposal_pending()
+        {
             continue;
         }
         let mut path = prefix.to_vec();
@@ -1737,7 +1750,11 @@ pub(crate) async fn shutdown_scope(
             collect_stragglers(&scope, &[], &mut stragglers);
             scope.force_shutdown(epoch);
             wait_for_incarnation(&scope, epoch).await;
-            Err(ShutdownTimeout { stragglers })
+            if stragglers.is_empty() {
+                Ok(())
+            } else {
+                Err(ShutdownTimeout { stragglers })
+            }
         }
     }
 }
@@ -2329,8 +2346,9 @@ impl ScopeRuntime {
         );
         let construction = child.construction.get_mut();
         let scope_child = matches!(construction, ChildConstruction::Scope(_));
-        let (body, declared_readiness) = match construction {
+        let (body, declared_readiness, construction_spent) = match construction {
             ChildConstruction::Raw(definition) => {
+                let one_shot = definition.one_shot();
                 let spawn = definition.take_spawn();
                 (
                     SpawnBody::Raw {
@@ -2350,6 +2368,7 @@ impl ScopeRuntime {
                         },
                     },
                     None,
+                    one_shot,
                 )
             }
             ChildConstruction::Task(definition) => {
@@ -2357,14 +2376,17 @@ impl ScopeRuntime {
                 (
                     SpawnBody::TaskRestartable(factory),
                     Some(child.options.readiness),
+                    false,
                 )
             }
             ChildConstruction::TaskOnce(definition) => {
                 let body = std::mem::replace(&mut definition.body, OnceTaskBody::Spent);
                 match body {
-                    OnceTaskBody::Available(body) => {
-                        (SpawnBody::TaskOnce(body), Some(child.options.readiness))
-                    }
+                    OnceTaskBody::Available(body) => (
+                        SpawnBody::TaskOnce(body),
+                        Some(child.options.readiness),
+                        true,
+                    ),
                     OnceTaskBody::Spent => {
                         panic!("one-shot task construction invoked more than once")
                     }
@@ -2389,6 +2411,7 @@ impl ScopeRuntime {
                             inherited,
                         },
                         Some(Readiness::Manual),
+                        false,
                     ),
                     ScopeSource::OneShot(_) => {
                         let source = std::mem::replace(&mut definition.source, ScopeSource::Spent);
@@ -2408,6 +2431,7 @@ impl ScopeRuntime {
                                 inherited,
                             },
                             Some(Readiness::Manual),
+                            true,
                         )
                     }
                     ScopeSource::Spent => {
@@ -2485,6 +2509,13 @@ impl ScopeRuntime {
         let constructed_sender = self.events.clone();
         let run_release = construction_release.clone();
         let child_readiness_override = child.options.readiness_override;
+        if construction_spent {
+            // One-shot actor/task/subtree state has moved into `body`; the
+            // retained construction is now framework-only spent metadata.
+            // Release it without adding a blocking-pool scheduling edge to
+            // terminal publication or restart-window arbitration.
+            drop(child.construction.take());
+        }
         let handle = runtime::spawn(incarnation, async move {
             let body = async move {
                 match body {
@@ -2736,11 +2767,15 @@ impl ScopeRuntime {
                 self.begin_terminal_disposal(key, exit, None, false);
                 self.children[key].terminalize(&self.root, Exit::never_started(), None, false);
             } else {
-                // Between incarnations the retained factory is still member
-                // ownership. Classify its final destructor before publishing
-                // terminality, unless hard escalation has already made all
-                // remaining cleanup detached.
-                self.begin_terminal_disposal(key, exit, None, false);
+                // Between incarnations, the recorded exit already owns the
+                // child verdict. There is no incarnation left to classify a
+                // later factory destructor, so publish synchronously and
+                // isolate cleanup without turning it into a shutdown
+                // straggler (including for a zero shutdown budget).
+                child.terminalize(&self.root, exit, None, false);
+                if let Some(construction) = child.construction.take() {
+                    runtime::dispose_detached(construction);
+                }
             }
         }
     }
@@ -2875,11 +2910,9 @@ impl ScopeRuntime {
             .filter(|key| self.children[*key].pending_terminal.is_some())
             .collect::<Vec<_>>();
         for key in disposing {
-            if let Some(terminal) = self.children[key].pending_terminal.as_mut()
-                && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
-            {
-                terminal.exit = Exit::new(ExitKind::Aborted { after_grace: true }, true);
-            }
+            // The incarnation has already exited; only its retained factory
+            // remains. Hard escalation detaches that cleanup, but must not
+            // rewrite the actor's recorded verdict.
             self.handle_construction_disposed(key, None);
         }
     }
@@ -3145,6 +3178,7 @@ impl ScopeRuntime {
                 exited_incarnation,
                 startup_aborted,
             });
+            child.slot.member.set_terminal_disposal_pending(true);
             child.construction.take()
         };
         let Some(construction) = construction else {
@@ -3177,6 +3211,7 @@ impl ScopeRuntime {
         let Some(mut terminal) = child.pending_terminal.take() else {
             return;
         };
+        child.slot.member.set_terminal_disposal_pending(false);
         if let Some(message) = panic
             && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
         {

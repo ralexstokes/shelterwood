@@ -1062,7 +1062,7 @@ impl<M: Send + 'static> MailboxCell<M> {
         if message.is_some() {
             self.changed.pulse();
         }
-        promotion.finish_isolated();
+        promotion.finish();
         message
     }
 
@@ -1186,7 +1186,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         let promotion = promote_waiters(&mut state);
         drop(state);
         self.changed.pulse();
-        promotion.finish();
+        promotion.finish_isolated();
     }
 
     fn freeze(&self, incarnation: Incarnation) {

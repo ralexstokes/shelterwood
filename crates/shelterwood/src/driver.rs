@@ -2714,7 +2714,12 @@ impl ScopeRuntime {
         }
     }
 
-    fn handle_constructed(&mut self, key: ChildKey, incarnation: Incarnation, readiness: Readiness) {
+    fn handle_constructed(
+        &mut self,
+        key: ChildKey,
+        incarnation: Incarnation,
+        readiness: Readiness,
+    ) {
         let mut became_ready = false;
         let mut deadline_to_arm = None;
         {
@@ -3663,8 +3668,8 @@ mod tests {
     use crate::{
         ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind,
         LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline, RemoveOutcome,
-        ScopeState, SendErrorKind, StartupError, StartupFailureCause, StopReason, SubtreeOnceDef,
-        TaskDef, Tree,
+        Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause, StopReason,
+        SubtreeOnceDef, TaskDef, Tree,
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
@@ -3674,9 +3679,9 @@ mod tests {
 
     use super::{
         ChildArena, ChildRuntime, DynamicControl, DynamicEntry, MemberCell, MemberStage,
-        Obligation, RemovalResponses, RuntimeStorage, ScopeCell, ScopeFlavor, Signal,
-        ScopePhase, StartupPhase, complete_removals, mint_child_incarnation, report_channel,
-        run_nested_tree, run_scope_incarnation,
+        Obligation, RemovalResponses, RuntimeStorage, ScopeCell, ScopeFlavor, ScopePhase, Signal,
+        StartupPhase, complete_removals, mint_child_incarnation, report_channel, run_nested_tree,
+        run_scope_incarnation,
     };
 
     #[test]
@@ -3733,6 +3738,31 @@ mod tests {
         assert!(arena.get(current).is_some());
     }
 
+    #[test]
+    fn exhausted_child_generation_retires_the_slot() {
+        let mut tree = Tree::new();
+        tree.add_task("worker", TaskDef::new(|_| future::pending()))
+            .expect("valid task");
+        let mut plan = lower_tree_for_test(tree);
+        let child =
+            ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &plan.root);
+        let mut arena = ChildArena::default();
+        let original = arena.insert(child);
+        arena.slots[original.index].generation = u64::MAX;
+        let exhausted = super::ChildKey {
+            index: original.index,
+            generation: u64::MAX,
+        };
+
+        let child = arena
+            .remove(exhausted)
+            .expect("the forced exhausted generation is live");
+        let current = arena.insert(child);
+        assert_ne!(exhausted.index, current.index);
+        assert!(arena.get(exhausted).is_none());
+        assert!(arena.get(current).is_some());
+    }
+
     #[crate::runtime::test]
     async fn dynamic_high_cycle_add_remove_reuses_runtime_storage() {
         const CYCLES: usize = 1_000;
@@ -3779,6 +3809,26 @@ mod tests {
                     deadline_slots: 0,
                 },
                 "cycle {cycle} must reclaim the removed child"
+            );
+
+            let automatic = scope
+                .add_task(
+                    "worker",
+                    TaskDef::new(|_| async { Ok(()) }).retention(Retention::Remove),
+                )
+                .await
+                .expect("auto-removing task admission")
+                .into_handles();
+            automatic.wait().await;
+            assert_eq!(
+                cell.runtime_storage(),
+                RuntimeStorage {
+                    children: 0,
+                    child_slots: 1,
+                    deadlines: 0,
+                    deadline_slots: 0,
+                },
+                "cycle {cycle} must reclaim Retention::Remove registration"
             );
         }
 

@@ -1,11 +1,11 @@
 //! Minimal loop-owning raw actors and their incarnation context.
 
 use std::{
-    any::Any,
-    collections::VecDeque,
+    any::{Any, TypeId},
+    collections::{BTreeSet, HashMap, VecDeque, hash_map::RandomState},
     fmt,
     future::Future,
-    hash::Hash,
+    hash::{BuildHasher, Hash},
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -374,6 +374,166 @@ struct TimerEntry<M> {
     period: Option<Duration>,
 }
 
+/// Type-aware keyed timer lookup paired with an independently ordered
+/// deadline index.
+///
+/// Type identity participates in the key hash, so equal values of different
+/// key types remain distinct. A hash bucket still verifies erased equality to
+/// preserve `Eq` semantics in the unlikely event of a collision.
+struct TimerStore<M> {
+    key_hasher: RandomState,
+    keyed: HashMap<u64, Vec<TimerEntry<M>>>,
+    armings: HashMap<u64, u64>,
+    deadlines: BTreeSet<(Instant, u64)>,
+    #[cfg(test)]
+    lookup_probes: usize,
+}
+
+impl<M> Default for TimerStore<M> {
+    fn default() -> Self {
+        Self {
+            key_hasher: RandomState::new(),
+            keyed: HashMap::new(),
+            armings: HashMap::new(),
+            deadlines: BTreeSet::new(),
+            #[cfg(test)]
+            lookup_probes: 0,
+        }
+    }
+}
+
+impl<M> TimerStore<M> {
+    fn hash_key<K: Hash + 'static>(&self, key: &K) -> u64 {
+        self.key_hasher.hash_one((TypeId::of::<K>(), key))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.armings.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.keyed.clear();
+        self.armings.clear();
+        self.deadlines.clear();
+    }
+
+    fn replace<K>(
+        &mut self,
+        key: K,
+        deadline: Option<Instant>,
+        arming_order: u64,
+        message: TimerMessage<M>,
+        period: Option<Duration>,
+    ) where
+        K: Hash + Eq + Send + 'static,
+    {
+        let _ = self.remove(&key);
+        let hash = self.hash_key(&key);
+        self.keyed.entry(hash).or_default().push(TimerEntry {
+            key: Box::new(StoredTimerKey(key)),
+            deadline,
+            arming_order,
+            message,
+            period,
+        });
+        let previous = self.armings.insert(arming_order, hash);
+        debug_assert!(previous.is_none());
+        if let Some(deadline) = deadline {
+            self.deadlines.insert((deadline, arming_order));
+        }
+    }
+
+    fn remove<K>(&mut self, key: &K) -> Option<TimerEntry<M>>
+    where
+        K: Hash + Eq + 'static,
+    {
+        let hash = self.hash_key(key);
+        let (entry, empty) = {
+            let bucket = self.keyed.get_mut(&hash)?;
+            #[cfg(test)]
+            let mut probes = 0;
+            let index = bucket.iter().position(|entry| {
+                #[cfg(test)]
+                {
+                    probes += 1;
+                }
+                entry.key.as_any().downcast_ref::<K>() == Some(key)
+            })?;
+            #[cfg(test)]
+            {
+                self.lookup_probes = self.lookup_probes.saturating_add(probes);
+            }
+            let entry = bucket.swap_remove(index);
+            (entry, bucket.is_empty())
+        };
+        if empty {
+            self.keyed.remove(&hash);
+        }
+        self.armings.remove(&entry.arming_order);
+        if let Some(deadline) = entry.deadline {
+            self.deadlines.remove(&(deadline, entry.arming_order));
+        }
+        Some(entry)
+    }
+
+    fn remove_arming(&mut self, arming_order: u64) -> Option<TimerEntry<M>> {
+        let hash = self.armings.remove(&arming_order)?;
+        let (entry, empty) = {
+            let bucket = self
+                .keyed
+                .get_mut(&hash)
+                .expect("an arming index must reference a key bucket");
+            let index = bucket
+                .iter()
+                .position(|entry| entry.arming_order == arming_order)
+                .expect("an arming index must reference a timer");
+            let entry = bucket.swap_remove(index);
+            (entry, bucket.is_empty())
+        };
+        if empty {
+            self.keyed.remove(&hash);
+        }
+        if let Some(deadline) = entry.deadline {
+            self.deadlines.remove(&(deadline, arming_order));
+        }
+        Some(entry)
+    }
+
+    fn entry_mut(&mut self, arming_order: u64) -> Option<&mut TimerEntry<M>> {
+        let hash = *self.armings.get(&arming_order)?;
+        let entry = self
+            .keyed
+            .get_mut(&hash)
+            .expect("an arming index must reference a key bucket")
+            .iter_mut()
+            .find(|entry| entry.arming_order == arming_order)
+            .expect("an arming index must reference a timer");
+        Some(entry)
+    }
+
+    fn take_due(&mut self, now: Instant) -> VecDeque<u64> {
+        let due = self
+            .deadlines
+            .range(..=(now, u64::MAX))
+            .copied()
+            .collect::<Vec<_>>();
+        for deadline in &due {
+            self.deadlines.remove(deadline);
+        }
+        due.into_iter().map(|(_, arming)| arming).collect()
+    }
+
+    fn arm_deadline(&mut self, arming_order: u64, deadline: Option<Instant>) {
+        if let Some(deadline) = deadline {
+            self.deadlines.insert((deadline, arming_order));
+        }
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        self.deadlines.first().map(|(deadline, _)| *deadline)
+    }
+}
+
 struct FiredTimerBatch {
     armings: VecDeque<u64>,
     continuations_remaining: usize,
@@ -523,7 +683,7 @@ struct RawResources<M> {
     accepting: bool,
     continuations: VecDeque<M>,
     continuation_needs_external: bool,
-    timers: Vec<TimerEntry<M>>,
+    timers: TimerStore<M>,
     next_timer_order: u64,
     fired_batch: Option<FiredTimerBatch>,
     events: Arc<EventQueue<M>>,
@@ -540,7 +700,7 @@ impl<M> Default for RawResources<M> {
             accepting: true,
             continuations: VecDeque::new(),
             continuation_needs_external: false,
-            timers: Vec::new(),
+            timers: TimerStore::default(),
             next_timer_order: 0,
             fired_batch: None,
             events,
@@ -820,16 +980,7 @@ impl<M: Send + 'static> RawContext<M> {
     where
         K: Hash + Eq + Send + 'static,
     {
-        let Some(index) = self
-            .resources
-            .timers
-            .iter()
-            .position(|entry| entry.key.as_any().downcast_ref::<K>() == Some(key))
-        else {
-            return false;
-        };
-        self.resources.timers.swap_remove(index);
-        true
+        self.resources.timers.remove(key).is_some()
     }
 
     /// Starts incarnation-owned async work with one total deadline budget.
@@ -921,24 +1072,16 @@ impl<M: Send + 'static> RawContext<M> {
     ) where
         K: Hash + Eq + Send + 'static,
     {
-        if let Some(index) = self
-            .resources
-            .timers
-            .iter()
-            .position(|entry| entry.key.as_any().downcast_ref::<K>() == Some(&key))
-        {
-            self.resources.timers.swap_remove(index);
-        }
         self.resources.next_timer_order = self.resources.next_timer_order.saturating_add(1);
         let now = crate::driver::now();
         let deadline = crate::deadline::Deadline::after(now, after).instant();
-        self.resources.timers.push(TimerEntry {
-            key: Box::new(StoredTimerKey(key)),
+        self.resources.timers.replace(
+            key,
             deadline,
-            arming_order: self.resources.next_timer_order,
+            self.resources.next_timer_order,
             message,
             period,
-        });
+        );
     }
 
     fn start_offload<F, T, C>(
@@ -1145,19 +1288,12 @@ impl<M: Send + 'static> RawContext<M> {
             return;
         }
         let now = crate::driver::now();
-        let mut elapsed: Vec<_> = self
-            .resources
-            .timers
-            .iter()
-            .filter(|timer| timer.deadline.is_some_and(|deadline| deadline <= now))
-            .map(|timer| (timer.deadline, timer.arming_order))
-            .collect();
-        if elapsed.is_empty() {
+        let armings = self.resources.timers.take_due(now);
+        if armings.is_empty() {
             return;
         }
-        elapsed.sort_unstable();
         self.resources.fired_batch = Some(FiredTimerBatch {
-            armings: elapsed.into_iter().map(|(_, arming)| arming).collect(),
+            armings,
             continuations_remaining: self.resources.continuations.len(),
             mailbox_through: self.receiver.accepted_sequence(),
             mailbox_complete: false,
@@ -1167,38 +1303,31 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     fn deliver_timer(&mut self, arming: u64) -> Option<M> {
-        let index = self
+        let entry = self.resources.timers.entry_mut(arming)?;
+        if let Some(period) = entry.period {
+            let deadline = crate::deadline::Deadline::after(crate::driver::now(), period).instant();
+            entry.deadline = deadline;
+            let TimerMessage::Interval(make_message) = &entry.message else {
+                unreachable!("an interval timer must own a message factory")
+            };
+            let message = make_message();
+            self.resources.timers.arm_deadline(arming, deadline);
+            return Some(message);
+        }
+
+        let entry = self
             .resources
             .timers
-            .iter()
-            .position(|timer| timer.arming_order == arming)?;
-        let TimerEntry {
-            deadline,
-            message,
-            period,
-            ..
-        } = &mut self.resources.timers[index];
-        match message {
-            TimerMessage::Once(message) => {
-                let message = message.take();
-                self.resources.timers.swap_remove(index);
-                message
-            }
-            TimerMessage::Interval(make_message) => {
-                let period = period.expect("an interval timer must retain its period");
-                let now = crate::driver::now();
-                *deadline = crate::deadline::Deadline::after(now, period).instant();
-                Some(make_message())
-            }
-        }
+            .remove_arming(arming)
+            .expect("a due one-shot timer remains registered");
+        let TimerMessage::Once(message) = entry.message else {
+            unreachable!("a non-interval timer must own a one-shot message")
+        };
+        message
     }
 
     fn next_timer_deadline(&self) -> Option<Instant> {
-        self.resources
-            .timers
-            .iter()
-            .filter_map(|timer| timer.deadline)
-            .min()
+        self.resources.timers.next_deadline()
     }
 
     async fn wait_for_event(&mut self) {
@@ -1909,6 +2038,157 @@ mod tests {
             drops.load(Ordering::SeqCst),
             2,
             "repeat cancellation is inert"
+        );
+    }
+}
+
+#[cfg(test)]
+mod timer_store_tests {
+    use std::{
+        collections::HashSet,
+        time::{Duration, Instant},
+    };
+
+    use super::{TimerMessage, TimerStore};
+
+    #[derive(Eq, PartialEq)]
+    struct CollidingKey(u8);
+
+    impl std::hash::Hash for CollidingKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            0_u8.hash(state);
+        }
+    }
+
+    fn once(entry: super::TimerEntry<&'static str>) -> &'static str {
+        let TimerMessage::Once(Some(message)) = entry.message else {
+            panic!("expected a live one-shot timer")
+        };
+        message
+    }
+
+    #[test]
+    fn heterogeneous_keys_keep_exact_identity_and_deadline_order() {
+        let start = Instant::now();
+        let mut timers = TimerStore::default();
+        timers.replace(
+            7_u8,
+            Some(start + Duration::from_secs(3)),
+            1,
+            TimerMessage::Once(Some("old-u8")),
+            None,
+        );
+        timers.replace(
+            7_u16,
+            Some(start + Duration::from_secs(1)),
+            2,
+            TimerMessage::Once(Some("u16")),
+            None,
+        );
+        timers.replace(
+            7_u8,
+            Some(start + Duration::from_secs(2)),
+            3,
+            TimerMessage::Once(Some("new-u8")),
+            None,
+        );
+
+        assert_eq!(timers.next_deadline(), Some(start + Duration::from_secs(1)));
+        assert_eq!(
+            timers.take_due(start + Duration::from_secs(3)),
+            [2, 3],
+            "different key types coexist and replacement takes a fresh order"
+        );
+        assert_eq!(
+            once(timers.remove_arming(2).expect("u16 timer remains")),
+            "u16"
+        );
+        assert_eq!(
+            once(timers.remove_arming(3).expect("replacement remains")),
+            "new-u8"
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn hash_collision_uses_exact_erased_key_equality() {
+        let mut timers = TimerStore::default();
+        timers.replace(
+            CollidingKey(1),
+            None,
+            1,
+            TimerMessage::Once(Some("first")),
+            None,
+        );
+        timers.replace(
+            CollidingKey(2),
+            None,
+            2,
+            TimerMessage::Once(Some("second")),
+            None,
+        );
+        timers.replace(
+            CollidingKey(1),
+            None,
+            3,
+            TimerMessage::Once(Some("replacement")),
+            None,
+        );
+
+        assert_eq!(
+            once(
+                timers
+                    .remove(&CollidingKey(2))
+                    .expect("colliding peer remains registered")
+            ),
+            "second"
+        );
+        assert_eq!(
+            once(
+                timers
+                    .remove(&CollidingKey(1))
+                    .expect("replacement remains registered")
+            ),
+            "replacement"
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn keyed_timer_churn_has_one_lookup_probe_per_removal() {
+        const TIMERS: usize = 16_384;
+
+        let start = Instant::now();
+        let mut timers = TimerStore::default();
+        let mut hashes = HashSet::with_capacity(TIMERS);
+        let mut keys = Vec::with_capacity(TIMERS);
+        let mut candidate = 0_usize;
+        while keys.len() < TIMERS {
+            if hashes.insert(timers.hash_key(&candidate)) {
+                keys.push(candidate);
+            }
+            candidate = candidate
+                .checked_add(1)
+                .expect("test key space must contain enough distinct hashes");
+        }
+        for (index, key) in keys.iter().copied().enumerate() {
+            timers.replace(
+                key,
+                Some(start + Duration::from_secs((TIMERS - index) as u64)),
+                index as u64,
+                TimerMessage::Once(Some(())),
+                None,
+            );
+        }
+        for key in keys.into_iter().rev() {
+            assert!(timers.remove(&key).is_some());
+        }
+
+        assert!(timers.is_empty());
+        assert!(timers.deadlines.is_empty());
+        assert_eq!(
+            timers.lookup_probes, TIMERS,
+            "distinct hashes need one exact-key check each, not a vector scan"
         );
     }
 }

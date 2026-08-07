@@ -7,13 +7,13 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DeadlineElapsed, DynamicScopeRef,
     DynamicTree, ExitError, ExitResult, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
     LifecycleItem, Mailbox, Membership, RemoveOutcome, Reply, ReserveError, RestartPolicy,
     ScopeState, StopContext, SubtreeOnceDef, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, poll_until};
 
 async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
     loop {

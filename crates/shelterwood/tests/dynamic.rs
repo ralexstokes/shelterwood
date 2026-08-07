@@ -6,17 +6,17 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{
+    ReleaseGate, advance_time, assert_quiet,
+    policy::never,
+    poll_once, poll_until,
+    waiting::{task as waiting_task, tree as waiting_tree},
+};
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, Context as ActorContext, DynamicTree, ExitError, ExitKind,
     ExitResult, NotAdmittingCause, Readiness, RemoveOutcome, ReserveError, RestartCondition,
     RestartPolicy, Retention, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
     TaskOnceDef, Tree,
-};
-use shelterwood_test_support::{ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
-
-use crate::common::{
-    policy::never,
-    waiting::{task as waiting_task, tree as waiting_tree},
 };
 
 struct DropProbe(Arc<AtomicBool>);

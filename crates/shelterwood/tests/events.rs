@@ -6,8 +6,8 @@ use std::{
     time::Duration,
 };
 
+use crate::common::ReleaseGate;
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Tree};
-use shelterwood_test_support::ReleaseGate;
 
 #[derive(Clone, Copy, Debug)]
 enum PriorityMessage {

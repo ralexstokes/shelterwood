@@ -6,15 +6,13 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{
+    DestructorBlocker, DestructorGate, ReleaseGate, policy::never, poll_once, poll_until,
+};
 use shelterwood::{
     Backoff, ExitError, ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef,
     RestartCondition, RestartPolicy, SendErrorKind, Tree,
 };
-use shelterwood_test_support::{
-    DestructorBlocker, DestructorGate, ReleaseGate, poll_once, poll_until,
-};
-
-use crate::common::policy::never;
 
 struct RestartActor {
     generation: usize,

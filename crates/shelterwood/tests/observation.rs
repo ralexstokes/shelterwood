@@ -7,15 +7,16 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{
+    ReleaseGate, poll_until,
+    waiting::{task as waiting_task, tree as waiting_tree},
+};
 use shelterwood::{
     Backoff, ChildState, DynamicScopeRef, DynamicTree, Jitter, LifecycleEvent, LifecycleEventKind,
     LifecycleEvents, LifecycleItem, LifecycleTryRecvError, RemoveOutcome, RestartCondition,
     RestartPolicy, Retention, ScopeRef, ScopeState, StopReason, SubtreeDef, SubtreeOnceDef,
     TaskDef, TaskOnceDef, Tree, WaitError,
 };
-use shelterwood_test_support::poll_until;
-
-use crate::common::waiting::{task as waiting_task, tree as waiting_tree};
 
 async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
     tokio::time::timeout(Duration::from_secs(2), events.recv())
@@ -974,7 +975,7 @@ async fn descendant_resolves_leaf_and_scope_path_endings() {
 /// arrives — not one that is already due.
 #[tokio::test]
 async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
-    let gate = shelterwood_test_support::ReleaseGate::default();
+    let gate = ReleaseGate::default();
     let mut tree = Tree::new();
     tree.add_task(
         "gated",

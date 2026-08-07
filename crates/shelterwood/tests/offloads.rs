@@ -6,11 +6,11 @@ use std::{
     time::Duration,
 };
 
+use crate::common::poll_until;
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
     Readiness, StartupError, StartupFailureCause, Tree,
 };
-use shelterwood_test_support::poll_until;
 
 enum ZeroMessage {
     Done,

@@ -6,13 +6,11 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, advance_time, assert_quiet, policy::never, poll_until};
 use shelterwood::{
     DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, Shutdown, StartupError,
     StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, advance_time, assert_quiet, poll_until};
-
-use crate::common::policy::never;
 
 #[tokio::test]
 async fn ordered_startup_waits_for_manual_readiness() {

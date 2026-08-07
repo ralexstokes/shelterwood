@@ -7,14 +7,12 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{PanicOnDrop, ReleaseGate, assert_quiet, policy::never, poll_until};
 use shelterwood::{
     Actor, ActorOnceDef, Context, DynamicTree, ExitError, ExitKind, ExitResult, Intensity,
     Readiness, Retention, Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeOnceDef,
     TaskDef, TaskOnceDef, Tree,
 };
-use shelterwood_test_support::{PanicOnDrop, ReleaseGate, assert_quiet, poll_until};
-
-use crate::common::policy::never;
 
 #[tokio::test]
 async fn non_owners_are_quiet_and_an_empty_root_needs_its_owner() {

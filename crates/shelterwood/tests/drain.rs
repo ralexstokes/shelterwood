@@ -6,10 +6,10 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, poll_until};
 use shelterwood::{
     Actor, ActorOnceDef, Context, ExitError, ExitResult, Mailbox, SendErrorKind, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, poll_until};
 
 #[derive(Clone, Copy, Debug)]
 enum Message {

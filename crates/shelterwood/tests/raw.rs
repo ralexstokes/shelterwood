@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, poll_until};
 use shelterwood::{
     DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
     RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ScopeDefaults,
     SendErrorKind, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, poll_until};
 
 struct FactoryTaskActor {
     factory_task: String,

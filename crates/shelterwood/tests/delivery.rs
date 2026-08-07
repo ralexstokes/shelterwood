@@ -7,11 +7,11 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, assert_quiet, poll_once, poll_until};
 use shelterwood::{
     CallErrorKind, ExitError, ExitResult, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Reply,
     SendErrorKind, Shutdown, SubtreeOnceDef, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, assert_quiet, poll_once, poll_until};
 
 struct PrefixActor {
     generation: usize,

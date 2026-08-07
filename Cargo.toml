@@ -1,12 +1,10 @@
 [workspace]
 default-members = [
     "crates/shelterwood",
-    "crates/test-support",
     "tools/api-reachability",
 ]
 members = [
     "crates/shelterwood",
-    "crates/test-support",
     "tools/api-reachability",
 ]
 resolver = "3"

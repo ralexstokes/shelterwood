@@ -6,11 +6,11 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DynamicTree, ExitError, ExitResult, Handler, RawActor,
     RawContext, RawOnceDef, Readiness, StopContext, TaskDef, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, poll_until};
 
 #[derive(Clone)]
 struct BasicArgs {

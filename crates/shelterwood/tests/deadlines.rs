@@ -7,11 +7,11 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
     CallErrorKind, ExitResult, Mailbox, RawActor, RawContext, RawOnceDef, Reply, ReplyError,
     SendErrorKind, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 
 #[derive(Debug)]
 enum Message {

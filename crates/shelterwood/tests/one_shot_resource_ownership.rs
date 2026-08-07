@@ -1,12 +1,10 @@
 use std::time::Duration;
 
+use crate::common::{ConsumeCount, ConsumeGuard, policy::never};
 use shelterwood::{
     Actor, ActorOnceDef, Context, ExitError, ExitResult, RawActor, RawContext, RawOnceDef,
     Readiness, ReadinessDeadline, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
-use shelterwood_test_support::{ConsumeCount, ConsumeGuard};
-
-use crate::common::policy::never;
 
 #[derive(Clone, Copy)]
 enum RawResourceMode {

@@ -145,7 +145,6 @@ name = "shelterwood"
 version = "0.1.0"
 dependencies = [
  "fastrand",
- "shelterwood-test-support",
  "slab",
  "thiserror",
  "tokio",
@@ -158,13 +157,6 @@ name = "shelterwood-api-reachability"
 version = "0.1.0"
 dependencies = [
  "serde_json",
-]
-
-[[package]]
-name = "shelterwood-test-support"
-version = "0.1.0"
-dependencies = [
- "tokio",
 ]
 
 [[package]]

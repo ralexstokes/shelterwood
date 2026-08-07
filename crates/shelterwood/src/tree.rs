@@ -747,6 +747,11 @@ pub(crate) fn lower_tree_for_test(tree: Tree) -> ScopePlan {
         .expect("test tree must be fully defined")
 }
 
+#[cfg(test)]
+pub(crate) fn into_core_for_test(tree: Tree) -> BuilderCore {
+    tree.core
+}
+
 /// An owned pre-spawn actor slot with a stable mailbox binding.
 pub struct ActorSlot<M> {
     slot: Arc<SlotCell>,

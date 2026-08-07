@@ -15,8 +15,8 @@ use crate::common::{
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, Context as ActorContext, DynamicTree, ExitError, ExitKind,
     ExitResult, NotAdmittingCause, Readiness, RemoveOutcome, ReserveError, RestartCondition,
-    RestartPolicy, Retention, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
-    TaskOnceDef, Tree,
+    RestartPolicy, Retention, SendErrorKind, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef,
+    TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe(Arc<AtomicBool>);
@@ -35,6 +35,21 @@ impl Actor for GatedDynamicActor {
 
     async fn init(gate: Self::Args, _: &mut ActorContext<'_, Self>) -> Result<Self, ExitError> {
         gate.wait().await;
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), _: &mut ActorContext<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
+struct EvidenceActor;
+
+impl Actor for EvidenceActor {
+    type Msg = ();
+    type Args = ();
+
+    async fn init((): (), _: &mut ActorContext<'_, Self>) -> Result<Self, ExitError> {
         Ok(Self)
     }
 
@@ -186,6 +201,53 @@ async fn nested_declared_membership_is_superseded_by_its_runtime_replacement() {
         !unrelated_worker
             .membership()
             .supersedes(replacement.membership())
+    );
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}
+
+#[tokio::test]
+async fn nested_actor_replacement_keeps_mailbox_evidence_in_each_exact_membership() {
+    let mut nested = DynamicTree::new();
+    let declared = nested
+        .add_actor("worker", shelterwood::ActorDef::<EvidenceActor>::cloned(()))
+        .expect("valid declared actor");
+    let mut root = Tree::new();
+    let nested_scope = root
+        .add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid nested scope");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+
+    let declared_incarnation = declared.try_send(()).expect("declared actor accepts");
+    assert_eq!(declared_incarnation.membership(), declared.membership());
+    assert_eq!(
+        nested_scope.remove_actor(&declared).await,
+        RemoveOutcome::Removed
+    );
+    let terminal = declared
+        .try_send(())
+        .expect_err("the declared handle remains pinned to its removed membership");
+    assert_eq!(terminal.kind, SendErrorKind::Terminated);
+    assert_eq!(terminal.incarnation_observed, Some(declared_incarnation));
+
+    let replacement = nested_scope
+        .add_actor("worker", shelterwood::ActorDef::<EvidenceActor>::cloned(()))
+        .await
+        .expect("runtime replacement is admitted")
+        .into_handles();
+    let replacement_incarnation = replacement.try_send(()).expect("replacement actor accepts");
+    assert!(replacement.membership().supersedes(declared.membership()));
+    assert_eq!(
+        replacement_incarnation.membership(),
+        replacement.membership()
+    );
+    assert!(
+        !replacement_incarnation.supersedes(declared_incarnation),
+        "incarnation retry order never crosses membership replacement"
     );
 
     system

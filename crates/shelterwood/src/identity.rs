@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn membership_and_incarnation_order_is_scoped() {
+    fn membership_and_incarnation_order_is_scoped_by_owner_and_id() {
         let mut scope = ScopeIdentity::new().expect("scope identity available");
         let id = ChildId::from("worker");
         let first = scope.mint_membership(&id).expect("membership available");
@@ -257,6 +257,45 @@ mod tests {
     }
 
     #[test]
+    fn stable_scope_adopts_the_first_declaration_then_orders_rebuilds() {
+        let id = ChildId::from("worker");
+        let other_id = ChildId::from("other");
+        let mut first_builder = ScopeIdentity::new().expect("builder identity available");
+        let first = first_builder
+            .mint_membership(&id)
+            .expect("first provisional membership available");
+        let other = first_builder
+            .mint_membership(&other_id)
+            .expect("other provisional membership available");
+        let mut rebuilt_builder = ScopeIdentity::new().expect("builder identity available");
+        let rebuilt = rebuilt_builder
+            .mint_membership(&id)
+            .expect("rebuilt provisional membership available");
+
+        let mut stable = ScopeIdentity::new().expect("stable identity available");
+        assert_eq!(
+            stable.adopt_or_mint_membership(&id, first),
+            Some(first),
+            "first lowering preserves pre-spawn identity"
+        );
+        assert_eq!(
+            stable.adopt_or_mint_membership(&other_id, other),
+            Some(other),
+            "each id adopts its own provisional lineage"
+        );
+        let successor = stable
+            .adopt_or_mint_membership(&id, rebuilt)
+            .expect("stable identity mints a rebuilt successor");
+
+        assert!(successor.supersedes(first));
+        assert!(!first.supersedes(successor));
+        assert!(!successor.supersedes(rebuilt));
+        assert!(!rebuilt.supersedes(successor));
+        assert!(!successor.supersedes(other));
+        assert!(!other.supersedes(successor));
+    }
+
+    #[test]
     fn exhaustion_never_mints_the_poison_value_or_a_duplicate() {
         let id = ChildId::from("worker");
         let counter = FenceCounter::near_exhaustion(7);
@@ -271,6 +310,32 @@ mod tests {
         assert_ne!(last, other);
         assert!(!last.supersedes(other));
         assert!(!other.supersedes(last));
+
+        let unrelated = scope
+            .mint_membership(&ChildId::from("other"))
+            .expect("one exhausted id does not poison an unrelated domain");
+        assert!(!unrelated.supersedes(last));
+        assert!(!last.supersedes(unrelated));
+    }
+
+    #[test]
+    fn exhausted_stable_domain_rejects_a_rebuilt_declaration() {
+        let id = ChildId::from("worker");
+        let mut stable = ScopeIdentity::with_counter(id.clone(), FenceCounter::near_exhaustion(7));
+        stable
+            .mint_membership(&id)
+            .expect("last usable stable membership is minted");
+        let mut builder = ScopeIdentity::new().expect("builder identity available");
+        let provisional = builder
+            .mint_membership(&id)
+            .expect("provisional membership available");
+
+        assert_eq!(stable.adopt_or_mint_membership(&id, provisional), None);
+        assert_eq!(stable.adopt_or_mint_membership(&id, provisional), None);
+        assert!(
+            stable.mint_membership(&ChildId::from("other")).is_some(),
+            "exhaustion remains local to one child id"
+        );
     }
 
     #[test]

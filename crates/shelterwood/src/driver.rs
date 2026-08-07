@@ -3346,18 +3346,18 @@ mod tests {
     use crate::{
         ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind,
         LifecycleItem, LifecycleTryRecvError, Readiness, RemoveOutcome, ScopeState, SendErrorKind,
-        StopReason, SubtreeOnceDef, TaskDef, Tree,
+        StartupError, StartupFailureCause, StopReason, SubtreeOnceDef, TaskDef, Tree,
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
         runtime::Latch,
-        tree::{SlotCell, lower_tree_for_test},
+        tree::{SlotCell, into_core_for_test, lower_tree_for_test},
     };
 
     use super::{
         DynamicControl, DynamicEntry, MemberCell, MemberStage, Obligation, RemovalResponses,
         ScopeCell, ScopeFlavor, complete_removals, mint_child_incarnation, report_channel,
-        run_scope_incarnation,
+        run_nested_tree, run_scope_incarnation,
     };
 
     #[test]
@@ -3727,9 +3727,10 @@ mod tests {
     #[test]
     fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from("worker");
         let member = MemberCell::new(
-            ChildId::from("worker"),
-            identity.mint_membership().expect("membership available"),
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
         );
         let mailbox = MailboxCell::new(member.id().clone());
         let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
@@ -3767,9 +3768,10 @@ mod tests {
     #[test]
     fn attach_during_terminal_publication_finishes_record_before_mailbox_wake() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from("worker");
         let member = MemberCell::new(
-            ChildId::from("worker"),
-            identity.mint_membership().expect("membership available"),
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
         );
         let mailbox = MailboxCell::new(member.id().clone());
         let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
@@ -3811,9 +3813,10 @@ mod tests {
     #[test]
     fn concurrent_terminalizers_return_after_one_consistent_record_is_visible() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from("worker");
         let member = MemberCell::new(
-            ChildId::from("worker"),
-            identity.mint_membership().expect("membership available"),
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
         );
         let start = Arc::new(Barrier::new(3));
         let workers = [Exit::never_started(), Exit::new(ExitKind::Completed, false)]
@@ -3843,9 +3846,10 @@ mod tests {
     #[test]
     fn terminal_startup_wake_follows_member_and_incarnation_publication() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from("root");
         let member = MemberCell::new(
-            ChildId::from("root"),
-            identity.mint_membership().expect("membership available"),
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
         );
         let scope = ScopeCell::new(
             member,
@@ -3889,9 +3893,10 @@ mod tests {
     #[test]
     fn no_live_root_startup_wake_follows_member_publication() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from("root");
         let member = MemberCell::new(
-            ChildId::from("root"),
-            identity.mint_membership().expect("membership available"),
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
         );
         let scope = ScopeCell::new(
             member,
@@ -4057,6 +4062,65 @@ mod tests {
             MemberStage::Terminal(ref exit) if exit == &previous
         ));
         assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+    }
+
+    #[crate::runtime::test]
+    async fn nested_membership_exhaustion_is_structured_and_fail_closed() {
+        let nested_id = ChildId::from("nested");
+        let mut parent_identity = ScopeIdentity::new().expect("parent identity available");
+        let nested_membership = parent_identity
+            .mint_membership(&nested_id)
+            .expect("nested membership available");
+        let nested_member = MemberCell::new(nested_id, nested_membership);
+
+        let worker_id = ChildId::from("worker");
+        let mut child_identity =
+            ScopeIdentity::with_counter(worker_id.clone(), FenceCounter::near_exhaustion(7));
+        child_identity
+            .mint_membership(&worker_id)
+            .expect("last usable membership is minted before the rebuild");
+        let scope = ScopeCell::new(nested_member, ScopeFlavor::Ordered, child_identity);
+
+        let mut tree = Tree::new();
+        let worker = tree
+            .add_task(
+                worker_id.clone(),
+                TaskDef::new(|_| future::pending::<crate::ExitResult>()),
+            )
+            .expect("provisional declaration succeeds");
+        let ready = Latch::default();
+        let error = run_nested_tree(
+            into_core_for_test(tree),
+            Arc::clone(&scope),
+            crate::policy::ResolvedDefaults::default(),
+            ready.clone(),
+            Latch::default(),
+            Latch::default(),
+            Latch::default(),
+        )
+        .await
+        .expect_err("the stable child-id domain is exhausted");
+
+        let failure = error
+            .startup_failure()
+            .expect("framework provenance is retained");
+        assert!(matches!(
+            failure.cause,
+            StartupFailureCause::IdentityExhausted { ref id } if id == &worker_id
+        ));
+        assert!(matches!(
+            scope.record().startup,
+            Some(Err(StartupError::StartupFailed(ref failure)))
+                if matches!(failure.cause, StartupFailureCause::IdentityExhausted { ref id } if id == &worker_id)
+        ));
+        assert!(matches!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::StartupFailed(_)
+            }
+        ));
+        assert!(!ready.is_fired());
+        assert!(matches!(worker.wait().await.kind(), ExitKind::NeverStarted));
     }
 
     #[crate::runtime::test]

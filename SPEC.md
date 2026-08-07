@@ -133,8 +133,8 @@ any single design rule:
 - **Policies are plain data.** Every policy and configuration surface —
   `RestartPolicy`, `Backoff`, `Shutdown`, `Readiness` and its deadline,
   `Strategy`, `Intensity`, mailbox settings, the shared options record
-  (§8) — is a plain enum or struct: `Clone` (`Copy` where cheap), `Debug`,
-  `Eq` (universal — a float-valued field stores a validated newtype whose
+  (§8) — is a plain enum or struct: `Clone` (`Copy` where cheap), `Eq`
+  (universal — a float-valued field stores a validated newtype whose
   invariant makes bit-equality correct: §9.2's backoff factor),
   serializable where Part II §21 needs it, and carrying **no
   behavior** beyond small pure derivation functions of the
@@ -1180,7 +1180,7 @@ One classification, produced at one point, used by every consumer.
   the shared reference sound. `ExitError` itself does NOT implement
   `std::error::Error` (the `anyhow` precedent): implementing it would make
   the blanket `From<E>` overlap `core`'s reflexive `From<T> for T`. It
-  carries `Display`/`Debug`, source-chain access, and a by-reference
+  carries `Display`, source-chain access, and a by-reference
   `&(dyn Error)` view instead. Applications
   MAY downcast it (e.g. routing on a domain error surfaced in a `Failed`
   exit); the framework NEVER does — framework verdicts have their own
@@ -2701,9 +2701,9 @@ everything §9.3's inheritance machinery decides silently (scope defaults,
 inherit-vs-reset at subtree edges, library fallbacks). Its uses are
 golden-outline tests that pin a system's effective supervision policy in
 CI without spawning anything, startup logging, and cross-environment
-diffing. `Debug` output cannot substitute (no injectivity or stability
-contract), nor can snapshots (they need a running system and carry only
-part of the policy surface, B.6).
+diffing. Ad hoc diagnostic output cannot substitute (no injectivity or
+stability contract), nor can snapshots (they need a running system and
+carry only part of the policy surface, B.6).
 
 **Non-goals.** The outline carries no actor implementations, closures,
 args, or state: it is a description of a declaration, not a constructor
@@ -3450,10 +3450,8 @@ state.
 ### B.10 Trait and concurrency matrix
 
 Uniform bounds, stated once; a conforming implementation provides at
-least these. `Debug` is universal on public types (with opaque tokens
-debug-printing an identity, not internals); policy/config data
-additionally follows §1's plain-data rule (`Clone`, `Eq`, `Copy` where
-cheap).
+least these. Policy/config data additionally follows §1's plain-data rule
+(`Clone`, `Eq`, `Copy` where cheap).
 
 - **Identity tokens** — `Membership`, `Incarnation`: `Copy`, `Eq`,
   `Hash`, `Send`, `Sync`. Ordering is `supersedes` (§3.1–§3.3),

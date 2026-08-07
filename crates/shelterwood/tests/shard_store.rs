@@ -391,8 +391,7 @@ async fn replace_with_retry(
                     let observed = error
                         .incarnation_observed
                         .expect("ReplyDropped carries the accepting incarnation");
-                    let remaining = deadline
-                        .saturating_duration_since(tokio::time::Instant::now());
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     scope
                         .wait_for_child(
                             "topology-writer",
@@ -661,7 +660,10 @@ async fn shard_store_retire_waits_for_accepted_requests() {
         .expect("write task joins")
         .expect("the accepted write completes across retirement");
     assert_eq!(durable.get("alpha"), Some(7));
-    assert_eq!(removal.await.expect("removal joins"), RemoveOutcome::Removed);
+    assert_eq!(
+        removal.await.expect("removal joins"),
+        RemoveOutcome::Removed
+    );
 
     system
         .shutdown(Duration::from_secs(1))

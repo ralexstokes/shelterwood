@@ -368,10 +368,7 @@ async fn sidecar_startup_failure_leaves_prefix_supervised_until_host_rolls_it_ba
     for prefix in ["config", "telemetry"] {
         assert!(
             matches!(
-                snapshot
-                    .child(prefix)
-                    .expect("prefix child resident")
-                    .state,
+                snapshot.child(prefix).expect("prefix child resident").state,
                 ChildState::Running
             ),
             "started prefix `{prefix}` must stay running through the park"

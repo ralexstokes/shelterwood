@@ -932,6 +932,14 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }
         state.status = BindingStatus::Bound(incarnation);
         state.last_bound = Some(incarnation);
+        // Binding is an observation edge for every operation that remained
+        // parked through it, including FIFO overflow that cannot be promoted
+        // into the current capacity. Withdrawal takes the mailbox lock before
+        // the operation lock, so a concurrent timeout sees either the prior
+        // evidence or this incarnation consistently with which edge won.
+        for operation in &state.waiters {
+            operation.observe(incarnation);
+        }
         let promotion = promote_waiters(&mut state);
         drop(state);
         self.changed.pulse();

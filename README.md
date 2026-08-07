@@ -33,7 +33,7 @@ use shelterwood::{ExitError, TaskOnceDef, Tree};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = Tree::new();
-    tree.add_task_once(
+    let (_worker, _completion) = tree.add_task_once(
         "worker",
         TaskOnceDef::new(|context| async move {
             context.shutdown_token().cancelled().await;

@@ -363,7 +363,17 @@ impl Actor for RouterActor {
     }
 }
 
-async fn replace_with_retry(router: &ActorRef<RouterMessage>, operation: u64) -> Route {
+/// The §3.3 retry discipline, hand-rolled: one overall deadline for the whole
+/// logical operation, retries only of the same durable idempotent operation
+/// id, and a resend after `ReplyDropped` only once a *superseding* router
+/// incarnation is running — never into the same doomed mailbox or the rebind
+/// window.
+async fn replace_with_retry(
+    scope: &ScopeRef,
+    router: &ActorRef<RouterMessage>,
+    operation: u64,
+) -> Route {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     for _ in 0..4 {
         match router
             .call(
@@ -373,19 +383,39 @@ async fn replace_with_retry(router: &ActorRef<RouterMessage>, operation: u64) ->
             .await
         {
             Ok(reply) => return reply.value,
-            Err(error) => {
-                assert!(matches!(
-                    error.kind,
-                    CallErrorKind::ReplyDropped
-                        | CallErrorKind::ResponseTimedOut
-                        | CallErrorKind::AcceptanceTimedOut
-                ));
-                // The request may have committed. Retry only the same durable,
-                // idempotent operation id; the accepting/observed incarnation
-                // is evidence for diagnostics, never permission to invent a
-                // fresh operation.
-                assert!(error.incarnation_observed.is_some());
-            }
+            Err(error) => match error.kind {
+                CallErrorKind::ReplyDropped => {
+                    // Acceptance happened and the accepting incarnation lost
+                    // the reply (B.3 guarantees its token). Await the
+                    // incarnation-after before resending (§3.3 step 2).
+                    let observed = error
+                        .incarnation_observed
+                        .expect("ReplyDropped carries the accepting incarnation");
+                    let remaining = deadline
+                        .saturating_duration_since(tokio::time::Instant::now());
+                    scope
+                        .wait_for_child(
+                            "topology-writer",
+                            move |child| {
+                                child
+                                    .incarnation
+                                    .is_some_and(|current| current.supersedes(observed))
+                            },
+                            remaining,
+                        )
+                        .await
+                        .expect("a superseding router incarnation runs");
+                }
+                CallErrorKind::AcceptanceTimedOut => {
+                    // Guaranteed-not-accepted; always safe to retry
+                    // (§3.3 step 4).
+                }
+                other => panic!(
+                    "never blindly retry an accepted request with an unknown \
+                     outcome — reconcile against durable evidence instead \
+                     (§3.3 step 3): {other:?}"
+                ),
+            },
         }
     }
     panic!("idempotent topology operation did not reconcile")
@@ -424,6 +454,7 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
         .expect("valid topology writer");
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("store starts");
+    let root_scope = system.scope();
 
     durable.inject(1, Fault::BeforeCommit);
     let first_error = router
@@ -443,7 +474,7 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
         OperationRecord::Committed { .. } => panic!("pre-commit crash cannot be committed"),
     };
 
-    let first = replace_with_retry(&router, 1).await;
+    let first = replace_with_retry(&root_scope, &router, 1).await;
     assert!(
         first
             .membership
@@ -485,10 +516,10 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
         committed_candidate.route.membership
     );
 
-    let second = replace_with_retry(&router, 2).await;
+    let second = replace_with_retry(&root_scope, &router, 2).await;
     assert_eq!(second.membership, committed_candidate.route.membership);
     assert_eq!(
-        replace_with_retry(&router, 2).await.membership,
+        replace_with_retry(&root_scope, &router, 2).await.membership,
         second.membership,
         "replaying a committed operation is idempotent"
     );
@@ -507,6 +538,130 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
         .expect("new route accepts a write");
     assert_eq!(committed_candidate.durable.get("alpha"), Some(41));
     assert_eq!(failed_candidate.durable.get("alpha"), None);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("store shuts down");
+}
+
+struct GatedShardActor {
+    durable: DurableShard,
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+impl Actor for GatedShardActor {
+    type Msg = ShardMessage;
+    type Args = (
+        DurableShard,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<tokio::sync::Notify>,
+    );
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        let (durable, entered, gate) = args;
+        Ok(Self {
+            durable,
+            entered,
+            gate,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+        let ShardMessage::Put { key, value, reply } = message;
+        self.entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.gate.notified().await;
+        self.durable
+            .0
+            .lock()
+            .expect("durable shard mutex poisoned")
+            .insert(key, value);
+        reply.send(());
+        Ok(())
+    }
+}
+
+/// C.1's accepted-request quiescence: a write accepted by the retiring mount
+/// completes durably — reply delivered, value persisted — even though the
+/// mount's removal begins while the request is still in flight.
+#[tokio::test]
+async fn shard_store_retire_waits_for_accepted_requests() {
+    let durable = DurableShard::default();
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let mut root = Tree::new();
+    let ranges = root
+        .add_subtree_once("ranges", SubtreeOnceDef::new(DynamicTree::new()))
+        .expect("valid dynamic range scope");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("store starts");
+
+    let mut mount = Tree::new();
+    let actor = mount
+        .add_actor(
+            "shard",
+            ActorDef::<GatedShardActor>::cloned((
+                durable.clone(),
+                Arc::clone(&entered),
+                Arc::clone(&gate),
+            )),
+        )
+        .expect("valid shard");
+    let scope = ranges
+        .add_subtree_once("range-live", SubtreeOnceDef::new(mount))
+        .await
+        .expect("range admission")
+        .into_handles();
+
+    let write = tokio::spawn({
+        let actor = actor.clone();
+        async move {
+            actor
+                .call(
+                    |reply| ShardMessage::Put {
+                        key: "alpha".to_owned(),
+                        value: 7,
+                        reply,
+                    },
+                    Duration::from_secs(4),
+                )
+                .await
+        }
+    });
+    while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+
+    // Retirement starts while the accepted write is mid-handling;
+    // `membership_status` flips synchronously at the call (§13.12).
+    let removal = tokio::spawn({
+        let ranges = ranges.clone();
+        let scope = scope.clone();
+        async move { ranges.remove_scope(&scope).await }
+    });
+    ranges
+        .wait_for_child(
+            "range-live",
+            |child| {
+                matches!(
+                    child.membership_status,
+                    shelterwood::MembershipStatus::Removing
+                )
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("removal is underway");
+
+    gate.notify_one();
+    write
+        .await
+        .expect("write task joins")
+        .expect("the accepted write completes across retirement");
+    assert_eq!(durable.get("alpha"), Some(7));
+    assert_eq!(removal.await.expect("removal joins"), RemoveOutcome::Removed);
 
     system
         .shutdown(Duration::from_secs(1))

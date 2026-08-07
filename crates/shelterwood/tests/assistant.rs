@@ -694,3 +694,145 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .await
         .expect("staged control-plane shutdown completes");
 }
+
+enum IdleMessage {
+    Activity,
+    IdleExpired,
+}
+
+struct IdleSessionActor {
+    evictions: tokio::sync::mpsc::UnboundedSender<()>,
+    activities: Arc<AtomicUsize>,
+}
+
+const IDLE_AFTER: Duration = Duration::from_secs(60);
+
+impl Actor for IdleSessionActor {
+    type Msg = IdleMessage;
+    type Args = (tokio::sync::mpsc::UnboundedSender<()>, Arc<AtomicUsize>);
+
+    async fn init(args: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        context
+            .set_timeout("idle", IdleMessage::IdleExpired, IDLE_AFTER)
+            .expect("live session arms its idle timer");
+        let (evictions, activities) = args;
+        Ok(Self {
+            evictions,
+            activities,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            IdleMessage::Activity => {
+                // Re-keying replaces the pending deadline: activity pushes
+                // idleness out instead of stacking timers (§5.3).
+                context
+                    .set_timeout("idle", IdleMessage::IdleExpired, IDLE_AFTER)
+                    .expect("live session re-arms its idle timer");
+                self.activities.fetch_add(1, Ordering::SeqCst);
+            }
+            IdleMessage::IdleExpired => {
+                let _ = self.evictions.send(());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// C.5's idle eviction and cancellable streaming: idleness is detected by an
+/// actor-local keyed timer that activity re-arms, eviction is the session
+/// scope's removal, and a stream cut off mid-flight fails senders with
+/// `Terminated` while never leaking another value.
+#[tokio::test(start_paused = true)]
+async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight() {
+    let (evictions, mut evicted) = tokio::sync::mpsc::unbounded_channel();
+    let activities = Arc::new(AtomicUsize::new(0));
+    let stream_values = Arc::new(Mutex::new(Vec::new()));
+    let mut session = Tree::new();
+    let idle = session
+        .add_actor(
+            "idle",
+            ActorDef::<IdleSessionActor>::cloned((evictions, Arc::clone(&activities))),
+        )
+        .expect("idle actor declared");
+    let stream_gate = ReleaseGate::default();
+    let stream = session
+        .add_actor_once(
+            "stream",
+            ActorOnceDef::<StreamActor>::new((stream_gate.clone(), Arc::clone(&stream_values)))
+                .mailbox(Mailbox::latest()),
+        )
+        .expect("stream actor declared");
+    stream_gate.release();
+
+    let sessions = DynamicTree::new();
+    let mut root = Tree::new();
+    let sessions = root
+        .add_subtree_once("sessions", SubtreeOnceDef::new(sessions))
+        .expect("session scope declared");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("assistant starts");
+    let session = sessions
+        .add_subtree_once("session-1", SubtreeOnceDef::new(session))
+        .await
+        .expect("session admitted")
+        .into_handles();
+
+    // Mid-life streaming works and the idle timer is armed from init.
+    stream.send(5).await.expect("stream accepts mid-life value");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            stream_values
+                .lock()
+                .expect("stream values mutex poisoned")
+                .as_slice()
+                == [5]
+        })
+        .await
+    );
+
+    // Activity half-way through the idle window replaces the deadline …
+    tokio::time::advance(Duration::from_secs(30)).await;
+    idle.send(IdleMessage::Activity)
+        .await
+        .expect("live session accepts activity");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            activities.load(Ordering::SeqCst) == 1
+        })
+        .await,
+        "the activity is handled (and the timer re-armed) before time moves"
+    );
+    // … so the original deadline passing evicts nothing …
+    tokio::time::advance(Duration::from_secs(40)).await;
+    assert!(
+        evicted.try_recv().is_err(),
+        "activity must push the idle deadline out"
+    );
+    // … and only the re-armed deadline fires.
+    tokio::time::advance(Duration::from_secs(25)).await;
+    tokio::time::timeout(Duration::from_secs(1), evicted.recv())
+        .await
+        .expect("idle timer fires after the re-armed window")
+        .expect("eviction signal arrives");
+
+    // Eviction is removal of the session scope; the stream is cut off
+    // mid-flight: senders now fail terminally and no value ever leaks.
+    assert_eq!(
+        sessions.remove_scope(&session).await,
+        RemoveOutcome::Removed
+    );
+    let error = stream
+        .try_send(9)
+        .expect_err("a cancelled stream rejects new values");
+    assert_eq!(error.kind, shelterwood::SendErrorKind::Terminated);
+    assert_eq!(
+        stream_values
+            .lock()
+            .expect("stream values mutex poisoned")
+            .as_slice(),
+        [5],
+        "no value leaks past cancellation"
+    );
+}

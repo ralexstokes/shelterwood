@@ -362,6 +362,21 @@ async fn sidecar_startup_failure_leaves_prefix_supervised_until_host_rolls_it_ba
             .state,
         ChildState::StartupAborted { .. }
     ));
+    // The park is the point of the state: the started prefix stays running
+    // and supervised until the host decides (Appendix C.2), rather than
+    // being eagerly torn down with the failure.
+    for prefix in ["config", "telemetry"] {
+        assert!(
+            matches!(
+                snapshot
+                    .child(prefix)
+                    .expect("prefix child resident")
+                    .state,
+                ChildState::Running
+            ),
+            "started prefix `{prefix}` must stay running through the park"
+        );
+    }
 
     let StartOrShutdownError {
         startup: rollback_startup,

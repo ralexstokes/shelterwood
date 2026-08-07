@@ -972,7 +972,13 @@ impl ScopeCell {
         let state = ScopeState::Stopped {
             reason: reason.clone(),
         };
-        self.record.lock().expect("scope mutex poisoned").state = state.clone();
+        {
+            let mut record = self.record.lock().expect("scope mutex poisoned");
+            if record.startup.is_none() {
+                record.startup = Some(Err(StartupError::ShutdownRequested));
+            }
+            record.state = state.clone();
+        }
         let terminal = terminal_exit.is_some();
         if let Some(exit) = terminal_exit {
             self.member.terminalize(exit);
@@ -1011,7 +1017,13 @@ impl ScopeCell {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = ScopeState::Stopped { reason };
-            self.record.lock().expect("scope mutex poisoned").state = state.clone();
+            {
+                let mut record = self.record.lock().expect("scope mutex poisoned");
+                if record.startup.is_none() {
+                    record.startup = Some(Err(StartupError::ShutdownRequested));
+                }
+                record.state = state.clone();
+            }
             self.member.terminalize(exit);
             self.member.changed.pulse();
             self.emit_locked(LifecycleEventKind::ScopeState { state });
@@ -3328,20 +3340,20 @@ enum Pending {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::Future, sync::Arc, task::Poll, time::Duration};
+    use std::{future, future::Future, sync::Arc, task::Poll, time::Duration};
 
     use crate::{
         ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind,
-        LifecycleItem, RemoveOutcome, ScopeState, SendErrorKind,
+        LifecycleItem, Readiness, RemoveOutcome, ScopeState, SendErrorKind, TaskDef, Tree,
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
-        tree::SlotCell,
+        tree::{SlotCell, lower_tree_for_test},
     };
 
     use super::{
         DynamicControl, DynamicEntry, Latch, MemberCell, MemberStage, Obligation, RemovalResponse,
-        ScopeCell, ScopeFlavor, mint_child_incarnation, report_channel,
+        ScopeCell, ScopeFlavor, mint_child_incarnation, report_channel, run_scope_incarnation,
     };
 
     #[test]
@@ -3411,6 +3423,49 @@ mod tests {
         assert_eq!(parked.kind, SendErrorKind::Terminated);
         let immediate = actor.try_send(2).expect_err("terminal send is rejected");
         assert_eq!(immediate.kind, SendErrorKind::Terminated);
+    }
+
+    #[crate::runtime::test]
+    async fn task_aborted_scope_driver_resolves_startup() {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "not-ready",
+            TaskDef::new(|_| future::pending())
+                .readiness(Readiness::Manual)
+                .expect("manual readiness is valid"),
+        )
+        .expect("valid task");
+        let plan = lower_tree_for_test(tree);
+        let scope = Arc::clone(&plan.root);
+        let epoch = scope.begin_incarnation();
+        let driver = crate::runtime::spawn(
+            (),
+            run_scope_incarnation(plan, false, Some(Latch::default()), None, None, None, epoch),
+        );
+        let abort = driver.abort_handle();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(scope.record().state, ScopeState::Starting) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scope driver reaches startup");
+        let waiter_scope = Arc::clone(&scope);
+        let waiter = crate::runtime::spawn((), async move { waiter_scope.wait_started().await });
+        tokio::task::yield_now().await;
+
+        abort.abort();
+        assert!(matches!(
+            crate::runtime::join(driver).await,
+            crate::runtime::JoinOutcome::Cancelled { .. }
+        ));
+        let crate::runtime::JoinOutcome::Ok { value, .. } = crate::runtime::join(waiter).await
+        else {
+            panic!("startup waiter must join normally");
+        };
+        assert_eq!(value, Err(crate::StartupError::ShutdownRequested));
+        assert!(matches!(scope.record().state, ScopeState::Stopped { .. }));
+        assert!(scope.record().startup.is_some());
     }
 
     #[test]

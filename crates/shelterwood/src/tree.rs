@@ -690,6 +690,13 @@ fn spawn_builder<R>(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn lower_tree_for_test(tree: Tree) -> ScopePlan {
+    tree.core
+        .lower(ResolvedDefaults::default(), None)
+        .expect("test tree must be fully defined")
+}
+
 /// An owned pre-spawn actor slot with a stable mailbox binding.
 pub struct ActorSlot<M> {
     slot: Arc<SlotCell>,

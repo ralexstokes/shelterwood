@@ -17,11 +17,12 @@ use crate::{
     LifecycleEvents, Membership, ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults,
     ScopeSnapshot, Shutdown, ShutdownTimeout, SnapshotReceiver, StartupFailure, Strategy,
     WaitError,
-    driver::{DynamicReservation, Latch, MemberCell, ScopeCell},
+    driver::{DynamicReservation, MemberCell, ScopeCell},
     identity::ScopeIdentity,
     mailbox::MailboxCell,
     policy::{CommonOptions, IdError, ResolvedCommonOptions, ResolvedDefaults, resolve_common},
     raw::{RawConstruction, RawDef, RawOnceDef},
+    runtime::Latch,
     task::{Completion, OnceTask, OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
 

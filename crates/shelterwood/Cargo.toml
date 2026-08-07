@@ -5,8 +5,16 @@ edition = "2024"
 rust-version = "1.97.1"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = []
+serde = ["dep:serde"]
+host = []
+metrics = ["dep:metrics"]
+
 [dependencies]
 fastrand.workspace = true
+metrics = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 slab.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

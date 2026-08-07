@@ -1,13 +1,17 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use shelterwood::{
     Actor, ActorDef, ActorRef, CallErrorKind, Context, DynamicScopeRef, DynamicTree, ExitError,
-    ExitResult, Membership, RemoveOutcome, Reply, ScopeRef, SubtreeOnceDef, Tree,
+    ExitResult, Mailbox, Membership, RemoveOutcome, Reply, ScopeRef, SubtreeOnceDef, Tree,
 };
+use shelterwood_test_support::ReleaseGate;
 
 #[derive(Clone, Debug, Default)]
 struct DurableShard(Arc<Mutex<HashMap<String, u64>>>);
@@ -117,6 +121,7 @@ enum OperationRecord {
 enum Fault {
     BeforeCommit,
     AfterCommitBeforeReply,
+    AfterCommitPark,
 }
 
 #[derive(Clone, Default)]
@@ -124,6 +129,10 @@ struct DurableTopology {
     operations: Arc<Mutex<HashMap<u64, OperationRecord>>>,
     current: Arc<Mutex<Option<Mount>>>,
     faults: Arc<Mutex<HashMap<u64, Fault>>>,
+    aborted: Arc<Mutex<Vec<(u64, Mount)>>>,
+    retry_kinds: Arc<Mutex<Vec<(u64, CallErrorKind)>>>,
+    acceptances: Arc<AtomicUsize>,
+    response_gate: ReleaseGate,
 }
 
 impl DurableTopology {
@@ -148,6 +157,35 @@ impl DurableTopology {
             .get(&operation)
             .cloned()
     }
+
+    fn acceptances(&self) -> usize {
+        self.acceptances.load(Ordering::SeqCst)
+    }
+
+    fn record_retry(&self, operation: u64, kind: CallErrorKind) {
+        self.retry_kinds
+            .lock()
+            .expect("retry-kind mutex poisoned")
+            .push((operation, kind));
+    }
+
+    fn retry_kinds(&self, operation: u64) -> Vec<CallErrorKind> {
+        self.retry_kinds
+            .lock()
+            .expect("retry-kind mutex poisoned")
+            .iter()
+            .filter_map(|(recorded, kind)| (*recorded == operation).then_some(*kind))
+            .collect()
+    }
+
+    fn aborted(&self, operation: u64) -> Mount {
+        self.aborted
+            .lock()
+            .expect("aborted-mount mutex poisoned")
+            .iter()
+            .find_map(|(recorded, mount)| (*recorded == operation).then(|| mount.clone()))
+            .expect("operation has an aborted mount")
+    }
 }
 
 enum RouterMessage {
@@ -161,19 +199,59 @@ struct RouterArgs {
     durable: DurableTopology,
 }
 
+async fn directory_route(args: &RouterArgs) -> Result<Option<Route>, ExitError> {
+    args.directory
+        .call(
+            |reply| DirectoryMessage::Lookup { reply },
+            Duration::from_secs(1),
+        )
+        .await
+        .map(|reply| reply.value)
+        .map_err(|error| ExitError::message(format!("directory lookup failed: {error}")))
+}
+
+async fn reconcile_topology(
+    args: &RouterArgs,
+    candidate: Mount,
+    previous: Option<Mount>,
+) -> Result<Route, ExitError> {
+    let installed = directory_route(args).await?;
+    if installed
+        .as_ref()
+        .is_none_or(|route| route.membership != candidate.route.membership)
+    {
+        args.directory
+            .call(
+                {
+                    let route = candidate.route.clone();
+                    move |reply| DirectoryMessage::Cutover { route, reply }
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .map_err(|error| ExitError::message(format!("directory cutover failed: {error}")))?;
+    }
+    if let Some(previous) = previous
+        && previous.scope.membership() != candidate.scope.membership()
+    {
+        let outcome = args.ranges.remove_scope(&previous.scope).await;
+        if outcome != RemoveOutcome::Removed && outcome != RemoveOutcome::AlreadyAbsent {
+            return Err(ExitError::message("unexpected exact-retire outcome"));
+        }
+    }
+    *args
+        .durable
+        .current
+        .lock()
+        .expect("current mount mutex poisoned") = Some(candidate.clone());
+    Ok(candidate.route)
+}
+
 struct RouterActor(RouterArgs);
 
 impl RouterActor {
     async fn directory_route(&self) -> Result<Option<Route>, ExitError> {
-        self.0
-            .directory
-            .call(
-                |reply| DirectoryMessage::Lookup { reply },
-                Duration::from_secs(1),
-            )
-            .await
-            .map(|reply| reply.value)
-            .map_err(|error| ExitError::message(format!("directory lookup failed: {error}")))
+        directory_route(&self.0).await
     }
 
     async fn reconcile(
@@ -181,40 +259,7 @@ impl RouterActor {
         candidate: Mount,
         previous: Option<Mount>,
     ) -> Result<Route, ExitError> {
-        let installed = self.directory_route().await?;
-        if installed
-            .as_ref()
-            .is_none_or(|route| route.membership != candidate.route.membership)
-        {
-            self.0
-                .directory
-                .call(
-                    {
-                        let route = candidate.route.clone();
-                        move |reply| DirectoryMessage::Cutover { route, reply }
-                    },
-                    Duration::from_secs(1),
-                )
-                .await
-                .map_err(|error| {
-                    ExitError::message(format!("directory cutover failed: {error}"))
-                })?;
-        }
-        if let Some(previous) = previous
-            && previous.scope.membership() != candidate.scope.membership()
-        {
-            let outcome = self.0.ranges.remove_scope(&previous.scope).await;
-            if outcome != RemoveOutcome::Removed && outcome != RemoveOutcome::AlreadyAbsent {
-                return Err(ExitError::message("unexpected exact-retire outcome"));
-            }
-        }
-        *self
-            .0
-            .durable
-            .current
-            .lock()
-            .expect("current mount mutex poisoned") = Some(candidate.clone());
-        Ok(candidate.route)
+        reconcile_topology(&self.0, candidate, previous).await
     }
 
     async fn mount(&self, operation: u64) -> Result<Mount, ExitError> {
@@ -279,6 +324,12 @@ impl RouterActor {
                             "pre-commit abort found an unexpected directory route",
                         ));
                     }
+                    self.0
+                        .durable
+                        .aborted
+                        .lock()
+                        .expect("aborted-mount mutex poisoned")
+                        .push((operation, candidate.clone()));
                     let _ = self.0.ranges.remove_scope(&candidate.scope).await;
                     self.0
                         .durable
@@ -343,6 +394,9 @@ impl RouterActor {
         if matches!(fault, Some(Fault::AfterCommitBeforeReply)) {
             return Err(ExitError::message("injected post-commit reply loss"));
         }
+        if matches!(fault, Some(Fault::AfterCommitPark)) {
+            self.0.durable.response_gate.wait().await;
+        }
         self.reconcile(candidate, previous).await
     }
 }
@@ -357,74 +411,99 @@ impl Actor for RouterActor {
 
     async fn handle(&mut self, message: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
         let RouterMessage::Replace { operation, reply } = message;
+        self.0.durable.acceptances.fetch_add(1, Ordering::SeqCst);
         let route = self.replace(operation).await?;
         reply.send(route);
         Ok(())
     }
 }
 
-/// The §3.3 retry discipline, hand-rolled: one overall deadline for the whole
-/// logical operation, retries only of the same durable idempotent operation
-/// id, and a resend after `ReplyDropped` only once a *superseding* router
-/// incarnation is running — never into the same doomed mailbox or the rebind
-/// window.
 async fn replace_with_retry(
-    scope: &ScopeRef,
     router: &ActorRef<RouterMessage>,
+    root: &ScopeRef,
+    args: &RouterArgs,
     operation: u64,
+    per_attempt: Duration,
+    overall: Duration,
+    acceptance_timeout_observed: Option<ReleaseGate>,
 ) -> Route {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    for _ in 0..4 {
-        // Every attempt spends from the one overall budget (§3.3 step 1),
-        // the call's own acceptance deadline included.
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    assert!(!per_attempt.is_zero());
+    assert!(!overall.is_zero());
+    let deadline = Instant::now()
+        .checked_add(overall)
+        .expect("test retry deadline is representable");
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
-            "the overall deadline bounds the whole logical operation"
+            "idempotent topology retry budget exhausted"
         );
+        let slice = per_attempt.min(remaining);
         match router
             .call(
                 move |reply| RouterMessage::Replace { operation, reply },
-                Duration::from_secs(1).min(remaining),
+                slice,
             )
             .await
         {
             Ok(reply) => return reply.value,
-            Err(error) => match error.kind {
-                CallErrorKind::ReplyDropped => {
-                    // Acceptance happened and the accepting incarnation lost
-                    // the reply (B.3 guarantees its token). Await the
-                    // incarnation-after before resending (§3.3 step 2).
-                    let observed = error
-                        .incarnation_observed
-                        .expect("ReplyDropped carries the accepting incarnation");
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    scope
-                        .wait_for_child(
+            Err(error) => {
+                args.durable.record_retry(operation, error.kind);
+                match error.kind {
+                    CallErrorKind::AcceptanceTimedOut => {
+                        // Successful withdrawal is the only arm that may retry
+                        // without reconciliation or an incarnation transition.
+                        if let Some(observed) = &acceptance_timeout_observed {
+                            observed.release();
+                        }
+                    }
+                    CallErrorKind::ReplyDropped => {
+                        let accepting = error
+                            .incarnation_observed
+                            .expect("reply loss carries the accepting incarnation");
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        assert!(!remaining.is_zero(), "budget expired before restart wait");
+                        root.wait_for_child(
                             "topology-writer",
                             move |child| {
-                                child
-                                    .incarnation
-                                    .is_some_and(|current| current.supersedes(observed))
+                                matches!(child.state, shelterwood::ChildState::Running)
+                                    && child
+                                        .incarnation
+                                        .is_some_and(|current| current.supersedes(accepting))
                             },
                             remaining,
                         )
                         .await
-                        .expect("a superseding router incarnation runs");
+                        .expect("reply-loss retry observes a superseding incarnation");
+                    }
+                    CallErrorKind::ResponseTimedOut => {
+                        // Acceptance makes resend unsafe. Reconcile the same
+                        // durable journal record outside the parked actor instead.
+                        let record = args
+                            .durable
+                            .operation(operation)
+                            .expect("accepted operation has a journal record");
+                        return match record {
+                            OperationRecord::Committed {
+                                candidate,
+                                previous,
+                            } => reconcile_topology(args, candidate, previous)
+                                .await
+                                .expect("committed response timeout reconciles"),
+                            OperationRecord::Mounted { .. } => {
+                                panic!("response timed out before a durable commit verdict")
+                            }
+                        };
+                    }
+                    CallErrorKind::Terminated => {
+                        panic!("topology writer terminated during retry")
+                    }
+                    _ => panic!("unexpected call error kind"),
                 }
-                CallErrorKind::AcceptanceTimedOut => {
-                    // Guaranteed-not-accepted; always safe to retry
-                    // (§3.3 step 4).
-                }
-                other => panic!(
-                    "never blindly retry an accepted request with an unknown \
-                     outcome — reconcile against durable evidence instead \
-                     (§3.3 step 3): {other:?}"
-                ),
-            },
+            }
         }
     }
-    panic!("idempotent topology operation did not reconcile")
 }
 
 async fn lookup(directory: &ActorRef<DirectoryMessage>) -> Option<Route> {
@@ -439,7 +518,7 @@ async fn lookup(directory: &ActorRef<DirectoryMessage>) -> Option<Route> {
 }
 
 #[tokio::test]
-async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries() {
+async fn shard_store_reconciles_retry_outcomes_with_one_overall_budget() {
     let durable = DurableTopology::default();
     let mut root = Tree::new();
     let directory = root
@@ -448,14 +527,16 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
     let ranges = root
         .add_subtree_once("ranges", SubtreeOnceDef::new(DynamicTree::new()))
         .expect("valid dynamic range scope");
+    let router_args = RouterArgs {
+        ranges: ranges.clone(),
+        directory: directory.clone(),
+        durable: durable.clone(),
+    };
     let router = root
         .add_actor(
             "topology-writer",
-            ActorDef::<RouterActor>::cloned(RouterArgs {
-                ranges: ranges.clone(),
-                directory: directory.clone(),
-                durable: durable.clone(),
-            }),
+            ActorDef::<RouterActor>::cloned(router_args.clone())
+                .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
         )
         .expect("valid topology writer");
     let system = root.spawn().expect("runtime is available");
@@ -463,24 +544,22 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
     let root_scope = system.scope();
 
     durable.inject(1, Fault::BeforeCommit);
-    let first_error = router
-        .call(
-            |reply| RouterMessage::Replace {
-                operation: 1,
-                reply,
-            },
-            Duration::from_secs(1),
-        )
-        .await
-        .expect_err("pre-commit crash drops its reply");
-    assert_eq!(first_error.kind, CallErrorKind::ReplyDropped);
-    assert!(lookup(&directory).await.is_none(), "cutover did not happen");
-    let failed_candidate = match durable.operation(1).expect("mount was journaled") {
-        OperationRecord::Mounted { candidate, .. } => candidate,
-        OperationRecord::Committed { .. } => panic!("pre-commit crash cannot be committed"),
-    };
-
-    let first = replace_with_retry(&root_scope, &router, 1).await;
+    let first = replace_with_retry(
+        &router,
+        &root_scope,
+        &router_args,
+        1,
+        Duration::from_millis(500),
+        Duration::from_secs(3),
+        None,
+    )
+    .await;
+    assert_eq!(
+        durable.retry_kinds(1),
+        [CallErrorKind::ReplyDropped],
+        "pre-commit fault exercises the superseding-incarnation retry"
+    );
+    let failed_candidate = durable.aborted(1);
     assert!(
         first
             .membership
@@ -499,17 +578,21 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
     );
 
     durable.inject(2, Fault::AfterCommitBeforeReply);
-    let second_error = router
-        .call(
-            |reply| RouterMessage::Replace {
-                operation: 2,
-                reply,
-            },
-            Duration::from_secs(1),
-        )
-        .await
-        .expect_err("post-commit crash drops its reply");
-    assert_eq!(second_error.kind, CallErrorKind::ReplyDropped);
+    let second = replace_with_retry(
+        &router,
+        &root_scope,
+        &router_args,
+        2,
+        Duration::from_millis(500),
+        Duration::from_secs(3),
+        None,
+    )
+    .await;
+    assert_eq!(
+        durable.retry_kinds(2),
+        [CallErrorKind::ReplyDropped],
+        "post-commit reply loss also waits for the restarted writer"
+    );
     let committed_candidate = match durable.operation(2).expect("commit was journaled") {
         OperationRecord::Committed { candidate, .. } => candidate,
         OperationRecord::Mounted { .. } => panic!("directory cutover must be committed"),
@@ -522,10 +605,19 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
         committed_candidate.route.membership
     );
 
-    let second = replace_with_retry(&root_scope, &router, 2).await;
     assert_eq!(second.membership, committed_candidate.route.membership);
     assert_eq!(
-        replace_with_retry(&root_scope, &router, 2).await.membership,
+        replace_with_retry(
+            &router,
+            &root_scope,
+            &router_args,
+            2,
+            Duration::from_millis(500),
+            Duration::from_secs(3),
+            None,
+        )
+        .await
+        .membership,
         second.membership,
         "replaying a committed operation is idempotent"
     );
@@ -544,6 +636,92 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
         .expect("new route accepts a write");
     assert_eq!(committed_candidate.durable.get("alpha"), Some(41));
     assert_eq!(failed_candidate.durable.get("alpha"), None);
+
+    durable.inject(3, Fault::AfterCommitPark);
+    let accepted_before_timeout = durable.acceptances();
+    let third = replace_with_retry(
+        &router,
+        &root_scope,
+        &router_args,
+        3,
+        Duration::from_millis(500),
+        Duration::from_secs(3),
+        None,
+    )
+    .await;
+    assert_eq!(
+        durable.retry_kinds(3),
+        [CallErrorKind::ResponseTimedOut],
+        "parked accepted request reconciles instead of resending"
+    );
+    assert_eq!(
+        durable.acceptances(),
+        accepted_before_timeout + 1,
+        "response timeout reaches the handler exactly once"
+    );
+    assert_eq!(
+        lookup(&directory)
+            .await
+            .expect("timed-out committed route remains visible")
+            .membership,
+        third.membership
+    );
+    assert_eq!(
+        durable
+            .current
+            .lock()
+            .expect("current mount mutex poisoned")
+            .as_ref()
+            .expect("response-timeout reconciliation records current")
+            .route
+            .membership,
+        third.membership
+    );
+
+    // While operation 3's accepted handler is still parked, occupy the
+    // one-slot mailbox with an idempotent replay. Operation 4 therefore
+    // proves withdrawal with AcceptanceTimedOut before retrying. The gate is
+    // the deterministic observation edge; no timing sleep releases the actor.
+    let (queued_reply, queued_response) = Reply::channel();
+    router
+        .try_send(RouterMessage::Replace {
+            operation: 3,
+            reply: queued_reply,
+        })
+        .expect("empty one-slot mailbox proves no retry was accepted after response timeout");
+    drop(queued_response);
+
+    let acceptance_timeout_observed = ReleaseGate::default();
+    let retry_task = {
+        let router = router.clone();
+        let root_scope = root_scope.clone();
+        let router_args = router_args.clone();
+        let observed = acceptance_timeout_observed.clone();
+        tokio::spawn(async move {
+            replace_with_retry(
+                &router,
+                &root_scope,
+                &router_args,
+                4,
+                Duration::from_millis(500),
+                Duration::from_secs(3),
+                Some(observed),
+            )
+            .await
+        })
+    };
+    acceptance_timeout_observed.wait().await;
+    durable.response_gate.release();
+    let fourth = retry_task.await.expect("retry task remains joinable");
+    assert_eq!(fourth.operation, 4);
+    let fourth_retries = durable.retry_kinds(4);
+    assert!(!fourth_retries.is_empty());
+    assert!(
+        fourth_retries
+            .iter()
+            .all(|kind| *kind == CallErrorKind::AcceptanceTimedOut),
+        "only proven-unaccepted attempts retry without reconciliation"
+    );
 
     system
         .shutdown(Duration::from_secs(1))

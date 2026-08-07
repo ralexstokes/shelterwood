@@ -51,6 +51,11 @@
               inherit cargoArtifacts;
               nativeBuildInputs = [ pkgs.ripgrep ];
               buildPhaseCargoCommand = ''
+                cargo check --locked -p shelterwood --all-targets --no-default-features
+                cargo check --locked -p shelterwood --all-targets --no-default-features --features serde
+                cargo check --locked -p shelterwood --all-targets --no-default-features --features host
+                cargo check --locked -p shelterwood --all-targets --no-default-features --features metrics
+                cargo check --locked -p shelterwood --all-targets --all-features
                 RUSTDOCFLAGS="-Z unstable-options --output-format json" \
                   cargo rustdoc --locked -p shelterwood --all-features --lib
                 cargo run --locked -p shelterwood-api-reachability -- \

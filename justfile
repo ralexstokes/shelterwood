@@ -14,6 +14,13 @@ lint:
 check:
     cargo check --locked --workspace --all-targets --all-features
 
+feature-check:
+    cargo check --locked -p shelterwood --all-targets --no-default-features
+    cargo check --locked -p shelterwood --all-targets --no-default-features --features serde
+    cargo check --locked -p shelterwood --all-targets --no-default-features --features host
+    cargo check --locked -p shelterwood --all-targets --no-default-features --features metrics
+    cargo check --locked -p shelterwood --all-targets --all-features
+
 build:
     cargo build --locked --workspace --all-targets --all-features
 
@@ -39,7 +46,7 @@ nixfmt-check:
 
 # Fast local CI mirror — reuses the local cargo cache and incremental builds.
 # The clean Nix lane retains the explicit all-target build for non-test codegen coverage.
-ci: fmt lint test doc-check runtime-api-check runtime-path-check exit-path-check nixfmt-check
+ci: fmt lint feature-check test doc-check runtime-api-check runtime-path-check exit-path-check nixfmt-check
 
 # Full clean Nix CI lane; use before pushing or when touching Nix files.
 ci-nix:

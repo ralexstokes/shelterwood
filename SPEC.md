@@ -32,7 +32,16 @@ resolution must satisfy).
 Appendices are normative unless marked otherwise and span all parts, with
 Part II surfaces tagged: **A** — default values and bounds; **B** — context,
 handle, error, and event surfaces; **C** — acceptance scenarios and preserved
-patterns.
+patterns; **D** — build, feature, and runtime-boundary constraints.
+
+**Part II readiness marks.** Part II surfaces carry one of three marks after
+M6: *Accepted* means its public shape and observable behavior are normative and
+may be implemented; *Evidence-gated* means the named artifact must decide the
+surface before feature code exists; *Deferred* means it is deliberately absent
+from the current implementation wave. A section containing a gated sub-surface
+is still individually shippable when the accepted surface is complete and the
+gated surface remains explicitly absent. A gate is never an invitation to ship
+a speculative placeholder.
 
 ## Table of contents
 
@@ -66,6 +75,7 @@ patterns.
 - [Appendix A. Normative defaults and bounds](#appendix-a-normative-defaults-and-bounds)
 - [Appendix B. Surface reference](#appendix-b-surface-reference)
 - [Appendix C. Acceptance scenarios](#appendix-c-acceptance-scenarios-informative-in-prose-normative-in-obligation)
+- [Appendix D. Build, feature, and runtime constraints](#appendix-d-build-feature-and-runtime-constraints)
 
 ---
 
@@ -796,10 +806,10 @@ fairness:
    pending delivery);
 2. actor-local continuations (`ctx.continue_with` runs as the *next*
    message), with one fairness exception: immediately after a continuation
-   runs, one ready mailbox/offload delivery gets a turn before the next
+   runs, one ready mailbox/offload/monitor delivery gets a turn before the next
    continuation, so a continuation chain cannot starve external input;
    dropped-continuation reporting on exit is preserved;
-3. mailbox and offload deliveries;
+3. mailbox, offload, and Part II monitor deliveries;
 4. keyed timers.
 
 Tie order within a class is pinned, never select-arm luck (§14.2's
@@ -815,9 +825,9 @@ at the same instant deliver in **arming order** — the order their
 replacement) takes the new position — and the bounded retraction turn
 below runs once for the whole simultaneous batch: messages queued at
 the fire instant deliver first, then the still-armed members of the
-batch in arming order. Within class 3, ordering between mailbox and
-offload deliveries stays deliberately unspecified (§5.1's ordering
-contract promises per-sender FIFO and nothing more).
+batch in arming order. Within class 3, ordering between mailbox, offload, and
+monitor sources stays deliberately unspecified (§5.1's ordering contract
+promises per-sender FIFO and §18 promises FIFO only within one watch).
 
 Already-queued messages get one bounded turn to retract an elapsed timer:
 when a timer fires, the messages queued *at that instant* are delivered
@@ -935,10 +945,12 @@ second method, taxing every actor implementation to type-check a rare
 stage. Within one callback, stage narrowing is value-level; a stage earns a
 context type only by arriving with its own callback. Revisit only if
 value-level checking demonstrably causes a shipped bug. `Rejected`
-outcomes are value-carrying: the rejection returns the owned payload (the
-continuation or timer message, the not-yet-started offload work) to the
-caller rather than dropping it — recovery mirrors B.3's send errors; exact
-types are per-operation, the payload-return property is normative. The
+outcomes use B.3's `SendPayload`-shaped carrier: ordinary context operations
+return `Recovered(payload)`, while a mapped `project` path may return
+`Projected` after its injection consumed the inner value. Thus an unmapped
+rejection returns the continuation or timer message, or the not-yet-started
+offload work, rather than dropping it. Exact types are per-operation; the
+recovery/projected distinction is normative. The
 full per-stage capability matrix is Appendix B.1.
 
 **`for_actor` — same-`Msg` re-entry — is core, and its contract lives
@@ -2488,18 +2500,78 @@ Specified now, built after core ships. Each section is individually
 adoptable and names the hook core already carries for it. Order within this
 part is a suggested sequence, not a dependency chain, except where stated.
 
+M6 leaves no implicit design queue. This table is the implementation ledger;
+the status line in each section is the detailed authority.
+
+| Section | M6 status | Implementation boundary |
+|---|---|---|
+| §15 incarnation refinements | **Accepted / Evidence-gated (M7)** | pinning and next-incarnation wait are accepted; the bounded idempotent-call helper is decided by its M7 re-port |
+| §16 keyed conflation | **Accepted (M8)** | keyed latest-wins only; a priority/control lane is evidence-gated to M12 |
+| §17 message mapping | **Accepted (M7) / Evidence-gated** | `contramap` is accepted; `project` waits for the durability consumer |
+| §18 peer monitoring | **Accepted (M8)** | actor, task, and scope memberships through a separate event source |
+| §19 group strategies | **Accepted (M9)** | one non-merging group cycle through the existing exit funnel |
+| §20 observation extensions | **Accepted (M10)** | cumulative stats, reducer views, and optional metric emission |
+| §21 outline | **Accepted (M11)** | recursive one-shot declarations; opaque restartable interiors |
+| §22 hosting | **Accepted (M11)** | one non-restarting incarnation behind the shared runner |
+| §23 lifetime and timing | **Accepted (M11)** | cross-actor timers, all-of completion, and sibling readiness |
+
 ## 15. Incarnation refinements
+
+**Status: Accepted / Evidence-gated (M7).** Pinning and the
+next-incarnation awaitable are accepted. The repaired shard-store artifact
+(Appendix C) exercises every retry transition and validates the candidate
+`call_idempotent` shape; M7 decides build-or-omit by re-porting that artifact
+onto the candidate API. No general retry helper and no automatic
+reconciliation are implied.
 
 Core already mints `Incarnation` tokens and carries them in events, errors,
 and snapshots (§3.3) — that was the retrofit-hostile half. This adds the
 convenience surface:
 
-- `ActorRef::pinned(incarnation) -> PinnedRef` — sends only to that
-  incarnation and fails fast once it is superseded or terminal. Membership
+```rust
+fn next_incarnation(
+    &self,
+    after: Incarnation,
+    deadline: Duration,
+) -> impl Future<Output = Result<Incarnation, NextIncarnationError>> + Send;
+fn call_idempotent<T: Send + 'static>(
+    &self,
+    make_msg: impl Fn(Reply<T>) -> M + Send + 'static,
+    policy: RetryPolicy,
+    overall_deadline: Duration,
+) -> impl Future<Output = Result<Replied<T>, IdempotentCallError>> + Send;
+```
+
+`PinnedRef<M>` repeats `ActorRef<M>`'s four method signatures and success
+types verbatim; only the additional B.3 `Superseded` outcome varies.
+
+- `ActorRef::pinned(incarnation) -> PinnedRef<M>` — sends only to that
+  incarnation and fails fast once it is not current. `PinnedRef<M>` is a
+  cheap `Clone`, exposes the same `send`, `try_send`, `send_timeout`, and
+  `call` flavors as `ActorRef<M>`, and has `unpinned() -> ActorRef<M>`.
+  A pinned operation may park for backpressure only while that exact
+  incarnation remains live and acceptance-open; it never parks through a
+  rebind. Losing currentness withdraws the operation and returns the new,
+  non-exhaustive `Superseded { pinned, newest_observed }` kind. `pinned` is
+  the requested token; `newest_observed` is the newest token seen for the
+  ref's membership, or `None` when no incarnation is bound. A token from a
+  different membership therefore fails closed as `Superseded` without
+  touching the mailbox. An intake-frozen current incarnation uses ordinary
+  `NotRunning`; terminal membership uses ordinary `Terminated`. Membership
   addressing remains the default; pinning is the explicit refinement.
 - A public awaitable for "the next incarnation after `inc` is running" —
-  the packaged form of §3.3's retry-discipline step 2.
-- `call_idempotent(make_msg, deadline)` — the packaged form of §3.3's
+  the packaged form of §3.3's retry-discipline step 2:
+  `ActorRef::next_incarnation(after, deadline) -> Result<Incarnation,
+  NextIncarnationError>`. It resolves only with a currently bound,
+  acceptance-open incarnation that strictly `supersedes(after)`, immediately
+  if one already exists. The non-exhaustive errors are `Terminated { last }`
+  and `TimedOut`. `last` is the membership's final incarnation, if any. A
+  foreign `after` token can never satisfy `supersedes`; it waits normally and
+  ends only by timeout or membership terminality, keeping the error surface
+  honest rather than inventing a comparison result. The deadline is one
+  trailing budget under Appendix B's zero and boundary rules. Dropping the
+  future only abandons observation.
+- `call_idempotent(make_msg, policy, overall_deadline)` — the packaged form of §3.3's
   retry-discipline steps 1, 2, and 4. Steps 3 (reconcile) and 5 (ledger
   bounds) are application obligations under any surface and stay outside
   it. Decided shape:
@@ -2512,33 +2584,50 @@ convenience surface:
     what choosing this entry point means.
   - One overall deadline budget covers all attempts — binding waits,
     acceptance, response, and inter-attempt delay included [#352].
-    Inter-attempt delay reuses `Backoff` as plain data (§9.2). Each
+    `RetryPolicy { per_attempt, backoff }` is `Clone + Eq` validated plain
+    data; `per_attempt` is non-zero and `backoff` reuses §9.2's `Backoff`.
+    `make_msg` is
+    `Fn(Reply<T>) -> M + Send + 'static`; attempts are sequential inside one
+    `Send` future, so `Sync` is neither needed nor promised. Each
     attempt's inner `call` runs under a **per-attempt slice** — a
     per-attempt duration carried in the same retry-policy data as the
     `Backoff`, clamped to the remaining overall budget. The slice is
     load-bearing, not tuning: with the whole budget as every attempt's
     deadline, `AcceptanceTimedOut` could only ever coincide with overall
     exhaustion, making the retry arm unreachable.
-  - Retry transitions: `AcceptanceTimedOut` retries within budget;
-    `ReplyDropped` first awaits the incarnation-after (the awaitable
-    above), then retries. `ResponseTimedOut` and terminality return
+  - Retry transitions: `AcceptanceTimedOut` records the attempt, applies
+    backoff, and retries within budget; `ReplyDropped` first awaits an
+    acceptance-open incarnation strictly newer than the accepting one, then
+    applies backoff and retries the same operation. `ResponseTimedOut` and
+    terminality return
     immediately: the unsafe retry is unrepresentable, not discouraged —
     the outcome type offers no retry continuation for them.
-  - The terminal error carries the attempt history (each attempt's
-    observed incarnation and where it ended) as data — input for the
+  - The terminal error carries `attempts: Vec<Attempt>` in call order, where
+    `Attempt { incarnation, ended }` and `ended` is `AcceptanceTimedOut |
+    ReplyDropped | ResponseTimedOut | Terminated`. `incarnation` follows
+    B.3's exact observation rules.
+    The non-exhaustive terminal kind is `BudgetExhausted |
+    ResponseTimedOut | Terminated`; expiry during a rebinding wait or backoff
+    adds no fictional attempt. This is input for the
     application's reconciliation and for bounding its idempotency ledger
     (§3.3 steps 3 and 5).
+  - The overall clock starts when the returned future is first polled. An
+    attempt slice is clamped to the remaining budget; if the slice expires
+    after acceptance, the result is the terminal `ResponseTimedOut`, even
+    when overall time remains. If it expires before acceptance, the ordinary
+    withdrawal proof produces the retryable `AcceptanceTimedOut`. Backoff
+    attempt numbering starts at one after the first retryable failure and
+    uses §9.2's runtime jitter source.
   - Boundary with §24: this is a client-side combinator re-sending under
     an explicit capability proof. Nothing buffers, nothing persists, and
     each individual send remains at-most-once (§1 principle 6); it is not
     durable or at-least-once delivery.
-  - Adoption gate, per §16's pattern: the shard-store scenario ports in
-    the core wave and hand-rolls this discipline first (Appendix C); the
-    helper is built by re-porting that retry loop onto it, and the port
-    decides. If the scenario's per-operation ledger bookkeeping cannot
-    live with the synchronous constructor closure acceptably, that
-    artifact justifies the revision (or nothing) — the helper is not
-    built on spec alone.
+  - The repaired shard-store loop is the M6 API artifact: one overall
+    `Instant` budget, clamped attempt slices, a provoked restart for
+    `ReplyDropped`, and an accepted request parked past its response slice.
+    Its response-timeout arm consults the durable journal and never resends;
+    a handler-entry counter plus an immediate empty-one-slot mailbox probe
+    proves exactly one acceptance in that arm without adding §20 feature code.
   - Conformance tests (with this feature): a call failing only with
     `ResponseTimedOut` produces exactly one send attempt — the helper
     never resends after acceptance; and a `ReplyDropped` retry lands only
@@ -2547,11 +2636,33 @@ convenience surface:
 
 Activates the pinning clause of invariant §13.2.
 
+| Retry state | Input | Required transition |
+|---|---|---|
+| Attempting | `AcceptanceTimedOut` | record attempt → bounded backoff → retry with remaining overall budget |
+| Attempting | `ReplyDropped` | record accepting incarnation → await strictly newer acceptance-open incarnation → bounded backoff → retry |
+| Attempting | `ResponseTimedOut` | record attempt → return terminal error; never resend |
+| Attempting | `Terminated` | record attempt → return terminal error |
+| Waiting/backoff | overall budget expires | return `BudgetExhausted`; do not add an attempt |
+| Any | overall budget exhausted before next attempt | return `BudgetExhausted` |
+
 ## 16. Keyed conflation: `latest_by_key`
 
-`latest_by_key(capacity, key_fn)` — conflation per key with a bounded key
+**Status: Accepted (M8).** The keyed mailbox is implementable; a
+first-class control/priority lane is *Evidence-gated (M12)* unless the trading-engine
+acceptance scenario produces contrary evidence.
+
+`latest_by_key(capacity, key_fn)` — a typed extension on `ActorDef<A>` and
+`RawActorDef<M>`, with `K: Eq + Hash + Send + 'static` and
+`key_fn: impl Fn(&M) -> K + Send + Sync + 'static` — provides conflation per key with a bounded key
 set, joining `queue` and `latest` (§5.1; the non-exhaustive mailbox
-constructor is the hook). Semantics: same key replaces in place (counted as
+constructor is the hook). `capacity: KeyedCapacity`, where the plain-data
+enum is `Inherit | Explicit(NonZeroUsize)`; inherited capacity uses the resolved scope/library capacity while
+the actor declaration still selects the keyed kind. The closure stays on the
+typed definition and never enters `CommonOptions`. The key is computed
+synchronously on the sender's acceptance path. A panic propagates on that
+sender stack, the message is not accepted, and it is not an actor exit — the
+same policy as §17's wrap and §20's size observer. Semantics: same key
+replaces in place without refreshing the key's eviction age (counted as
 conflated); a new key at capacity **evicts the oldest key's pending
 message** and accepts — it never blocks and never errors. This is documented
 conflation semantics (newest state wins), and the documentation MUST say so,
@@ -2569,6 +2680,22 @@ public home is §20's statistics — adopting §16 before §20 keeps the
 counter internal (test-observable) until the stats surface lands, so
 neither section depends on the other.
 
+The exact definition methods consume and return the typed definition:
+
+```rust
+fn latest_by_key<K>(
+    self,
+    capacity: KeyedCapacity,
+    key_fn: impl Fn(&M) -> K + Send + Sync + 'static,
+) -> Self
+where
+    K: Eq + Hash + Send + 'static;
+```
+
+`M` is `A::Msg` on `ActorDef<A>` and the raw message type on
+`RawActorDef<M>`. `KeyedCapacity::Explicit` is already non-zero, so the method
+has no deferred validation error.
+
 Decided: documentation-guided — no first-class control/priority lane,
 gated the same way as `project` (§17). If the trading-engine port's
 urgent-control-under-flood pattern cannot be written acceptably with
@@ -2579,6 +2706,10 @@ split is real — a barrier cannot safely share a keyed conflating mailbox
 with replaceable state.
 
 ## 17. Message mapping: `contramap` and `project` [#351]
+
+**Status: Accepted (M7) / Evidence-gated.** `contramap` is accepted; `project` remains
+*Evidence-gated* on a durability consumer that needs provenance-preserving
+context mapping; it is absent until that artifact exists.
 
 Two primitives, preserving identity and fencing semantics of the underlying
 ref. Their settled design decisions are normative for whoever implements
@@ -2611,10 +2742,12 @@ impl<'a, A: Actor + ?Sized> Context<'a, A> {
   *outer* mailbox's; a conflating outer mailbox conflates wrapped
   self-sends (pin with a test). Do not build per-view conflation machinery.
 - `call` needs no special support: the `Reply` rides inside the message.
-- Eager conversion has an error-payload cost, decided: a contramapped
-  ref's send errors carry no recoverable `N` — the wrap already consumed
-  it. Mapped refs surface B.3's boxed projection (id + kind, payload
-  dropped), and B.3's payload-recovery clause is scoped to unmapped refs.
+- Eager conversion has an error-payload cost, decided with one coordinated
+  0.2 surface change. `SendError<M>` carries B.3's `SendPayload<M>`:
+  unmapped ingress always returns `Recovered(M)`, while a contramapped ref
+  returns `Projected` because the wrap consumed `N`. The same carrier is
+  used by mapped-context `Rejected` outcomes. `CallError` is unchanged: a
+  call never promises recovery of the constructed request.
   The alternatives (deferred conversion, a mandatory inverse, `N: Clone`
   on every mapped send) each break a settled rule above — one mailbox
   typed to the outer message, cheap pure wraps.
@@ -2632,24 +2765,68 @@ impl<'a, A: Actor + ?Sized> Context<'a, A> {
 
 ## 18. Peer monitoring
 
+**Status: Accepted (M8).** Watches target actor, task, and scope
+memberships. They are actor-loop input, never user-mailbox entries.
+
 `ctx.watch(&ref, wrap)` (and a cancel-on-drop `watch_scoped`) — where
 `wrap: impl Fn(MonitorEvent) -> A::Msg + Send + Sync + 'static`, the §17
 closure discipline, since a `MonitorEvent` cannot enter an arbitrary
-`Msg` mailbox unmapped — delivers
-`MonitorEvent`s (shape: Appendix B.4) into the watcher's mailbox via a
+`Msg` loop unmapped — queues raw `MonitorEvent`s (shape: Appendix B.4) in a
+**separate event source** via a
 bounded drop-oldest queue per watch (depth: Appendix A); overflow coalesces
 into one `Lagged`; terminal `Removed` is never dropped (it is always
-newest); `Started` carries the `Incarnation`; stale-membership routing uses
-the §3.1 primitive — that primitive and the single publication path are the
-core hooks. Watching an already-running target delivers an immediate
-`Started`; re-registering a watch aliases the existing one without a
-duplicate immediate `Started`. Because immediate restart can outrun an
-external query, transition evidence is available from events without
-keeping application-side history. In core, sibling-failure reaction routes
-through the supervisor (fate-sharing) or lifecycle-stream subscription;
-watch is the in-mailbox refinement.
+newest). The wrap runs only when the actor loop dequeues an event, in §5.2
+priority class 3; monitor delivery counts as received but not accepted.
+Per-watch FIFO is strict. Ordering between different watches and between
+monitor, mailbox, and offload sources in class 3 is deliberately unspecified.
+
+The watch key is `(watcher incarnation, target membership)`. Re-registering
+the same key replaces its wrap and queue exactly like a keyed timer; it does
+not create a duplicate immediate edge. `watch` is owned by the watcher
+incarnation and needs no guard; `watch_scoped` additionally returns B.7's
+cancel-on-drop `Guard`. Explicit `unwatch(target)` and guard cancellation
+linearize at the event queue: after the cancellation point no event can be
+enqueued, and events already queued for that watch are dropped. A cancellation
+racing a dequeue either prevents that dequeue or lets that one already-owned
+event run; it never retracts an actor callback.
+
+Watching a currently live target yields an immediate `Started`; a pre-spawn
+live membership yields no synthetic edge and waits for its first real
+`Started`; an already-terminal membership yields an immediate `Removed` with
+its final incarnation. Actor, task, and scope targets use the same event
+shape and membership fence. Because immediate restart can outrun an external
+query, transition evidence is available without application-side history.
+
+The generic surface is sealed to the three library handle kinds:
+
+```rust
+fn watch<T, W>(&mut self, target: &T, wrap: W) -> Result<(), Rejected<W>>
+where
+    T: WatchTarget, W: Fn(MonitorEvent) -> A::Msg + Send + Sync + 'static;
+fn watch_scoped<T, W>(&mut self, target: &T, wrap: W) -> Result<Guard, Rejected<W>>
+where
+    T: WatchTarget, W: Fn(MonitorEvent) -> A::Msg + Send + Sync + 'static;
+fn unwatch<T: WatchTarget>(&mut self, target: &T) -> bool;
+```
+
+`WatchTarget` is implemented only for `ActorRef<_>`, `TaskRef`, and
+`ScopeRef`; its public methods are sealed so downstream types cannot forge
+membership publication sources. `unwatch` returns whether the key existed.
+
+| Watch state | Operation/event | Result |
+|---|---|---|
+| Absent | register live target | install queue and wrap; enqueue one `Started` |
+| Absent | register pre-spawn target | install only; first real edge arrives later |
+| Absent | register terminal target | install, enqueue `Removed`, then finish watch |
+| Present | re-register same key | replace wrap and queue; no duplicate immediate edge |
+| Present | target edge | enqueue in per-watch FIFO; overflow uses B.4 `Lagged` rules |
+| Present | cancel | close enqueue side and discard queued events at the linearization point |
+| Any | watcher incarnation ends | cancel all its watches |
 
 ## 19. Group strategies: `OneForAll`, `RestForOne`
+
+**Status: Accepted (M9).** Exactly one group cycle may own an affected
+subset; concurrent exits do not merge, widen, or recursively schedule it.
 
 New variants on the non-exhaustive `Strategy` (§9.1). Group restarts drain
 the affected set, re-mint the group cancellation context, and respawn in
@@ -2657,43 +2834,115 @@ declared order. **Every sibling respawn charges the scope intensity budget**
 (§9.2 — stated in core precisely so this section cannot relitigate it).
 Group teardown reuses §10's ladder unchanged; the exit funnel's
 mode-dispatch (§10) is the hook — group drain is a `Draining { scope:
-subset, reason }` mode, not a second dispatch path. Decided edges: a
-group respawn re-runs only restartable members — one-shot members
-(structurally `Never`) are terminally removed by the group restart per
-their §8 retention and do not block it, and other `Never` members
-likewise stay down. The triggering child's own `Backoff` delays the whole
+subset, reason }` mode, not a second dispatch path. Decided edges: a group
+cycle triggers only when the failing child **would restart under
+`OneForOne`**. A `Never` or structurally one-shot failure never starts one.
+`OneForAll` affects the failing membership plus every other resident
+restartable member. `RestForOne` affects the failing membership plus later
+**resident restartable** members in declaration order. Tombstones never
+revive; apart from the trigger, only live or already-restarting memberships
+enter the subset. One-shot and other `Never` members stay down and do not
+block it. The triggering child's own `Backoff` delays the whole
 group respawn; siblings' attempt counters do not advance (every respawn
 still charges intensity, §9.2). Intensity is charged **atomically**: all
 forced respawns of one group restart are charged together, before any
 member respawns — if the batch trips the budget, the scope fails without
 a partial respawn. Exits arriving while the group drains are recorded by
 the funnel but schedule nothing and charge nothing (mode dispatch, §10) —
-they are part of the drain. Respawn is declared-order and
-readiness-gated, exactly like ordered startup (§6). Activates the group
+they are part of the drain. Exits from outside the chosen subset are recorded
+but processed only after the funnel returns to `Running`; they never merge
+with or widen the active subset. A readiness failure during group respawn is
+an ordinary child exit and re-enters this same funnel after the current cycle
+completes. Respawn is declared-order and readiness-gated, exactly like
+ordered startup (§6).
+
+“Re-mint the group cancellation context” means each member receives its
+ordinary freshly minted, incarnation-fenced shutdown and abort tokens for
+each respawn, so a straggler from the prior cycle is stale-fenced. There is no
+shared public group token and no token survives the cycle. Activates the group
 clause of invariant §13.9.
+
+| Funnel state | Input | Decision/effect | Next state |
+|---|---|---|---|
+| Running | child exit that would not restart | ordinary §9 handling; no group | Running/terminal |
+| Running | restartable child exit | freeze exact affected subset; batch-charge intensity; begin §10 drain | GroupDrain or terminal |
+| GroupDrain | any exit | record against frozen cycle; never widen | GroupDrain |
+| GroupDrain | subset joined | arm the triggering child's backoff for the whole respawn | GroupBackoff |
+| GroupBackoff | outside-subset exit | record for later ordinary processing | GroupBackoff |
+| GroupBackoff | triggering backoff due | respawn frozen restartable memberships in declaration order, readiness-gated | GroupStart |
+| GroupStart | readiness/exit | finish this one cycle; queue outcome through ordinary funnel | Running |
+| Running | recorded outside exit | process as a fresh ordinary input | policy result |
 
 ## 20. Observation extensions
 
+**Status: Accepted (M10).** Statistics are membership-cumulative,
+saturating `u64` values; reducers recover from loss by replacing state from
+authoritative snapshots.
+
 All adapters over core's two streams and identity types:
 
-- **Actor statistics** (field inventory: Appendix B.6): readable per
-  membership; per-incarnation attribution distinguishable via §3.3;
-  recursive scope-wide stats resolve through typed child metadata, not
-  attachment scans [#362]. Brings `message_size` observation with it,
-  added as a typed actor-spec extension — the measurer is code, so it
+```text
+ActorRef::stats(&self) -> ActorStatsSnapshot
+ScopeRef::stats_recursive(&self) -> Vec<RecursiveActorStats>
+ScopeRef::observe_children(&self) -> ChildObserver
+ChildObserver::next(&mut self) -> Future<Option<ChildObservation>>
+  ChildObservation = Reset { snapshot, dropped }
+                   | Changed { snapshot, cause: LifecycleEvent }
+ScopeRef::restart_counts(&self) -> RestartCounter
+RestartCounter::next(&mut self) -> Future<Option<RestartCount>>
+  RestartCount { total, delta, resynced }
+```
+
+Both receivers close at scope-membership terminality after emitting the final
+state. They are library-owned `Send` receivers and expose no runtime stream
+type.
+
+- **Actor statistics** (field inventory: Appendix B.6):
+  `ActorRef::stats()` performs an on-demand read. Values are cumulative for
+  the membership and the result is stamped with the currently observed
+  `Incarnation`, if one is bound. Per-incarnation attribution is obtained by
+  differencing two token-fenced snapshots; there is no second counter bank.
+  `ScopeRef::stats_recursive()` returns rows containing child path/id, kind,
+  membership, observed incarnation, and stats. It resolves through typed
+  child metadata, not attachment scans [#362]. `message_size(impl Fn(&M) ->
+  usize + Send + Sync + 'static)` is a typed actor-definition extension. The
+  measurer runs on the sender's acceptance path and follows the same panic
+  policy as §17's wrap and §16's key extractor. It is code, so it
   lives outside §8's plain-data options record, exactly like §16's key
   extractor (§8's extractor boundary).
 - **Child observation** — self-recovering reducer projection that resets
-  with a full snapshot after lag; consumers never see a raw `Lagged`, they
-  see a reset carrying the fresh snapshot and the dropped count.
+  with a full snapshot after lag. `ScopeRef::observe_children()` starts with
+  `Reset { snapshot, dropped: 0 }`, then yields `Changed { snapshot, cause }`;
+  on lag it reads a fresh authoritative snapshot and emits only
+  `Reset { snapshot, dropped }`. Consumers never see raw `Lagged`.
 - **Packaged restart-counter view** — subscription plus cumulative total
-  that survives `Lagged`, deduplicated, making breaker patterns turnkey
-  without hand-carried totals.
+  that survives `Lagged`, deduplicated. `ScopeRef::restart_counts()` yields
+  `{ total, delta, resynced }`; `total` always comes from
+  `ScopeSnapshot.total_restarts`, `delta` is the saturating difference from
+  the prior emitted total, and a reset sets `resynced = true`. Thus loss can
+  neither double-charge nor hide the authoritative cumulative value.
 - **`metrics` feature** — optional metric emission from the same single
   choke point as `tracing`; the debugging surface exposes structured
   snapshots rather than name-filtered tuples.
 
+Counter increments are exact:
+
+| Input | `accepted` | `received` | `conflated` | `evicted` | bytes |
+|---|---:|---:|---:|---:|---:|
+| FIFO or non-replacing conflating message accepted | +1 | 0 | 0 | 0 | measured message size |
+| mailbox message dequeued by actor loop | 0 | +1 | 0 | 0 | 0 |
+| `latest` or keyed same-key replacement | +1 | 0 | +1 | 0 | replacement bytes |
+| keyed new-key eviction | +1 | 0 | 0 | +1 | accepted bytes |
+| offload/timer/monitor delivery dequeued | 0 | +1 | 0 | 0 | 0 |
+| ingress rejection | 0 | 0 | 0 | 0 | 0; `sends_rejected` +1 |
+
+The metrics facade exports only B.6's stable name/label/unit table.
+
 ## 21. Outline (`serde` feature)
+
+**Status: Accepted (M11).** Restartable subtree factories are never
+invoked by outlining; their interiors are explicitly `Opaque`. One-shot
+subtrees are recursively outlined.
 
 **Purpose.** The outline is a policy-drift fingerprint: a serializable,
 injective projection of a tree's *resolved* declaration, capturing
@@ -2723,11 +2972,41 @@ outline carries** — the policy and topology fields below — MUST serialize
 differently. Injectivity is over that surface, not over code: per the
 non-goals above, two trees identical in outline may still differ in spawn
 outcome through the implementations, closures, or args they carry.
+`Tree::outline(&self) -> Result<Outline, OutlineError>` is a pure borrow: it
+does not require a runtime, spawn, run actor/task code, or invoke a restartable
+subtree factory. `OutlineError::UnfilledReservations { paths }` is the only
+construction-time error and reports every unresolved child path.
+
+```text
+Outline { root: ScopeOutline }
+ScopeOutline { kind, strategy: Option<Strategy>, intensity,
+               defaults: ResolvedScopeDefaults, children: Vec<ChildOutline> }
+ChildOutline { id, kind, restart, shutdown, readiness, retention,
+               mailbox: Option<ResolvedMailbox>,
+               interior: Option<OutlineInterior> }
+OutlineInterior = Recursive(ScopeOutline) | Opaque
+```
+
+All named policy fields use their public §8/§9 plain-data types; `Option` is
+present only where the child kind makes a field inapplicable, never to mean an
+unresolved default. Children retain declaration order. `DynamicTree` exposes
+the same borrowing method for a dynamic root declaration.
+
 The outline carries, per scope: kind,
 strategy (ordered only), intensity, and every scope default including
 mailbox capacity; per child: kind, id, restart condition + backoff,
 shutdown policy, readiness mode + deadline, terminal-membership retention,
-and (actors) mailbox kind + capacity. Outlines reject unknown fields and
+and (actors) mailbox kind + capacity. Each subtree row additionally has
+`interior: Recursive(ScopeOutline) | Opaque`. A concrete one-shot subtree is
+`Recursive`; a restartable subtree is always `Opaque`, even if invoking its
+factory would appear cheap or deterministic. The parent row still carries
+all of its id/kind/restart/backoff/shutdown/readiness/retention policy.
+This asymmetry is intentional and user-visible: policy drift *inside* a
+restartable factory cannot be fingerprinted by this format. A future
+plain-data declarative tree description that could close that gap is
+*Deferred* and is not smuggled into `Tree`.
+
+Outlines reject unknown fields and
 missing required fields on deserialization, so schema drift is loud. Ship
 it complete on first release — the unknown-fields discipline makes late
 field additions wire breaks for persisted outlines; this completeness
@@ -2736,27 +3015,129 @@ the loud-failure property. Activates invariant §13.11.
 
 ## 22. Hosting (`host` feature)
 
-Exposes running incarnations without a supervisor, using the **same**
+**Status: Accepted (M11).** The feature exposes exactly one structurally
+non-restarting incarnation through the shared runner; it is not a miniature
+supervisor.
+
+The `host` module exposes running incarnations without a supervisor, using the **same**
 incarnation runner as supervised execution — that single runner is the core
 hook (§7): same exit type (including `Panicked`, so hosted users never
 hand-write `catch_unwind`), same readiness handling, same teardown
 ordering. It is the seam for embedding and for a future
-`!Send`/thread-per-core mode. Activates the hosted-parity clause of
-invariant §13.7.
+`!Send`/thread-per-core mode.
+
+The typed surface is:
+
+```text
+Hosted::<A>::spawn(args, options)
+    -> Result<(ActorRef<A::Msg>, HostedHandle), HostError>
+HostedRaw::<M>::spawn(raw_actor, options)
+    -> Result<(ActorRef<M>, HostedHandle), HostError>
+HostedTask::spawn(task_factory, options)
+    -> Result<(TaskRef, HostedHandle), HostError>
+
+HostedHandle::wait_ready(&self) -> Result<(), HostedReadyError>
+HostedHandle::shutdown(self, grace) -> Result<Exit, ShutdownTimeout>
+HostedHandle::wait(self) -> Exit
+```
+
+`HostOptions` is validated plain data: mailbox (actor/raw only), readiness
+mode and deadline, child shutdown policy, and shutdown grace. It has no
+restart strategy, restart condition, intensity, retention, child id, or
+scope defaults. The hosted membership and incarnation are genuine tokens
+minted by the ordinary fencing primitive beneath a degenerate root; they are
+not sentinels. Exactly one incarnation may run and any exit is terminal.
+
+`HostedHandle` is the non-`Clone`, `#[must_use]` owner. Drop requests graceful
+shutdown using the configured grace. `wait_ready` observes the ordinary
+readiness gate under the configured readiness deadline; `shutdown(grace)` overrides the configured drop grace for
+that consuming operation, applies the ordinary cooperative/escalation
+ladder, fully joins, and returns the actual `Exit`. `wait` fully joins a
+natural or externally requested exit. The actor, raw actor, and task forms
+have the same exit classification, panic containment, cancellation order,
+and readiness behavior as supervised incarnations. Activates the
+hosted-parity clause of invariant §13.7.
 
 ## 23. Lifetime and timing conveniences
+
+**Status: Accepted (M11).** Cross-actor timers reuse B.7's existing
+`Guard`; completion is all-of only; sibling waits are scope-relative.
 
 - **Cross-actor delayed delivery** (`send_after_to` / `interval_to`): a
   mailbox-semantics facility (capacity and conflation apply), owned by the
   sender's incarnation via a `Guard` (Appendix B.7), and the only
-  spawned-task timer path (§5.3).
+  spawned-task timer path (§5.3). `send_after_to(target, message, delay)`
+  parks using full `send` semantics after the delay; zero delay schedules an
+  immediate ordinary turn, never a synchronous send. `interval_to(target,
+  message, period)` requires `M: Clone`, rejects a zero period eagerly, first
+  fires after one period, and uses `try_send`: a full or temporarily
+  non-running target skips that tick and no tick is queued for catch-up.
+  Terminal target membership finishes the guard. Cancellation linearizes at
+  mailbox acceptance: if cancel wins, an unaccepted parked send is withdrawn;
+  if acceptance wins, that delivered message is beyond the timer's ownership.
+
+  ```rust
+  fn send_after_to<M: Send + 'static>(
+      &mut self,
+      target: &ActorRef<M>,
+      message: M,
+      after: Duration,
+  ) -> Result<Guard, Rejected<M>>;
+  fn interval_to<M: Clone + Send + 'static>(
+      &mut self,
+      target: &ActorRef<M>,
+      message: M,
+      period: Duration,
+  ) -> Result<Guard, Rejected<M>>;
+  ```
+
+  `Rejected` distinguishes `Draining` from `ZeroPeriod`; unmapped calls
+  recover the message through B.3. A zero `after` is accepted, not rejected.
 - **Completion-driven lifetime**: bind the root's lifetime to selected
   child completions ("run until these tasks finish, then shut down") for
-  finite/batch applications; composes `OneShotTaskRef` awaitables with
-  `shutdown()`.
+  finite/batch applications. `System::run_until_all(tasks, grace)` consumes
+  the owner and accepts `TaskRef`s, not owning `OneShotTaskRef` result
+  capabilities. It awaits membership-terminal `TaskRef::wait()` for **all**
+  inputs, then requests root shutdown with the explicit grace. Any-of is
+  ordinary user `select`, not a second helper. Its result contains input-order
+  `TaskCompletion { membership, exit }` rows and
+  `shutdown: Result<(), ShutdownTimeout>`; task exits are never hidden by a
+  shutdown timeout.
+
+  ```text
+  System::run_until_all(self, tasks: impl IntoIterator<Item = TaskRef>, grace)
+      -> Future<Output = RunUntilAllResult>
+  RunUntilAllResult { tasks: Vec<TaskCompletion>,
+                      shutdown: Result<(), ShutdownTimeout> }
+  TaskCompletion { membership, exit }
+  ```
 - **Sibling-readiness barrier**: first-class support for a child awaiting a
   *named sibling's* readiness (a scope-relative readiness barrier),
-  replacing offload-the-wait plumbing.
+  replacing offload-the-wait plumbing:
+  `ctx.await_sibling_ready(id, deadline) -> Result<ChildSnapshot,
+  SiblingReadyError>`. Lookup is relative to `ctx.scope()` and is by id;
+  callers fence reuse with the returned membership. In an ordered scope,
+  waiting on self or a later declared sibling fails immediately with
+  `WouldDeadlock`; an earlier sibling is legal and an undeclared id fails
+  `UnknownSibling`. In a dynamic scope any id, including one not currently
+  resident, remains pending for later admission exactly like B.9
+  `wait_for_child`. Other errors are `TimedOut` and
+  `ScopeTerminated { state }`.
+
+| Cross-actor timer state | Event | Transition |
+|---|---|---|
+| Armed | cancel / sender incarnation ends | finish; enqueue nothing |
+| Armed delay | deadline | begin one mailbox `send`, preserving cancellation withdrawal |
+| Sending delay | accepted | finish; later handler delivery is not retractable |
+| Sending delay | target terminal | finish |
+| Armed interval | tick | one `try_send`; accepted or skipped, then arm next period |
+| Armed interval | target terminal | finish |
+
+| Completion state | Event | Transition |
+|---|---|---|
+| Waiting | selected task terminalizes | record its membership and exit; continue |
+| Waiting | all selected tasks recorded (empty included) | request root shutdown with `grace` |
+| Shutting down | root joins | return every task row plus shutdown outcome |
 
 ---
 
@@ -2811,6 +3192,8 @@ marked *(II)* ship with the named Part II feature.
 | Control/command channel | **64**, floored to 1 | Internal; awaited insertion commands (`add_*`/`define`) only — shutdown requests and `remove` ride level latches (§10, §11), lossless |
 | Snapshot channel | conflating watch, capacity 1 | Structural |
 | `call` / `send_timeout` deadline | **none — always explicit** | One budget per call (§5.1); zero deadline fails immediately |
+| `call_idempotent` retry policy *(II §15)* | **none — always explicit** | Non-zero per-attempt slice, backoff, and one explicit overall deadline |
+| Cross-actor interval period *(II §23)* | **none — always explicit** | Zero rejected; first tick after one full period |
 | Identity counters | `u64`, saturating | Fail-closed overflow, decided once in the fencing primitive (§3.1); lifecycle `seq`/`lifecycle_seq` mint through the same primitive (B.4's exhaustion rule) |
 | Far-future clamp | timer arithmetic saturates to a far-future instant | Instead of panicking on `Instant + Duration` overflow |
 
@@ -2888,6 +3271,7 @@ the same series during shutdown drain; **Stop** = `StopContext<'_, A>` in
 | Keyed timers: `set_timeout` / `set_interval` / `clear_timer` (§5.3) | ✓ | ✓ | **R** | — |
 | `send_after_to` / `interval_to` *(II §23)* | ✓ | ✓ | **R** | — |
 | `watch` / `watch_scoped` *(II §18)* | ✓ | ✓ | **R** | — |
+| `await_sibling_ready` *(II §23)* | ✓ | ✓ | **R** | — |
 | `offload` / `offload_scoped` (§5.5) | ✓ | ✓ | **R** | — |
 | Re-entry/mapping: `for_actor` (same-`Msg`, core); `project` *(II §17)* | — | ✓ | ✓ | `for_actor` only |
 
@@ -2912,20 +3296,27 @@ state change).
 ### B.3 Send/call errors
 
 ```text
-SendError<M> { actor_id, incarnation_observed: Option<Incarnation>, message: M, kind }
+SendPayload<M> = Recovered(M) | Projected
+SendError<M> { actor_id, incarnation_observed: Option<Incarnation>, payload: SendPayload<M>, kind }
+  into_message(self) -> Option<M>              // Some only for Recovered
   kind: NotRunning   — membership currently not accepting (rebind window,
                        or intake frozen at stop — §5.1); try_send only
         Full         — FIFO at capacity; try_send only (conflating mailboxes accept instead)
-        Terminated   — membership terminal; the only failure `send` can return
+        Terminated   — membership terminal; the only failure unpinned `send` can return
         TimedOut     — send_timeout only; reported post-withdrawal:
                        guaranteed-not-accepted, message recovered (§5.1)
-  (message recoverable; a boxed projection drops the payload but keeps id + kind)
+        Superseded { pinned, newest_observed }   — pinned ref is no longer current (II §15)
+
+Rejected<P> { payload: SendPayload<P>, kind }  // stage rejection (§5.4)
+  kind: Draining | ZeroPeriod                  // ZeroPeriod only for II §23 interval
+  into_payload(self) -> Option<P>              // Some only for Recovered
 
 CallError { actor_id, incarnation_observed: Option<Incarnation>, kind }
   kind: Terminated          — terminal before acceptance
         AcceptanceTimedOut  — deadline hit before acceptance: guaranteed-not-accepted, safe retry
         ResponseTimedOut    — deadline hit after acceptance: unknown outcome — reconcile (§3.3)
         ReplyDropped        — handler dropped the Reply unanswered (what conflation-away looks like)
+        Superseded { pinned, newest_observed }   — pinned ref lost currentness (II §15)
 
 ReplyReceiver::recv(self, deadline) → Result<T, ReplyError { Dropped | Timeout }>
   (trailing deadline covers the response wait only — acceptance evidence
@@ -2935,6 +3326,14 @@ ReplyReceiver::recv(self, deadline) → Result<T, ReplyError { Dropped | Timeout
 Success values carry identity too: `send` / `try_send` / `send_timeout`
 resolve to the accepting `Incarnation`; `call` exposes the accepting
 incarnation alongside `T` (§3.3).
+
+Part II §15 adds `NextIncarnationError = Terminated { last:
+Option<Incarnation> } | TimedOut` and `IdempotentCallError { attempts:
+Vec<Attempt>, kind }`, where `Attempt { incarnation: Option<Incarnation>,
+ended: AcceptanceTimedOut | ReplyDropped | ResponseTimedOut | Terminated }`
+and `kind = BudgetExhausted | ResponseTimedOut |
+Terminated`. `RetryPolicy { per_attempt, backoff }` is validated, `Clone +
+Eq`, and rejects zero `per_attempt`.
 
 `incarnation_observed` is pinned per kind, not best-effort — the §3.3
 retry discipline consumes it:
@@ -2964,11 +3363,13 @@ is composed by choosing a longer deadline, not by a second `recv`.
 Dropping the receiver unawaited discards the value only; `Reply::send`
 stays infallible either way (§5.1).
 
-All error enums are non-exhaustive. `send` ↔ flavor mapping is normative:
-`send` fails only `Terminated`; `try_send` never `TimedOut`. The
-payload-recovery clause is scoped to unmapped refs: a contramapped ref
-*(II §17)* always surfaces the boxed projection — the wrap consumed the
-caller's payload at ingress.
+All error enums are non-exhaustive. `SendPayload` is exhaustive so callers can
+handle the coordinated 0.2 recovery change completely. `send` ↔ flavor
+mapping is normative: an unpinned `send` fails only `Terminated`; `try_send`
+never `TimedOut`. **Every unmapped send failure carries `Recovered(M)`** and
+`into_message` returns `Some(M)`. A contramapped ref *(II §17)* carries
+`Projected` because eager injection consumed the caller's value. Mapping does
+not alter `CallError`.
 
 ### B.4 Events
 
@@ -3102,16 +3503,18 @@ Ordering and delivery contract:
 **Monitor events** *(II §18)*:
 
 ```text
-MonitorEvent { member_id, kind }
+MonitorEvent { member_id, member_kind: Actor | Task | Scope, membership, kind }
   kind: Started { incarnation }
         Exited  { incarnation, exit }        // the §7 exit type
         Lagged  { dropped }                  // resync point, not an edge
         Removed { last_incarnation: Option<Incarnation> }   // terminal; None = never started
 ```
 
-Delivery semantics: §18 (bounded drop-oldest per watch; coalesced `Lagged`
-kept at the front; `Removed` never dropped; immediate `Started` on watching
-a running target; re-registration aliases).
+Delivery semantics: §18 (separate class-3 event source; wrap at dequeue;
+bounded drop-oldest per watch; coalesced `Lagged` kept at the front;
+`Removed` never dropped; immediate `Started` only for a currently live
+target; immediate `Removed` for a terminal target; re-registration replaces
+the wrap and queue). The event is received-but-not-accepted in B.6 statistics.
 
 ### B.5 The exit type
 
@@ -3221,14 +3624,38 @@ ScopeSnapshot   { state: Unstarted                              // membership ex
                                                          //   absent (§3.2)
                 + child(id), descendant(path) traversal helpers
 
-ActorStats (II §20)
-                { messages_received, messages_accepted, messages_conflated,
+ActorStatsSnapshot (II §20)
+                { membership, observed_incarnation: Option<Incarnation>, stats }
+ActorStats      { messages_received, messages_accepted, messages_conflated,
                   messages_evicted,                      // cross-key evictions (§16)
                   message_bytes_accepted: Option<u64>, sends_rejected,
                   outstanding_offloads, mailbox_depth, mailbox_capacity }
-                — per membership; per-incarnation attribution distinguishable via §3.3;
-                recursive scope-wide stats resolve through typed child metadata (§20)
+                — all counters membership-cumulative saturating u64; gauges are
+                  sampled current values. `message_bytes_accepted` is None when
+                  no size observer is installed. Per-incarnation attribution is
+                  the difference between snapshots fenced by their observed
+                  tokens; no second counters exist.
+RecursiveActorStats
+                { path, id, kind: Actor | RawActor, membership,
+                  observed_incarnation: Option<Incarnation>, stats }
+                — returned by `ScopeRef::stats_recursive()` through typed child
+                  metadata, in snapshot child order (§20)
 ```
+
+With the `metrics` feature, every instrument has labels `scope.path`,
+`actor.id`, and `actor.membership`; names and units are stable:
+
+| Instrument | Kind | Unit/source |
+|---|---|---|
+| `shelterwood.actor.messages_accepted` | counter | messages / `messages_accepted` |
+| `shelterwood.actor.messages_received` | counter | messages / `messages_received` |
+| `shelterwood.actor.messages_conflated` | counter | messages / `messages_conflated` |
+| `shelterwood.actor.messages_evicted` | counter | messages / `messages_evicted` |
+| `shelterwood.actor.message_bytes_accepted` | counter | bytes / enabled size observer |
+| `shelterwood.actor.sends_rejected` | counter | operations / `sends_rejected` |
+| `shelterwood.actor.outstanding_offloads` | gauge | operations / current value |
+| `shelterwood.actor.mailbox_depth` | gauge | messages / current value |
+| `shelterwood.actor.mailbox_capacity` | gauge | messages / resolved capacity |
 
 ### B.7 Guards
 
@@ -3314,11 +3741,15 @@ implied on all; error/outcome types are B.3 and B.8):
   dispatch), `wait_started()`, `start_or_shutdown()`, `wait()` (resolves
   with the root's terminal reason, §11),
   `shutdown(timeout)` (§11); not `Clone`, `#[must_use]`, drop = request
-  graceful shutdown.
+  graceful shutdown; consuming `run_until_all(tasks, grace)` *(II §23)*.
 - **`ActorRef<M>`**: cheap `Clone`, membership-addressed (§2); `send` /
   `try_send` / `send_timeout` (each resolving to the accepting
   `Incarnation`) and `call` per §5.1, error and success shapes per B.3;
-  `contramap` *(II §17)*, `pinned` *(II §15)*.
+  `contramap` *(II §17)*; `pinned`, `next_incarnation`, and
+  `call_idempotent` *(II §15)*; `stats` *(II §20)*.
+- **`PinnedRef<M>`** *(II §15)*: cheap `Clone`, the same four ingress
+  flavors as `ActorRef<M>`, fail-fast `Superseded` fencing, and
+  `unpinned() -> ActorRef<M>`.
 - **`ScopeRef`**: `snapshot()`, `subscribe_snapshots()` (conflating
   watch), `subscribe_lifecycle()` (B.4), the `wait_for_child` helper
   (contract below), `child(id)` / `descendant(path)` traversal (B.6),
@@ -3356,8 +3787,9 @@ implied on all; error/outcome types are B.3 and B.8):
   (`Stopped { reason: NeverStarted }` for a scope membership that
   never spawned — §3.2, B.6); observing one
   incarnation's transient stop is the event stream's job (B.4
-  `ScopeState`), not this helper's. `dynamic()` as the runtime
-  downgrade query (§11).
+  `ScopeState`), not this helper's. `dynamic()` as the runtime downgrade
+  query (§11); `stats_recursive()`, `observe_children()`, and
+  `restart_counts()` *(II §20)*.
 - **`DynamicScopeRef`**: everything on `ScopeRef`, plus the eight add
   entry points (§8, the raw pair included; resolving at admission, B.8),
   the `reserve_*`
@@ -3373,6 +3805,9 @@ implied on all; error/outcome types are B.3 and B.8):
   discarded, §5.1); `channel()` split (§5.1); drop
   observed by the caller as `ReplyDropped`. **`ReplyReceiver<T>`**:
   owned, non-`Clone`, consuming `recv(deadline)` — contract in B.3.
+- **`HostedHandle`** *(II §22)*: non-`Clone`, `#[must_use]`; `wait_ready`,
+  consuming `shutdown`, consuming `wait`; drop = configured graceful
+  shutdown. The `host` module's typed, raw, and task constructors are §22.
 - **Cancellation tokens** (`shutdown_token()`, `abort_token()`,
   `run_blocking`'s child token): library-owned; `is_cancelled()`,
   awaitable `cancelled()`; derivation and detach-past-abort per §5.5.
@@ -3460,16 +3895,20 @@ cheap).
   deliberately not `Ord`: cross-scope and cross-membership comparison
   has no meaning and fails closed.
 - **Non-owning handles** — `ActorRef<M>`, `TaskRef`, `ScopeRef`,
-  `DynamicScopeRef`, snapshot receivers, lifecycle subscriptions:
+  `DynamicScopeRef`, snapshot receivers, lifecycle subscriptions, and Part II
+  observation reducers:
   `Send + Sync`; the refs additionally cheap `Clone` with `Eq` + `Hash`
   **by membership identity** — two handles to one membership compare
   equal and collide as map keys, which is what makes userland
   registries and routing tables ordinary code.
+- **Pinned actor handles** — `PinnedRef<M>`: cheap `Clone + Send + Sync`.
+  If `Eq`/`Hash` are exposed they use `(membership, pinned incarnation)`,
+  never membership alone; §15 does not require those comparison traits.
 - **Cancellation tokens** (B.9 — `shutdown_token()`, `abort_token()`,
   `run_blocking`'s child token): `Clone + Send + Sync` — they are held
   across awaits inside `Send`-declared callback futures (§4.1) and
   handed into blocking closures (§5.5).
-- **Owned, at-most-once values** — `System`, slots, `OneShotTaskRef<T>`,
+- **Owned, at-most-once values** — `System`, `HostedHandle`, slots, `OneShotTaskRef<T>`,
   `Reply<T>`, `ReplyReceiver<T>`, `Guard`: `Send`, not `Clone`; `Sync`
   is not promised (they are moved, not shared). `System` is
   `#[must_use]`. (`mark_ready()` is deliberately not here: its
@@ -3488,7 +3927,7 @@ cheap).
   `Guard::cancel`/`detach` (B.7), `Reply::send`, `ReplyReceiver::recv`
   (B.3), the `OneShotTaskRef`
   await, slot `define`, `System::shutdown` / `start_or_shutdown` /
-  `wait`. Probes and observers take `&self`. A conforming surface MUST
+  `wait` / `run_until_all`, and `HostedHandle::shutdown` / `wait`. Probes and observers take `&self`. A conforming surface MUST
   NOT re-shape a consuming operation as `&self` plus a runtime
   already-used error.
 
@@ -3514,9 +3953,16 @@ conflation, outlines, metrics) and port in full alongside it.
    mount → readiness → directory cutover → exact-handle retire, with
    idempotent operation ids, compensating cleanup, a durable abort path,
    and post-commit reconciliation. Fault injection covers pre-commit crash
-   and post-commit reply loss; the script proves accepted-request
-   quiescence, the crash-window fence, and reconcile-or-rollback for each
-   outcome. This scenario is the reason receipts (§3.2), incarnation
+   and post-commit reply loss. The M6 repair additionally hand-rolls §15's
+   retry table with one overall `Instant` budget and clamped attempt slices:
+   `AcceptanceTimedOut` retries, `ReplyDropped` first observes a strictly
+   superseding live incarnation, and `ResponseTimedOut` reconciles the durable
+   journal without resending. Deterministic gates provoke the restart and park
+   an accepted handler beyond its response slice; a handler-entry counter plus
+   an immediate empty-one-slot mailbox probe proves that response timeout
+   produced exactly one acceptance. The script proves
+   accepted-request quiescence, the crash-window fence, and
+   reconcile-or-rollback for each outcome. This scenario is the reason receipts (§3.2), incarnation
    tokens and the retry discipline (§3.3), idempotent/exact-handle removal
    (§11), and the replacement-membership boundary (§3.4) exist.
 2. **Sidecar — task-first embedding in a host-owned process.** Four plain
@@ -3556,6 +4002,19 @@ conflation, outlines, metrics) and port in full alongside it.
    `RestForOne` scope flavors and peer watches join with Part II §18/§19;
    the core port uses `OneForOne` scopes and lifecycle subscriptions.)
 
+**M6 compile-spike findings.** Throwaway, type-only trading-engine and
+build-farm skeletons were checked against the candidate shapes and then
+discarded; they are not a retained probe suite. The trading skeleton confirmed
+that typed keyed-mailbox extractors, `contramap`, all-three-kind watch targets,
+membership-cumulative stats, and the restart reducer compose without a
+registry or priority lane. The build-farm skeleton confirmed that keeping
+`TaskRef` as the non-owning completion input while retaining the separate
+owned `OneShotTaskRef<T>` result capability makes `run_until_all` compose;
+outlining by shared borrow before `Tree::spawn` avoids consuming or invoking
+declaration code. It also exposed the outline asymmetry now made normative:
+restartable factory interiors cannot be inspected without executing code and
+must serialize as `Opaque`.
+
 **Patterns that must remain expressible** (they composed well in the origin
 and later designs must not regress them): slot-before-define wiring for
 reference cycles; incarnation-owned offloads completing through the actor
@@ -3566,3 +4025,71 @@ children plus exact-handle removal; `continue_with` rehydration;
 holding a `Reply` to model a pending acknowledgement; received/conflated
 statistics; rebuilding a single-use `Tree` from retained host state for
 re-embedding.
+
+---
+
+## Appendix D. Build, feature, and runtime constraints
+
+This appendix restores the build/runtime seam referenced throughout the
+specification. It is normative and changes only with the implementation and
+its enforcement in the same patch.
+
+### D.1 Part II Cargo features
+
+The library feature graph is deliberately flat:
+
+```toml
+[features]
+default = []
+serde = ["dep:serde"]
+host = []
+metrics = ["dep:metrics"]
+```
+
+No Part II feature enables another, and none is default. `serde` controls only
+§21 and derives on policy/outline data needed by it. `host` controls only the
+§22 module and needs no optional dependency. `metrics` controls only §20's
+facade and its `metrics` dependency. Public core types remain reachable and
+semantically identical in every combination.
+
+The local `just` mirror and authoritative Nix check run these locked feature
+lanes whenever the first feature declaration lands, and must stay in sync:
+
+1. `shelterwood` with no default features;
+2. each of `serde`, `host`, and `metrics` alone with no defaults;
+3. all features together.
+
+The ordinary workspace all-features lint, test, documentation, and API checks
+remain in addition to this matrix. A feature lane may compile an empty
+implementation boundary before its section lands; it may not expose a
+placeholder public API that contradicts the accepted section.
+
+### D.2 Toolchain and language boundary
+
+The repository's stable implementation toolchain is the exact
+`rust-toolchain.toml` channel (`1.97.1` at M6). Stable library and test code
+must compile there. Nightly is used only by explicitly named formatting,
+linting, and rustdoc-JSON enforcement recipes; no nightly-only language or
+library feature may leak into implementation or public API. The crate's
+`rust-version` matches the stable channel, and changing either updates both
+in one patch.
+
+### D.3 Runtime boundary
+
+All runtime coupling is private and concentrated in `src/runtime.rs`:
+
+1. public APIs expose `std::time::{Duration, Instant}` and library-owned
+   futures, streams, guards, and cancellation tokens — never `tokio`,
+   `tokio_util`, or another executor's types;
+2. outside the runtime seam, production source does not name `tokio`,
+   `tokio_util`, or the runtime jitter provider directly;
+3. the seam owns spawning, time, cancellation plumbing, panic-join
+   translation, and jitter selection required by the engine;
+4. runtime absence is translated to B.8 `BuildError::NoRuntime`, never a
+   public executor error or an ambient panic.
+
+`tools/check-runtime-paths.sh` enforces the path restriction;
+`shelterwood-api-reachability` over rustdoc JSON enforces public-type
+reachability. Both run in the local and Nix lanes. A future scheduler seam is
+internal only (§24); relaxing this appendix requires its performance evidence
+and a coordinated spec/enforcement change.

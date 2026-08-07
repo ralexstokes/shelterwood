@@ -307,8 +307,7 @@ pub(crate) struct MemberRecord {
 pub(crate) struct MemberCell {
     id: ChildId,
     membership: Membership,
-    record: Mutex<MemberRecord>,
-    changed: Signal,
+    record: runtime::WatchSender<MemberRecord>,
     mailbox: Mutex<Option<Arc<dyn MailboxControl>>>,
     options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
     pub(crate) removal: Latch,
@@ -316,20 +315,20 @@ pub(crate) struct MemberCell {
 
 impl MemberCell {
     pub(crate) fn new(id: ChildId, membership: Membership) -> Arc<Self> {
+        let (record, _) = runtime::watch(MemberRecord {
+            stage: MemberStage::Reserved,
+            incarnation: None,
+            last_incarnation: None,
+            last_exit: None,
+            restart_count: 0,
+            restart_at: None,
+            removing: false,
+            startup_aborted: false,
+        });
         Arc::new(Self {
             id,
             membership,
-            record: Mutex::new(MemberRecord {
-                stage: MemberStage::Reserved,
-                incarnation: None,
-                last_incarnation: None,
-                last_exit: None,
-                restart_count: 0,
-                restart_at: None,
-                removing: false,
-                startup_aborted: false,
-            }),
-            changed: Signal::default(),
+            record,
             mailbox: Mutex::new(None),
             options: Mutex::new(None),
             removal: Latch::default(),
@@ -345,17 +344,15 @@ impl MemberCell {
     }
 
     pub(crate) fn record(&self) -> MemberRecord {
-        self.record.lock().expect("member mutex poisoned").clone()
+        self.record.read_cloned()
     }
 
     pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
-        update(&mut self.record.lock().expect("member mutex poisoned"));
-        self.changed.pulse();
+        self.record.send_modify(update);
     }
 
     fn update_locked(&self, update: impl FnOnce(&mut MemberRecord)) {
-        update(&mut self.record.lock().expect("member mutex poisoned"));
-        self.changed.pulse();
+        self.record.send_modify(update);
     }
 
     pub(crate) fn set_options(&self, options: crate::policy::ResolvedCommonOptions) {
@@ -396,8 +393,7 @@ impl MemberCell {
     }
 
     pub(crate) fn terminalize(&self, exit: Exit) {
-        let changed = {
-            let mut record = self.record.lock().expect("member mutex poisoned");
+        let _ = self.record.send_if_modified(|record| {
             if matches!(record.stage, MemberStage::Terminal(_)) {
                 false
             } else {
@@ -405,27 +401,25 @@ impl MemberCell {
                 record.restart_at = None;
                 record.last_exit = Some(exit.clone());
                 record.stage = MemberStage::Terminal(exit);
+                // Complete mailbox terminality before watch wakes can expose
+                // the terminal member record.
+                if let Some(mailbox) = self.mailbox() {
+                    mailbox.terminate();
+                    let stats = mailbox.stats();
+                    debug_assert!(stats.delivered <= stats.accepted);
+                    debug_assert!(stats.conflated <= stats.accepted);
+                    debug_assert!(stats.depth <= stats.capacity);
+                    let _ = stats.sends_rejected;
+                }
                 true
             }
-        };
-        if !changed {
-            return;
-        }
-        if let Some(mailbox) = self.mailbox() {
-            mailbox.terminate();
-            let stats = mailbox.stats();
-            debug_assert!(stats.delivered <= stats.accepted);
-            debug_assert!(stats.conflated <= stats.accepted);
-            debug_assert!(stats.depth <= stats.capacity);
-            let _ = stats.sends_rejected;
-        }
-        self.changed.pulse();
+        });
     }
 
     pub(crate) async fn wait_terminal(&self) -> Exit {
-        let mut watcher = self.changed.watcher();
+        let mut watcher = self.record.watcher();
         loop {
-            if let MemberStage::Terminal(exit) = self.record().stage {
+            if let MemberStage::Terminal(exit) = watcher.borrow_cloned().stage {
                 return exit;
             }
             watcher.changed().await;
@@ -612,7 +606,7 @@ impl ScopeCell {
         }
         record.state = state.clone();
         drop(record);
-        self.member.changed.pulse();
+        self.member.record.pulse();
         self.emit_locked(LifecycleEventKind::ScopeState { state });
     }
 
@@ -902,7 +896,7 @@ impl ScopeCell {
         if record.startup.is_none() {
             record.startup = Some(startup);
             drop(record);
-            self.member.changed.pulse();
+            self.member.record.pulse();
         }
     }
 
@@ -912,7 +906,7 @@ impl ScopeCell {
         control.live = true;
         let epoch = control.current_epoch;
         drop(control);
-        self.member.changed.pulse();
+        self.member.record.pulse();
         epoch
     }
 
@@ -962,7 +956,7 @@ impl ScopeCell {
             }
         }
         drop(control);
-        self.member.changed.pulse();
+        self.member.record.pulse();
         self.emit_locked(LifecycleEventKind::ScopeState { state });
         if terminal {
             self.close_observation_locked();
@@ -989,7 +983,7 @@ impl ScopeCell {
                 record.state = state.clone();
             }
             self.member.terminalize(exit);
-            self.member.changed.pulse();
+            self.member.record.pulse();
             self.emit_locked(LifecycleEventKind::ScopeState { state });
             self.close_observation_locked();
         }
@@ -1012,7 +1006,7 @@ impl ScopeCell {
             });
         }
         drop(control);
-        self.member.changed.pulse();
+        self.member.record.pulse();
         target
     }
 
@@ -1036,7 +1030,7 @@ impl ScopeCell {
             });
         }
         drop(control);
-        self.member.changed.pulse();
+        self.member.record.pulse();
     }
 
     fn take_force_request(&self, epoch: u64) -> bool {
@@ -1124,7 +1118,7 @@ impl ScopeCell {
             .current_dynamic
             .lock()
             .expect("scope dynamic-control mutex poisoned") = control;
-        self.member.changed.pulse();
+        self.member.record.pulse();
     }
 
     fn dynamic(&self) -> Option<Arc<DynamicControl>> {
@@ -1134,12 +1128,12 @@ impl ScopeCell {
             .clone()
     }
 
-    pub(crate) fn signal(&self) -> &Signal {
-        &self.member.changed
+    pub(crate) fn signal(&self) -> &runtime::WatchSender<MemberRecord> {
+        &self.member.record
     }
 
     pub(crate) async fn wait_started(&self) -> Result<(), StartupError> {
-        let mut watcher = self.member.changed.watcher();
+        let mut watcher = self.member.record.watcher();
         loop {
             if let Some(result) = self.record().startup {
                 return result;
@@ -1177,7 +1171,7 @@ impl ScopeCell {
                 reason: StopReason::NeverStarted,
             };
         }
-        self.member.changed.pulse();
+        self.member.record.pulse();
         self.emit_locked(LifecycleEventKind::ScopeState {
             state: ScopeState::Stopped {
                 reason: StopReason::NeverStarted,
@@ -3578,7 +3572,7 @@ mod tests {
         });
         let waker = Waker::from(Arc::clone(&probe));
         let mut context = Context::from_waker(&waker);
-        let mut watcher = member.changed.watcher();
+        let mut watcher = member.record.watcher();
         let mut changed = Box::pin(watcher.changed());
         assert!(changed.as_mut().poll(&mut context).is_pending());
 

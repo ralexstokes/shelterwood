@@ -1,6 +1,7 @@
 //! The only boundary between the library and its async runtime.
 
 use std::{
+    fmt,
     future::Future,
     ops::RangeBounds,
     sync::{
@@ -11,7 +12,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{Notify, mpsc, oneshot},
+    sync::{Notify, broadcast, mpsc, oneshot, watch},
     task, time,
 };
 
@@ -111,6 +112,170 @@ impl<T> OneShotReceiver<T> {
     #[cfg(test)]
     pub(crate) fn try_receive(&mut self) -> Option<T> {
         self.0.try_recv().ok()
+    }
+}
+
+/// Publishing half of a runtime-backed conflating state channel.
+pub(crate) struct WatchSender<T>(watch::Sender<T>);
+
+/// Observing half of a runtime-backed conflating state channel.
+pub(crate) struct WatchReceiver<T>(watch::Receiver<T>);
+
+pub(crate) fn watch<T>(initial: T) -> (WatchSender<T>, WatchReceiver<T>) {
+    let (sender, receiver) = watch::channel(initial);
+    (WatchSender(sender), WatchReceiver(receiver))
+}
+
+impl<T> WatchSender<T> {
+    pub(crate) fn watcher(&self) -> WatchReceiver<T> {
+        WatchReceiver(self.0.subscribe())
+    }
+
+    pub(crate) fn receiver_count(&self) -> usize {
+        self.0.receiver_count()
+    }
+
+    pub(crate) fn pulse(&self) {
+        self.0.send_modify(|_| {});
+    }
+
+    pub(crate) fn send_modify(&self, update: impl FnOnce(&mut T)) {
+        self.0.send_modify(update);
+    }
+
+    pub(crate) fn send_if_modified(&self, update: impl FnOnce(&mut T) -> bool) -> bool {
+        self.0.send_if_modified(update)
+    }
+
+    pub(crate) fn replace(&self, value: T) {
+        self.0.send_replace(value);
+    }
+}
+
+impl<T: Clone> WatchSender<T> {
+    pub(crate) fn read_cloned(&self) -> T {
+        self.0.borrow().clone()
+    }
+}
+
+impl<T> Clone for WatchReceiver<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> WatchReceiver<T> {
+    pub(crate) async fn changed(&mut self) {
+        let _ = self.0.changed().await;
+    }
+
+    pub(crate) async fn changed_or_closed(&mut self) -> bool {
+        self.0.changed().await.is_ok()
+    }
+}
+
+impl<T: Clone> WatchReceiver<T> {
+    pub(crate) fn borrow_cloned(&self) -> T {
+        self.0.borrow().clone()
+    }
+
+    pub(crate) fn borrow_and_update_cloned(&mut self) -> T {
+        self.0.borrow_and_update().clone()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for WatchSender<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WatchSender")
+            .field("value", &*self.0.borrow())
+            .field("receivers", &self.0.receiver_count())
+            .finish()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for WatchReceiver<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WatchReceiver")
+            .field("value", &*self.0.borrow())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of receiving from a runtime-backed broadcast channel.
+pub(crate) enum BroadcastReceive<T> {
+    Item(T),
+    Empty,
+    Closed,
+    Lagged(u64),
+}
+
+/// Publishing half of a bounded runtime-backed broadcast channel.
+pub(crate) struct BroadcastSender<T>(broadcast::Sender<T>);
+
+/// Per-subscriber receiving half of a bounded runtime-backed broadcast channel.
+pub(crate) struct BroadcastReceiver<T>(broadcast::Receiver<T>);
+
+pub(crate) fn broadcast<T: Clone>(capacity: usize) -> (BroadcastSender<T>, BroadcastReceiver<T>) {
+    let (sender, receiver) = broadcast::channel(capacity);
+    (BroadcastSender(sender), BroadcastReceiver(receiver))
+}
+
+impl<T: Clone> BroadcastSender<T> {
+    pub(crate) fn subscribe(&self) -> BroadcastReceiver<T> {
+        BroadcastReceiver(self.0.subscribe())
+    }
+
+    pub(crate) fn send(&self, value: T) -> Result<usize, T> {
+        self.0.send(value).map_err(|error| error.0)
+    }
+
+    pub(crate) fn receiver_count(&self) -> usize {
+        self.0.receiver_count()
+    }
+}
+
+impl<T: Clone> BroadcastReceiver<T> {
+    pub(crate) async fn receive(&mut self) -> BroadcastReceive<T> {
+        match self.0.recv().await {
+            Ok(value) => BroadcastReceive::Item(value),
+            Err(broadcast::error::RecvError::Closed) => BroadcastReceive::Closed,
+            Err(broadcast::error::RecvError::Lagged(dropped)) => BroadcastReceive::Lagged(dropped),
+        }
+    }
+
+    pub(crate) fn try_receive(&mut self) -> BroadcastReceive<T> {
+        match self.0.try_recv() {
+            Ok(value) => BroadcastReceive::Item(value),
+            Err(broadcast::error::TryRecvError::Empty) => BroadcastReceive::Empty,
+            Err(broadcast::error::TryRecvError::Closed) => BroadcastReceive::Closed,
+            Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
+                BroadcastReceive::Lagged(dropped)
+            }
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<T> fmt::Debug for BroadcastSender<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BroadcastSender")
+            .field("receivers", &self.0.receiver_count())
+            .finish()
+    }
+}
+
+impl<T> fmt::Debug for BroadcastReceiver<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BroadcastReceiver")
+            .field("queued", &self.0.len())
+            .finish()
     }
 }
 

@@ -354,6 +354,10 @@ impl Drop for ScopePlan {
                 scope.terminalize_never_started();
             }
         }
+        // Lowering can publish the planned children before ScopeRuntime takes
+        // ownership. If construction then unwinds, the plan fallback also
+        // owns those residencies and their matching Removed edges.
+        self.root.clear_residents();
         self.root.terminalize_never_started();
     }
 }

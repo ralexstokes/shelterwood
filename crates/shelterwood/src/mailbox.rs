@@ -1623,15 +1623,18 @@ mod tests {
     }
 
     #[test]
-    fn promotion_wakes_every_sender_when_one_waker_panics() {
+    fn promotion_wakes_every_sender_when_multiple_wakers_panic() {
         let (mailbox, actor) = actor();
         let mut first = Box::pin(actor.send(1));
         let mut second = Box::pin(actor.send(2));
-        let panicking = Waker::from(Arc::new(PanicWake));
+        let mut third = Box::pin(actor.send(3));
+        let first_panicking = Waker::from(Arc::new(PanicWake));
+        let second_panicking = Waker::from(Arc::new(PanicWake));
         let wakes = Arc::new(AtomicUsize::new(0));
         let counting = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
-        park_with(&mut first, &panicking);
-        park_with(&mut second, &counting);
+        park_with(&mut first, &first_panicking);
+        park_with(&mut second, &second_panicking);
+        park_with(&mut third, &counting);
         MailboxControl::configure(&*mailbox, Mailbox::default());
         let mut generations = {
             let mut identity = ScopeIdentity::new().expect("scope identity available");
@@ -1658,18 +1661,25 @@ mod tests {
                 .poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Ok(_))
         ));
+        assert!(matches!(
+            third.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(_))
+        ));
     }
 
     #[test]
-    fn termination_discharge_reaches_every_sender_when_one_waker_panics() {
+    fn termination_discharge_reaches_every_sender_when_multiple_wakers_panic() {
         let (mailbox, actor) = actor();
         let mut first = Box::pin(actor.send(1));
         let mut second = Box::pin(actor.send(2));
-        let panicking = Waker::from(Arc::new(PanicWake));
+        let mut third = Box::pin(actor.send(3));
+        let first_panicking = Waker::from(Arc::new(PanicWake));
+        let second_panicking = Waker::from(Arc::new(PanicWake));
         let wakes = Arc::new(AtomicUsize::new(0));
         let counting = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
-        park_with(&mut first, &panicking);
-        park_with(&mut second, &counting);
+        park_with(&mut first, &first_panicking);
+        park_with(&mut second, &second_panicking);
+        park_with(&mut third, &counting);
 
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -1678,7 +1688,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
-        for future in [&mut first, &mut second] {
+        for future in [&mut first, &mut second, &mut third] {
             let Poll::Ready(Err(error)) = future
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))

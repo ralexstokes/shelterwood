@@ -1135,7 +1135,7 @@ impl ScopeCell {
         });
     }
 
-    fn clear_residents(&self) {
+    pub(crate) fn clear_residents(&self) {
         let _gate = OBSERVATION_GATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1785,26 +1785,34 @@ struct ChildRuntime {
 
 impl ChildRuntime {
     fn from_plan(plan: ChildPlan, scope: &Arc<ScopeCell>) -> Self {
+        let ChildPlan {
+            slot,
+            construction,
+            options,
+        } = plan;
+        // Arm terminality before any fallible setup. If a poisoned lock or
+        // mailbox callback unwinds construction, this child has already left
+        // ScopePlan and therefore needs its own synchronous fallback.
+        let terminality = Obligation::new(
+            ChildTerminality {
+                root: Arc::clone(scope),
+                slot: Arc::clone(&slot),
+            },
+            discharge_child_terminality,
+        );
         let incarnations = scope
             .child_identity
             .lock()
             .expect("scope identity mutex poisoned")
-            .incarnation_counter(plan.slot.member.membership());
-        if let Some(mailbox) = plan.slot.member.mailbox() {
-            mailbox.configure(plan.options.mailbox);
+            .incarnation_counter(slot.member.membership());
+        if let Some(mailbox) = slot.member.mailbox() {
+            mailbox.configure(options.mailbox);
         }
-        let slot = plan.slot;
         Self {
-            terminality: Obligation::new(
-                ChildTerminality {
-                    root: Arc::clone(scope),
-                    slot: Arc::clone(&slot),
-                },
-                discharge_child_terminality,
-            ),
+            terminality,
             slot,
-            construction: Some(plan.construction),
-            options: plan.options,
+            construction: Some(construction),
+            options,
             incarnations,
             restarts: RestartState::new(),
             active: None,
@@ -3101,10 +3109,15 @@ async fn run_scope_incarnation(
             .map(|child| Arc::clone(&child.slot))
             .collect(),
     );
-    let children = std::mem::take(&mut plan.children)
-        .into_iter()
-        .map(|child| ChildRuntime::from_plan(child, &root))
-        .collect();
+    // Transfer children one at a time. The not-yet-converted suffix remains
+    // owned by ScopePlan, while ChildRuntime::from_plan arms the current
+    // child's obligation before fallible setup. Thus a panic at any point has
+    // exactly one terminality owner for every child.
+    let mut children = Vec::with_capacity(plan.children.len());
+    plan.children.reverse();
+    while let Some(child) = plan.children.pop() {
+        children.push(ChildRuntime::from_plan(child, &root));
+    }
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
         flavor: plan.flavor,
@@ -3341,12 +3354,19 @@ enum Pending {
 
 #[cfg(test)]
 mod tests {
-    use std::{future, future::Future, sync::Arc, task::Poll, time::Duration};
+    use std::{
+        future,
+        future::Future,
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::Arc,
+        task::{Context, Poll, Waker},
+        time::Duration,
+    };
 
     use crate::{
         ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind,
         LifecycleItem, LifecycleTryRecvError, Readiness, RemoveOutcome, ScopeState, SendErrorKind,
-        StopReason, TaskDef, Tree,
+        StopReason, SubtreeOnceDef, TaskDef, Tree,
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
@@ -3485,6 +3505,125 @@ mod tests {
             Err(crate::StartupError::ShutdownRequested)
         );
         assert_eq!(root.wait_stopped().await, StopReason::NeverStarted);
+    }
+
+    #[crate::runtime::test]
+    async fn dropped_unpolled_scope_plan_terminalizes_nested_declarations() {
+        let mut inner = Tree::new();
+        let leaf = inner
+            .add_task("leaf", TaskDef::new(|_| future::pending()))
+            .expect("valid nested task");
+        let mut outer = Tree::new();
+        let nested = outer
+            .add_subtree_once("nested", SubtreeOnceDef::new(inner))
+            .expect("valid nested scope");
+        let mut snapshots = nested.subscribe_snapshots();
+        let mut events = nested.subscribe_lifecycle();
+        let plan = lower_tree_for_test(outer);
+
+        drop(plan);
+
+        assert_eq!(nested.wait_stopped().await, StopReason::NeverStarted);
+        snapshots
+            .changed()
+            .await
+            .expect("the final nested snapshot is delivered before closure");
+        assert!(matches!(
+            snapshots.borrow_latest().state,
+            ScopeState::Stopped {
+                reason: StopReason::NeverStarted
+            }
+        ));
+        assert!(snapshots.changed().await.is_err());
+        assert!(matches!(leaf.wait().await.kind(), ExitKind::NeverStarted));
+        let mut saw_stopped = false;
+        while let Some(item) = events.recv().await {
+            saw_stopped |= matches!(
+                item,
+                LifecycleItem::Event(crate::LifecycleEvent {
+                    kind: LifecycleEventKind::ScopeState {
+                        state: ScopeState::Stopped {
+                            reason: StopReason::NeverStarted
+                        }
+                    },
+                    ..
+                })
+            );
+        }
+        assert!(
+            saw_stopped,
+            "nested observation closes after its final event"
+        );
+    }
+
+    #[crate::runtime::test]
+    async fn scope_plan_conversion_panic_terminalizes_every_child() {
+        let mut tree = Tree::new();
+        for id in ["first", "second"] {
+            tree.add_task(id, TaskDef::new(|_| future::pending()))
+                .expect("valid task");
+        }
+        let plan = lower_tree_for_test(tree);
+        let root = Arc::clone(&plan.root);
+        let mut events = root.subscribe_lifecycle();
+        let children: Vec<_> = plan
+            .children
+            .iter()
+            .map(|child| Arc::clone(&child.slot.member))
+            .collect();
+        let epoch = root.begin_incarnation();
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _identity = root
+                    .child_identity
+                    .lock()
+                    .expect("scope identity mutex starts healthy");
+                panic!("inject child conversion failure");
+            }))
+            .is_err()
+        );
+
+        let mut driver = Box::pin(run_scope_incarnation(
+            plan, false, None, None, None, None, epoch,
+        ));
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut context = Context::from_waker(Waker::noop());
+                let _ = driver.as_mut().poll(&mut context);
+            }))
+            .is_err()
+        );
+        drop(driver);
+
+        for child in children {
+            assert!(
+                matches!(child.record().stage, MemberStage::Terminal(_)),
+                "every transferred or pending child must terminalize"
+            );
+        }
+        assert_eq!(
+            root.wait_started().await,
+            Err(crate::StartupError::ShutdownRequested)
+        );
+        assert_eq!(root.wait_stopped().await, StopReason::NeverStarted);
+        assert!(
+            root.snapshot().children.is_empty(),
+            "the fallback must release every admitted residency"
+        );
+        let mut removed = 0;
+        while let Some(item) = events.recv().await {
+            if matches!(
+                item,
+                LifecycleItem::Event(crate::LifecycleEvent {
+                    kind: LifecycleEventKind::Removed { .. },
+                    ..
+                })
+            ) {
+                removed += 1;
+            }
+        }
+        assert_eq!(removed, 2, "every Added edge needs a matching Removed edge");
     }
 
     #[test]
@@ -3627,9 +3766,33 @@ mod tests {
             record.last_incarnation = Some(first);
             record.last_exit = Some(Exit::new(ExitKind::Completed, false));
         });
+        scope.set_state(ScopeState::Stopped {
+            reason: StopReason::Finished,
+        });
 
         assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(matches!(
+            events.try_recv(),
+            Ok(LifecycleItem::Event(crate::LifecycleEvent {
+                kind: LifecycleEventKind::ScopeState {
+                    state: ScopeState::Stopped {
+                        reason: StopReason::Finished
+                    }
+                },
+                ..
+            }))
+        ));
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+        snapshots
+            .changed()
+            .await
+            .expect("the prior incarnation's final snapshot remains observable");
+        assert!(matches!(
+            snapshots.borrow_latest().state,
+            ScopeState::Stopped {
+                reason: StopReason::Finished
+            }
+        ));
         assert!(snapshots.changed().await.is_err());
     }
 

@@ -354,14 +354,19 @@ impl<T> OneShotTaskRef<T> {
         Self { completion, task }
     }
 
-    /// Consumes the claim and waits for the typed value or terminal exit.
+    /// Consumes the claim and waits for the authoritative terminal verdict.
+    ///
+    /// The typed value is released only when terminal publication classifies
+    /// the membership as [`crate::ExitKind::Completed`]. Any competing
+    /// failure, panic, abort, readiness timeout, or never-started verdict wins
+    /// even if the task body produced a value first.
     pub async fn wait(self) -> Result<T, Exit> {
         let Self { completion, task } = self;
-        if let Some(value) = completion.receive().await {
-            Ok(value)
-        } else {
-            Err(task.wait().await)
+        let exit = task.wait().await;
+        if !matches!(exit.kind(), crate::ExitKind::Completed) {
+            return Err(exit);
         }
+        completion.receive().await.ok_or(exit)
     }
 }
 

@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crate::common::LiveFlag;
 use shelterwood::{
-    BuildError, DynamicTree, ExitKind, Readiness, RemoveOutcome, StopReason, TaskDef, TaskOnceDef,
-    Tree,
+    BuildError, DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, RemoveOutcome,
+    Shutdown, StopReason, TaskDef, TaskOnceDef, Tree,
 };
 
 #[test]
@@ -114,6 +114,108 @@ async fn one_shot_completion_finishes_an_ordered_root() {
     assert_eq!(completion.wait().await.expect("task completed"), 42);
     assert!(matches!(task.wait().await.kind(), ExitKind::Completed));
     assert_eq!(system.wait().await, StopReason::Finished);
+}
+
+#[tokio::test]
+async fn one_shot_completion_reports_failure_and_panic_verdicts() {
+    let mut failed_tree = Tree::new();
+    let (_task, failed) = failed_tree
+        .add_task_once(
+            "failed",
+            TaskOnceDef::<u8>::new(|_| async { Err(ExitError::message("failed")) }),
+        )
+        .expect("valid declaration");
+    let failed_system = failed_tree.spawn().expect("runtime is available");
+    assert!(matches!(
+        failed
+            .wait()
+            .await
+            .expect_err("failure has no value")
+            .kind(),
+        ExitKind::Failed(_)
+    ));
+    assert_eq!(failed_system.wait().await, StopReason::Finished);
+
+    let mut panicked_tree = Tree::new();
+    let (_task, panicked) = panicked_tree
+        .add_task_once(
+            "panicked",
+            TaskOnceDef::<u8>::new(|_| async { panic!("one-shot panic") }),
+        )
+        .expect("valid declaration");
+    let panicked_system = panicked_tree.spawn().expect("runtime is available");
+    assert!(matches!(
+        panicked
+            .wait()
+            .await
+            .expect_err("panic has no value")
+            .kind(),
+        ExitKind::Panicked { .. }
+    ));
+    assert_eq!(panicked_system.wait().await, StopReason::Finished);
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_shot_completion_reports_abort_verdict() {
+    let mut tree = Tree::new();
+    let (_task, completion) = tree
+        .add_task_once(
+            "aborted",
+            TaskOnceDef::<u8>::new(|_| std::future::pending()).shutdown(Shutdown::Abort),
+        )
+        .expect("valid declaration");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("task starts");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("forced shutdown joins the task");
+
+    assert!(matches!(
+        completion
+            .wait()
+            .await
+            .expect_err("aborted task has no value")
+            .kind(),
+        ExitKind::Aborted { .. }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_shot_value_cannot_override_readiness_timeout_verdict() {
+    let readiness_width = Duration::from_secs(10);
+    let mut tree = Tree::new();
+    let (_task, completion) = tree
+        .add_task_once(
+            "late-value",
+            TaskOnceDef::new(|context| async move {
+                context.shutdown_token().cancelled().await;
+                Ok::<_, ExitError>(42_u8)
+            })
+            .shutdown(Shutdown::Abort)
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .readiness_deadline(
+                ReadinessDeadline::bounded(readiness_width).expect("non-zero deadline"),
+            ),
+        )
+        .expect("valid declaration");
+    let system = tree.spawn().expect("runtime is available");
+
+    tokio::time::advance(readiness_width).await;
+    assert!(matches!(
+        completion
+            .wait()
+            .await
+            .expect_err("the readiness verdict wins over the returned value")
+            .kind(),
+        ExitKind::ReadinessTimedOut { .. }
+    ));
+    assert!(system.wait_started().await.is_err());
+    system
+        .shutdown(Duration::ZERO)
+        .await
+        .expect("terminal task leaves no straggler");
 }
 
 #[tokio::test]

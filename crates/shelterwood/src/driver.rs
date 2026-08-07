@@ -2078,7 +2078,6 @@ impl ScopeRuntime {
                         abort: abort.clone(),
                         ready: ready.clone(),
                         local_stop: local_stop.clone(),
-                        readiness_override: child.options.readiness_override,
                         mailbox_shutdown: child.options.mailbox_shutdown,
                     },
                 },
@@ -2208,11 +2207,15 @@ impl ScopeRuntime {
         let nested_abort_ack = framework_abort_ack.clone();
         let constructed_sender = self.events.clone();
         let run_release = construction_release.clone();
+        let child_readiness_override = child.options.readiness_override;
         let handle = runtime::spawn(incarnation, async move {
             let result = match body {
                 SpawnBody::Raw { spawn, context } => {
                     let instance = spawn.construct();
-                    let readiness = instance.readiness();
+                    let readiness = match child_readiness_override {
+                        Some(readiness) => readiness,
+                        None => instance.readiness(),
+                    };
                     let _ = runtime::mpsc_send(
                         &constructed_sender,
                         DriverEvent::Child(ChildEvent::Constructed {
@@ -2223,7 +2226,7 @@ impl ScopeRuntime {
                     )
                     .await;
                     run_release.fired().await;
-                    instance.run(context).await
+                    instance.run(context, readiness).await
                 }
                 SpawnBody::TaskRestartable(factory) => {
                     let future = factory(task_context);
@@ -2542,7 +2545,7 @@ impl ScopeRuntime {
         }
     }
 
-    fn handle_constructed(&mut self, index: usize, incarnation: Incarnation, declared: Readiness) {
+    fn handle_constructed(&mut self, index: usize, incarnation: Incarnation, readiness: Readiness) {
         let mut became_ready = false;
         let mut deadline_to_arm = None;
         {
@@ -2557,7 +2560,6 @@ impl ScopeRuntime {
                 active.construction_release.fire();
                 return;
             }
-            let readiness = child.options.readiness_override.unwrap_or(declared);
             if readiness == Readiness::Immediate {
                 active.readiness = ReadinessGate::Immediate;
                 active.ready_signal.fire();

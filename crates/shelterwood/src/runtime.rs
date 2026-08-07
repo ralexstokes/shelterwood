@@ -122,6 +122,11 @@ pub(crate) async fn sleep(duration: Duration) {
     time::sleep(duration).await;
 }
 
+#[cfg(test)]
+pub(crate) async fn yield_now() {
+    task::yield_now().await;
+}
+
 pub(crate) async fn sleep_until_std(deadline: std::time::Instant) {
     time::sleep_until(time::Instant::from_std(deadline)).await;
 }

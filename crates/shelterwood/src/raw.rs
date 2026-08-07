@@ -501,10 +501,14 @@ impl<M> TimerStore<M> {
 
     fn entry_mut(&mut self, arming_order: u64) -> Option<&mut TimerEntry<M>> {
         let hash = *self.armings.get(&arming_order)?;
-        self.keyed
-            .get_mut(&hash)?
+        let entry = self
+            .keyed
+            .get_mut(&hash)
+            .expect("an arming index must reference a key bucket")
             .iter_mut()
             .find(|entry| entry.arming_order == arming_order)
+            .expect("an arming index must reference a timer");
+        Some(entry)
     }
 
     fn take_due(&mut self, now: Instant) -> VecDeque<u64> {
@@ -1299,33 +1303,27 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     fn deliver_timer(&mut self, arming: u64) -> Option<M> {
-        let interval = self.resources.timers.entry_mut(arming)?.period.is_some();
-        if !interval {
-            let entry = self.resources.timers.remove_arming(arming)?;
-            let TimerMessage::Once(message) = entry.message else {
-                unreachable!("a non-interval timer must own a one-shot message")
-            };
-            return message;
-        }
-
-        let (message, deadline) = {
-            let entry = self
-                .resources
-                .timers
-                .entry_mut(arming)
-                .expect("the interval timer remains registered");
-            let period = entry
-                .period
-                .expect("an interval timer must retain its period");
+        let entry = self.resources.timers.entry_mut(arming)?;
+        if let Some(period) = entry.period {
             let deadline = crate::deadline::Deadline::after(crate::driver::now(), period).instant();
             entry.deadline = deadline;
             let TimerMessage::Interval(make_message) = &entry.message else {
                 unreachable!("an interval timer must own a message factory")
             };
-            (make_message(), deadline)
+            let message = make_message();
+            self.resources.timers.arm_deadline(arming, deadline);
+            return Some(message);
+        }
+
+        let entry = self
+            .resources
+            .timers
+            .remove_arming(arming)
+            .expect("a due one-shot timer remains registered");
+        let TimerMessage::Once(message) = entry.message else {
+            unreachable!("a non-interval timer must own a one-shot message")
         };
-        self.resources.timers.arm_deadline(arming, deadline);
-        Some(message)
+        message
     }
 
     fn next_timer_deadline(&self) -> Option<Instant> {

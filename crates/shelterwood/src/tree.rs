@@ -14,8 +14,9 @@ use std::{
 
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId, DefaultsInheritance, Exit, Intensity, IntensityTrip,
-    Membership, ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults, Shutdown,
-    ShutdownTimeout, StartupFailure, Strategy,
+    LifecycleEvents, Membership, ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults,
+    ScopeSnapshot, Shutdown, ShutdownTimeout, SnapshotReceiver, StartupFailure, Strategy,
+    WaitError,
     driver::{DynamicReservation, Latch, MemberCell, ScopeCell},
     identity::ScopeIdentity,
     mailbox::MailboxCell,
@@ -45,27 +46,6 @@ pub enum StopReason {
     StartupFailed(StartupFailure),
     /// The membership terminalized without an incarnation.
     NeverStarted,
-}
-
-/// Current state of one scope incarnation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ScopeState {
-    /// The membership exists but no incarnation has run.
-    Unstarted,
-    /// Initial children are starting.
-    Starting,
-    /// Aggregate readiness has completed.
-    Running,
-    /// A root startup failed and its started members remain supervised.
-    StartupFailed,
-    /// Teardown is in progress.
-    Draining,
-    /// This incarnation has stopped.
-    Stopped {
-        /// Structured terminal reason.
-        reason: StopReason,
-    },
 }
 
 /// Failure of the root startup barrier.
@@ -278,6 +258,8 @@ impl BuilderCore {
         inherited: ResolvedDefaults,
         root_override: Option<Arc<ScopeCell>>,
     ) -> Result<ScopePlan, Vec<Vec<ChildId>>> {
+        let root = root_override.unwrap_or_else(|| Arc::clone(&self.root));
+        root.set_config(self.config.clone());
         let undefined: Vec<_> = self
             .slots
             .iter()
@@ -303,6 +285,7 @@ impl BuilderCore {
             };
             let resolved =
                 resolve_common(options, &defaults, one_shot, crate::Readiness::Immediate);
+            slot.member.set_options(resolved.clone());
             children.push(ChildPlan {
                 slot: Arc::clone(slot),
                 construction: definition,
@@ -311,7 +294,7 @@ impl BuilderCore {
         }
         self.armed = false;
         Ok(ScopePlan {
-            root: root_override.unwrap_or_else(|| Arc::clone(&self.root)),
+            root,
             flavor: self.flavor,
             config: self.config.clone(),
             defaults,
@@ -1576,6 +1559,109 @@ impl ScopeRef {
         self.cell.member.membership()
     }
 
+    /// Computes an authoritative recursive snapshot on demand.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<ScopeSnapshot> {
+        self.cell.snapshot()
+    }
+
+    /// Subscribes to conflated recursive snapshots.
+    #[must_use]
+    pub fn subscribe_snapshots(&self) -> SnapshotReceiver {
+        self.cell.subscribe_snapshots()
+    }
+
+    /// Subscribes to this scope's lifecycle and all forwarded descendants.
+    #[must_use]
+    pub fn subscribe_lifecycle(&self) -> LifecycleEvents {
+        self.cell.subscribe_lifecycle()
+    }
+
+    /// Looks up a direct child in an authoritative current snapshot.
+    #[must_use]
+    pub fn child(&self, id: impl AsRef<str>) -> Option<crate::ChildSnapshot> {
+        self.snapshot().child(id).cloned()
+    }
+
+    /// Traverses a child-id path in an authoritative current snapshot.
+    #[must_use]
+    pub fn descendant<I, S>(&self, path: I) -> Option<crate::ChildSnapshot>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.snapshot().descendant(path).cloned()
+    }
+
+    /// Waits for a named child snapshot satisfying an at-or-past predicate.
+    ///
+    /// Snapshot watches conflate intermediate states, so `pred` should accept
+    /// every state at or beyond the desired edge and must remain cheap and
+    /// non-blocking.
+    pub async fn wait_for_child<P>(
+        &self,
+        id: impl Into<ChildId>,
+        mut pred: P,
+        deadline: Duration,
+    ) -> Result<crate::ChildSnapshot, WaitError>
+    where
+        P: FnMut(&crate::ChildSnapshot) -> bool + Send,
+    {
+        let id = id.into();
+        let expires = crate::runtime::now()
+            .checked_add(deadline)
+            .unwrap_or_else(crate::runtime::now);
+        let mut snapshots = self.subscribe_snapshots();
+
+        loop {
+            if deadline.is_zero() {
+                return Err(WaitError::TimedOut);
+            }
+            let snapshot = snapshots.borrow_latest();
+            if let Some(child) = snapshot.child(id.as_str())
+                && pred(child)
+            {
+                return Ok(child.clone());
+            }
+            if matches!(
+                self.cell.member.record().stage,
+                crate::driver::MemberStage::Terminal(_)
+            ) {
+                return Err(WaitError::ScopeTerminated {
+                    state: snapshot.state.clone(),
+                });
+            }
+            match crate::runtime::select_two(
+                snapshots.changed(),
+                crate::runtime::sleep_until_std(expires),
+            )
+            .await
+            {
+                crate::runtime::Either::Left(Ok(_)) => {}
+                crate::runtime::Either::Left(Err(_)) => {
+                    let snapshot = snapshots.borrow_latest();
+                    if let Some(child) = snapshot.child(id.as_str())
+                        && pred(child)
+                    {
+                        return Ok(child.clone());
+                    }
+                    return Err(WaitError::ScopeTerminated {
+                        state: snapshot.state.clone(),
+                    });
+                }
+                crate::runtime::Either::Right(()) => {
+                    let snapshot = snapshots.borrow_latest();
+                    if let Some(child) = snapshot.child(id.as_str())
+                        && pred(child)
+                    {
+                        return Ok(child.clone());
+                    }
+                    return Err(WaitError::TimedOut);
+                }
+            }
+        }
+    }
+
     /// Requests shutdown without waiting.
     pub fn request_shutdown(&self) {
         self.cell.request_shutdown();
@@ -1642,6 +1728,53 @@ impl DynamicScopeRef {
     #[must_use]
     pub fn membership(&self) -> Membership {
         self.0.membership()
+    }
+
+    /// Computes an authoritative recursive snapshot on demand.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<ScopeSnapshot> {
+        self.0.snapshot()
+    }
+
+    /// Subscribes to conflated recursive snapshots.
+    #[must_use]
+    pub fn subscribe_snapshots(&self) -> SnapshotReceiver {
+        self.0.subscribe_snapshots()
+    }
+
+    /// Subscribes to this scope's lifecycle and all forwarded descendants.
+    #[must_use]
+    pub fn subscribe_lifecycle(&self) -> LifecycleEvents {
+        self.0.subscribe_lifecycle()
+    }
+
+    /// Looks up a direct child in an authoritative current snapshot.
+    #[must_use]
+    pub fn child(&self, id: impl AsRef<str>) -> Option<crate::ChildSnapshot> {
+        self.0.child(id)
+    }
+
+    /// Traverses a child-id path in an authoritative current snapshot.
+    #[must_use]
+    pub fn descendant<I, S>(&self, path: I) -> Option<crate::ChildSnapshot>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.0.descendant(path)
+    }
+
+    /// Waits for a named child snapshot satisfying an at-or-past predicate.
+    pub async fn wait_for_child<P>(
+        &self,
+        id: impl Into<ChildId>,
+        pred: P,
+        deadline: Duration,
+    ) -> Result<crate::ChildSnapshot, WaitError>
+    where
+        P: FnMut(&crate::ChildSnapshot) -> bool + Send,
+    {
+        self.0.wait_for_child(id, pred, deadline).await
     }
 
     /// Requests shutdown without waiting.

@@ -102,6 +102,14 @@ impl FenceCounter {
             generation: next,
         })
     }
+
+    /// Mints a generation for a non-identity monotone sequence.
+    ///
+    /// Observation uses the same saturating, poison-never-minted primitive as
+    /// membership and incarnation fencing.
+    pub(crate) fn mint_sequence(&mut self) -> Option<u64> {
+        self.mint().map(|fence| fence.generation)
+    }
 }
 
 /// The identity domain owned by one scope membership.

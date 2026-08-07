@@ -15,7 +15,7 @@ use std::{
 
 use crate::{
     ChildId, Exit, ExitKind, Incarnation, IntensityTrip, Membership, Readiness, ReadinessDeadline,
-    ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     engine::{
         ArbitrationClass, DeadlineQueue, ExitDispatch, IntensityState, MembershipMode,
         ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode, StopAction,
@@ -24,16 +24,26 @@ use crate::{
     exit::{JoinVerdict, RecordedOutcome, classify_exit},
     identity::{FenceCounter, ScopeIdentity},
     mailbox::MailboxControl,
+    observe::{
+        ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
+        LifecycleHub, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
+    },
     policy::{DefaultsInheritance, ResolvedDefaults},
     raw::{RawRunContext, RawSpawn},
     runtime,
     task::{OnceTaskBody, TaskContext, TaskFactory},
     tree::{
         BuilderCore, ChildConstruction, ChildPlan, NotAdmittingCause, RemoveOutcome, ReserveError,
-        ScopeFactory, ScopeFlavor, ScopePlan, ScopeSource, ScopeState, SlotCell, StartupError,
-        StopReason,
+        ScopeFactory, ScopeFlavor, ScopePlan, ScopeSource, SlotCell, StartupError, StopReason,
     },
 };
+
+/// Observation is one globally serialized projection/publication path.
+///
+/// The decision records remain independently locked and runtime-free. This
+/// gate makes a state mutation, recursive projection, and lifecycle staging
+/// one atomic observation edge, including cross-scope forwarding.
+static OBSERVATION_GATE: Mutex<()> = Mutex::new(());
 
 pub(crate) type DriverSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -273,9 +283,12 @@ pub(crate) enum MemberStage {
 pub(crate) struct MemberRecord {
     pub(crate) stage: MemberStage,
     pub(crate) incarnation: Option<Incarnation>,
+    pub(crate) last_incarnation: Option<Incarnation>,
     pub(crate) last_exit: Option<Exit>,
     pub(crate) restart_count: u64,
+    pub(crate) restart_at: Option<Instant>,
     pub(crate) removing: bool,
+    pub(crate) startup_aborted: bool,
 }
 
 #[derive(Debug)]
@@ -286,6 +299,7 @@ pub(crate) struct MemberCell {
     changed: Signal,
     terminal_signals: Mutex<Vec<Signal>>,
     mailbox: Mutex<Option<Arc<dyn MailboxControl>>>,
+    options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
     pub(crate) removal: Latch,
 }
 
@@ -297,13 +311,17 @@ impl MemberCell {
             record: Mutex::new(MemberRecord {
                 stage: MemberStage::Reserved,
                 incarnation: None,
+                last_incarnation: None,
                 last_exit: None,
                 restart_count: 0,
+                restart_at: None,
                 removing: false,
+                startup_aborted: false,
             }),
             changed: Signal::default(),
             terminal_signals: Mutex::new(Vec::new()),
             mailbox: Mutex::new(None),
+            options: Mutex::new(None),
             removal: Latch::default(),
         })
     }
@@ -323,6 +341,30 @@ impl MemberCell {
     pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
         update(&mut self.record.lock().expect("member mutex poisoned"));
         self.changed.pulse();
+    }
+
+    fn update_locked(&self, update: impl FnOnce(&mut MemberRecord)) {
+        update(&mut self.record.lock().expect("member mutex poisoned"));
+        self.changed.pulse();
+    }
+
+    pub(crate) fn set_options(&self, options: crate::policy::ResolvedCommonOptions) {
+        *self.options.lock().expect("member options mutex poisoned") = Some(options);
+    }
+
+    fn options(&self) -> crate::policy::ResolvedCommonOptions {
+        self.options
+            .lock()
+            .expect("member options mutex poisoned")
+            .clone()
+            .unwrap_or_else(|| {
+                crate::policy::resolve_common(
+                    &crate::policy::CommonOptions::default(),
+                    &crate::policy::ResolvedDefaults::default(),
+                    false,
+                    Readiness::Immediate,
+                )
+            })
     }
 
     pub(crate) fn add_terminal_signal(&self, signal: Signal) {
@@ -355,6 +397,7 @@ impl MemberCell {
                 false
             } else {
                 record.incarnation = None;
+                record.restart_at = None;
                 record.last_exit = Some(exit.clone());
                 record.stage = MemberStage::Terminal(exit);
                 true
@@ -444,17 +487,25 @@ impl ReportReceiver {
 pub(crate) struct ScopeRecord {
     pub(crate) state: ScopeState,
     pub(crate) startup: Option<Result<(), StartupError>>,
+    pub(crate) total_restarts: u64,
 }
 
 pub(crate) struct ScopeCell {
     pub(crate) member: Arc<MemberCell>,
     pub(crate) flavor: ScopeFlavor,
     pub(crate) child_identity: Mutex<ScopeIdentity>,
+    config: Mutex<crate::tree::ScopeConfig>,
     record: Mutex<ScopeRecord>,
     changed: Signal,
     control: Mutex<ScopeControl>,
     current_dynamic: Mutex<Option<Arc<DynamicControl>>>,
-    current_children: Mutex<Vec<Weak<SlotCell>>>,
+    current_children: Mutex<Vec<Arc<SlotCell>>>,
+    parent: Mutex<Option<Weak<ScopeCell>>>,
+    lifecycle_sequence: Mutex<FenceCounter>,
+    lifecycle_seq: AtomicU64,
+    lifecycle: LifecycleHub,
+    snapshots: SnapshotHub,
+    observation_closed: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -482,14 +533,22 @@ impl ScopeCell {
             member,
             flavor,
             child_identity: Mutex::new(child_identity),
+            config: Mutex::new(crate::tree::ScopeConfig::default()),
             record: Mutex::new(ScopeRecord {
                 state: ScopeState::Unstarted,
                 startup: None,
+                total_restarts: 0,
             }),
             changed: Signal::default(),
             control: Mutex::new(ScopeControl::default()),
             current_dynamic: Mutex::new(None),
             current_children: Mutex::new(Vec::new()),
+            parent: Mutex::new(None),
+            lifecycle_sequence: Mutex::new(FenceCounter::new(0)),
+            lifecycle_seq: AtomicU64::new(0),
+            lifecycle: LifecycleHub::default(),
+            snapshots: SnapshotHub::default(),
+            observation_closed: AtomicBool::new(false),
         })
     }
 
@@ -498,8 +557,293 @@ impl ScopeCell {
     }
 
     pub(crate) fn set_state(&self, state: ScopeState) {
-        self.record.lock().expect("scope mutex poisoned").state = state;
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.record.lock().expect("scope mutex poisoned").state = state.clone();
         self.changed.pulse();
+        self.emit_locked(LifecycleEventKind::ScopeState { state });
+    }
+
+    pub(crate) fn set_config(&self, config: crate::tree::ScopeConfig) {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self.config.lock().expect("scope config mutex poisoned") = config;
+        self.publish_snapshot_chain_locked();
+    }
+
+    pub(crate) fn transition_child(
+        &self,
+        member: &MemberCell,
+        update: impl FnOnce(&mut MemberRecord),
+        event: Option<LifecycleEventKind>,
+    ) {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        member.update_locked(update);
+        if let Some(event) = event {
+            self.emit_locked(event);
+        } else {
+            self.publish_snapshot_chain_locked();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emit(&self, event: LifecycleEventKind) {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.emit_locked(event);
+    }
+
+    pub(crate) fn schedule_child_restart(
+        &self,
+        member: &MemberCell,
+        update: impl FnOnce(&mut MemberRecord),
+        exited: LifecycleEventKind,
+        scheduled: LifecycleEventKind,
+    ) {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut scope = self.record.lock().expect("scope mutex poisoned");
+        scope.total_restarts = scope.total_restarts.saturating_add(1);
+        drop(scope);
+        member.update_locked(update);
+        self.emit_locked(exited);
+        self.emit_locked(scheduled);
+    }
+
+    pub(crate) fn terminalize_child(
+        &self,
+        member: &MemberCell,
+        exit: Exit,
+        exited_incarnation: Option<Incarnation>,
+        startup_aborted: bool,
+    ) -> bool {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(member.record().stage, MemberStage::Terminal(_)) {
+            return false;
+        }
+        member.update_locked(|record| record.startup_aborted = startup_aborted);
+        member.terminalize(exit.clone());
+        if let Some(incarnation) = exited_incarnation {
+            self.emit_locked(LifecycleEventKind::Exited {
+                id: member.id().clone(),
+                membership: member.membership(),
+                incarnation,
+                exit: exit.clone(),
+            });
+        }
+        if let Some(scope) = self
+            .current_children
+            .lock()
+            .expect("scope children mutex poisoned")
+            .iter()
+            .find(|slot| slot.member.membership() == member.membership())
+            .and_then(|slot| slot.scope.as_ref())
+        {
+            scope.close_observation_locked();
+        }
+        true
+    }
+
+    pub(crate) fn prune_child(&self, member: &MemberCell) -> bool {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let membership = member.membership();
+        let removed = {
+            let mut children = self
+                .current_children
+                .lock()
+                .expect("scope children mutex poisoned");
+            let Some(index) = children
+                .iter()
+                .position(|child| child.member.membership() == membership)
+            else {
+                return false;
+            };
+            children.remove(index)
+        };
+        debug_assert_eq!(removed.member.membership(), membership);
+        self.emit_locked(LifecycleEventKind::Removed {
+            id: member.id().clone(),
+            membership,
+            last_incarnation: member.record().last_incarnation,
+        });
+        true
+    }
+
+    pub(crate) fn snapshot(&self) -> Arc<ScopeSnapshot> {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.snapshot_locked()
+    }
+
+    pub(crate) fn subscribe_snapshots(&self) -> SnapshotReceiver {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let receiver = self.snapshots.subscribe(self.snapshot_locked());
+        if self.observation_closed.load(Ordering::Acquire) {
+            self.snapshots.close();
+        }
+        receiver
+    }
+
+    pub(crate) fn subscribe_lifecycle(&self) -> LifecycleEvents {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let events = self.lifecycle.subscribe();
+        if self.observation_closed.load(Ordering::Acquire) {
+            self.lifecycle.close();
+        }
+        events
+    }
+
+    fn snapshot_locked(&self) -> Arc<ScopeSnapshot> {
+        let record = self.record();
+        let config = self
+            .config
+            .lock()
+            .expect("scope config mutex poisoned")
+            .clone();
+        let children = self
+            .current_children
+            .lock()
+            .expect("scope children mutex poisoned")
+            .clone()
+            .into_iter()
+            .map(|slot| self.child_snapshot_locked(&slot))
+            .collect::<Vec<_>>();
+        Arc::new(ScopeSnapshot {
+            state: record.state,
+            kind: match self.flavor {
+                ScopeFlavor::Ordered => ScopeKind::Ordered,
+                ScopeFlavor::Dynamic => ScopeKind::Dynamic,
+            },
+            strategy: (self.flavor == ScopeFlavor::Ordered).then_some(config.strategy),
+            intensity: config.intensity,
+            total_restarts: record.total_restarts,
+            lifecycle_seq: self.lifecycle_seq.load(Ordering::Acquire),
+            children: children.into(),
+        })
+    }
+
+    fn child_snapshot_locked(&self, slot: &SlotCell) -> ChildSnapshot {
+        let record = slot.member.record();
+        let options = slot.member.options();
+        let terminal = matches!(record.stage, MemberStage::Terminal(_));
+        let nested = slot.scope.as_ref().and_then(|scope| {
+            (record.incarnation.is_some() || terminal).then(|| scope.snapshot_locked())
+        });
+        ChildSnapshot {
+            id: slot.member.id().clone(),
+            membership: slot.member.membership(),
+            incarnation: record.incarnation,
+            state: match record.stage {
+                MemberStage::Reserved | MemberStage::Admitted => ChildState::Admitted,
+                MemberStage::Starting => ChildState::Starting,
+                MemberStage::Running => ChildState::Running,
+                MemberStage::Restarting => ChildState::Restarting,
+                MemberStage::Stopping => ChildState::Stopping,
+                MemberStage::Terminal(exit) if record.startup_aborted => {
+                    ChildState::StartupAborted { exit }
+                }
+                MemberStage::Terminal(exit) => ChildState::Stopped { exit },
+            },
+            last_exit: record.last_exit,
+            membership_status: if record.removing {
+                MembershipStatus::Removing
+            } else {
+                MembershipStatus::Active
+            },
+            restart_count: record.restart_count,
+            restart_policy: options.restart,
+            retention: options.retention,
+            restart_at: record.restart_at,
+            nested,
+            scope_seq: slot
+                .scope
+                .as_ref()
+                .map(|scope| scope.lifecycle_seq.load(Ordering::Acquire)),
+        }
+    }
+
+    fn ancestors_locked(&self) -> Vec<Arc<ScopeCell>> {
+        let mut ancestors = Vec::new();
+        let mut current = self
+            .parent
+            .lock()
+            .expect("scope parent mutex poisoned")
+            .as_ref()
+            .and_then(Weak::upgrade);
+        while let Some(scope) = current {
+            current = scope
+                .parent
+                .lock()
+                .expect("scope parent mutex poisoned")
+                .as_ref()
+                .and_then(Weak::upgrade);
+            ancestors.push(scope);
+        }
+        ancestors
+    }
+
+    fn publish_snapshot_chain_locked(&self) {
+        self.snapshots.publish(|| self.snapshot_locked());
+        for ancestor in self.ancestors_locked() {
+            ancestor.snapshots.publish(|| ancestor.snapshot_locked());
+        }
+    }
+
+    fn emit_locked(&self, kind: LifecycleEventKind) {
+        let seq = self
+            .lifecycle_sequence
+            .lock()
+            .expect("lifecycle sequence mutex poisoned")
+            .mint_sequence();
+        let Some(seq) = seq else {
+            self.lifecycle_seq.store(u64::MAX, Ordering::Release);
+            self.publish_snapshot_chain_locked();
+            self.lifecycle.publish_lagged(1);
+            for ancestor in self.ancestors_locked() {
+                ancestor.lifecycle.publish_lagged(1);
+            }
+            return;
+        };
+        self.lifecycle_seq.store(seq, Ordering::Release);
+        self.publish_snapshot_chain_locked();
+
+        let scope = self.member.membership();
+        let mut event = LifecycleEvent {
+            scope_path: Vec::new(),
+            scope,
+            seq,
+            kind,
+        };
+        self.lifecycle.publish(event.clone());
+        let mut child_id = self.member.id().clone();
+        for ancestor in self.ancestors_locked() {
+            event.scope_path.insert(0, child_id);
+            child_id = ancestor.member.id().clone();
+            ancestor.lifecycle.publish(event.clone());
+        }
+    }
+
+    fn close_observation_locked(&self) {
+        if self.observation_closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.snapshots.close();
+        self.lifecycle.close();
     }
 
     pub(crate) fn set_startup(&self, startup: Result<(), StartupError>) {
@@ -535,10 +879,14 @@ impl ScopeCell {
         reason: StopReason,
         terminal_exit: Option<Exit>,
     ) {
-        {
-            let mut record = self.record.lock().expect("scope mutex poisoned");
-            record.state = ScopeState::Stopped { reason };
-        }
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = ScopeState::Stopped {
+            reason: reason.clone(),
+        };
+        self.record.lock().expect("scope mutex poisoned").state = state.clone();
+        let terminal = terminal_exit.is_some();
         if let Some(exit) = terminal_exit {
             self.member.terminalize(exit);
         }
@@ -558,6 +906,10 @@ impl ScopeCell {
         }
         drop(control);
         self.changed.pulse();
+        self.emit_locked(LifecycleEventKind::ScopeState { state });
+        if terminal {
+            self.close_observation_locked();
+        }
     }
 
     fn finish_live_root_incarnation(&self, reason: StopReason, exit: Exit) {
@@ -568,10 +920,15 @@ impl ScopeCell {
         if let Some(epoch) = epoch {
             self.finish_root_incarnation(epoch, reason, exit);
         } else {
-            self.record.lock().expect("scope mutex poisoned").state =
-                ScopeState::Stopped { reason };
+            let _gate = OBSERVATION_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = ScopeState::Stopped { reason };
+            self.record.lock().expect("scope mutex poisoned").state = state.clone();
             self.member.terminalize(exit);
             self.changed.pulse();
+            self.emit_locked(LifecycleEventKind::ScopeState { state });
+            self.close_observation_locked();
         }
     }
 
@@ -635,21 +992,51 @@ impl ScopeCell {
         control.last_stopped_epoch >= epoch
     }
 
-    fn set_children(&self, children: impl IntoIterator<Item = Arc<SlotCell>>) {
-        *self
-            .current_children
+    fn set_admitted_children(self: &Arc<Self>, children: Vec<Arc<SlotCell>>) {
+        let _gate = OBSERVATION_GATE
             .lock()
-            .expect("scope children mutex poisoned") = children
-            .into_iter()
-            .map(|child| Arc::downgrade(&child))
-            .collect();
-    }
-
-    fn add_child(&self, child: &Arc<SlotCell>) {
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.current_children
             .lock()
             .expect("scope children mutex poisoned")
-            .push(Arc::downgrade(child));
+            .clear();
+        for child in children {
+            if let Some(scope) = &child.scope {
+                *scope.parent.lock().expect("scope parent mutex poisoned") =
+                    Some(Arc::downgrade(self));
+            }
+            child
+                .member
+                .update_locked(|record| record.stage = MemberStage::Admitted);
+            self.current_children
+                .lock()
+                .expect("scope children mutex poisoned")
+                .push(Arc::clone(&child));
+            self.emit_locked(LifecycleEventKind::Added {
+                id: child.member.id().clone(),
+                membership: child.member.membership(),
+            });
+        }
+    }
+
+    fn admit_child(self: &Arc<Self>, child: &Arc<SlotCell>) {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(scope) = &child.scope {
+            *scope.parent.lock().expect("scope parent mutex poisoned") = Some(Arc::downgrade(self));
+        }
+        self.current_children
+            .lock()
+            .expect("scope children mutex poisoned")
+            .push(Arc::clone(child));
+        child
+            .member
+            .update_locked(|record| record.stage = MemberStage::Admitted);
+        self.emit_locked(LifecycleEventKind::Added {
+            id: child.member.id().clone(),
+            membership: child.member.membership(),
+        });
     }
 
     fn set_dynamic(&self, control: Option<Arc<DynamicControl>>) {
@@ -694,11 +1081,29 @@ impl ScopeCell {
     }
 
     pub(crate) fn terminalize_never_started(&self) {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.observation_closed.load(Ordering::Acquire) {
+            return;
+        }
         self.member.terminalize(Exit::never_started());
-        self.set_startup(Err(StartupError::ShutdownRequested));
-        self.set_state(ScopeState::Stopped {
-            reason: StopReason::NeverStarted,
+        {
+            let mut record = self.record.lock().expect("scope mutex poisoned");
+            if record.startup.is_none() {
+                record.startup = Some(Err(StartupError::ShutdownRequested));
+            }
+            record.state = ScopeState::Stopped {
+                reason: StopReason::NeverStarted,
+            };
+        }
+        self.changed.pulse();
+        self.emit_locked(LifecycleEventKind::ScopeState {
+            state: ScopeState::Stopped {
+                reason: StopReason::NeverStarted,
+            },
         });
+        self.close_observation_locked();
     }
 }
 
@@ -974,11 +1379,15 @@ pub(crate) fn remove_dynamic(
         return response;
     }
     if matches!(entry.slot.member.record().stage, MemberStage::Terminal(_)) {
+        let member = Arc::clone(&entry.slot.member);
         state.entries.remove(id);
+        drop(state);
+        scope.prune_child(&member);
         response.complete(RemoveOutcome::Removed);
         return response;
     }
-    entry.slot.member.update(|record| record.removing = true);
+    let member = Arc::clone(&entry.slot.member);
+    scope.transition_child(&member, |record| record.removing = true, None);
     entry.slot.member.removal.fire();
     drop(state);
     scope.signal().pulse();
@@ -1016,9 +1425,7 @@ fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<Shutd
         .current_children
         .lock()
         .expect("scope children mutex poisoned")
-        .iter()
-        .filter_map(Weak::upgrade)
-        .collect::<Vec<_>>();
+        .clone();
     for child in children {
         if matches!(child.member.record().stage, MemberStage::Terminal(_)) {
             continue;
@@ -1236,7 +1643,12 @@ impl Drop for ScopeRuntime {
                 active.abort.fire();
                 active.abort_handle.abort();
             } else if !child.is_terminal() {
-                child.slot.member.terminalize(Exit::never_started());
+                self.root.terminalize_child(
+                    &child.slot.member,
+                    Exit::never_started(),
+                    None,
+                    child.initial && !child.spawned_once,
+                );
             }
         }
         if !matches!(self.root.record().state, ScopeState::Stopped { .. }) {
@@ -1277,6 +1689,15 @@ impl ScopeRuntime {
         let child = &mut self.children[index];
         let Some(incarnation) = mint_child_incarnation(&child.slot.member, &mut child.incarnations)
         else {
+            if child.slot.member.record().last_incarnation.is_none()
+                && let Some(scope) = &child.slot.scope
+            {
+                scope.terminalize_never_started();
+            }
+            self.root.transition_child(&child.slot.member, |_| {}, None);
+            if child.options.retention == crate::Retention::Remove {
+                self.root.prune_child(&child.slot.member);
+            }
             return;
         };
 
@@ -1382,23 +1803,38 @@ impl ScopeRuntime {
 
         let now = runtime::now();
         child.spawned_once = true;
-        child.slot.member.update(|record| {
-            record.stage = MemberStage::Starting;
-            record.incarnation = Some(incarnation);
-        });
         if let Some(mailbox) = child.slot.member.mailbox() {
             mailbox.bind(incarnation);
         }
+        self.root.transition_child(
+            &child.slot.member,
+            |record| {
+                record.stage = MemberStage::Starting;
+                record.incarnation = Some(incarnation);
+                record.last_incarnation = Some(incarnation);
+                record.restart_at = None;
+            },
+            Some(LifecycleEventKind::Started {
+                id: child.slot.member.id().clone(),
+                membership: child.slot.member.membership(),
+                incarnation,
+            }),
+        );
 
         let readiness = if construction_pending {
             ReadinessGate::Waiting { deadline: None }
         } else if !gated {
             ready.fire();
             child.initial_ready = true;
-            child
-                .slot
-                .member
-                .update(|record| record.stage = MemberStage::Running);
+            self.root.transition_child(
+                &child.slot.member,
+                |record| record.stage = MemberStage::Running,
+                Some(LifecycleEventKind::Ready {
+                    id: child.slot.member.id().clone(),
+                    membership: child.slot.member.membership(),
+                    incarnation,
+                }),
+            );
             ReadinessGate::Immediate
         } else {
             let deadline = match child.options.readiness_deadline {
@@ -1597,10 +2033,11 @@ impl ScopeRuntime {
                 }
                 return;
             }
-            child
-                .slot
-                .member
-                .update(|record| record.stage = MemberStage::Stopping);
+            self.root.transition_child(
+                &child.slot.member,
+                |record| record.stage = MemberStage::Stopping,
+                None,
+            );
             if let Some(mailbox) = child.slot.member.mailbox() {
                 mailbox.freeze(active.incarnation);
             }
@@ -1611,13 +2048,19 @@ impl ScopeRuntime {
             active.ladder = Some(StopLadder::new(child.options.shutdown));
             self.advance_ladder(index, runtime::now());
         } else {
-            let exit = child
-                .slot
-                .member
-                .record()
-                .last_exit
-                .unwrap_or_else(Exit::never_started);
-            child.slot.member.terminalize(exit);
+            let record = child.slot.member.record();
+            let exit = record.last_exit.unwrap_or_else(Exit::never_started);
+            if record.last_incarnation.is_none()
+                && let Some(scope) = &child.slot.scope
+            {
+                scope.terminalize_never_started();
+            }
+            self.root.terminalize_child(
+                &child.slot.member,
+                exit,
+                None,
+                child.initial && !child.spawned_once,
+            );
         }
     }
 
@@ -1733,10 +2176,15 @@ impl ScopeRuntime {
                 if !self.startup_complete {
                     child.initial_ready = true;
                 }
-                child
-                    .slot
-                    .member
-                    .update(|record| record.stage = MemberStage::Running);
+                self.root.transition_child(
+                    &child.slot.member,
+                    |record| record.stage = MemberStage::Running,
+                    Some(LifecycleEventKind::Ready {
+                        id: child.slot.member.id().clone(),
+                        membership: child.slot.member.membership(),
+                        incarnation,
+                    }),
+                );
                 became_ready = true;
             } else {
                 let deadline = match child.options.readiness_deadline {
@@ -1778,10 +2226,15 @@ impl ScopeRuntime {
         if !self.startup_complete {
             child.initial_ready = true;
         }
-        child
-            .slot
-            .member
-            .update(|record| record.stage = MemberStage::Running);
+        self.root.transition_child(
+            &child.slot.member,
+            |record| record.stage = MemberStage::Running,
+            Some(LifecycleEventKind::Ready {
+                id: child.slot.member.id().clone(),
+                membership: child.slot.member.membership(),
+                incarnation,
+            }),
+        );
         self.progress_startup();
     }
 
@@ -1814,6 +2267,10 @@ impl ScopeRuntime {
         if let Some(mailbox) = child.slot.member.mailbox() {
             mailbox.close(incarnation);
         }
+        let was_ready = matches!(
+            active.readiness,
+            ReadinessGate::Immediate | ReadinessGate::Ready
+        );
         active.readiness.step(ReadinessEvent::Exit);
         if let (JoinVerdict::Cancelled { .. }, Some(after_grace)) =
             (&join, active.hard_abort_after_grace)
@@ -1826,10 +2283,6 @@ impl ScopeRuntime {
         if ran_for >= self.intensity_policy.within {
             child.restarts.settled();
         }
-        child.slot.member.update(|record| {
-            record.incarnation = None;
-            record.last_exit = Some(exit.clone());
-        });
 
         let mode = if self.draining.is_some() {
             ScopeMode::Draining
@@ -1844,12 +2297,20 @@ impl ScopeRuntime {
         match dispatch_exit(&exit, child.options.restart, mode, member_mode) {
             ExitDispatch::Terminal => {
                 let pre_ready = child.initial && !self.startup_complete && !child.initial_ready;
-                child.slot.member.terminalize(exit.clone());
+                self.root.terminalize_child(
+                    &child.slot.member,
+                    exit.clone(),
+                    Some(incarnation),
+                    !was_ready,
+                );
                 let removing = child.slot.member.record().removing;
                 if removing {
                     self.finalize_removal(index);
                 } else if pre_ready && self.draining.is_none() {
                     self.fail_startup(index, exit);
+                    if self.children[index].options.retention == crate::Retention::Remove {
+                        self.prune_terminal(index);
+                    }
                 } else {
                     if child.options.retention == crate::Retention::Remove {
                         self.prune_terminal(index);
@@ -1875,14 +2336,40 @@ impl ScopeRuntime {
                     sample,
                     &mut effects,
                 );
-                child.slot.member.update(|record| {
-                    record.restart_count = decision.restart_count;
-                    record.stage = MemberStage::Restarting;
-                });
                 debug_assert!(matches!(
                     effects.first(),
                     Some(crate::engine::RestartEffect::Scheduled { .. })
                 ));
+                let delay = child
+                    .options
+                    .restart
+                    .backoff()
+                    .next_delay(decision.attempt, sample);
+                let restart_at = decision
+                    .restart_at
+                    .unwrap_or_else(|| now.checked_add(delay).unwrap_or(now));
+                self.root.schedule_child_restart(
+                    &child.slot.member,
+                    |record| {
+                        record.incarnation = None;
+                        record.last_exit = Some(exit.clone());
+                        record.restart_count = decision.restart_count;
+                        record.restart_at = Some(restart_at);
+                        record.stage = MemberStage::Restarting;
+                    },
+                    LifecycleEventKind::Exited {
+                        id: child.slot.member.id().clone(),
+                        membership: child.slot.member.membership(),
+                        incarnation,
+                        exit: exit.clone(),
+                    },
+                    LifecycleEventKind::RestartScheduled {
+                        id: child.slot.member.id().clone(),
+                        membership: child.slot.member.membership(),
+                        attempt: decision.attempt,
+                        delay,
+                    },
+                );
                 if decision.charge.tripped {
                     let trip = IntensityTrip {
                         max_restarts: self.intensity_policy.max_restarts,
@@ -1895,12 +2382,8 @@ impl ScopeRuntime {
                     }
                     self.begin_drain(StopReason::IntensityTripped(trip));
                 } else {
-                    self.deadlines.push(
-                        decision
-                            .restart_at
-                            .expect("a permitted restart has a deadline"),
-                        DeadlineKind::Restart { index },
-                    );
+                    self.deadlines
+                        .push(restart_at, DeadlineKind::Restart { index });
                 }
             }
         }
@@ -1921,12 +2404,17 @@ impl ScopeRuntime {
         if self.flavor == ScopeFlavor::Ordered {
             for later in index + 1..self.children.len() {
                 if !self.children[later].spawned_once {
-                    self.children[later]
-                        .slot
-                        .member
-                        .terminalize(Exit::never_started());
                     if let Some(scope) = &self.children[later].slot.scope {
                         scope.terminalize_never_started();
+                    }
+                    self.root.terminalize_child(
+                        &self.children[later].slot.member,
+                        Exit::never_started(),
+                        None,
+                        true,
+                    );
+                    if self.children[later].options.retention == crate::Retention::Remove {
+                        self.prune_terminal(later);
                     }
                 }
             }
@@ -2042,6 +2530,7 @@ impl ScopeRuntime {
         };
         let resolved =
             crate::policy::resolve_common(options, &self.defaults, one_shot, Readiness::Immediate);
+        request.slot.member.set_options(resolved.clone());
         let plan = ChildPlan {
             slot: Arc::clone(&request.slot),
             construction: definition,
@@ -2050,22 +2539,20 @@ impl ScopeRuntime {
         let mut child = ChildRuntime::from_plan(plan, &self.root);
         child.initial = false;
         let index = self.children.len();
-        self.root.add_child(&request.slot);
+        self.root.admit_child(&request.slot);
         self.children.push(child);
-        request
-            .slot
-            .member
-            .update(|record| record.stage = MemberStage::Admitted);
         {
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
             let Some(entry) = state.entries.get_mut(request.slot.member.id()) else {
                 request.response.complete(Err(ReserveError::NotAdmitting(
                     NotAdmittingCause::ReservationEnded,
                 )));
-                self.children[index]
-                    .slot
-                    .member
-                    .terminalize(Exit::never_started());
+                self.root.terminalize_child(
+                    &self.children[index].slot.member,
+                    Exit::never_started(),
+                    None,
+                    true,
+                );
                 return;
             };
             entry.admitted = true;
@@ -2116,10 +2603,11 @@ impl ScopeRuntime {
         else {
             return;
         };
-        self.children[index]
-            .slot
-            .member
-            .update(|record| record.removing = true);
+        self.root.transition_child(
+            &self.children[index].slot.member,
+            |record| record.removing = true,
+            None,
+        );
         if self.children[index].is_terminal() {
             self.finalize_removal(index);
         } else {
@@ -2143,23 +2631,31 @@ impl ScopeRuntime {
             .is_some_and(|entry| entry.slot.member.membership() == child.slot.member.membership())
         {
             let entry = state.entries.remove(&id).expect("entry was just resolved");
+            drop(state);
+            self.root.prune_child(&child.slot.member);
             entry.removal.complete(RemoveOutcome::Removed);
         }
     }
 
     fn prune_terminal(&mut self, index: usize) {
-        let Some(control) = &self.dynamic else {
-            return;
-        };
         let child = &self.children[index];
-        let id = child.slot.member.id().clone();
-        let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-        if state
-            .entries
-            .get(&id)
-            .is_some_and(|entry| entry.slot.member.membership() == child.slot.member.membership())
-        {
-            state.entries.remove(&id);
+        if let Some(control) = &self.dynamic {
+            let id = child.slot.member.id().clone();
+            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
+            if state.entries.get(&id).is_some_and(|entry| {
+                entry.slot.member.membership() == child.slot.member.membership()
+            }) {
+                state.entries.remove(&id);
+            }
+        }
+        self.root.prune_child(&child.slot.member);
+    }
+
+    fn prune_terminal_members(&mut self) {
+        for index in 0..self.children.len() {
+            if self.children[index].is_terminal() {
+                self.prune_terminal(index);
+            }
         }
     }
 }
@@ -2187,7 +2683,6 @@ async fn run_nested_tree(
     cancel: Latch,
 ) -> crate::ExitResult {
     let epoch = scope.begin_incarnation();
-    scope.set_state(ScopeState::Starting);
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
         Err(undefined) => {
@@ -2247,17 +2742,16 @@ async fn run_scope_incarnation(
         drop(state);
         root.set_dynamic(Some(Arc::clone(control)));
     }
-    root.set_children(plan.children.iter().map(|child| Arc::clone(&child.slot)));
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| Arc::clone(&child.slot))
+            .collect(),
+    );
     let children = plan
         .children
         .into_iter()
-        .map(|child| {
-            child
-                .slot
-                .member
-                .update(|record| record.stage = MemberStage::Admitted);
-            ChildRuntime::from_plan(child, &root)
-        })
+        .map(|child| ChildRuntime::from_plan(child, &root))
         .collect();
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
@@ -2422,6 +2916,10 @@ async fn run_scope_incarnation(
         }
 
         if let Some(reason) = scope.finish_if_ready() {
+            // Terminality is decided before retention-based pruning. Scope
+            // termination then prunes every remaining tombstone and publishes
+            // those Removed edges before the final ScopeState event.
+            scope.prune_terminal_members();
             if is_root {
                 let exit = match &reason {
                     StopReason::Finished | StopReason::ShutdownRequested => {
@@ -2459,12 +2957,14 @@ enum Pending {
 #[cfg(test)]
 mod tests {
     use crate::{
-        ChildId, Exit, ExitError, ExitKind,
+        ChildId, Exit, ExitError, ExitKind, LifecycleEventKind, LifecycleItem, ScopeState,
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
     };
 
-    use super::{MemberCell, MemberStage, mint_child_incarnation, report_channel};
+    use super::{
+        MemberCell, MemberStage, ScopeCell, ScopeFlavor, mint_child_incarnation, report_channel,
+    };
 
     #[test]
     fn owned_report_token_consumes_or_falls_back_once() {
@@ -2502,5 +3002,40 @@ mod tests {
             MemberStage::Terminal(ref exit) if exit == &previous
         ));
         assert!(mint_child_incarnation(&member, &mut counter).is_none());
+    }
+
+    #[test]
+    fn lifecycle_sequence_exhaustion_poison_is_never_minted_and_becomes_lag() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let membership = identity.mint_membership().expect("membership available");
+        let member = MemberCell::new(ChildId::from("scope"), membership);
+        let scope = ScopeCell::new(
+            member,
+            ScopeFlavor::Ordered,
+            ScopeIdentity::new().expect("child identity available"),
+        );
+        *scope
+            .lifecycle_sequence
+            .lock()
+            .expect("lifecycle sequence mutex poisoned") = FenceCounter::near_exhaustion(0);
+        let mut events = scope.subscribe_lifecycle();
+
+        scope.emit(LifecycleEventKind::ScopeState {
+            state: ScopeState::Starting,
+        });
+        scope.emit(LifecycleEventKind::ScopeState {
+            state: ScopeState::Running,
+        });
+        scope.emit(LifecycleEventKind::ScopeState {
+            state: ScopeState::Draining,
+        });
+
+        assert_eq!(events.try_recv(), Ok(LifecycleItem::Lagged { dropped: 2 }));
+        let LifecycleItem::Event(event) = events.try_recv().expect("last mintable event remains")
+        else {
+            panic!("expected the final mintable event");
+        };
+        assert_eq!(event.seq, u64::MAX - 1);
+        assert_eq!(scope.snapshot().lifecycle_seq, u64::MAX);
     }
 }

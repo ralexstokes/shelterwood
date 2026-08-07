@@ -8,6 +8,7 @@ mod engine;
 mod exit;
 mod identity;
 mod mailbox;
+mod observe;
 mod policy;
 mod raw;
 mod task;
@@ -28,6 +29,11 @@ pub use mailbox::{
     ActorRef, CallError, CallErrorKind, CallFuture, Replied, Reply, ReplyError, ReplyReceive,
     ReplyReceiver, SendError, SendErrorKind, SendFuture, SendTimeout,
 };
+pub use observe::{
+    ChildSnapshot, ChildState, LIFECYCLE_EVENT_CAPACITY, LifecycleEvent, LifecycleEventKind,
+    LifecycleEvents, LifecycleItem, LifecycleTryRecvError, MembershipStatus, ScopeKind,
+    ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
+};
 pub use policy::{
     Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, Jitter, Mailbox,
     MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, RestartCondition, RestartPolicy,
@@ -40,6 +46,6 @@ pub use task::{CancellationToken, OneShotTaskRef, TaskContext, TaskDef, TaskOnce
 pub use tree::{
     ActorSlot, Admission, AdmissionReceipt, BuildError, DynamicActorSlot, DynamicScopeRef,
     DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, NotAdmittingCause, Removal, RemoveOutcome,
-    ReserveError, ScopeRef, ScopeState, StartOrShutdownError, StartupError, StopReason, Subtree,
-    SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskSlot, Tree,
+    ReserveError, ScopeRef, StartOrShutdownError, StartupError, StopReason, Subtree, SubtreeDef,
+    SubtreeOnceDef, SubtreeSlot, System, TaskSlot, Tree,
 };

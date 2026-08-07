@@ -89,6 +89,14 @@ pub enum CallErrorKind {
 }
 
 /// A failed request/reply call with retry-discipline identity evidence.
+///
+/// [`CallErrorKind::AcceptanceTimedOut`] proves that the request was not
+/// accepted and is safe to retry. [`CallErrorKind::ResponseTimedOut`] means
+/// that it was accepted with an unknown outcome and must be reconciled rather
+/// than blindly retried. A [`CallErrorKind::ReplyDropped`] retry is safe only
+/// for an idempotent operation, under one overall deadline, after snapshots or
+/// lifecycle events show an incarnation that
+/// [`supersedes`](Incarnation::supersedes) `incarnation_observed`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallError {
     /// Target actor id.
@@ -1020,6 +1028,19 @@ impl<M: Send + 'static> ActorRef<M> {
     }
 
     /// Sends a request built around one reply capability and awaits its reply.
+    ///
+    /// One deadline covers binding, mailbox acceptance, and response. The
+    /// returned [`Replied`] identifies the accepting incarnation; [`CallError`]
+    /// distinguishes a guaranteed-unaccepted timeout from an accepted request
+    /// with an unknown outcome. See [`CallError`] for the required retry
+    /// discipline.
+    ///
+    /// On a latest-value mailbox, a newer accepted message can replace this
+    /// request. Dropping the replaced request's [`Reply`] reports
+    /// [`CallErrorKind::ReplyDropped`]. Awaiting a call to `myself()` from an
+    /// actor handler deadlocks because the blocked handler is also the only code
+    /// that can produce the reply; use an actor-local continuation or an
+    /// incarnation-owned offload instead.
     pub fn call<T: Send + 'static>(
         &self,
         make_msg: impl FnOnce(Reply<T>) -> M + Send + 'static,

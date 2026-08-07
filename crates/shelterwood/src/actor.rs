@@ -227,6 +227,9 @@ impl<'a, A: Actor> Context<'a, A> {
     }
 
     /// Starts blocking work tied to actor shutdown and returned-future drop.
+    ///
+    /// Cancellation is cooperative; a hard-aborted operation's OS thread
+    /// detaches and may outlive this actor incarnation.
     pub fn run_blocking<F, T>(&self, operation: F) -> Blocking<T>
     where
         F: FnOnce(CancellationToken) -> T + Send + 'static,
@@ -307,6 +310,9 @@ impl<'a, A: Actor> StopContext<'a, A> {
     }
 
     /// Starts blocking work tied to actor shutdown and returned-future drop.
+    ///
+    /// Cancellation is cooperative; a hard-aborted operation's OS thread
+    /// detaches and may outlive this actor incarnation.
     pub fn run_blocking<F, T>(&self, operation: F) -> Blocking<T>
     where
         F: FnOnce(CancellationToken) -> T + Send + 'static,
@@ -512,6 +518,9 @@ impl<A: Actor> ActorDef<A> {
 }
 
 /// Consuming one-shot handler-actor definition.
+///
+/// “One-shot” means exactly one incarnation because the owned arguments cannot
+/// be minted again; it does not mean one handler iteration.
 pub struct ActorOnceDef<A: Actor> {
     args: A::Args,
     pub(crate) options: CommonOptions,

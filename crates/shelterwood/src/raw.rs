@@ -110,6 +110,11 @@ impl Drop for Guard {
 }
 
 /// A blocking operation whose thread cooperatively observes actor cancellation.
+///
+/// Cancellation cannot forcibly stop a blocking thread. Dropping this future
+/// or hard-aborting its actor detaches the thread after requesting cooperative
+/// cancellation; Shelterwood does not join it, and any later value or panic is
+/// discarded. The operation must therefore be safe to outlive its actor.
 #[must_use = "dropping this future requests cooperative cancellation and detaches the thread"]
 pub struct Blocking<T> {
     future: Pin<Box<dyn Future<Output = T> + Send + 'static>>,
@@ -418,6 +423,14 @@ pub trait RawActor: Send + 'static {
     }
 
     /// Runs one incarnation using the membership-owned mailbox binding.
+    ///
+    /// [`RawContext::recv`] freezes external intake and returns `None` when
+    /// shutdown begins. A raw loop must then honor
+    /// [`RawContext::mailbox_shutdown`]: for
+    /// [`MailboxShutdown::Drain`], repeatedly call [`RawContext::try_recv`] to
+    /// handle the frozen accepted prefix; for [`MailboxShutdown::Discard`],
+    /// return without draining. The high-level [`crate::Actor`] loop implements
+    /// this policy automatically.
     fn run(
         &mut self,
         context: &mut RawContext<Self::Msg>,
@@ -636,6 +649,9 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     /// Starts blocking work with cancellation tied to shutdown and future drop.
+    ///
+    /// Cancellation is cooperative. If this future is dropped or its actor is
+    /// hard-aborted, the OS thread detaches and can outlive the incarnation.
     pub fn run_blocking<F, T>(&self, operation: F) -> Blocking<T>
     where
         F: FnOnce(CancellationToken) -> T + Send + 'static,

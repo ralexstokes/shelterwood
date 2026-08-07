@@ -1992,6 +1992,10 @@ impl<R: Clone> System<R> {
     }
 
     /// Rolls a startup failure back through full shutdown.
+    ///
+    /// Unlike [`Self::wait_started`], this consumes the owner so a failed
+    /// startup cannot leave its successfully started prefix running. The error
+    /// preserves both the original startup cause and any rollback timeout.
     pub async fn start_or_shutdown(
         mut self,
         timeout: Duration,
@@ -2010,6 +2014,10 @@ impl<R: Clone> System<R> {
     }
 
     /// Requests shutdown, escalates at `timeout`, joins, and consumes owner.
+    ///
+    /// `timeout` bounds cooperative teardown, not necessarily this method's
+    /// wall-clock return: after escalation every actor future is still joined.
+    /// Blocking threads created by `run_blocking` detach past hard abort.
     pub async fn shutdown(mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
         self.armed = false;
         self.run.shutdown(timeout).await

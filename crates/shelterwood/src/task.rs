@@ -189,6 +189,9 @@ impl TaskDef {
 type OnceTaskFuture<T> = Pin<Box<dyn Future<Output = Result<T, ExitError>> + Send + 'static>>;
 
 /// A consuming one-shot task definition with a typed completion value.
+///
+/// “One-shot” means exactly one incarnation because the owned body cannot be
+/// invoked again; the task may perform arbitrarily many iterations internally.
 pub struct TaskOnceDef<T> {
     body: Box<dyn FnOnce(TaskContext) -> OnceTaskFuture<T> + Send + 'static>,
     pub(crate) options: CommonOptions,

@@ -351,3 +351,69 @@ async fn intervals_start_after_one_period_and_skip_missed_ticks() {
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(ticks.load(Ordering::SeqCst), 2);
 }
+
+#[derive(Clone)]
+enum OverflowMessage {
+    Fired,
+}
+
+struct OverflowTimerActor {
+    fired: Arc<AtomicUsize>,
+    interval: bool,
+}
+
+impl Actor for OverflowTimerActor {
+    type Msg = OverflowMessage;
+    type Args = (Arc<AtomicUsize>, bool);
+
+    async fn init(args: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        let (fired, interval) = args;
+        if interval {
+            context
+                .set_interval("never", OverflowMessage::Fired, Duration::MAX)
+                .expect("live actor arms its interval");
+        } else {
+            context
+                .set_timeout("never", OverflowMessage::Fired, Duration::MAX)
+                .expect("live actor arms its timeout");
+        }
+        Ok(Self { fired, interval })
+    }
+
+    async fn handle(
+        &mut self,
+        OverflowMessage::Fired: Self::Msg,
+        _: &mut Context<'_, Self>,
+    ) -> ExitResult {
+        self.fired.fetch_add(1, Ordering::SeqCst);
+        let _ = self.interval;
+        Ok(())
+    }
+}
+
+/// A delay too large for the clock is a deadline that never arrives — not an
+/// immediate fire (and for intervals, not an immediate-fire loop).
+#[tokio::test]
+async fn overflowing_timer_deadlines_never_fire() {
+    for interval in [false, true] {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let mut tree = Tree::new();
+        tree.add_actor_once(
+            "overflow",
+            ActorOnceDef::<OverflowTimerActor>::new((Arc::clone(&fired), interval)),
+        )
+        .expect("valid actor");
+        let system = tree.spawn().expect("runtime is available");
+        system.wait_started().await.expect("actor starts");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "an overflowed deadline (interval: {interval}) must never fire"
+        );
+        system
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("tree shuts down");
+    }
+}

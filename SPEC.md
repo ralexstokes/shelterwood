@@ -2833,7 +2833,7 @@ the same series during shutdown drain; **Stop** = `StopContext<'_, A>` in
 | `recv()` / `try_recv()` (the merged event source: mailbox, offload completions, fired timers, queued continuations, §5.2 priority; `recv` yields `None` on stop request, biased; `try_recv` ignores the stop token — the drain primitive for raw loops: under `Drain`, exhaust the frozen prefix via `try_recv` after `recv` yields `None`, §10's raw-loop obligation) | ✓ | — | — | — |
 | `mailbox_shutdown()` (the resolved §10 policy for this actor's mailbox — what a raw loop consults to honor `Drain` vs `Discard`) | ✓ | — | — | — |
 | `mark_ready()` (one-shot effect by construction; meaningful only under gated readiness, else a documented no-op — B.2's rule, uniformly; during drain always the no-op) | ✓ | ✓ | ✓ | — |
-| `stop()` (clean self-stop after current callback; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §10 ladder as the stop bound) | — | ✓ | ✓ | — |
+| `stop()` (clean self-stop; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §10 ladder as the stop bound. Live/Drain: effective after the current callback. Raw: freezes intake at the call — drain the frozen prefix via `try_recv` after `recv` yields `None`; §1 principle 5's public primitive for the blanket loop's `stop()`) | ✓ | ✓ | ✓ | — |
 | `is_draining()` | — | ✓ | ✓ | — |
 | `continue_with(msg)` (next-message continuation; no mailbox capacity; anti-starvation per §5.2) | ✓ | ✓ | **R** | — |
 | Keyed timers: `set_timeout` / `set_interval` / `clear_timer` (§5.3) | ✓ | ✓ | **R** | — |

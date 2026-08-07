@@ -631,23 +631,23 @@ trait RawActor: Send + 'static {
   before `run` is called. The shared options record applies unchanged
   (mailbox settings included — honoring `mailbox_shutdown` is the raw
   loop's own obligation, §10/B.1); readiness defaults `Immediate` per §6.
-- *Open (§14.1), with the constraint set any resolution MUST satisfy:*
-  how `init` + `Args` thread through the raw layer. Provisional resolution
-  from the origin spike, to be validated:
-  1. `RawActor::run(&mut self, ctx)` stays untouched — construction is an
-     `Actor`-layer concept; the raw trait is construction-agnostic.
-  2. The casualty is the blanket `impl<H: Actor> RawActor for H`: with
-     `init(args)`, the actor value does not exist before `run`, so the
-     blanket moves to a wrapper type with `Uninit(Args) → Running(A)`
-     phases.
-  3. That wrapper replaces exactly the code where the origin's readiness
-     hack lived ("must be the first operation before any await"); declared
-     readiness (§6) MUST land with or before this change so the poll-order
-     trap cannot be reintroduced.
-  4. The unvalidated risk is **decorator ergonomics** — how wrappers around
-     handler actors compose after the change. This cannot be desk-checked;
-     the spike validates it by porting the two largest acceptance scenarios
-     (Appendix C) and the shutdown-race tests before committing.
+- **Resolved by the M3 §14.1 spike:** `init` and `Args` remain entirely an
+  `Actor`-layer concern. `RawActor::run(&mut self, ctx)` is unchanged and
+  construction-agnostic. The handler loop lives in the public `Handler<A>`
+  raw-actor wrapper, which owns the `Uninit(Args) → Running(A)` transition;
+  `ActorDef` and `ActorOnceDef` construct that wrapper rather than relying on
+  a blanket `impl<A: Actor> RawActor for A` (which cannot exist before
+  `init` produces `A`). The wrapper stores its declared readiness mode, the
+  engine reads it before `run` is first polled, and only `AfterInit` performs
+  the automatic post-init `mark_ready`; `Immediate` and `Manual` retain their
+  declared meanings. Raw decorators can wrap `Handler<A>` directly and may
+  await before delegation without changing readiness. Handler decorators use
+  the zero-cost same-message `Context::for_actor` / `StopContext::for_actor`
+  reborrow, sharing identity and incarnation-owned resources. Executable
+  shard-store and nested assistant-control-plane spike ports validate both
+  composition paths, readiness gating, exact-handle replacement, nested
+  dynamic teardown, and stage preservation. **Verdict: accept the provisional
+  wrapper design; no decorator-ergonomics blocker remains.**
 
 ## 5. Mailboxes, delivery, and the event loop
 
@@ -2398,14 +2398,14 @@ integration toolkit for the driver shell and the end-to-end invariants.
     all stay alive until the owner acts; a retained terminal sibling
     does not block completion.
 
-## 14. Open questions (resolve during the core spike)
+## 14. Core-spike decisions
 
-Two remain:
+Both questions are resolved:
 
-1. **`init`/`Args` threading through the raw-actor layer** — constraint set
-   and provisional resolution in §4.3; the spike's job is to validate
-   decorator ergonomics by porting the two largest acceptance scenarios,
-   not to revisit the constraints.
+1. **`init`/`Args` threading through the raw-actor layer — resolved in M3.**
+   The public `Handler<A>` wrapper and same-message context re-entry design
+   described in §4.3 passed the shard-store and assistant-control-plane
+   executable spikes, including a raw decorator that awaits before delegation.
 2. **Engine event arbitration — resolved in M1.** When one driver wake makes
    several events eligible, the engine processes them in this order:
    scope shutdown, membership removal, child exit, readiness signal,

@@ -398,6 +398,7 @@ enum MailboxKind {
 
 struct Envelope<M> {
     message: M,
+    accepted_sequence: u64,
 }
 
 enum OperationOutcome<M> {
@@ -588,13 +589,21 @@ impl<M: Send + 'static> MailboxCell<M> {
                     let (message, wake) = operation
                         .accept(incarnation)
                         .expect("a newly submitted operation still owns its message");
+                    state.accepted = state.accepted.saturating_add(1);
+                    let accepted_sequence = state.accepted;
                     let displaced = match state.kind {
                         Some(MailboxKind::Queue(_)) => {
-                            state.queue.push_back(Envelope { message });
+                            state.queue.push_back(Envelope {
+                                message,
+                                accepted_sequence,
+                            });
                             None
                         }
                         Some(MailboxKind::Latest) => {
-                            let displaced = state.latest.replace(Envelope { message });
+                            let displaced = state.latest.replace(Envelope {
+                                message,
+                                accepted_sequence,
+                            });
                             state.conflated = state
                                 .conflated
                                 .saturating_add(u64::from(displaced.is_some()));
@@ -602,7 +611,6 @@ impl<M: Send + 'static> MailboxCell<M> {
                         }
                         None => unreachable!(),
                     };
-                    state.accepted = state.accepted.saturating_add(1);
                     drop(state);
                     self.changed.pulse();
                     if let Some(waker) = wake {
@@ -664,15 +672,23 @@ impl<M: Send + 'static> MailboxCell<M> {
                     })
                 }
                 Some(MailboxKind::Queue(_)) => {
-                    state.queue.push_back(Envelope { message });
                     state.accepted = state.accepted.saturating_add(1);
+                    let accepted_sequence = state.accepted;
+                    state.queue.push_back(Envelope {
+                        message,
+                        accepted_sequence,
+                    });
                     drop(state);
                     self.changed.pulse();
                     Ok(incarnation)
                 }
                 Some(MailboxKind::Latest) => {
-                    let displaced = state.latest.replace(Envelope { message });
                     state.accepted = state.accepted.saturating_add(1);
+                    let accepted_sequence = state.accepted;
+                    let displaced = state.latest.replace(Envelope {
+                        message,
+                        accepted_sequence,
+                    });
                     state.conflated = state
                         .conflated
                         .saturating_add(u64::from(displaced.is_some()));
@@ -694,7 +710,12 @@ impl<M: Send + 'static> MailboxCell<M> {
         }
     }
 
-    fn receive(&self, incarnation: Incarnation, allow_frozen: bool) -> Option<M> {
+    fn receive(
+        &self,
+        incarnation: Incarnation,
+        allow_frozen: bool,
+        accepted_through: Option<u64>,
+    ) -> Option<M> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         let eligible = match state.status {
             BindingStatus::Bound(current) => current == incarnation,
@@ -705,8 +726,24 @@ impl<M: Send + 'static> MailboxCell<M> {
             return None;
         }
         let message = match state.kind {
-            Some(MailboxKind::Queue(_)) => state.queue.pop_front().map(|item| item.message),
-            Some(MailboxKind::Latest) => state.latest.take().map(|item| item.message),
+            Some(MailboxKind::Queue(_)) => {
+                let eligible = state.queue.front().is_some_and(|item| {
+                    accepted_through.is_none_or(|limit| item.accepted_sequence <= limit)
+                });
+                eligible
+                    .then(|| state.queue.pop_front())
+                    .flatten()
+                    .map(|item| item.message)
+            }
+            Some(MailboxKind::Latest) => {
+                let eligible = state.latest.as_ref().is_some_and(|item| {
+                    accepted_through.is_none_or(|limit| item.accepted_sequence <= limit)
+                });
+                eligible
+                    .then(|| state.latest.take())
+                    .flatten()
+                    .map(|item| item.message)
+            }
             None => None,
         };
         let promotion = if message.is_some() && matches!(state.status, BindingStatus::Bound(_)) {
@@ -902,16 +939,23 @@ fn promote_waiters<M>(state: &mut MailboxState<M>) -> Promotion<M> {
         if let Some(waker) = wake {
             promotion.wakers.push(waker);
         }
+        state.accepted = state.accepted.saturating_add(1);
+        let accepted_sequence = state.accepted;
         match kind {
-            MailboxKind::Queue(_) => state.queue.push_back(Envelope { message }),
+            MailboxKind::Queue(_) => state.queue.push_back(Envelope {
+                message,
+                accepted_sequence,
+            }),
             MailboxKind::Latest => {
-                if let Some(displaced) = state.latest.replace(Envelope { message }) {
+                if let Some(displaced) = state.latest.replace(Envelope {
+                    message,
+                    accepted_sequence,
+                }) {
                     state.conflated = state.conflated.saturating_add(1);
                     promotion.displaced.push(displaced);
                 }
             }
         }
-        state.accepted = state.accepted.saturating_add(1);
         accepted += 1;
     }
     promotion
@@ -1442,11 +1486,20 @@ impl<M: Send + 'static> MailboxReceiver<M> {
     }
 
     pub(crate) fn try_recv(&self) -> Option<M> {
-        self.mailbox.receive(self.incarnation, true)
+        self.mailbox.receive(self.incarnation, true, None)
     }
 
     pub(crate) fn try_recv_live(&self) -> Option<M> {
-        self.mailbox.receive(self.incarnation, false)
+        self.mailbox.receive(self.incarnation, false, None)
+    }
+
+    pub(crate) fn try_recv_live_through(&self, accepted_sequence: u64) -> Option<M> {
+        self.mailbox
+            .receive(self.incarnation, false, Some(accepted_sequence))
+    }
+
+    pub(crate) fn accepted_sequence(&self) -> u64 {
+        self.mailbox.stats().accepted
     }
 
     pub(crate) async fn changed(&mut self) {

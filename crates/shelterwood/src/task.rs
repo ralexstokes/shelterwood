@@ -20,22 +20,44 @@ pub(crate) type TaskFactory = Arc<Mutex<Box<dyn Fn(TaskContext) -> TaskFuture + 
 
 /// A library-owned cancellation token.
 #[derive(Clone, Debug, Default)]
-pub struct CancellationToken(Latch);
+pub struct CancellationToken {
+    primary: Latch,
+    secondary: Option<Latch>,
+}
 
 impl CancellationToken {
     pub(crate) fn from_latch(latch: Latch) -> Self {
-        Self(latch)
+        Self {
+            primary: latch,
+            secondary: None,
+        }
+    }
+
+    pub(crate) fn from_latches(primary: Latch, secondary: Latch) -> Self {
+        Self {
+            primary,
+            secondary: Some(secondary),
+        }
+    }
+
+    pub(crate) fn child(&self, cancellation: Latch) -> Self {
+        debug_assert!(self.secondary.is_none());
+        Self::from_latches(self.primary.clone(), cancellation)
     }
 
     /// Reports whether cancellation has been requested.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.0.is_fired()
+        self.primary.is_fired() || self.secondary.as_ref().is_some_and(Latch::is_fired)
     }
 
     /// Waits until cancellation is requested.
     pub async fn cancelled(&self) {
-        self.0.fired().await;
+        if let Some(secondary) = &self.secondary {
+            let _ = crate::driver::select(self.primary.fired(), secondary.fired()).await;
+        } else {
+            self.primary.fired().await;
+        }
     }
 }
 

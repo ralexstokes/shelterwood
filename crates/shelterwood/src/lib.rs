@@ -2,6 +2,7 @@
 
 //! Structured supervision and actors for asynchronous Rust systems.
 
+mod actor;
 mod driver;
 mod engine;
 mod exit;
@@ -17,6 +18,7 @@ mod tree;
 #[allow(dead_code)]
 mod runtime;
 
+pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use exit::{
     Exit, ExitError, ExitKind, ExitResult, IntensityTrip, ShutdownStraggler, ShutdownTimeout,
     StartupFailure, StartupFailureCause,
@@ -31,7 +33,9 @@ pub use policy::{
     MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, RestartCondition, RestartPolicy,
     Retention, ScopeDefaults, Shutdown, Strategy,
 };
-pub use raw::{RawActor, RawContext, RawDef, RawOnceDef};
+pub use raw::{
+    Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,
+};
 pub use task::{CancellationToken, OneShotTaskRef, TaskContext, TaskDef, TaskOnceDef, TaskRef};
 pub use tree::{
     ActorSlot, Admission, AdmissionReceipt, BuildError, DynamicActorSlot, DynamicScopeRef,

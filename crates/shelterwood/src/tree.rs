@@ -13,9 +13,9 @@ use std::{
 };
 
 use crate::{
-    ActorRef, ChildId, DefaultsInheritance, Exit, Intensity, IntensityTrip, Membership,
-    ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults, Shutdown, ShutdownTimeout,
-    StartupFailure, Strategy,
+    ActorDef, ActorOnceDef, ActorRef, ChildId, DefaultsInheritance, Exit, Intensity, IntensityTrip,
+    Membership, ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults, Shutdown,
+    ShutdownTimeout, StartupFailure, Strategy,
     driver::{DynamicReservation, Latch, MemberCell, ScopeCell},
     identity::ScopeIdentity,
     mailbox::MailboxCell,
@@ -421,6 +421,25 @@ impl Tree {
         self.core.reserve(id, None).map(attach_actor_slot)
     }
 
+    /// Adds a restartable callback-oriented actor.
+    pub fn add_actor<A: crate::Actor>(
+        &mut self,
+        id: impl Into<ChildId>,
+        definition: ActorDef<A>,
+    ) -> Result<ActorRef<A::Msg>, ReserveError> {
+        self.reserve_actor(id).map(|slot| slot.define(definition))
+    }
+
+    /// Adds a consuming one-shot callback-oriented actor.
+    pub fn add_actor_once<A: crate::Actor>(
+        &mut self,
+        id: impl Into<ChildId>,
+        definition: ActorOnceDef<A>,
+    ) -> Result<ActorRef<A::Msg>, ReserveError> {
+        self.reserve_actor(id)
+            .map(|slot| slot.define_once(definition))
+    }
+
     /// Adds a restartable raw actor.
     pub fn add_raw<R: crate::RawActor>(
         &mut self,
@@ -554,6 +573,25 @@ impl DynamicTree {
         self.core.reserve(id, None).map(attach_actor_slot)
     }
 
+    /// Adds an initial restartable callback-oriented actor.
+    pub fn add_actor<A: crate::Actor>(
+        &mut self,
+        id: impl Into<ChildId>,
+        definition: ActorDef<A>,
+    ) -> Result<ActorRef<A::Msg>, ReserveError> {
+        self.reserve_actor(id).map(|slot| slot.define(definition))
+    }
+
+    /// Adds an initial consuming one-shot callback-oriented actor.
+    pub fn add_actor_once<A: crate::Actor>(
+        &mut self,
+        id: impl Into<ChildId>,
+        definition: ActorOnceDef<A>,
+    ) -> Result<ActorRef<A::Msg>, ReserveError> {
+        self.reserve_actor(id)
+            .map(|slot| slot.define_once(definition))
+    }
+
     /// Adds an initial restartable raw actor.
     pub fn add_raw<R: crate::RawActor>(
         &mut self,
@@ -677,6 +715,24 @@ impl<M: Send + 'static> ActorSlot<M> {
     #[must_use]
     pub fn actor_ref(&self) -> ActorRef<M> {
         ActorRef::new(Arc::clone(&self.slot.member), Arc::clone(&self.mailbox))
+    }
+
+    /// Defines a restartable callback-oriented actor and consumes the slot.
+    #[must_use]
+    pub fn define<A>(self, definition: ActorDef<A>) -> ActorRef<M>
+    where
+        A: crate::Actor<Msg = M>,
+    {
+        self.define_raw(definition.into_raw())
+    }
+
+    /// Defines a consuming one-shot callback-oriented actor and consumes the slot.
+    #[must_use]
+    pub fn define_once<A>(self, definition: ActorOnceDef<A>) -> ActorRef<M>
+    where
+        A: crate::Actor<Msg = M>,
+    {
+        self.define_once_raw(definition.into_raw())
     }
 
     /// Defines a restartable raw actor and consumes the slot.
@@ -934,6 +990,36 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
             Arc::clone(&self.reservation().slot.member),
             Arc::clone(&self.mailbox),
         )
+    }
+
+    /// Defines a restartable callback-oriented actor; dropping after first poll detaches.
+    pub fn define<A>(self, definition: ActorDef<A>) -> Admission<ActorRef<M>>
+    where
+        A: crate::Actor<Msg = M>,
+    {
+        self.define_raw(definition.into_raw())
+    }
+
+    fn define_fused<A>(self, definition: ActorDef<A>) -> Admission<ActorRef<M>>
+    where
+        A: crate::Actor<Msg = M>,
+    {
+        self.define_raw_fused(definition.into_raw())
+    }
+
+    /// Defines a one-shot callback-oriented actor; dropping after first poll detaches.
+    pub fn define_once<A>(self, definition: ActorOnceDef<A>) -> Admission<ActorRef<M>>
+    where
+        A: crate::Actor<Msg = M>,
+    {
+        self.define_once_raw(definition.into_raw())
+    }
+
+    fn define_once_fused<A>(self, definition: ActorOnceDef<A>) -> Admission<ActorRef<M>>
+    where
+        A: crate::Actor<Msg = M>,
+    {
+        self.define_once_raw_fused(definition.into_raw())
     }
 
     /// Defines a restartable raw actor; dropping after first poll detaches.
@@ -1587,6 +1673,30 @@ impl DynamicScopeRef {
                 mailbox,
             }
         })
+    }
+
+    /// Adds a restartable callback-oriented actor, resolving at admission.
+    pub fn add_actor<A: crate::Actor>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: ActorDef<A>,
+    ) -> Admission<ActorRef<A::Msg>> {
+        match self.reserve_actor(id) {
+            Ok(slot) => slot.define_fused(definition),
+            Err(error) => Admission::error(error),
+        }
+    }
+
+    /// Adds a consuming one-shot callback-oriented actor, resolving at admission.
+    pub fn add_actor_once<A: crate::Actor>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: ActorOnceDef<A>,
+    ) -> Admission<ActorRef<A::Msg>> {
+        match self.reserve_actor(id) {
+            Ok(slot) => slot.define_once_fused(definition),
+            Err(error) => Admission::error(error),
+        }
     }
 
     /// Adds a restartable raw actor, resolving at admission.

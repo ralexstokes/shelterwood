@@ -125,6 +125,18 @@ pub(crate) async fn join<I, T>(handle: JoinHandle<I, T>) -> JoinOutcome<I, T> {
     }
 }
 
+pub(crate) async fn join_resuming<I, T>(handle: JoinHandle<I, T>) -> (I, T) {
+    let JoinHandle { id, inner } = handle;
+    match inner.await {
+        Ok(value) => (id, value),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => {
+            debug_assert!(error.is_cancelled());
+            panic!("library-owned operation task was unexpectedly cancelled")
+        }
+    }
+}
+
 fn panic_message(payload: Box<dyn std::any::Any + Send + 'static>) -> Option<String> {
     if let Some(message) = payload.downcast_ref::<&str>() {
         Some((*message).to_owned())

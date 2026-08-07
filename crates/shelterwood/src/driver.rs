@@ -41,6 +41,69 @@ pub(crate) fn sleep(duration: Duration) -> DriverSleep {
     Box::pin(runtime::sleep(duration))
 }
 
+pub(crate) fn sleep_until(deadline: Instant) -> DriverSleep {
+    Box::pin(runtime::sleep_until_std(deadline))
+}
+
+pub(crate) fn now() -> Instant {
+    runtime::now()
+}
+
+pub(crate) struct ActorWork {
+    handle: Option<runtime::JoinHandle<(), ()>>,
+    abort: runtime::AbortHandle,
+}
+
+impl ActorWork {
+    pub(crate) fn abort(&self) {
+        self.abort.abort();
+    }
+
+    pub(crate) async fn join(mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let _ = runtime::join(handle).await;
+    }
+}
+
+impl Drop for ActorWork {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+pub(crate) fn spawn_actor_work(future: impl Future<Output = ()> + Send + 'static) -> ActorWork {
+    let handle = runtime::spawn((), future);
+    let abort = handle.abort_handle();
+    ActorWork {
+        handle: Some(handle),
+        abort,
+    }
+}
+
+pub(crate) struct BlockingWork<T> {
+    handle: Option<runtime::JoinHandle<(), T>>,
+}
+
+impl<T: Send + 'static> BlockingWork<T> {
+    pub(crate) async fn join(mut self) -> T {
+        let handle = self
+            .handle
+            .take()
+            .expect("blocking operation was joined more than once");
+        runtime::join_resuming(handle).await.1
+    }
+}
+
+pub(crate) fn spawn_blocking_work<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> BlockingWork<T> {
+    BlockingWork {
+        handle: Some(runtime::spawn_blocking((), operation)),
+    }
+}
+
 pub(crate) enum Selected<A, B> {
     First(A),
     Second(B),
@@ -1054,6 +1117,10 @@ enum ChildEvent {
         index: usize,
         incarnation: Incarnation,
     },
+    SelfStop {
+        index: usize,
+        incarnation: Incarnation,
+    },
     Exited {
         index: usize,
         incarnation: Incarnation,
@@ -1218,6 +1285,7 @@ impl ScopeRuntime {
         let ready = Latch::default();
         let ended = Latch::default();
         let construction_release = Latch::default();
+        let local_stop = Latch::default();
         let id = child.slot.member.id().clone();
         let task_context = TaskContext::new(
             id.clone(),
@@ -1241,6 +1309,7 @@ impl ScopeRuntime {
                         shutdown: shutdown.clone(),
                         abort: abort.clone(),
                         ready: ready.clone(),
+                        local_stop: local_stop.clone(),
                         mailbox_shutdown: child.options.mailbox_shutdown,
                     },
                 },
@@ -1397,6 +1466,7 @@ impl ScopeRuntime {
         let abort_handle = handle.abort_handle();
         let exit_sender = self.events.clone();
         let exit_shutdown = shutdown.clone();
+        let exit_local_stop = local_stop.clone();
         let exit_ended = ended.clone();
         runtime::spawn((), async move {
             let join = match runtime::join(handle).await {
@@ -1415,13 +1485,14 @@ impl ScopeRuntime {
                     incarnation,
                     recorded,
                     join,
-                    cancelled: exit_shutdown.is_fired(),
+                    cancelled: exit_shutdown.is_fired() || exit_local_stop.is_fired(),
                 }),
             )
             .await;
         });
 
         let readiness_signal = ready.clone();
+        let self_stop_ended = ended.clone();
         if gated {
             let ready_sender = self.events.clone();
             runtime::spawn((), async move {
@@ -1437,6 +1508,19 @@ impl ScopeRuntime {
                 }
             });
         }
+        let self_stop_sender = self.events.clone();
+        runtime::spawn((), async move {
+            if matches!(
+                runtime::select_two(local_stop.fired(), self_stop_ended.fired()).await,
+                runtime::Either::Left(())
+            ) {
+                let _ = runtime::mpsc_send(
+                    &self_stop_sender,
+                    DriverEvent::Child(ChildEvent::SelfStop { index, incarnation }),
+                )
+                .await;
+            }
+        });
 
         child.active = Some(ActiveChild {
             incarnation,
@@ -1699,6 +1783,16 @@ impl ScopeRuntime {
             .member
             .update(|record| record.stage = MemberStage::Running);
         self.progress_startup();
+    }
+
+    fn handle_self_stop(&mut self, index: usize, incarnation: Incarnation) {
+        if self.children[index]
+            .active
+            .as_ref()
+            .is_some_and(|active| active.incarnation == incarnation)
+        {
+            self.begin_stop_child(index, None);
+        }
     }
 
     fn handle_exit(
@@ -2223,6 +2317,9 @@ async fn run_scope_incarnation(
         }
         while let Some(event) = runtime::mpsc_try_recv(&mut event_receiver) {
             let class = match event {
+                DriverEvent::Child(ChildEvent::SelfStop { .. }) => {
+                    ArbitrationClass::MembershipRemoval
+                }
                 DriverEvent::Child(ChildEvent::Constructed { .. })
                 | DriverEvent::Child(ChildEvent::Ready { .. }) => ArbitrationClass::ReadinessSignal,
                 DriverEvent::Child(ChildEvent::Exited { .. }) => ArbitrationClass::ChildExit,
@@ -2263,6 +2360,9 @@ async fn run_scope_incarnation(
                 | runtime::ScopeWake::Deadline => continue,
                 runtime::ScopeWake::Message(Some(event)) => {
                     let class = match event {
+                        DriverEvent::Child(ChildEvent::SelfStop { .. }) => {
+                            ArbitrationClass::MembershipRemoval
+                        }
                         DriverEvent::Child(ChildEvent::Constructed { .. })
                         | DriverEvent::Child(ChildEvent::Ready { .. }) => {
                             ArbitrationClass::ReadinessSignal
@@ -2306,6 +2406,10 @@ async fn run_scope_incarnation(
                 Pending::Driver(DriverEvent::Child(ChildEvent::Ready { index, incarnation })) => {
                     scope.handle_ready(index, incarnation);
                 }
+                Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop {
+                    index,
+                    incarnation,
+                })) => scope.handle_self_stop(index, incarnation),
                 Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
                     index,
                     incarnation,

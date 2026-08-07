@@ -257,12 +257,16 @@ impl ScopeSnapshot {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        let mut scope = self;
-        let mut found = None;
+        let mut found: Option<&ChildSnapshot> = None;
         for id in path {
-            let child = scope.child(id)?;
-            found = Some(child);
-            scope = child.nested.as_deref()?;
+            // A nested snapshot is required only to *advance* past a scope
+            // child — a path may end at any child kind, including a scope in
+            // a restart window whose nested snapshot is momentarily absent.
+            let scope = match found {
+                None => self,
+                Some(previous) => previous.nested.as_deref()?,
+            };
+            found = Some(scope.child(id)?);
         }
         found
     }

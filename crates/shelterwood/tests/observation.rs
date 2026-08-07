@@ -1083,26 +1083,18 @@ async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
     .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    let waiter = tokio::spawn({
-        let scope = scope.clone();
-        async move {
-            scope
-                .wait_for_child(
-                    "gated",
-                    |child| matches!(child.state, ChildState::Running),
-                    Duration::MAX,
-                )
-                .await
-        }
-    });
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-    assert!(!waiter.is_finished(), "the overflowing wait remains armed");
+    let mut waiter = Box::pin(scope.wait_for_child(
+        "gated",
+        |child| matches!(child.state, ChildState::Running),
+        Duration::MAX,
+    ));
+    assert!(
+        poll_once(waiter.as_mut()).is_pending(),
+        "an unsatisfied far-future wait is registered rather than timing out"
+    );
     gate.release();
     waiter
         .await
-        .expect("waiter joins")
         .expect("a far-future deadline waits for the condition instead of expiring");
     system
         .shutdown(Duration::from_secs(1))

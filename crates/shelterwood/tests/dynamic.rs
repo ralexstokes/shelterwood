@@ -14,7 +14,7 @@ use crate::common::{
 };
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicTree, ExitError,
-    ExitKind, ExitResult, NotAdmittingCause, RawActor, RawContext, RawDef, Readiness,
+    ExitKind, ExitResult, NotAdmittingCause, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
     RemoveOutcome, ReserveError, RestartCondition, RestartPolicy, Retention, SendErrorKind,
     Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
@@ -89,6 +89,44 @@ async fn restartable_dynamic_surfaces_are_parallel_across_all_three_child_kinds(
         .add_subtree("subtree", SubtreeDef::factory(waiting_tree))
         .await
         .expect("restartable subtree is admitted");
+    let subtree = subtree_receipt.into_handles();
+
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
+async fn consuming_dynamic_surfaces_are_parallel_across_all_three_child_kinds() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+
+    let task_receipt = scope
+        .add_task_once(
+            "task-once",
+            TaskOnceDef::new(|context| async move {
+                context.shutdown_token().cancelled().await;
+                Ok::<_, ExitError>(())
+            }),
+        )
+        .await
+        .expect("one-shot task is admitted");
+    let (task, completion) = task_receipt.into_handles();
+    drop(completion);
+    let raw_receipt = scope
+        .add_raw_once("raw-once", RawOnceDef::new(WaitingRaw))
+        .await
+        .expect("one-shot raw actor is admitted");
+    let raw = raw_receipt.into_handles();
+    let subtree_receipt = scope
+        .add_subtree_once("subtree-once", SubtreeOnceDef::new(waiting_tree()))
+        .await
+        .expect("one-shot subtree is admitted");
     let subtree = subtree_receipt.into_handles();
 
     assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);

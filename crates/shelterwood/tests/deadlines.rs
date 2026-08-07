@@ -22,6 +22,7 @@ enum Message {
 
 struct BoundaryActor {
     gate: Option<ReleaseGate>,
+    call_seen: Option<ReleaseGate>,
     values: Arc<Mutex<Vec<usize>>>,
     calls: Arc<AtomicUsize>,
     hold_reply: bool,
@@ -52,6 +53,9 @@ impl RawActor for BoundaryActor {
                     .push(value),
                 Message::Ask(reply) => {
                     self.calls.fetch_add(1, Ordering::SeqCst);
+                    if let Some(call_seen) = &self.call_seen {
+                        call_seen.release();
+                    }
                     if self.hold_reply {
                         self.held = Some(reply);
                     } else {
@@ -72,6 +76,7 @@ fn boundary_actor(
 ) -> BoundaryActor {
     BoundaryActor {
         gate,
+        call_seen: None,
         values: Arc::clone(values),
         calls: Arc::clone(calls),
         hold_reply,
@@ -315,14 +320,16 @@ async fn preacceptance_expiry_and_terminality_follow_the_identity_table() {
 #[tokio::test(start_paused = true)]
 async fn call_uses_one_budget_across_acceptance_and_response() {
     let gate = ReleaseGate::default();
+    let call_seen = ReleaseGate::default();
     let values = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
+    let mut definition = boundary_actor(Some(gate.clone()), &values, &calls, true);
+    definition.call_seen = Some(call_seen.clone());
     let actor = tree
         .add_raw_once(
             "one-budget",
-            RawOnceDef::new(boundary_actor(Some(gate.clone()), &values, &calls, true))
-                .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
+            RawOnceDef::new(definition).mailbox(Mailbox::queue(1).expect("non-zero capacity")),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -334,12 +341,7 @@ async fn call_uses_one_budget_across_acceptance_and_response() {
 
     advance_time(Duration::from_secs(6)).await;
     gate.release();
-    for _ in 0..32 {
-        if calls.load(Ordering::SeqCst) == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    call_seen.wait().await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_quiet(Duration::from_secs(3), || {
         poll_once(call.as_mut()).is_ready()

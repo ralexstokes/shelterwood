@@ -429,6 +429,11 @@ impl ScopeCell {
         flavor: ScopeFlavor,
         child_identity: ScopeIdentity,
     ) -> Arc<Self> {
+        let changed = Signal::default();
+        // Waiters parked on the scope signal (`shutdown_scope`,
+        // `wait_for_incarnation`) exit on member terminality, so terminality
+        // reached without a scope-state transition must still pulse it.
+        member.add_terminal_signal(changed.clone());
         Arc::new(Self {
             member,
             flavor,
@@ -437,7 +442,7 @@ impl ScopeCell {
                 state: ScopeState::Unstarted,
                 startup: None,
             }),
-            changed: Signal::default(),
+            changed,
             control: Mutex::new(ScopeControl::default()),
             current_dynamic: Mutex::new(None),
             current_children: Mutex::new(Vec::new()),
@@ -775,6 +780,13 @@ impl DynamicControl {
             .filter(|entry| !entry.admitted)
             .map(|entry| Arc::clone(&entry.slot))
             .collect::<Vec<_>>();
+        // In-flight removals can no longer be finalized by the driver; their
+        // members terminalize with the scope, so the removal is complete.
+        let removals = state
+            .entries
+            .values()
+            .map(|entry| Arc::clone(&entry.removal))
+            .collect::<Vec<_>>();
         drop(state);
         for slot in unadmitted {
             drop(slot.take_defined());
@@ -782,6 +794,9 @@ impl DynamicControl {
             if let Some(scope) = &slot.scope {
                 scope.terminalize_never_started();
             }
+        }
+        for removal in removals {
+            removal.complete(RemoveOutcome::Removed);
         }
     }
 }
@@ -954,6 +969,17 @@ struct AdmissionRequest {
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
     response: Arc<AdmissionResponse>,
+}
+
+impl Drop for AdmissionRequest {
+    fn drop(&mut self) {
+        // A request dropped without being processed — the driver returned or
+        // was hard-aborted with this event still queued — must still resolve
+        // its caller (§13.12: dynamic mutations resolve on every path).
+        // `complete` is first-wins, so this is a no-op after normal handling.
+        self.response
+            .complete(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
+    }
 }
 
 enum DriverEvent {
@@ -1195,6 +1221,13 @@ impl Drop for ScopeRuntime {
                 active.shutdown.fire();
                 active.abort.fire();
                 active.abort_handle.abort();
+                // A dropped driver can never process this child's exit event,
+                // so publish terminality now: without it, exit-awaiting
+                // surfaces hang and sends park forever (§13.2, §13.7).
+                child
+                    .slot
+                    .member
+                    .terminalize(Exit::new(ExitKind::Aborted { after_grace: false }, true));
             } else if !child.is_terminal() {
                 child.slot.member.terminalize(Exit::never_started());
             }
@@ -1237,7 +1270,30 @@ impl ScopeRuntime {
         let child = &mut self.children[index];
         let Some(incarnation) = mint_child_incarnation(&child.slot.member, &mut child.incarnations)
         else {
+            // Incarnation exhaustion terminalized the membership (§3.1);
+            // route the terminal outcome through the same paths as a terminal
+            // exit so ordered startup fails or draining advances instead of
+            // wedging the scope.
             child.construction.take();
+            let exit = match child.slot.member.record().stage {
+                MemberStage::Terminal(exit) => exit,
+                _ => Exit::never_started(),
+            };
+            let pre_ready = child.initial && !self.startup_complete && !child.initial_ready;
+            let removing = child.slot.member.record().removing;
+            let retention_remove = child.options.retention == crate::Retention::Remove;
+            if removing {
+                self.finalize_removal(index);
+            } else if pre_ready && self.draining.is_none() {
+                self.fail_startup(index, exit);
+            } else {
+                if retention_remove {
+                    self.prune_terminal(index);
+                }
+                if self.draining.is_some() {
+                    self.stop_next_ordered();
+                }
+            }
             return;
         };
 
@@ -1429,6 +1485,7 @@ impl ScopeRuntime {
         let abort_handle = handle.abort_handle();
         let exit_sender = self.events.clone();
         let exit_ended = ended.clone();
+        let exit_member = Arc::clone(&child.slot.member);
         runtime::spawn((), async move {
             let join = match runtime::join(handle).await {
                 runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
@@ -1439,7 +1496,12 @@ impl ScopeRuntime {
             };
             exit_ended.fire();
             let report = report_receiver.receive();
-            let _ = runtime::mpsc_send(
+            if let Err(DriverEvent::Child(ChildEvent::Exited {
+                recorded,
+                join,
+                cancelled,
+                ..
+            })) = runtime::mpsc_send(
                 &exit_sender,
                 DriverEvent::Child(ChildEvent::Exited {
                     index,
@@ -1449,7 +1511,14 @@ impl ScopeRuntime {
                     cancelled: report.cancelled,
                 }),
             )
-            .await;
+            .await
+            {
+                // The driver is gone (hard-aborted ancestor or a finished
+                // scope): nothing upstream can process this exit, so the
+                // post-join publication happens here — otherwise the
+                // membership is stranded and exit-awaiting surfaces hang.
+                exit_member.terminalize(classify_exit(recorded, join, cancelled));
+            }
         });
 
         let readiness_signal = ready.clone();
@@ -1932,7 +2001,7 @@ impl ScopeRuntime {
         None
     }
 
-    fn handle_admission(&mut self, request: AdmissionRequest) {
+    fn handle_admission(&mut self, mut request: AdmissionRequest) {
         let Some(control) = request.control.upgrade() else {
             request
                 .response
@@ -1967,7 +2036,7 @@ impl ScopeRuntime {
             return;
         }
 
-        let Some(definition) = request.slot.take_definition() else {
+        let Some(definition) = request.slot.take_defined() else {
             cancel_dynamic_reservation(&control, &request.slot);
             request.response.complete(Err(ReserveError::NotAdmitting(
                 NotAdmittingCause::ReservationEnded,
@@ -2013,7 +2082,7 @@ impl ScopeRuntime {
                 .get_mut(id)
                 .expect("the matching reservation was just resolved");
             entry.admitted = true;
-            entry.fused_cancel = request.fused_cancel;
+            entry.fused_cancel = request.fused_cancel.take();
         }
         let mut child = ChildRuntime::from_plan(plan, &self.root);
         child.initial = false;

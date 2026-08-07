@@ -797,3 +797,47 @@ async fn draining_scopes_reject_admission_and_treat_removal_as_absent() {
         .expect("shutdown joins")
         .expect("clean shutdown");
 }
+
+#[tokio::test]
+async fn removal_of_a_polled_split_definition_keeps_the_scope_admitting() {
+    let factory_dropped = Arc::new(AtomicBool::new(false));
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+    let slot = scope.reserve_task("worker").expect("reservation succeeds");
+    let task = slot.task_ref();
+    let mut admission = Box::pin(slot.define(TaskDef::new({
+        let probe = DropProbe(Arc::clone(&factory_dropped));
+        move |context| {
+            let _ = &probe;
+            async move {
+                context.shutdown_token().cancelled().await;
+                Ok(())
+            }
+        }
+    })));
+    // The first poll queues the admission with the driver; the removal then
+    // lands before the driver dequeues it — §13.12's mandated race, which
+    // must resolve `ReservationEnded` while the scope keeps admitting.
+    assert!(poll_once(admission.as_mut()).is_pending());
+    assert_eq!(scope.remove("worker").await, RemoveOutcome::Removed);
+    assert!(matches!(
+        admission.await,
+        Err(ReserveError::NotAdmitting(
+            NotAdmittingCause::ReservationEnded
+        ))
+    ));
+    assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
+    assert!(factory_dropped.load(Ordering::SeqCst));
+
+    let survivor = scope
+        .add_task("worker", waiting_task())
+        .await
+        .expect("the scope keeps admitting and the id is free")
+        .into_handles();
+    assert_eq!(scope.remove_task(&survivor).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}

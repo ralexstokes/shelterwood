@@ -1476,17 +1476,9 @@ pub(crate) fn remove_dynamic(
         }
         return response;
     }
-    if matches!(entry.slot.member.record().stage, MemberStage::Terminal(_)) {
-        let member = Arc::clone(&entry.slot.member);
-        scope.transition_child(&member, |record| record.removing = true, None);
-        entry.slot.member.removal.fire();
-        drop(state);
-        // Terminal residents still have a driver registration. Route them
-        // through the normal removal path so that registration is reclaimed
-        // before the removal response completes.
-        scope.signal().pulse();
-        return response;
-    }
+    // Terminal residents still have a driver registration. Route them
+    // through the normal removal path, like live residents, so that
+    // registration is reclaimed before the removal response completes.
     let member = Arc::clone(&entry.slot.member);
     scope.transition_child(&member, |record| record.removing = true, None);
     entry.slot.member.removal.fire();

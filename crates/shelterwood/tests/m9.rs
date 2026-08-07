@@ -142,6 +142,92 @@ async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
     );
 }
 
+struct LaterUnreadyActor {
+    generation: usize,
+    finish_unready: ReleaseGate,
+}
+
+impl RawActor for LaterUnreadyActor {
+    type Msg = GroupMessage;
+
+    fn readiness(&self) -> Readiness {
+        Readiness::Manual
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        if self.generation == 1 {
+            context.mark_ready();
+            let Some(GroupMessage::Crash) = context.recv().await else {
+                return Ok(());
+            };
+            Err(ExitError::message("restart into an unready incarnation"))
+        } else {
+            self.finish_unready.wait().await;
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn stopping_a_later_unready_incarnation_does_not_rewind_startup_state() {
+    let constructions = Arc::new(AtomicUsize::new(0));
+    let finish_unready = ReleaseGate::default();
+    let hold_constructions = Arc::new(AtomicUsize::new(0));
+    let ready = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.strategy(Strategy::OneForAll);
+    let actor = tree
+        .add_raw(
+            "later-unready",
+            RawDef::factory({
+                let constructions = Arc::clone(&constructions);
+                let finish_unready = finish_unready.clone();
+                move || LaterUnreadyActor {
+                    generation: constructions.fetch_add(1, Ordering::SeqCst) + 1,
+                    finish_unready: finish_unready.clone(),
+                }
+            }),
+        )
+        .expect("valid later-unready actor");
+    tree.add_raw(
+        "hold",
+        group_actor(&hold_constructions, &ready, false).restart(RestartPolicy::new(
+            RestartCondition::Never,
+            Backoff::Immediate,
+        )),
+    )
+    .expect("valid holding actor");
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("first incarnation starts");
+    let scope = system.scope().clone();
+
+    actor
+        .send(GroupMessage::Crash)
+        .await
+        .expect("restart trigger accepted");
+    wait_for_count(&constructions, 2).await;
+    finish_unready.release();
+    let terminal = scope
+        .wait_for_child(
+            "later-unready",
+            |child| child.state.is_terminal(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("terminal membership remains observable");
+    assert!(
+        matches!(terminal.state, shelterwood::ChildState::Stopped { .. }),
+        "unexpected terminal snapshot: {terminal:#?}"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("group fixture stops");
+}
+
 #[tokio::test]
 async fn one_for_all_drains_restartable_residents_and_respawns_in_ready_order() {
     let first = Arc::new(AtomicUsize::new(0));

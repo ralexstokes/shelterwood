@@ -321,13 +321,13 @@ error payloads. Both tokens are views of §3.1's one fencing primitive;
 `Incarnation::membership()` projects an incarnation's owning membership,
 and equality between an incarnation's projection and a held membership
 token is the "same slot?" question answered exactly. `supersedes` on
-`Membership` is scope-relative creation order: for two memberships of
-the same scope it answers "was `a` created after `b`" — the
-replacement-detection question of §3.4, meaningful whether or not the id
-was reused — and for tokens of different scopes it is `false` in both
-directions (fail closed, §3.1's rule; never a panic). Equality is exact
-identity; there is deliberately no total `Ord` — cross-scope comparison
-has no meaning.
+`Membership` is replacement order for one child id under one stable owning
+scope: it answers whether `a` is a later membership for the same logical
+slot than `b` (§3.4). Different child ids and different owning scopes are
+incomparable and return `false` in both directions (fail closed, §3.1's
+rule; never a panic). Equality is exact identity; there is deliberately no
+total `Ord` — comparison outside one stable `(scope, child-id)` domain has no
+meaning.
 
 Consequences (normative):
 
@@ -443,9 +443,14 @@ An `ActorRef` follows incarnations of **its** membership, never a same-id
 replacement membership. This boundary is kept (it is what makes identity
 exact), but it MUST be discoverable: removal-then-re-add under the same id
 yields a fresh membership whose handles come from the new insertion, and the
-old handles report terminal. A small routing/registry adapter for planned
-handoff (a `ServiceRef`/route-cell that the application repoints at cutover)
-is non-core (§24) — it must not weaken exact membership identity.
+old handles report terminal. The replacement membership supersedes its
+removed predecessor. The ordering domain belongs to the stable scope cell,
+not to a temporary builder: an initially declared child and its later runtime
+replacement compare, as do corresponding descendants rebuilt across
+incarnations of one nested scope membership. Different ids and different
+owning scope memberships remain incomparable. A small routing/registry adapter
+for planned handoff (a `ServiceRef`/route-cell that the application repoints at
+cutover) is non-core (§24) — it must not weaken exact membership identity.
 
 ## 4. Construction and restart [#360]
 
@@ -2252,12 +2257,16 @@ integration toolkit for the driver shell and the end-to-end invariants.
    child with the same id (and, by construction, colliding internal
    coordinates), then present scope A's handle to scope B and require
    rejection. Replay remove→re-add under one id and assert the stale handle
-   fails while the replacement is untouched. Exhaustion mints nothing
-   (§3.1): drive a counter to saturation and assert no duplicate token
-   is ever issued — an unmintable incarnation terminalizes the
-   membership as under `Never`; an unmintable membership is the
-   enumerated reservation rejection (B.8). The structural half is
-   enforced by API shape (no public bare integers) and review, not tests.
+   fails while the replacement is untouched and supersedes it; assert that
+   different ids and different owning scopes are incomparable. Repeat the
+   ordering check for a declared child replaced at runtime and for a
+   corresponding descendant rebuilt after a nested-scope restart. Exhaustion
+   mints nothing (§3.1): drive a counter to saturation and assert no duplicate
+   token is ever issued — an unmintable incarnation terminalizes the
+   membership as under `Never`; an unmintable membership is the enumerated
+   reservation rejection (B.8), or structured nested-startup provenance when
+   a stable scope cannot rebase a produced declaration. The structural half
+   is enforced by API shape (no public bare integers) and review, not tests.
 5. **One-shot construction drops its resources exactly once across: init
    panic, startup failure, shutdown-before-start, normal exit.** One
    drop-counting guard type owned by the args, four tests asserting exactly
@@ -3472,14 +3481,18 @@ least these. Policy/config data additionally follows §1's plain-data rule
 
 - **Identity tokens** — `Membership`, `Incarnation`: `Copy`, `Eq`,
   `Hash`, `Send`, `Sync`. Ordering is `supersedes` (§3.1–§3.3),
-  deliberately not `Ord`: cross-scope and cross-membership comparison
-  has no meaning and fails closed.
+  deliberately not `Ord`: membership comparison across owning scopes or
+  child ids, and incarnation comparison across memberships, has no meaning
+  and fails closed.
 - **Non-owning handles** — `ActorRef<M>`, `TaskRef`, `ScopeRef`,
   `DynamicScopeRef`, snapshot receivers, lifecycle subscriptions:
   `Send + Sync`; the refs additionally cheap `Clone` with `Eq` + `Hash`
-  **by membership identity** — two handles to one membership compare
-  equal and collide as map keys, which is what makes userland
-  registries and routing tables ordinary code.
+  **by slot identity** — two handles to one slot (equivalently, at any
+  instant, to one membership) compare equal and collide as map keys,
+  which is what makes userland registries and routing tables ordinary
+  code. Slot identity is what stays fixed when lowering rebases a
+  rebuilt declaration's membership (§3.4): the token read through the
+  handle refreshes; the handle's map identity MUST NOT change.
 - **Cancellation tokens** (B.9 — `shutdown_token()`, `abort_token()`,
   `run_blocking`'s child token): `Clone + Send + Sync` — they are held
   across awaits inside `Send`-declared callback futures (§4.1) and

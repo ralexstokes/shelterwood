@@ -608,7 +608,9 @@ mod tests {
     #[test]
     fn a_retained_event_after_explicit_lag_remains_subject_to_later_overflow() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
-        let membership = identity.mint_membership().expect("membership available");
+        let membership = identity
+            .mint_membership(&crate::ChildId::from("scope"))
+            .expect("membership available");
         let event = |seq| LifecycleEvent {
             scope_path: Vec::new(),
             scope: membership,

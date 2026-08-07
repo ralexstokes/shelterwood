@@ -1158,9 +1158,12 @@ impl<M> fmt::Debug for ActorRef<M> {
     }
 }
 
+// Handle identity is the slot cell, not the membership token: lowering a
+// rebuilt nested declaration rebases the token behind live pre-spawn handles,
+// and a token-value hash would strand entries keyed before the rebase.
 impl<M> PartialEq for ActorRef<M> {
     fn eq(&self, other: &Self) -> bool {
-        self.membership() == other.membership()
+        Arc::ptr_eq(&self.member, &other.member)
     }
 }
 
@@ -1168,7 +1171,7 @@ impl<M> Eq for ActorRef<M> {}
 
 impl<M> Hash for ActorRef<M> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.membership().hash(state);
+        Arc::as_ptr(&self.member).hash(state);
     }
 }
 
@@ -1658,9 +1661,10 @@ mod tests {
 
     fn actor() -> (Arc<MailboxCell<u8>>, ActorRef<u8>) {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from("actor");
         let member = MemberCell::new(
-            ChildId::from("actor"),
-            identity.mint_membership().expect("membership available"),
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
         );
         let mailbox = MailboxCell::new(member.id().clone());
         member.attach_mailbox(mailbox.clone());
@@ -1688,7 +1692,9 @@ mod tests {
         MailboxControl::configure(&*mailbox, Mailbox::default());
         let mut generations = {
             let mut identity = ScopeIdentity::new().expect("scope identity available");
-            let membership = identity.mint_membership().expect("membership available");
+            let membership = identity
+                .mint_membership(&ChildId::from("actor"))
+                .expect("membership available");
             (membership, identity.incarnation_counter(membership))
         };
         let incarnation = ScopeIdentity::mint_incarnation(generations.0, &mut generations.1)

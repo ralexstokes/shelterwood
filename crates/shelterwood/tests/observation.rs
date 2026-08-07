@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -15,7 +15,7 @@ use shelterwood::{
     Backoff, ChildState, DynamicScopeRef, DynamicTree, Jitter, LifecycleEvent, LifecycleEventKind,
     LifecycleEvents, LifecycleItem, LifecycleTryRecvError, RemoveOutcome, RestartCondition,
     RestartPolicy, Retention, ScopeRef, ScopeState, StopReason, SubtreeDef, SubtreeOnceDef,
-    TaskDef, TaskOnceDef, Tree, WaitError,
+    TaskDef, TaskOnceDef, TaskRef, Tree, WaitError,
 };
 
 async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
@@ -611,7 +611,11 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
             break membership;
         }
     };
-    assert_ne!(Some(second_child), first_child);
+    let first_child = first_child.expect("first incarnation admits its child");
+    assert!(
+        second_child.supersedes(first_child),
+        "corresponding descendants retain ordering across a scope restart"
+    );
     assert_eq!(nested.membership(), scope_membership);
     assert_eq!(nested.snapshot().total_restarts, 0);
     assert!(nested.snapshot().lifecycle_seq >= starting.seq);
@@ -623,6 +627,88 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
         })
         .await
     );
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}
+
+#[tokio::test]
+async fn rebased_declared_handles_keep_their_map_identity() {
+    fn hashed(value: &impl std::hash::Hash) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = std::hash::DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    let stash: Arc<Mutex<Vec<(TaskRef, u64, shelterwood::Membership)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let builds = Arc::new(AtomicUsize::new(0));
+    let mut outer = Tree::new();
+    let nested = outer
+        .add_subtree(
+            "nested",
+            SubtreeDef::factory({
+                let stash = Arc::clone(&stash);
+                let builds = Arc::clone(&builds);
+                move || {
+                    let mut tree = Tree::new();
+                    let handle = if builds.fetch_add(1, Ordering::SeqCst) == 0 {
+                        tree.add_task("worker", TaskDef::new(|_| async { Ok(()) }))
+                            .expect("valid finishing task")
+                    } else {
+                        tree.add_task("worker", waiting_task())
+                            .expect("valid waiting task")
+                    };
+                    // Capture identity before lowering rebases a rebuilt
+                    // declaration onto the stable scope.
+                    stash.lock().expect("stash mutex intact").push((
+                        handle.clone(),
+                        hashed(&handle),
+                        handle.membership(),
+                    ));
+                    tree
+                }
+            })
+            .restart(RestartPolicy::new(
+                RestartCondition::Always,
+                Backoff::Immediate,
+            )),
+        )
+        .expect("valid subtree");
+    let mut events = nested.subscribe_lifecycle();
+    let system = outer.spawn().expect("runtime is available");
+
+    let mut admissions = Vec::new();
+    while admissions.len() < 2 {
+        if let LifecycleEventKind::Added { membership, .. } = next_event(&mut events).await.kind {
+            admissions.push(membership);
+        }
+    }
+
+    let (first, first_hash, first_declared) = {
+        let stash = stash.lock().expect("stash mutex intact");
+        assert_eq!(stash.len(), 2);
+        stash[0].clone()
+    };
+    let (second, second_hash, second_declared) =
+        stash.lock().expect("stash mutex intact")[1].clone();
+
+    assert_eq!(first.membership(), first_declared);
+    assert_eq!(hashed(&first), first_hash);
+    assert!(
+        second.membership().supersedes(first.membership()),
+        "the rebuilt declaration is rebased onto the stable scope"
+    );
+    assert_ne!(second.membership(), second_declared);
+    assert_eq!(
+        hashed(&second),
+        second_hash,
+        "handle identity survives the rebase that refreshed its membership"
+    );
+    assert_eq!(second.membership(), admissions[1]);
 
     system
         .shutdown(Duration::from_secs(1))

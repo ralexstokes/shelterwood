@@ -39,9 +39,21 @@ idempotent `ReplyDropped` loop.
 
 Membership and incarnation answer different questions. An `ActorRef` follows
 restarts of one membership. After remove and re-add under the same child id,
-the replacement has a new `Membership`; neither membership supersedes the
-other, and an old handle never retargets it. Within one membership,
-`Incarnation::supersedes` is the correct restart ordering test.
+the replacement has a new `Membership` that supersedes the removed membership,
+while the old handle remains pinned to the removed one and never retargets.
+Membership ordering is narrow: only replacements of the same child id in the
+same stable scope compare. Different child ids and memberships owned by
+different scopes remain incomparable.
+
+The stable scope identity also spans declaration and runtime boundaries.
+Replacing an initially declared child dynamically therefore supersedes that
+declared membership, and a corresponding descendant produced after a nested
+scope restart supersedes its predecessor. A rebuilt declaration's handle
+observes that rebased membership, but the handle's own `Eq`/`Hash` identity
+is the slot itself: a handle stashed in a map before lowering remains
+addressable afterward. Read `membership()` when the exact token matters.
+Within one membership, `Incarnation::supersedes` remains the correct restart
+ordering test.
 
 ## Latest-value mailboxes and calls
 

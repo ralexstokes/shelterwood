@@ -316,9 +316,12 @@ impl fmt::Debug for TaskRef {
     }
 }
 
+// Handle identity is the slot cell, not the membership token: lowering a
+// rebuilt nested declaration rebases the token behind live pre-spawn handles,
+// and a token-value hash would strand entries keyed before the rebase.
 impl PartialEq for TaskRef {
     fn eq(&self, other: &Self) -> bool {
-        self.membership() == other.membership()
+        Arc::ptr_eq(&self.cell, &other.cell)
     }
 }
 
@@ -326,7 +329,7 @@ impl Eq for TaskRef {}
 
 impl Hash for TaskRef {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.membership().hash(state);
+        Arc::as_ptr(&self.cell).hash(state);
     }
 }
 

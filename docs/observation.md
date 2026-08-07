@@ -88,7 +88,8 @@ For planned replacement, retain the admission receipt or exact handle, remove
 that membership, await `RemoveOutcome::Removed`, then add the replacement. An
 add racing an in-progress same-id removal fails with `RemovalInProgress`; await
 the removal and retry. The replacement's membership is distinct rather than a
-new incarnation of the old one.
+new incarnation of the old one, and it supersedes the removed same-id
+membership. Different ids and different owning scopes remain incomparable.
 
 ## Pre-spawn observation
 

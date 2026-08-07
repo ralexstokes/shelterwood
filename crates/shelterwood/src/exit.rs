@@ -163,6 +163,11 @@ pub enum StartupFailureCause {
         /// Undefined child-id paths relative to the subtree root.
         undefined: Vec<Vec<ChildId>>,
     },
+    /// The stable scope could mint no identity for a declared child.
+    IdentityExhausted {
+        /// Child whose stable membership could not be minted.
+        id: ChildId,
+    },
 }
 
 #[derive(Debug)]
@@ -176,6 +181,12 @@ impl fmt::Display for StructuredStartupFailure {
             }
             StartupFailureCause::Lowering { undefined } => {
                 write!(formatter, "subtree has {} undefined slots", undefined.len())
+            }
+            StartupFailureCause::IdentityExhausted { id } => {
+                write!(
+                    formatter,
+                    "membership identity space is exhausted for child `{id}`"
+                )
             }
         }
     }

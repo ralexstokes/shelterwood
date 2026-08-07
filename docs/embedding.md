@@ -21,11 +21,16 @@ At the root, `wait_started()` reports a startup failure but deliberately leaves
 the successfully started prefix supervised. This permits a host-specific
 decision, but most embeddings want rollback:
 
-```rust,ignore
+```rust,no_run
+# use std::time::Duration;
+# use shelterwood::{System, Tree};
+# async fn start(tree: Tree) -> Result<System, Box<dyn std::error::Error>> {
 let system = tree.spawn()?;
 let system = system
     .start_or_shutdown(Duration::from_secs(5))
     .await?;
+# Ok(system)
+# }
 ```
 
 `start_or_shutdown` returns the owner on success. On failure it drives full

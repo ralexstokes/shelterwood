@@ -309,9 +309,8 @@ async fn timed_send_withdraws_while_replacement_is_in_backoff() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     let first = actor.try_send(1).expect("first incarnation accepts");
-    let timed_actor = actor.clone();
-    let timed = tokio::spawn(async move { timed_actor.send_timeout(42, timeout).await });
-    tokio::task::yield_now().await;
+    let mut timed = Box::pin(actor.send_timeout(42, timeout));
+    assert!(poll_once(timed.as_mut()).is_pending());
     fail_first.release();
     let mut observed_rebind = None;
     assert!(
@@ -328,10 +327,7 @@ async fn timed_send_withdraws_while_replacement_is_in_backoff() {
     );
     assert_eq!(observed_rebind, Some(None));
     tokio::time::advance(timeout).await;
-    let error = timed
-        .await
-        .expect("timed send task joins")
-        .expect_err("backoff outlives timeout");
+    let error = timed.await.expect_err("backoff outlives timeout");
     assert_eq!(error.kind, SendErrorKind::TimedOut);
     assert_eq!(error.incarnation_observed, Some(first));
     assert_eq!(error.message, 42);

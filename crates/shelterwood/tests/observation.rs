@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::common::{
-    ReleaseGate, poll_until,
+    ReleaseGate, assert_quiet, poll_once, poll_until,
     waiting::{task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
@@ -1108,4 +1108,87 @@ async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
+}
+
+#[tokio::test(start_paused = true)]
+async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_value() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+    let mut snapshots = scope.subscribe_snapshots();
+
+    let task = scope
+        .add_task(
+            "ephemeral",
+            TaskDef::new(|_| async { Ok(()) })
+                .restart(RestartPolicy::new(
+                    RestartCondition::Never,
+                    Backoff::Immediate,
+                ))
+                .retention(Retention::Remove),
+        )
+        .await
+        .expect("ephemeral task is admitted")
+        .into_handles();
+    task.wait().await;
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            scope.child("ephemeral").is_none()
+        })
+        .await,
+        "terminal removal reaches the latest snapshot"
+    );
+
+    let latest = snapshots
+        .changed()
+        .await
+        .expect("one notification exposes the newest conflated snapshot");
+    assert!(latest.child("ephemeral").is_none());
+    let mut next = Box::pin(snapshots.changed());
+    assert_quiet(Duration::from_secs(1), || {
+        poll_once(next.as_mut()).is_ready()
+    })
+    .await;
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_subscriptions_start_now_without_replaying_prior_history() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+    let old = scope
+        .add_task("old", waiting_task())
+        .await
+        .expect("old membership is admitted")
+        .into_handles();
+    assert_eq!(scope.remove_task(&old).await, RemoveOutcome::Removed);
+
+    let mut events = scope.subscribe_lifecycle();
+    assert_quiet(Duration::from_secs(1), || {
+        !matches!(events.try_recv(), Err(LifecycleTryRecvError::Empty))
+    })
+    .await;
+
+    let new = scope
+        .add_task("new", waiting_task())
+        .await
+        .expect("new membership is admitted")
+        .into_handles();
+    let event = next_event(&mut events).await;
+    assert!(matches!(
+        event.kind,
+        LifecycleEventKind::Added { ref id, membership }
+            if id.as_str() == "new" && membership == new.membership()
+    ));
+
+    assert_eq!(scope.remove_task(&new).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
 }

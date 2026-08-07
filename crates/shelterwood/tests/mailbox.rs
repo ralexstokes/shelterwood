@@ -87,7 +87,7 @@ fn recorder(
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn queue_backpressure_and_send_error_identity_are_exact() {
     let gate = ReleaseGate::default();
     let values = Arc::new(Mutex::new(Vec::new()));
@@ -124,11 +124,16 @@ async fn queue_backpressure_and_send_error_identity_are_exact() {
     assert_eq!(full.incarnation_observed, Some(accepting));
 
     let waiting_actor = actor.clone();
-    let waiting = tokio::spawn(async move { waiting_actor.send(full.message).await });
-    for _ in 0..4 {
-        tokio::task::yield_now().await;
-    }
-    assert!(!waiting.is_finished(), "send applies real backpressure");
+    let waiting_started = ReleaseGate::default();
+    let waiting = tokio::spawn({
+        let waiting_started = waiting_started.clone();
+        async move {
+            waiting_started.release();
+            waiting_actor.send(full.message).await
+        }
+    });
+    waiting_started.wait().await;
+    assert_quiet(Duration::from_millis(20), || waiting.is_finished()).await;
     gate.release();
     assert_eq!(
         waiting
@@ -322,13 +327,10 @@ async fn call_distinguishes_success_drop_and_response_timeout() {
 async fn reply_receiver_is_consuming_and_late_replies_are_discarded() {
     let width = Duration::from_secs(10);
     let (reply, receiver) = Reply::channel();
-    let waiter = tokio::spawn(async move { receiver.recv(width).await });
-    tokio::task::yield_now().await;
+    let mut waiter = Box::pin(receiver.recv(width));
+    assert!(poll_once(waiter.as_mut()).is_pending());
     advance_time(width).await;
-    assert_eq!(
-        waiter.await.expect("receiver task joins"),
-        Err(ReplyError::Timeout)
-    );
+    assert_eq!(waiter.await, Err(ReplyError::Timeout));
     reply.send(1);
 
     let (reply, receiver) = Reply::<usize>::channel();

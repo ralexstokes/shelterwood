@@ -16,6 +16,10 @@
     }:
     rust-env.lib.mkRustProject {
       src = ./.;
+      # Repository docs are compiled as crate doctests, so keep Markdown
+      # alongside Cargo sources in the clean build sandbox.
+      extraSourceFilter =
+        path: type: type == "regular" && builtins.match ".*\\.md" (toString path) != null;
       extraChecks =
         pkgs:
         let

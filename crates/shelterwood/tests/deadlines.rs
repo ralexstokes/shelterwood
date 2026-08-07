@@ -283,26 +283,17 @@ async fn preacceptance_expiry_and_terminality_follow_the_identity_table() {
         .expect("valid actor");
     let width = Duration::from_secs(10);
 
-    let timed_actor = actor.clone();
-    let timed =
-        tokio::spawn(async move { timed_actor.send_timeout(Message::Value(1), width).await });
-    tokio::task::yield_now().await;
+    let mut timed = Box::pin(actor.send_timeout(Message::Value(1), width));
+    assert!(poll_once(timed.as_mut()).is_pending());
     advance_time(width).await;
-    let timed = timed
-        .await
-        .expect("timed send joins")
-        .expect_err("unbound send expires");
+    let timed = timed.await.expect_err("unbound send expires");
     assert_eq!(timed.kind, SendErrorKind::TimedOut);
     assert_eq!(timed.incarnation_observed, None);
 
-    let call_actor = actor.clone();
-    let call = tokio::spawn(async move { call_actor.call(Message::Ask, width).await });
-    tokio::task::yield_now().await;
+    let mut call = Box::pin(actor.call(Message::Ask, width));
+    assert!(poll_once(call.as_mut()).is_pending());
     advance_time(width).await;
-    let call = call
-        .await
-        .expect("call task joins")
-        .expect_err("unbound call expires");
+    let call = call.await.expect_err("unbound call expires");
     assert_eq!(call.kind, CallErrorKind::AcceptanceTimedOut);
     assert_eq!(call.incarnation_observed, None);
 
@@ -338,9 +329,8 @@ async fn call_uses_one_budget_across_acceptance_and_response() {
     system.wait_started().await.expect("actor starts");
     let accepting = actor.try_send(Message::Value(1)).expect("queue fills");
     let budget = Duration::from_secs(10);
-    let call_actor = actor.clone();
-    let call = tokio::spawn(async move { call_actor.call(Message::Ask, budget).await });
-    tokio::task::yield_now().await;
+    let mut call = Box::pin(actor.call(Message::Ask, budget));
+    assert!(poll_once(call.as_mut()).is_pending());
 
     advance_time(Duration::from_secs(6)).await;
     gate.release();
@@ -351,15 +341,12 @@ async fn call_uses_one_budget_across_acceptance_and_response() {
         tokio::task::yield_now().await;
     }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(
-        !call.is_finished(),
-        "response still has the remaining budget"
-    );
-    advance_time(Duration::from_secs(4)).await;
-    let error = call
-        .await
-        .expect("call task joins")
-        .expect_err("one overall budget expires");
+    assert_quiet(Duration::from_secs(3), || {
+        poll_once(call.as_mut()).is_ready()
+    })
+    .await;
+    advance_time(Duration::from_secs(1)).await;
+    let error = call.await.expect_err("one overall budget expires");
     assert_eq!(error.kind, CallErrorKind::ResponseTimedOut);
     assert_eq!(error.incarnation_observed, Some(accepting));
     system

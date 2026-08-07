@@ -51,7 +51,10 @@ The framework always freezes raw-actor intake, but the raw loop owns delivery.
 It must consult `RawContext::mailbox_shutdown` and use `try_recv` to drain the
 frozen prefix when requested:
 
-```rust,ignore
+```rust,no_run
+# use shelterwood::{ExitError, ExitResult, MailboxShutdown, RawContext};
+# fn handle<T>(_message: T) -> Result<(), ExitError> { Ok(()) }
+# async fn drain<M: Send + 'static>(context: &mut RawContext<M>) -> ExitResult {
 while let Some(message) = context.recv().await {
     handle(message)?;
 }
@@ -61,6 +64,8 @@ if context.mailbox_shutdown() == MailboxShutdown::Drain {
         handle(message)?;
     }
 }
+# Ok(())
+# }
 ```
 
 For a queue mailbox, that prefix is every accepted but undelivered message in

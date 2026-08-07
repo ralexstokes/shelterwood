@@ -46,3 +46,23 @@ pub use tree::{
     ReserveError, ScopeRef, StartOrShutdownError, StartupError, StopReason, Subtree, SubtreeDef,
     SubtreeOnceDef, SubtreeSlot, System, TaskSlot, Tree,
 };
+
+// Keep the repository-facing examples in the same rustdoc compilation lane as
+// the crate API without adding documentation-only modules to the public surface.
+#[cfg(doctest)]
+mod repository_docs {
+    #[doc = include_str!("../../../README.md")]
+    mod readme {}
+
+    #[doc = include_str!("../../../docs/embedding.md")]
+    mod embedding {}
+
+    #[doc = include_str!("../../../docs/observation.md")]
+    mod observation {}
+
+    #[doc = include_str!("../../../docs/retry-and-ordering.md")]
+    mod retry_and_ordering {}
+
+    #[doc = include_str!("../../../docs/shutdown-and-resources.md")]
+    mod shutdown_and_resources {}
+}

@@ -9,9 +9,11 @@ use std::{
 
 use crate::common::{ReleaseGate, advance_time, poll_until};
 use shelterwood::{
-    Backoff, DynamicTree, ExitError, ExitKind, Intensity, Readiness, RestartCondition,
-    RestartPolicy, Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeDef,
-    SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, Tree,
+    Actor, ActorOnceDef, Backoff, Context, DefaultsInheritance, DynamicTree, ExitError, ExitKind,
+    ExitResult, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox,
+    Readiness, ReadinessDeadline, RestartCondition, RestartPolicy, ScopeDefaults, SendErrorKind,
+    Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
+    TaskOnceDef, TaskRef, Tree,
 };
 
 #[tokio::test]
@@ -663,4 +665,184 @@ async fn locally_requested_subtree_shutdown_reads_cancelled() {
         exit.cancelled(),
         "a locally requested shutdown is still a stop request: {exit:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn restart_attempt_resets_after_a_ready_incarnation_settles() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let replacement_started = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.intensity(Intensity::new(100, Duration::from_secs(10)).expect("valid intensity"));
+    tree.add_task(
+        "worker",
+        TaskDef::new({
+            let starts = Arc::clone(&starts);
+            let replacement_started = replacement_started.clone();
+            move |context| {
+                let generation = starts.fetch_add(1, Ordering::SeqCst) + 1;
+                let replacement_started = replacement_started.clone();
+                async move {
+                    match generation {
+                        1 => Err(ExitError::message("pre-ready failure")),
+                        2 => {
+                            context.mark_ready();
+                            tokio::time::sleep(Duration::from_secs(11)).await;
+                            Err(ExitError::message("post-ready failure"))
+                        }
+                        _ => {
+                            replacement_started.release();
+                            context.mark_ready();
+                            context.shutdown_token().cancelled().await;
+                            Ok(())
+                        }
+                    }
+                }
+            }
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded)
+        .shutdown(Shutdown::Abort),
+    )
+    .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    system
+        .wait_started()
+        .await
+        .expect("the second incarnation settles aggregate readiness");
+
+    advance_time(Duration::from_secs(11)).await;
+    replacement_started.wait().await;
+
+    let mut attempts = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(LifecycleItem::Event(event)) => {
+                if let LifecycleEventKind::RestartScheduled { attempt, .. } = event.kind {
+                    attempts.push(attempt);
+                }
+            }
+            Ok(LifecycleItem::Lagged { dropped }) => {
+                panic!("short restart trace unexpectedly lagged by {dropped}")
+            }
+            Err(LifecycleTryRecvError::Empty) => break,
+            Err(LifecycleTryRecvError::Closed) => panic!("live root stream closed"),
+            Ok(_) | Err(_) => panic!("unexpected future lifecycle variant"),
+        }
+    }
+    assert_eq!(attempts, [1, 1]);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[derive(Clone, Copy)]
+enum CapacityMessage {
+    Hold,
+    Queued,
+}
+
+struct CapacityActor {
+    entered: ReleaseGate,
+    release: ReleaseGate,
+}
+
+impl Actor for CapacityActor {
+    type Msg = CapacityMessage;
+    type Args = (ReleaseGate, ReleaseGate);
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            entered: args.0,
+            release: args.1,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+        if matches!(message, CapacityMessage::Hold) {
+            self.entered.release();
+            self.release.wait().await;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn subtree_defaults_inherit_or_reset_end_to_end() {
+    let inherited_entered = ReleaseGate::default();
+    let inherited_release = ReleaseGate::default();
+    let reset_entered = ReleaseGate::default();
+    let reset_release = ReleaseGate::default();
+
+    let mut inherited_tree = Tree::new();
+    let inherited_actor = inherited_tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<CapacityActor>::new((
+                inherited_entered.clone(),
+                inherited_release.clone(),
+            )),
+        )
+        .expect("valid inherited actor");
+    let mut reset_tree = Tree::new();
+    let reset_actor = reset_tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<CapacityActor>::new((reset_entered.clone(), reset_release.clone())),
+        )
+        .expect("valid reset actor");
+
+    let mut root = Tree::new();
+    root.defaults(ScopeDefaults {
+        mailbox: Some(Mailbox::queue(1).expect("valid inherited capacity")),
+        ..ScopeDefaults::default()
+    });
+    root.add_subtree_once(
+        "inherited",
+        SubtreeOnceDef::new(inherited_tree).defaults(DefaultsInheritance::Inherit),
+    )
+    .expect("valid inherited subtree");
+    root.add_subtree_once(
+        "reset",
+        SubtreeOnceDef::new(reset_tree).defaults(DefaultsInheritance::Reset),
+    )
+    .expect("valid reset subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("both subtrees start");
+
+    inherited_actor
+        .send(CapacityMessage::Hold)
+        .await
+        .expect("inherited actor accepts hold");
+    reset_actor
+        .send(CapacityMessage::Hold)
+        .await
+        .expect("reset actor accepts hold");
+    inherited_entered.wait().await;
+    reset_entered.wait().await;
+
+    inherited_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("the inherited one-slot queue accepts one pending message");
+    let inherited_full = inherited_actor
+        .try_send(CapacityMessage::Queued)
+        .expect_err("the second pending message observes the inherited capacity");
+    assert_eq!(inherited_full.kind, SendErrorKind::Full);
+
+    reset_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("reset uses the library queue capacity");
+    reset_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("reset does not inherit the parent's one-slot capacity");
+
+    inherited_release.release();
+    reset_release.release();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
 }

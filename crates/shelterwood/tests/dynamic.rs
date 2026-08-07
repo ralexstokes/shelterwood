@@ -13,10 +13,10 @@ use crate::common::{
     waiting::{task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
-    Actor, ActorOnceDef, Backoff, Context as ActorContext, DynamicTree, ExitError, ExitKind,
-    ExitResult, NotAdmittingCause, Readiness, RemoveOutcome, ReserveError, RestartCondition,
-    RestartPolicy, Retention, SendErrorKind, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef,
-    TaskDef, TaskOnceDef, Tree,
+    Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicTree, ExitError,
+    ExitKind, ExitResult, NotAdmittingCause, RawActor, RawContext, RawDef, Readiness,
+    RemoveOutcome, ReserveError, RestartCondition, RestartPolicy, Retention, SendErrorKind,
+    Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe(Arc<AtomicBool>);
@@ -56,6 +56,48 @@ impl Actor for EvidenceActor {
     async fn handle(&mut self, (): (), _: &mut ActorContext<'_, Self>) -> ExitResult {
         Ok(())
     }
+}
+
+struct WaitingRaw;
+
+impl RawActor for WaitingRaw {
+    type Msg = ();
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        context.shutdown_token().cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn restartable_dynamic_surfaces_are_parallel_across_all_three_child_kinds() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+
+    let task_receipt = scope
+        .add_task("task", waiting_task())
+        .await
+        .expect("restartable task is admitted");
+    let task = task_receipt.into_handles();
+    let raw_receipt = scope
+        .add_raw("raw", RawDef::factory(|| WaitingRaw))
+        .await
+        .expect("restartable raw actor is admitted");
+    let raw = raw_receipt.into_handles();
+    let subtree_receipt = scope
+        .add_subtree("subtree", SubtreeDef::factory(waiting_tree))
+        .await
+        .expect("restartable subtree is admitted");
+    let subtree = subtree_receipt.into_handles();
+
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
 }
 
 #[tokio::test]
@@ -786,10 +828,15 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
         })
         .await
     );
-    advance_time(Duration::from_secs(1)).await;
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    system
+        .scope()
+        .wait_for_child(
+            "dynamic",
+            |child| matches!(child.state, ChildState::Restarting),
+            Duration::MAX,
+        )
+        .await
+        .expect("the failed incarnation enters its explicit restart window");
     assert_eq!(factories.load(Ordering::SeqCst), 1);
     assert!(matches!(
         scope.reserve_task("too-early"),
@@ -880,18 +927,27 @@ async fn pending_restart_window_stop_targets_the_next_incarnation_once() {
         })
         .await
     );
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    system
+        .scope()
+        .wait_for_child(
+            "nested",
+            |child| matches!(child.state, ChildState::Restarting),
+            Duration::MAX,
+        )
+        .await
+        .expect("the first incarnation enters its explicit restart window");
 
     let nested_wait = nested.clone();
-    let stop =
-        tokio::spawn(async move { nested_wait.shutdown_and_wait(Duration::from_secs(1)).await });
-    tokio::task::yield_now().await;
-    assert!(
-        !stop.is_finished(),
-        "restart-window request waits for the next incarnation"
-    );
+    let stop_started = ReleaseGate::default();
+    let stop = tokio::spawn({
+        let stop_started = stop_started.clone();
+        async move {
+            stop_started.release();
+            nested_wait.shutdown_and_wait(Duration::from_secs(1)).await
+        }
+    });
+    stop_started.wait().await;
+    assert_quiet(Duration::from_secs(1), || stop.is_finished()).await;
     advance_time(width).await;
     stop.await
         .expect("stop waiter joins")
@@ -996,4 +1052,88 @@ async fn removal_of_a_polled_split_definition_keeps_the_scope_admitting() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal() {
+    let worker_started = ReleaseGate::default();
+    let worker_cancelled = ReleaseGate::default();
+    let mut nested = DynamicTree::new();
+    let worker = nested
+        .add_task(
+            "worker",
+            TaskDef::new({
+                let worker_started = worker_started.clone();
+                let worker_cancelled = worker_cancelled.clone();
+                move |context| {
+                    let worker_started = worker_started.clone();
+                    let worker_cancelled = worker_cancelled.clone();
+                    async move {
+                        worker_started.release();
+                        context.shutdown_token().cancelled().await;
+                        worker_cancelled.release();
+                        std::future::pending::<ExitResult>().await
+                    }
+                }
+            })
+            .shutdown(Shutdown::Graceful {
+                grace: Duration::from_secs(60),
+            }),
+        )
+        .expect("valid worker");
+    let mut root = Tree::new();
+    let nested = root
+        .add_subtree_once(
+            "nested",
+            SubtreeOnceDef::new(nested).shutdown(Shutdown::Abort),
+        )
+        .expect("valid dynamic subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("nested scope starts");
+    worker_started.wait().await;
+
+    let mut removal = Box::pin(nested.remove_task(&worker));
+    worker_cancelled.wait().await;
+    assert!(
+        poll_once(removal.as_mut()).is_pending(),
+        "the worker keeps exact removal in flight"
+    );
+
+    let slot = nested.reserve_task("queued").expect("reservation succeeds");
+    let queued = slot.task_ref();
+    let mut admission =
+        Box::pin(slot.define(
+            TaskDef::new(|_| std::future::pending::<ExitResult>()).shutdown(Shutdown::Abort),
+        ));
+    assert!(
+        poll_once(admission.as_mut()).is_pending(),
+        "first poll owns a queued admission request before yielding"
+    );
+
+    let mut shutdown = Box::pin(system.shutdown(Duration::from_secs(1)));
+    assert!(
+        poll_once(shutdown.as_mut()).is_pending(),
+        "ancestor shutdown is armed before queued work gets a scheduler turn"
+    );
+
+    match admission.await {
+        Ok(receipt) => {
+            assert_eq!(receipt.membership(), queued.membership());
+            drop(receipt);
+        }
+        Err(ReserveError::NotAdmitting(_)) => {}
+        Err(error) => panic!("unexpected queued-admission result: {error:?}"),
+    }
+    shutdown
+        .await
+        .expect("the aborting subtree recursively joins its descendants");
+    assert_eq!(removal.await, RemoveOutcome::Removed);
+    assert!(matches!(
+        worker.wait().await.kind(),
+        ExitKind::Aborted { .. }
+    ));
+    assert!(matches!(
+        queued.wait().await.kind(),
+        ExitKind::Aborted { .. } | ExitKind::NeverStarted
+    ));
 }

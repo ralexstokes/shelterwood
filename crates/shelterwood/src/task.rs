@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
-pub(crate) type TaskFactory = Arc<Mutex<Box<dyn Fn(TaskContext) -> TaskFuture + Send + 'static>>>;
+pub(crate) type TaskFactory = Arc<dyn Fn(TaskContext) -> TaskFuture + Send + Sync + 'static>;
 
 /// A library-owned cancellation token.
 #[derive(Clone, Debug, Default)]
@@ -138,13 +138,11 @@ impl TaskDef {
     /// Creates a restartable task definition from a repeatable body factory.
     pub fn new<F, Fut>(factory: F) -> Self
     where
-        F: Fn(TaskContext) -> Fut + Send + 'static,
+        F: Fn(TaskContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ExitResult> + Send + 'static,
     {
         Self {
-            factory: Arc::new(Mutex::new(Box::new(move |context| {
-                Box::pin(factory(context))
-            }))),
+            factory: Arc::new(move |context| Box::pin(factory(context))),
             options: CommonOptions::default(),
         }
     }

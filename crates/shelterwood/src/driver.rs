@@ -2126,11 +2126,7 @@ impl ScopeRuntime {
                     instance.run(context).await
                 }
                 SpawnBody::TaskRestartable(factory) => {
-                    let future = (factory
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner))(
-                        task_context
-                    );
+                    let future = factory(task_context);
                     future.await
                 }
                 SpawnBody::TaskOnce(body) => body(task_context).await,
@@ -2139,10 +2135,7 @@ impl ScopeRuntime {
                     scope,
                     inherited,
                 } => {
-                    let tree = (factory
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner))(
-                    );
+                    let tree = factory();
                     run_nested_tree(
                         tree,
                         scope,

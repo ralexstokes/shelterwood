@@ -1094,7 +1094,7 @@ impl<M: Send + 'static> RawContext<M> {
 
 /// Restartable raw-actor definition.
 pub struct RawDef<R: RawActor> {
-    factory: Arc<Mutex<Box<dyn Fn() -> R + Send + 'static>>>,
+    factory: Arc<dyn Fn() -> R + Send + Sync + 'static>,
     pub(crate) options: CommonOptions,
 }
 
@@ -1109,9 +1109,9 @@ impl<R: RawActor> fmt::Debug for RawDef<R> {
 
 impl<R: RawActor> RawDef<R> {
     /// Creates a restartable definition from a repeatable actor factory.
-    pub fn factory(factory: impl Fn() -> R + Send + 'static) -> Self {
+    pub fn factory(factory: impl Fn() -> R + Send + Sync + 'static) -> Self {
         Self {
-            factory: Arc::new(Mutex::new(Box::new(factory))),
+            factory: Arc::new(factory),
             options: CommonOptions::default(),
         }
     }
@@ -1170,16 +1170,13 @@ impl<R: RawActor> RawDef<R> {
     pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
         let factory = self.factory;
         RawConstruction {
-            source: RawSource::Restartable(Arc::new(Mutex::new(Box::new(move || {
-                let actor = (factory
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner))(
-                );
+            source: RawSource::Restartable(Arc::new(move || {
+                let actor = factory();
                 Box::new(RawInstance {
                     actor,
                     mailbox: Arc::clone(&mailbox),
                 })
-            })))),
+            })),
             options: self.options,
         }
     }
@@ -1266,7 +1263,7 @@ impl<R: RawActor> RawOnceDef<R> {
 }
 
 pub(crate) type RawFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
-type RawFactory = Arc<Mutex<Box<dyn Fn() -> Box<dyn ErasedRawInstance> + Send + 'static>>>;
+type RawFactory = Arc<dyn Fn() -> Box<dyn ErasedRawInstance> + Send + Sync + 'static>;
 
 pub(crate) trait ErasedRawInstance: Send {
     fn readiness(&self) -> Readiness;
@@ -1400,10 +1397,7 @@ pub(crate) enum RawSpawn {
 impl RawSpawn {
     pub(crate) fn construct(self) -> Box<dyn ErasedRawInstance> {
         match self {
-            Self::Restartable(factory) => (factory
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner))(
-            ),
+            Self::Restartable(factory) => factory(),
             Self::OneShot(instance) => instance,
         }
     }

@@ -1317,7 +1317,7 @@ impl Future for Removal {
 
 /// A restartable subtree definition.
 pub struct SubtreeDef<T: Subtree> {
-    factory: Box<dyn Fn() -> T + Send + 'static>,
+    factory: Box<dyn Fn() -> T + Send + Sync + 'static>,
     options: CommonOptions,
     defaults: DefaultsInheritance,
 }
@@ -1334,7 +1334,7 @@ impl<T: Subtree> fmt::Debug for SubtreeDef<T> {
 
 impl<T: Subtree> SubtreeDef<T> {
     /// Creates a restartable subtree from a repeatable declaration source.
-    pub fn factory(factory: impl Fn() -> T + Send + 'static) -> Self {
+    pub fn factory(factory: impl Fn() -> T + Send + Sync + 'static) -> Self {
         Self {
             factory: Box::new(factory),
             options: CommonOptions::default(),
@@ -1380,9 +1380,9 @@ impl<T: Subtree> SubtreeDef<T> {
     fn erase(self) -> ScopeConstruction {
         let factory = self.factory;
         ScopeConstruction {
-            source: ScopeSource::Restartable(Arc::new(Mutex::new(Box::new(move || {
+            source: ScopeSource::Restartable(Arc::new(move || {
                 <T as sealed::Sealed>::into_core(factory())
-            })))),
+            })),
             options: self.options,
             defaults: self.defaults,
         }
@@ -1461,7 +1461,7 @@ pub(crate) struct ScopeConstruction {
     pub(crate) defaults: DefaultsInheritance,
 }
 
-pub(crate) type ScopeFactory = Arc<Mutex<Box<dyn Fn() -> BuilderCore + Send + 'static>>>;
+pub(crate) type ScopeFactory = Arc<dyn Fn() -> BuilderCore + Send + Sync + 'static>;
 
 impl ScopeConstruction {
     pub(crate) fn one_shot(&self) -> bool {

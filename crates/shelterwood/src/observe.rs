@@ -492,6 +492,9 @@ impl LifecycleEvents {
             .state
             .lock()
             .expect("lifecycle queue mutex poisoned");
+        // The marker leads the overflow episode deliberately. A consumer
+        // snapshots here, then discards retained events at or below that
+        // watermark before applying the newer suffix.
         if let Some(dropped) = state.lagged.take() {
             return Ok(LifecycleItem::Lagged { dropped });
         }

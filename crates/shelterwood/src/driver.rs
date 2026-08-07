@@ -1941,18 +1941,12 @@ impl ScopeRuntime {
             return;
         }
         let child = &mut self.children[index];
-        let Some(incarnation) = mint_child_incarnation(&child.slot.member, &mut child.incarnations)
-        else {
+        let Some(incarnation) = mint_child_incarnation(&child.slot, &mut child.incarnations) else {
             child.complete_terminality();
             // Incarnation exhaustion terminalized the membership (§3.1):
             // publish the observation edges, then route the terminal outcome
             // through the same paths as a terminal exit so ordered startup
             // fails or draining advances instead of wedging the scope.
-            if child.slot.member.record().last_incarnation.is_none()
-                && let Some(scope) = &child.slot.scope
-            {
-                scope.terminalize_never_started();
-            }
             self.root.transition_child(&child.slot.member, |_| {}, None);
             if child.options.retention == crate::Retention::Remove {
                 self.root.prune_child(&child.slot.member);
@@ -2997,17 +2991,23 @@ impl ScopeRuntime {
     }
 }
 
-fn mint_child_incarnation(
-    member: &Arc<MemberCell>,
-    counter: &mut FenceCounter,
-) -> Option<Incarnation> {
+fn mint_child_incarnation(slot: &Arc<SlotCell>, counter: &mut FenceCounter) -> Option<Incarnation> {
+    let member = &slot.member;
     let incarnation = ScopeIdentity::mint_incarnation(member.membership(), counter);
     if incarnation.is_none() {
-        let exit = member
-            .record()
-            .last_exit
-            .unwrap_or_else(Exit::never_started);
+        let record = member.record();
+        let exit = record.last_exit.unwrap_or_else(Exit::never_started);
         member.terminalize(exit);
+        if let Some(scope) = &slot.scope {
+            if record.last_incarnation.is_none() {
+                scope.terminalize_never_started();
+            } else {
+                let _gate = OBSERVATION_GATE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                scope.close_observation_locked();
+            }
+        }
     }
     incarnation
 }
@@ -3058,7 +3058,7 @@ async fn run_scope(plan: ScopePlan, is_root: bool, parent_ready: Option<Latch>) 
 }
 
 async fn run_scope_incarnation(
-    plan: ScopePlan,
+    mut plan: ScopePlan,
     is_root: bool,
     parent_ready: Option<Latch>,
     incarnation_cancel: Option<Latch>,
@@ -3101,15 +3101,14 @@ async fn run_scope_incarnation(
             .map(|child| Arc::clone(&child.slot))
             .collect(),
     );
-    let children = plan
-        .children
+    let children = std::mem::take(&mut plan.children)
         .into_iter()
         .map(|child| ChildRuntime::from_plan(child, &root))
         .collect();
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
         flavor: plan.flavor,
-        defaults: plan.defaults,
+        defaults: plan.defaults.clone(),
         intensity_policy: plan.config.intensity,
         intensity: IntensityState::default(),
         children,
@@ -3131,6 +3130,8 @@ async fn run_scope_incarnation(
         ancestor_abort_seen: false,
         completion: None,
     };
+    plan.armed = false;
+    drop(plan);
 
     match scope.flavor {
         ScopeFlavor::Ordered => scope.progress_startup(),
@@ -3344,7 +3345,8 @@ mod tests {
 
     use crate::{
         ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind,
-        LifecycleItem, Readiness, RemoveOutcome, ScopeState, SendErrorKind, TaskDef, Tree,
+        LifecycleItem, LifecycleTryRecvError, Readiness, RemoveOutcome, ScopeState, SendErrorKind,
+        StopReason, TaskDef, Tree,
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
@@ -3471,6 +3473,20 @@ mod tests {
         assert!(scope.record().startup.is_some());
     }
 
+    #[crate::runtime::test]
+    async fn dropped_unpolled_scope_plan_terminalizes_its_root() {
+        let plan = lower_tree_for_test(Tree::new());
+        let root = Arc::clone(&plan.root);
+
+        drop(plan);
+
+        assert_eq!(
+            root.wait_started().await,
+            Err(crate::StartupError::ShutdownRequested)
+        );
+        assert_eq!(root.wait_stopped().await, StopReason::NeverStarted);
+    }
+
     #[test]
     fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
@@ -3579,15 +3595,42 @@ mod tests {
             record.stage = MemberStage::Restarting;
             record.last_exit = Some(previous.clone());
         });
+        let slot = SlotCell::new(Arc::clone(&member), None);
         let mut counter = FenceCounter::near_exhaustion(71);
 
-        assert!(mint_child_incarnation(&member, &mut counter).is_some());
-        assert!(mint_child_incarnation(&member, &mut counter).is_none());
+        assert!(mint_child_incarnation(&slot, &mut counter).is_some());
+        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
         assert!(matches!(
             member.record().stage,
             MemberStage::Terminal(ref exit) if exit == &previous
         ));
-        assert!(mint_child_incarnation(&member, &mut counter).is_none());
+        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+    }
+
+    #[crate::runtime::test]
+    async fn scope_incarnation_exhaustion_closes_nested_observation() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let membership = identity.mint_membership().expect("membership available");
+        let member = MemberCell::new(ChildId::from("nested"), membership);
+        let scope = ScopeCell::new(
+            Arc::clone(&member),
+            ScopeFlavor::Ordered,
+            ScopeIdentity::new().expect("child identity available"),
+        );
+        let slot = SlotCell::new(Arc::clone(&member), Some(Arc::clone(&scope)));
+        let mut snapshots = scope.subscribe_snapshots();
+        let mut events = scope.subscribe_lifecycle();
+        let mut counter = FenceCounter::near_exhaustion(83);
+        let first = mint_child_incarnation(&slot, &mut counter).expect("last incarnation mints");
+        member.update(|record| {
+            record.stage = MemberStage::Restarting;
+            record.last_incarnation = Some(first);
+            record.last_exit = Some(Exit::new(ExitKind::Completed, false));
+        });
+
+        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+        assert!(snapshots.changed().await.is_err());
     }
 
     #[test]

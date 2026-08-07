@@ -6,6 +6,7 @@ use std::{
     future::Future,
     hash::{Hash, Hasher},
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
@@ -524,11 +525,54 @@ impl<M> Default for Promotion<M> {
 }
 
 impl<M> Promotion<M> {
-    fn finish(self) {
-        for waker in self.wakers {
-            waker.wake();
+    fn finish(self) {}
+}
+
+impl<M> Drop for Promotion<M> {
+    fn drop(&mut self) {
+        let already_panicking = std::thread::panicking();
+        let mut first_panic = None;
+        for waker in self.wakers.drain(..) {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| waker.wake()))
+                && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
         }
-        drop(self.displaced);
+        if !already_panicking && let Some(payload) = first_panic {
+            resume_unwind(payload);
+        }
+    }
+}
+
+struct Termination<M> {
+    waiters: VecDeque<Arc<SendOperation<M>>>,
+    final_incarnation: Option<Incarnation>,
+}
+
+impl<M> Termination<M> {
+    fn finish(self) {}
+
+    fn drain(&mut self) {
+        let already_panicking = std::thread::panicking();
+        let mut first_panic = None;
+        while let Some(waiter) = self.waiters.pop_front() {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+                waiter.terminate(self.final_incarnation);
+            })) && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
+        }
+        if !already_panicking && let Some(payload) = first_panic {
+            resume_unwind(payload);
+        }
+    }
+}
+
+impl<M> Drop for Termination<M> {
+    fn drop(&mut self) {
+        self.drain();
     }
 }
 
@@ -909,13 +953,15 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         let queue = std::mem::take(&mut state.queue);
         let latest = state.latest.take();
         let waiters = std::mem::take(&mut state.waiters);
+        let termination = Termination {
+            waiters,
+            final_incarnation,
+        };
         drop(state);
-        for waiter in waiters {
-            waiter.terminate(final_incarnation);
-        }
         self.changed.pulse();
         drop(queue);
         drop(latest);
+        termination.finish();
     }
 
     fn stats(&self) -> MailboxStats {
@@ -1525,5 +1571,121 @@ impl<M: Send + 'static> MailboxReceiver<M> {
 
     pub(crate) async fn changed(&mut self) {
         self.watcher.changed().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    use crate::{ChildId, Mailbox, SendErrorKind, driver::MemberCell, identity::ScopeIdentity};
+
+    use super::{ActorRef, MailboxCell, MailboxControl};
+
+    struct PanicWake;
+
+    impl Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            panic!("injected waker panic");
+        }
+    }
+
+    struct CountWake(Arc<AtomicUsize>);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn actor() -> (Arc<MailboxCell<u8>>, ActorRef<u8>) {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let member = MemberCell::new(
+            ChildId::from("actor"),
+            identity.mint_membership().expect("membership available"),
+        );
+        let mailbox = MailboxCell::new(member.id().clone());
+        member.attach_mailbox(mailbox.clone());
+        (Arc::clone(&mailbox), ActorRef::new(member, mailbox))
+    }
+
+    fn park_with(future: &mut std::pin::Pin<Box<super::SendFuture<u8>>>, waker: &Waker) {
+        let mut context = Context::from_waker(waker);
+        assert!(future.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[test]
+    fn promotion_wakes_every_sender_when_one_waker_panics() {
+        let (mailbox, actor) = actor();
+        let mut first = Box::pin(actor.send(1));
+        let mut second = Box::pin(actor.send(2));
+        let panicking = Waker::from(Arc::new(PanicWake));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counting = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+        park_with(&mut first, &panicking);
+        park_with(&mut second, &counting);
+        MailboxControl::configure(&*mailbox, Mailbox::default());
+        let mut generations = {
+            let mut identity = ScopeIdentity::new().expect("scope identity available");
+            let membership = identity.mint_membership().expect("membership available");
+            (membership, identity.incarnation_counter(membership))
+        };
+        let incarnation = ScopeIdentity::mint_incarnation(generations.0, &mut generations.1)
+            .expect("incarnation available");
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                MailboxControl::bind(&*mailbox, incarnation);
+            }))
+            .is_err()
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            first.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(_))
+        ));
+        assert!(matches!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(_))
+        ));
+    }
+
+    #[test]
+    fn termination_discharge_reaches_every_sender_when_one_waker_panics() {
+        let (mailbox, actor) = actor();
+        let mut first = Box::pin(actor.send(1));
+        let mut second = Box::pin(actor.send(2));
+        let panicking = Waker::from(Arc::new(PanicWake));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counting = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+        park_with(&mut first, &panicking);
+        park_with(&mut second, &counting);
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                MailboxControl::terminate(&*mailbox);
+            }))
+            .is_err()
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        for future in [&mut first, &mut second] {
+            let Poll::Ready(Err(error)) = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("every parked send must be discharged");
+            };
+            assert_eq!(error.kind, SendErrorKind::Terminated);
+        }
     }
 }

@@ -78,13 +78,18 @@ impl Guard {
         self.cancellation.is_fired()
     }
 
-    /// Reports whether the guarded work has stopped running.
+    /// Reports whether the work completed or incarnation teardown requested cancellation.
+    ///
+    /// A teardown notification is not a join: under hard abort the task may
+    /// still be unwinding when this becomes true.
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.finished.is_fired()
     }
 
-    /// Waits until the guarded work has stopped running.
+    /// Waits for work completion or an incarnation-teardown cancellation request.
+    ///
+    /// This notification does not join work that is being hard-aborted.
     pub async fn finished(&self) {
         self.finished.fired().await;
     }

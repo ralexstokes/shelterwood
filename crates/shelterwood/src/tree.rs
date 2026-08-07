@@ -311,6 +311,7 @@ impl BuilderCore {
             config: self.config.clone(),
             defaults,
             children,
+            armed: true,
         })
     }
 
@@ -339,6 +340,22 @@ pub(crate) struct ScopePlan {
     pub(crate) config: ScopeConfig,
     pub(crate) defaults: ResolvedDefaults,
     pub(crate) children: Vec<ChildPlan>,
+    pub(crate) armed: bool,
+}
+
+impl Drop for ScopePlan {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for child in &self.children {
+            child.slot.member.terminalize(Exit::never_started());
+            if let Some(scope) = &child.slot.scope {
+                scope.terminalize_never_started();
+            }
+        }
+        self.root.terminalize_never_started();
+    }
 }
 
 pub(crate) struct ChildPlan {

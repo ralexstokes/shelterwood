@@ -3487,9 +3487,12 @@ least these. Policy/config data additionally follows §1's plain-data rule
 - **Non-owning handles** — `ActorRef<M>`, `TaskRef`, `ScopeRef`,
   `DynamicScopeRef`, snapshot receivers, lifecycle subscriptions:
   `Send + Sync`; the refs additionally cheap `Clone` with `Eq` + `Hash`
-  **by membership identity** — two handles to one membership compare
-  equal and collide as map keys, which is what makes userland
-  registries and routing tables ordinary code.
+  **by slot identity** — two handles to one slot (equivalently, at any
+  instant, to one membership) compare equal and collide as map keys,
+  which is what makes userland registries and routing tables ordinary
+  code. Slot identity is what stays fixed when lowering rebases a
+  rebuilt declaration's membership (§3.4): the token read through the
+  handle refreshes; the handle's map identity MUST NOT change.
 - **Cancellation tokens** (B.9 — `shutdown_token()`, `abort_token()`,
   `run_blocking`'s child token): `Clone + Send + Sync` — they are held
   across awaits inside `Send`-declared callback futures (§4.1) and

@@ -3406,6 +3406,41 @@ mod tests {
         assert!(receiver.receive().cancelled);
     }
 
+    #[test]
+    fn handle_identity_is_stable_across_membership_rebase() {
+        fn hashed(value: &impl std::hash::Hash) -> u64 {
+            use std::hash::Hasher;
+            let mut hasher = std::hash::DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        let mailbox: Arc<MailboxCell<u8>> = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), mailbox);
+        let peer = actor.clone();
+        let task = crate::TaskRef::new(Arc::clone(&member));
+        let declared = actor.membership();
+        let actor_hash = hashed(&actor);
+        let task_hash = hashed(&task);
+
+        member.rebase_membership(
+            identity
+                .mint_membership(&id)
+                .expect("successor membership available"),
+        );
+
+        assert!(actor.membership().supersedes(declared));
+        assert_eq!(actor, peer);
+        assert_eq!(hashed(&actor), actor_hash);
+        assert_eq!(hashed(&task), task_hash);
+    }
+
     #[crate::runtime::test]
     async fn attaching_after_terminality_closes_the_mailbox() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");

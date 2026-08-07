@@ -1,7 +1,7 @@
 //! Membership-owned actor mailboxes and request/reply capabilities.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt,
     future::Future,
     hash::{Hash, Hasher},
@@ -427,6 +427,7 @@ enum OperationOutcome<M> {
 struct OperationState<M> {
     outcome: OperationOutcome<M>,
     waker: Option<Waker>,
+    registration: Option<WaiterId>,
 }
 
 struct SendOperation<M> {
@@ -442,8 +443,22 @@ impl<M> SendOperation<M> {
                     newest_observed: None,
                 },
                 waker: None,
+                registration: None,
             }),
         })
+    }
+
+    fn register(&self, registration: WaiterId) {
+        let mut state = self.state.lock().expect("send operation mutex poisoned");
+        debug_assert!(state.registration.is_none());
+        debug_assert!(matches!(state.outcome, OperationOutcome::Waiting { .. }));
+        state.registration = Some(registration);
+    }
+
+    fn clear_registration(&self, registration: WaiterId) {
+        let mut state = self.state.lock().expect("send operation mutex poisoned");
+        debug_assert_eq!(state.registration, Some(registration));
+        state.registration = None;
     }
 
     fn observe(&self, incarnation: Incarnation) {
@@ -494,11 +509,128 @@ struct MailboxState<M> {
     last_bound: Option<Incarnation>,
     queue: VecDeque<Envelope<M>>,
     latest: Option<Envelope<M>>,
-    waiters: VecDeque<Arc<SendOperation<M>>>,
+    waiters: WaiterQueue<M>,
     accepted: u64,
     delivered: u64,
     conflated: u64,
     sends_rejected: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct WaiterId(u64);
+
+struct WaiterEntry<M> {
+    operation: Arc<SendOperation<M>>,
+    previous: Option<WaiterId>,
+    next: Option<WaiterId>,
+}
+
+/// FIFO registrations with constant-time removal by a send operation.
+///
+/// The mailbox mutex serializes every mutation, so a compact intrusive list
+/// can use monotonic local ids without another synchronization layer. The ids
+/// are never reused, which also prevents a stale cancellation from unlinking
+/// a later operation.
+struct WaiterQueue<M> {
+    entries: HashMap<WaiterId, WaiterEntry<M>>,
+    head: Option<WaiterId>,
+    tail: Option<WaiterId>,
+    next_id: u64,
+    #[cfg(test)]
+    direct_removals: usize,
+}
+
+impl<M> Default for WaiterQueue<M> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            head: None,
+            tail: None,
+            next_id: 0,
+            #[cfg(test)]
+            direct_removals: 0,
+        }
+    }
+}
+
+impl<M> WaiterQueue<M> {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn push_back(&mut self, operation: Arc<SendOperation<M>>) -> WaiterId {
+        let id = WaiterId(self.next_id);
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("mailbox waiter identity space exhausted");
+        let previous = self.tail;
+        let replaced = self.entries.insert(
+            id,
+            WaiterEntry {
+                operation,
+                previous,
+                next: None,
+            },
+        );
+        debug_assert!(replaced.is_none());
+        if let Some(previous) = previous {
+            self.entries
+                .get_mut(&previous)
+                .expect("tail registration must be live")
+                .next = Some(id);
+        } else {
+            self.head = Some(id);
+        }
+        self.tail = Some(id);
+        id
+    }
+
+    fn park(&mut self, operation: &Arc<SendOperation<M>>) {
+        let registration = self.push_back(Arc::clone(operation));
+        operation.register(registration);
+    }
+
+    fn observe_all(&self, incarnation: Incarnation) {
+        for entry in self.entries.values() {
+            entry.operation.observe(incarnation);
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<(WaiterId, Arc<SendOperation<M>>)> {
+        let id = self.head?;
+        self.remove(id).map(|operation| (id, operation))
+    }
+
+    fn remove(&mut self, id: WaiterId) -> Option<Arc<SendOperation<M>>> {
+        let entry = self.entries.remove(&id)?;
+        #[cfg(test)]
+        {
+            self.direct_removals = self.direct_removals.saturating_add(1);
+        }
+        if let Some(previous) = entry.previous {
+            self.entries
+                .get_mut(&previous)
+                .expect("previous registration must be live")
+                .next = entry.next;
+        } else {
+            self.head = entry.next;
+        }
+        if let Some(next) = entry.next {
+            self.entries
+                .get_mut(&next)
+                .expect("next registration must be live")
+                .previous = entry.previous;
+        } else {
+            self.tail = entry.previous;
+        }
+        Some(entry.operation)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -547,7 +679,7 @@ impl<M> Drop for Promotion<M> {
 }
 
 struct Termination<M> {
-    waiters: VecDeque<Arc<SendOperation<M>>>,
+    waiters: WaiterQueue<M>,
     final_incarnation: Option<Incarnation>,
 }
 
@@ -557,7 +689,8 @@ impl<M> Termination<M> {
     fn drain(&mut self) {
         let already_panicking = std::thread::panicking();
         let mut first_panic = None;
-        while let Some(waiter) = self.waiters.pop_front() {
+        while let Some((registration, waiter)) = self.waiters.pop_front() {
+            waiter.clear_registration(registration);
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
                 waiter.terminate(self.final_incarnation);
             })) && first_panic.is_none()
@@ -634,7 +767,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                 last_bound: None,
                 queue: VecDeque::new(),
                 latest: None,
-                waiters: VecDeque::new(),
+                waiters: WaiterQueue::default(),
                 accepted: 0,
                 delivered: 0,
                 conflated: 0,
@@ -693,14 +826,14 @@ impl<M: Send + 'static> MailboxCell<M> {
                     }
                     drop(displaced);
                 } else {
-                    state.waiters.push_back(Arc::clone(operation));
+                    state.waiters.park(operation);
                 }
             }
             BindingStatus::Frozen(incarnation) => {
                 operation.observe(incarnation);
-                state.waiters.push_back(Arc::clone(operation));
+                state.waiters.park(operation);
             }
-            BindingStatus::Unbound => state.waiters.push_back(Arc::clone(operation)),
+            BindingStatus::Unbound => state.waiters.park(operation),
         }
     }
 
@@ -869,7 +1002,7 @@ impl<M: Send + 'static> MailboxCell<M> {
 impl<M> MailboxCell<M> {
     fn withdraw(&self, operation: &Arc<SendOperation<M>>) -> Withdrawal<M> {
         let mut mailbox = self.state.lock().expect("mailbox mutex poisoned");
-        let result = {
+        let (result, registration) = {
             let mut state = operation
                 .state
                 .lock()
@@ -885,26 +1018,39 @@ impl<M> MailboxCell<M> {
                     let observed = *newest_observed;
                     state.outcome = OperationOutcome::Withdrawn;
                     state.waker = None;
-                    Withdrawal::Withdrawn { message, observed }
+                    (
+                        Withdrawal::Withdrawn { message, observed },
+                        state.registration.take(),
+                    )
                 }
-                OperationOutcome::Accepted(incarnation) => Withdrawal::Accepted(*incarnation),
+                OperationOutcome::Accepted(incarnation) => (
+                    Withdrawal::Accepted(*incarnation),
+                    state.registration.take(),
+                ),
                 OperationOutcome::Terminated {
                     message,
                     final_incarnation,
-                } => Withdrawal::Terminated {
-                    message: message
-                        .take()
-                        .expect("a terminal operation must retain its message"),
-                    observed: *final_incarnation,
-                },
+                } => (
+                    Withdrawal::Terminated {
+                        message: message
+                            .take()
+                            .expect("a terminal operation must retain its message"),
+                        observed: *final_incarnation,
+                    },
+                    state.registration.take(),
+                ),
                 OperationOutcome::Withdrawn => {
                     panic!("a send operation was withdrawn more than once")
                 }
             }
         };
-        mailbox
-            .waiters
-            .retain(|candidate| !Arc::ptr_eq(candidate, operation));
+        if let Some(registration) = registration {
+            let removed = mailbox
+                .waiters
+                .remove(registration)
+                .expect("a waiting operation's registration must be live");
+            debug_assert!(Arc::ptr_eq(&removed, operation));
+        }
         result
     }
 }
@@ -938,9 +1084,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         // into the current capacity. Withdrawal takes the mailbox lock before
         // the operation lock, so a concurrent timeout sees either the prior
         // evidence or this incarnation consistently with which edge won.
-        for operation in &state.waiters {
-            operation.observe(incarnation);
-        }
+        state.waiters.observe_all(incarnation);
         let promotion = promote_waiters(&mut state);
         drop(state);
         self.changed.pulse();
@@ -1016,9 +1160,10 @@ fn promote_waiters<M>(state: &mut MailboxState<M>) -> Promotion<M> {
     };
     let mut accepted = 0usize;
     while accepted < available {
-        let Some(operation) = state.waiters.pop_front() else {
+        let Some((registration, operation)) = state.waiters.pop_front() else {
             break;
         };
+        operation.clear_registration(registration);
         operation.observe(incarnation);
         let Some((message, wake)) = operation.accept(incarnation) else {
             continue;
@@ -1639,6 +1784,41 @@ mod tests {
     fn park_with(future: &mut std::pin::Pin<Box<super::SendFuture<u8>>>, waker: &Waker) {
         let mut context = Context::from_waker(waker);
         assert!(future.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[test]
+    fn cancelling_many_parked_sends_unlinks_one_registration_each() {
+        const SENDS: usize = 16_384;
+
+        let (mailbox, actor) = actor();
+        let mut sends = Vec::with_capacity(SENDS);
+        for _ in 0..SENDS {
+            let mut send = Box::pin(actor.send(1));
+            park_with(&mut send, Waker::noop());
+            sends.push(send);
+        }
+        assert_eq!(
+            mailbox
+                .state
+                .lock()
+                .expect("mailbox mutex poisoned")
+                .waiters
+                .len(),
+            SENDS
+        );
+
+        // Reverse cancellation stresses head, tail, and interior unlinking
+        // without making the result depend on scheduler timing.
+        while let Some(send) = sends.pop() {
+            drop(send);
+        }
+
+        let state = mailbox.state.lock().expect("mailbox mutex poisoned");
+        assert!(state.waiters.is_empty());
+        assert_eq!(
+            state.waiters.direct_removals, SENDS,
+            "mass cancellation must do one direct unlink per parked send"
+        );
     }
 
     #[test]

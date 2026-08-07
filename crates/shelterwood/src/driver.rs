@@ -41,13 +41,6 @@ use crate::{
     },
 };
 
-/// Observation is one globally serialized projection/publication path.
-///
-/// The decision records remain independently locked and runtime-free. This
-/// gate makes a state mutation, recursive projection, and lifecycle staging
-/// one atomic observation edge, including cross-scope forwarding.
-static OBSERVATION_GATE: Mutex<()> = Mutex::new(());
-
 pub(crate) type DriverSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 pub(crate) fn deadline(duration: Duration) -> Deadline {
@@ -613,12 +606,12 @@ pub(crate) struct ScopeRecord {
 
 /// Shared scope state follows two distinct synchronization regimes.
 ///
-/// `OBSERVATION_GATE` serializes compound, observation-visible transitions
-/// across `config`, `record`, `current_children`, and `parent`, including
-/// recursive snapshot projection and lifecycle-event staging. Their watch
-/// channels retain the latest independently readable value; they do not make
-/// that compound transition atomic, so every multi-field observation path must
-/// continue to hold the gate.
+/// One gate per running tree serializes compound, observation-visible
+/// transitions across `config`, `record`, `current_children`, and `parent`,
+/// including recursive snapshot projection and lifecycle-event staging. Their
+/// watch channels retain the latest independently readable value; they do not
+/// make that compound transition atomic, so every multi-field observation path
+/// must continue to hold the gate.
 ///
 /// The remaining mutexes are deliberately not collapsed into one state lock.
 /// `control` is an epoch-tagged request plane with concurrent callers,
@@ -635,6 +628,7 @@ pub(crate) struct ScopeCell {
     current_dynamic: Mutex<Option<Arc<DynamicControl>>>,
     current_children: runtime::WatchSender<Vec<ResidentChild>>,
     parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
+    observation_gate: Mutex<Arc<Mutex<()>>>,
     lifecycle_sequence: Mutex<FenceCounter>,
     lifecycle_seq: AtomicU64,
     lifecycle: LifecycleHub,
@@ -681,6 +675,7 @@ impl ScopeCell {
             current_dynamic: Mutex::new(None),
             current_children,
             parent,
+            observation_gate: Mutex::new(Arc::new(Mutex::new(()))),
             lifecycle_sequence: Mutex::new(FenceCounter::new(0)),
             lifecycle_seq: AtomicU64::new(0),
             lifecycle: LifecycleHub::default(),
@@ -693,26 +688,62 @@ impl ScopeCell {
         self.record.read_cloned()
     }
 
-    pub(crate) fn set_state(&self, state: ScopeState) {
-        let _gate = OBSERVATION_GATE
+    fn observation_gate(&self) -> Arc<Mutex<()>> {
+        Arc::clone(
+            &self
+                .observation_gate
+                .lock()
+                .expect("observation gate handoff mutex poisoned"),
+        )
+    }
+
+    fn adopt_observation_gate(&self, gate: &Arc<Mutex<()>>) {
+        *self
+            .observation_gate
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.record.send_modify(|record| {
-            if state == ScopeState::Starting {
-                record.total_restarts = 0;
+            .expect("observation gate handoff mutex poisoned") = Arc::clone(gate);
+    }
+
+    /// Runs against the cell's current tree gate. Adoption can race an early
+    /// pre-start observer, so a waiter that acquired an obsolete gate retries
+    /// before entering the observation critical section.
+    fn with_observation_gate<R>(&self, operation: impl FnOnce() -> R) -> R {
+        let mut operation = Some(operation);
+        loop {
+            let gate = self.observation_gate();
+            let guard = gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if Arc::ptr_eq(&gate, &self.observation_gate()) {
+                let operation = operation
+                    .take()
+                    .expect("observation operation runs exactly once");
+                let result = operation();
+                drop(guard);
+                return result;
             }
-            record.state = state.clone();
+            drop(guard);
+        }
+    }
+
+    pub(crate) fn set_state(&self, state: ScopeState) {
+        self.with_observation_gate(|| {
+            self.record.send_modify(|record| {
+                if state == ScopeState::Starting {
+                    record.total_restarts = 0;
+                }
+                record.state = state.clone();
+            });
+            self.member.record.pulse();
+            self.emit_locked(LifecycleEventKind::ScopeState { state });
         });
-        self.member.record.pulse();
-        self.emit_locked(LifecycleEventKind::ScopeState { state });
     }
 
     pub(crate) fn set_config(&self, config: crate::tree::ScopeConfig) {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.config.replace(config);
-        self.publish_snapshot_chain_locked();
+        self.with_observation_gate(|| {
+            self.config.replace(config);
+            self.publish_snapshot_chain_locked();
+        });
     }
 
     pub(crate) fn transition_child(
@@ -721,23 +752,19 @@ impl ScopeCell {
         update: impl FnOnce(&mut MemberRecord),
         event: Option<LifecycleEventKind>,
     ) {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        member.update_locked(update);
-        if let Some(event) = event {
-            self.emit_locked(event);
-        } else {
-            self.publish_snapshot_chain_locked();
-        }
+        self.with_observation_gate(|| {
+            member.update_locked(update);
+            if let Some(event) = event {
+                self.emit_locked(event);
+            } else {
+                self.publish_snapshot_chain_locked();
+            }
+        });
     }
 
     #[cfg(test)]
     pub(crate) fn emit(&self, event: LifecycleEventKind) {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.emit_locked(event);
+        self.with_observation_gate(|| self.emit_locked(event));
     }
 
     pub(crate) fn publish_child_restart(
@@ -748,15 +775,14 @@ impl ScopeCell {
         exited: LifecycleEventKind,
         scheduled: LifecycleEventKind,
     ) {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.record.send_modify(|scope| {
-            scope.total_restarts = total_restarts;
+        self.with_observation_gate(|| {
+            self.record.send_modify(|scope| {
+                scope.total_restarts = total_restarts;
+            });
+            member.update_locked(update);
+            self.emit_locked(exited);
+            self.emit_locked(scheduled);
         });
-        member.update_locked(update);
-        self.emit_locked(exited);
-        self.emit_locked(scheduled);
     }
 
     pub(crate) fn terminalize_child(
@@ -766,89 +792,82 @@ impl ScopeCell {
         exited_incarnation: Option<Incarnation>,
         startup_aborted: bool,
     ) -> bool {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if matches!(member.record().stage, MemberStage::Terminal(_)) {
-            return false;
-        }
-        member.update_locked(|record| record.startup_aborted = startup_aborted);
-        member.terminalize(exit.clone());
-        if let Some(incarnation) = exited_incarnation {
-            self.emit_locked(LifecycleEventKind::Exited {
-                id: member.id().clone(),
-                membership: member.membership(),
-                incarnation,
-                exit: exit.clone(),
+        self.with_observation_gate(|| {
+            if matches!(member.record().stage, MemberStage::Terminal(_)) {
+                return false;
+            }
+            member.update_locked(|record| record.startup_aborted = startup_aborted);
+            member.terminalize(exit.clone());
+            if let Some(incarnation) = exited_incarnation {
+                self.emit_locked(LifecycleEventKind::Exited {
+                    id: member.id().clone(),
+                    membership: member.membership(),
+                    incarnation,
+                    exit: exit.clone(),
+                });
+            }
+            let nested = self.current_children.read_with(|children| {
+                children
+                    .iter()
+                    .find(|resident| resident.slot.member.membership() == member.membership())
+                    .and_then(|resident| resident.slot.scope.as_ref())
+                    .cloned()
             });
-        }
-        let nested = self.current_children.read_with(|children| {
-            children
-                .iter()
-                .find(|resident| resident.slot.member.membership() == member.membership())
-                .and_then(|resident| resident.slot.scope.as_ref())
-                .cloned()
-        });
-        if let Some(scope) = nested {
-            scope.close_observation_locked();
-        }
-        true
+            if let Some(scope) = nested {
+                scope.close_observation_locked();
+            }
+            true
+        })
     }
 
     pub(crate) fn prune_child(&self, member: &MemberCell) -> bool {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let membership = member.membership();
-        let mut resident = None;
-        let removed = self.current_children.send_if_modified(|children| {
-            let Some(index) = children
-                .iter()
-                .position(|child| child.slot.member.membership() == membership)
-            else {
+        self.with_observation_gate(|| {
+            let membership = member.membership();
+            let mut resident = None;
+            let removed = self.current_children.send_if_modified(|children| {
+                let Some(index) = children
+                    .iter()
+                    .position(|child| child.slot.member.membership() == membership)
+                else {
+                    return false;
+                };
+                resident = Some(children.remove(index));
+                true
+            });
+            if !removed {
                 return false;
-            };
-            resident = Some(children.remove(index));
+            }
+            let resident = resident.expect("a reported removal owns its resident entry");
+            debug_assert_eq!(resident.slot.member.membership(), membership);
+            // Dropping residency while the observation gate is held emits the
+            // matching Removed edge through its owned completion.
+            drop(resident);
             true
-        });
-        if !removed {
-            return false;
-        }
-        let resident = resident.expect("a reported removal owns its resident entry");
-        debug_assert_eq!(resident.slot.member.membership(), membership);
-        // Dropping residency while the observation gate is held emits the
-        // matching Removed edge through its owned completion.
-        drop(resident);
-        true
+        })
     }
 
     pub(crate) fn snapshot(&self) -> Arc<ScopeSnapshot> {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.snapshot_locked()
+        self.with_observation_gate(|| self.snapshot_locked())
     }
 
     pub(crate) fn subscribe_snapshots(&self) -> SnapshotReceiver {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let receiver = self.snapshots.subscribe(self.snapshot_locked());
-        if self.observation_closed.load(Ordering::Acquire) {
-            self.snapshots.close();
-        }
-        receiver
+        self.with_observation_gate(|| {
+            let receiver = self.snapshots.subscribe(self.snapshot_locked());
+            if self.observation_closed.load(Ordering::Acquire) {
+                self.snapshots.close();
+            }
+            receiver
+        })
     }
 
     pub(crate) fn subscribe_lifecycle(&self) -> LifecycleEvents {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let events = self.lifecycle.subscribe();
-        if self.observation_closed.load(Ordering::Acquire) {
-            self.lifecycle.close();
-        }
-        events
+        self.with_observation_gate(|| {
+            let events = self.lifecycle.subscribe();
+            if self.observation_closed.load(Ordering::Acquire) {
+                self.lifecycle.close();
+            }
+            events
+        })
     }
 
     fn snapshot_locked(&self) -> Arc<ScopeSnapshot> {
@@ -1019,45 +1038,44 @@ impl ScopeCell {
         reason: StopReason,
         terminal_exit: Option<Exit>,
     ) {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = ScopeState::Stopped {
-            reason: reason.clone(),
-        };
-        self.record.modify_silently(|record| {
-            if record.startup.is_none() {
-                record.startup = Some(Err(StartupError::ShutdownRequested));
+        self.with_observation_gate(|| {
+            let state = ScopeState::Stopped {
+                reason: reason.clone(),
+            };
+            self.record.modify_silently(|record| {
+                if record.startup.is_none() {
+                    record.startup = Some(Err(StartupError::ShutdownRequested));
+                }
+                record.state = state.clone();
+            });
+            let terminal = terminal_exit.is_some();
+            if let Some(exit) = terminal_exit {
+                self.member.terminalize(exit);
             }
-            record.state = state.clone();
+            let mut control = self.control.lock().expect("scope control mutex poisoned");
+            if control.current_epoch == epoch {
+                control.live = false;
+                control.last_stopped_epoch = control.last_stopped_epoch.max(epoch);
+                if control
+                    .shutdown
+                    .is_some_and(|request| request.epoch <= epoch)
+                {
+                    control.shutdown = None;
+                }
+                if control.force.is_some_and(|request| request.epoch <= epoch) {
+                    control.force = None;
+                }
+            }
+            drop(control);
+            self.member.record.pulse();
+            // `wait_started` must not observe terminal startup until the member
+            // and incarnation-control planes above are consistent.
+            self.record.pulse();
+            self.emit_locked(LifecycleEventKind::ScopeState { state });
+            if terminal {
+                self.close_observation_locked();
+            }
         });
-        let terminal = terminal_exit.is_some();
-        if let Some(exit) = terminal_exit {
-            self.member.terminalize(exit);
-        }
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        if control.current_epoch == epoch {
-            control.live = false;
-            control.last_stopped_epoch = control.last_stopped_epoch.max(epoch);
-            if control
-                .shutdown
-                .is_some_and(|request| request.epoch <= epoch)
-            {
-                control.shutdown = None;
-            }
-            if control.force.is_some_and(|request| request.epoch <= epoch) {
-                control.force = None;
-            }
-        }
-        drop(control);
-        self.member.record.pulse();
-        // `wait_started` must not observe terminal startup until the member
-        // and incarnation-control planes above are consistent.
-        self.record.pulse();
-        self.emit_locked(LifecycleEventKind::ScopeState { state });
-        if terminal {
-            self.close_observation_locked();
-        }
     }
 
     fn finish_live_root_incarnation(&self, reason: StopReason, exit: Exit) {
@@ -1068,21 +1086,20 @@ impl ScopeCell {
         if let Some(epoch) = epoch {
             self.finish_root_incarnation(epoch, reason, exit);
         } else {
-            let _gate = OBSERVATION_GATE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let state = ScopeState::Stopped { reason };
-            self.record.modify_silently(|record| {
-                if record.startup.is_none() {
-                    record.startup = Some(Err(StartupError::ShutdownRequested));
-                }
-                record.state = state.clone();
+            self.with_observation_gate(|| {
+                let state = ScopeState::Stopped { reason };
+                self.record.modify_silently(|record| {
+                    if record.startup.is_none() {
+                        record.startup = Some(Err(StartupError::ShutdownRequested));
+                    }
+                    record.state = state.clone();
+                });
+                self.member.terminalize(exit);
+                self.member.record.pulse();
+                self.record.pulse();
+                self.emit_locked(LifecycleEventKind::ScopeState { state });
+                self.close_observation_locked();
             });
-            self.member.terminalize(exit);
-            self.member.record.pulse();
-            self.record.pulse();
-            self.emit_locked(LifecycleEventKind::ScopeState { state });
-            self.close_observation_locked();
         }
     }
 
@@ -1147,50 +1164,49 @@ impl ScopeCell {
     }
 
     fn set_admitted_children(self: &Arc<Self>, children: Vec<Arc<SlotCell>>) {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.clear_residents_locked();
-        for child in children {
+        let gate = self.observation_gate();
+        self.with_observation_gate(|| {
+            self.clear_residents_locked();
+            for child in children {
+                if let Some(scope) = &child.scope {
+                    scope.adopt_observation_gate(&gate);
+                    scope.parent.replace(Some(Arc::downgrade(self)));
+                }
+                child
+                    .member
+                    .update_locked(|record| record.stage = MemberStage::Admitted);
+                self.current_children.send_modify(|children| {
+                    children.push(ResidentChild::new(self, Arc::clone(&child)))
+                });
+                self.emit_locked(LifecycleEventKind::Added {
+                    id: child.member.id().clone(),
+                    membership: child.member.membership(),
+                });
+            }
+        });
+    }
+
+    fn admit_child(self: &Arc<Self>, child: &Arc<SlotCell>) {
+        let gate = self.observation_gate();
+        self.with_observation_gate(|| {
             if let Some(scope) = &child.scope {
+                scope.adopt_observation_gate(&gate);
                 scope.parent.replace(Some(Arc::downgrade(self)));
             }
+            self.current_children
+                .send_modify(|children| children.push(ResidentChild::new(self, Arc::clone(child))));
             child
                 .member
                 .update_locked(|record| record.stage = MemberStage::Admitted);
-            self.current_children.send_modify(|children| {
-                children.push(ResidentChild::new(self, Arc::clone(&child)))
-            });
             self.emit_locked(LifecycleEventKind::Added {
                 id: child.member.id().clone(),
                 membership: child.member.membership(),
             });
-        }
-    }
-
-    fn admit_child(self: &Arc<Self>, child: &Arc<SlotCell>) {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(scope) = &child.scope {
-            scope.parent.replace(Some(Arc::downgrade(self)));
-        }
-        self.current_children
-            .send_modify(|children| children.push(ResidentChild::new(self, Arc::clone(child))));
-        child
-            .member
-            .update_locked(|record| record.stage = MemberStage::Admitted);
-        self.emit_locked(LifecycleEventKind::Added {
-            id: child.member.id().clone(),
-            membership: child.member.membership(),
         });
     }
 
     pub(crate) fn clear_residents(&self) {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.clear_residents_locked();
+        self.with_observation_gate(|| self.clear_residents_locked());
     }
 
     fn clear_residents_locked(&self) {
@@ -1243,29 +1259,28 @@ impl ScopeCell {
     }
 
     pub(crate) fn terminalize_never_started(&self) {
-        let _gate = OBSERVATION_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.observation_closed.load(Ordering::Acquire) {
-            return;
-        }
-        self.member.terminalize(Exit::never_started());
-        self.record.modify_silently(|record| {
-            if record.startup.is_none() {
-                record.startup = Some(Err(StartupError::ShutdownRequested));
+        self.with_observation_gate(|| {
+            if self.observation_closed.load(Ordering::Acquire) {
+                return;
             }
-            record.state = ScopeState::Stopped {
-                reason: StopReason::NeverStarted,
-            };
+            self.member.terminalize(Exit::never_started());
+            self.record.modify_silently(|record| {
+                if record.startup.is_none() {
+                    record.startup = Some(Err(StartupError::ShutdownRequested));
+                }
+                record.state = ScopeState::Stopped {
+                    reason: StopReason::NeverStarted,
+                };
+            });
+            self.member.record.pulse();
+            self.record.pulse();
+            self.emit_locked(LifecycleEventKind::ScopeState {
+                state: ScopeState::Stopped {
+                    reason: StopReason::NeverStarted,
+                },
+            });
+            self.close_observation_locked();
         });
-        self.member.record.pulse();
-        self.record.pulse();
-        self.emit_locked(LifecycleEventKind::ScopeState {
-            state: ScopeState::Stopped {
-                reason: StopReason::NeverStarted,
-            },
-        });
-        self.close_observation_locked();
     }
 }
 
@@ -3054,10 +3069,7 @@ fn mint_child_incarnation(slot: &Arc<SlotCell>, counter: &mut FenceCounter) -> O
             if record.last_incarnation.is_none() {
                 scope.terminalize_never_started();
             } else {
-                let _gate = OBSERVATION_GATE
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                scope.close_observation_locked();
+                scope.with_observation_gate(|| scope.close_observation_locked());
             }
         }
     }
@@ -3423,6 +3435,93 @@ mod tests {
         ScopeCell, ScopeFlavor, ScopePhase, StartupPhase, complete_removals,
         mint_child_incarnation, report_channel, run_nested_tree, run_scope_incarnation,
     };
+
+    fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let member = MemberCell::new(
+            ChildId::from(id),
+            identity.mint_membership().expect("membership available"),
+        );
+        ScopeCell::new(
+            member,
+            flavor,
+            ScopeIdentity::new().expect("child identity available"),
+        )
+    }
+
+    #[test]
+    fn independent_systems_do_not_share_an_observation_critical_section() {
+        let first = isolated_scope("first", ScopeFlavor::Ordered);
+        let second = isolated_scope("second", ScopeFlavor::Ordered);
+        let first_gate = first.observation_gate();
+        let second_gate = second.observation_gate();
+        assert!(!Arc::ptr_eq(&first_gate, &second_gate));
+
+        let held = first_gate
+            .lock()
+            .expect("first observation gate starts healthy");
+        let (completed, receiver) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            second.set_state(ScopeState::Starting);
+            completed.send(()).expect("test receiver remains available");
+        });
+        let result = receiver.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        worker.join().expect("independent transition succeeds");
+        assert_eq!(
+            result,
+            Ok(()),
+            "holding one system's gate must not stall another system"
+        );
+    }
+
+    #[test]
+    fn admitted_subtrees_share_their_parent_observation_gate() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+
+        root.set_admitted_children(vec![slot]);
+
+        assert!(Arc::ptr_eq(
+            &root.observation_gate(),
+            &nested.observation_gate()
+        ));
+    }
+
+    #[test]
+    fn pre_admission_observer_retries_after_gate_handoff() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        let prior_gate = nested.observation_gate();
+        let held = prior_gate
+            .lock()
+            .expect("pre-admission observation gate starts healthy");
+        let observer = Arc::clone(&nested);
+        let worker = std::thread::spawn(move || observer.set_state(ScopeState::Starting));
+
+        for _ in 0..100_000 {
+            if Arc::strong_count(&prior_gate) >= 3 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            Arc::strong_count(&prior_gate) >= 3,
+            "observer must be waiting on the pre-admission gate"
+        );
+
+        let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        root.set_admitted_children(vec![slot]);
+        drop(held);
+        worker.join().expect("observer follows the gate handoff");
+
+        assert_eq!(nested.record().state, ScopeState::Starting);
+        assert!(Arc::ptr_eq(
+            &root.observation_gate(),
+            &nested.observation_gate()
+        ));
+    }
 
     #[test]
     fn scope_phase_preserves_startup_status_while_draining() {

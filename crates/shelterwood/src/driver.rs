@@ -341,7 +341,6 @@ pub(crate) struct MemberCell {
     membership: Membership,
     record: Mutex<MemberRecord>,
     changed: Signal,
-    terminal_signals: Mutex<Vec<Signal>>,
     mailbox: Mutex<Option<Arc<dyn MailboxControl>>>,
     options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
     pub(crate) removal: Latch,
@@ -363,7 +362,6 @@ impl MemberCell {
                 startup_aborted: false,
             }),
             changed: Signal::default(),
-            terminal_signals: Mutex::new(Vec::new()),
             mailbox: Mutex::new(None),
             options: Mutex::new(None),
             removal: Latch::default(),
@@ -380,6 +378,10 @@ impl MemberCell {
 
     pub(crate) fn record(&self) -> MemberRecord {
         self.record.lock().expect("member mutex poisoned").clone()
+    }
+
+    pub(crate) fn change_signal(&self) -> Signal {
+        self.changed.clone()
     }
 
     pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
@@ -409,13 +411,6 @@ impl MemberCell {
                     Readiness::Immediate,
                 )
             })
-    }
-
-    pub(crate) fn add_terminal_signal(&self, signal: Signal) {
-        self.terminal_signals
-            .lock()
-            .expect("member terminal-signal mutex poisoned")
-            .push(signal);
     }
 
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
@@ -458,14 +453,6 @@ impl MemberCell {
             debug_assert!(stats.conflated <= stats.accepted);
             debug_assert!(stats.depth <= stats.capacity);
             let _ = stats.sends_rejected;
-        }
-        for signal in self
-            .terminal_signals
-            .lock()
-            .expect("member terminal-signal mutex poisoned")
-            .iter()
-        {
-            signal.pulse();
         }
     }
 
@@ -591,7 +578,6 @@ pub(crate) struct ScopeCell {
     pub(crate) child_identity: Mutex<ScopeIdentity>,
     config: Mutex<crate::tree::ScopeConfig>,
     record: Mutex<ScopeRecord>,
-    changed: Signal,
     control: Mutex<ScopeControl>,
     current_dynamic: Mutex<Option<Arc<DynamicControl>>>,
     current_children: Mutex<Vec<ResidentChild>>,
@@ -624,11 +610,6 @@ impl ScopeCell {
         flavor: ScopeFlavor,
         child_identity: ScopeIdentity,
     ) -> Arc<Self> {
-        let changed = Signal::default();
-        // Waiters parked on the scope signal (`shutdown_scope`,
-        // `wait_for_incarnation`) exit on member terminality, so terminality
-        // reached without a scope-state transition must still pulse it.
-        member.add_terminal_signal(changed.clone());
         Arc::new(Self {
             member,
             flavor,
@@ -639,7 +620,6 @@ impl ScopeCell {
                 startup: None,
                 total_restarts: 0,
             }),
-            changed,
             control: Mutex::new(ScopeControl::default()),
             current_dynamic: Mutex::new(None),
             current_children: Mutex::new(Vec::new()),
@@ -666,7 +646,7 @@ impl ScopeCell {
         }
         record.state = state.clone();
         drop(record);
-        self.changed.pulse();
+        self.member.changed.pulse();
         self.emit_locked(LifecycleEventKind::ScopeState { state });
     }
 
@@ -956,7 +936,7 @@ impl ScopeCell {
         if record.startup.is_none() {
             record.startup = Some(startup);
             drop(record);
-            self.changed.pulse();
+            self.member.changed.pulse();
         }
     }
 
@@ -966,7 +946,7 @@ impl ScopeCell {
         control.live = true;
         let epoch = control.current_epoch;
         drop(control);
-        self.changed.pulse();
+        self.member.changed.pulse();
         epoch
     }
 
@@ -1010,7 +990,7 @@ impl ScopeCell {
             }
         }
         drop(control);
-        self.changed.pulse();
+        self.member.changed.pulse();
         self.emit_locked(LifecycleEventKind::ScopeState { state });
         if terminal {
             self.close_observation_locked();
@@ -1031,7 +1011,7 @@ impl ScopeCell {
             let state = ScopeState::Stopped { reason };
             self.record.lock().expect("scope mutex poisoned").state = state.clone();
             self.member.terminalize(exit);
-            self.changed.pulse();
+            self.member.changed.pulse();
             self.emit_locked(LifecycleEventKind::ScopeState { state });
             self.close_observation_locked();
         }
@@ -1054,7 +1034,7 @@ impl ScopeCell {
             });
         }
         drop(control);
-        self.changed.pulse();
+        self.member.changed.pulse();
         target
     }
 
@@ -1078,7 +1058,7 @@ impl ScopeCell {
             });
         }
         drop(control);
-        self.changed.pulse();
+        self.member.changed.pulse();
     }
 
     fn take_force_request(&self, epoch: u64) -> bool {
@@ -1166,7 +1146,7 @@ impl ScopeCell {
             .current_dynamic
             .lock()
             .expect("scope dynamic-control mutex poisoned") = control;
-        self.changed.pulse();
+        self.member.changed.pulse();
     }
 
     fn dynamic(&self) -> Option<Arc<DynamicControl>> {
@@ -1177,11 +1157,11 @@ impl ScopeCell {
     }
 
     pub(crate) fn signal(&self) -> &Signal {
-        &self.changed
+        &self.member.changed
     }
 
     pub(crate) async fn wait_started(&self) -> Result<(), StartupError> {
-        let mut watcher = self.changed.watcher();
+        let mut watcher = self.member.changed.watcher();
         loop {
             if let Some(result) = self.record().startup {
                 return result;
@@ -1219,7 +1199,7 @@ impl ScopeCell {
                 reason: StopReason::NeverStarted,
             };
         }
-        self.changed.pulse();
+        self.member.changed.pulse();
         self.emit_locked(LifecycleEventKind::ScopeState {
             state: ScopeState::Stopped {
                 reason: StopReason::NeverStarted,

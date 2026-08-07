@@ -143,8 +143,17 @@ impl<T> WatchSender<T> {
         self.0.send_modify(update);
     }
 
-    pub(crate) fn send_if_modified(&self, update: impl FnOnce(&mut T) -> bool) -> bool {
-        self.0.send_if_modified(update)
+    /// Mutates the retained value without advancing the watch version.
+    ///
+    /// This is only for compound publication that must finish another
+    /// synchronous state transition before receivers are notified. The caller
+    /// must follow a successful logical mutation with [`Self::pulse`].
+    pub(crate) fn modify_silently(&self, update: impl FnOnce(&mut T)) {
+        let notified = self.0.send_if_modified(|value| {
+            update(value);
+            false
+        });
+        debug_assert!(!notified);
     }
 
     pub(crate) fn replace(&self, value: T) {
@@ -237,14 +246,6 @@ impl<T: Clone> BroadcastSender<T> {
 }
 
 impl<T: Clone> BroadcastReceiver<T> {
-    pub(crate) async fn receive(&mut self) -> BroadcastReceive<T> {
-        match self.0.recv().await {
-            Ok(value) => BroadcastReceive::Item(value),
-            Err(broadcast::error::RecvError::Closed) => BroadcastReceive::Closed,
-            Err(broadcast::error::RecvError::Lagged(dropped)) => BroadcastReceive::Lagged(dropped),
-        }
-    }
-
     pub(crate) fn try_receive(&mut self) -> BroadcastReceive<T> {
         match self.0.try_recv() {
             Ok(value) => BroadcastReceive::Item(value),

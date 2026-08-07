@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     future::Future,
     pin::Pin,
     sync::{
@@ -23,7 +24,7 @@ use crate::{
     },
     exit::{JoinVerdict, RecordedOutcome, classify_exit},
     identity::{FenceCounter, ScopeIdentity},
-    mailbox::MailboxControl,
+    mailbox::{MailboxControl, MailboxTermination},
     observe::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
         LifecycleHub, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
@@ -313,10 +314,22 @@ pub(crate) struct MemberCell {
     pub(crate) removal: Latch,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct MemberMailbox {
     control: Option<Arc<dyn MailboxControl>>,
-    terminal: bool,
+    terminal: Option<Exit>,
+    teardown: Option<Box<dyn MailboxTermination>>,
+}
+
+impl fmt::Debug for MemberMailbox {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MemberMailbox")
+            .field("control", &self.control)
+            .field("terminal", &self.terminal)
+            .field("teardown_pending", &self.teardown.is_some())
+            .finish()
+    }
 }
 
 impl MemberCell {
@@ -381,14 +394,19 @@ impl MemberCell {
     }
 
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
-        let terminal = {
+        let terminal_exit = {
             let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
             assert!(state.control.is_none(), "a member can own only one mailbox");
             state.control = Some(Arc::clone(&mailbox));
-            state.terminal
+            let terminal_exit = state.terminal.clone();
+            if terminal_exit.is_some() {
+                debug_assert!(state.teardown.is_none());
+                state.teardown = mailbox.prepare_termination();
+            }
+            terminal_exit
         };
-        if terminal {
-            mailbox.terminate();
+        if let Some(terminal_exit) = terminal_exit {
+            self.publish_terminal(terminal_exit);
         }
     }
 
@@ -401,33 +419,52 @@ impl MemberCell {
     }
 
     pub(crate) fn terminalize(&self, exit: Exit) {
-        let mailbox = {
+        let (terminal_exit, mailbox) = {
             let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            if state.terminal {
-                return;
-            }
-            state.terminal = true;
-            state.control.clone()
+            let terminal_exit = if let Some(terminal_exit) = &state.terminal {
+                terminal_exit.clone()
+            } else {
+                let teardown = state
+                    .control
+                    .as_ref()
+                    .and_then(|mailbox| mailbox.prepare_termination());
+                state.terminal = Some(exit.clone());
+                state.teardown = teardown;
+                exit
+            };
+            (terminal_exit, state.control.clone())
         };
+        self.publish_terminal(terminal_exit);
         if let Some(mailbox) = mailbox {
-            mailbox.terminate();
             let stats = mailbox.stats();
             debug_assert!(stats.delivered <= stats.accepted);
             debug_assert!(stats.conflated <= stats.accepted);
             debug_assert!(stats.depth <= stats.capacity);
             let _ = stats.sends_rejected;
         }
-        let _ = self.record.send_if_modified(|record| {
-            if matches!(record.stage, MemberStage::Terminal(_)) {
-                false
-            } else {
+    }
+
+    fn publish_terminal(&self, terminal_exit: Exit) {
+        let mut published = false;
+        self.record.modify_silently(|record| {
+            if !matches!(record.stage, MemberStage::Terminal(_)) {
                 record.incarnation = None;
                 record.restart_at = None;
-                record.last_exit = Some(exit.clone());
-                record.stage = MemberStage::Terminal(exit);
-                true
+                record.last_exit = Some(terminal_exit.clone());
+                record.stage = MemberStage::Terminal(terminal_exit);
+                published = true;
             }
         });
+        let teardown = self
+            .mailbox
+            .lock()
+            .expect("member mailbox mutex poisoned")
+            .teardown
+            .take();
+        drop(teardown);
+        if published {
+            self.record.pulse();
+        }
     }
 
     pub(crate) async fn wait_terminal(&self) -> Exit {
@@ -3267,7 +3304,7 @@ mod tests {
     use std::{
         future::{self, Future},
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::{Arc, Mutex},
+        sync::{Arc, Barrier, Mutex},
         task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
@@ -3569,6 +3606,31 @@ mod tests {
         }
     }
 
+    struct ObserveMemberOnMailboxWake {
+        member: Arc<MemberCell>,
+        competing_exit: Exit,
+        observed: Mutex<Option<(MemberStage, MemberStage)>>,
+    }
+
+    impl ObserveMemberOnMailboxWake {
+        fn observe(&self) {
+            let before = self.member.record().stage;
+            self.member.terminalize(self.competing_exit.clone());
+            let after = self.member.record().stage;
+            *self.observed.lock().expect("observation mutex poisoned") = Some((before, after));
+        }
+    }
+
+    impl Wake for ObserveMemberOnMailboxWake {
+        fn wake(self: Arc<Self>) {
+            self.observe();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observe();
+        }
+    }
+
     #[test]
     fn terminality_signal_follows_mailbox_termination() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
@@ -3597,6 +3659,122 @@ mod tests {
             Some(SendErrorKind::Terminated)
         );
         assert!(changed.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let member = MemberCell::new(
+            ChildId::from("worker"),
+            identity.mint_membership().expect("membership available"),
+        );
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+        let first_exit = Exit::never_started();
+        let probe = Arc::new(ObserveMemberOnMailboxWake {
+            member: Arc::clone(&member),
+            competing_exit: Exit::new(ExitKind::Completed, false),
+            observed: Mutex::new(None),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut parked = Box::pin(actor.send(1));
+        assert!(
+            parked
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        member.terminalize(first_exit.clone());
+
+        assert_eq!(
+            *probe.observed.lock().expect("observation mutex poisoned"),
+            Some((
+                MemberStage::Terminal(first_exit.clone()),
+                MemberStage::Terminal(first_exit.clone())
+            ))
+        );
+        assert!(matches!(
+            member.record().stage,
+            MemberStage::Terminal(exit) if exit == first_exit
+        ));
+    }
+
+    #[test]
+    fn attach_during_terminal_publication_finishes_record_before_mailbox_wake() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let member = MemberCell::new(
+            ChildId::from("worker"),
+            identity.mint_membership().expect("membership available"),
+        );
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        let first_exit = Exit::never_started();
+        member
+            .mailbox
+            .lock()
+            .expect("member mailbox mutex poisoned")
+            .terminal = Some(first_exit.clone());
+        let probe = Arc::new(ObserveMemberOnMailboxWake {
+            member: Arc::clone(&member),
+            competing_exit: Exit::new(ExitKind::Completed, false),
+            observed: Mutex::new(None),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut parked = Box::pin(actor.send(1));
+        assert!(
+            parked
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        member.attach_mailbox(mailbox);
+
+        assert_eq!(
+            *probe.observed.lock().expect("observation mutex poisoned"),
+            Some((
+                MemberStage::Terminal(first_exit.clone()),
+                MemberStage::Terminal(first_exit.clone())
+            ))
+        );
+        assert!(matches!(
+            member.record().stage,
+            MemberStage::Terminal(exit) if exit == first_exit
+        ));
+    }
+
+    #[test]
+    fn concurrent_terminalizers_return_after_one_consistent_record_is_visible() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let member = MemberCell::new(
+            ChildId::from("worker"),
+            identity.mint_membership().expect("membership available"),
+        );
+        let start = Arc::new(Barrier::new(3));
+        let workers = [Exit::never_started(), Exit::new(ExitKind::Completed, false)]
+            .into_iter()
+            .map(|exit| {
+                let member = Arc::clone(&member);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    member.terminalize(exit);
+                    assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for worker in workers {
+            worker.join().expect("terminalizer thread succeeds");
+        }
+
+        let record = member.record();
+        let MemberStage::Terminal(exit) = record.stage else {
+            panic!("one terminal record must be visible");
+        };
+        assert_eq!(record.last_exit, Some(exit));
     }
 
     #[test]

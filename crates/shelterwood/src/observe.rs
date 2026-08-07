@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartPolicy, Retention, StopReason,
-    Strategy, driver, runtime,
+    Strategy, runtime,
 };
 
 /// Number of lifecycle events retained independently for each subscriber.
@@ -409,8 +409,6 @@ pub struct LifecycleEvents {
     events: runtime::BroadcastReceiver<LifecycleEvent>,
     explicit_lag: runtime::WatchReceiver<u64>,
     seen_explicit_lag: u64,
-    pending_event: Option<LifecycleEvent>,
-    pending_lag: u64,
 }
 
 impl LifecycleEvents {
@@ -422,20 +420,7 @@ impl LifecycleEvents {
                 Err(LifecycleTryRecvError::Closed) => return None,
                 Err(LifecycleTryRecvError::Empty) => {}
             }
-            let events = &mut self.events;
-            let explicit_lag = &mut self.explicit_lag;
-            match driver::select(events.receive(), explicit_lag.changed_or_closed()).await {
-                driver::Selected::First(runtime::BroadcastReceive::Item(event)) => {
-                    self.pending_event = Some(event);
-                }
-                driver::Selected::First(runtime::BroadcastReceive::Lagged(dropped)) => {
-                    self.pending_lag = self.pending_lag.saturating_add(dropped);
-                }
-                driver::Selected::First(
-                    runtime::BroadcastReceive::Empty | runtime::BroadcastReceive::Closed,
-                )
-                | driver::Selected::Second(_) => {}
-            }
+            let _ = self.explicit_lag.changed_or_closed().await;
         }
     }
 
@@ -448,25 +433,24 @@ impl LifecycleEvents {
         if current_explicit_lag != self.seen_explicit_lag {
             let mut dropped = current_explicit_lag.saturating_sub(self.seen_explicit_lag);
             self.seen_explicit_lag = current_explicit_lag;
-            dropped = dropped.saturating_add(std::mem::take(&mut self.pending_lag));
-            if self.pending_event.is_none() {
+            // Do not pull a retained event forward across this marker. It
+            // must remain in the bounded ring so a later overflow can still
+            // evict the oldest unread event. Tokio guarantees the next read
+            // reports lag when `len` exceeds the effective capacity; 128 is
+            // already a power of two, so the effective capacity is exact.
+            if self.events.len() > LIFECYCLE_EVENT_CAPACITY {
                 match self.events.try_receive() {
-                    runtime::BroadcastReceive::Item(event) => self.pending_event = Some(event),
                     runtime::BroadcastReceive::Lagged(overflow) => {
                         dropped = dropped.saturating_add(overflow);
                     }
-                    runtime::BroadcastReceive::Empty | runtime::BroadcastReceive::Closed => {}
+                    runtime::BroadcastReceive::Item(_)
+                    | runtime::BroadcastReceive::Empty
+                    | runtime::BroadcastReceive::Closed => {
+                        unreachable!("a lagging broadcast receiver reports its dropped prefix")
+                    }
                 }
             }
             return Ok(LifecycleItem::Lagged { dropped });
-        }
-        if self.pending_lag > 0 {
-            return Ok(LifecycleItem::Lagged {
-                dropped: std::mem::take(&mut self.pending_lag),
-            });
-        }
-        if let Some(event) = self.pending_event.take() {
-            return Ok(LifecycleItem::Event(event));
         }
         match self.events.try_receive() {
             runtime::BroadcastReceive::Item(event) => Ok(LifecycleItem::Event(event)),
@@ -482,7 +466,6 @@ impl fmt::Debug for LifecycleEvents {
         formatter
             .debug_struct("LifecycleEvents")
             .field("queued", &self.events.len())
-            .field("pending_lag", &self.pending_lag)
             .finish_non_exhaustive()
     }
 }
@@ -519,8 +502,6 @@ impl LifecycleHub {
                 events: channels.events.subscribe(),
                 explicit_lag,
                 seen_explicit_lag,
-                pending_event: None,
-                pending_lag: 0,
             };
         }
         let (events_sender, events) = runtime::broadcast(LIFECYCLE_EVENT_CAPACITY);
@@ -531,8 +512,6 @@ impl LifecycleHub {
             events,
             explicit_lag,
             seen_explicit_lag: 0,
-            pending_event: None,
-            pending_lag: 0,
         }
     }
 
@@ -551,6 +530,9 @@ impl LifecycleHub {
             .as_ref()
         {
             let _ = channels.events.send(event);
+            // The watch version is also the no-loss activity notification for
+            // async receivers. Its value changes only for explicit lag.
+            channels.explicit_lag.pulse();
         }
     }
 
@@ -608,11 +590,52 @@ pub enum WaitError {
 
 #[cfg(test)]
 mod tests {
-    use super::SnapshotHub;
+    use crate::{
+        ScopeState,
+        identity::ScopeIdentity,
+        observe::{LifecycleEvent, LifecycleEventKind, LifecycleItem},
+    };
+
+    use super::{LIFECYCLE_EVENT_CAPACITY, LifecycleHub, SnapshotHub};
 
     #[test]
     fn snapshot_projection_is_skipped_without_subscribers() {
         let hub = SnapshotHub::default();
         hub.publish(|| panic!("projection must be lazy when no receiver exists"));
+    }
+
+    #[test]
+    fn a_retained_event_after_explicit_lag_remains_subject_to_later_overflow() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let membership = identity.mint_membership().expect("membership available");
+        let event = |seq| LifecycleEvent {
+            scope_path: Vec::new(),
+            scope: membership,
+            seq,
+            kind: LifecycleEventKind::ScopeState {
+                state: ScopeState::Running,
+            },
+        };
+        let hub = LifecycleHub::default();
+        let mut events = hub.subscribe();
+
+        hub.publish_lagged(1);
+        hub.publish(event(1));
+        assert_eq!(events.try_recv(), Ok(LifecycleItem::Lagged { dropped: 1 }));
+
+        for seq in 2..=(LIFECYCLE_EVENT_CAPACITY as u64 + 2) {
+            hub.publish(event(seq));
+        }
+        assert_eq!(
+            events.try_recv(),
+            Ok(LifecycleItem::Lagged { dropped: 2 }),
+            "the prior retained event and the next oldest event are both evicted"
+        );
+        let LifecycleItem::Event(first_retained) =
+            events.try_recv().expect("the retained suffix follows lag")
+        else {
+            panic!("expected the retained suffix");
+        };
+        assert_eq!(first_retained.seq, 3);
     }
 }

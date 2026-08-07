@@ -1,10 +1,13 @@
 //! Deterministic fixtures shared by Shelterwood's conformance tests.
 
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -181,14 +184,33 @@ impl Drop for DestructorBlocker {
     }
 }
 
-/// A fixture that panics when dropped.
-#[derive(Debug, Default)]
-pub struct PanicOnDrop;
+/// A fixture that panics with a chosen message when dropped.
+#[derive(Debug)]
+pub struct PanicOnDrop(&'static str);
+
+impl PanicOnDrop {
+    /// Creates a drop fixture with the supplied panic message.
+    pub const fn new(message: &'static str) -> Self {
+        Self(message)
+    }
+}
+
+impl Default for PanicOnDrop {
+    fn default() -> Self {
+        Self::new("intentional destructor panic")
+    }
+}
 
 impl Drop for PanicOnDrop {
     fn drop(&mut self) {
-        panic!("intentional destructor panic");
+        panic!("{}", self.0);
     }
+}
+
+/// Polls a pinned future once with a no-op waker.
+pub fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+    let mut context = Context::from_waker(Waker::noop());
+    future.poll(&mut context)
 }
 
 /// Pauses Tokio's clock for deterministic timing tests.
@@ -236,9 +258,9 @@ pub async fn assert_quiet(duration: Duration, mut predicate: impl FnMut() -> boo
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{future, task::Poll, time::Duration};
 
-    use super::{ConsumeCount, LiveFlag, ReleaseGate, assert_quiet};
+    use super::{ConsumeCount, LiveFlag, ReleaseGate, assert_quiet, poll_once};
 
     #[test]
     fn guards_report_drop_and_consumption() {
@@ -257,6 +279,12 @@ mod tests {
         let gate = ReleaseGate::default();
         gate.release();
         gate.wait().await;
+    }
+
+    #[test]
+    fn one_poll_uses_a_noop_waker() {
+        let mut future = Box::pin(future::ready(7));
+        assert_eq!(poll_once(future.as_mut()), Poll::Ready(7));
     }
 
     #[tokio::test(start_paused = true)]

@@ -15,18 +15,10 @@ use shelterwood::{
 };
 use shelterwood_test_support::poll_until;
 
-fn waiting_task() -> TaskDef {
-    TaskDef::new(|context| async move {
-        context.shutdown_token().cancelled().await;
-        Ok(())
-    })
-}
+#[path = "common/waiting.rs"]
+mod waiting;
 
-fn waiting_tree() -> Tree {
-    let mut tree = Tree::new();
-    tree.add_task("worker", waiting_task()).expect("valid task");
-    tree
-}
+use waiting::{task as waiting_task, tree as waiting_tree};
 
 async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
     tokio::time::timeout(Duration::from_secs(2), events.recv())

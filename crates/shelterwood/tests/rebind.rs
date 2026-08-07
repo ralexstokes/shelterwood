@@ -1,11 +1,8 @@
 use std::{
-    future::Future,
-    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -13,12 +10,14 @@ use shelterwood::{
     Backoff, ExitError, ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef,
     RestartCondition, RestartPolicy, SendErrorKind, Tree,
 };
-use shelterwood_test_support::{DestructorBlocker, DestructorGate, ReleaseGate, poll_until};
+use shelterwood_test_support::{
+    DestructorBlocker, DestructorGate, ReleaseGate, poll_once, poll_until,
+};
 
-fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.poll(&mut context)
-}
+#[path = "common/policy.rs"]
+mod policy;
+
+use policy::never;
 
 struct RestartActor {
     generation: usize,
@@ -154,7 +153,7 @@ async fn never_restart_turns_a_frozen_parked_send_into_terminal() {
                 &destructor,
                 &deliveries,
                 true,
-                RestartPolicy::new(RestartCondition::Never, Backoff::Immediate),
+                never(),
             ),
         )
         .expect("valid actor");

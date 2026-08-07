@@ -1,11 +1,8 @@
 use std::{
-    future::Future,
-    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -13,12 +10,7 @@ use shelterwood::{
     CallErrorKind, ExitResult, Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, Reply,
     ReplyError, SendErrorKind, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, advance_time, assert_quiet, poll_until};
-
-fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.poll(&mut context)
-}
+use shelterwood_test_support::{ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 
 #[derive(Debug)]
 enum Message {

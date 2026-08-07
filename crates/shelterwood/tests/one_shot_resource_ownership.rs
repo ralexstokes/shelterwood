@@ -1,0 +1,460 @@
+use std::time::Duration;
+
+use shelterwood::{
+    Actor, ActorOnceDef, Context, ExitError, ExitResult, RawActor, RawContext, RawOnceDef,
+    Readiness, ReadinessDeadline, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+};
+use shelterwood_test_support::{ConsumeCount, ConsumeGuard};
+
+#[path = "common/policy.rs"]
+mod policy;
+
+use policy::never;
+
+#[derive(Clone, Copy)]
+enum RawResourceMode {
+    Normal,
+    ReadinessPanic,
+    StartupFailure,
+}
+
+struct ResourceRawActor {
+    _guard: ConsumeGuard,
+    mode: RawResourceMode,
+}
+
+impl RawActor for ResourceRawActor {
+    type Msg = ();
+
+    fn readiness(&self) -> Readiness {
+        match self.mode {
+            RawResourceMode::Normal => Readiness::Immediate,
+            RawResourceMode::ReadinessPanic => panic!("raw readiness panic"),
+            RawResourceMode::StartupFailure => Readiness::Manual,
+        }
+    }
+
+    async fn run(&mut self, _context: &mut RawContext<Self::Msg>) -> ExitResult {
+        match self.mode {
+            RawResourceMode::Normal => Ok(()),
+            RawResourceMode::ReadinessPanic => unreachable!("readiness prevents run"),
+            RawResourceMode::StartupFailure => {
+                Err(ExitError::message("raw actor failed before ready"))
+            }
+        }
+    }
+}
+
+fn resource_raw_actor(count: &ConsumeCount, mode: RawResourceMode) -> ResourceRawActor {
+    ResourceRawActor {
+        _guard: count.guard(),
+        mode,
+    }
+}
+
+#[tokio::test]
+async fn one_shot_raw_resource_drops_once_on_normal_exit() {
+    let count = ConsumeCount::default();
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "raw",
+        RawOnceDef::new(resource_raw_actor(&count, RawResourceMode::Normal)),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_raw_resource_drops_once_on_construction_panic() {
+    let count = ConsumeCount::default();
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "raw",
+        RawOnceDef::new(resource_raw_actor(&count, RawResourceMode::ReadinessPanic)),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    assert!(system.wait_started().await.is_err());
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root rolls back");
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_raw_resource_drops_once_on_startup_failure() {
+    let count = ConsumeCount::default();
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "raw",
+        RawOnceDef::new(resource_raw_actor(&count, RawResourceMode::StartupFailure)),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    assert!(system.wait_started().await.is_err());
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root rolls back");
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_raw_resource_drops_once_on_shutdown_before_start() {
+    let count = ConsumeCount::default();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "gate",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        })
+        .restart(never())
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid gate");
+    tree.add_raw_once(
+        "never-spawned",
+        RawOnceDef::new(resource_raw_actor(&count, RawResourceMode::Normal)),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("shutdown completes");
+    count.assert_once();
+}
+
+#[derive(Clone, Copy)]
+enum ActorResourceMode {
+    Normal,
+    InitPanic,
+    StartupFailure,
+}
+
+struct ResourceArgs {
+    guard: ConsumeGuard,
+    mode: ActorResourceMode,
+}
+
+enum ResourceMessage {
+    Stop,
+}
+
+struct ResourceActor {
+    _guard: ConsumeGuard,
+}
+
+impl Actor for ResourceActor {
+    type Msg = ResourceMessage;
+    type Args = ResourceArgs;
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        match args.mode {
+            ActorResourceMode::Normal => Ok(Self { _guard: args.guard }),
+            ActorResourceMode::InitPanic => panic!("actor init panic"),
+            ActorResourceMode::StartupFailure => Err(ExitError::message("actor init failed")),
+        }
+    }
+
+    async fn handle(
+        &mut self,
+        ResourceMessage::Stop: Self::Msg,
+        context: &mut Context<'_, Self>,
+    ) -> ExitResult {
+        context.stop();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn one_shot_actor_args_drop_once_on_normal_exit() {
+    let count = ConsumeCount::default();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<ResourceActor>::new(ResourceArgs {
+                guard: count.guard(),
+                mode: ActorResourceMode::Normal,
+            }),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor.send(ResourceMessage::Stop).await.expect("actor live");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    count.assert_once();
+}
+
+async fn assert_actor_init_path_drops_once(mode: ActorResourceMode) {
+    let count = ConsumeCount::default();
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "actor",
+        ActorOnceDef::<ResourceActor>::new(ResourceArgs {
+            guard: count.guard(),
+            mode,
+        }),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect_err("init path fails startup");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root shuts down");
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_actor_args_drop_once_on_init_panic_and_startup_failure() {
+    assert_actor_init_path_drops_once(ActorResourceMode::InitPanic).await;
+    assert_actor_init_path_drops_once(ActorResourceMode::StartupFailure).await;
+}
+
+#[tokio::test]
+async fn one_shot_actor_args_drop_once_when_shutdown_prevents_start() {
+    let count = ConsumeCount::default();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "gate",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual task readiness is valid"),
+    )
+    .expect("valid gate");
+    tree.add_actor_once(
+        "actor",
+        ActorOnceDef::<ResourceActor>::new(ResourceArgs {
+            guard: count.guard(),
+            mode: ActorResourceMode::Normal,
+        }),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    tokio::task::yield_now().await;
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_task_resource_drops_once_on_normal_exit() {
+    let count = ConsumeCount::default();
+    let guard = count.guard();
+    let mut tree = Tree::new();
+    let (_task, completion) = tree
+        .add_task_once(
+            "task",
+            TaskOnceDef::new(move |_| async move {
+                let _guard = guard;
+                Ok::<_, ExitError>(())
+            }),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    completion.wait().await.expect("task completes");
+    system.wait().await;
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_task_resource_drops_once_on_panic() {
+    let count = ConsumeCount::default();
+    let guard = count.guard();
+    let mut tree = Tree::new();
+    let (task, _completion) = tree
+        .add_task_once(
+            "task",
+            TaskOnceDef::new(move |_| async move {
+                let _guard = guard;
+                panic!("construction body panic");
+                #[allow(unreachable_code)]
+                Ok::<_, ExitError>(())
+            }),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    task.wait().await;
+    system.wait().await;
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_task_resource_drops_once_on_startup_failure() {
+    let count = ConsumeCount::default();
+    let guard = count.guard();
+    let mut tree = Tree::new();
+    let (_task, _completion) = tree
+        .add_task_once(
+            "task",
+            TaskOnceDef::new(move |_| async move {
+                let _guard = guard;
+                Err::<(), _>(ExitError::message("failed before ready"))
+            })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness"),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    assert!(system.wait_started().await.is_err());
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root rolls back");
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_task_resource_drops_once_on_shutdown_before_start() {
+    let count = ConsumeCount::default();
+    let guard = count.guard();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "gate",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        })
+        .restart(never())
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid gate");
+    let (_task, _completion) = tree
+        .add_task_once(
+            "never-spawned",
+            TaskOnceDef::new(move |_| async move {
+                let _guard = guard;
+                Ok::<_, ExitError>(())
+            }),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("shutdown completes");
+    count.assert_once();
+}
+
+fn one_shot_subtree_with_guard(count: &ConsumeCount, mode: &'static str) -> Tree {
+    let guard = count.guard();
+    let mut tree = Tree::new();
+    let definition = match mode {
+        "normal" => TaskOnceDef::new(move |_| async move {
+            let _guard = guard;
+            Ok::<_, ExitError>(())
+        }),
+        "panic" => TaskOnceDef::new(move |_| async move {
+            let _guard = guard;
+            panic!("subtree construction panic");
+            #[allow(unreachable_code)]
+            Ok::<_, ExitError>(())
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness"),
+        _ => unreachable!("known fixture mode"),
+    };
+    let (_task, _completion) = tree
+        .add_task_once("resource", definition)
+        .expect("valid task");
+    tree
+}
+
+#[tokio::test]
+async fn one_shot_subtree_resource_drops_once_on_normal_exit() {
+    let count = ConsumeCount::default();
+    let nested = one_shot_subtree_with_guard(&count, "normal");
+    let mut root = Tree::new();
+    root.add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait().await;
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_subtree_resource_drops_once_on_panic() {
+    let count = ConsumeCount::default();
+    let nested = one_shot_subtree_with_guard(&count, "panic");
+    let mut root = Tree::new();
+    root.add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    assert!(system.wait_started().await.is_err());
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root rolls back");
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_subtree_resource_drops_once_on_lowering_failure() {
+    let count = ConsumeCount::default();
+    let guard = count.guard();
+    let mut nested = Tree::new();
+    let _undefined = nested.reserve_task("undefined").expect("reservation");
+    let (_task, _completion) = nested
+        .add_task_once(
+            "resource",
+            TaskOnceDef::new(move |_| async move {
+                let _guard = guard;
+                Ok::<_, ExitError>(())
+            }),
+        )
+        .expect("valid task");
+    let mut root = Tree::new();
+    root.add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    assert!(system.wait_started().await.is_err());
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root rolls back");
+    count.assert_once();
+}
+
+#[tokio::test]
+async fn one_shot_subtree_resource_drops_once_on_shutdown_before_start() {
+    let count = ConsumeCount::default();
+    let nested = one_shot_subtree_with_guard(&count, "normal");
+    let mut root = Tree::new();
+    root.add_task(
+        "gate",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid gate");
+    root.add_subtree_once("never-spawned", SubtreeOnceDef::new(nested))
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("shutdown completes");
+    count.assert_once();
+}

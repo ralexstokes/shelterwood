@@ -8,11 +8,16 @@ use std::{
 };
 
 use shelterwood::{
-    Actor, ActorOnceDef, Backoff, ChildState, Context, ExitError, ExitKind, ExitResult, Readiness,
-    ReadinessDeadline, RestartCondition, RestartPolicy, Shutdown, StartOrShutdownError,
-    StopContext, SubtreeOnceDef, TaskDef, TaskRef, Tree,
+    Actor, ActorOnceDef, ChildState, Context, ExitError, ExitKind, ExitResult, Readiness,
+    ReadinessDeadline, Shutdown, StartOrShutdownError, StopContext, SubtreeOnceDef, TaskDef,
+    TaskRef, Tree,
 };
 use shelterwood_test_support::{ReleaseGate, poll_until};
+
+#[path = "../common/policy.rs"]
+mod policy;
+
+use policy::never;
 
 type JournalEvent = (usize, &'static str, &'static str);
 type JournalEntries = Arc<Mutex<Vec<JournalEvent>>>;
@@ -38,10 +43,6 @@ impl HostJournal {
             })
             .collect()
     }
-}
-
-fn never() -> RestartPolicy {
-    RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
 }
 
 fn cooperative_task(

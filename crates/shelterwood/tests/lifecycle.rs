@@ -8,14 +8,16 @@ use std::{
 };
 
 use shelterwood::{
-    Backoff, DynamicTree, ExitError, ExitKind, Intensity, Readiness, RestartCondition,
-    RestartPolicy, Retention, Shutdown, StopReason, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    Actor, ActorOnceDef, Context, DynamicTree, ExitError, ExitKind, ExitResult, Intensity,
+    Readiness, Retention, Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeOnceDef,
+    TaskDef, TaskOnceDef, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, assert_quiet, poll_until};
+use shelterwood_test_support::{PanicOnDrop, ReleaseGate, assert_quiet, poll_until};
 
-fn never() -> RestartPolicy {
-    RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
-}
+#[path = "common/policy.rs"]
+mod policy;
+
+use policy::never;
 
 #[tokio::test]
 async fn non_owners_are_quiet_and_an_empty_root_needs_its_owner() {
@@ -137,19 +139,12 @@ async fn framework_task_verdicts_remain_typed() {
 
 #[tokio::test]
 async fn task_destructor_panic_is_one_post_join_panic_exit() {
-    struct PanicOnDrop;
-    impl Drop for PanicOnDrop {
-        fn drop(&mut self) {
-            panic!("task destructor panic");
-        }
-    }
-
     let mut tree = Tree::new();
     let task = tree
         .add_task_once(
             "panic-on-drop",
             TaskOnceDef::new(|_| async move {
-                let _value = PanicOnDrop;
+                let _value = PanicOnDrop::new("task destructor panic");
                 Ok::<_, ExitError>(())
             }),
         )
@@ -163,6 +158,62 @@ async fn task_destructor_panic_is_one_post_join_panic_exit() {
         ExitKind::Panicked { message: Some(message) } if message == "task destructor panic"
     ));
     assert_eq!(system.wait().await, StopReason::Finished);
+}
+
+struct CompletedThenDropPanic;
+
+impl Drop for CompletedThenDropPanic {
+    fn drop(&mut self) {
+        panic!("actor destructor panic");
+    }
+}
+
+impl Actor for CompletedThenDropPanic {
+    type Msg = ();
+    type Args = ();
+
+    async fn init(_: (), _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), context: &mut Context<'_, Self>) -> ExitResult {
+        context.stop();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn actor_destructor_panic_supersedes_the_completed_run_outcome() {
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<CompletedThenDropPanic>::new(()).readiness(Readiness::Manual),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    actor
+        .send(())
+        .await
+        .expect("mailbox accepts before readiness");
+    let error = system
+        .wait_started()
+        .await
+        .expect_err("destructor panic prevents readiness");
+    let StartupError::StartupFailed(failure) = error else {
+        panic!("expected child startup failure");
+    };
+    let StartupFailureCause::Child { exit, .. } = failure.cause else {
+        panic!("expected child failure");
+    };
+    assert!(matches!(
+        exit.kind(),
+        ExitKind::Panicked { message } if message.as_deref() == Some("actor destructor panic")
+    ));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root shuts down");
 }
 
 #[tokio::test]

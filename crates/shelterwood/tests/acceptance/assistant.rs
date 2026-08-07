@@ -8,10 +8,10 @@ use std::{
 };
 
 use shelterwood::{
-    Actor, ActorDef, ActorOnceDef, ActorRef, Backoff, ChildState, Context, DeadlineElapsed,
-    DynamicScopeRef, DynamicTree, ExitError, ExitResult, LifecycleEvent, LifecycleEventKind,
-    LifecycleEvents, LifecycleItem, Mailbox, Membership, RemoveOutcome, Reply, ReserveError,
-    RestartCondition, RestartPolicy, ScopeState, StopContext, SubtreeOnceDef, Tree,
+    Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DeadlineElapsed, DynamicScopeRef,
+    DynamicTree, ExitError, ExitResult, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
+    LifecycleItem, Mailbox, Membership, RemoveOutcome, Reply, ReserveError, RestartPolicy,
+    ScopeState, StopContext, SubtreeOnceDef, Tree,
 };
 use shelterwood_test_support::{ReleaseGate, poll_until};
 
@@ -25,10 +25,6 @@ async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
             return event;
         }
     }
-}
-
-fn restart_on_failure() -> RestartPolicy {
-    RestartPolicy::new(RestartCondition::OnFailure, Backoff::Immediate)
 }
 
 #[derive(Clone, Default)]
@@ -372,7 +368,7 @@ fn session_fixture() -> SessionFixture {
                 stop_entered: Arc::clone(&stop_entered),
                 stop_gate: stop_gate.clone(),
             })
-            .restart(restart_on_failure()),
+            .restart(RestartPolicy::default()),
         )
         .expect("session control declared");
     SessionFixture {
@@ -545,7 +541,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     let tool = tools
         .add_actor(
             "temporary-tool",
-            ActorDef::<ToolActor>::cloned(tool_args.clone()).restart(restart_on_failure()),
+            ActorDef::<ToolActor>::cloned(tool_args.clone()).restart(RestartPolicy::default()),
         )
         .await
         .expect("temporary tool admitted")

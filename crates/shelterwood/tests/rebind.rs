@@ -227,7 +227,7 @@ async fn timed_send_withdraws_while_replacement_is_in_backoff() {
         .expect_err("backoff outlives timeout");
     assert_eq!(error.kind, SendErrorKind::TimedOut);
     assert_eq!(error.incarnation_observed, Some(first));
-    assert_eq!(error.message, 42);
+    assert_eq!(error.into_message(), Some(42));
     system.shutdown(Duration::ZERO).await.expect("root stops");
 }
 

@@ -29,6 +29,10 @@ pub(crate) fn now() -> std::time::Instant {
     time::Instant::now().into_std()
 }
 
+pub(crate) fn jitter_sample() -> f64 {
+    fastrand::f64()
+}
+
 pub(crate) fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }

@@ -4,12 +4,13 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use shelterwood::{
-    Actor, ActorDef, ActorRef, CallErrorKind, Context, DynamicScopeRef, DynamicTree, ExitError,
-    ExitResult, Mailbox, Membership, RemoveOutcome, Reply, ScopeRef, SubtreeOnceDef, Tree,
+    Actor, ActorDef, ActorRef, AttemptEnd, Backoff, Context, DynamicScopeRef, DynamicTree,
+    ExitError, ExitResult, IdempotentCallErrorKind, Incarnation, Mailbox, Membership,
+    RemoveOutcome, Reply, RetryPolicy, ScopeRef, SubtreeOnceDef, Tree,
 };
 use shelterwood_test_support::ReleaseGate;
 
@@ -130,7 +131,8 @@ struct DurableTopology {
     current: Arc<Mutex<Option<Mount>>>,
     faults: Arc<Mutex<HashMap<u64, Fault>>>,
     aborted: Arc<Mutex<Vec<(u64, Mount)>>>,
-    retry_kinds: Arc<Mutex<Vec<(u64, CallErrorKind)>>>,
+    attempt_constructions: Arc<Mutex<HashMap<u64, usize>>>,
+    accepting_incarnations: Arc<Mutex<Vec<(u64, Incarnation)>>>,
     acceptances: Arc<AtomicUsize>,
     response_gate: ReleaseGate,
 }
@@ -162,19 +164,38 @@ impl DurableTopology {
         self.acceptances.load(Ordering::SeqCst)
     }
 
-    fn record_retry(&self, operation: u64, kind: CallErrorKind) {
-        self.retry_kinds
+    fn record_attempt_construction(&self, operation: u64) -> usize {
+        let mut attempts = self
+            .attempt_constructions
             .lock()
-            .expect("retry-kind mutex poisoned")
-            .push((operation, kind));
+            .expect("attempt-construction mutex poisoned");
+        let count = attempts.entry(operation).or_default();
+        *count += 1;
+        *count
     }
 
-    fn retry_kinds(&self, operation: u64) -> Vec<CallErrorKind> {
-        self.retry_kinds
+    fn attempt_constructions(&self, operation: u64) -> usize {
+        self.attempt_constructions
             .lock()
-            .expect("retry-kind mutex poisoned")
+            .expect("attempt-construction mutex poisoned")
+            .get(&operation)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn record_acceptance(&self, operation: u64, incarnation: Incarnation) {
+        self.accepting_incarnations
+            .lock()
+            .expect("accepting-incarnation mutex poisoned")
+            .push((operation, incarnation));
+    }
+
+    fn accepting_incarnations(&self, operation: u64) -> Vec<Incarnation> {
+        self.accepting_incarnations
+            .lock()
+            .expect("accepting-incarnation mutex poisoned")
             .iter()
-            .filter_map(|(recorded, kind)| (*recorded == operation).then_some(*kind))
+            .filter_map(|(recorded, incarnation)| (*recorded == operation).then_some(*incarnation))
             .collect()
     }
 
@@ -409,9 +430,12 @@ impl Actor for RouterActor {
         Ok(Self(args))
     }
 
-    async fn handle(&mut self, message: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         let RouterMessage::Replace { operation, reply } = message;
         self.0.durable.acceptances.fetch_add(1, Ordering::SeqCst);
+        self.0
+            .durable
+            .record_acceptance(operation, context.incarnation());
         let route = self.replace(operation).await?;
         reply.send(route);
         Ok(())
@@ -420,89 +444,52 @@ impl Actor for RouterActor {
 
 async fn replace_with_retry(
     router: &ActorRef<RouterMessage>,
-    root: &ScopeRef,
     args: &RouterArgs,
     operation: u64,
     per_attempt: Duration,
     overall: Duration,
-    acceptance_timeout_observed: Option<ReleaseGate>,
+    retry_started: Option<ReleaseGate>,
 ) -> Route {
-    assert!(!per_attempt.is_zero());
-    assert!(!overall.is_zero());
-    let deadline = Instant::now()
-        .checked_add(overall)
-        .expect("test retry deadline is representable");
-
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "idempotent topology retry budget exhausted"
-        );
-        let slice = per_attempt.min(remaining);
-        match router
-            .call(
-                move |reply| RouterMessage::Replace { operation, reply },
-                slice,
-            )
-            .await
-        {
-            Ok(reply) => return reply.value,
-            Err(error) => {
-                args.durable.record_retry(operation, error.kind);
-                match error.kind {
-                    CallErrorKind::AcceptanceTimedOut => {
-                        // Successful withdrawal is the only arm that may retry
-                        // without reconciliation or an incarnation transition.
-                        if let Some(observed) = &acceptance_timeout_observed {
-                            observed.release();
-                        }
-                    }
-                    CallErrorKind::ReplyDropped => {
-                        let accepting = error
-                            .incarnation_observed
-                            .expect("reply loss carries the accepting incarnation");
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        assert!(!remaining.is_zero(), "budget expired before restart wait");
-                        root.wait_for_child(
-                            "topology-writer",
-                            move |child| {
-                                matches!(child.state, shelterwood::ChildState::Running)
-                                    && child
-                                        .incarnation
-                                        .is_some_and(|current| current.supersedes(accepting))
-                            },
-                            remaining,
-                        )
-                        .await
-                        .expect("reply-loss retry observes a superseding incarnation");
-                    }
-                    CallErrorKind::ResponseTimedOut => {
-                        // Acceptance makes resend unsafe. Reconcile the same
-                        // durable journal record outside the parked actor instead.
-                        let record = args
-                            .durable
-                            .operation(operation)
-                            .expect("accepted operation has a journal record");
-                        return match record {
-                            OperationRecord::Committed {
-                                candidate,
-                                previous,
-                            } => reconcile_topology(args, candidate, previous)
-                                .await
-                                .expect("committed response timeout reconciles"),
-                            OperationRecord::Mounted { .. } => {
-                                panic!("response timed out before a durable commit verdict")
-                            }
-                        };
-                    }
-                    CallErrorKind::Terminated => {
-                        panic!("topology writer terminated during retry")
-                    }
-                    _ => panic!("unexpected call error kind"),
+    let durable = args.durable.clone();
+    match router
+        .call_idempotent(
+            move |reply| {
+                let count = durable.record_attempt_construction(operation);
+                if count == 2
+                    && let Some(observed) = &retry_started
+                {
+                    observed.release();
+                }
+                RouterMessage::Replace { operation, reply }
+            },
+            RetryPolicy::new(per_attempt, Backoff::Immediate).expect("valid retry policy"),
+            overall,
+        )
+        .await
+    {
+        Ok(reply) => reply.value,
+        Err(error) if error.kind == IdempotentCallErrorKind::ResponseTimedOut => {
+            assert_eq!(error.attempts.len(), 1);
+            assert_eq!(error.attempts[0].ended, AttemptEnd::ResponseTimedOut);
+            // Acceptance makes resend unsafe. Reconcile the same durable
+            // journal record outside the parked actor instead.
+            let record = args
+                .durable
+                .operation(operation)
+                .expect("accepted operation has a journal record");
+            match record {
+                OperationRecord::Committed {
+                    candidate,
+                    previous,
+                } => reconcile_topology(args, candidate, previous)
+                    .await
+                    .expect("committed response timeout reconciles"),
+                OperationRecord::Mounted { .. } => {
+                    panic!("response timed out before a durable commit verdict")
                 }
             }
         }
+        Err(error) => panic!("idempotent topology call failed unexpectedly: {error}"),
     }
 }
 
@@ -541,12 +528,9 @@ async fn shard_store_reconciles_retry_outcomes_with_one_overall_budget() {
         .expect("valid topology writer");
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("store starts");
-    let root_scope = system.scope();
-
     durable.inject(1, Fault::BeforeCommit);
     let first = replace_with_retry(
         &router,
-        &root_scope,
         &router_args,
         1,
         Duration::from_millis(500),
@@ -554,11 +538,10 @@ async fn shard_store_reconciles_retry_outcomes_with_one_overall_budget() {
         None,
     )
     .await;
-    assert_eq!(
-        durable.retry_kinds(1),
-        [CallErrorKind::ReplyDropped],
-        "pre-commit fault exercises the superseding-incarnation retry"
-    );
+    let first_acceptances = durable.accepting_incarnations(1);
+    assert_eq!(first_acceptances.len(), 2);
+    assert!(first_acceptances[1].supersedes(first_acceptances[0]));
+    assert_eq!(durable.attempt_constructions(1), 2);
     let failed_candidate = durable.aborted(1);
     assert!(
         first
@@ -580,7 +563,6 @@ async fn shard_store_reconciles_retry_outcomes_with_one_overall_budget() {
     durable.inject(2, Fault::AfterCommitBeforeReply);
     let second = replace_with_retry(
         &router,
-        &root_scope,
         &router_args,
         2,
         Duration::from_millis(500),
@@ -588,11 +570,10 @@ async fn shard_store_reconciles_retry_outcomes_with_one_overall_budget() {
         None,
     )
     .await;
-    assert_eq!(
-        durable.retry_kinds(2),
-        [CallErrorKind::ReplyDropped],
-        "post-commit reply loss also waits for the restarted writer"
-    );
+    let second_acceptances = durable.accepting_incarnations(2);
+    assert_eq!(second_acceptances.len(), 2);
+    assert!(second_acceptances[1].supersedes(second_acceptances[0]));
+    assert_eq!(durable.attempt_constructions(2), 2);
     let committed_candidate = match durable.operation(2).expect("commit was journaled") {
         OperationRecord::Committed { candidate, .. } => candidate,
         OperationRecord::Mounted { .. } => panic!("directory cutover must be committed"),
@@ -609,7 +590,6 @@ async fn shard_store_reconciles_retry_outcomes_with_one_overall_budget() {
     assert_eq!(
         replace_with_retry(
             &router,
-            &root_scope,
             &router_args,
             2,
             Duration::from_millis(500),
@@ -641,7 +621,6 @@ async fn shard_store_reconciles_retry_outcomes_with_one_overall_budget() {
     let accepted_before_timeout = durable.acceptances();
     let third = replace_with_retry(
         &router,
-        &root_scope,
         &router_args,
         3,
         Duration::from_millis(500),
@@ -649,11 +628,7 @@ async fn shard_store_reconciles_retry_outcomes_with_one_overall_budget() {
         None,
     )
     .await;
-    assert_eq!(
-        durable.retry_kinds(3),
-        [CallErrorKind::ResponseTimedOut],
-        "parked accepted request reconciles instead of resending"
-    );
+    assert_eq!(durable.attempt_constructions(3), 1);
     assert_eq!(
         durable.acceptances(),
         accepted_before_timeout + 1,
@@ -694,13 +669,11 @@ async fn shard_store_reconciles_retry_outcomes_with_one_overall_budget() {
     let acceptance_timeout_observed = ReleaseGate::default();
     let retry_task = {
         let router = router.clone();
-        let root_scope = root_scope.clone();
         let router_args = router_args.clone();
         let observed = acceptance_timeout_observed.clone();
         tokio::spawn(async move {
             replace_with_retry(
                 &router,
-                &root_scope,
                 &router_args,
                 4,
                 Duration::from_millis(500),
@@ -714,13 +687,11 @@ async fn shard_store_reconciles_retry_outcomes_with_one_overall_budget() {
     durable.response_gate.release();
     let fourth = retry_task.await.expect("retry task remains joinable");
     assert_eq!(fourth.operation, 4);
-    let fourth_retries = durable.retry_kinds(4);
-    assert!(!fourth_retries.is_empty());
-    assert!(
-        fourth_retries
-            .iter()
-            .all(|kind| *kind == CallErrorKind::AcceptanceTimedOut),
-        "only proven-unaccepted attempts retry without reconciliation"
+    assert!(durable.attempt_constructions(4) >= 2);
+    assert_eq!(
+        durable.accepting_incarnations(4).len(),
+        1,
+        "withdrawn acceptance-timeout attempts never reach the handler"
     );
 
     system

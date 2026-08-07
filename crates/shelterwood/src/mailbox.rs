@@ -1,5 +1,9 @@
 //! Membership-owned actor mailboxes and request/reply capabilities.
 
+// `SendError<M>` intentionally owns `M`: guaranteed-unaccepted sends must let
+// callers recover arbitrarily sized messages without another allocation.
+#![allow(clippy::result_large_err)]
+
 use std::{
     collections::VecDeque,
     fmt,
@@ -13,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    ChildId, Incarnation, Mailbox, Membership,
+    Backoff, ChildId, Incarnation, Mailbox, Membership, PolicyError,
     driver::{MemberCell, Signal, SignalWatcher},
 };
 
@@ -29,18 +33,58 @@ pub enum SendErrorKind {
     Terminated,
     /// A timed send was withdrawn before acceptance.
     TimedOut,
+    /// An incarnation-pinned ref no longer names the accepting incarnation.
+    Superseded {
+        /// Incarnation the ref was pinned to.
+        pinned: Incarnation,
+        /// Newest currently bound incarnation, when one exists.
+        newest_observed: Option<Incarnation>,
+    },
 }
 
-/// A failed send with its recoverable message and identity evidence.
+/// Payload carried by a failed ingress operation.
+///
+/// Ordinary actor refs always return [`SendPayload::Recovered`]. A
+/// contramapped ref has already consumed its input while applying the mapping
+/// closure and therefore returns [`SendPayload::Projected`].
+#[derive(Eq, PartialEq)]
+pub enum SendPayload<M> {
+    /// The value was not accepted and is recoverable by the caller.
+    Recovered(M),
+    /// The value was consumed by an eager ingress projection.
+    Projected,
+}
+
+impl<M> fmt::Debug for SendPayload<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Recovered(_) => formatter.write_str("Recovered(<payload>)"),
+            Self::Projected => formatter.write_str("Projected"),
+        }
+    }
+}
+
+/// A failed send with its payload disposition and identity evidence.
 pub struct SendError<M> {
     /// Target actor id.
     pub actor_id: ChildId,
     /// Incarnation required by the error-kind identity table.
     pub incarnation_observed: Option<Incarnation>,
-    /// Message proven not to have been accepted.
-    pub message: M,
+    /// Disposition of the value submitted at this ingress layer.
+    pub payload: SendPayload<M>,
     /// Failure category.
     pub kind: SendErrorKind,
+}
+
+impl<M> SendError<M> {
+    /// Recovers an unaccepted value from an unmapped ingress layer.
+    #[must_use]
+    pub fn into_message(self) -> Option<M> {
+        match self.payload {
+            SendPayload::Recovered(message) => Some(message),
+            SendPayload::Projected => None,
+        }
+    }
 }
 
 impl<M> fmt::Debug for SendError<M> {
@@ -49,7 +93,7 @@ impl<M> fmt::Debug for SendError<M> {
             .debug_struct("SendError")
             .field("actor_id", &self.actor_id)
             .field("incarnation_observed", &self.incarnation_observed)
-            .field("message", &"<recoverable message>")
+            .field("payload", &self.payload)
             .field("kind", &self.kind)
             .finish()
     }
@@ -70,6 +114,7 @@ impl fmt::Display for SendErrorKind {
             Self::Full => "mailbox is full",
             Self::Terminated => "actor membership is terminal",
             Self::TimedOut => "acceptance deadline elapsed",
+            Self::Superseded { .. } => "pinned actor incarnation was superseded",
         })
     }
 }
@@ -86,6 +131,13 @@ pub enum CallErrorKind {
     ResponseTimedOut,
     /// The accepted request's reply capability was dropped unanswered.
     ReplyDropped,
+    /// An incarnation-pinned ref no longer names the accepting incarnation.
+    Superseded {
+        /// Incarnation the ref was pinned to.
+        pinned: Incarnation,
+        /// Newest currently bound incarnation, when one exists.
+        newest_observed: Option<Incarnation>,
+    },
 }
 
 /// A failed request/reply call with retry-discipline identity evidence.
@@ -122,6 +174,155 @@ impl fmt::Display for CallErrorKind {
             Self::AcceptanceTimedOut => "request acceptance deadline elapsed",
             Self::ResponseTimedOut => "response deadline elapsed after acceptance",
             Self::ReplyDropped => "reply capability was dropped unanswered",
+            Self::Superseded { .. } => "pinned actor incarnation was superseded",
+        })
+    }
+}
+
+fn call_error_kind_from_send(
+    kind: SendErrorKind,
+    pinned: Option<Incarnation>,
+    observed: Option<Incarnation>,
+) -> CallErrorKind {
+    match kind {
+        SendErrorKind::Superseded {
+            pinned,
+            newest_observed,
+        } => CallErrorKind::Superseded {
+            pinned,
+            newest_observed,
+        },
+        SendErrorKind::NotRunning if pinned.is_some() => CallErrorKind::Superseded {
+            pinned: pinned.expect("checked pinned call"),
+            newest_observed: observed,
+        },
+        SendErrorKind::NotRunning
+        | SendErrorKind::Full
+        | SendErrorKind::Terminated
+        | SendErrorKind::TimedOut => CallErrorKind::Terminated,
+    }
+}
+
+/// Failure while awaiting a strictly newer accepting incarnation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum NextIncarnationError {
+    /// The actor membership terminalized before a newer incarnation ran.
+    Terminated {
+        /// Final incarnation, or `None` when the membership never ran.
+        last: Option<Incarnation>,
+    },
+    /// The deadline elapsed before a newer accepting incarnation ran.
+    TimedOut,
+}
+
+impl fmt::Display for NextIncarnationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Terminated { .. } => "actor membership terminalized",
+            Self::TimedOut => "next-incarnation deadline elapsed",
+        })
+    }
+}
+
+impl std::error::Error for NextIncarnationError {}
+
+/// Validated retry data for [`ActorRef::call_idempotent`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RetryPolicy {
+    per_attempt: Duration,
+    backoff: Backoff,
+}
+
+impl RetryPolicy {
+    /// Constructs a policy with a non-zero per-attempt slice.
+    pub fn new(per_attempt: Duration, backoff: Backoff) -> Result<Self, PolicyError> {
+        if per_attempt.is_zero() {
+            Err(PolicyError::ZeroDuration)
+        } else {
+            Ok(Self {
+                per_attempt,
+                backoff,
+            })
+        }
+    }
+
+    /// Returns the maximum budget for one call attempt.
+    #[must_use]
+    pub const fn per_attempt(self) -> Duration {
+        self.per_attempt
+    }
+
+    /// Returns the delay policy applied after retryable failures.
+    #[must_use]
+    pub const fn backoff(self) -> Backoff {
+        self.backoff
+    }
+}
+
+/// Why one idempotent-call attempt ended.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum AttemptEnd {
+    /// The request was withdrawn before acceptance.
+    AcceptanceTimedOut,
+    /// The accepting incarnation dropped the reply capability.
+    ReplyDropped,
+    /// The request was accepted but its response slice expired.
+    ResponseTimedOut,
+    /// The target membership terminalized before acceptance.
+    Terminated,
+}
+
+/// Identity evidence for one completed idempotent-call attempt.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Attempt {
+    /// Accepting or newest-observed incarnation for this attempt.
+    pub incarnation: Option<Incarnation>,
+    /// Terminal observation for this attempt.
+    pub ended: AttemptEnd,
+}
+
+/// Terminal category for an idempotent call.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum IdempotentCallErrorKind {
+    /// The overall logical-operation budget elapsed.
+    BudgetExhausted,
+    /// An accepted request's response slice elapsed; reconcile, never resend.
+    ResponseTimedOut,
+    /// The actor membership terminalized.
+    Terminated,
+}
+
+/// Terminal idempotent-call failure with complete attempt history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdempotentCallError {
+    /// Attempts that actually began, in call order.
+    pub attempts: Vec<Attempt>,
+    /// Terminal category.
+    pub kind: IdempotentCallErrorKind,
+}
+
+impl fmt::Display for IdempotentCallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "idempotent call failed after {} attempt(s): {}",
+            self.attempts.len(),
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for IdempotentCallError {}
+
+impl fmt::Display for IdempotentCallErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BudgetExhausted => "overall deadline elapsed",
+            Self::ResponseTimedOut => "response deadline elapsed after acceptance",
+            Self::Terminated => "actor membership terminalized",
         })
     }
 }
@@ -415,9 +616,10 @@ enum OperationOutcome<M> {
         newest_observed: Option<Incarnation>,
     },
     Accepted(Incarnation),
-    Terminated {
-        message: Option<M>,
-        final_incarnation: Option<Incarnation>,
+    Failed {
+        payload: Option<SendPayload<M>>,
+        observed: Option<Incarnation>,
+        kind: SendErrorKind,
     },
     Withdrawn,
 }
@@ -428,12 +630,14 @@ struct OperationState<M> {
 }
 
 struct SendOperation<M> {
+    pinned: Option<Incarnation>,
     state: Mutex<OperationState<M>>,
 }
 
 impl<M> SendOperation<M> {
-    fn new(message: M) -> Arc<Self> {
+    fn new(message: M, pinned: Option<Incarnation>) -> Arc<Self> {
         Arc::new(Self {
+            pinned,
             state: Mutex::new(OperationState {
                 outcome: OperationOutcome::Waiting {
                     message: Some(message),
@@ -467,22 +671,28 @@ impl<M> SendOperation<M> {
         Some((message, wake))
     }
 
-    fn terminate(&self, final_incarnation: Option<Incarnation>) {
-        let wake = {
+    fn fail(&self, observed: Option<Incarnation>, kind: SendErrorKind) -> Option<Waker> {
+        {
             let mut state = self.state.lock().expect("send operation mutex poisoned");
             let OperationOutcome::Waiting { message, .. } = &mut state.outcome else {
-                return;
+                return None;
             };
-            let message = message.take();
-            state.outcome = OperationOutcome::Terminated {
-                message,
-                final_incarnation,
+            let payload = message.take().map(SendPayload::Recovered);
+            state.outcome = OperationOutcome::Failed {
+                payload,
+                observed,
+                kind,
             };
             state.waker.take()
-        };
-        if let Some(waker) = wake {
-            waker.wake();
         }
+    }
+
+    fn terminate(&self, final_incarnation: Option<Incarnation>) -> Option<Waker> {
+        self.fail(final_incarnation, SendErrorKind::Terminated)
+    }
+
+    fn pinned(&self) -> Option<Incarnation> {
+        self.pinned
     }
 }
 
@@ -582,9 +792,28 @@ impl<M: Send + 'static> MailboxCell<M> {
         match state.status {
             BindingStatus::Terminal(final_incarnation) => {
                 drop(state);
-                operation.terminate(final_incarnation);
+                if let Some(waker) = operation.terminate(final_incarnation) {
+                    waker.wake();
+                }
             }
             BindingStatus::Bound(incarnation) => {
+                if operation
+                    .pinned()
+                    .is_some_and(|pinned| pinned != incarnation)
+                {
+                    let pinned = operation.pinned().expect("checked pinned incarnation");
+                    drop(state);
+                    if let Some(waker) = operation.fail(
+                        Some(incarnation),
+                        SendErrorKind::Superseded {
+                            pinned,
+                            newest_observed: Some(incarnation),
+                        },
+                    ) {
+                        waker.wake();
+                    }
+                    return;
+                }
                 operation.observe(incarnation);
                 let can_accept = match state.kind {
                     Some(MailboxKind::Queue(capacity)) => {
@@ -631,13 +860,47 @@ impl<M: Send + 'static> MailboxCell<M> {
             }
             BindingStatus::Frozen(incarnation) => {
                 operation.observe(incarnation);
-                state.waiters.push_back(Arc::clone(operation));
+                if let Some(pinned) = operation.pinned() {
+                    let kind = if pinned == incarnation {
+                        SendErrorKind::NotRunning
+                    } else {
+                        SendErrorKind::Superseded {
+                            pinned,
+                            newest_observed: Some(incarnation),
+                        }
+                    };
+                    drop(state);
+                    if let Some(waker) = operation.fail(Some(incarnation), kind) {
+                        waker.wake();
+                    }
+                } else {
+                    state.waiters.push_back(Arc::clone(operation));
+                }
             }
-            BindingStatus::Unbound => state.waiters.push_back(Arc::clone(operation)),
+            BindingStatus::Unbound => {
+                if let Some(pinned) = operation.pinned() {
+                    drop(state);
+                    if let Some(waker) = operation.fail(
+                        None,
+                        SendErrorKind::Superseded {
+                            pinned,
+                            newest_observed: None,
+                        },
+                    ) {
+                        waker.wake();
+                    }
+                } else {
+                    state.waiters.push_back(Arc::clone(operation));
+                }
+            }
         }
     }
 
-    fn try_send(&self, message: M) -> Result<Incarnation, SendError<M>> {
+    fn try_send(
+        &self,
+        message: M,
+        pinned: Option<Incarnation>,
+    ) -> Result<Incarnation, SendError<M>> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         match state.status {
             BindingStatus::Terminal(final_incarnation) => {
@@ -645,7 +908,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                 Err(SendError {
                     actor_id: self.actor_id.clone(),
                     incarnation_observed: final_incarnation,
-                    message,
+                    payload: SendPayload::Recovered(message),
                     kind: SendErrorKind::Terminated,
                 })
             }
@@ -654,8 +917,13 @@ impl<M: Send + 'static> MailboxCell<M> {
                 Err(SendError {
                     actor_id: self.actor_id.clone(),
                     incarnation_observed: None,
-                    message,
-                    kind: SendErrorKind::NotRunning,
+                    payload: SendPayload::Recovered(message),
+                    kind: pinned.map_or(SendErrorKind::NotRunning, |pinned| {
+                        SendErrorKind::Superseded {
+                            pinned,
+                            newest_observed: None,
+                        }
+                    }),
                 })
             }
             BindingStatus::Frozen(incarnation) => {
@@ -663,8 +931,29 @@ impl<M: Send + 'static> MailboxCell<M> {
                 Err(SendError {
                     actor_id: self.actor_id.clone(),
                     incarnation_observed: Some(incarnation),
-                    message,
-                    kind: SendErrorKind::NotRunning,
+                    payload: SendPayload::Recovered(message),
+                    kind: match pinned {
+                        Some(pinned) if pinned != incarnation => SendErrorKind::Superseded {
+                            pinned,
+                            newest_observed: Some(incarnation),
+                        },
+                        _ => SendErrorKind::NotRunning,
+                    },
+                })
+            }
+            BindingStatus::Bound(incarnation)
+                if pinned.is_some_and(|pinned| pinned != incarnation) =>
+            {
+                state.sends_rejected = state.sends_rejected.saturating_add(1);
+                let pinned = pinned.expect("checked pinned incarnation");
+                Err(SendError {
+                    actor_id: self.actor_id.clone(),
+                    incarnation_observed: Some(incarnation),
+                    payload: SendPayload::Recovered(message),
+                    kind: SendErrorKind::Superseded {
+                        pinned,
+                        newest_observed: Some(incarnation),
+                    },
                 })
             }
             BindingStatus::Bound(incarnation) => match state.kind {
@@ -675,7 +964,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                     Err(SendError {
                         actor_id: self.actor_id.clone(),
                         incarnation_observed: Some(incarnation),
-                        message,
+                        payload: SendPayload::Recovered(message),
                         kind: SendErrorKind::Full,
                     })
                 }
@@ -710,7 +999,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                     Err(SendError {
                         actor_id: self.actor_id.clone(),
                         incarnation_observed: None,
-                        message,
+                        payload: SendPayload::Recovered(message),
                         kind: SendErrorKind::NotRunning,
                     })
                 }
@@ -768,12 +1057,11 @@ impl<M: Send + 'static> MailboxCell<M> {
         message
     }
 
-    fn current_observation(&self) -> Option<Incarnation> {
+    fn binding_observation(&self) -> BindingObservation {
         match self.state.lock().expect("mailbox mutex poisoned").status {
-            BindingStatus::Bound(incarnation) | BindingStatus::Frozen(incarnation) => {
-                Some(incarnation)
-            }
-            BindingStatus::Unbound | BindingStatus::Terminal(_) => None,
+            BindingStatus::Bound(incarnation) => BindingObservation::Accepting(incarnation),
+            BindingStatus::Unbound | BindingStatus::Frozen(_) => BindingObservation::NotAccepting,
+            BindingStatus::Terminal(last) => BindingObservation::Terminal(last),
         }
     }
 
@@ -818,17 +1106,22 @@ impl<M> MailboxCell<M> {
                     let observed = *newest_observed;
                     state.outcome = OperationOutcome::Withdrawn;
                     state.waker = None;
-                    Withdrawal::Withdrawn { message, observed }
+                    Withdrawal::Withdrawn {
+                        payload: SendPayload::Recovered(message),
+                        observed,
+                    }
                 }
                 OperationOutcome::Accepted(incarnation) => Withdrawal::Accepted(*incarnation),
-                OperationOutcome::Terminated {
-                    message,
-                    final_incarnation,
-                } => Withdrawal::Terminated {
-                    message: message
+                OperationOutcome::Failed {
+                    payload,
+                    observed,
+                    kind,
+                } => Withdrawal::Failed {
+                    payload: payload
                         .take()
-                        .expect("a terminal operation must retain its message"),
-                    observed: *final_incarnation,
+                        .expect("a failed operation must retain its payload"),
+                    observed: *observed,
+                    kind: *kind,
                 },
                 OperationOutcome::Withdrawn => {
                     panic!("a send operation was withdrawn more than once")
@@ -876,8 +1169,23 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         if state.status == BindingStatus::Bound(incarnation) {
             state.status = BindingStatus::Frozen(incarnation);
+            let mut retained = VecDeque::with_capacity(state.waiters.len());
+            let mut wakers = Vec::new();
+            while let Some(waiter) = state.waiters.pop_front() {
+                if waiter.pinned() == Some(incarnation) {
+                    if let Some(waker) = waiter.fail(Some(incarnation), SendErrorKind::NotRunning) {
+                        wakers.push(waker);
+                    }
+                } else {
+                    retained.push_back(waiter);
+                }
+            }
+            state.waiters = retained;
             drop(state);
             self.changed.pulse();
+            for waker in wakers {
+                waker.wake();
+            }
         }
     }
 
@@ -893,8 +1201,29 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         state.status = BindingStatus::Unbound;
         let queue = std::mem::take(&mut state.queue);
         let latest = state.latest.take();
+        let mut retained = VecDeque::with_capacity(state.waiters.len());
+        let mut wakers = Vec::new();
+        while let Some(waiter) = state.waiters.pop_front() {
+            if let Some(pinned) = waiter.pinned() {
+                if let Some(waker) = waiter.fail(
+                    None,
+                    SendErrorKind::Superseded {
+                        pinned,
+                        newest_observed: None,
+                    },
+                ) {
+                    wakers.push(waker);
+                }
+            } else {
+                retained.push_back(waiter);
+            }
+        }
+        state.waiters = retained;
         drop(state);
         self.changed.pulse();
+        for waker in wakers {
+            waker.wake();
+        }
         drop(queue);
         drop(latest);
     }
@@ -910,10 +1239,16 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         let latest = state.latest.take();
         let waiters = std::mem::take(&mut state.waiters);
         drop(state);
+        let mut wakers = Vec::new();
         for waiter in waiters {
-            waiter.terminate(final_incarnation);
+            if let Some(waker) = waiter.terminate(final_incarnation) {
+                wakers.push(waker);
+            }
         }
         self.changed.pulse();
+        for waker in wakers {
+            waker.wake();
+        }
         drop(queue);
         drop(latest);
     }
@@ -940,6 +1275,22 @@ fn promote_waiters<M>(state: &mut MailboxState<M>) -> Promotion<M> {
         let Some(operation) = state.waiters.pop_front() else {
             break;
         };
+        if operation
+            .pinned()
+            .is_some_and(|pinned| pinned != incarnation)
+        {
+            let pinned = operation.pinned().expect("checked pinned incarnation");
+            if let Some(waker) = operation.fail(
+                Some(incarnation),
+                SendErrorKind::Superseded {
+                    pinned,
+                    newest_observed: Some(incarnation),
+                },
+            ) {
+                promotion.wakers.push(waker);
+            }
+            continue;
+        }
         operation.observe(incarnation);
         let Some((message, wake)) = operation.accept(incarnation) else {
             continue;
@@ -971,27 +1322,107 @@ fn promote_waiters<M>(state: &mut MailboxState<M>) -> Promotion<M> {
 
 enum Withdrawal<M> {
     Withdrawn {
-        message: M,
+        payload: SendPayload<M>,
         observed: Option<Incarnation>,
     },
     Accepted(Incarnation),
-    Terminated {
-        message: M,
+    Failed {
+        payload: SendPayload<M>,
         observed: Option<Incarnation>,
+        kind: SendErrorKind,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BindingObservation {
+    Accepting(Incarnation),
+    NotAccepting,
+    Terminal(Option<Incarnation>),
+}
+
+trait SendDriver<M>: Send + Unpin {
+    fn poll_send(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<Incarnation, SendError<M>>>;
+    fn withdraw(&mut self) -> Withdrawal<M>;
+}
+
+trait ActorIngress<M>: Send + Sync {
+    fn start_send(&self, message: M, pinned: Option<Incarnation>) -> SendFuture<M>;
+    fn try_send(
+        &self,
+        message: M,
+        pinned: Option<Incarnation>,
+    ) -> Result<Incarnation, SendError<M>>;
+    fn binding_observation(&self) -> BindingObservation;
+    fn watcher(&self) -> SignalWatcher;
+}
+
+struct MappedIngress<N, M> {
+    outer: ActorRef<M>,
+    wrap: Arc<dyn Fn(N) -> M + Send + Sync + 'static>,
+}
+
+impl<N: Send + 'static, M: Send + 'static> ActorIngress<N> for MappedIngress<N, M> {
+    fn start_send(&self, message: N, pinned: Option<Incarnation>) -> SendFuture<N> {
+        let message = (self.wrap)(message);
+        SendFuture::from_driver(ProjectedSend::<N, M> {
+            outer: self.outer.start_send(message, pinned),
+            marker: std::marker::PhantomData,
+        })
+    }
+
+    fn try_send(
+        &self,
+        message: N,
+        pinned: Option<Incarnation>,
+    ) -> Result<Incarnation, SendError<N>> {
+        let message = (self.wrap)(message);
+        self.outer
+            .try_send_with_pin(message, pinned)
+            .map_err(project_send_error)
+    }
+
+    fn binding_observation(&self) -> BindingObservation {
+        self.outer.binding_observation()
+    }
+
+    fn watcher(&self) -> SignalWatcher {
+        self.outer.binding_watcher()
+    }
+}
+
+fn project_send_error<N, M>(error: SendError<M>) -> SendError<N> {
+    SendError {
+        actor_id: error.actor_id,
+        incarnation_observed: error.incarnation_observed,
+        payload: SendPayload::Projected,
+        kind: error.kind,
+    }
 }
 
 /// A cheap membership-addressed actor handle.
 pub struct ActorRef<M> {
     member: Arc<MemberCell>,
-    mailbox: Arc<MailboxCell<M>>,
+    ingress: Ingress<M>,
+}
+
+enum Ingress<M> {
+    Direct(Arc<MailboxCell<M>>),
+    Mapped(Arc<dyn ActorIngress<M>>),
+}
+
+impl<M> Clone for Ingress<M> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Direct(mailbox) => Self::Direct(Arc::clone(mailbox)),
+            Self::Mapped(ingress) => Self::Mapped(Arc::clone(ingress)),
+        }
+    }
 }
 
 impl<M> ActorRef<M> {
-    pub(crate) fn new(member: Arc<MemberCell>, mailbox: Arc<MailboxCell<M>>) -> Self {
-        Self { member, mailbox }
-    }
-
     /// Returns the actor's child id.
     #[must_use]
     pub fn id(&self) -> &ChildId {
@@ -1006,19 +1437,65 @@ impl<M> ActorRef<M> {
 }
 
 impl<M: Send + 'static> ActorRef<M> {
+    pub(crate) fn new(member: Arc<MemberCell>, mailbox: Arc<MailboxCell<M>>) -> Self {
+        Self {
+            member,
+            ingress: Ingress::Direct(mailbox),
+        }
+    }
+
+    fn start_send(&self, message: M, pinned: Option<Incarnation>) -> SendFuture<M> {
+        match &self.ingress {
+            Ingress::Direct(mailbox) => SendFuture::from_direct(DirectSend {
+                actor_id: self.id().clone(),
+                mailbox: Arc::clone(mailbox),
+                operation: SendOperation::new(message, pinned),
+                submitted: false,
+                done: false,
+            }),
+            Ingress::Mapped(ingress) => ingress.start_send(message, pinned),
+        }
+    }
+
+    fn try_send_with_pin(
+        &self,
+        message: M,
+        pinned: Option<Incarnation>,
+    ) -> Result<Incarnation, SendError<M>> {
+        match &self.ingress {
+            Ingress::Direct(mailbox) => mailbox.try_send(message, pinned),
+            Ingress::Mapped(ingress) => ingress.try_send(message, pinned),
+        }
+    }
+
+    fn binding_observation(&self) -> BindingObservation {
+        match &self.ingress {
+            Ingress::Direct(mailbox) => mailbox.binding_observation(),
+            Ingress::Mapped(ingress) => ingress.binding_observation(),
+        }
+    }
+
+    fn binding_watcher(&self) -> SignalWatcher {
+        match &self.ingress {
+            Ingress::Direct(mailbox) => mailbox.watcher(),
+            Ingress::Mapped(ingress) => ingress.watcher(),
+        }
+    }
+
     /// Sends with backpressure and transparently waits through rebind windows.
     pub fn send(&self, message: M) -> SendFuture<M> {
-        SendFuture::new(self.clone(), message)
+        self.start_send(message, None)
     }
 
     /// Attempts immediate acceptance without parking.
     pub fn try_send(&self, message: M) -> Result<Incarnation, SendError<M>> {
-        self.mailbox.try_send(message)
+        self.try_send_with_pin(message, None)
     }
 
     /// Sends within one acceptance budget, recovering an unaccepted message.
     pub fn send_timeout(&self, message: M, deadline: Duration) -> SendTimeout<M> {
         SendTimeout {
+            actor: self.clone(),
             send: Some(self.send(message)),
             deadline,
             timer: None,
@@ -1048,7 +1525,10 @@ impl<M: Send + 'static> ActorRef<M> {
     ) -> CallFuture<M, T> {
         CallFuture {
             actor: self.clone(),
+            pinned: None,
             make_msg: Some(Box::new(make_msg)),
+            prepared_message: None,
+            prepared_reply: None,
             deadline,
             timer: None,
             send: None,
@@ -1058,13 +1538,91 @@ impl<M: Send + 'static> ActorRef<M> {
             done: false,
         }
     }
+
+    /// Waits for an acceptance-open incarnation strictly newer than `after`.
+    pub fn next_incarnation(&self, after: Incarnation, deadline: Duration) -> NextIncarnation {
+        let actor = self.clone();
+        let mut watcher = actor.binding_watcher();
+        NextIncarnation {
+            inner: Box::pin(async move {
+                if deadline.is_zero() {
+                    return Err(NextIncarnationError::TimedOut);
+                }
+                let wait = async {
+                    loop {
+                        match actor.binding_observation() {
+                            BindingObservation::Accepting(current) if current.supersedes(after) => {
+                                return Ok(current);
+                            }
+                            BindingObservation::Terminal(last) => {
+                                return Err(NextIncarnationError::Terminated { last });
+                            }
+                            BindingObservation::Accepting(_) | BindingObservation::NotAccepting => {
+                                watcher.changed().await
+                            }
+                        }
+                    }
+                };
+                match crate::driver::select(wait, crate::driver::sleep(deadline)).await {
+                    crate::driver::Selected::First(result) => result,
+                    crate::driver::Selected::Second(()) => Err(NextIncarnationError::TimedOut),
+                }
+            }),
+        }
+    }
+
+    /// Repeats an explicitly idempotent call under one overall deadline.
+    ///
+    /// Only guaranteed-unaccepted attempts and reply loss followed by a
+    /// strictly newer accepting incarnation retry. A response timeout or
+    /// terminal membership returns immediately with attempt history.
+    pub fn call_idempotent<T: Send + 'static>(
+        &self,
+        make_msg: impl Fn(Reply<T>) -> M + Send + 'static,
+        policy: RetryPolicy,
+        overall_deadline: Duration,
+    ) -> IdempotentCallFuture<T> {
+        IdempotentCallFuture {
+            inner: Box::pin(run_idempotent_call(
+                self.clone(),
+                make_msg,
+                policy,
+                overall_deadline,
+            )),
+        }
+    }
+
+    /// Creates a ref that accepts an input type mapped into this actor's
+    /// message type on the sender's ingress path.
+    pub fn contramap<N: Send + 'static>(
+        &self,
+        wrap: impl Fn(N) -> M + Send + Sync + 'static,
+    ) -> ActorRef<N> {
+        let ingress: Arc<dyn ActorIngress<N>> = Arc::new(MappedIngress {
+            outer: self.clone(),
+            wrap: Arc::new(wrap),
+        });
+        ActorRef {
+            member: Arc::clone(&self.member),
+            ingress: Ingress::Mapped(ingress),
+        }
+    }
+
+    /// Pins this membership-addressed ref to one exact incarnation.
+    #[must_use]
+    pub fn pinned(&self, incarnation: Incarnation) -> PinnedRef<M> {
+        PinnedRef {
+            actor: self.clone(),
+            incarnation,
+        }
+    }
 }
 
 impl<M> Clone for ActorRef<M> {
     fn clone(&self) -> Self {
         Self {
             member: Arc::clone(&self.member),
-            mailbox: Arc::clone(&self.mailbox),
+            ingress: self.ingress.clone(),
         }
     }
 }
@@ -1092,27 +1650,318 @@ impl<M> Hash for ActorRef<M> {
     }
 }
 
+/// A cheap actor handle constrained to one exact incarnation.
+pub struct PinnedRef<M> {
+    actor: ActorRef<M>,
+    incarnation: Incarnation,
+}
+
+impl<M: Send + 'static> PinnedRef<M> {
+    /// Returns the actor's child id.
+    #[must_use]
+    pub fn id(&self) -> &ChildId {
+        self.actor.id()
+    }
+
+    /// Returns the actor membership identity.
+    #[must_use]
+    pub fn membership(&self) -> Membership {
+        self.actor.membership()
+    }
+
+    /// Returns the incarnation this ref is constrained to.
+    #[must_use]
+    pub fn incarnation(&self) -> Incarnation {
+        self.incarnation
+    }
+
+    /// Recovers the membership-addressed actor ref.
+    #[must_use]
+    pub fn unpinned(&self) -> ActorRef<M> {
+        self.actor.clone()
+    }
+
+    /// Sends with backpressure only while this incarnation remains current.
+    pub fn send(&self, message: M) -> SendFuture<M> {
+        self.actor.start_send(message, Some(self.incarnation))
+    }
+
+    /// Attempts immediate acceptance by this exact incarnation.
+    pub fn try_send(&self, message: M) -> Result<Incarnation, SendError<M>> {
+        self.actor
+            .try_send_with_pin(message, Some(self.incarnation))
+    }
+
+    /// Sends within one acceptance budget without riding through a rebind.
+    pub fn send_timeout(&self, message: M, deadline: Duration) -> SendTimeout<M> {
+        SendTimeout {
+            actor: self.actor.clone(),
+            send: Some(self.send(message)),
+            deadline,
+            timer: None,
+            started: false,
+            done: false,
+        }
+    }
+
+    /// Calls this exact incarnation within one acceptance-and-response budget.
+    pub fn call<T: Send + 'static>(
+        &self,
+        make_msg: impl FnOnce(Reply<T>) -> M + Send + 'static,
+        deadline: Duration,
+    ) -> CallFuture<M, T> {
+        CallFuture {
+            actor: self.actor.clone(),
+            pinned: Some(self.incarnation),
+            make_msg: Some(Box::new(make_msg)),
+            prepared_message: None,
+            prepared_reply: None,
+            deadline,
+            timer: None,
+            send: None,
+            reply: None,
+            accepted: None,
+            started: false,
+            done: false,
+        }
+    }
+}
+
+impl<M> Clone for PinnedRef<M> {
+    fn clone(&self) -> Self {
+        Self {
+            actor: self.actor.clone(),
+            incarnation: self.incarnation,
+        }
+    }
+}
+
+impl<M> fmt::Debug for PinnedRef<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PinnedRef")
+            .field("membership", &self.actor.membership())
+            .field("incarnation", &self.incarnation)
+            .finish()
+    }
+}
+
+/// Future returned by [`ActorRef::next_incarnation`].
+#[must_use]
+pub struct NextIncarnation {
+    inner:
+        Pin<Box<dyn Future<Output = Result<Incarnation, NextIncarnationError>> + Send + 'static>>,
+}
+
+impl fmt::Debug for NextIncarnation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NextIncarnation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Future for NextIncarnation {
+    type Output = Result<Incarnation, NextIncarnationError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner.as_mut().poll(context)
+    }
+}
+
+/// Future returned by [`ActorRef::call_idempotent`].
+#[must_use]
+pub struct IdempotentCallFuture<T> {
+    inner: Pin<Box<dyn Future<Output = Result<Replied<T>, IdempotentCallError>> + Send + 'static>>,
+}
+
+impl<T> fmt::Debug for IdempotentCallFuture<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IdempotentCallFuture")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> Future for IdempotentCallFuture<T> {
+    type Output = Result<Replied<T>, IdempotentCallError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner.as_mut().poll(context)
+    }
+}
+
+async fn run_idempotent_call<M, T, F>(
+    actor: ActorRef<M>,
+    make_msg: F,
+    policy: RetryPolicy,
+    overall_deadline: Duration,
+) -> Result<Replied<T>, IdempotentCallError>
+where
+    M: Send + 'static,
+    T: Send + 'static,
+    F: Fn(Reply<T>) -> M + Send + 'static,
+{
+    let started = crate::driver::now();
+    let mut attempts = Vec::new();
+    let mut retry_number = 0u64;
+
+    loop {
+        let remaining = overall_remaining(started, overall_deadline);
+        if remaining.is_zero() {
+            return Err(IdempotentCallError {
+                attempts,
+                kind: IdempotentCallErrorKind::BudgetExhausted,
+            });
+        }
+        let slice = policy.per_attempt.min(remaining);
+        let (reply, mut receiver) = Reply::channel();
+        let message = make_msg(reply);
+        let reply = receiver
+            .shared
+            .take()
+            .expect("a fresh reply receiver owns its shared state");
+        let result = CallFuture::prepared(actor.clone(), message, reply, slice).await;
+        match result {
+            Ok(replied) => return Ok(replied),
+            Err(error) => match error.kind {
+                CallErrorKind::AcceptanceTimedOut => {
+                    attempts.push(Attempt {
+                        incarnation: error.incarnation_observed,
+                        ended: AttemptEnd::AcceptanceTimedOut,
+                    });
+                }
+                CallErrorKind::ReplyDropped => {
+                    let accepting = error
+                        .incarnation_observed
+                        .expect("reply loss carries the accepting incarnation");
+                    attempts.push(Attempt {
+                        incarnation: Some(accepting),
+                        ended: AttemptEnd::ReplyDropped,
+                    });
+                    let remaining = overall_remaining(started, overall_deadline);
+                    if remaining.is_zero() {
+                        return Err(IdempotentCallError {
+                            attempts,
+                            kind: IdempotentCallErrorKind::BudgetExhausted,
+                        });
+                    }
+                    match actor.next_incarnation(accepting, remaining).await {
+                        Ok(_) => {}
+                        Err(NextIncarnationError::TimedOut) => {
+                            return Err(IdempotentCallError {
+                                attempts,
+                                kind: IdempotentCallErrorKind::BudgetExhausted,
+                            });
+                        }
+                        Err(NextIncarnationError::Terminated { .. }) => {
+                            return Err(IdempotentCallError {
+                                attempts,
+                                kind: IdempotentCallErrorKind::Terminated,
+                            });
+                        }
+                    }
+                }
+                CallErrorKind::ResponseTimedOut => {
+                    attempts.push(Attempt {
+                        incarnation: error.incarnation_observed,
+                        ended: AttemptEnd::ResponseTimedOut,
+                    });
+                    return Err(IdempotentCallError {
+                        attempts,
+                        kind: IdempotentCallErrorKind::ResponseTimedOut,
+                    });
+                }
+                CallErrorKind::Terminated => {
+                    attempts.push(Attempt {
+                        incarnation: error.incarnation_observed,
+                        ended: AttemptEnd::Terminated,
+                    });
+                    return Err(IdempotentCallError {
+                        attempts,
+                        kind: IdempotentCallErrorKind::Terminated,
+                    });
+                }
+                CallErrorKind::Superseded { .. } => {
+                    unreachable!("membership-addressed idempotent calls are never pinned")
+                }
+            },
+        }
+
+        retry_number = retry_number.saturating_add(1);
+        let delay = policy
+            .backoff
+            .next_delay(retry_number, crate::driver::jitter_sample());
+        let remaining = overall_remaining(started, overall_deadline);
+        if remaining.is_zero() {
+            return Err(IdempotentCallError {
+                attempts,
+                kind: IdempotentCallErrorKind::BudgetExhausted,
+            });
+        }
+        if !delay.is_zero() {
+            crate::driver::sleep(delay.min(remaining)).await;
+            if delay >= remaining {
+                return Err(IdempotentCallError {
+                    attempts,
+                    kind: IdempotentCallErrorKind::BudgetExhausted,
+                });
+            }
+        }
+    }
+}
+
+fn overall_remaining(started: std::time::Instant, overall: Duration) -> Duration {
+    overall.saturating_sub(crate::driver::now().saturating_duration_since(started))
+}
+
 /// Cancellation-safe future returned by [`ActorRef::send`].
 #[must_use]
 pub struct SendFuture<M> {
-    actor: ActorRef<M>,
-    operation: Arc<SendOperation<M>>,
-    submitted: bool,
+    inner: SendFutureInner<M>,
     done: bool,
 }
 
-impl<M: Send + 'static> SendFuture<M> {
-    fn new(actor: ActorRef<M>, message: M) -> Self {
+enum SendFutureInner<M> {
+    Direct(DirectSend<M>),
+    Mapped(Pin<Box<dyn SendDriver<M>>>),
+}
+
+impl<M> SendFuture<M> {
+    fn from_direct(driver: DirectSend<M>) -> Self {
         Self {
-            actor,
-            operation: SendOperation::new(message),
-            submitted: false,
+            inner: SendFutureInner::Direct(driver),
+            done: false,
+        }
+    }
+
+    fn from_driver(driver: impl SendDriver<M> + 'static) -> Self {
+        Self {
+            inner: SendFutureInner::Mapped(Box::pin(driver)),
             done: false,
         }
     }
 
     fn withdraw(&mut self) -> Withdrawal<M> {
-        let result = self.actor.mailbox.withdraw(&self.operation);
+        self.done = true;
+        match &mut self.inner {
+            SendFutureInner::Direct(driver) => driver.withdraw_inner(),
+            SendFutureInner::Mapped(driver) => driver.as_mut().get_mut().withdraw(),
+        }
+    }
+}
+
+struct DirectSend<M> {
+    actor_id: ChildId,
+    mailbox: Arc<MailboxCell<M>>,
+    operation: Arc<SendOperation<M>>,
+    submitted: bool,
+    done: bool,
+}
+
+impl<M> DirectSend<M> {
+    fn withdraw_inner(&mut self) -> Withdrawal<M> {
+        let result = self.mailbox.withdraw(&self.operation);
         self.done = true;
         result
     }
@@ -1122,7 +1971,6 @@ impl<M> fmt::Debug for SendFuture<M> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SendFuture")
-            .field("submitted", &self.submitted)
             .field("done", &self.done)
             .finish_non_exhaustive()
     }
@@ -1132,9 +1980,25 @@ impl<M: Send + 'static> Future for SendFuture<M> {
     type Output = Result<Incarnation, SendError<M>>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = match &mut self.inner {
+            SendFutureInner::Direct(driver) => Pin::new(driver).poll_send(context),
+            SendFutureInner::Mapped(driver) => driver.as_mut().poll_send(context),
+        };
+        if result.is_ready() {
+            self.done = true;
+        }
+        result
+    }
+}
+
+impl<M: Send + 'static> SendDriver<M> for DirectSend<M> {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<Incarnation, SendError<M>>> {
         if !self.submitted {
             self.submitted = true;
-            self.actor.mailbox.submit(&self.operation);
+            self.mailbox.submit(&self.operation);
         }
         let mut state = self
             .operation
@@ -1148,17 +2012,18 @@ impl<M: Send + 'static> Future for SendFuture<M> {
                 self.done = true;
                 Poll::Ready(Ok(incarnation))
             }
-            OperationOutcome::Terminated {
-                message,
-                final_incarnation,
+            OperationOutcome::Failed {
+                payload,
+                observed,
+                kind,
             } => {
                 let error = SendError {
-                    actor_id: self.actor.id().clone(),
-                    incarnation_observed: *final_incarnation,
-                    message: message
+                    actor_id: self.actor_id.clone(),
+                    incarnation_observed: *observed,
+                    payload: payload
                         .take()
-                        .expect("a terminal operation retains its message until observed"),
-                    kind: SendErrorKind::Terminated,
+                        .expect("a failed operation retains its payload until observed"),
+                    kind: *kind,
                 };
                 drop(state);
                 self.done = true;
@@ -1171,12 +2036,51 @@ impl<M: Send + 'static> Future for SendFuture<M> {
             OperationOutcome::Withdrawn => panic!("a withdrawn send future was polled"),
         }
     }
+
+    fn withdraw(&mut self) -> Withdrawal<M> {
+        self.withdraw_inner()
+    }
 }
 
 impl<M> Drop for SendFuture<M> {
     fn drop(&mut self) {
         if !self.done {
-            let _ = self.actor.mailbox.withdraw(&self.operation);
+            let _ = match &mut self.inner {
+                SendFutureInner::Direct(driver) => driver.withdraw_inner(),
+                SendFutureInner::Mapped(driver) => driver.as_mut().get_mut().withdraw(),
+            };
+        }
+    }
+}
+
+struct ProjectedSend<N, M> {
+    outer: SendFuture<M>,
+    marker: std::marker::PhantomData<fn(N)>,
+}
+
+impl<N: Send + 'static, M: Send + 'static> SendDriver<N> for ProjectedSend<N, M> {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<Incarnation, SendError<N>>> {
+        match Pin::new(&mut self.outer).poll(context) {
+            Poll::Ready(result) => Poll::Ready(result.map_err(project_send_error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn withdraw(&mut self) -> Withdrawal<N> {
+        match self.outer.withdraw() {
+            Withdrawal::Withdrawn { observed, .. } => Withdrawal::Withdrawn {
+                payload: SendPayload::Projected,
+                observed,
+            },
+            Withdrawal::Accepted(incarnation) => Withdrawal::Accepted(incarnation),
+            Withdrawal::Failed { observed, kind, .. } => Withdrawal::Failed {
+                payload: SendPayload::Projected,
+                observed,
+                kind,
+            },
         }
     }
 }
@@ -1184,6 +2088,7 @@ impl<M> Drop for SendFuture<M> {
 /// Cancellation-safe future returned by [`ActorRef::send_timeout`].
 #[must_use]
 pub struct SendTimeout<M> {
+    actor: ActorRef<M>,
     send: Option<SendFuture<M>>,
     deadline: Duration,
     timer: Option<crate::driver::DriverSleep>,
@@ -1208,33 +2113,24 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
         if !self.started {
             self.started = true;
             if self.deadline.is_zero() {
-                let actor_id = self
-                    .send
-                    .as_ref()
-                    .expect("pending timed send retains send")
-                    .actor
-                    .id()
-                    .clone();
-                let current = self
-                    .send
-                    .as_ref()
-                    .expect("pending timed send retains send")
-                    .actor
-                    .mailbox
-                    .current_observation();
+                let actor_id = self.actor.id().clone();
+                let current = match self.actor.binding_observation() {
+                    BindingObservation::Accepting(incarnation) => Some(incarnation),
+                    BindingObservation::NotAccepting | BindingObservation::Terminal(_) => None,
+                };
                 let withdrawal = self
                     .send
                     .as_mut()
                     .expect("pending timed send retains send")
                     .withdraw();
-                let Withdrawal::Withdrawn { message, observed } = withdrawal else {
+                let Withdrawal::Withdrawn { payload, observed } = withdrawal else {
                     unreachable!("an unpolled send cannot already be accepted")
                 };
                 self.done = true;
                 return Poll::Ready(Err(SendError {
                     actor_id,
                     incarnation_observed: observed.or(current),
-                    message,
+                    payload,
                     kind: SendErrorKind::TimedOut,
                 }));
             }
@@ -1253,15 +2149,15 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
             .poll(context)
             .is_ready()
         {
+            let actor_id = self.actor.id().clone();
             let send = self.send.as_mut().expect("pending timed send retains send");
-            let actor_id = send.actor.id().clone();
             match send.withdraw() {
-                Withdrawal::Withdrawn { message, observed } => {
+                Withdrawal::Withdrawn { payload, observed } => {
                     self.done = true;
                     Poll::Ready(Err(SendError {
                         actor_id,
                         incarnation_observed: observed,
-                        message,
+                        payload,
                         kind: SendErrorKind::TimedOut,
                     }))
                 }
@@ -1269,13 +2165,17 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
                     self.done = true;
                     Poll::Ready(Ok(incarnation))
                 }
-                Withdrawal::Terminated { message, observed } => {
+                Withdrawal::Failed {
+                    payload,
+                    observed,
+                    kind,
+                } => {
                     self.done = true;
                     Poll::Ready(Err(SendError {
                         actor_id,
                         incarnation_observed: observed,
-                        message,
-                        kind: SendErrorKind::Terminated,
+                        payload,
+                        kind,
                     }))
                 }
             }
@@ -1289,7 +2189,10 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
 #[must_use]
 pub struct CallFuture<M, T> {
     actor: ActorRef<M>,
+    pinned: Option<Incarnation>,
     make_msg: Option<Box<dyn FnOnce(Reply<T>) -> M + Send + 'static>>,
+    prepared_message: Option<M>,
+    prepared_reply: Option<Arc<ReplyShared<T>>>,
     deadline: Duration,
     timer: Option<crate::driver::DriverSleep>,
     send: Option<SendFuture<M>>,
@@ -1297,6 +2200,32 @@ pub struct CallFuture<M, T> {
     accepted: Option<Incarnation>,
     started: bool,
     done: bool,
+}
+
+impl<M, T> Unpin for CallFuture<M, T> {}
+
+impl<M: Send + 'static, T: Send + 'static> CallFuture<M, T> {
+    fn prepared(
+        actor: ActorRef<M>,
+        message: M,
+        reply: Arc<ReplyShared<T>>,
+        deadline: Duration,
+    ) -> Self {
+        Self {
+            actor,
+            pinned: None,
+            make_msg: None,
+            prepared_message: Some(message),
+            prepared_reply: Some(reply),
+            deadline,
+            timer: None,
+            send: None,
+            reply: None,
+            accepted: None,
+            started: false,
+            done: false,
+        }
+    }
 }
 
 impl<M, T> fmt::Debug for CallFuture<M, T> {
@@ -1320,17 +2249,28 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
                 self.done = true;
                 return Poll::Ready(Err(CallError {
                     actor_id: self.actor.id().clone(),
-                    incarnation_observed: self.actor.mailbox.current_observation(),
+                    incarnation_observed: match self.actor.binding_observation() {
+                        BindingObservation::Accepting(incarnation) => Some(incarnation),
+                        BindingObservation::NotAccepting | BindingObservation::Terminal(_) => None,
+                    },
                     kind: CallErrorKind::AcceptanceTimedOut,
                 }));
             }
-            let (reply, mut receiver) = Reply::channel();
-            let message =
-                self.make_msg
+            let message = if let Some(message) = self.prepared_message.take() {
+                self.reply = self.prepared_reply.take();
+                message
+            } else {
+                let (reply, mut receiver) = Reply::channel();
+                let message = self
+                    .make_msg
                     .take()
-                    .expect("unstarted call retains its message constructor")(reply);
-            self.reply = receiver.shared.take();
-            self.send = Some(self.actor.send(message));
+                    .expect("unstarted call retains its message constructor")(
+                    reply
+                );
+                self.reply = receiver.shared.take();
+                message
+            };
+            self.send = Some(self.actor.start_send(message, self.pinned));
             self.timer = Some(crate::driver::sleep(self.deadline));
         }
 
@@ -1352,7 +2292,11 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
                     return Poll::Ready(Err(CallError {
                         actor_id: error.actor_id,
                         incarnation_observed: error.incarnation_observed,
-                        kind: CallErrorKind::Terminated,
+                        kind: call_error_kind_from_send(
+                            error.kind,
+                            self.pinned,
+                            error.incarnation_observed,
+                        ),
                     }));
                 }
                 Poll::Pending => {}
@@ -1465,10 +2409,10 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
                         kind: CallErrorKind::ResponseTimedOut,
                     }
                 }
-                Withdrawal::Terminated { observed, .. } => CallError {
+                Withdrawal::Failed { observed, kind, .. } => CallError {
                     actor_id,
                     incarnation_observed: observed,
-                    kind: CallErrorKind::Terminated,
+                    kind: call_error_kind_from_send(kind, self.pinned, observed),
                 },
             };
             if let Some(reply) = &self.reply {

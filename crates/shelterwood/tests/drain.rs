@@ -55,12 +55,15 @@ impl Actor for DrainActor {
                     let continuation = context
                         .continue_with(Message::Deferred)
                         .expect_err("drain rejects continuations");
-                    assert!(matches!(continuation.into_inner(), Message::Deferred));
+                    assert!(matches!(
+                        continuation.into_payload(),
+                        Some(Message::Deferred)
+                    ));
 
                     let timer = context
                         .set_timeout("timer", Message::Timer, Duration::ZERO)
                         .expect_err("drain rejects timers");
-                    assert!(matches!(timer.into_inner().1, Message::Timer));
+                    assert!(matches!(timer.into_payload(), Some((_, Message::Timer))));
 
                     let ran = Arc::clone(&self.0.deferred_ran);
                     let offload = context

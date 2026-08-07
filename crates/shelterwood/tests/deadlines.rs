@@ -174,7 +174,10 @@ async fn zero_deadlines_short_circuit_without_acceptance_or_message_construction
             || calls.load(Ordering::SeqCst) != 0
     })
     .await;
-    assert!(matches!(timed.message, Message::Value(2)));
+    let timed_message = timed
+        .into_message()
+        .expect("unmapped timed send recovers message");
+    assert!(matches!(timed_message, Message::Value(2)));
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -219,7 +222,11 @@ async fn preacceptance_expiry_and_terminality_follow_the_identity_table() {
 
     drop(tree);
     let terminal_send = actor
-        .send(timed.message)
+        .send(
+            timed
+                .into_message()
+                .expect("unmapped send recovers message"),
+        )
         .await
         .expect_err("never-started actor is terminal");
     assert_eq!(terminal_send.kind, SendErrorKind::Terminated);

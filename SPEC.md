@@ -2505,7 +2505,7 @@ the status line in each section is the detailed authority.
 
 | Section | M6 status | Implementation boundary |
 |---|---|---|
-| §15 incarnation refinements | **Accepted / Evidence-gated (M7)** | pinning and next-incarnation wait are accepted; the bounded idempotent-call helper is decided by its M7 re-port |
+| §15 incarnation refinements | **Accepted (M7)** | pinning, next-incarnation wait, and the bounded idempotent-call helper are implemented; the helper's shard-store gate verdict is **build** |
 | §16 keyed conflation | **Accepted (M8)** | keyed latest-wins only; a priority/control lane is evidence-gated to M12 |
 | §17 message mapping | **Accepted (M7) / Evidence-gated** | `contramap` is accepted; `project` waits for the durability consumer |
 | §18 peer monitoring | **Accepted (M8)** | actor, task, and scope memberships through a separate event source |
@@ -2515,14 +2515,24 @@ the status line in each section is the detailed authority.
 | §22 hosting | **Accepted (M11)** | one non-restarting incarnation behind the shared runner |
 | §23 lifetime and timing | **Accepted (M11)** | cross-actor timers, all-of completion, and sibling readiness |
 
+**Evidence-gate ledger.** A verdict changes only when the named artifact is
+ported, and the implementation plus this row change together.
+
+| Gate | Deciding artifact | Verdict |
+|---|---|---|
+| §15 `call_idempotent` | repaired shard-store retry loop re-ported onto the candidate API in M7 | **build** — the synchronous constructor closure carries the operation ledger id without friction; response timeout remains an external reconciliation arm |
+| §17 `project` | provenance-sensitive durability prototype | open; no consumer has yet demonstrated the provenance wall |
+| §16 control/priority lane | M12 trading-engine urgent-control-under-flood port | open |
+
 ## 15. Incarnation refinements
 
-**Status: Accepted / Evidence-gated (M7).** Pinning and the
-next-incarnation awaitable are accepted. The repaired shard-store artifact
-(Appendix C) exercises every retry transition and validates the candidate
-`call_idempotent` shape; M7 decides build-or-omit by re-porting that artifact
-onto the candidate API. No general retry helper and no automatic
-reconciliation are implied.
+**Status: Accepted (M7); `call_idempotent` gate verdict: build.** Pinning and
+the next-incarnation awaitable are implemented. The repaired shard-store
+artifact (Appendix C) was re-ported onto the candidate `call_idempotent` API:
+its synchronous constructor closure carries the durable operation id without
+friction, every retry transition remains observable, and response timeout
+still exits to application reconciliation. No general retry helper and no
+automatic reconciliation are implied.
 
 Core already mints `Incarnation` tokens and carries them in events, errors,
 and snapshots (§3.3) — that was the retrofit-hostile half. This adds the
@@ -2622,12 +2632,15 @@ types verbatim; only the additional B.3 `Superseded` outcome varies.
     an explicit capability proof. Nothing buffers, nothing persists, and
     each individual send remains at-most-once (§1 principle 6); it is not
     durable or at-least-once delivery.
-  - The repaired shard-store loop is the M6 API artifact: one overall
-    `Instant` budget, clamped attempt slices, a provoked restart for
-    `ReplyDropped`, and an accepted request parked past its response slice.
-    Its response-timeout arm consults the durable journal and never resends;
-    a handler-entry counter plus an immediate empty-one-slot mailbox probe
-    proves exactly one acceptance in that arm without adding §20 feature code.
+  - The repaired shard-store loop was the M6 API artifact and its M7 re-port
+    is the adoption verdict: `call_idempotent` now owns the one overall budget,
+    clamped attempt slices, and superseding-incarnation wait. A provoked
+    restart proves `ReplyDropped` retries only on the successor; an accepted
+    request parked past its response slice returns the terminal attempt
+    history to the artifact, whose response-timeout arm consults the durable
+    journal and never resends. A handler-entry counter plus an immediate
+    empty-one-slot mailbox probe proves exactly one acceptance in that arm
+    without adding §20 feature code. **Verdict: build.**
   - Conformance tests (with this feature): a call failing only with
     `ResponseTimedOut` produces exactly one send attempt — the helper
     never resends after acceptance; and a `ReplyDropped` retry lands only
@@ -3953,11 +3966,13 @@ conflation, outlines, metrics) and port in full alongside it.
    mount → readiness → directory cutover → exact-handle retire, with
    idempotent operation ids, compensating cleanup, a durable abort path,
    and post-commit reconciliation. Fault injection covers pre-commit crash
-   and post-commit reply loss. The M6 repair additionally hand-rolls §15's
-   retry table with one overall `Instant` budget and clamped attempt slices:
+   and post-commit reply loss. The M6 repair first hand-rolled §15's retry
+   table; M7 re-ports that loop onto `call_idempotent`, whose policy carries
+   the clamped attempt slice under one overall budget:
    `AcceptanceTimedOut` retries, `ReplyDropped` first observes a strictly
-   superseding live incarnation, and `ResponseTimedOut` reconciles the durable
-   journal without resending. Deterministic gates provoke the restart and park
+   superseding live incarnation, and terminal `ResponseTimedOut` returns to
+   the artifact, which reconciles the durable journal without resending.
+   Deterministic gates provoke the restart and park
    an accepted handler beyond its response slice; a handler-entry counter plus
    an immediate empty-one-slot mailbox probe proves that response timeout
    produced exactly one acceptance. The script proves

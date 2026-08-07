@@ -15,7 +15,8 @@ use std::{
 
 use crate::{
     ActorRef, CancellationToken, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown,
-    PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef, Shutdown,
+    PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef, SendPayload,
+    Shutdown,
     driver::{ActorWork, Latch, Signal, SignalWatcher},
     mailbox::{MailboxCell, MailboxControl, MailboxReceiver},
     policy::CommonOptions,
@@ -30,10 +31,21 @@ type SharedWork = Arc<Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send + 'sta
 #[error("the offload deadline elapsed")]
 pub struct DeadlineElapsed;
 
-/// An operation rejected because the actor incarnation is already stopping.
+/// The kind of a rejected actor-context operation.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum RejectedKind {
+    /// The actor incarnation is already draining or stopping.
+    Draining,
+}
+
+/// An operation rejected by the actor's current callback stage.
 #[derive(Eq, PartialEq)]
 pub struct Rejected<T> {
-    payload: T,
+    /// Disposition of the rejected operation payload.
+    pub payload: SendPayload<T>,
+    /// Rejection category.
+    pub kind: RejectedKind,
 }
 
 impl<T> fmt::Debug for Rejected<T> {
@@ -44,13 +56,19 @@ impl<T> fmt::Debug for Rejected<T> {
 
 impl<T> Rejected<T> {
     pub(crate) fn new(payload: T) -> Self {
-        Self { payload }
+        Self {
+            payload: SendPayload::Recovered(payload),
+            kind: RejectedKind::Draining,
+        }
     }
 
     /// Recovers the operation payload that was never accepted.
     #[must_use]
-    pub fn into_inner(self) -> T {
-        self.payload
+    pub fn into_payload(self) -> Option<T> {
+        match self.payload {
+            SendPayload::Recovered(payload) => Some(payload),
+            SendPayload::Projected => None,
+        }
     }
 }
 

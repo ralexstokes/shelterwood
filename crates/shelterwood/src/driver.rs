@@ -59,6 +59,10 @@ pub(crate) fn now() -> Instant {
     runtime::now()
 }
 
+pub(crate) fn jitter_sample() -> f64 {
+    runtime::jitter_sample()
+}
+
 pub(crate) struct ActorWork {
     handle: Option<runtime::JoinHandle<(), ()>>,
     abort: runtime::AbortHandle,

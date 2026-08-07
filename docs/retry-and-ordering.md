@@ -29,11 +29,40 @@ For a safe `ReplyDropped` retry in the core API:
 5. Bound the retry horizon and garbage-collect the application's idempotency
    ledger only after a retry is no longer possible.
 
+`ActorRef::call_idempotent` packages the mechanical parts of that loop. The
+caller supplies a re-mintable `Fn(Reply<T>) -> M`, a non-zero per-attempt
+slice plus `Backoff`, and one overall deadline. `AcceptanceTimedOut` retries
+within the remaining budget; `ReplyDropped` waits for a strictly superseding
+acceptance-open incarnation before retrying. `ResponseTimedOut` and terminal
+membership return immediately with the attempt history and offer no retry
+continuation.
+
+The name is an assertion by the caller: a repeatable constructor proves only
+that a message can be rebuilt, not that repeating its effect is safe. Durable
+reconciliation after `ResponseTimedOut` and a bounded or garbage-collected
+application idempotency ledger remain application obligations. The helper
+does not make delivery durable or at-least-once; it repeats individual
+at-most-once sends under an explicit idempotency claim.
+
 `ResponseTimedOut` deliberately has no equivalent retry recipe. Acceptance
 happened, so only application ground truth can distinguish “not applied,”
 “applied without a reply,” and “still running.” Reconcile first. The shard-store
 acceptance test demonstrates both the post-commit reconciliation case and the
 idempotent `ReplyDropped` loop.
+
+Incarnation-pinned refs are the deliberate exception to membership routing.
+`ActorRef::pinned(incarnation)` accepts only through that exact incarnation;
+it never rides a rebind window. Use `next_incarnation(after, deadline)` when a
+protocol explicitly needs the next acceptance-open incarnation, and keep an
+ordinary `ActorRef` when restart transparency is the desired default.
+
+`contramap` applies its injection eagerly on the sender's ingress path. The
+closure can run concurrently on sender threads and must be cheap and
+non-blocking. A mapped ref shares the outer actor's id, membership, mailbox,
+backpressure, conflation, lifecycle, and statistics. Because eager mapping
+consumes the mapped value, its send failures carry `SendPayload::Projected`;
+ordinary refs continue to return `SendPayload::Recovered` and
+`SendError::into_message()` returns the original value.
 
 Membership and incarnation answer different questions. An `ActorRef` follows
 restarts of one membership. After remove and re-add under the same child id,

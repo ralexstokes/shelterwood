@@ -132,7 +132,10 @@ async fn queue_backpressure_and_send_error_identity_are_exact() {
     assert_eq!(full.incarnation_observed, Some(accepting));
 
     let waiting_actor = actor.clone();
-    let waiting = tokio::spawn(async move { waiting_actor.send(full.message).await });
+    let waiting_message = full
+        .into_message()
+        .expect("unmapped error recovers message");
+    let waiting = tokio::spawn(async move { waiting_actor.send(waiting_message).await });
     for _ in 0..4 {
         tokio::task::yield_now().await;
     }
@@ -251,7 +254,11 @@ async fn timed_send_withdraws_and_recovers_the_message() {
         .await
     );
     actor
-        .send(error.message)
+        .send(
+            error
+                .into_message()
+                .expect("unmapped error recovers message"),
+        )
         .await
         .expect("recovered message is safe to resend");
     assert!(

@@ -26,8 +26,10 @@ pub use exit::{
 };
 pub use identity::{Incarnation, Membership};
 pub use mailbox::{
-    ActorRef, CallError, CallErrorKind, CallFuture, Replied, Reply, ReplyError, ReplyReceive,
-    ReplyReceiver, SendError, SendErrorKind, SendFuture, SendTimeout,
+    ActorRef, Attempt, AttemptEnd, CallError, CallErrorKind, CallFuture, IdempotentCallError,
+    IdempotentCallErrorKind, IdempotentCallFuture, NextIncarnation, NextIncarnationError,
+    PinnedRef, Replied, Reply, ReplyError, ReplyReceive, ReplyReceiver, RetryPolicy, SendError,
+    SendErrorKind, SendFuture, SendPayload, SendTimeout,
 };
 pub use observe::{
     ChildSnapshot, ChildState, LIFECYCLE_EVENT_CAPACITY, LifecycleEvent, LifecycleEventKind,
@@ -41,6 +43,7 @@ pub use policy::{
 };
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,
+    RejectedKind,
 };
 pub use task::{CancellationToken, OneShotTaskRef, TaskContext, TaskDef, TaskOnceDef, TaskRef};
 pub use tree::{

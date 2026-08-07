@@ -1439,9 +1439,7 @@ pub(crate) fn cancel_dynamic_reservation(control: &Arc<DynamicControl>, slot: &A
     let cancelled = state.entries.get(&id).is_some_and(|entry| {
         entry.slot.member.membership() == slot.member.membership() && !entry.admitted
     });
-    if cancelled {
-        state.entries.remove(&id);
-    }
+    let removed = cancelled.then(|| state.entries.remove(&id)).flatten();
     drop(state);
     if cancelled {
         drop(slot.take_defined());
@@ -1450,6 +1448,9 @@ pub(crate) fn cancel_dynamic_reservation(control: &Arc<DynamicControl>, slot: &A
             scope.terminalize_never_started();
         }
     }
+    // The entry's drop completes its removal response; it must follow the
+    // member's terminal publication.
+    drop(removed);
 }
 
 pub(crate) fn signal_fused_cancel(control: &Arc<DynamicControl>, latch: &Latch) {
@@ -1493,9 +1494,12 @@ pub(crate) fn remove_dynamic(
     }
     if matches!(entry.slot.member.record().stage, MemberStage::Terminal(_)) {
         let member = Arc::clone(&entry.slot.member);
-        state.entries.remove(id);
+        let entry = state.entries.remove(id).expect("entry was just resolved");
         drop(state);
         scope.prune_child(&member);
+        // The entry's drop completes the removal response; it must follow
+        // the Removed edge so a woken remover never sees the child resident.
+        drop(entry);
         return response;
     }
     let member = Arc::clone(&entry.slot.member);
@@ -2937,16 +2941,21 @@ impl ScopeRuntime {
 
     fn prune_terminal(&mut self, index: usize) {
         let child = &self.children[index];
+        let mut removed = None;
         if let Some(control) = &self.dynamic {
             let id = child.slot.member.id().clone();
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
             if state.entries.get(&id).is_some_and(|entry| {
                 entry.slot.member.membership() == child.slot.member.membership()
             }) {
-                state.entries.remove(&id);
+                removed = state.entries.remove(&id);
             }
         }
         self.root.prune_child(&child.slot.member);
+        // The entry's drop completes any in-flight removal response; it must
+        // follow the Removed edge so a woken remover never sees the child
+        // resident.
+        drop(removed);
     }
 }
 

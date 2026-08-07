@@ -27,6 +27,14 @@ impl Drop for DropProbe {
     }
 }
 
+struct DropSignal(ReleaseGate);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 struct GatedDynamicActor;
 
 impl Actor for GatedDynamicActor {
@@ -1096,6 +1104,7 @@ async fn removal_of_a_polled_split_definition_keeps_the_scope_admitting() {
 async fn ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal() {
     let worker_started = ReleaseGate::default();
     let worker_cancelled = ReleaseGate::default();
+    let queued_disposed = ReleaseGate::default();
     let mut nested = DynamicTree::new();
     let worker = nested
         .add_task(
@@ -1139,10 +1148,18 @@ async fn ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal()
 
     let slot = nested.reserve_task("queued").expect("reservation succeeds");
     let queued = slot.task_ref();
-    let mut admission =
-        Box::pin(slot.define(
-            TaskDef::new(|_| std::future::pending::<ExitResult>()).shutdown(Shutdown::Abort),
-        ));
+    let mut admission = Box::pin(
+        slot.define(
+            TaskDef::new({
+                let drop_signal = DropSignal(queued_disposed.clone());
+                move |_| {
+                    let _ = &drop_signal;
+                    std::future::pending::<ExitResult>()
+                }
+            })
+            .shutdown(Shutdown::Abort),
+        ),
+    );
     assert!(
         poll_once(admission.as_mut()).is_pending(),
         "first poll owns a queued admission request before yielding"
@@ -1165,6 +1182,7 @@ async fn ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal()
     shutdown
         .await
         .expect("the aborting subtree recursively joins its descendants");
+    queued_disposed.wait().await;
     assert_eq!(removal.await, RemoveOutcome::Removed);
     assert!(matches!(
         worker.wait().await.kind(),

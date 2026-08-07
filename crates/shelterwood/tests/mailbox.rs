@@ -225,15 +225,10 @@ async fn timed_send_withdraws_and_recovers_the_message() {
     let accepting = actor.try_send(Message::Value(1)).expect("queue fills");
 
     let width = Duration::from_secs(10);
-    let timed_actor = actor.clone();
-    let timed =
-        tokio::spawn(async move { timed_actor.send_timeout(Message::Value(2), width).await });
-    tokio::task::yield_now().await;
+    let mut timed = Box::pin(actor.send_timeout(Message::Value(2), width));
+    assert!(poll_once(timed.as_mut()).is_pending());
     advance_time(width).await;
-    let error = timed
-        .await
-        .expect("timed send task joins")
-        .expect_err("send withdraws");
+    let error = timed.await.expect_err("send withdraws");
     assert_eq!(error.kind, SendErrorKind::TimedOut);
     assert_eq!(error.incarnation_observed, Some(accepting));
 

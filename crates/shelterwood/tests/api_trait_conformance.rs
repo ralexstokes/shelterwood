@@ -3,11 +3,11 @@ use std::{cell::Cell, error::Error, hash::Hash, time::Duration};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ActorSlot, Admission, Blocking, CallError, CallFuture,
     CancellationToken, Context, DeadlineElapsed, DynamicActorSlot, DynamicScopeRef,
-    DynamicSubtreeSlot, DynamicTaskSlot, ExitError, ExitResult, Guard, Handler, Incarnation,
-    LifecycleEvents, LifecycleTryRecvError, Membership, OneShotTaskRef, RawActor, RawContext,
-    RawDef, RawOnceDef, Removal, Reply, ReplyReceive, ReplyReceiver, ScopeRef, SendError,
-    SendFuture, SendTimeout, SnapshotClosed, SnapshotReceiver, SubtreeDef, SubtreeOnceDef,
-    SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, Tree, WaitError,
+    DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError, ExitResult, Guard, Handler,
+    Incarnation, LifecycleEvents, LifecycleTryRecvError, Membership, OneShotTaskRef, RawActor,
+    RawContext, RawDef, RawOnceDef, Removal, Reply, ReplyReceive, ReplyReceiver, ScopeRef,
+    SendError, SendFuture, SendTimeout, SnapshotClosed, SnapshotReceiver, SubtreeDef,
+    SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, Tree, WaitError,
 };
 
 fn assert_error<T: Error>() {}
@@ -35,12 +35,15 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     // These owned, at-most-once values promise Send. Deliberately do not
     // turn their current implementation's incidental Sync-ness into API.
     assert_send_type::<System<ScopeRef>>();
+    assert_send_type::<System<DynamicScopeRef>>();
     assert_send_type::<ActorSlot<Cell<()>>>();
     assert_send_type::<DynamicActorSlot<Cell<()>>>();
     assert_send_type::<TaskSlot>();
     assert_send_type::<DynamicTaskSlot>();
     assert_send_type::<SubtreeSlot<Tree>>();
+    assert_send_type::<SubtreeSlot<DynamicTree>>();
     assert_send_type::<DynamicSubtreeSlot<Tree>>();
+    assert_send_type::<DynamicSubtreeSlot<DynamicTree>>();
     assert_send_type::<OneShotTaskRef<Cell<()>>>();
     assert_send_type::<Reply<Cell<()>>>();
     assert_send_type::<ReplyReceiver<Cell<()>>>();
@@ -177,7 +180,14 @@ fn raw_types_obey_error_and_future_trait_contracts() {
         .expect("valid actor");
     assert_send(actor.send(Cell::new(())));
     assert_send(actor.send_timeout(Cell::new(()), Duration::from_secs(1)));
-    assert_send(actor.call(|_reply: Reply<()>| Cell::new(()), Duration::from_secs(1)));
+    let call_state = Cell::new(());
+    assert_send(actor.call(
+        move |_reply: Reply<()>| {
+            call_state.set(());
+            Cell::new(())
+        },
+        Duration::from_secs(1),
+    ));
     let (reply, receiver) = Reply::<Cell<()>>::channel();
     assert_send(reply);
     assert_send(receiver);

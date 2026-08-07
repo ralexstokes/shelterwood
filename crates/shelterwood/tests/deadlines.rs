@@ -391,14 +391,7 @@ async fn message_construction_consumes_the_call_budget() {
     let error = result.expect_err("the over-budget call times out");
     assert_eq!(error.kind, CallErrorKind::AcceptanceTimedOut);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "an available mailbox must not accept work after construction exhausts the budget"
-    );
+    assert_quiet(Duration::from_secs(1), || calls.load(Ordering::SeqCst) != 0).await;
 
     system
         .shutdown(Duration::from_secs(1))
@@ -408,12 +401,20 @@ async fn message_construction_consumes_the_call_budget() {
 
 #[tokio::test(start_paused = true)]
 async fn overflowing_readiness_deadline_remains_pending() {
+    let task_started = ReleaseGate::default();
     let mut tree = Tree::new();
     tree.add_task(
         "manual",
-        TaskDef::new(|context| async move {
-            context.shutdown_token().cancelled().await;
-            Ok(())
+        TaskDef::new({
+            let task_started = task_started.clone();
+            move |context| {
+                let task_started = task_started.clone();
+                async move {
+                    task_started.release();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
         })
         .readiness(Readiness::Manual)
         .expect("manual readiness")
@@ -422,9 +423,7 @@ async fn overflowing_readiness_deadline_remains_pending() {
     .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
 
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
+    task_started.wait().await;
     let mut startup = Box::pin(system.wait_started());
     assert!(poll_once(startup.as_mut()).is_pending());
     assert!(matches!(
@@ -446,16 +445,20 @@ async fn overflowing_readiness_deadline_remains_pending() {
 #[tokio::test(start_paused = true)]
 async fn overflowing_shutdown_grace_does_not_escalate() {
     let dropped = Arc::new(AtomicBool::new(false));
+    let shutdown_seen = ReleaseGate::default();
     let mut tree = Tree::new();
     tree.add_task(
         "stubborn",
         TaskDef::new({
             let dropped = Arc::clone(&dropped);
+            let shutdown_seen = shutdown_seen.clone();
             move |context| {
                 let dropped = Arc::clone(&dropped);
+                let shutdown_seen = shutdown_seen.clone();
                 async move {
                     let _drop = DropFlag(dropped);
                     context.shutdown_token().cancelled().await;
+                    shutdown_seen.release();
                     std::future::pending::<ExitResult>().await
                 }
             }
@@ -469,13 +472,8 @@ async fn overflowing_shutdown_grace_does_not_escalate() {
     system.wait_started().await.expect("task starts");
 
     system.scope().request_shutdown();
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        !dropped.load(Ordering::SeqCst),
-        "an overflowing grace must not trigger immediate escalation"
-    );
+    shutdown_seen.wait().await;
+    assert_quiet(Duration::from_secs(1), || dropped.load(Ordering::SeqCst)).await;
 
     let shutdown = system.shutdown(Duration::ZERO).await;
     assert!(shutdown.is_err(), "forced cleanup reports the straggler");
@@ -526,10 +524,10 @@ async fn overflowing_restart_delay_never_restarts_immediately() {
         })
         .await
     );
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_quiet(Duration::from_secs(1), || {
+        starts.load(Ordering::SeqCst) != 1
+    })
+    .await;
 
     system
         .shutdown(Duration::from_secs(1))

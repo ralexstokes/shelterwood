@@ -497,7 +497,9 @@ async fn shutdown_and_wait_wakes_when_a_parent_drain_terminalizes_a_restarting_s
             .expect("non-zero backoff"),
     ));
     let mut root = Tree::new();
-    let sub = root.add_subtree("nested", definition).expect("valid subtree");
+    let sub = root
+        .add_subtree("nested", definition)
+        .expect("valid subtree");
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     let inner = inner

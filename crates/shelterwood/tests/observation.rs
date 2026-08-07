@@ -523,10 +523,25 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
                 move || {
                     let mut tree = Tree::new();
                     if builds.fetch_add(1, Ordering::SeqCst) == 0 {
-                        let (_, completion) = tree
-                            .add_task_once("worker", TaskOnceDef::new(|_| async { Ok(()) }))
-                            .expect("valid completing task");
-                        drop(completion);
+                        let attempts = Arc::new(AtomicUsize::new(0));
+                        tree.add_task(
+                            "worker",
+                            TaskDef::new(move |_| {
+                                let fail = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+                                async move {
+                                    if fail {
+                                        Err(shelterwood::ExitError::message("retry once"))
+                                    } else {
+                                        Ok(())
+                                    }
+                                }
+                            })
+                            .restart(RestartPolicy::new(
+                                RestartCondition::OnFailure,
+                                Backoff::Immediate,
+                            )),
+                        )
+                        .expect("valid restarting task");
                     } else {
                         tree.add_task("worker", waiting_task())
                             .expect("valid waiting task");
@@ -583,6 +598,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     assert_eq!(child.restart_count, 1);
     assert_eq!(restart_window.total_restarts, 1);
     assert_eq!(child.scope_seq, Some(stopped_seq));
+    assert_eq!(nested.snapshot().total_restarts, 1);
 
     tokio::time::advance(Duration::from_secs(10)).await;
     let starting = loop {
@@ -607,6 +623,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     };
     assert_ne!(Some(second_child), first_child);
     assert_eq!(nested.membership(), scope_membership);
+    assert_eq!(nested.snapshot().total_restarts, 0);
     assert!(nested.snapshot().lifecycle_seq >= starting.seq);
     assert!(
         poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
@@ -722,6 +739,45 @@ async fn undefined_dynamic_reservations_are_absent_and_emit_no_membership_edges(
         .shutdown(Duration::from_secs(1))
         .await
         .expect("root shuts down");
+}
+
+#[tokio::test]
+async fn withdrawn_queued_admission_never_publishes_an_added_child() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let root = system.scope();
+    let mut events = root.subscribe_lifecycle();
+    let slot = root
+        .reserve_task("withdrawn")
+        .expect("reservation succeeds");
+    let membership = slot.task_ref().membership();
+    let removal = root.remove("withdrawn");
+    let admission = slot.define(waiting_task());
+
+    assert_eq!(removal.await, RemoveOutcome::Removed);
+    assert!(matches!(
+        admission.await,
+        Err(shelterwood::ReserveError::NotAdmitting(
+            shelterwood::NotAdmittingCause::ReservationEnded
+        ))
+    ));
+    assert!(root.snapshot().child("withdrawn").is_none());
+    while let Ok(item) = events.try_recv() {
+        if let LifecycleItem::Event(event) = item {
+            assert!(!matches!(
+                event.kind,
+                LifecycleEventKind::Added {
+                    membership: added,
+                    ..
+                } if added == membership
+            ));
+        }
+    }
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
 }
 
 #[tokio::test]

@@ -11,8 +11,9 @@ use std::{
 use crate::{
     ChildId, Exit, ExitError, ExitResult, Incarnation, Membership, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
-    driver::{Latch, MemberCell, MemberStage, Signal},
+    driver::{MemberCell, MemberStage, Signal},
     policy::CommonOptions,
+    runtime::Latch,
 };
 
 pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
@@ -417,6 +418,83 @@ impl<T> Drop for OneShotTaskRef<T> {
             .expect("completion mutex poisoned");
         if matches!(*state, CompletionState::Completed(_)) {
             *state = CompletionState::Discarded;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::runtime::{self, JoinOutcome, Latch, Timeout};
+
+    use super::CancellationToken;
+
+    #[crate::runtime::test]
+    async fn local_cancellation_cancels_only_the_derived_token() {
+        let primary = Latch::default();
+        let local = Latch::default();
+        let supervisor = CancellationToken::from_latch(primary.clone());
+        let operation = supervisor.child(local.clone());
+
+        assert!(local.fire());
+        assert!(matches!(
+            runtime::timeout(Duration::from_secs(1), operation.cancelled()).await,
+            Timeout::Completed(())
+        ));
+        assert!(operation.is_cancelled());
+        assert!(!supervisor.is_cancelled());
+        assert!(!primary.is_fired());
+    }
+
+    #[crate::runtime::test]
+    async fn supervisor_cancellation_cancels_the_derived_token() {
+        let primary = Latch::default();
+        let local = Latch::default();
+        let supervisor = CancellationToken::from_latch(primary.clone());
+        let operation = supervisor.child(local.clone());
+
+        assert!(primary.fire());
+        assert!(matches!(
+            runtime::timeout(Duration::from_secs(1), operation.cancelled()).await,
+            Timeout::Completed(())
+        ));
+        assert!(supervisor.is_cancelled());
+        assert!(operation.is_cancelled());
+        assert!(!local.is_fired());
+    }
+
+    #[crate::runtime::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_supervisor_and_local_cancellation_wake_the_operation() {
+        for _ in 0..128 {
+            let primary = Latch::default();
+            let local = Latch::default();
+            let operation = CancellationToken::from_latch(primary.clone()).child(local.clone());
+            let waiter = runtime::spawn((), async move {
+                operation.cancelled().await;
+            });
+
+            let primary_firer = runtime::spawn((), async move {
+                runtime::yield_now().await;
+                primary.fire()
+            });
+            let local_firer = runtime::spawn((), async move {
+                runtime::yield_now().await;
+                local.fire()
+            });
+
+            assert!(matches!(
+                runtime::join(primary_firer).await,
+                JoinOutcome::Ok { value: true }
+            ));
+            assert!(matches!(
+                runtime::join(local_firer).await,
+                JoinOutcome::Ok { value: true }
+            ));
+            assert!(matches!(
+                runtime::timeout(Duration::from_secs(1), runtime::join(waiter)).await,
+                Timeout::Completed(JoinOutcome::Ok { value: () })
+            ));
         }
     }
 }

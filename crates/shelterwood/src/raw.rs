@@ -16,9 +16,10 @@ use std::{
 use crate::{
     ActorRef, CancellationToken, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown,
     PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef, Shutdown,
-    driver::{ActorWork, Latch, Signal, SignalWatcher},
+    driver::{ActorWork, Signal, SignalWatcher},
     mailbox::{MailboxCell, MailboxControl, MailboxReceiver},
     policy::CommonOptions,
+    runtime::Latch,
 };
 
 type PanicPayload = Box<dyn Any + Send + 'static>;

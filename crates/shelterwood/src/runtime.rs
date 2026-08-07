@@ -1,8 +1,19 @@
 //! The only boundary between the library and its async runtime.
 
-use std::{future::Future, ops::RangeBounds, time::Duration};
+use std::{
+    future::Future,
+    ops::RangeBounds,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
-use tokio::{sync::mpsc, task, time};
+use tokio::{
+    sync::{Notify, mpsc},
+    task, time,
+};
 
 #[cfg(test)]
 pub(crate) use tokio::test;
@@ -13,6 +24,67 @@ pub(crate) fn now() -> std::time::Instant {
 
 pub(crate) fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
+}
+
+/// A one-shot, multi-waiter signal backed by Tokio's waiter queue.
+///
+/// The atomic provides a linearizable, idempotent transition and retains the
+/// fired state for future waiters. [`Notify`] wakes the waiters that already
+/// exist and removes cancelled waits from its intrusive queue. Creating the
+/// notification before rechecking the atomic is essential: Tokio guarantees
+/// that such a notification observes a subsequent `notify_waiters`, even when
+/// it has not been polled yet.
+///
+/// This deliberately does not use `tokio_util::sync::CancellationToken`.
+/// Shelterwood also uses latches for readiness and completion, needs `fire` to
+/// report which caller performed the transition, and keeps parent and local
+/// cancellation as distinct shared latches. The Tokio-util cancellation tree
+/// would add allocation, locking, and dependencies without replacing those
+/// semantics. A Tokio watch channel similarly adds value locking to the hot
+/// `is_fired` path.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Latch {
+    state: Arc<LatchState>,
+}
+
+#[derive(Debug, Default)]
+struct LatchState {
+    fired: AtomicBool,
+    notify: Notify,
+}
+
+impl Latch {
+    pub(crate) fn fire(&self) -> bool {
+        if self
+            .state
+            .fired
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.state.notify.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn is_fired(&self) -> bool {
+        self.state.fired.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn fired(&self) {
+        loop {
+            if self.is_fired() {
+                return;
+            }
+
+            let notified = self.state.notify.notified();
+            if self.is_fired() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// A spawned operation whose identity is retained through joining.
@@ -210,5 +282,120 @@ impl JitterRng {
         R: RangeBounds<u64>,
     {
         self.0.u64(range)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::Poll,
+        time::Duration,
+    };
+
+    use super::{JoinOutcome, Latch, Timeout, join, spawn, timeout, yield_now};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exactly_one_concurrent_fire_performs_the_transition() {
+        const FIRERS: usize = 32;
+
+        let latch = Latch::default();
+        let ready = Arc::new(AtomicUsize::new(0));
+        let mut firers = Vec::with_capacity(FIRERS);
+        for _ in 0..FIRERS {
+            let latch = latch.clone();
+            let ready = Arc::clone(&ready);
+            firers.push(spawn((), async move {
+                ready.fetch_add(1, Ordering::AcqRel);
+                while ready.load(Ordering::Acquire) != FIRERS {
+                    yield_now().await;
+                }
+                latch.fire()
+            }));
+        }
+
+        let mut transitions = 0;
+        for firer in firers {
+            let JoinOutcome::Ok { value } = join(firer).await else {
+                panic!("latch firer must complete normally");
+            };
+            transitions += usize::from(value);
+        }
+
+        assert_eq!(transitions, 1);
+        assert!(latch.is_fired());
+        assert!(!latch.fire());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn all_pre_fire_waiters_wake() {
+        const WAITERS: usize = 32;
+
+        let latch = Latch::default();
+        let parked = Arc::new(AtomicUsize::new(0));
+        let mut waiters = Vec::with_capacity(WAITERS);
+        for _ in 0..WAITERS {
+            let latch = latch.clone();
+            let parked = Arc::clone(&parked);
+            waiters.push(spawn((), async move {
+                let mut fired = Box::pin(latch.fired());
+                let first_poll =
+                    std::future::poll_fn(|context| Poll::Ready(fired.as_mut().poll(context))).await;
+                assert!(first_poll.is_pending());
+                parked.fetch_add(1, Ordering::Release);
+                fired.await;
+            }));
+        }
+
+        while parked.load(Ordering::Acquire) != WAITERS {
+            yield_now().await;
+        }
+        assert!(latch.fire());
+
+        for waiter in waiters {
+            let result = timeout(Duration::from_secs(1), join(waiter)).await;
+            assert!(matches!(
+                result,
+                Timeout::Completed(JoinOutcome::Ok { value: () })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn post_fire_waiters_complete_immediately() {
+        let latch = Latch::default();
+        assert!(latch.fire());
+
+        assert!(matches!(
+            timeout(Duration::from_secs(1), latch.fired()).await,
+            Timeout::Completed(())
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_waits_do_not_consume_the_signal() {
+        let latch = Latch::default();
+
+        for _ in 0..1_024 {
+            let mut fired = Box::pin(latch.fired());
+            let first_poll =
+                std::future::poll_fn(|context| Poll::Ready(fired.as_mut().poll(context))).await;
+            assert!(first_poll.is_pending());
+            drop(fired);
+        }
+
+        let mut live_waiter = Box::pin(latch.fired());
+        let first_poll =
+            std::future::poll_fn(|context| Poll::Ready(live_waiter.as_mut().poll(context))).await;
+        assert!(first_poll.is_pending());
+        assert!(latch.fire());
+        assert!(matches!(
+            timeout(Duration::from_secs(1), live_waiter).await,
+            Timeout::Completed(())
+        ));
     }
 }

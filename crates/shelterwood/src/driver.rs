@@ -30,7 +30,7 @@ use crate::{
     },
     policy::{DefaultsInheritance, ResolvedDefaults},
     raw::{RawRunContext, RawSpawn},
-    runtime,
+    runtime::{self, Latch},
     task::{OnceTaskBody, TaskContext, TaskFactory},
     tree::{
         BuilderCore, ChildConstruction, ChildPlan, NotAdmittingCause, RemoveOutcome, ReserveError,
@@ -276,38 +276,6 @@ impl Future for WaiterFuture {
             Poll::Ready(())
         } else {
             Poll::Pending
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Latch {
-    fired: Arc<AtomicBool>,
-    signal: Signal,
-}
-
-impl Latch {
-    pub(crate) fn fire(&self) -> bool {
-        if self
-            .fired
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.signal.pulse();
-            true
-        } else {
-            false
-        }
-    }
-
-    pub(crate) fn is_fired(&self) -> bool {
-        self.fired.load(Ordering::Acquire)
-    }
-
-    pub(crate) async fn fired(&self) {
-        let mut watcher = self.signal.watcher();
-        while !self.is_fired() {
-            watcher.changed().await;
         }
     }
 }
@@ -3363,11 +3331,12 @@ mod tests {
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
+        runtime::Latch,
         tree::{SlotCell, lower_tree_for_test},
     };
 
     use super::{
-        DynamicControl, DynamicEntry, Latch, MemberCell, MemberStage, Obligation, RemovalResponse,
+        DynamicControl, DynamicEntry, MemberCell, MemberStage, Obligation, RemovalResponse,
         ScopeCell, ScopeFlavor, mint_child_incarnation, report_channel, run_scope_incarnation,
     };
 

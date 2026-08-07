@@ -740,9 +740,10 @@ impl ScopeCell {
         self.emit_locked(event);
     }
 
-    pub(crate) fn schedule_child_restart(
+    pub(crate) fn publish_child_restart(
         &self,
         member: &MemberCell,
+        total_restarts: u64,
         update: impl FnOnce(&mut MemberRecord),
         exited: LifecycleEventKind,
         scheduled: LifecycleEventKind,
@@ -751,7 +752,7 @@ impl ScopeCell {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.record.send_modify(|scope| {
-            scope.total_restarts = scope.total_restarts.saturating_add(1);
+            scope.total_restarts = total_restarts;
         });
         member.update_locked(update);
         self.emit_locked(exited);
@@ -1843,6 +1844,72 @@ impl ChildRuntime {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupPhase {
+    Pending,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Driver-loop lifecycle state. `ScopeRecord` remains the observation projection and
+/// `ScopeControl` remains the epoch-tagged request plane; neither duplicates these phases.
+enum ScopePhase {
+    Starting,
+    Running,
+    StartupFailed,
+    Draining {
+        reason: StopReason,
+        startup: StartupPhase,
+    },
+}
+
+impl ScopePhase {
+    fn startup_complete(&self) -> bool {
+        matches!(
+            self,
+            Self::Running
+                | Self::Draining {
+                    startup: StartupPhase::Complete,
+                    ..
+                }
+        )
+    }
+
+    fn startup_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::StartupFailed
+                | Self::Draining {
+                    startup: StartupPhase::Failed,
+                    ..
+                }
+        )
+    }
+
+    fn is_draining(&self) -> bool {
+        matches!(self, Self::Draining { .. })
+    }
+
+    fn draining_reason(&self) -> Option<&StopReason> {
+        match self {
+            Self::Draining { reason, .. } => Some(reason),
+            Self::Starting | Self::Running | Self::StartupFailed => None,
+        }
+    }
+
+    fn begin_drain(&mut self, reason: StopReason) -> bool {
+        let startup = match self {
+            Self::Starting => StartupPhase::Pending,
+            Self::Running => StartupPhase::Complete,
+            Self::StartupFailed => StartupPhase::Failed,
+            Self::Draining { .. } => return false,
+        };
+        *self = Self::Draining { reason, startup };
+        true
+    }
+}
+
 struct ScopeRuntime {
     root: Arc<ScopeCell>,
     flavor: ScopeFlavor,
@@ -1853,10 +1920,8 @@ struct ScopeRuntime {
     events: runtime::MpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
-    startup_complete: bool,
-    startup_failed: bool,
+    phase: ScopePhase,
     next_ordered_start: usize,
-    draining: Option<StopReason>,
     is_root: bool,
     parent_ready: Option<Latch>,
     dynamic: Option<Arc<DynamicControl>>,
@@ -1910,7 +1975,7 @@ impl Drop for ScopeRuntime {
             let reason = completion
                 .as_ref()
                 .map(|completion| completion.reason.clone())
-                .or_else(|| self.draining.clone())
+                .or_else(|| self.phase.draining_reason().cloned())
                 .unwrap_or(StopReason::ShutdownRequested);
             if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
                 self.root.finish_root_incarnation(self.epoch, reason, exit);
@@ -1942,7 +2007,7 @@ enum SpawnBody {
 
 impl ScopeRuntime {
     fn spawn_child(&mut self, index: usize) {
-        if self.draining.is_some() || self.children[index].is_terminal() {
+        if self.phase.is_draining() || self.children[index].is_terminal() {
             return;
         }
         let child = &mut self.children[index];
@@ -1961,18 +2026,18 @@ impl ScopeRuntime {
                 MemberStage::Terminal(exit) => exit,
                 _ => Exit::never_started(),
             };
-            let pre_ready = child.initial && !self.startup_complete && !child.initial_ready;
+            let pre_ready = child.initial && !self.phase.startup_complete() && !child.initial_ready;
             let removing = child.slot.member.record().removing;
             let retention_remove = child.options.retention == crate::Retention::Remove;
             if removing {
                 self.finalize_removal(index);
-            } else if pre_ready && self.draining.is_none() {
+            } else if pre_ready && !self.phase.is_draining() {
                 self.fail_startup(index, exit);
             } else {
                 if retention_remove {
                     self.prune_terminal(index);
                 }
-                if self.draining.is_some() {
+                if self.phase.is_draining() {
                     self.stop_next_ordered();
                 }
             }
@@ -2275,7 +2340,7 @@ impl ScopeRuntime {
     }
 
     fn progress_startup(&mut self) {
-        if self.startup_complete || self.startup_failed || self.draining.is_some() {
+        if self.phase != ScopePhase::Starting {
             return;
         }
         match self.flavor {
@@ -2314,7 +2379,7 @@ impl ScopeRuntime {
     }
 
     fn complete_startup(&mut self) {
-        self.startup_complete = true;
+        self.phase = ScopePhase::Running;
         self.root.set_state(ScopeState::Running);
         self.root.set_startup(Ok(()));
         if let Some(parent_ready) = &self.parent_ready {
@@ -2421,13 +2486,13 @@ impl ScopeRuntime {
     }
 
     fn begin_drain(&mut self, reason: StopReason) {
-        if self.draining.is_some() {
+        let startup_pending = self.phase == ScopePhase::Starting;
+        if !self.phase.begin_drain(reason) {
             return;
         }
-        if !self.startup_complete && !self.startup_failed {
+        if startup_pending {
             self.root.set_startup(Err(StartupError::ShutdownRequested));
         }
-        self.draining = Some(reason);
         self.root.set_state(ScopeState::Draining);
         match self.flavor {
             ScopeFlavor::Ordered => self.stop_next_ordered(),
@@ -2440,7 +2505,7 @@ impl ScopeRuntime {
     }
 
     fn stop_next_ordered(&mut self) {
-        if self.flavor != ScopeFlavor::Ordered || self.draining.is_none() {
+        if self.flavor != ScopeFlavor::Ordered || !self.phase.is_draining() {
             return;
         }
         loop {
@@ -2458,7 +2523,7 @@ impl ScopeRuntime {
     }
 
     fn force_all(&mut self) {
-        if self.draining.is_none() {
+        if !self.phase.is_draining() {
             self.begin_drain(StopReason::ShutdownRequested);
         }
         let now = runtime::now();
@@ -2496,7 +2561,7 @@ impl ScopeRuntime {
             if readiness == Readiness::Immediate {
                 active.readiness = ReadinessGate::Immediate;
                 active.ready_signal.fire();
-                if !self.startup_complete {
+                if !self.phase.startup_complete() {
                     child.initial_ready = true;
                 }
                 self.root.transition_child(
@@ -2543,7 +2608,7 @@ impl ScopeRuntime {
         {
             return;
         }
-        if !self.startup_complete {
+        if !self.phase.startup_complete() {
             child.initial_ready = true;
         }
         self.root.transition_child(
@@ -2600,7 +2665,7 @@ impl ScopeRuntime {
             child.restarts.settled();
         }
 
-        let mode = if self.draining.is_some() {
+        let mode = if self.phase.is_draining() {
             ScopeMode::Draining
         } else {
             ScopeMode::Running
@@ -2616,13 +2681,14 @@ impl ScopeRuntime {
                 // membership failed before its *initial* readiness edge. A
                 // later incarnation stopped pre-ready (e.g. during drain)
                 // does not rewind it.
-                let pre_ready = child.initial && !self.startup_complete && !child.initial_ready;
+                let pre_ready =
+                    child.initial && !self.phase.startup_complete() && !child.initial_ready;
                 child.terminalize(&self.root, exit.clone(), Some(incarnation), pre_ready);
                 child.construction.take();
                 let removing = child.slot.member.record().removing;
                 if removing {
                     self.finalize_removal(index);
-                } else if pre_ready && self.draining.is_none() {
+                } else if pre_ready && !self.phase.is_draining() {
                     self.fail_startup(index, exit);
                     if self.children[index].options.retention == crate::Retention::Remove {
                         self.prune_terminal(index);
@@ -2631,18 +2697,17 @@ impl ScopeRuntime {
                     if child.options.retention == crate::Retention::Remove {
                         self.prune_terminal(index);
                     }
-                    if self.draining.is_some() {
+                    if self.phase.is_draining() {
                         self.stop_next_ordered();
                     }
                 }
             }
             ExitDispatch::ScheduleRestart => {
-                if !self.startup_complete {
+                if !self.phase.startup_complete() {
                     child.initial_ready = false;
                 }
                 let sample = self.jitter.sample(0..u64::MAX) as f64 / u64::MAX as f64;
                 let now = runtime::now();
-                let mut effects = Vec::new();
                 let decision = schedule_restart(
                     &mut child.restarts,
                     &mut self.intensity,
@@ -2650,33 +2715,18 @@ impl ScopeRuntime {
                     child.options.restart,
                     now,
                     sample,
-                    &mut effects,
                 );
-                debug_assert!(matches!(
-                    effects.first(),
-                    Some(crate::engine::RestartEffect::Scheduled { .. })
-                ));
-                let scheduled_at = match effects.first() {
-                    Some(crate::engine::RestartEffect::Scheduled { restart_at, .. }) => *restart_at,
-                    Some(crate::engine::RestartEffect::IntensityTripped { .. }) | None => {
-                        unreachable!("restart scheduling emits its schedule first")
-                    }
-                };
-                let delay = child
-                    .options
-                    .restart
-                    .backoff()
-                    .next_delay(decision.attempt, sample);
-                self.root.schedule_child_restart(
+                self.root.publish_child_restart(
                     &child.slot.member,
+                    decision.charge.total_restarts,
                     |record| {
                         record.incarnation = None;
                         record.last_exit = Some(exit.clone());
                         record.restart_count = decision.restart_count;
                         // Publish the derived schedule even when intensity
-                        // prevents spawning it. `None` then remains reserved
-                        // for an unrepresentable clock deadline.
-                        record.restart_at = scheduled_at;
+                        // prevents spawning it. `None` remains reserved for
+                        // an unrepresentable clock deadline.
+                        record.restart_at = decision.restart_at;
                         record.stage = MemberStage::Restarting;
                     },
                     LifecycleEventKind::Exited {
@@ -2689,7 +2739,7 @@ impl ScopeRuntime {
                         id: child.slot.member.id().clone(),
                         membership: child.slot.member.membership(),
                         attempt: decision.attempt,
-                        delay,
+                        delay: decision.delay,
                     },
                 );
                 if decision.charge.tripped {
@@ -2698,7 +2748,7 @@ impl ScopeRuntime {
                         observed_restarts: decision.charge.in_window,
                         within: self.intensity_policy.within,
                     };
-                    if !self.startup_complete && !self.startup_failed {
+                    if self.phase == ScopePhase::Starting {
                         self.root
                             .set_startup(Err(StartupError::IntensityTripped(trip.clone())));
                     }
@@ -2722,7 +2772,7 @@ impl ScopeRuntime {
                 exit,
             },
         };
-        self.startup_failed = true;
+        self.phase = ScopePhase::StartupFailed;
         self.root
             .set_startup(Err(StartupError::StartupFailed(failure.clone())));
         if self.flavor == ScopeFlavor::Ordered {
@@ -2789,13 +2839,13 @@ impl ScopeRuntime {
     }
 
     fn finish_if_ready(&mut self) -> Option<StopReason> {
-        if let Some(reason) = &self.draining {
+        if let Some(reason) = self.phase.draining_reason() {
             if self.children.iter().all(ChildRuntime::is_terminal) {
                 return Some(reason.clone());
             }
             return None;
         }
-        if !self.startup_failed
+        if !self.phase.startup_failed()
             && self.flavor == ScopeFlavor::Ordered
             && !self.children.is_empty()
             && self.children.iter().all(ChildRuntime::is_terminal)
@@ -2814,13 +2864,13 @@ impl ScopeRuntime {
             .dynamic
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &control))
-            || self.draining.is_some()
-            || self.startup_failed
+            || self.phase.is_draining()
+            || self.phase.startup_failed()
         {
             cancel_dynamic_reservation(&control, &request.slot);
-            let cause = if self.draining.is_some() {
+            let cause = if self.phase.is_draining() {
                 NotAdmittingCause::Draining
-            } else if self.startup_failed {
+            } else if self.phase.startup_failed() {
                 NotAdmittingCause::StartupFailed
             } else {
                 NotAdmittingCause::NoLiveIncarnation
@@ -3125,10 +3175,8 @@ async fn run_scope_incarnation(
         events,
         deadlines: DeadlineQueue::default(),
         jitter: runtime::JitterRng::from_system_entropy(),
-        startup_complete: false,
-        startup_failed: false,
+        phase: ScopePhase::Starting,
         next_ordered_start: 0,
-        draining: None,
         is_root,
         parent_ready,
         dynamic,
@@ -3372,9 +3420,28 @@ mod tests {
 
     use super::{
         DynamicControl, DynamicEntry, MemberCell, MemberStage, Obligation, RemovalResponses,
-        ScopeCell, ScopeFlavor, complete_removals, mint_child_incarnation, report_channel,
-        run_nested_tree, run_scope_incarnation,
+        ScopeCell, ScopeFlavor, ScopePhase, StartupPhase, complete_removals,
+        mint_child_incarnation, report_channel, run_nested_tree, run_scope_incarnation,
     };
+
+    #[test]
+    fn scope_phase_preserves_startup_status_while_draining() {
+        for (mut phase, startup) in [
+            (ScopePhase::Starting, StartupPhase::Pending),
+            (ScopePhase::Running, StartupPhase::Complete),
+            (ScopePhase::StartupFailed, StartupPhase::Failed),
+        ] {
+            assert!(phase.begin_drain(StopReason::ShutdownRequested));
+            assert_eq!(
+                phase,
+                ScopePhase::Draining {
+                    reason: StopReason::ShutdownRequested,
+                    startup,
+                }
+            );
+            assert!(!phase.begin_drain(StopReason::Finished));
+        }
+    }
 
     #[test]
     fn owned_report_token_consumes_or_falls_back_once() {

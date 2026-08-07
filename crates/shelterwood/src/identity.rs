@@ -6,9 +6,17 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use crate::ChildId;
 
 static NEXT_LINEAGE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static CURRENT_THREAD_SCOPE_CREATIONS: Cell<u64> = const { Cell::new(0) };
+}
 
 /// A child's identity within one supervising scope.
 ///
@@ -125,6 +133,10 @@ pub(crate) struct ScopeIdentity {
 
 impl ScopeIdentity {
     pub(crate) fn new() -> Option<Self> {
+        #[cfg(test)]
+        CURRENT_THREAD_SCOPE_CREATIONS.with(|creations| {
+            creations.set(creations.get().saturating_add(1));
+        });
         Some(Self {
             memberships: HashMap::new(),
         })
@@ -139,6 +151,11 @@ impl ScopeIdentity {
             .ok()?
             + 1;
         Some(FenceCounter::new(lineage))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_thread_creations() -> u64 {
+        CURRENT_THREAD_SCOPE_CREATIONS.with(Cell::get)
     }
 
     #[cfg(test)]

@@ -10,16 +10,6 @@ use crate::{
     Exit, Intensity, RestartPolicy, Shutdown, deadline::Deadline, policy::tidy_abort_beat,
 };
 
-pub(crate) trait EffectSink<E> {
-    fn emit(&mut self, effect: E);
-}
-
-impl<E> EffectSink<E> for Vec<E> {
-    fn emit(&mut self, effect: E) {
-        self.push(effect);
-    }
-}
-
 /// Deterministic priority when one driver wake exposes several events.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ArbitrationClass {
@@ -204,26 +194,14 @@ impl RestartState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RestartEffect {
-    Scheduled {
-        attempt: u64,
-        restart_count: u64,
-        total_restarts: u64,
-        restart_at: Option<Instant>,
-    },
-    IntensityTripped {
-        in_window: u64,
-        total_restarts: u64,
-    },
-}
-
+/// Complete restart verdict consumed verbatim by the scope driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RestartDecision {
     pub(crate) attempt: u64,
     pub(crate) restart_count: u64,
-    pub(crate) charge: IntensityCharge,
+    pub(crate) delay: Duration,
     pub(crate) restart_at: Option<Instant>,
+    pub(crate) charge: IntensityCharge,
 }
 
 pub(crate) fn schedule_restart(
@@ -233,29 +211,17 @@ pub(crate) fn schedule_restart(
     restart_policy: RestartPolicy,
     now: Instant,
     jitter_sample: f64,
-    effects: &mut impl EffectSink<RestartEffect>,
 ) -> RestartDecision {
     let (attempt, restart_count) = restarts.schedule();
     let delay = restart_policy.backoff().next_delay(attempt, jitter_sample);
     let restart_at = Deadline::after(now, delay).instant();
     let charge = intensity.charge(intensity_policy, now);
-    effects.emit(RestartEffect::Scheduled {
-        attempt,
-        restart_count,
-        total_restarts: charge.total_restarts,
-        restart_at,
-    });
-    if charge.tripped {
-        effects.emit(RestartEffect::IntensityTripped {
-            in_window: charge.in_window,
-            total_restarts: charge.total_restarts,
-        });
-    }
     RestartDecision {
         attempt,
         restart_count,
+        delay,
+        restart_at,
         charge,
-        restart_at: (!charge.tripped).then_some(restart_at).flatten(),
     }
 }
 
@@ -384,8 +350,8 @@ mod tests {
 
     use super::{
         ArbitrationClass, DeadlineQueue, ExitDispatch, IntensityState, MembershipMode,
-        ReadinessEffect, ReadinessEvent, ReadinessGate, RestartEffect, RestartState, ScopeMode,
-        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
+        ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode, StopAction,
+        StopLadder, arbitrate, dispatch_exit, schedule_restart,
     };
 
     #[test]
@@ -493,13 +459,12 @@ mod tests {
     }
 
     #[test]
-    fn over_budget_restart_emits_schedule_before_trip_and_has_no_spawn_deadline() {
+    fn restart_decision_owns_the_backoff_and_intensity_verdict() {
         let now = Instant::now();
         let intensity_policy = Intensity::new(0, Duration::from_secs(10)).expect("valid intensity");
         let restart_policy = RestartPolicy::new(RestartCondition::OnFailure, Backoff::Immediate);
         let mut restarts = RestartState::new();
         let mut intensity = IntensityState::default();
-        let mut effects = Vec::new();
         let decision = schedule_restart(
             &mut restarts,
             &mut intensity,
@@ -507,22 +472,14 @@ mod tests {
             restart_policy,
             now,
             0.5,
-            &mut effects,
         );
 
         assert_eq!(decision.attempt, 1);
         assert_eq!(decision.restart_count, 1);
+        assert_eq!(decision.delay, Duration::ZERO);
+        assert_eq!(decision.restart_at, Some(now));
         assert_eq!(decision.charge.total_restarts, 1);
         assert!(decision.charge.tripped);
-        assert_eq!(decision.restart_at, None);
-        assert!(matches!(
-            effects[0],
-            RestartEffect::Scheduled {
-                restart_at: Some(restart_at),
-                ..
-            } if restart_at == now
-        ));
-        assert!(matches!(effects[1], RestartEffect::IntensityTripped { .. }));
     }
 
     #[test]
@@ -535,8 +492,6 @@ mod tests {
         );
         let mut restarts = RestartState::new();
         let mut intensity = IntensityState::default();
-        let mut effects = Vec::new();
-
         let decision = schedule_restart(
             &mut restarts,
             &mut intensity,
@@ -544,17 +499,9 @@ mod tests {
             restart_policy,
             now,
             0.5,
-            &mut effects,
         );
 
         assert_eq!(decision.restart_at, None);
-        assert!(matches!(
-            effects[0],
-            RestartEffect::Scheduled {
-                restart_at: None,
-                ..
-            }
-        ));
     }
 
     #[test]

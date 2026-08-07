@@ -428,3 +428,101 @@ async fn dynamic_and_always_members_do_not_finish_naturally() {
         .await
         .expect("owner stops always member");
 }
+
+#[tokio::test]
+async fn hard_aborted_subtree_descendants_still_publish_exits() {
+    let mut nested = Tree::new();
+    let leaf = nested
+        .add_task(
+            "leaf",
+            TaskDef::new(|_| future::pending()).shutdown(Shutdown::Graceful {
+                grace: Duration::from_secs(60),
+            }),
+        )
+        .expect("valid leaf");
+    let mut root = Tree::new();
+    root.add_subtree_once(
+        "nested",
+        SubtreeOnceDef::new(nested).shutdown(Shutdown::Abort),
+    )
+    .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    system
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("the subtree's abort policy bounds teardown");
+    let exit = tokio::time::timeout(Duration::from_secs(1), leaf.wait())
+        .await
+        .expect("hard-aborted descendants terminalize");
+    assert!(matches!(exit.kind(), ExitKind::Aborted { .. }));
+    assert!(exit.cancelled());
+}
+
+#[tokio::test]
+async fn shutdown_and_wait_wakes_when_a_parent_drain_terminalizes_a_restarting_subtree() {
+    let gate = shelterwood_test_support::ReleaseGate::default();
+    let inner = Arc::new(Mutex::new(None::<TaskRef>));
+    let definition = SubtreeDef::factory({
+        let gate = gate.clone();
+        let inner = Arc::clone(&inner);
+        move || {
+            let mut tree = Tree::new();
+            tree.intensity(Intensity::new(0, Duration::from_secs(10)).expect("valid intensity"));
+            let task = tree
+                .add_task(
+                    "failing",
+                    TaskDef::new({
+                        let gate = gate.clone();
+                        move |_| {
+                            let gate = gate.clone();
+                            async move {
+                                gate.wait().await;
+                                Err(ExitError::message("trip the nested budget"))
+                            }
+                        }
+                    }),
+                )
+                .expect("valid task");
+            inner
+                .lock()
+                .expect("handle mutex poisoned")
+                .get_or_insert(task);
+            tree
+        }
+    })
+    .restart(RestartPolicy::new(
+        RestartCondition::Always,
+        Backoff::fixed(Duration::from_secs(60), shelterwood::Jitter::None)
+            .expect("non-zero backoff"),
+    ));
+    let mut root = Tree::new();
+    let sub = root
+        .add_subtree("nested", definition)
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    let inner = inner
+        .lock()
+        .expect("handle mutex poisoned")
+        .clone()
+        .expect("first subtree incarnation exposed its task");
+    gate.release();
+    // The nested budget trips and the incarnation finishes; the parent then
+    // schedules the subtree restart far in the future, so the membership
+    // sits in its restart window with no live incarnation.
+    assert!(matches!(inner.wait().await.kind(), ExitKind::Failed(_)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let waiter = tokio::spawn({
+        let sub = sub.clone();
+        async move { sub.shutdown_and_wait(Duration::from_secs(1)).await }
+    });
+    // Give the waiter time to park on the scope signal before draining.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(system);
+    tokio::time::timeout(Duration::from_secs(3), waiter)
+        .await
+        .expect("parent drain terminalizes the restarting subtree and wakes waiters")
+        .expect("waiter joins")
+        .expect("teardown completes in bound");
+}

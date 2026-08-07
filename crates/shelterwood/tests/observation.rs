@@ -815,3 +815,119 @@ async fn unspawned_scope_publishes_terminal_values_before_both_observers_close()
     assert!(snapshots.changed().await.is_err());
     assert_eq!(snapshots.borrow_latest(), terminal);
 }
+
+/// A hard-aborted scope incarnation still pairs every `Added` with its
+/// terminal edges: the active child's `Exited` and `Removed` are published
+/// before the scope's final event, no snapshot row of a stopped scope keeps
+/// a live incarnation, and the member's handles resolve terminal (§3.2's
+/// exact pairing; §13.7 on the abort path).
+#[tokio::test]
+async fn hard_aborted_scope_pairs_added_with_exited_and_removed() {
+    let mut nested = Tree::new();
+    let stuck = nested
+        .add_task(
+            "stuck",
+            TaskDef::new(|_| std::future::pending()).shutdown(shelterwood::Shutdown::Graceful {
+                grace: Duration::from_secs(30),
+            }),
+        )
+        .expect("valid stuck task");
+    let mut root = Tree::new();
+    let sub = root
+        .add_subtree_once(
+            "nested",
+            SubtreeOnceDef::new(nested).shutdown(shelterwood::Shutdown::Abort),
+        )
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    let mut events = sub.subscribe_lifecycle();
+    system
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("the subtree's abort policy bounds teardown");
+
+    let stuck_membership = stuck.membership();
+    let mut saw_exited = false;
+    let mut saw_removed = false;
+    loop {
+        let event = next_event(&mut events).await;
+        match &event.kind {
+            LifecycleEventKind::Exited { membership, .. } if *membership == stuck_membership => {
+                assert!(!saw_removed, "Exited precedes Removed");
+                saw_exited = true;
+            }
+            LifecycleEventKind::Removed { membership, .. } if *membership == stuck_membership => {
+                saw_removed = true;
+            }
+            LifecycleEventKind::ScopeState {
+                state: ScopeState::Stopped { .. },
+                ..
+            } => {
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_exited, "the aborted child's exit is published");
+    assert!(saw_removed, "the aborted child's membership is pruned");
+
+    let snapshot = sub.snapshot();
+    assert!(matches!(snapshot.state, ScopeState::Stopped { .. }));
+    for child in snapshot.children.iter() {
+        assert!(
+            child.incarnation.is_none(),
+            "a stopped scope never shows a live incarnation: {child:?}"
+        );
+    }
+    let exit = tokio::time::timeout(Duration::from_secs(1), stuck.wait())
+        .await
+        .expect("hard-aborted descendants terminalize");
+    assert!(matches!(exit.kind(), shelterwood::ExitKind::Aborted { .. }));
+}
+
+/// A member that never spawned is the plain `Stopped { NeverStarted }`
+/// terminal (B.6) — `StartupAborted` is reserved for the §6 case: a
+/// membership that ran and failed before its initial readiness edge.
+#[tokio::test]
+async fn never_ran_members_stop_rather_than_report_startup_abort() {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "failing-readiness",
+        TaskDef::new(|_| async { Err(shelterwood::ExitError::message("fails before ready")) })
+            .readiness(shelterwood::Readiness::Manual)
+            .expect("manual readiness")
+            .restart(RestartPolicy::new(
+                RestartCondition::Never,
+                Backoff::Immediate,
+            )),
+    )
+    .expect("valid failing task");
+    tree.add_task("never-ran", waiting_task())
+        .expect("valid suffix task");
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    system
+        .wait_started()
+        .await
+        .expect_err("pre-ready terminal exit aborts startup");
+    let snapshot = scope.snapshot();
+    assert!(matches!(
+        snapshot
+            .child("failing-readiness")
+            .expect("aborted child resident")
+            .state,
+        ChildState::StartupAborted { .. }
+    ));
+    assert!(
+        matches!(
+            &snapshot
+                .child("never-ran")
+                .expect("never-ran child resident")
+                .state,
+            ChildState::Stopped { exit } if matches!(exit.kind(), shelterwood::ExitKind::NeverStarted)
+        ),
+        "a never-ran terminal is Stopped, not StartupAborted: {:?}",
+        snapshot.child("never-ran")
+    );
+}

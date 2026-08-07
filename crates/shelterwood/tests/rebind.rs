@@ -230,3 +230,61 @@ async fn timed_send_withdraws_while_replacement_is_in_backoff() {
     assert_eq!(error.message, 42);
     system.shutdown(Duration::ZERO).await.expect("root stops");
 }
+
+/// Dropping a parked send while the mailbox is unbound (the rebind window)
+/// withdraws it: the replacement incarnation never sees the message even
+/// though promotion runs at the next bind (§5.1's withdrawal rule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropping_a_parked_send_in_the_rebind_window_withdraws_it() {
+    let factories = Arc::new(AtomicUsize::new(0));
+    let fail_first = ReleaseGate::default();
+    let destructor = DestructorGate::default();
+    let deliveries = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw(
+            "worker",
+            restarting_definition(
+                &factories,
+                &fail_first,
+                &destructor,
+                &deliveries,
+                true,
+                RestartPolicy::default(),
+            ),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("first actor starts");
+    actor.try_send(1).expect("first incarnation accepts");
+    let mut parked = Box::pin(actor.send(42));
+    assert!(poll_once(parked.as_mut()).is_pending());
+
+    fail_first.release();
+    wait_for_destructor(&destructor).await;
+    // Park a second send inside the frozen rebind window, then drop it
+    // before the replacement binds.
+    let mut doomed = Box::pin(actor.send(43));
+    assert!(poll_once(doomed.as_mut()).is_pending());
+    drop(doomed);
+
+    destructor.release();
+    parked.await.expect("the retained send rides the window");
+    actor.send(44).await.expect("replacement accepts");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            deliveries
+                .lock()
+                .expect("deliveries mutex poisoned")
+                .as_slice()
+                == [(2, 42), (2, 44)]
+        })
+        .await,
+        "the withdrawn send must never be promoted at bind: {:?}",
+        deliveries.lock().expect("deliveries mutex poisoned")
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("actor stops");
+}

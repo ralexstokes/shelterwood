@@ -561,6 +561,11 @@ impl ScopeCell {
         flavor: ScopeFlavor,
         child_identity: ScopeIdentity,
     ) -> Arc<Self> {
+        let changed = Signal::default();
+        // Waiters parked on the scope signal (`shutdown_scope`,
+        // `wait_for_incarnation`) exit on member terminality, so terminality
+        // reached without a scope-state transition must still pulse it.
+        member.add_terminal_signal(changed.clone());
         Arc::new(Self {
             member,
             flavor,
@@ -571,7 +576,7 @@ impl ScopeCell {
                 startup: None,
                 total_restarts: 0,
             }),
-            changed: Signal::default(),
+            changed,
             control: Mutex::new(ScopeControl::default()),
             current_dynamic: Mutex::new(None),
             current_children: Mutex::new(Vec::new()),
@@ -1033,6 +1038,19 @@ impl ScopeCell {
         let _gate = OBSERVATION_GATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let residents = self
+                .current_children
+                .lock()
+                .expect("scope children mutex poisoned");
+            // A previous incarnation's residents must have been pruned with
+            // their Removed edges (§3.2's exact pairing) — clearing here is
+            // never allowed to be the edge that loses them.
+            debug_assert!(
+                residents.is_empty(),
+                "scope restart found unpruned residents of a previous incarnation"
+            );
+        }
         self.current_children
             .lock()
             .expect("scope children mutex poisoned")
@@ -1266,6 +1284,13 @@ impl DynamicControl {
             .filter(|entry| !entry.admitted)
             .map(|entry| Arc::clone(&entry.slot))
             .collect::<Vec<_>>();
+        // In-flight removals can no longer be finalized by the driver; their
+        // members terminalize with the scope, so the removal is complete.
+        let removals = state
+            .entries
+            .values()
+            .map(|entry| Arc::clone(&entry.removal))
+            .collect::<Vec<_>>();
         drop(state);
         for slot in unadmitted {
             drop(slot.take_defined());
@@ -1273,6 +1298,9 @@ impl DynamicControl {
             if let Some(scope) = &slot.scope {
                 scope.terminalize_never_started();
             }
+        }
+        for removal in removals {
+            removal.complete(RemoveOutcome::Removed);
         }
     }
 }
@@ -1449,6 +1477,17 @@ struct AdmissionRequest {
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
     response: Arc<AdmissionResponse>,
+}
+
+impl Drop for AdmissionRequest {
+    fn drop(&mut self) {
+        // A request dropped without being processed — the driver returned or
+        // was hard-aborted with this event still queued — must still resolve
+        // its caller (§13.12: dynamic mutations resolve on every path).
+        // `complete` is first-wins, so this is a no-op after normal handling.
+        self.response
+            .complete(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
+    }
 }
 
 enum DriverEvent {
@@ -1692,15 +1731,26 @@ impl Drop for ScopeRuntime {
                 active.shutdown.fire();
                 active.abort.fire();
                 active.abort_handle.abort();
-            } else if !child.is_terminal() {
+                // A dropped driver can never process this child's exit event,
+                // so publish terminality now — with its observation edges, so
+                // every Added is paired and no snapshot row outlives its
+                // incarnation (§13.2, §13.7, §3.2's exact pairing).
                 self.root.terminalize_child(
                     &child.slot.member,
-                    Exit::never_started(),
-                    None,
-                    child.initial && !child.spawned_once,
+                    Exit::new(ExitKind::Aborted { after_grace: false }, true),
+                    Some(active.incarnation),
+                    false,
                 );
+            } else if !child.is_terminal() {
+                self.root
+                    .terminalize_child(&child.slot.member, Exit::never_started(), None, false);
             }
         }
+        // Every membership above is now terminal; emit the Removed edges
+        // before the scope's own final event so a subscriber never sees a
+        // Stopped scope still holding resident children of a dead
+        // incarnation, and a restarting scope never silently clears them.
+        self.prune_terminal_members();
         if !matches!(self.root.record().state, ScopeState::Stopped { .. }) {
             self.root.finish_incarnation(
                 self.epoch,
@@ -1739,6 +1789,10 @@ impl ScopeRuntime {
         let child = &mut self.children[index];
         let Some(incarnation) = mint_child_incarnation(&child.slot.member, &mut child.incarnations)
         else {
+            // Incarnation exhaustion terminalized the membership (§3.1):
+            // publish the observation edges, then route the terminal outcome
+            // through the same paths as a terminal exit so ordered startup
+            // fails or draining advances instead of wedging the scope.
             if child.slot.member.record().last_incarnation.is_none()
                 && let Some(scope) = &child.slot.scope
             {
@@ -1749,6 +1803,25 @@ impl ScopeRuntime {
                 self.root.prune_child(&child.slot.member);
             }
             child.construction.take();
+            let exit = match child.slot.member.record().stage {
+                MemberStage::Terminal(exit) => exit,
+                _ => Exit::never_started(),
+            };
+            let pre_ready = child.initial && !self.startup_complete && !child.initial_ready;
+            let removing = child.slot.member.record().removing;
+            let retention_remove = child.options.retention == crate::Retention::Remove;
+            if removing {
+                self.finalize_removal(index);
+            } else if pre_ready && self.draining.is_none() {
+                self.fail_startup(index, exit);
+            } else {
+                if retention_remove {
+                    self.prune_terminal(index);
+                }
+                if self.draining.is_some() {
+                    self.stop_next_ordered();
+                }
+            }
             return;
         };
 
@@ -1786,6 +1859,7 @@ impl ScopeRuntime {
                         abort: abort.clone(),
                         ready: ready.clone(),
                         local_stop: local_stop.clone(),
+                        readiness_override: child.options.readiness_override,
                         mailbox_shutdown: child.options.mailbox_shutdown,
                     },
                 },
@@ -1957,6 +2031,7 @@ impl ScopeRuntime {
         let abort_handle = handle.abort_handle();
         let exit_sender = self.events.clone();
         let exit_ended = ended.clone();
+        let exit_member = Arc::clone(&child.slot.member);
         runtime::spawn((), async move {
             let join = match runtime::join(handle).await {
                 runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
@@ -1967,7 +2042,12 @@ impl ScopeRuntime {
             };
             exit_ended.fire();
             let report = report_receiver.receive();
-            let _ = runtime::mpsc_send(
+            if let Err(DriverEvent::Child(ChildEvent::Exited {
+                recorded,
+                join,
+                cancelled,
+                ..
+            })) = runtime::mpsc_send(
                 &exit_sender,
                 DriverEvent::Child(ChildEvent::Exited {
                     index,
@@ -1977,7 +2057,14 @@ impl ScopeRuntime {
                     cancelled: report.cancelled,
                 }),
             )
-            .await;
+            .await
+            {
+                // The driver is gone (hard-aborted ancestor or a finished
+                // scope): nothing upstream can process this exit, so the
+                // post-join publication happens here — otherwise the
+                // membership is stranded and exit-awaiting surfaces hang.
+                exit_member.terminalize(classify_exit(recorded, join, cancelled));
+            }
         });
 
         let readiness_signal = ready.clone();
@@ -2108,12 +2195,10 @@ impl ScopeRuntime {
             {
                 scope.terminalize_never_started();
             }
-            self.root.terminalize_child(
-                &child.slot.member,
-                exit,
-                None,
-                child.initial && !child.spawned_once,
-            );
+            // A never-ran terminal is the plain `Stopped { NeverStarted }`
+            // state (B.6), not a §6 startup abort.
+            self.root
+                .terminalize_child(&child.slot.member, exit, None, false);
             child.construction.take();
         }
     }
@@ -2321,10 +2406,6 @@ impl ScopeRuntime {
         if let Some(mailbox) = child.slot.member.mailbox() {
             mailbox.close(incarnation);
         }
-        let was_ready = matches!(
-            active.readiness,
-            ReadinessGate::Immediate | ReadinessGate::Ready
-        );
         active.readiness.step(ReadinessEvent::Exit);
         if let (JoinVerdict::Cancelled { .. }, Some(after_grace)) =
             (&join, active.hard_abort_after_grace)
@@ -2350,12 +2431,16 @@ impl ScopeRuntime {
         };
         match dispatch_exit(&exit, child.options.restart, mode, member_mode) {
             ExitDispatch::Terminal => {
+                // §6's startup abort is a startup-sequence property: the
+                // membership failed before its *initial* readiness edge. A
+                // later incarnation stopped pre-ready (e.g. during drain)
+                // does not rewind it.
                 let pre_ready = child.initial && !self.startup_complete && !child.initial_ready;
                 self.root.terminalize_child(
                     &child.slot.member,
                     exit.clone(),
                     Some(incarnation),
-                    !was_ready,
+                    pre_ready,
                 );
                 child.construction.take();
                 let removing = child.slot.member.record().removing;
@@ -2466,7 +2551,7 @@ impl ScopeRuntime {
                         &self.children[later].slot.member,
                         Exit::never_started(),
                         None,
-                        true,
+                        false,
                     );
                     if self.children[later].options.retention == crate::Retention::Remove {
                         self.prune_terminal(later);
@@ -2536,7 +2621,7 @@ impl ScopeRuntime {
         None
     }
 
-    fn handle_admission(&mut self, request: AdmissionRequest) {
+    fn handle_admission(&mut self, mut request: AdmissionRequest) {
         let Some(control) = request.control.upgrade() else {
             request
                 .response
@@ -2571,7 +2656,7 @@ impl ScopeRuntime {
             return;
         }
 
-        let Some(definition) = request.slot.take_definition() else {
+        let Some(definition) = request.slot.take_defined() else {
             cancel_dynamic_reservation(&control, &request.slot);
             request.response.complete(Err(ReserveError::NotAdmitting(
                 NotAdmittingCause::ReservationEnded,
@@ -2618,7 +2703,7 @@ impl ScopeRuntime {
                 .get_mut(id)
                 .expect("the matching reservation was just resolved");
             entry.admitted = true;
-            entry.fused_cancel = request.fused_cancel;
+            entry.fused_cancel = request.fused_cancel.take();
         }
         let mut child = ChildRuntime::from_plan(plan, &self.root);
         child.initial = false;

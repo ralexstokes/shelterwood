@@ -259,3 +259,50 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         .await
         .expect("tree shuts down");
 }
+
+struct InertActor;
+
+impl Actor for InertActor {
+    type Msg = ();
+    type Args = ();
+
+    async fn init(_: (), _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        context.mark_ready();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn manual_readiness_override_on_a_wrapped_handler_stays_gated() {
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "gated",
+            RawOnceDef::new(Handler::<InertActor>::new(()))
+                .readiness(Readiness::Manual)
+                .expect("manual readiness override"),
+        )
+        .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+    // The engine gates on the Manual override; the blanket handler loop must
+    // consult the same resolved mode instead of auto-firing after init.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), system.wait_started())
+            .await
+            .is_err(),
+        "a Manual override must not be released by the handler's post-init mark_ready"
+    );
+    actor.send(()).await.expect("gated actor accepts messages");
+    system
+        .wait_started()
+        .await
+        .expect("an explicit mark_ready releases the gate");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}

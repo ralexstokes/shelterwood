@@ -15,8 +15,8 @@ use crate::common::{
 };
 use shelterwood::{
     Backoff, ChildState, DynamicTree, ExitError, ExitKind, ExitResult, Jitter, LifecycleEventKind,
-    LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Readiness, RemoveOutcome,
-    RestartCondition, RestartPolicy, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline,
+    RemoveOutcome, RestartCondition, RestartPolicy, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe {
@@ -69,6 +69,50 @@ impl BlockingDropProbe {
 impl Drop for BlockingDropProbe {
     fn drop(&mut self) {
         let _ = self.dropped.send(thread::current().id());
+    }
+}
+
+struct OrderedBlockingDropProbe {
+    order: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    blocker: Option<DestructorBlocker>,
+}
+
+impl OrderedBlockingDropProbe {
+    fn new(gate: &DestructorGate, order: Arc<std::sync::Mutex<Vec<&'static str>>>) -> Self {
+        Self {
+            order,
+            blocker: Some(gate.blocker()),
+        }
+    }
+}
+
+impl Drop for OrderedBlockingDropProbe {
+    fn drop(&mut self) {
+        self.order
+            .lock()
+            .expect("order mutex is available")
+            .push("later-dispose-start");
+        drop(self.blocker.take());
+        self.order
+            .lock()
+            .expect("order mutex is available")
+            .push("later-dispose-end");
+    }
+}
+
+struct PanickingPanicPayload;
+
+impl Drop for PanickingPanicPayload {
+    fn drop(&mut self) {
+        panic!("panic payload destructor");
+    }
+}
+
+struct PanicAnyOnDrop;
+
+impl Drop for PanicAnyOnDrop {
+    fn drop(&mut self) {
+        std::panic::panic_any(PanickingPanicPayload);
     }
 }
 
@@ -454,6 +498,105 @@ async fn unadmitted_removal_completes_after_blocking_definition_disposal() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("dynamic root shuts down");
+}
+
+#[tokio::test]
+async fn unadmitted_removal_completes_when_the_panic_payload_destructor_panics() {
+    let tree = DynamicTree::new();
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+    let slot = scope.reserve_task("pending").expect("task reservation");
+    let task = slot.task_ref();
+    let admission = slot.define(TaskDef::new({
+        let capture = PanicAnyOnDrop;
+        move |_| {
+            let _ = &capture;
+            async { Ok(()) }
+        }
+    }));
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), scope.remove_task(&task))
+            .await
+            .expect("panic payload disposal publishes removal completion"),
+        RemoveOutcome::Removed
+    );
+    assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
+    drop(admission);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root shuts down");
+}
+
+#[tokio::test]
+async fn ordered_shutdown_waits_for_later_unstarted_definition_disposal() {
+    let gate = DestructorGate::default();
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "earlier",
+        TaskDef::new({
+            let order = Arc::clone(&order);
+            move |context| {
+                let shutdown = context.shutdown_token();
+                started
+                    .send(shutdown.clone())
+                    .expect("test observes task startup");
+                let order = Arc::clone(&order);
+                async move {
+                    shutdown.cancelled().await;
+                    order
+                        .lock()
+                        .expect("order mutex is available")
+                        .push("earlier-stop");
+                    Ok(())
+                }
+            }
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid earlier task");
+    let (_later, _completion) = tree
+        .add_task_once(
+            "later",
+            TaskOnceDef::new({
+                let capture = OrderedBlockingDropProbe::new(&gate, Arc::clone(&order));
+                move |_| {
+                    let _ = &capture;
+                    async { Ok::<_, ExitError>(()) }
+                }
+            }),
+        )
+        .expect("valid later task");
+
+    let system = tree.spawn().expect("runtime is available");
+    let shutdown_token = starts.recv().await.expect("earlier task starts");
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1)));
+    wait_for_destructor(&gate).await;
+    assert!(
+        !shutdown_token.is_cancelled(),
+        "earlier child must remain live while later definition disposal is pending"
+    );
+    assert_eq!(
+        *order.lock().expect("order mutex is available"),
+        ["later-dispose-start"]
+    );
+
+    gate.release();
+    shutdown_token.cancelled().await;
+    shutdown
+        .await
+        .expect("shutdown task joins")
+        .expect("ordered root shuts down");
+    assert_eq!(
+        *order.lock().expect("order mutex is available"),
+        ["later-dispose-start", "later-dispose-end", "earlier-stop"]
+    );
 }
 
 #[tokio::test]

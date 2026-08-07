@@ -2867,18 +2867,13 @@ impl ScopeRuntime {
             return;
         }
         loop {
-            let Some(key) = self
-                .children
-                .keys()
-                .rev()
-                .find(|key| !self.children[*key].is_terminal())
-            else {
+            let Some(key) = self.children.keys().rev().find(|key| {
+                !self.children[*key].is_terminal() || self.children[*key].is_disposing()
+            }) else {
                 return;
             };
             self.begin_stop_child(key, None);
-            if self.children[key].active.is_some()
-                || (self.children[key].is_disposing() && !self.children[key].is_terminal())
-            {
+            if self.children[key].active.is_some() || self.children[key].is_disposing() {
                 return;
             }
         }

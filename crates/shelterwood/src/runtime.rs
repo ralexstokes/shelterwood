@@ -98,7 +98,7 @@ where
         };
         let panic = catch_unwind(AssertUnwindSafe(|| drop(value)))
             .err()
-            .map(panic_message);
+            .map(contain_panic_payload);
         // Completion is framework bookkeeping. Contain it as well so a
         // hostile waker or a runtime teardown race cannot unwind a blocking
         // worker or double-panic while the job is being dropped.
@@ -537,7 +537,7 @@ pub(crate) async fn join<I, T>(handle: JoinHandle<I, T>) -> JoinOutcome<T> {
     match inner.await {
         Ok(value) => JoinOutcome::Ok { value },
         Err(error) if error.is_panic() => JoinOutcome::Panic {
-            message: panic_message(error.into_panic()),
+            message: contain_panic_payload(error.into_panic()),
         },
         Err(error) => {
             debug_assert!(error.is_cancelled());
@@ -558,7 +558,17 @@ pub(crate) async fn join_resuming<I, T>(handle: JoinHandle<I, T>) -> (I, T) {
     }
 }
 
-fn panic_message(payload: Box<dyn std::any::Any + Send + 'static>) -> Option<String> {
+fn contain_panic_payload(payload: Box<dyn std::any::Any + Send + 'static>) -> Option<String> {
+    let message = catch_unwind(AssertUnwindSafe(|| panic_message(payload.as_ref())))
+        .ok()
+        .flatten();
+    // A custom panic payload is user-owned too. Its destructor may panic, so
+    // discard it under a fresh unwind boundary before publishing completion.
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+    message
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send + 'static)) -> Option<String> {
     if let Some(message) = payload.downcast_ref::<&str>() {
         Some((*message).to_owned())
     } else {

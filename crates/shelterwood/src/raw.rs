@@ -2048,9 +2048,21 @@ mod tests {
 
 #[cfg(test)]
 mod timer_store_tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        collections::HashSet,
+        time::{Duration, Instant},
+    };
 
     use super::{TimerMessage, TimerStore};
+
+    #[derive(Eq, PartialEq)]
+    struct CollidingKey(u8);
+
+    impl std::hash::Hash for CollidingKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            0_u8.hash(state);
+        }
+    }
 
     fn once(entry: super::TimerEntry<&'static str>) -> &'static str {
         let TimerMessage::Once(Some(message)) = entry.message else {
@@ -2103,21 +2115,76 @@ mod timer_store_tests {
     }
 
     #[test]
+    fn hash_collision_uses_exact_erased_key_equality() {
+        let mut timers = TimerStore::default();
+        timers.replace(
+            CollidingKey(1),
+            None,
+            1,
+            TimerMessage::Once(Some("first")),
+            None,
+        );
+        timers.replace(
+            CollidingKey(2),
+            None,
+            2,
+            TimerMessage::Once(Some("second")),
+            None,
+        );
+        timers.replace(
+            CollidingKey(1),
+            None,
+            3,
+            TimerMessage::Once(Some("replacement")),
+            None,
+        );
+
+        assert_eq!(
+            once(
+                timers
+                    .remove(&CollidingKey(2))
+                    .expect("colliding peer remains registered")
+            ),
+            "second"
+        );
+        assert_eq!(
+            once(
+                timers
+                    .remove(&CollidingKey(1))
+                    .expect("replacement remains registered")
+            ),
+            "replacement"
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
     fn keyed_timer_churn_has_one_lookup_probe_per_removal() {
         const TIMERS: usize = 16_384;
 
         let start = Instant::now();
         let mut timers = TimerStore::default();
-        for key in 0..TIMERS {
+        let mut hashes = HashSet::with_capacity(TIMERS);
+        let mut keys = Vec::with_capacity(TIMERS);
+        let mut candidate = 0_usize;
+        while keys.len() < TIMERS {
+            if hashes.insert(timers.hash_key(&candidate)) {
+                keys.push(candidate);
+            }
+            candidate = candidate
+                .checked_add(1)
+                .expect("test key space must contain enough distinct hashes");
+        }
+        for (index, key) in keys.iter().copied().enumerate() {
             timers.replace(
                 key,
-                Some(start + Duration::from_secs((TIMERS - key) as u64)),
-                key as u64,
+                Some(start + Duration::from_secs((TIMERS - index) as u64)),
+                index as u64,
                 TimerMessage::Once(Some(())),
                 None,
             );
         }
-        for key in (0..TIMERS).rev() {
+        for key in keys.into_iter().rev() {
             assert!(timers.remove(&key).is_some());
         }
 

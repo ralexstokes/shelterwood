@@ -698,10 +698,65 @@ impl ScopeCell {
     }
 
     fn adopt_observation_gate(&self, gate: &Arc<Mutex<()>>) {
-        *self
-            .observation_gate
-            .lock()
-            .expect("observation gate handoff mutex poisoned") = Arc::clone(gate);
+        loop {
+            let current = self.observation_gate();
+            if Arc::ptr_eq(&current, gate) {
+                return;
+            }
+
+            // An operation that passed `with_observation_gate`'s pointer
+            // check is allowed to finish its complete observation edge before
+            // the handoff. Conversely, an operation that only captured this
+            // gate will see the replacement after acquiring it and retry.
+            let current_guard = current
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut installed = self
+                .observation_gate
+                .lock()
+                .expect("observation gate handoff mutex poisoned");
+            if Arc::ptr_eq(&current, &installed) {
+                *installed = Arc::clone(gate);
+                drop(installed);
+                self.adopt_descendant_observation_gates_locked(&current, gate);
+                drop(current_guard);
+                return;
+            }
+            drop(installed);
+            drop(current_guard);
+        }
+    }
+
+    /// Re-homes a resident subtree while its former tree gate is held. The
+    /// caller also holds the destination gate, so observers cannot enter
+    /// either half of the tree while the handoff is being installed.
+    fn adopt_descendant_observation_gates_locked(
+        &self,
+        previous: &Arc<Mutex<()>>,
+        gate: &Arc<Mutex<()>>,
+    ) {
+        let descendants = self.current_children.read_with(|children| {
+            children
+                .iter()
+                .filter_map(|resident| resident.slot.scope.as_ref().cloned())
+                .collect::<Vec<_>>()
+        });
+        for descendant in descendants {
+            let mut installed = descendant
+                .observation_gate
+                .lock()
+                .expect("observation gate handoff mutex poisoned");
+            if Arc::ptr_eq(&installed, previous) {
+                *installed = Arc::clone(gate);
+            } else {
+                assert!(
+                    Arc::ptr_eq(&installed, gate),
+                    "one resident tree must share one observation gate"
+                );
+            }
+            drop(installed);
+            descendant.adopt_descendant_observation_gates_locked(previous, gate);
+        }
     }
 
     /// Runs against the cell's current tree gate. Adoption can race an early
@@ -1164,8 +1219,8 @@ impl ScopeCell {
     }
 
     fn set_admitted_children(self: &Arc<Self>, children: Vec<Arc<SlotCell>>) {
-        let gate = self.observation_gate();
         self.with_observation_gate(|| {
+            let gate = self.observation_gate();
             self.clear_residents_locked();
             for child in children {
                 if let Some(scope) = &child.scope {
@@ -1187,8 +1242,8 @@ impl ScopeCell {
     }
 
     fn admit_child(self: &Arc<Self>, child: &Arc<SlotCell>) {
-        let gate = self.observation_gate();
         self.with_observation_gate(|| {
+            let gate = self.observation_gate();
             if let Some(scope) = &child.scope {
                 scope.adopt_observation_gate(&gate);
                 scope.parent.replace(Some(Arc::downgrade(self)));
@@ -3438,9 +3493,10 @@ mod tests {
 
     fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let id = ChildId::from(id);
         let member = MemberCell::new(
-            ChildId::from(id),
-            identity.mint_membership().expect("membership available"),
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
         );
         ScopeCell::new(
             member,
@@ -3490,6 +3546,26 @@ mod tests {
     }
 
     #[test]
+    fn admitted_subtree_rehomes_existing_descendants_to_one_gate() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        let leaf = isolated_scope("leaf", ScopeFlavor::Ordered);
+        let leaf_slot = SlotCell::new(Arc::clone(&leaf.member), Some(Arc::clone(&leaf)));
+        nested.set_admitted_children(vec![leaf_slot]);
+        assert!(Arc::ptr_eq(
+            &nested.observation_gate(),
+            &leaf.observation_gate()
+        ));
+
+        let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        root.set_admitted_children(vec![nested_slot]);
+
+        let root_gate = root.observation_gate();
+        assert!(Arc::ptr_eq(&root_gate, &nested.observation_gate()));
+        assert!(Arc::ptr_eq(&root_gate, &leaf.observation_gate()));
+    }
+
+    #[test]
     fn pre_admission_observer_retries_after_gate_handoff() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
@@ -3511,8 +3587,13 @@ mod tests {
             "observer must be waiting on the pre-admission gate"
         );
 
-        let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-        root.set_admitted_children(vec![slot]);
+        // Model the instant at which adoption owns the old gate and publishes
+        // the replacement. The waiting observer must acquire the old gate,
+        // detect this handoff, and retry on the root gate.
+        *nested
+            .observation_gate
+            .lock()
+            .expect("observation gate handoff mutex remains healthy") = root.observation_gate();
         drop(held);
         worker.join().expect("observer follows the gate handoff");
 
@@ -3540,6 +3621,67 @@ mod tests {
             );
             assert!(!phase.begin_drain(StopReason::Finished));
         }
+    }
+
+    #[test]
+    fn gate_handoff_waits_for_an_in_flight_observation_edge() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        let prior_gate = nested.observation_gate();
+        let (entered, entered_receiver) = std::sync::mpsc::sync_channel(0);
+        let (release, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let observer = Arc::clone(&nested);
+        let observation = std::thread::spawn(move || {
+            observer.with_observation_gate(|| {
+                entered.send(()).expect("test receiver remains available");
+                release_receiver
+                    .recv()
+                    .expect("test sender releases the observation edge");
+            });
+        });
+        entered_receiver
+            .recv()
+            .expect("observer enters the pre-admission edge");
+
+        let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        let adopting_root = Arc::clone(&root);
+        let (adopted, adopted_receiver) = std::sync::mpsc::sync_channel(0);
+        let adoption = std::thread::spawn(move || {
+            adopting_root.set_admitted_children(vec![slot]);
+            adopted.send(()).expect("test receiver remains available");
+        });
+
+        // The field, this test, and the active observation own three gate
+        // references. A fourth proves adoption reached the old gate and is
+        // blocked behind the complete observation edge rather than replacing
+        // it concurrently.
+        for _ in 0..100_000 {
+            if Arc::strong_count(&prior_gate) >= 4 {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            Arc::strong_count(&prior_gate) >= 4,
+            "adoption must synchronize through the prior observation gate"
+        );
+        assert!(matches!(
+            adopted_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        release
+            .send(())
+            .expect("active observation remains available");
+        observation.join().expect("observation edge completes");
+        adopted_receiver
+            .recv()
+            .expect("adoption reports completion after the edge");
+        adoption.join().expect("gate handoff completes");
+        assert!(Arc::ptr_eq(
+            &root.observation_gate(),
+            &nested.observation_gate()
+        ));
     }
 
     #[test]

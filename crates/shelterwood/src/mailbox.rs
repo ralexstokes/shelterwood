@@ -457,8 +457,13 @@ impl<M> SendOperation<M> {
 
     fn clear_registration(&self, registration: WaiterId) {
         let mut state = self.state.lock().expect("send operation mutex poisoned");
-        debug_assert_eq!(state.registration, Some(registration));
-        state.registration = None;
+        if state.registration == Some(registration) {
+            state.registration = None;
+        } else {
+            // A cancellation can win after terminal teardown detaches the
+            // queue but before it discharges this entry.
+            debug_assert!(state.registration.is_none());
+        }
     }
 
     fn observe(&self, incarnation: Incarnation) {
@@ -1045,11 +1050,11 @@ impl<M> MailboxCell<M> {
             }
         };
         if let Some(registration) = registration {
-            let removed = mailbox
-                .waiters
-                .remove(registration)
-                .expect("a waiting operation's registration must be live");
-            debug_assert!(Arc::ptr_eq(&removed, operation));
+            if let Some(removed) = mailbox.waiters.remove(registration) {
+                debug_assert!(Arc::ptr_eq(&removed, operation));
+            } else {
+                debug_assert!(matches!(mailbox.status, BindingStatus::Terminal(_)));
+            }
         }
         result
     }
@@ -1795,7 +1800,7 @@ mod tests {
         for _ in 0..SENDS {
             let mut send = Box::pin(actor.send(1));
             park_with(&mut send, Waker::noop());
-            sends.push(send);
+            sends.push(Some(send));
         }
         assert_eq!(
             mailbox
@@ -1807,9 +1812,18 @@ mod tests {
             SENDS
         );
 
-        // Reverse cancellation stresses head, tail, and interior unlinking
-        // without making the result depend on scheduler timing.
-        while let Some(send) = sends.pop() {
+        // Exercise one interior, the head, and the tail explicitly, then a
+        // deterministic odd/even permutation. The counter measures queue
+        // operations rather than elapsed time or scheduler behavior.
+        for index in [SENDS / 2, 0, SENDS - 1] {
+            drop(sends[index].take().expect("selected send remains live"));
+        }
+        for index in (1..SENDS - 1).step_by(2) {
+            if let Some(send) = sends[index].take() {
+                drop(send);
+            }
+        }
+        for send in sends.into_iter().flatten() {
             drop(send);
         }
 
@@ -1898,5 +1912,53 @@ mod tests {
             };
             assert_eq!(error.kind, SendErrorKind::Terminated);
         }
+    }
+
+    #[test]
+    fn cancellation_can_race_detached_terminal_teardown() {
+        let (mailbox, actor) = actor();
+        let mut send = Box::pin(actor.send(1));
+        park_with(&mut send, Waker::noop());
+
+        let teardown = MailboxControl::prepare_termination(&*mailbox)
+            .expect("live mailbox prepares terminal teardown");
+        // Teardown is deliberately retained: cancellation sees terminal state
+        // after the waiter queue was detached but before it was discharged.
+        drop(send);
+        drop(teardown);
+
+        assert!(
+            mailbox
+                .state
+                .lock()
+                .expect("mailbox mutex remains healthy")
+                .waiters
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_waiter_id_cannot_unlink_a_later_registration() {
+        let mut waiters = super::WaiterQueue::default();
+        let first = super::SendOperation::new(1_u8);
+        let first_id = waiters.push_back(Arc::clone(&first));
+        first.register(first_id);
+        let removed = waiters.remove(first_id).expect("first waiter is live");
+        removed.clear_registration(first_id);
+
+        let second = super::SendOperation::new(2_u8);
+        let second_id = waiters.push_back(Arc::clone(&second));
+        second.register(second_id);
+        assert_ne!(first_id, second_id, "waiter identities are never reused");
+        assert!(
+            waiters.remove(first_id).is_none(),
+            "a stale cancellation cannot unlink a later waiter"
+        );
+        let removed = waiters
+            .remove(second_id)
+            .expect("second waiter remains live");
+        assert!(Arc::ptr_eq(&removed, &second));
+        removed.clear_registration(second_id);
+        assert!(waiters.is_empty());
     }
 }

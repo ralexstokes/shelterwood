@@ -4,6 +4,7 @@ use std::{
     fmt,
     future::Future,
     ops::RangeBounds,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,6 +26,70 @@ pub(crate) fn now() -> std::time::Instant {
 
 pub(crate) fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
+}
+
+/// Ownership wrapper for user values retained by framework state.
+///
+/// Dropping the wrapper transfers the value to an isolated blocking task, so
+/// framework futures never run user destruction as part of their own drop
+/// glue. Callers that need to classify destruction can take the value and
+/// join a dedicated blocking task explicitly.
+pub(crate) struct Isolated<T: Send + 'static> {
+    value: Option<T>,
+}
+
+impl<T: Send + 'static> Isolated<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self { value: Some(value) }
+    }
+
+    pub(crate) fn get(&self) -> &T {
+        self.value
+            .as_ref()
+            .expect("isolated user value was already taken")
+    }
+
+    pub(crate) fn get_mut(&mut self) -> &mut T {
+        self.value
+            .as_mut()
+            .expect("isolated user value was already taken")
+    }
+
+    pub(crate) fn take(&mut self) -> Option<T> {
+        self.value.take()
+    }
+}
+
+impl<T: Send + 'static> Drop for Isolated<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            dispose_detached(value);
+        }
+    }
+}
+
+struct PanicSafeDrop<T>(Option<T>);
+
+impl<T> Drop for PanicSafeDrop<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            let _ = catch_unwind(AssertUnwindSafe(|| drop(value)));
+        }
+    }
+}
+
+/// Detaches potentially blocking or panicking user destruction from the
+/// caller. The guard also contains a panic if task/thread creation itself
+/// fails and drops the closure on the submitting thread.
+pub(crate) fn dispose_detached<T: Send + 'static>(value: T) {
+    let guarded = PanicSafeDrop(Some(value));
+    if is_available() {
+        drop(task::spawn_blocking(move || drop(guarded)));
+    } else {
+        let _ = std::thread::Builder::new()
+            .name("shelterwood-disposal".to_owned())
+            .spawn(move || drop(guarded));
+    }
 }
 
 /// A one-shot, multi-waiter signal backed by Tokio's waiter queue.

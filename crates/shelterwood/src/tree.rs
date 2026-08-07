@@ -157,7 +157,7 @@ pub(crate) enum ChildConstruction {
 
 enum DefinitionState {
     Undefined,
-    Defined(ChildConstruction),
+    Defined(crate::runtime::Isolated<ChildConstruction>),
     Lowered,
 }
 
@@ -179,7 +179,9 @@ impl SlotCell {
     pub(crate) fn define(&self, definition: ChildConstruction) {
         let mut state = self.definition.lock().expect("definition mutex poisoned");
         match *state {
-            DefinitionState::Undefined => *state = DefinitionState::Defined(definition),
+            DefinitionState::Undefined => {
+                *state = DefinitionState::Defined(crate::runtime::Isolated::new(definition));
+            }
             DefinitionState::Defined(_) | DefinitionState::Lowered => {
                 panic!("a child slot was defined more than once")
             }
@@ -193,7 +195,7 @@ impl SlotCell {
         )
     }
 
-    pub(crate) fn take_definition(&self) -> Option<ChildConstruction> {
+    pub(crate) fn take_definition(&self) -> Option<crate::runtime::Isolated<ChildConstruction>> {
         let mut state = self.definition.lock().expect("definition mutex poisoned");
         match std::mem::replace(&mut *state, DefinitionState::Lowered) {
             DefinitionState::Defined(definition) => Some(definition),
@@ -205,7 +207,7 @@ impl SlotCell {
         }
     }
 
-    pub(crate) fn take_defined(&self) -> Option<ChildConstruction> {
+    pub(crate) fn take_defined(&self) -> Option<crate::runtime::Isolated<ChildConstruction>> {
         let mut state = self.definition.lock().expect("definition mutex poisoned");
         match std::mem::replace(&mut *state, DefinitionState::Lowered) {
             DefinitionState::Defined(definition) => Some(definition),
@@ -311,7 +313,7 @@ impl BuilderCore {
             let definition = slot
                 .take_definition()
                 .expect("validated slot must have a definition");
-            let (options, one_shot) = match &definition {
+            let (options, one_shot) = match definition.get() {
                 ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
                 ChildConstruction::Task(definition) => (&definition.options, false),
                 ChildConstruction::TaskOnce(definition) => (&definition.options, true),
@@ -388,7 +390,7 @@ impl Drop for ScopePlan {
 
 pub(crate) struct ChildPlan {
     pub(crate) slot: Arc<SlotCell>,
-    pub(crate) construction: ChildConstruction,
+    pub(crate) construction: crate::runtime::Isolated<ChildConstruction>,
     pub(crate) options: ResolvedCommonOptions,
 }
 

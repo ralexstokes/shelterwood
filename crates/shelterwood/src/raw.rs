@@ -290,7 +290,9 @@ enum TimerMessage<M> {
 
 struct TimerEntry<M> {
     key: Box<dyn ErasedTimerKey>,
-    deadline: Instant,
+    /// `None` when the requested delay overflows the clock: a deadline that
+    /// never arrives, mirroring the offload path — never "due now".
+    deadline: Option<Instant>,
     arming_order: u64,
     message: TimerMessage<M>,
     period: Option<Duration>,
@@ -376,11 +378,12 @@ impl<M> Default for RawResources<M> {
 }
 
 impl<M> RawResources<M> {
-    fn freeze(&mut self) {
+    fn freeze(&mut self) -> usize {
         if !self.accepting {
-            return;
+            return 0;
         }
         self.accepting = false;
+        let dropped_continuations = self.continuations.len();
         self.continuations.clear();
         self.timers.clear();
         self.fired_batch = None;
@@ -388,6 +391,7 @@ impl<M> RawResources<M> {
         for offload in &mut self.offloads {
             offload.cancel();
         }
+        dropped_continuations
     }
 
     async fn join_offloads(&mut self) {
@@ -403,7 +407,7 @@ impl<M> RawResources<M> {
 
 impl<M> Drop for RawResources<M> {
     fn drop(&mut self) {
-        self.freeze();
+        let _ = self.freeze();
     }
 }
 
@@ -434,6 +438,7 @@ pub struct RawContext<M> {
     abort: CancellationToken,
     ready: Latch,
     local_stop: Latch,
+    readiness: Readiness,
     mailbox_shutdown: MailboxShutdown,
     mailbox: Arc<MailboxCell<M>>,
     receiver: MailboxReceiver<M>,
@@ -451,7 +456,12 @@ impl<M> fmt::Debug for RawContext<M> {
 }
 
 impl<M: Send + 'static> RawContext<M> {
-    fn new(run: RawRunContext, myself: ActorRef<M>, mailbox: Arc<MailboxCell<M>>) -> Self {
+    fn new(
+        run: RawRunContext,
+        myself: ActorRef<M>,
+        mailbox: Arc<MailboxCell<M>>,
+        readiness: Readiness,
+    ) -> Self {
         Self {
             id: run.id,
             incarnation: run.incarnation,
@@ -461,6 +471,7 @@ impl<M: Send + 'static> RawContext<M> {
             abort: CancellationToken::from_latch(run.abort),
             ready: run.ready,
             local_stop: run.local_stop,
+            readiness,
             mailbox_shutdown: run.mailbox_shutdown,
             mailbox: Arc::clone(&mailbox),
             receiver: MailboxReceiver::new(mailbox, run.incarnation),
@@ -515,6 +526,16 @@ impl<M: Send + 'static> RawContext<M> {
         self.mailbox_shutdown
     }
 
+    /// Returns the engine-resolved effective readiness mode for this
+    /// incarnation: the definition-level override when one was given,
+    /// otherwise the actor's declared mode. This is the single source the
+    /// gate is driven by (§6) — decorators and the blanket handler loop
+    /// consult it rather than re-deriving their own.
+    #[must_use]
+    pub fn readiness(&self) -> Readiness {
+        self.readiness
+    }
+
     /// Releases this incarnation's readiness gate.
     pub fn mark_ready(&self) {
         if !self.is_stopping() {
@@ -522,9 +543,17 @@ impl<M: Send + 'static> RawContext<M> {
         }
     }
 
-    pub(crate) fn request_self_stop(&mut self) {
+    /// Requests a clean self-stop of this incarnation.
+    ///
+    /// External intake freezes at this call — the drained set is exactly the
+    /// already-accepted prefix (§5.1's close point) — queued continuations
+    /// and timers are discarded, and `recv` begins yielding the frozen
+    /// prefix followed by `None`. Idempotent. This is the primitive the
+    /// blanket handler loop's `Context::stop` is built on (§1 principle 5);
+    /// the child's configured §10 ladder bounds the stop.
+    pub fn stop(&mut self) {
         self.mailbox.freeze(self.incarnation);
-        self.resources.freeze();
+        self.freeze_and_report();
         self.local_stop.fire();
     }
 
@@ -655,12 +684,12 @@ impl<M: Send + 'static> RawContext<M> {
     pub async fn recv(&mut self) -> Option<M> {
         loop {
             if self.local_stop.is_fired() {
-                self.resources.freeze();
+                self.freeze_and_report();
                 self.shutdown.cancelled().await;
                 return None;
             }
             if self.shutdown.is_cancelled() {
-                self.resources.freeze();
+                self.freeze_and_report();
                 return None;
             }
             if let Some(message) = self.next_ready(false) {
@@ -673,7 +702,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// Receives one ready event without awaiting or consulting shutdown.
     pub fn try_recv(&mut self) -> Option<M> {
         if self.is_stopping() {
-            self.resources.freeze();
+            self.freeze_and_report();
             self.receiver.try_recv()
         } else {
             self.next_ready(false)
@@ -699,7 +728,7 @@ impl<M: Send + 'static> RawContext<M> {
         }
         self.resources.next_timer_order = self.resources.next_timer_order.saturating_add(1);
         let now = crate::driver::now();
-        let deadline = now.checked_add(after).unwrap_or(now);
+        let deadline = now.checked_add(after);
         self.resources.timers.push(TimerEntry {
             key: Box::new(StoredTimerKey(key)),
             deadline,
@@ -724,6 +753,12 @@ impl<M: Send + 'static> RawContext<M> {
         if self.is_stopping() || !self.resources.accepting {
             return Err(Rejected::new((work, continuation)));
         }
+        // Completed offloads no longer need their resources; prune them here
+        // so a long-lived incarnation's ledger stays O(in-flight), not
+        // O(offloads-ever-issued).
+        self.resources
+            .offloads
+            .retain(|offload| !offload.finished.is_fired());
 
         let cancellation = Latch::default();
         let finished = Latch::default();
@@ -917,7 +952,7 @@ impl<M: Send + 'static> RawContext<M> {
             .resources
             .timers
             .iter()
-            .filter(|timer| timer.deadline <= now)
+            .filter(|timer| timer.deadline.is_some_and(|deadline| deadline <= now))
             .map(|timer| (timer.deadline, timer.arming_order))
             .collect();
         if elapsed.is_empty() {
@@ -955,7 +990,7 @@ impl<M: Send + 'static> RawContext<M> {
             TimerMessage::Interval(make_message) => {
                 let period = period.expect("an interval timer must retain its period");
                 let now = crate::driver::now();
-                *deadline = now.checked_add(period).unwrap_or(now);
+                *deadline = now.checked_add(period);
                 Some(make_message())
             }
         }
@@ -965,7 +1000,7 @@ impl<M: Send + 'static> RawContext<M> {
         self.resources
             .timers
             .iter()
-            .map(|timer| timer.deadline)
+            .filter_map(|timer| timer.deadline)
             .min()
     }
 
@@ -993,7 +1028,21 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     pub(crate) fn freeze_resources(&mut self) {
-        self.resources.freeze();
+        self.freeze_and_report();
+    }
+
+    /// Freezes incarnation resources, reporting §5.2's discarded
+    /// continuations on the exit path.
+    fn freeze_and_report(&mut self) {
+        let dropped = self.resources.freeze();
+        if dropped > 0 {
+            tracing::debug!(
+                id = %self.id,
+                incarnation = ?self.incarnation,
+                dropped_continuations = dropped,
+                "queued continuations discarded at the stop freeze"
+            );
+        }
     }
 
     pub(crate) async fn join_resources(&mut self) {
@@ -1197,7 +1246,8 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
             let Self { mut actor, mailbox } = *self;
             let incarnation = context.incarnation;
             let myself = ActorRef::new(Arc::clone(&context.member), Arc::clone(&mailbox));
-            let mut raw = RawContext::new(context, myself, Arc::clone(&mailbox));
+            let readiness = context.readiness_override.unwrap_or(actor.readiness());
+            let mut raw = RawContext::new(context, myself, Arc::clone(&mailbox), readiness);
             let outcome = CatchUnwindFuture::new(actor.run(&mut raw)).await;
             mailbox.freeze(incarnation);
             raw.freeze_resources();
@@ -1274,5 +1324,6 @@ pub(crate) struct RawRunContext {
     pub(crate) abort: Latch,
     pub(crate) ready: Latch,
     pub(crate) local_stop: Latch,
+    pub(crate) readiness_override: Option<Readiness>,
     pub(crate) mailbox_shutdown: MailboxShutdown,
 }

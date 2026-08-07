@@ -122,7 +122,7 @@ impl<'a, A: Actor> Context<'a, A> {
     /// Requests a clean local stop after the current callback.
     pub fn stop(&mut self) {
         if !self.draining {
-            self.raw.request_self_stop();
+            self.raw.stop();
         }
     }
 
@@ -360,7 +360,7 @@ impl<A: Actor> RawActor for Handler<A> {
             let mut context = Context::<A>::new(raw, false);
             A::init(args, &mut context).await?
         };
-        if self.readiness == Readiness::AfterInit {
+        if raw.readiness() == Readiness::AfterInit {
             raw.mark_ready();
         }
 
@@ -369,7 +369,7 @@ impl<A: Actor> RawActor for Handler<A> {
             let message = match received {
                 Ok(Some(message)) => message,
                 Ok(None) => break,
-                Err(payload) => resume_after_actor_drop(actor, payload),
+                Err(payload) => resume_after_teardown(raw, actor, payload).await,
             };
             let handled = {
                 let mut context = Context::<A>::new(raw, false);
@@ -377,7 +377,7 @@ impl<A: Actor> RawActor for Handler<A> {
             };
             match handled {
                 Ok(outcome) => outcome?,
-                Err(payload) => resume_after_actor_drop(actor, payload),
+                Err(payload) => resume_after_teardown(raw, actor, payload).await,
             }
         }
 
@@ -390,7 +390,7 @@ impl<A: Actor> RawActor for Handler<A> {
                     };
                     match handled {
                         Ok(outcome) => outcome?,
-                        Err(payload) => resume_after_actor_drop(actor, payload),
+                        Err(payload) => resume_after_teardown(raw, actor, payload).await,
                     }
                 }
             }
@@ -403,13 +403,23 @@ impl<A: Actor> RawActor for Handler<A> {
 
         let mut context = StopContext::<A>::new(raw);
         if let Err(payload) = CatchUnwindFuture::new(actor.on_stop(&mut context)).await {
-            resume_after_actor_drop(actor, payload);
+            resume_after_teardown(raw, actor, payload).await;
         }
         Ok(())
     }
 }
 
-fn resume_after_actor_drop<A>(actor: A, payload: Box<dyn std::any::Any + Send + 'static>) -> ! {
+/// Resumes a caught callback panic after §5.5's teardown order: offloads and
+/// other incarnation-owned work are destroyed (frozen, cancelled, joined)
+/// before actor state, and the destructor runs outside the callback's unwind
+/// per §7's containment boundary.
+async fn resume_after_teardown<A, M: Send + 'static>(
+    raw: &mut RawContext<M>,
+    actor: A,
+    payload: Box<dyn std::any::Any + Send + 'static>,
+) -> ! {
+    raw.freeze_resources();
+    raw.join_resources().await;
     let _ = catch_unwind(AssertUnwindSafe(|| drop(actor)));
     resume_unwind(payload)
 }

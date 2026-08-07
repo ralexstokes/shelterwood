@@ -516,3 +516,83 @@ async fn run_blocking_panic_resumes_where_awaited() {
 async fn primary_callback_panic_survives_a_panicking_actor_destructor() {
     assert_pre_ready_panic(PanicMode::HandlerAndDrop, "primary handler panic", true).await;
 }
+
+enum CrashTeardownMessage {
+    Start,
+}
+
+struct CrashTeardownActor {
+    _drop: DropLog,
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Actor for CrashTeardownActor {
+    type Msg = CrashTeardownMessage;
+    type Args = Arc<Mutex<Vec<&'static str>>>;
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            _drop: DropLog {
+                name: "actor",
+                log: Arc::clone(&args),
+            },
+            log: args,
+        })
+    }
+
+    async fn handle(
+        &mut self,
+        CrashTeardownMessage::Start: Self::Msg,
+        context: &mut Context<'_, Self>,
+    ) -> ExitResult {
+        let drop = DropLog {
+            name: "offload",
+            log: Arc::clone(&self.log),
+        };
+        context
+            .offload(
+                async move {
+                    let _drop = drop;
+                    std::future::pending::<()>().await;
+                },
+                |_| CrashTeardownMessage::Start,
+                Duration::MAX,
+            )
+            .expect("offload accepted");
+        panic!("injected handle panic");
+    }
+}
+
+/// §5.5's teardown order holds on the crash path too: a `handle` panic joins
+/// and destroys in-flight offload work before actor state is dropped.
+#[tokio::test]
+async fn incarnation_offloads_are_destroyed_before_actor_state_on_panic() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "crash-teardown",
+            ActorOnceDef::<CrashTeardownActor>::new(Arc::clone(&log)),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor
+        .send(CrashTeardownMessage::Start)
+        .await
+        .expect("actor live");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            log.lock().expect("drop log mutex poisoned").len() == 2
+        })
+        .await
+    );
+    assert_eq!(
+        *log.lock().expect("drop log mutex poisoned"),
+        ["offload", "actor"]
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}

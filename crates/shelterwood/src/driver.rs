@@ -1360,6 +1360,7 @@ impl ScopeRuntime {
                         abort: abort.clone(),
                         ready: ready.clone(),
                         local_stop: local_stop.clone(),
+                        readiness_override: child.options.readiness_override,
                         mailbox_shutdown: child.options.mailbox_shutdown,
                     },
                 },

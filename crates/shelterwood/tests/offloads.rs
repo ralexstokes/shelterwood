@@ -9,7 +9,8 @@ use std::{
 use crate::common::poll_until;
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
-    Readiness, StartupError, StartupFailureCause, Tree,
+    LifecycleEventKind, LifecycleItem, Readiness, Shutdown, StartupError, StartupFailureCause,
+    Tree,
 };
 
 enum ZeroMessage {
@@ -590,6 +591,137 @@ async fn assert_pre_ready_panic(mode: PanicMode, expected: &str, trigger: bool) 
 async fn offload_future_and_continuation_panics_resume_on_actor_task() {
     assert_pre_ready_panic(PanicMode::Future, "offload future panic", false).await;
     assert_pre_ready_panic(PanicMode::Continuation, "offload continuation panic", false).await;
+}
+
+#[derive(Clone, Copy)]
+enum QueuedPanicMode {
+    Stop,
+    HandlerError,
+    HardAbort,
+}
+
+struct QueuedPanicActor {
+    mode: QueuedPanicMode,
+    queued: Arc<AtomicBool>,
+}
+
+impl Actor for QueuedPanicActor {
+    type Msg = PanicMessage;
+    type Args = (QueuedPanicMode, Arc<AtomicBool>);
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            mode: args.0,
+            queued: args.1,
+        })
+    }
+
+    async fn handle(&mut self, _: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        let guard = context
+            .offload_scoped(
+                async {
+                    panic!("owned offload panic");
+                    #[allow(unreachable_code)]
+                    ()
+                },
+                |_| PanicMessage::Delivery,
+                Duration::MAX,
+            )
+            .expect("offload accepted");
+        guard.finished().await;
+        self.queued.store(true, Ordering::SeqCst);
+        match self.mode {
+            QueuedPanicMode::Stop => {
+                context.stop();
+                Ok(())
+            }
+            QueuedPanicMode::HandlerError => Err(ExitError::message("secondary handler error")),
+            QueuedPanicMode::HardAbort => std::future::pending().await,
+        }
+    }
+}
+
+async fn assert_queued_panic_beats_orderly_exit(mode: QueuedPanicMode) {
+    let queued = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "panic",
+            ActorOnceDef::<QueuedPanicActor>::new((mode, Arc::clone(&queued)))
+                .readiness(Readiness::Manual),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    actor
+        .send(PanicMessage::Trigger)
+        .await
+        .expect("mailbox accepts before readiness");
+    let message = startup_panic_message(
+        system
+            .wait_started()
+            .await
+            .expect_err("queued offload panic fails startup"),
+    );
+    assert_eq!(message.as_deref(), Some("owned offload panic"));
+    assert!(queued.load(Ordering::SeqCst));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root shuts down");
+}
+
+#[tokio::test]
+async fn queued_offload_panic_survives_stop_and_handler_error() {
+    assert_queued_panic_beats_orderly_exit(QueuedPanicMode::Stop).await;
+    assert_queued_panic_beats_orderly_exit(QueuedPanicMode::HandlerError).await;
+}
+
+#[tokio::test]
+async fn queued_offload_panic_survives_hard_abort() {
+    let queued = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "panic",
+            ActorOnceDef::<QueuedPanicActor>::new((
+                QueuedPanicMode::HardAbort,
+                Arc::clone(&queued),
+            ))
+            .readiness(Readiness::Manual)
+            .shutdown(Shutdown::Abort),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    actor
+        .send(PanicMessage::Trigger)
+        .await
+        .expect("mailbox accepts before readiness");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            queued.load(Ordering::SeqCst)
+        })
+        .await,
+        "offload panic is queued before hard abort"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("hard abort bounds shutdown");
+
+    let mut panic_message = None;
+    while let Some(item) = events.recv().await {
+        let LifecycleItem::Event(event) = item else {
+            panic!("small fixture must not lag");
+        };
+        if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+            && id.as_str() == "panic"
+            && let ExitKind::Panicked { message } = exit.kind()
+        {
+            panic_message = message.clone();
+        }
+    }
+    assert_eq!(panic_message.as_deref(), Some("owned offload panic"));
 }
 
 #[tokio::test]

@@ -200,10 +200,27 @@ enum QueuedEvent<M> {
         cancellation: Latch,
         make_message: DeferredMessage<M>,
     },
-    Panic {
-        cancellation: Latch,
-        payload: PanicPayload,
-    },
+}
+
+#[derive(Default)]
+struct PanicSlot {
+    payload: Mutex<Option<PanicPayload>>,
+}
+
+impl PanicSlot {
+    fn record(&self, payload: PanicPayload) {
+        let mut pending = self.payload.lock().expect("offload panic mutex poisoned");
+        if pending.is_none() {
+            *pending = Some(payload);
+        }
+    }
+
+    fn take(&self) -> Option<PanicPayload> {
+        self.payload
+            .lock()
+            .expect("offload panic mutex poisoned")
+            .take()
+    }
 }
 
 struct SequencedEvent<M> {
@@ -360,6 +377,7 @@ struct RawResources<M> {
     next_timer_order: u64,
     fired_batch: Option<FiredTimerBatch>,
     events: Arc<EventQueue<M>>,
+    panic: Arc<PanicSlot>,
     event_watcher: SignalWatcher,
     offloads: Vec<OffloadResource>,
 }
@@ -376,6 +394,7 @@ impl<M> Default for RawResources<M> {
             next_timer_order: 0,
             fired_batch: None,
             events,
+            panic: Arc::new(PanicSlot::default()),
             event_watcher,
             offloads: Vec::new(),
         }
@@ -392,11 +411,17 @@ impl<M> RawResources<M> {
         self.continuations.clear();
         self.timers.clear();
         self.fired_batch = None;
-        self.events.clear();
         for offload in &mut self.offloads {
             offload.cancel();
         }
+        self.events.clear();
         dropped_continuations
+    }
+
+    fn resume_pending_panic(&self) {
+        if let Some(payload) = self.panic.take() {
+            resume_unwind(payload);
+        }
     }
 
     async fn join_offloads(&mut self) {
@@ -407,12 +432,16 @@ impl<M> RawResources<M> {
         }
         self.events.clear();
         self.offloads.clear();
+        self.resume_pending_panic();
     }
 }
 
 impl<M> Drop for RawResources<M> {
     fn drop(&mut self) {
         let _ = self.freeze();
+        if !std::thread::panicking() {
+            self.resume_pending_panic();
+        }
     }
 }
 
@@ -784,6 +813,7 @@ impl<M: Send + 'static> RawContext<M> {
             armed: true,
         });
         let events = Arc::clone(&self.resources.events);
+        let panic = Arc::clone(&self.resources.panic);
         if deadline.is_zero() {
             drop(work);
             events.push(QueuedEvent::Deliver {
@@ -827,10 +857,8 @@ impl<M: Send + 'static> RawContext<M> {
                     });
                 }
                 crate::driver::Selected::Second(Err(payload)) => {
-                    events.push(QueuedEvent::Panic {
-                        cancellation: event_cancellation,
-                        payload,
-                    });
+                    panic.record(payload);
+                    events.signal.pulse();
                 }
             }
             event_finished.fire();
@@ -848,6 +876,7 @@ impl<M: Send + 'static> RawContext<M> {
 
     fn next_ready(&mut self, allow_frozen_mailbox: bool) -> Option<M> {
         loop {
+            self.resources.resume_pending_panic();
             self.begin_fired_batch();
             if let Some(mut batch) = self.resources.fired_batch.take() {
                 if !self.resources.continuation_needs_external
@@ -946,16 +975,6 @@ impl<M: Send + 'static> RawContext<M> {
                 cancellation,
                 make_message,
             } => (!cancellation.is_fired()).then(make_message),
-            QueuedEvent::Panic {
-                cancellation,
-                payload,
-            } => {
-                if cancellation.is_fired() {
-                    None
-                } else {
-                    resume_unwind(payload)
-                }
-            }
         }
     }
 
@@ -1059,6 +1078,7 @@ impl<M: Send + 'static> RawContext<M> {
                 "queued continuations discarded at the stop freeze"
             );
         }
+        self.resources.resume_pending_panic();
     }
 
     pub(crate) async fn join_resources(&mut self) {

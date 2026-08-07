@@ -1,10 +1,13 @@
 //! Minimal loop-owning raw actors and their incarnation context.
 
 use std::{
+    any::Any,
     fmt,
     future::Future,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{Arc, Mutex},
+    task::{Context as TaskPollContext, Poll},
 };
 
 use crate::{
@@ -14,6 +17,52 @@ use crate::{
     mailbox::{MailboxCell, MailboxControl, MailboxReceiver},
     policy::CommonOptions,
 };
+
+type PanicPayload = Box<dyn Any + Send + 'static>;
+
+/// Polls a future behind a panic boundary so a panic can be recorded before
+/// any surrounding state is destroyed (§7's containment boundary).
+pub(crate) struct CatchUnwindFuture<F> {
+    future: Option<Pin<Box<F>>>,
+}
+
+impl<F> CatchUnwindFuture<F> {
+    pub(crate) fn new(future: F) -> Self {
+        Self {
+            future: Some(Box::pin(future)),
+        }
+    }
+}
+
+impl<F: Future> Future for CatchUnwindFuture<F> {
+    type Output = Result<F::Output, PanicPayload>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut TaskPollContext<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let polled = catch_unwind(AssertUnwindSafe(|| {
+            this.future
+                .as_mut()
+                .expect("a completed panic boundary was polled again")
+                .as_mut()
+                .poll(context)
+        }));
+        match polled {
+            Ok(Poll::Ready(value)) => {
+                let future = this.future.take();
+                match catch_unwind(AssertUnwindSafe(|| drop(future))) {
+                    Ok(()) => Poll::Ready(Ok(value)),
+                    Err(payload) => Poll::Ready(Err(payload)),
+                }
+            }
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(payload) => {
+                let future = this.future.take();
+                let _ = catch_unwind(AssertUnwindSafe(|| drop(future)));
+                Poll::Ready(Err(payload))
+            }
+        }
+    }
+}
 
 /// Minimal actor contract for application-owned receive loops.
 pub trait RawActor: Send + 'static {
@@ -342,11 +391,22 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
             let incarnation = context.incarnation;
             let myself = ActorRef::new(Arc::clone(&context.member), Arc::clone(&mailbox));
             let mut raw = RawContext::new(context, myself, Arc::clone(&mailbox));
-            let result = actor.run(&mut raw).await;
+            // The panic boundary sits before the actor value is destroyed
+            // (§7): a `run` panic must never unwind through the actor's own
+            // destructor, where a second panic would abort the process.
+            let outcome = CatchUnwindFuture::new(actor.run(&mut raw)).await;
             mailbox.freeze(incarnation);
             drop(raw);
-            drop(actor);
-            result
+            match outcome {
+                Ok(result) => {
+                    drop(actor);
+                    result
+                }
+                Err(payload) => {
+                    let _ = catch_unwind(AssertUnwindSafe(|| drop(actor)));
+                    resume_unwind(payload)
+                }
+            }
         })
     }
 }

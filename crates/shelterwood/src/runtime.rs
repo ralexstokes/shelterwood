@@ -102,6 +102,10 @@ impl<T> OneShotSender<T> {
     pub(crate) fn send(self, value: T) -> Result<(), T> {
         self.0.send(value)
     }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
 }
 
 impl<T> OneShotReceiver<T> {

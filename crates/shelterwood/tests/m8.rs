@@ -185,6 +185,7 @@ enum WatchMessage {
     UnwatchTask,
     CancelScope,
     WatchTerminalTask,
+    WatchTerminalTaskAgain,
     WatchTerminalScope,
 }
 
@@ -239,6 +240,11 @@ impl RawActor for WatchAllActor {
                     context
                         .watch(&self.task, |event| WatchMessage::Event(3, event))
                         .expect("terminal task watch accepted");
+                }
+                WatchMessage::WatchTerminalTaskAgain => {
+                    context
+                        .watch(&self.task, |event| WatchMessage::Event(5, event))
+                        .expect("terminal task re-watch accepted");
                 }
                 WatchMessage::WatchTerminalScope => {
                     context
@@ -447,6 +453,24 @@ async fn watches_cover_all_handle_kinds_replace_cancel_and_report_terminal_targe
                     && event.membership == task.membership()
                     && !matches!(event.kind, MonitorEventKind::Started { .. })
             })
+    );
+    watcher
+        .send(WatchMessage::WatchTerminalTaskAgain)
+        .await
+        .expect("terminal-task re-watch command accepted");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            events
+                .lock()
+                .expect("monitor event log mutex poisoned")
+                .iter()
+                .any(|(generation, event)| {
+                    *generation == 5
+                        && event.membership == task.membership()
+                        && matches!(event.kind, MonitorEventKind::Removed { .. })
+                })
+        })
+        .await
     );
 
     watcher

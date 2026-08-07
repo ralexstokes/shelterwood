@@ -308,6 +308,9 @@ impl<M> MonitorSink<M> {
             None
         }?;
         let terminal = matches!(event.kind, MonitorEventKind::Removed { .. });
+        if terminal {
+            state.active = false;
+        }
         let wrap = Arc::clone(&state.wrap);
         drop(state);
         if terminal {

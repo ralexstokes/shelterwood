@@ -141,48 +141,41 @@ async fn rebind_refreshes_all_overflow_waiter_incarnation_evidence() {
         .expect("first incarnation queue fills");
     let width = Duration::from_secs(10);
 
-    let promoted_actor = actor.clone();
-    let promoted = tokio::spawn(async move {
-        promoted_actor
-            .send_timeout(EvidenceMessage::Value, width)
-            .await
-    });
-    tokio::task::yield_now().await;
-    let overflow_actor = actor.clone();
-    let overflow = tokio::spawn(async move {
-        overflow_actor
-            .send_timeout(EvidenceMessage::Value, width)
-            .await
-    });
-    tokio::task::yield_now().await;
-    let call_actor = actor.clone();
-    let call = tokio::spawn(async move { call_actor.call(EvidenceMessage::Ask, width).await });
-    tokio::task::yield_now().await;
-    assert!(!promoted.is_finished());
-    assert!(!overflow.is_finished());
-    assert!(!call.is_finished());
+    let mut promoted = Box::pin(actor.send_timeout(EvidenceMessage::Value, width));
+    let mut overflow = Box::pin(actor.send_timeout(EvidenceMessage::Value, width));
+    let mut call = Box::pin(actor.call(EvidenceMessage::Ask, width));
+    assert!(poll_once(promoted.as_mut()).is_pending());
+    assert!(poll_once(overflow.as_mut()).is_pending());
+    assert!(poll_once(call.as_mut()).is_pending());
 
     fail_first.release();
-    let replacement = promoted
+    let mut replacement = None;
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            if let std::task::Poll::Ready(result) = poll_once(promoted.as_mut()) {
+                replacement = Some(result.expect("first waiter enters replacement capacity"));
+                true
+            } else {
+                false
+            }
+        })
         .await
-        .expect("promoted send task joins")
-        .expect("first waiter enters replacement capacity");
+    );
+    let replacement = replacement.expect("replacement bind promotes the first waiter");
     assert!(replacement.supersedes(first));
     assert_eq!(factories.load(Ordering::SeqCst), 2);
-    assert!(!overflow.is_finished());
-    assert!(!call.is_finished());
+    assert!(poll_once(overflow.as_mut()).is_pending());
+    assert!(poll_once(call.as_mut()).is_pending());
 
     tokio::time::advance(width).await;
-    let send_error = overflow
-        .await
-        .expect("overflow send task joins")
-        .expect_err("overflow send times out");
+    let std::task::Poll::Ready(Err(send_error)) = poll_once(overflow.as_mut()) else {
+        panic!("overflow send times out");
+    };
     assert_eq!(send_error.kind, SendErrorKind::TimedOut);
     assert_eq!(send_error.incarnation_observed, Some(replacement));
-    let call_error = call
-        .await
-        .expect("overflow call task joins")
-        .expect_err("overflow call times out before acceptance");
+    let std::task::Poll::Ready(Err(call_error)) = poll_once(call.as_mut()) else {
+        panic!("overflow call times out before acceptance");
+    };
     assert_eq!(call_error.kind, CallErrorKind::AcceptanceTimedOut);
     assert_eq!(call_error.incarnation_observed, Some(replacement));
 

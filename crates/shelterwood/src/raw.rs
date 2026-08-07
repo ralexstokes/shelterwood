@@ -19,7 +19,8 @@ use crate::{
     SendPayload, Shutdown, WatchTarget,
     driver::{ActorWork, Latch, Signal, SignalWatcher},
     mailbox::{
-        MailboxCell, MailboxControl, MailboxKeyExtractor, MailboxReceiver, mailbox_key_extractor,
+        MailboxCell, MailboxControl, MailboxKeyExtractor, MailboxReceiver, MessageSizeObserver,
+        mailbox_key_extractor, message_size_observer,
     },
     monitor::{MonitorDelivery, MonitorEvent, MonitorSink, MonitorSource, MonitorSubscriber},
     policy::CommonOptions,
@@ -909,7 +910,9 @@ impl<M: Send + 'static> RawContext<M> {
         let expires_at = started_at.checked_add(deadline);
         let event_cancellation = cancellation.clone();
         let event_finished = finished.clone();
+        let outstanding = self.mailbox.begin_offload();
         let operation = async move {
+            let _outstanding = outstanding;
             let completion = async move {
                 let work = CatchUnwindFuture::new(work);
                 if let Some(expires_at) = expires_at {
@@ -1041,6 +1044,7 @@ impl<M: Send + 'static> RawContext<M> {
                         self.resources.events.pop_through(batch.offloads_through)
                     {
                         if let Some(message) = Self::materialize_event(event) {
+                            self.mailbox.record_local_delivery();
                             self.resources.continuation_needs_external = false;
                             self.resources.fired_batch = Some(batch);
                             return Some(message);
@@ -1073,6 +1077,7 @@ impl<M: Send + 'static> RawContext<M> {
 
                 while let Some(arming) = batch.armings.pop_front() {
                     if let Some(message) = self.deliver_timer(arming) {
+                        self.mailbox.record_local_delivery();
                         self.resources.continuation_needs_external = false;
                         self.resources.fired_batch = Some(batch);
                         return Some(message);
@@ -1101,6 +1106,7 @@ impl<M: Send + 'static> RawContext<M> {
 
             while let Some(event) = self.resources.events.pop() {
                 if let Some(message) = Self::materialize_event(event) {
+                    self.mailbox.record_local_delivery();
                     self.resources.continuation_needs_external = false;
                     return Some(message);
                 }
@@ -1257,6 +1263,7 @@ pub struct RawDef<R: RawActor> {
     factory: Arc<Mutex<Box<dyn Fn() -> R + Send + 'static>>>,
     pub(crate) options: CommonOptions,
     pub(crate) mailbox_key: Option<MailboxKeyExtractor<R::Msg>>,
+    pub(crate) message_size: Option<MessageSizeObserver<R::Msg>>,
 }
 
 impl<R: RawActor> fmt::Debug for RawDef<R> {
@@ -1275,6 +1282,7 @@ impl<R: RawActor> RawDef<R> {
             factory: Arc::new(Mutex::new(Box::new(factory))),
             options: CommonOptions::default(),
             mailbox_key: None,
+            message_size: None,
         }
     }
 
@@ -1320,6 +1328,16 @@ impl<R: RawActor> RawDef<R> {
         self
     }
 
+    /// Observes accepted message sizes on the sender's ingress stack.
+    #[must_use]
+    pub fn message_size(
+        mut self,
+        measure: impl Fn(&R::Msg) -> usize + Send + Sync + 'static,
+    ) -> Self {
+        self.message_size = Some(message_size_observer(measure));
+        self
+    }
+
     /// Overrides frozen-prefix drain versus discard behavior.
     #[must_use]
     pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
@@ -1354,6 +1372,9 @@ impl<R: RawActor> RawDef<R> {
         if let Some(extractor) = self.mailbox_key {
             mailbox.install_key_extractor(extractor);
         }
+        if let Some(observer) = self.message_size {
+            mailbox.install_size_observer(observer);
+        }
         let factory = self.factory;
         RawConstruction {
             source: RawSource::Restartable(Arc::new(Mutex::new(Box::new(move || {
@@ -1376,6 +1397,7 @@ pub struct RawOnceDef<R: RawActor> {
     actor: R,
     pub(crate) options: CommonOptions,
     pub(crate) mailbox_key: Option<MailboxKeyExtractor<R::Msg>>,
+    pub(crate) message_size: Option<MessageSizeObserver<R::Msg>>,
 }
 
 impl<R: RawActor> fmt::Debug for RawOnceDef<R> {
@@ -1395,6 +1417,7 @@ impl<R: RawActor> RawOnceDef<R> {
             actor,
             options: CommonOptions::default(),
             mailbox_key: None,
+            message_size: None,
         }
     }
 
@@ -1433,6 +1456,16 @@ impl<R: RawActor> RawOnceDef<R> {
         self
     }
 
+    /// Observes accepted message sizes on the sender's ingress stack.
+    #[must_use]
+    pub fn message_size(
+        mut self,
+        measure: impl Fn(&R::Msg) -> usize + Send + Sync + 'static,
+    ) -> Self {
+        self.message_size = Some(message_size_observer(measure));
+        self
+    }
+
     /// Overrides frozen-prefix drain versus discard behavior.
     #[must_use]
     pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
@@ -1466,6 +1499,9 @@ impl<R: RawActor> RawOnceDef<R> {
     pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
         if let Some(extractor) = self.mailbox_key {
             mailbox.install_key_extractor(extractor);
+        }
+        if let Some(observer) = self.message_size {
+            mailbox.install_size_observer(observer);
         }
         RawConstruction {
             source: RawSource::OneShot(Some(Box::new(RawInstance {

@@ -36,9 +36,11 @@ pub use monitor::{
     MONITOR_EVENT_CAPACITY, MonitorEvent, MonitorEventKind, MonitorMemberKind, WatchTarget,
 };
 pub use observe::{
-    ChildSnapshot, ChildState, LIFECYCLE_EVENT_CAPACITY, LifecycleEvent, LifecycleEventKind,
-    LifecycleEvents, LifecycleItem, LifecycleTryRecvError, MembershipStatus, ScopeKind,
-    ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
+    ActorKind, ActorStats, ActorStatsSnapshot, ChildObservation, ChildObserver, ChildSnapshot,
+    ChildState, LIFECYCLE_EVENT_CAPACITY, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
+    LifecycleItem, LifecycleTryRecvError, MembershipStatus, RecursiveActorStats, RestartCount,
+    RestartCounter, ScopeKind, ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver,
+    WaitError,
 };
 pub use policy::{
     Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, Jitter, KeyedCapacity,

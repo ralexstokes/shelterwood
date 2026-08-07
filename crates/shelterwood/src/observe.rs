@@ -16,6 +16,66 @@ use crate::{
 /// Number of lifecycle events retained independently for each subscriber.
 pub const LIFECYCLE_EVENT_CAPACITY: usize = 128;
 
+/// Membership-cumulative actor counters and current gauges.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActorStats {
+    /// Messages dequeued by the actor loop, including offload, timer, and monitor deliveries.
+    pub messages_received: u64,
+    /// Messages accepted through actor ingress.
+    pub messages_accepted: u64,
+    /// Accepted messages that replaced a pending same-slot or same-key message.
+    pub messages_conflated: u64,
+    /// Pending keyed messages evicted by acceptance of a different key.
+    pub messages_evicted: u64,
+    /// Bytes accepted through ingress, or `None` when no size observer is installed.
+    pub message_bytes_accepted: Option<u64>,
+    /// Immediate ingress operations rejected before acceptance.
+    pub sends_rejected: u64,
+    /// Incarnation-owned offloads that have not finished yet.
+    pub outstanding_offloads: u64,
+    /// Current number of messages pending in the mailbox.
+    pub mailbox_depth: u64,
+    /// Resolved mailbox capacity.
+    pub mailbox_capacity: u64,
+}
+
+/// An on-demand actor statistics sample fenced by membership and incarnation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActorStatsSnapshot {
+    /// Actor membership whose cumulative counters are sampled.
+    pub membership: Membership,
+    /// Incarnation bound to the mailbox at sampling time, if any.
+    pub observed_incarnation: Option<Incarnation>,
+    /// Membership-cumulative counters and current gauges.
+    pub stats: ActorStats,
+}
+
+/// Typed actor flavor retained by recursive statistics metadata.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ActorKind {
+    /// Callback-oriented [`crate::Actor`].
+    Actor,
+    /// Loop-owning [`crate::RawActor`].
+    RawActor,
+}
+
+/// One actor row returned by [`crate::ScopeRef::stats_recursive`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecursiveActorStats {
+    /// Path from the queried scope to the actor's containing scope.
+    pub path: Vec<ChildId>,
+    /// Actor id within its containing scope.
+    pub id: ChildId,
+    /// Typed actor flavor from its declaration.
+    pub kind: ActorKind,
+    /// Actor membership identity.
+    pub membership: Membership,
+    /// Incarnation bound to the mailbox at sampling time, if any.
+    pub observed_incarnation: Option<Incarnation>,
+    /// Membership-cumulative counters and current gauges.
+    pub stats: ActorStats,
+}
+
 /// One item read from a lifecycle subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -518,6 +578,135 @@ impl fmt::Debug for LifecycleEvents {
             .field("queued", &state.events.len())
             .field("lagged", &state.lagged)
             .field("closed", &state.closed)
+            .finish()
+    }
+}
+
+/// Self-recovering child-observation item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ChildObservation {
+    /// Authoritative replacement state, initially or after subscriber loss.
+    Reset {
+        /// Fresh recursive scope snapshot.
+        snapshot: Arc<ScopeSnapshot>,
+        /// Lifecycle events lost since the prior authoritative state.
+        dropped: u64,
+    },
+    /// One lifecycle cause paired with consistent-or-newer authoritative state.
+    Changed {
+        /// Fresh recursive scope snapshot.
+        snapshot: Arc<ScopeSnapshot>,
+        /// Ordered lifecycle edge that caused this observation.
+        cause: LifecycleEvent,
+    },
+}
+
+/// Library-owned child observer that hides raw lifecycle lag markers.
+pub struct ChildObserver {
+    scope: crate::ScopeRef,
+    events: LifecycleEvents,
+    initial: Option<Arc<ScopeSnapshot>>,
+}
+
+impl ChildObserver {
+    pub(crate) fn new(
+        scope: crate::ScopeRef,
+        events: LifecycleEvents,
+        initial: Arc<ScopeSnapshot>,
+    ) -> Self {
+        Self {
+            scope,
+            events,
+            initial: Some(initial),
+        }
+    }
+
+    /// Returns the next reduced observation, or `None` after scope terminality.
+    pub async fn next(&mut self) -> Option<ChildObservation> {
+        if let Some(snapshot) = self.initial.take() {
+            return Some(ChildObservation::Reset {
+                snapshot,
+                dropped: 0,
+            });
+        }
+        match self.events.recv().await? {
+            LifecycleItem::Event(cause) => Some(ChildObservation::Changed {
+                snapshot: self.scope.snapshot(),
+                cause,
+            }),
+            LifecycleItem::Lagged { dropped } => Some(ChildObservation::Reset {
+                snapshot: self.scope.snapshot(),
+                dropped,
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for ChildObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChildObserver")
+            .field("scope", &self.scope)
+            .field("initial_pending", &self.initial.is_some())
+            .field("events", &self.events)
+            .finish()
+    }
+}
+
+/// One deduplicated cumulative restart-counter sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestartCount {
+    /// Authoritative cumulative restart total.
+    pub total: u64,
+    /// Saturating increase since the prior emitted total.
+    pub delta: u64,
+    /// Whether this sample followed an initial or lag-recovery reset.
+    pub resynced: bool,
+}
+
+/// Library-owned restart counter derived from authoritative scope snapshots.
+pub struct RestartCounter {
+    observer: ChildObserver,
+    prior: Option<u64>,
+}
+
+impl RestartCounter {
+    pub(crate) fn new(observer: ChildObserver) -> Self {
+        Self {
+            observer,
+            prior: None,
+        }
+    }
+
+    /// Returns the next changed or resynchronized restart total.
+    pub async fn next(&mut self) -> Option<RestartCount> {
+        loop {
+            let observation = self.observer.next().await?;
+            let (total, resynced) = match observation {
+                ChildObservation::Reset { snapshot, .. } => (snapshot.total_restarts, true),
+                ChildObservation::Changed { snapshot, .. } => (snapshot.total_restarts, false),
+            };
+            let prior = self.prior.unwrap_or(0);
+            if !resynced && self.prior == Some(total) {
+                continue;
+            }
+            self.prior = Some(total);
+            return Some(RestartCount {
+                total,
+                delta: total.saturating_sub(prior),
+                resynced,
+            });
+        }
+    }
+}
+
+impl fmt::Debug for RestartCounter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestartCounter")
+            .field("prior", &self.prior)
+            .field("observer", &self.observer)
             .finish()
     }
 }

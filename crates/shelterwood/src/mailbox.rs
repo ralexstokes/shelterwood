@@ -14,8 +14,8 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll, Waker},
     time::Duration,
@@ -666,6 +666,16 @@ where
 
 pub(crate) type MailboxKeyExtractor<M> = Arc<dyn MailboxKeyFn<M> + 'static>;
 
+pub(crate) type MessageSizeObserver<M> = Arc<dyn Fn(&M) -> usize + Send + Sync + 'static>;
+
+pub(crate) fn message_size_observer<M, F>(measure: F) -> MessageSizeObserver<M>
+where
+    M: Send + 'static,
+    F: Fn(&M) -> usize + Send + Sync + 'static,
+{
+    Arc::new(measure)
+}
+
 pub(crate) fn mailbox_key_extractor<M, K, F>(key_fn: F) -> MailboxKeyExtractor<M>
 where
     M: Send + 'static,
@@ -706,7 +716,16 @@ struct SendOperation<M> {
     pinned: Option<Incarnation>,
     key: Mutex<Option<MailboxKey>>,
     key_preparation_requested: AtomicBool,
+    measured_size: Mutex<Option<u64>>,
+    size_preparation_requested: AtomicBool,
     state: Mutex<OperationState<M>>,
+}
+
+struct AcceptedMessage<M> {
+    message: M,
+    key: Option<MailboxKey>,
+    measured_size: Option<u64>,
+    waker: Option<Waker>,
 }
 
 impl<M> SendOperation<M> {
@@ -715,6 +734,8 @@ impl<M> SendOperation<M> {
             pinned,
             key: Mutex::new(key),
             key_preparation_requested: AtomicBool::new(false),
+            measured_size: Mutex::new(None),
+            size_preparation_requested: AtomicBool::new(false),
             state: Mutex::new(OperationState {
                 outcome: OperationOutcome::Waiting {
                     message: Some(message),
@@ -735,18 +756,35 @@ impl<M> SendOperation<M> {
         }
     }
 
-    fn accept(&self, incarnation: Incarnation) -> Option<(M, Option<MailboxKey>, Option<Waker>)> {
-        let (message, key, wake) = {
+    fn is_waiting(&self) -> bool {
+        matches!(
+            &self
+                .state
+                .lock()
+                .expect("send operation mutex poisoned")
+                .outcome,
+            OperationOutcome::Waiting { .. }
+        )
+    }
+
+    fn accept(&self, incarnation: Incarnation) -> Option<AcceptedMessage<M>> {
+        let (message, key, measured_size, wake) = {
             let mut state = self.state.lock().expect("send operation mutex poisoned");
             let OperationOutcome::Waiting { message, .. } = &mut state.outcome else {
                 return None;
             };
             let message = message.take()?;
             let key = self.take_key();
+            let measured_size = self.measured_size();
             state.outcome = OperationOutcome::Accepted(incarnation);
-            (message, key, state.waker.take())
+            (message, key, measured_size, state.waker.take())
         };
-        Some((message, key, wake))
+        Some(AcceptedMessage {
+            message,
+            key,
+            measured_size,
+            waker: wake,
+        })
     }
 
     fn fail(&self, observed: Option<Incarnation>, kind: SendErrorKind) -> Option<Waker> {
@@ -832,6 +870,61 @@ impl<M> SendOperation<M> {
             false
         }
     }
+
+    fn measured_size(&self) -> Option<u64> {
+        *self
+            .measured_size
+            .lock()
+            .expect("send operation size mutex poisoned")
+    }
+
+    fn has_measured_size(&self) -> bool {
+        self.measured_size().is_some()
+    }
+
+    fn request_size_preparation(&self) -> Option<Waker> {
+        self.size_preparation_requested
+            .store(true, Ordering::Release);
+        self.state
+            .lock()
+            .expect("send operation mutex poisoned")
+            .waker
+            .take()
+    }
+
+    fn prepare_size_if_missing(&self, observer: &MessageSizeObserver<M>) -> bool {
+        if self.has_measured_size() {
+            return false;
+        }
+        let measured = {
+            let state = self.state.lock().expect("send operation mutex poisoned");
+            let OperationOutcome::Waiting {
+                message: Some(message),
+                ..
+            } = &state.outcome
+            else {
+                return false;
+            };
+            let measured = catch_unwind(AssertUnwindSafe(|| observer(message)));
+            drop(state);
+            match measured {
+                Ok(bytes) => u64::try_from(bytes).unwrap_or(u64::MAX),
+                Err(payload) => resume_unwind(payload),
+            }
+        };
+        let mut stored = self
+            .measured_size
+            .lock()
+            .expect("send operation size mutex poisoned");
+        if stored.is_none() {
+            *stored = Some(measured);
+            self.size_preparation_requested
+                .store(false, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 struct MailboxState<M> {
@@ -843,23 +936,25 @@ struct MailboxState<M> {
     keyed: VecDeque<KeyedEnvelope<M>>,
     waiters: VecDeque<Arc<SendOperation<M>>>,
     accepted: u64,
-    delivered: u64,
-    local_delivered: u64,
+    received: u64,
     conflated: u64,
     evicted: u64,
+    message_bytes_accepted: u64,
     sends_rejected: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MailboxStats {
     pub(crate) accepted: u64,
-    pub(crate) delivered: u64,
-    pub(crate) local_delivered: u64,
+    pub(crate) received: u64,
     pub(crate) conflated: u64,
     pub(crate) evicted: u64,
+    pub(crate) message_bytes_accepted: Option<u64>,
     pub(crate) sends_rejected: u64,
-    pub(crate) depth: usize,
-    pub(crate) capacity: usize,
+    pub(crate) outstanding_offloads: u64,
+    pub(crate) observed_incarnation: Option<Incarnation>,
+    pub(crate) depth: u64,
+    pub(crate) capacity: u64,
 }
 
 struct Promotion<M> {
@@ -893,12 +988,16 @@ pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
     fn close(&self, incarnation: Incarnation);
     fn terminate(&self);
     fn stats(&self) -> MailboxStats;
+    fn record_rejection(&self);
 }
 
 pub(crate) struct MailboxCell<M> {
     actor_id: ChildId,
+    member: Weak<MemberCell>,
     state: Mutex<MailboxState<M>>,
     key_extractor: Mutex<Option<MailboxKeyExtractor<M>>>,
+    size_observer: Mutex<Option<MessageSizeObserver<M>>>,
+    outstanding_offloads: AtomicU64,
     changed: Signal,
 }
 
@@ -912,9 +1011,10 @@ impl<M> fmt::Debug for MailboxCell<M> {
 }
 
 impl<M: Send + 'static> MailboxCell<M> {
-    pub(crate) fn new(actor_id: ChildId) -> Arc<Self> {
+    pub(crate) fn new(member: &Arc<MemberCell>) -> Arc<Self> {
         Arc::new(Self {
-            actor_id,
+            actor_id: member.id().clone(),
+            member: Arc::downgrade(member),
             state: Mutex::new(MailboxState {
                 kind: None,
                 status: BindingStatus::Unbound,
@@ -924,13 +1024,15 @@ impl<M: Send + 'static> MailboxCell<M> {
                 keyed: VecDeque::new(),
                 waiters: VecDeque::new(),
                 accepted: 0,
-                delivered: 0,
-                local_delivered: 0,
+                received: 0,
                 conflated: 0,
                 evicted: 0,
+                message_bytes_accepted: 0,
                 sends_rejected: 0,
             }),
             key_extractor: Mutex::new(None),
+            size_observer: Mutex::new(None),
+            outstanding_offloads: AtomicU64::new(0),
             changed: Signal::default(),
         })
     }
@@ -960,6 +1062,31 @@ impl<M: Send + 'static> MailboxCell<M> {
         }
     }
 
+    pub(crate) fn install_size_observer(&self, observer: MessageSizeObserver<M>) {
+        let previous = self
+            .size_observer
+            .lock()
+            .expect("mailbox size-observer mutex poisoned")
+            .replace(observer);
+        assert!(
+            previous.is_none(),
+            "a mailbox can own only one message-size observer"
+        );
+        let waiters = self
+            .state
+            .lock()
+            .expect("mailbox mutex poisoned")
+            .waiters
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for waiter in waiters {
+            if let Some(waker) = waiter.request_size_preparation() {
+                waker.wake();
+            }
+        }
+    }
+
     fn prepare_key(&self, message: &M) -> Option<MailboxKey> {
         let extractor = self
             .key_extractor
@@ -977,13 +1104,37 @@ impl<M: Send + 'static> MailboxCell<M> {
         }
     }
 
+    fn cloned_size_observer(&self) -> Option<MessageSizeObserver<M>> {
+        self.size_observer
+            .lock()
+            .expect("mailbox size-observer mutex poisoned")
+            .clone()
+    }
+
+    fn prepare_operation_size(&self, operation: &SendOperation<M>) -> bool {
+        self.cloned_size_observer()
+            .is_some_and(|observer| operation.prepare_size_if_missing(&observer))
+    }
+
+    fn measure_message(&self, message: &M) -> Option<u64> {
+        self.cloned_size_observer().map(|observer| {
+            let measured = catch_unwind(AssertUnwindSafe(|| observer(message)));
+            match measured {
+                Ok(bytes) => u64::try_from(bytes).unwrap_or(u64::MAX),
+                Err(payload) => resume_unwind(payload),
+            }
+        })
+    }
+
     fn promote_bound_waiters(&self) {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         let extractor = self.cloned_key_extractor();
-        let promotion = promote_waiters(&mut state, extractor.as_deref());
+        let size_observer = self.cloned_size_observer();
+        let promotion = promote_waiters(&mut state, extractor.as_deref(), size_observer.as_ref());
         drop(state);
         self.changed.pulse();
         promotion.finish();
+        self.publish_stats();
     }
 
     fn keys_equal(&self, left: &MailboxKey, right: &MailboxKey) -> bool {
@@ -1034,10 +1185,14 @@ impl<M: Send + 'static> MailboxCell<M> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         match state.status {
             BindingStatus::Terminal(final_incarnation) => {
+                state.sends_rejected = state
+                    .sends_rejected
+                    .saturating_add(u64::from(operation.is_waiting()));
                 drop(state);
                 if let Some(waker) = operation.terminate(final_incarnation) {
                     waker.wake();
                 }
+                self.publish_stats();
             }
             BindingStatus::Bound(incarnation) => {
                 if operation
@@ -1045,6 +1200,9 @@ impl<M: Send + 'static> MailboxCell<M> {
                     .is_some_and(|pinned| pinned != incarnation)
                 {
                     let pinned = operation.pinned().expect("checked pinned incarnation");
+                    state.sends_rejected = state
+                        .sends_rejected
+                        .saturating_add(u64::from(operation.is_waiting()));
                     drop(state);
                     if let Some(waker) = operation.fail(
                         Some(incarnation),
@@ -1055,6 +1213,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                     ) {
                         waker.wake();
                     }
+                    self.publish_stats();
                     return;
                 }
                 operation.observe(incarnation);
@@ -1067,10 +1226,27 @@ impl<M: Send + 'static> MailboxCell<M> {
                     None => false,
                 };
                 if can_accept {
-                    let (message, key, wake) = operation
+                    if self.cloned_size_observer().is_some() && !operation.has_measured_size() {
+                        let wake = operation.request_size_preparation();
+                        state.waiters.push_back(Arc::clone(operation));
+                        drop(state);
+                        if let Some(waker) = wake {
+                            waker.wake();
+                        }
+                        return;
+                    }
+                    let AcceptedMessage {
+                        message,
+                        key,
+                        measured_size,
+                        waker: wake,
+                    } = operation
                         .accept(incarnation)
                         .expect("a newly submitted operation still owns its message");
                     state.accepted = state.accepted.saturating_add(1);
+                    state.message_bytes_accepted = state
+                        .message_bytes_accepted
+                        .saturating_add(measured_size.unwrap_or(0));
                     let accepted_sequence = state.accepted;
                     let displaced = match state.kind {
                         Some(MailboxKind::Queue(_)) => {
@@ -1103,6 +1279,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                     };
                     drop(state);
                     self.changed.pulse();
+                    self.publish_stats();
                     if let Some(waker) = wake {
                         waker.wake();
                     }
@@ -1122,16 +1299,23 @@ impl<M: Send + 'static> MailboxCell<M> {
                             newest_observed: Some(incarnation),
                         }
                     };
+                    state.sends_rejected = state
+                        .sends_rejected
+                        .saturating_add(u64::from(operation.is_waiting()));
                     drop(state);
                     if let Some(waker) = operation.fail(Some(incarnation), kind) {
                         waker.wake();
                     }
+                    self.publish_stats();
                 } else {
                     state.waiters.push_back(Arc::clone(operation));
                 }
             }
             BindingStatus::Unbound => {
                 if let Some(pinned) = operation.pinned() {
+                    state.sends_rejected = state
+                        .sends_rejected
+                        .saturating_add(u64::from(operation.is_waiting()));
                     drop(state);
                     if let Some(waker) = operation.fail(
                         None,
@@ -1142,6 +1326,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                     ) {
                         waker.wake();
                     }
+                    self.publish_stats();
                 } else {
                     state.waiters.push_back(Arc::clone(operation));
                 }
@@ -1155,15 +1340,31 @@ impl<M: Send + 'static> MailboxCell<M> {
         pinned: Option<Incarnation>,
     ) -> Result<Incarnation, SendError<M>> {
         let mut key = None;
+        let mut measured_size = None;
         let mut state = loop {
             let state = self.state.lock().expect("mailbox mutex poisoned");
-            let needs_key = key.is_none()
-                && matches!(state.status, BindingStatus::Bound(incarnation)
-                    if pinned.is_none_or(|pinned| pinned == incarnation))
+            let can_accept = matches!(state.status, BindingStatus::Bound(incarnation)
+                if pinned.is_none_or(|pinned| pinned == incarnation))
+                && match state.kind {
+                    Some(MailboxKind::Queue(capacity)) => {
+                        state.waiters.is_empty() && state.queue.len() < capacity.get()
+                    }
+                    Some(MailboxKind::Latest | MailboxKind::LatestByKey(_)) => true,
+                    None => false,
+                };
+            let needs_key = can_accept
+                && key.is_none()
                 && matches!(state.kind, Some(MailboxKind::LatestByKey(_)));
-            if needs_key {
+            let needs_size =
+                can_accept && measured_size.is_none() && self.cloned_size_observer().is_some();
+            if needs_key || needs_size {
                 drop(state);
-                key = self.prepare_key(&message);
+                if needs_key {
+                    key = self.prepare_key(&message);
+                }
+                if needs_size {
+                    measured_size = self.measure_message(&message);
+                }
                 continue;
             }
             break state;
@@ -1171,6 +1372,8 @@ impl<M: Send + 'static> MailboxCell<M> {
         match state.status {
             BindingStatus::Terminal(final_incarnation) => {
                 state.sends_rejected = state.sends_rejected.saturating_add(1);
+                drop(state);
+                self.publish_stats();
                 Err(SendError {
                     actor_id: self.actor_id.clone(),
                     incarnation_observed: final_incarnation,
@@ -1180,6 +1383,8 @@ impl<M: Send + 'static> MailboxCell<M> {
             }
             BindingStatus::Unbound => {
                 state.sends_rejected = state.sends_rejected.saturating_add(1);
+                drop(state);
+                self.publish_stats();
                 Err(SendError {
                     actor_id: self.actor_id.clone(),
                     incarnation_observed: None,
@@ -1194,6 +1399,8 @@ impl<M: Send + 'static> MailboxCell<M> {
             }
             BindingStatus::Frozen(incarnation) => {
                 state.sends_rejected = state.sends_rejected.saturating_add(1);
+                drop(state);
+                self.publish_stats();
                 Err(SendError {
                     actor_id: self.actor_id.clone(),
                     incarnation_observed: Some(incarnation),
@@ -1212,6 +1419,8 @@ impl<M: Send + 'static> MailboxCell<M> {
             {
                 state.sends_rejected = state.sends_rejected.saturating_add(1);
                 let pinned = pinned.expect("checked pinned incarnation");
+                drop(state);
+                self.publish_stats();
                 Err(SendError {
                     actor_id: self.actor_id.clone(),
                     incarnation_observed: Some(incarnation),
@@ -1227,6 +1436,8 @@ impl<M: Send + 'static> MailboxCell<M> {
                     if !state.waiters.is_empty() || state.queue.len() >= capacity.get() =>
                 {
                     state.sends_rejected = state.sends_rejected.saturating_add(1);
+                    drop(state);
+                    self.publish_stats();
                     Err(SendError {
                         actor_id: self.actor_id.clone(),
                         incarnation_observed: Some(incarnation),
@@ -1236,6 +1447,9 @@ impl<M: Send + 'static> MailboxCell<M> {
                 }
                 Some(MailboxKind::Queue(_)) => {
                     state.accepted = state.accepted.saturating_add(1);
+                    state.message_bytes_accepted = state
+                        .message_bytes_accepted
+                        .saturating_add(measured_size.unwrap_or(0));
                     let accepted_sequence = state.accepted;
                     state.queue.push_back(Envelope {
                         message,
@@ -1243,10 +1457,14 @@ impl<M: Send + 'static> MailboxCell<M> {
                     });
                     drop(state);
                     self.changed.pulse();
+                    self.publish_stats();
                     Ok(incarnation)
                 }
                 Some(MailboxKind::Latest) => {
                     state.accepted = state.accepted.saturating_add(1);
+                    state.message_bytes_accepted = state
+                        .message_bytes_accepted
+                        .saturating_add(measured_size.unwrap_or(0));
                     let accepted_sequence = state.accepted;
                     let displaced = state.latest.replace(Envelope {
                         message,
@@ -1257,11 +1475,15 @@ impl<M: Send + 'static> MailboxCell<M> {
                         .saturating_add(u64::from(displaced.is_some()));
                     drop(state);
                     self.changed.pulse();
+                    self.publish_stats();
                     drop(displaced);
                     Ok(incarnation)
                 }
                 Some(MailboxKind::LatestByKey(capacity)) => {
                     state.accepted = state.accepted.saturating_add(1);
+                    state.message_bytes_accepted = state
+                        .message_bytes_accepted
+                        .saturating_add(measured_size.unwrap_or(0));
                     let accepted_sequence = state.accepted;
                     let displaced = self.insert_keyed(
                         &mut state,
@@ -1274,11 +1496,14 @@ impl<M: Send + 'static> MailboxCell<M> {
                     );
                     drop(state);
                     self.changed.pulse();
+                    self.publish_stats();
                     drop(displaced);
                     Ok(incarnation)
                 }
                 None => {
                     state.sends_rejected = state.sends_rejected.saturating_add(1);
+                    drop(state);
+                    self.publish_stats();
                     Err(SendError {
                         actor_id: self.actor_id.clone(),
                         incarnation_observed: None,
@@ -1339,16 +1564,20 @@ impl<M: Send + 'static> MailboxCell<M> {
         };
         let promotion = if message.is_some() && matches!(state.status, BindingStatus::Bound(_)) {
             let extractor = self.cloned_key_extractor();
-            promote_waiters(&mut state, extractor.as_deref())
+            let size_observer = self.cloned_size_observer();
+            promote_waiters(&mut state, extractor.as_deref(), size_observer.as_ref())
         } else {
             Promotion::default()
         };
-        state.delivered = state.delivered.saturating_add(u64::from(message.is_some()));
+        state.received = state.received.saturating_add(u64::from(message.is_some()));
         drop(state);
         if message.is_some() {
             self.changed.pulse();
         }
         promotion.finish();
+        if message.is_some() {
+            self.publish_stats();
+        }
         message
     }
 
@@ -1374,19 +1603,175 @@ impl<M: Send + 'static> MailboxCell<M> {
         };
         MailboxStats {
             accepted: state.accepted,
-            delivered: state.delivered,
-            local_delivered: state.local_delivered,
+            received: state.received,
             conflated: state.conflated,
             evicted: state.evicted,
+            message_bytes_accepted: self
+                .size_observer
+                .lock()
+                .expect("mailbox size-observer mutex poisoned")
+                .as_ref()
+                .map(|_| state.message_bytes_accepted),
             sends_rejected: state.sends_rejected,
-            depth,
-            capacity,
+            outstanding_offloads: self.outstanding_offloads.load(Ordering::Acquire),
+            observed_incarnation: match state.status {
+                BindingStatus::Bound(incarnation) | BindingStatus::Frozen(incarnation) => {
+                    Some(incarnation)
+                }
+                BindingStatus::Unbound | BindingStatus::Terminal(_) => None,
+            },
+            depth: u64::try_from(depth).unwrap_or(u64::MAX),
+            capacity: u64::try_from(capacity).unwrap_or(u64::MAX),
         }
     }
 
     pub(crate) fn record_local_delivery(&self) {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
-        state.local_delivered = state.local_delivered.saturating_add(1);
+        state.received = state.received.saturating_add(1);
+        drop(state);
+        self.publish_stats();
+    }
+
+    fn record_rejection(&self) {
+        let mut state = self.state.lock().expect("mailbox mutex poisoned");
+        state.sends_rejected = state.sends_rejected.saturating_add(1);
+        drop(state);
+        self.publish_stats();
+    }
+
+    pub(crate) fn begin_offload(self: &Arc<Self>) -> OutstandingOffload<M> {
+        let _ =
+            self.outstanding_offloads
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_add(1))
+                });
+        self.publish_stats();
+        OutstandingOffload {
+            mailbox: Arc::downgrade(self),
+        }
+    }
+
+    fn finish_offload(&self) {
+        let _ =
+            self.outstanding_offloads
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(1))
+                });
+        self.publish_stats();
+    }
+
+    fn publish_stats(&self) {
+        let stats = self.stats();
+        tracing::trace!(
+            actor.id = %self.actor_id,
+            actor.membership = ?self.member.upgrade().map(|member| member.membership()),
+            messages_accepted = stats.accepted,
+            messages_received = stats.received,
+            messages_conflated = stats.conflated,
+            messages_evicted = stats.evicted,
+            sends_rejected = stats.sends_rejected,
+            outstanding_offloads = stats.outstanding_offloads,
+            mailbox_depth = stats.depth,
+            mailbox_capacity = stats.capacity,
+            "actor statistics changed"
+        );
+        self.emit_metrics(stats);
+    }
+
+    #[cfg(not(feature = "metrics"))]
+    fn emit_metrics(&self, _stats: MailboxStats) {}
+
+    #[cfg(feature = "metrics")]
+    fn emit_metrics(&self, stats: MailboxStats) {
+        static DESCRIBE: std::sync::Once = std::sync::Once::new();
+        DESCRIBE.call_once(|| {
+            metrics::describe_counter!(
+                "shelterwood.actor.messages_accepted",
+                metrics::Unit::Count,
+                "Messages accepted by an actor membership"
+            );
+            metrics::describe_counter!(
+                "shelterwood.actor.messages_received",
+                metrics::Unit::Count,
+                "Messages received by an actor loop"
+            );
+            metrics::describe_counter!(
+                "shelterwood.actor.messages_conflated",
+                metrics::Unit::Count,
+                "Messages replaced by conflation"
+            );
+            metrics::describe_counter!(
+                "shelterwood.actor.messages_evicted",
+                metrics::Unit::Count,
+                "Messages evicted by keyed conflation"
+            );
+            metrics::describe_counter!(
+                "shelterwood.actor.message_bytes_accepted",
+                metrics::Unit::Bytes,
+                "Message bytes accepted by an actor membership"
+            );
+            metrics::describe_counter!(
+                "shelterwood.actor.sends_rejected",
+                metrics::Unit::Count,
+                "Actor ingress operations rejected before acceptance"
+            );
+            metrics::describe_gauge!(
+                "shelterwood.actor.outstanding_offloads",
+                metrics::Unit::Count,
+                "Current outstanding actor offloads"
+            );
+            metrics::describe_gauge!(
+                "shelterwood.actor.mailbox_depth",
+                metrics::Unit::Count,
+                "Current actor mailbox depth"
+            );
+            metrics::describe_gauge!(
+                "shelterwood.actor.mailbox_capacity",
+                metrics::Unit::Count,
+                "Resolved actor mailbox capacity"
+            );
+        });
+
+        let (scope_path, membership) = self.member.upgrade().map_or_else(
+            || (String::from("/"), String::from("unbound")),
+            |member| {
+                (
+                    member.scope_path_label(),
+                    format!("{:?}", member.membership()),
+                )
+            },
+        );
+        let labels = [
+            ("scope.path", scope_path),
+            ("actor.id", self.actor_id.as_str().to_owned()),
+            ("actor.membership", membership),
+        ];
+        metrics::counter!("shelterwood.actor.messages_accepted", &labels).absolute(stats.accepted);
+        metrics::counter!("shelterwood.actor.messages_received", &labels).absolute(stats.received);
+        metrics::counter!("shelterwood.actor.messages_conflated", &labels)
+            .absolute(stats.conflated);
+        metrics::counter!("shelterwood.actor.messages_evicted", &labels).absolute(stats.evicted);
+        if let Some(bytes) = stats.message_bytes_accepted {
+            metrics::counter!("shelterwood.actor.message_bytes_accepted", &labels).absolute(bytes);
+        }
+        metrics::counter!("shelterwood.actor.sends_rejected", &labels)
+            .absolute(stats.sends_rejected);
+        metrics::gauge!("shelterwood.actor.outstanding_offloads", &labels)
+            .set(stats.outstanding_offloads as f64);
+        metrics::gauge!("shelterwood.actor.mailbox_depth", &labels).set(stats.depth as f64);
+        metrics::gauge!("shelterwood.actor.mailbox_capacity", &labels).set(stats.capacity as f64);
+    }
+}
+
+pub(crate) struct OutstandingOffload<M: Send + 'static> {
+    mailbox: Weak<MailboxCell<M>>,
+}
+
+impl<M: Send + 'static> Drop for OutstandingOffload<M> {
+    fn drop(&mut self) {
+        if let Some(mailbox) = self.mailbox.upgrade() {
+            mailbox.finish_offload();
+        }
     }
 }
 
@@ -1465,6 +1850,8 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             Some(existing) => debug_assert_eq!(existing, kind),
             None => state.kind = Some(kind),
         }
+        drop(state);
+        self.publish_stats();
     }
 
     fn bind(&self, incarnation: Incarnation) {
@@ -1475,10 +1862,12 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         state.status = BindingStatus::Bound(incarnation);
         state.last_bound = Some(incarnation);
         let extractor = self.cloned_key_extractor();
-        let promotion = promote_waiters(&mut state, extractor.as_deref());
+        let size_observer = self.cloned_size_observer();
+        let promotion = promote_waiters(&mut state, extractor.as_deref(), size_observer.as_ref());
         drop(state);
         self.changed.pulse();
         promotion.finish();
+        self.publish_stats();
     }
 
     fn freeze(&self, incarnation: Incarnation) {
@@ -1489,6 +1878,9 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             let mut wakers = Vec::new();
             while let Some(waiter) = state.waiters.pop_front() {
                 if waiter.pinned() == Some(incarnation) {
+                    state.sends_rejected = state
+                        .sends_rejected
+                        .saturating_add(u64::from(waiter.is_waiting()));
                     if let Some(waker) = waiter.fail(Some(incarnation), SendErrorKind::NotRunning) {
                         wakers.push(waker);
                     }
@@ -1502,6 +1894,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             for waker in wakers {
                 waker.wake();
             }
+            self.publish_stats();
         }
     }
 
@@ -1522,6 +1915,9 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         let mut wakers = Vec::new();
         while let Some(waiter) = state.waiters.pop_front() {
             if let Some(pinned) = waiter.pinned() {
+                state.sends_rejected = state
+                    .sends_rejected
+                    .saturating_add(u64::from(waiter.is_waiting()));
                 if let Some(waker) = waiter.fail(
                     None,
                     SendErrorKind::Superseded {
@@ -1544,6 +1940,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         drop(queue);
         drop(latest);
         drop(keyed);
+        self.publish_stats();
     }
 
     fn terminate(&self) {
@@ -1557,6 +1954,9 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         let latest = state.latest.take();
         let keyed = std::mem::take(&mut state.keyed);
         let waiters = std::mem::take(&mut state.waiters);
+        state.sends_rejected = state
+            .sends_rejected
+            .saturating_add(waiters.iter().filter(|waiter| waiter.is_waiting()).count() as u64);
         drop(state);
         let mut wakers = Vec::new();
         for waiter in waiters {
@@ -1571,16 +1971,22 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         drop(queue);
         drop(latest);
         drop(keyed);
+        self.publish_stats();
     }
 
     fn stats(&self) -> MailboxStats {
         self.stats()
+    }
+
+    fn record_rejection(&self) {
+        self.record_rejection();
     }
 }
 
 fn promote_waiters<M>(
     state: &mut MailboxState<M>,
     key_extractor: Option<&dyn MailboxKeyFn<M>>,
+    size_observer: Option<&MessageSizeObserver<M>>,
 ) -> Promotion<M> {
     let mut promotion = Promotion::default();
     let Some(kind) = state.kind else {
@@ -1607,6 +2013,9 @@ fn promote_waiters<M>(
             .is_some_and(|pinned| pinned != incarnation)
         {
             let pinned = operation.pinned().expect("checked pinned incarnation");
+            state.sends_rejected = state
+                .sends_rejected
+                .saturating_add(u64::from(operation.is_waiting()));
             if let Some(waker) = operation.fail(
                 Some(incarnation),
                 SendErrorKind::Superseded {
@@ -1626,13 +2035,29 @@ fn promote_waiters<M>(
             state.waiters.push_back(operation);
             continue;
         }
-        let Some((message, key, wake)) = operation.accept(incarnation) else {
+        if size_observer.is_some() && !operation.has_measured_size() {
+            if let Some(waker) = operation.request_size_preparation() {
+                promotion.wakers.push(waker);
+            }
+            state.waiters.push_back(operation);
+            continue;
+        }
+        let Some(AcceptedMessage {
+            message,
+            key,
+            measured_size,
+            waker: wake,
+        }) = operation.accept(incarnation)
+        else {
             continue;
         };
         if let Some(waker) = wake {
             promotion.wakers.push(waker);
         }
         state.accepted = state.accepted.saturating_add(1);
+        state.message_bytes_accepted = state
+            .message_bytes_accepted
+            .saturating_add(measured_size.unwrap_or(0));
         let accepted_sequence = state.accepted;
         match kind {
             MailboxKind::Queue(_) => state.queue.push_back(Envelope {
@@ -1802,6 +2227,21 @@ impl<M> ActorRef<M> {
     #[must_use]
     pub fn membership(&self) -> Membership {
         self.member.membership()
+    }
+
+    /// Samples membership-cumulative actor counters and current gauges.
+    #[must_use]
+    pub fn stats(&self) -> crate::ActorStatsSnapshot {
+        self.member
+            .actor_stats()
+            .expect("an actor reference always owns mailbox metadata")
+    }
+
+    fn record_rejection(&self) {
+        self.member
+            .mailbox()
+            .expect("an actor reference always owns mailbox metadata")
+            .record_rejection();
     }
 }
 
@@ -2376,10 +2816,15 @@ impl<M: Send + 'static> SendDriver<M> for DirectSend<M> {
         context: &mut Context<'_>,
     ) -> Poll<Result<Incarnation, SendError<M>>> {
         let prepared_key = self.mailbox.prepare_operation_key(&self.operation);
+        let prepared_size = self
+            .operation
+            .size_preparation_requested
+            .load(Ordering::Acquire)
+            && self.mailbox.prepare_operation_size(&self.operation);
         if !self.submitted {
             self.submitted = true;
             self.mailbox.submit(&self.operation);
-        } else if prepared_key {
+        } else if prepared_key || prepared_size {
             self.mailbox.promote_bound_waiters();
         }
         let mut state = self
@@ -2418,8 +2863,13 @@ impl<M: Send + 'static> SendDriver<M> for DirectSend<M> {
                     .key_preparation_requested
                     .load(Ordering::Acquire)
                     && !self.operation.has_key();
+                let wake_for_size = self
+                    .operation
+                    .size_preparation_requested
+                    .load(Ordering::Acquire)
+                    && !self.operation.has_measured_size();
                 drop(state);
-                if wake_for_key {
+                if wake_for_key || wake_for_size {
                     context.waker().wake_by_ref();
                 }
                 Poll::Pending
@@ -2517,6 +2967,7 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
                 let Withdrawal::Withdrawn { payload, observed } = withdrawal else {
                     unreachable!("an unpolled send cannot already be accepted")
                 };
+                self.actor.record_rejection();
                 self.done = true;
                 return Poll::Ready(Err(SendError {
                     actor_id,
@@ -2544,6 +2995,7 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
             let send = self.send.as_mut().expect("pending timed send retains send");
             match send.withdraw() {
                 Withdrawal::Withdrawn { payload, observed } => {
+                    self.actor.record_rejection();
                     self.done = true;
                     Poll::Ready(Err(SendError {
                         actor_id,
@@ -2637,6 +3089,7 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
         if !self.started {
             self.started = true;
             if self.deadline.is_zero() {
+                self.actor.record_rejection();
                 self.done = true;
                 return Poll::Ready(Err(CallError {
                     actor_id: self.actor.id().clone(),
@@ -2770,11 +3223,14 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
                 .as_mut()
                 .expect("unaccepted call retains send future");
             let result = match send.withdraw() {
-                Withdrawal::Withdrawn { observed, .. } => CallError {
-                    actor_id,
-                    incarnation_observed: observed,
-                    kind: CallErrorKind::AcceptanceTimedOut,
-                },
+                Withdrawal::Withdrawn { observed, .. } => {
+                    self.actor.record_rejection();
+                    CallError {
+                        actor_id,
+                        incarnation_observed: observed,
+                        kind: CallErrorKind::AcceptanceTimedOut,
+                    }
+                }
                 Withdrawal::Accepted(incarnation) => {
                     if let Some(reply) = &self.reply {
                         match reply.poll(context) {
@@ -2868,7 +3324,7 @@ mod tests {
     use std::{num::NonZeroUsize, sync::Arc};
 
     use super::{MailboxCell, MailboxControl, mailbox_key_extractor};
-    use crate::{ChildId, Mailbox, identity::ScopeIdentity};
+    use crate::{ChildId, Mailbox, driver::MemberCell, identity::ScopeIdentity};
 
     #[test]
     fn keyed_eviction_has_a_dedicated_internal_counter() {
@@ -2877,7 +3333,8 @@ mod tests {
         let mut incarnations = identity.incarnation_counter(membership);
         let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
             .expect("incarnation available");
-        let mailbox = MailboxCell::new(ChildId::from("keyed-counter"));
+        let member = MemberCell::new(ChildId::from("keyed-counter"), membership);
+        let mailbox = MailboxCell::new(&member);
         mailbox.install_key_extractor(mailbox_key_extractor(|message: &(usize, usize)| message.0));
         mailbox.configure(Mailbox::latest(), NonZeroUsize::new(2));
         mailbox.bind(incarnation);

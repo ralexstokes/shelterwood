@@ -305,6 +305,7 @@ pub(crate) struct MemberCell {
     terminal_signals: Mutex<Vec<Signal>>,
     monitors: Mutex<Vec<Weak<dyn MonitorSubscriber>>>,
     mailbox: Mutex<Option<Arc<dyn MailboxControl>>>,
+    parent_scope: Mutex<Option<Weak<ScopeCell>>>,
     options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
     pub(crate) removal: Latch,
 }
@@ -328,6 +329,7 @@ impl MemberCell {
             terminal_signals: Mutex::new(Vec::new()),
             monitors: Mutex::new(Vec::new()),
             mailbox: Mutex::new(None),
+            parent_scope: Mutex::new(None),
             options: Mutex::new(None),
             removal: Latch::default(),
         })
@@ -432,6 +434,66 @@ impl MemberCell {
             .clone()
     }
 
+    pub(crate) fn set_parent_scope(&self, scope: &Arc<ScopeCell>) {
+        *self
+            .parent_scope
+            .lock()
+            .expect("member parent-scope mutex poisoned") = Some(Arc::downgrade(scope));
+    }
+
+    #[cfg(feature = "metrics")]
+    pub(crate) fn scope_path_label(&self) -> String {
+        let mut ids = Vec::new();
+        let mut current = self
+            .parent_scope
+            .lock()
+            .expect("member parent-scope mutex poisoned")
+            .as_ref()
+            .and_then(Weak::upgrade);
+        while let Some(scope) = current {
+            if scope
+                .parent
+                .lock()
+                .expect("scope parent mutex poisoned")
+                .is_some()
+            {
+                ids.push(scope.member.id().as_str().to_owned());
+            }
+            current = scope
+                .parent
+                .lock()
+                .expect("scope parent mutex poisoned")
+                .as_ref()
+                .and_then(Weak::upgrade);
+        }
+        ids.reverse();
+        if ids.is_empty() {
+            String::from("/")
+        } else {
+            format!("/{}", ids.join("/"))
+        }
+    }
+
+    pub(crate) fn actor_stats(&self) -> Option<crate::ActorStatsSnapshot> {
+        let mailbox = self.mailbox()?;
+        let stats = mailbox.stats();
+        Some(crate::ActorStatsSnapshot {
+            membership: self.membership,
+            observed_incarnation: stats.observed_incarnation,
+            stats: crate::ActorStats {
+                messages_received: stats.received,
+                messages_accepted: stats.accepted,
+                messages_conflated: stats.conflated,
+                messages_evicted: stats.evicted,
+                message_bytes_accepted: stats.message_bytes_accepted,
+                sends_rejected: stats.sends_rejected,
+                outstanding_offloads: stats.outstanding_offloads,
+                mailbox_depth: stats.depth,
+                mailbox_capacity: stats.capacity,
+            },
+        })
+    }
+
     pub(crate) fn terminalize(&self, exit: Exit) {
         let changed = {
             let mut record = self.record.lock().expect("member mutex poisoned");
@@ -455,12 +517,11 @@ impl MemberCell {
         if let Some(mailbox) = self.mailbox() {
             mailbox.terminate();
             let stats = mailbox.stats();
-            debug_assert!(stats.delivered <= stats.accepted);
             debug_assert!(stats.conflated <= stats.accepted);
             debug_assert!(stats.evicted <= stats.accepted);
             debug_assert!(stats.depth <= stats.capacity);
             let _ = stats.sends_rejected;
-            let _ = stats.local_delivered;
+            let _ = stats.received;
         }
         for signal in self
             .terminal_signals
@@ -846,6 +907,43 @@ impl ScopeCell {
         events
     }
 
+    pub(crate) fn stats_recursive(&self) -> Vec<crate::RecursiveActorStats> {
+        let mut rows = Vec::new();
+        self.collect_actor_stats(&mut Vec::new(), &mut rows);
+        rows
+    }
+
+    fn collect_actor_stats(
+        &self,
+        path: &mut Vec<ChildId>,
+        rows: &mut Vec<crate::RecursiveActorStats>,
+    ) {
+        let children = self
+            .current_children
+            .lock()
+            .expect("scope children mutex poisoned")
+            .clone();
+        for slot in children {
+            if let Some(kind) = slot.actor_kind()
+                && let Some(sample) = slot.member.actor_stats()
+            {
+                rows.push(crate::RecursiveActorStats {
+                    path: path.clone(),
+                    id: slot.member.id().clone(),
+                    kind,
+                    membership: sample.membership,
+                    observed_incarnation: sample.observed_incarnation,
+                    stats: sample.stats,
+                });
+            }
+            if let Some(scope) = &slot.scope {
+                path.push(slot.member.id().clone());
+                scope.collect_actor_stats(path, rows);
+                path.pop();
+            }
+        }
+    }
+
     fn snapshot_locked(&self) -> Arc<ScopeSnapshot> {
         let record = self.record();
         let config = self
@@ -1175,6 +1273,7 @@ impl ScopeCell {
             .expect("scope children mutex poisoned")
             .clear();
         for child in children {
+            child.member.set_parent_scope(self);
             if let Some(scope) = &child.scope {
                 *scope.parent.lock().expect("scope parent mutex poisoned") =
                     Some(Arc::downgrade(self));
@@ -1197,6 +1296,7 @@ impl ScopeCell {
         let _gate = OBSERVATION_GATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        child.member.set_parent_scope(self);
         if let Some(scope) = &child.scope {
             *scope.parent.lock().expect("scope parent mutex poisoned") = Some(Arc::downgrade(self));
         }

@@ -157,6 +157,7 @@ enum DefinitionState {
 pub(crate) struct SlotCell {
     pub(crate) member: Arc<MemberCell>,
     pub(crate) scope: Option<Arc<ScopeCell>>,
+    actor_kind: Mutex<Option<crate::ActorKind>>,
     definition: Mutex<DefinitionState>,
 }
 
@@ -165,6 +166,7 @@ impl SlotCell {
         Arc::new(Self {
             member,
             scope,
+            actor_kind: Mutex::new(None),
             definition: Mutex::new(DefinitionState::Undefined),
         })
     }
@@ -177,6 +179,19 @@ impl SlotCell {
                 panic!("a child slot was defined more than once")
             }
         }
+    }
+
+    pub(crate) fn set_actor_kind(&self, kind: crate::ActorKind) {
+        let mut stored = self.actor_kind.lock().expect("actor-kind mutex poisoned");
+        assert!(
+            stored.is_none(),
+            "an actor slot can have only one typed kind"
+        );
+        *stored = Some(kind);
+    }
+
+    pub(crate) fn actor_kind(&self) -> Option<crate::ActorKind> {
+        *self.actor_kind.lock().expect("actor-kind mutex poisoned")
     }
 
     pub(crate) fn is_undefined(&self) -> bool {
@@ -355,7 +370,7 @@ fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError> {
 }
 
 fn attach_actor_slot<M: Send + 'static>(slot: Arc<SlotCell>) -> ActorSlot<M> {
-    let mailbox = MailboxCell::new(slot.member.id().clone());
+    let mailbox = MailboxCell::new(&slot.member);
     slot.member.attach_mailbox(mailbox.clone());
     ActorSlot { slot, mailbox }
 }
@@ -718,7 +733,12 @@ impl<M: Send + 'static> ActorSlot<M> {
     where
         A: crate::Actor<Msg = M>,
     {
-        self.define_raw(definition.into_raw())
+        let actor = self.actor_ref();
+        self.slot.set_actor_kind(crate::ActorKind::Actor);
+        self.slot.define(ChildConstruction::Raw(
+            definition.into_raw().erase(self.mailbox),
+        ));
+        actor
     }
 
     /// Defines a consuming one-shot callback-oriented actor and consumes the slot.
@@ -727,7 +747,12 @@ impl<M: Send + 'static> ActorSlot<M> {
     where
         A: crate::Actor<Msg = M>,
     {
-        self.define_once_raw(definition.into_raw())
+        let actor = self.actor_ref();
+        self.slot.set_actor_kind(crate::ActorKind::Actor);
+        self.slot.define(ChildConstruction::Raw(
+            definition.into_raw().erase(self.mailbox),
+        ));
+        actor
     }
 
     /// Defines a restartable raw actor and consumes the slot.
@@ -737,6 +762,7 @@ impl<M: Send + 'static> ActorSlot<M> {
         R: crate::RawActor<Msg = M>,
     {
         let actor = self.actor_ref();
+        self.slot.set_actor_kind(crate::ActorKind::RawActor);
         self.slot
             .define(ChildConstruction::Raw(definition.erase(self.mailbox)));
         actor
@@ -749,6 +775,7 @@ impl<M: Send + 'static> ActorSlot<M> {
         R: crate::RawActor<Msg = M>,
     {
         let actor = self.actor_ref();
+        self.slot.set_actor_kind(crate::ActorKind::RawActor);
         self.slot
             .define(ChildConstruction::Raw(definition.erase(self.mailbox)));
         actor
@@ -992,14 +1019,16 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     where
         A: crate::Actor<Msg = M>,
     {
-        self.define_raw(definition.into_raw())
+        let mut this = self;
+        this.define_raw_with(definition.into_raw(), false, crate::ActorKind::Actor)
     }
 
     fn define_fused<A>(self, definition: ActorDef<A>) -> Admission<ActorRef<M>>
     where
         A: crate::Actor<Msg = M>,
     {
-        self.define_raw_fused(definition.into_raw())
+        let mut this = self;
+        this.define_raw_with(definition.into_raw(), true, crate::ActorKind::Actor)
     }
 
     /// Defines a one-shot callback-oriented actor; dropping after first poll detaches.
@@ -1007,14 +1036,16 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     where
         A: crate::Actor<Msg = M>,
     {
-        self.define_once_raw(definition.into_raw())
+        let mut this = self;
+        this.define_once_raw_with(definition.into_raw(), false, crate::ActorKind::Actor)
     }
 
     fn define_once_fused<A>(self, definition: ActorOnceDef<A>) -> Admission<ActorRef<M>>
     where
         A: crate::Actor<Msg = M>,
     {
-        self.define_once_raw_fused(definition.into_raw())
+        let mut this = self;
+        this.define_once_raw_with(definition.into_raw(), true, crate::ActorKind::Actor)
     }
 
     /// Defines a restartable raw actor; dropping after first poll detaches.
@@ -1022,22 +1053,28 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     where
         R: crate::RawActor<Msg = M>,
     {
-        self.define_raw_with(definition, false)
+        self.define_raw_with(definition, false, crate::ActorKind::RawActor)
     }
 
     fn define_raw_fused<R>(mut self, definition: RawDef<R>) -> Admission<ActorRef<M>>
     where
         R: crate::RawActor<Msg = M>,
     {
-        self.define_raw_with(definition, true)
+        self.define_raw_with(definition, true, crate::ActorKind::RawActor)
     }
 
-    fn define_raw_with<R>(&mut self, definition: RawDef<R>, fused: bool) -> Admission<ActorRef<M>>
+    fn define_raw_with<R>(
+        &mut self,
+        definition: RawDef<R>,
+        fused: bool,
+        kind: crate::ActorKind,
+    ) -> Admission<ActorRef<M>>
     where
         R: crate::RawActor<Msg = M>,
     {
         let actor = self.actor_ref();
         let reservation = self.take_reservation();
+        reservation.slot.set_actor_kind(kind);
         reservation.slot.define(ChildConstruction::Raw(
             definition.erase(Arc::clone(&self.mailbox)),
         ));
@@ -1049,26 +1086,28 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     where
         R: crate::RawActor<Msg = M>,
     {
-        self.define_once_raw_with(definition, false)
+        self.define_once_raw_with(definition, false, crate::ActorKind::RawActor)
     }
 
     fn define_once_raw_fused<R>(mut self, definition: RawOnceDef<R>) -> Admission<ActorRef<M>>
     where
         R: crate::RawActor<Msg = M>,
     {
-        self.define_once_raw_with(definition, true)
+        self.define_once_raw_with(definition, true, crate::ActorKind::RawActor)
     }
 
     fn define_once_raw_with<R>(
         &mut self,
         definition: RawOnceDef<R>,
         fused: bool,
+        kind: crate::ActorKind,
     ) -> Admission<ActorRef<M>>
     where
         R: crate::RawActor<Msg = M>,
     {
         let actor = self.actor_ref();
         let reservation = self.take_reservation();
+        reservation.slot.set_actor_kind(kind);
         reservation.slot.define(ChildConstruction::Raw(
             definition.erase(Arc::clone(&self.mailbox)),
         ));
@@ -1589,6 +1628,26 @@ impl ScopeRef {
         self.cell.subscribe_lifecycle()
     }
 
+    /// Samples all resident actors recursively in snapshot child order.
+    #[must_use]
+    pub fn stats_recursive(&self) -> Vec<crate::RecursiveActorStats> {
+        self.cell.stats_recursive()
+    }
+
+    /// Observes child changes with automatic authoritative resets after loss.
+    #[must_use]
+    pub fn observe_children(&self) -> crate::ChildObserver {
+        let events = self.subscribe_lifecycle();
+        let initial = self.snapshot();
+        crate::ChildObserver::new(self.clone(), events, initial)
+    }
+
+    /// Observes deduplicated cumulative restart counts with loss recovery.
+    #[must_use]
+    pub fn restart_counts(&self) -> crate::RestartCounter {
+        crate::RestartCounter::new(self.observe_children())
+    }
+
     /// Looks up a direct child in an authoritative current snapshot.
     #[must_use]
     pub fn child(&self, id: impl AsRef<str>) -> Option<crate::ChildSnapshot> {
@@ -1762,6 +1821,24 @@ impl DynamicScopeRef {
         self.0.subscribe_lifecycle()
     }
 
+    /// Samples all resident actors recursively in snapshot child order.
+    #[must_use]
+    pub fn stats_recursive(&self) -> Vec<crate::RecursiveActorStats> {
+        self.0.stats_recursive()
+    }
+
+    /// Observes child changes with automatic authoritative resets after loss.
+    #[must_use]
+    pub fn observe_children(&self) -> crate::ChildObserver {
+        self.0.observe_children()
+    }
+
+    /// Observes deduplicated cumulative restart counts with loss recovery.
+    #[must_use]
+    pub fn restart_counts(&self) -> crate::RestartCounter {
+        self.0.restart_counts()
+    }
+
     /// Looks up a direct child in an authoritative current snapshot.
     #[must_use]
     pub fn child(&self, id: impl AsRef<str>) -> Option<crate::ChildSnapshot> {
@@ -1813,7 +1890,7 @@ impl DynamicScopeRef {
     ) -> Result<DynamicActorSlot<M>, ReserveError> {
         let id = checked_id(id)?;
         crate::driver::reserve_dynamic(&self.0.cell, id, None).map(|reservation| {
-            let mailbox = MailboxCell::new(reservation.slot.member.id().clone());
+            let mailbox = MailboxCell::new(&reservation.slot.member);
             reservation.slot.member.attach_mailbox(mailbox.clone());
             DynamicActorSlot {
                 reservation: Some(reservation),

@@ -15,7 +15,9 @@ use crate::{
     Incarnation, KeyedCapacity, Mailbox, MailboxShutdown, MonitorEvent, RawActor, RawContext,
     RawDef, RawOnceDef, Readiness, ReadinessDeadline, Rejected, RestartPolicy, Retention, ScopeRef,
     Shutdown, WatchTarget,
-    mailbox::{MailboxKeyExtractor, mailbox_key_extractor},
+    mailbox::{
+        MailboxKeyExtractor, MessageSizeObserver, mailbox_key_extractor, message_size_observer,
+    },
     policy::CommonOptions,
     raw::CatchUnwindFuture,
 };
@@ -485,6 +487,7 @@ pub struct ActorDef<A: Actor> {
     factory: ArgsFactory<A>,
     pub(crate) options: CommonOptions,
     mailbox_key: Option<MailboxKeyExtractor<A::Msg>>,
+    message_size: Option<MessageSizeObserver<A::Msg>>,
 }
 
 impl<A: Actor> fmt::Debug for ActorDef<A> {
@@ -511,6 +514,7 @@ impl<A: Actor> ActorDef<A> {
             factory: Arc::new(Mutex::new(Box::new(factory))),
             options: CommonOptions::default(),
             mailbox_key: None,
+            message_size: None,
         }
     }
 
@@ -556,6 +560,16 @@ impl<A: Actor> ActorDef<A> {
         self
     }
 
+    /// Observes accepted message sizes on the sender's ingress stack.
+    #[must_use]
+    pub fn message_size(
+        mut self,
+        measure: impl Fn(&A::Msg) -> usize + Send + Sync + 'static,
+    ) -> Self {
+        self.message_size = Some(message_size_observer(measure));
+        self
+    }
+
     /// Overrides frozen-prefix drain versus discard behavior.
     #[must_use]
     pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
@@ -595,6 +609,7 @@ impl<A: Actor> ActorDef<A> {
         });
         raw.options = self.options;
         raw.mailbox_key = self.mailbox_key;
+        raw.message_size = self.message_size;
         raw
     }
 }
@@ -607,6 +622,7 @@ pub struct ActorOnceDef<A: Actor> {
     args: A::Args,
     pub(crate) options: CommonOptions,
     mailbox_key: Option<MailboxKeyExtractor<A::Msg>>,
+    message_size: Option<MessageSizeObserver<A::Msg>>,
 }
 
 impl<A: Actor> fmt::Debug for ActorOnceDef<A> {
@@ -626,6 +642,7 @@ impl<A: Actor> ActorOnceDef<A> {
             args,
             options: CommonOptions::default(),
             mailbox_key: None,
+            message_size: None,
         }
     }
 
@@ -664,6 +681,16 @@ impl<A: Actor> ActorOnceDef<A> {
         self
     }
 
+    /// Observes accepted message sizes on the sender's ingress stack.
+    #[must_use]
+    pub fn message_size(
+        mut self,
+        measure: impl Fn(&A::Msg) -> usize + Send + Sync + 'static,
+    ) -> Self {
+        self.message_size = Some(message_size_observer(measure));
+        self
+    }
+
     /// Overrides frozen-prefix drain versus discard behavior.
     #[must_use]
     pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
@@ -697,6 +724,7 @@ impl<A: Actor> ActorOnceDef<A> {
         let mut raw = RawOnceDef::new(Handler::with_readiness(self.args, readiness));
         raw.options = self.options;
         raw.mailbox_key = self.mailbox_key;
+        raw.message_size = self.message_size;
         raw
     }
 }

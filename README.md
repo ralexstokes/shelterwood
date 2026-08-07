@@ -6,11 +6,11 @@ the tree owns startup order, readiness, restart policy, bounded mailboxes,
 shutdown, and observation. Stable membership and incarnation identities make
 failure recovery explicit without a global registry.
 
-The current `0.1` surface is the core described by [SPEC.md](SPEC.md): ordered
-and dynamic scopes, `OneForOne` supervision, handler and raw actors, supervised
-tasks, queue and latest-value mailboxes, lifecycle events, and recursive
-snapshots. Part II features in the specification are intentionally not part of
-the core API yet.
+The current `0.1` surface is the core described by [SPEC.md](SPEC.md) plus the
+accepted Part II milestones through M10: incarnation-aware calls and mapping,
+keyed conflation and peer monitoring, ordered group strategies, and structured
+observation extensions. Later Part II sections remain staged by their status
+markers in the specification.
 
 ## Getting started
 
@@ -62,6 +62,7 @@ scope, and subtrees compose both recursively.
 - [Group restart strategies](docs/group-restart-strategies.md)
 - [Shutdown and resource ownership](docs/shutdown-and-resources.md)
 - [Snapshots and lifecycle events](docs/observation.md)
+- [Actor statistics and loss-recovering reducers](docs/observation-extensions.md)
 - [Embedding Shelterwood in a host process](docs/embedding.md)
 
 The executable application-scale examples live in the M5 acceptance tests:

@@ -1,16 +1,14 @@
 //! Restart-stable scope snapshots and lifecycle streams.
 
 use std::{
-    collections::VecDeque,
     fmt,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use crate::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartPolicy, Retention, StopReason,
-    Strategy,
-    driver::{Signal, SignalWatcher},
+    Strategy, runtime,
 };
 
 /// Number of lifecycle events retained independently for each subscriber.
@@ -295,68 +293,25 @@ impl ScopeSnapshot {
 #[error("scope snapshot watch is closed")]
 pub struct SnapshotClosed;
 
-#[derive(Debug)]
-struct SnapshotSubscriber {
-    state: Mutex<SnapshotSubscriberState>,
-    signal: Signal,
-}
-
-#[derive(Debug)]
-struct SnapshotSubscriberState {
-    latest: Arc<ScopeSnapshot>,
-    version: u64,
-    closed: bool,
-}
-
 /// Conflating receiver for recursive scope snapshots.
+#[derive(Clone)]
 pub struct SnapshotReceiver {
-    subscriber: Arc<SnapshotSubscriber>,
-    watcher: SignalWatcher,
-    seen: u64,
+    inner: runtime::WatchReceiver<Arc<ScopeSnapshot>>,
 }
 
 impl SnapshotReceiver {
     /// Borrows the newest snapshot without marking it observed.
     #[must_use]
     pub fn borrow_latest(&self) -> Arc<ScopeSnapshot> {
-        Arc::clone(
-            &self
-                .subscriber
-                .state
-                .lock()
-                .expect("snapshot subscriber mutex poisoned")
-                .latest,
-        )
+        self.inner.borrow_cloned()
     }
 
     /// Waits for and returns a newer snapshot.
     pub async fn changed(&mut self) -> Result<Arc<ScopeSnapshot>, SnapshotClosed> {
-        loop {
-            {
-                let state = self
-                    .subscriber
-                    .state
-                    .lock()
-                    .expect("snapshot subscriber mutex poisoned");
-                if state.version != self.seen {
-                    self.seen = state.version;
-                    return Ok(Arc::clone(&state.latest));
-                }
-                if state.closed {
-                    return Err(SnapshotClosed);
-                }
-            }
-            self.watcher.changed().await;
-        }
-    }
-}
-
-impl Clone for SnapshotReceiver {
-    fn clone(&self) -> Self {
-        Self {
-            subscriber: Arc::clone(&self.subscriber),
-            watcher: self.subscriber.signal.watcher(),
-            seen: self.seen,
+        if self.inner.changed_or_closed().await {
+            Ok(self.inner.borrow_and_update_cloned())
+        } else {
+            Err(SnapshotClosed)
         }
     }
 }
@@ -365,94 +320,76 @@ impl fmt::Debug for SnapshotReceiver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SnapshotReceiver")
-            .field("seen", &self.seen)
+            .field("inner", &self.inner)
             .finish_non_exhaustive()
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct SnapshotHub {
-    subscribers: Mutex<Vec<Weak<SnapshotSubscriber>>>,
+    state: Mutex<SnapshotHubState>,
+}
+
+#[derive(Default)]
+struct SnapshotHubState {
+    sender: Option<runtime::WatchSender<Arc<ScopeSnapshot>>>,
+    closed: bool,
 }
 
 impl SnapshotHub {
     pub(crate) fn subscribe(&self, initial: Arc<ScopeSnapshot>) -> SnapshotReceiver {
-        let subscriber = Arc::new(SnapshotSubscriber {
-            state: Mutex::new(SnapshotSubscriberState {
-                latest: initial,
-                version: 0,
-                closed: false,
-            }),
-            signal: Signal::default(),
-        });
-        self.subscribers
-            .lock()
-            .expect("snapshot hub mutex poisoned")
-            .push(Arc::downgrade(&subscriber));
-        SnapshotReceiver {
-            watcher: subscriber.signal.watcher(),
-            subscriber,
-            seen: 0,
+        let mut state = self.state.lock().expect("snapshot hub mutex poisoned");
+        if state.closed {
+            let (sender, inner) = runtime::watch(initial);
+            drop(sender);
+            return SnapshotReceiver { inner };
         }
+        if let Some(sender) = &state.sender
+            && sender.receiver_count() > 0
+        {
+            return SnapshotReceiver {
+                inner: sender.watcher(),
+            };
+        }
+        let (sender, inner) = runtime::watch(initial);
+        state.sender = Some(sender);
+        SnapshotReceiver { inner }
     }
 
     pub(crate) fn publish(&self, snapshot: impl FnOnce() -> Arc<ScopeSnapshot>) {
-        let mut subscribers = self
-            .subscribers
-            .lock()
-            .expect("snapshot hub mutex poisoned");
-        subscribers.retain(|subscriber| subscriber.strong_count() > 0);
-        if subscribers.is_empty() {
+        let mut state = self.state.lock().expect("snapshot hub mutex poisoned");
+        let Some(sender) = &state.sender else {
+            return;
+        };
+        if sender.receiver_count() == 0 {
+            state.sender = None;
             return;
         }
-        let snapshot = snapshot();
-        subscribers.retain(|subscriber| {
-            let Some(subscriber) = subscriber.upgrade() else {
-                return false;
-            };
-            let mut state = subscriber
-                .state
-                .lock()
-                .expect("snapshot subscriber mutex poisoned");
-            state.latest = Arc::clone(&snapshot);
-            state.version = state.version.saturating_add(1);
-            drop(state);
-            subscriber.signal.pulse();
-            true
-        });
+        sender.replace(snapshot());
     }
 
     pub(crate) fn close(&self) {
-        let mut subscribers = self
-            .subscribers
-            .lock()
-            .expect("snapshot hub mutex poisoned");
-        subscribers.retain(|subscriber| {
-            let Some(subscriber) = subscriber.upgrade() else {
-                return false;
-            };
-            subscriber
-                .state
-                .lock()
-                .expect("snapshot subscriber mutex poisoned")
-                .closed = true;
-            subscriber.signal.pulse();
-            true
-        });
+        let mut state = self.state.lock().expect("snapshot hub mutex poisoned");
+        state.closed = true;
+        state.sender = None;
     }
 }
 
-#[derive(Debug)]
-struct LifecycleQueue {
-    state: Mutex<LifecycleQueueState>,
-    signal: Signal,
-}
-
-#[derive(Debug, Default)]
-struct LifecycleQueueState {
-    events: VecDeque<LifecycleEvent>,
-    lagged: Option<u64>,
-    closed: bool,
+impl fmt::Debug for SnapshotHub {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.lock().expect("snapshot hub mutex poisoned");
+        formatter
+            .debug_struct("SnapshotHub")
+            .field(
+                "receivers",
+                &state
+                    .sender
+                    .as_ref()
+                    .map_or(0, |sender| sender.receiver_count()),
+            )
+            .field("closed", &state.closed)
+            .finish()
+    }
 }
 
 /// Error from a non-blocking lifecycle receive.
@@ -469,8 +406,9 @@ pub enum LifecycleTryRecvError {
 
 /// One membership-owned lifecycle subscription.
 pub struct LifecycleEvents {
-    queue: Arc<LifecycleQueue>,
-    watcher: SignalWatcher,
+    events: runtime::BroadcastReceiver<LifecycleEvent>,
+    explicit_lag: runtime::WatchReceiver<u64>,
+    seen_explicit_lag: u64,
 }
 
 impl LifecycleEvents {
@@ -480,69 +418,100 @@ impl LifecycleEvents {
             match self.try_recv() {
                 Ok(item) => return Some(item),
                 Err(LifecycleTryRecvError::Closed) => return None,
-                Err(LifecycleTryRecvError::Empty) => self.watcher.changed().await,
+                Err(LifecycleTryRecvError::Empty) => {}
             }
+            let _ = self.explicit_lag.changed_or_closed().await;
         }
     }
 
     /// Attempts to receive without waiting.
     pub fn try_recv(&mut self) -> Result<LifecycleItem, LifecycleTryRecvError> {
-        let mut state = self
-            .queue
-            .state
-            .lock()
-            .expect("lifecycle queue mutex poisoned");
         // The marker leads the overflow episode deliberately. A consumer
         // snapshots here, then discards retained events at or below that
         // watermark before applying the newer suffix.
-        if let Some(dropped) = state.lagged.take() {
+        let current_explicit_lag = self.explicit_lag.borrow_cloned();
+        if current_explicit_lag != self.seen_explicit_lag {
+            let mut dropped = current_explicit_lag.saturating_sub(self.seen_explicit_lag);
+            self.seen_explicit_lag = current_explicit_lag;
+            // Do not pull a retained event forward across this marker. It
+            // must remain in the bounded ring so a later overflow can still
+            // evict the oldest unread event. Tokio guarantees the next read
+            // reports lag when `len` exceeds the effective capacity; 128 is
+            // already a power of two, so the effective capacity is exact.
+            if self.events.len() > LIFECYCLE_EVENT_CAPACITY {
+                match self.events.try_receive() {
+                    runtime::BroadcastReceive::Lagged(overflow) => {
+                        dropped = dropped.saturating_add(overflow);
+                    }
+                    runtime::BroadcastReceive::Item(_)
+                    | runtime::BroadcastReceive::Empty
+                    | runtime::BroadcastReceive::Closed => {
+                        unreachable!("a lagging broadcast receiver reports its dropped prefix")
+                    }
+                }
+            }
             return Ok(LifecycleItem::Lagged { dropped });
         }
-        if let Some(event) = state.events.pop_front() {
-            return Ok(LifecycleItem::Event(event));
-        }
-        if state.closed {
-            Err(LifecycleTryRecvError::Closed)
-        } else {
-            Err(LifecycleTryRecvError::Empty)
+        match self.events.try_receive() {
+            runtime::BroadcastReceive::Item(event) => Ok(LifecycleItem::Event(event)),
+            runtime::BroadcastReceive::Lagged(dropped) => Ok(LifecycleItem::Lagged { dropped }),
+            runtime::BroadcastReceive::Empty => Err(LifecycleTryRecvError::Empty),
+            runtime::BroadcastReceive::Closed => Err(LifecycleTryRecvError::Closed),
         }
     }
 }
 
 impl fmt::Debug for LifecycleEvents {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self
-            .queue
-            .state
-            .lock()
-            .expect("lifecycle queue mutex poisoned");
         formatter
             .debug_struct("LifecycleEvents")
-            .field("queued", &state.events.len())
-            .field("lagged", &state.lagged)
-            .field("closed", &state.closed)
-            .finish()
+            .field("queued", &self.events.len())
+            .finish_non_exhaustive()
     }
 }
 
-#[derive(Debug, Default)]
 pub(crate) struct LifecycleHub {
-    subscribers: Mutex<Vec<Weak<LifecycleQueue>>>,
+    channels: Mutex<Option<LifecycleChannels>>,
+}
+
+struct LifecycleChannels {
+    events: runtime::BroadcastSender<LifecycleEvent>,
+    explicit_lag: runtime::WatchSender<u64>,
+}
+
+impl Default for LifecycleHub {
+    fn default() -> Self {
+        let (events, _) = runtime::broadcast(LIFECYCLE_EVENT_CAPACITY);
+        let (explicit_lag, _) = runtime::watch(0);
+        Self {
+            channels: Mutex::new(Some(LifecycleChannels {
+                events,
+                explicit_lag,
+            })),
+        }
+    }
 }
 
 impl LifecycleHub {
     pub(crate) fn subscribe(&self) -> LifecycleEvents {
-        let queue = Arc::new(LifecycleQueue {
-            state: Mutex::new(LifecycleQueueState::default()),
-            signal: Signal::default(),
-        });
-        self.subscribers
-            .lock()
-            .expect("lifecycle hub mutex poisoned")
-            .push(Arc::downgrade(&queue));
+        let channels = self.channels.lock().expect("lifecycle hub mutex poisoned");
+        if let Some(channels) = channels.as_ref() {
+            let explicit_lag = channels.explicit_lag.watcher();
+            let seen_explicit_lag = explicit_lag.borrow_cloned();
+            return LifecycleEvents {
+                events: channels.events.subscribe(),
+                explicit_lag,
+                seen_explicit_lag,
+            };
+        }
+        let (events_sender, events) = runtime::broadcast(LIFECYCLE_EVENT_CAPACITY);
+        let (lag_sender, explicit_lag) = runtime::watch(0);
+        drop(events_sender);
+        drop(lag_sender);
         LifecycleEvents {
-            watcher: queue.signal.watcher(),
-            queue,
+            events,
+            explicit_lag,
+            seen_explicit_lag: 0,
         }
     }
 
@@ -554,67 +523,53 @@ impl LifecycleHub {
             kind = ?event.kind,
             "scope lifecycle event"
         );
-        let mut subscribers = self
-            .subscribers
+        if let Some(channels) = self
+            .channels
             .lock()
-            .expect("lifecycle hub mutex poisoned");
-        subscribers.retain(|subscriber| {
-            let Some(subscriber) = subscriber.upgrade() else {
-                return false;
-            };
-            let mut state = subscriber
-                .state
-                .lock()
-                .expect("lifecycle queue mutex poisoned");
-            if state.events.len() == LIFECYCLE_EVENT_CAPACITY {
-                let dropped = state.events.pop_front();
-                debug_assert!(dropped.is_some());
-                state.lagged = Some(state.lagged.unwrap_or(0).saturating_add(1));
-            }
-            state.events.push_back(event.clone());
-            drop(state);
-            subscriber.signal.pulse();
-            true
-        });
+            .expect("lifecycle hub mutex poisoned")
+            .as_ref()
+        {
+            let _ = channels.events.send(event);
+            // The watch version is also the no-loss activity notification for
+            // async receivers. Its value changes only for explicit lag.
+            channels.explicit_lag.pulse();
+        }
     }
 
     pub(crate) fn publish_lagged(&self, dropped: u64) {
-        let mut subscribers = self
-            .subscribers
+        if let Some(channels) = self
+            .channels
             .lock()
-            .expect("lifecycle hub mutex poisoned");
-        subscribers.retain(|subscriber| {
-            let Some(subscriber) = subscriber.upgrade() else {
-                return false;
-            };
-            let mut state = subscriber
-                .state
-                .lock()
-                .expect("lifecycle queue mutex poisoned");
-            state.lagged = Some(state.lagged.unwrap_or(0).saturating_add(dropped));
-            drop(state);
-            subscriber.signal.pulse();
-            true
-        });
+            .expect("lifecycle hub mutex poisoned")
+            .as_ref()
+        {
+            channels
+                .explicit_lag
+                .send_modify(|total| *total = total.saturating_add(dropped));
+        }
     }
 
     pub(crate) fn close(&self) {
-        let mut subscribers = self
-            .subscribers
+        self.channels
             .lock()
-            .expect("lifecycle hub mutex poisoned");
-        subscribers.retain(|subscriber| {
-            let Some(subscriber) = subscriber.upgrade() else {
-                return false;
-            };
-            subscriber
-                .state
-                .lock()
-                .expect("lifecycle queue mutex poisoned")
-                .closed = true;
-            subscriber.signal.pulse();
-            true
-        });
+            .expect("lifecycle hub mutex poisoned")
+            .take();
+    }
+}
+
+impl fmt::Debug for LifecycleHub {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let channels = self.channels.lock().expect("lifecycle hub mutex poisoned");
+        formatter
+            .debug_struct("LifecycleHub")
+            .field(
+                "receivers",
+                &channels
+                    .as_ref()
+                    .map_or(0, |channels| channels.events.receiver_count()),
+            )
+            .field("closed", &channels.is_none())
+            .finish()
     }
 }
 
@@ -635,11 +590,52 @@ pub enum WaitError {
 
 #[cfg(test)]
 mod tests {
-    use super::SnapshotHub;
+    use crate::{
+        ScopeState,
+        identity::ScopeIdentity,
+        observe::{LifecycleEvent, LifecycleEventKind, LifecycleItem},
+    };
+
+    use super::{LIFECYCLE_EVENT_CAPACITY, LifecycleHub, SnapshotHub};
 
     #[test]
     fn snapshot_projection_is_skipped_without_subscribers() {
         let hub = SnapshotHub::default();
         hub.publish(|| panic!("projection must be lazy when no receiver exists"));
+    }
+
+    #[test]
+    fn a_retained_event_after_explicit_lag_remains_subject_to_later_overflow() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let membership = identity.mint_membership().expect("membership available");
+        let event = |seq| LifecycleEvent {
+            scope_path: Vec::new(),
+            scope: membership,
+            seq,
+            kind: LifecycleEventKind::ScopeState {
+                state: ScopeState::Running,
+            },
+        };
+        let hub = LifecycleHub::default();
+        let mut events = hub.subscribe();
+
+        hub.publish_lagged(1);
+        hub.publish(event(1));
+        assert_eq!(events.try_recv(), Ok(LifecycleItem::Lagged { dropped: 1 }));
+
+        for seq in 2..=(LIFECYCLE_EVENT_CAPACITY as u64 + 2) {
+            hub.publish(event(seq));
+        }
+        assert_eq!(
+            events.try_recv(),
+            Ok(LifecycleItem::Lagged { dropped: 2 }),
+            "the prior retained event and the next oldest event are both evicted"
+        );
+        let LifecycleItem::Event(first_retained) =
+            events.try_recv().expect("the retained suffix follows lag")
+        else {
+            panic!("expected the retained suffix");
+        };
+        assert_eq!(first_retained.seq, 3);
     }
 }

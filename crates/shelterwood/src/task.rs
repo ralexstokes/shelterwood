@@ -5,19 +5,19 @@ use std::{
     future::Future,
     hash::{Hash, Hasher},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use crate::{
     ChildId, Exit, ExitError, ExitResult, Incarnation, Membership, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
-    driver::{MemberCell, MemberStage, Signal},
+    driver::MemberCell,
     policy::CommonOptions,
-    runtime::Latch,
+    runtime::{self, Latch},
 };
 
 pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
-pub(crate) type TaskFactory = Arc<Mutex<Box<dyn Fn(TaskContext) -> TaskFuture + Send + 'static>>>;
+pub(crate) type TaskFactory = Arc<dyn Fn(TaskContext) -> TaskFuture + Send + Sync + 'static>;
 
 /// A library-owned cancellation token.
 #[derive(Clone, Debug, Default)]
@@ -138,13 +138,11 @@ impl TaskDef {
     /// Creates a restartable task definition from a repeatable body factory.
     pub fn new<F, Fut>(factory: F) -> Self
     where
-        F: Fn(TaskContext) -> Fut + Send + 'static,
+        F: Fn(TaskContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ExitResult> + Send + 'static,
     {
         Self {
-            factory: Arc::new(Mutex::new(Box::new(move |context| {
-                Box::pin(factory(context))
-            }))),
+            factory: Arc::new(move |context| Box::pin(factory(context))),
             options: CommonOptions::default(),
         }
     }
@@ -250,14 +248,14 @@ impl<T: Send + 'static> TaskOnceDef<T> {
         self
     }
 
-    pub(crate) fn erase(self, completion: Arc<Completion<T>>) -> OnceTask {
+    pub(crate) fn erase(self, completion: runtime::OneShotSender<T>) -> OnceTask {
         let body = self.body;
         OnceTask {
             body: OnceTaskBody::Available(Box::new(move |context| {
                 Box::pin(async move {
                     match body(context).await {
                         Ok(value) => {
-                            completion.complete(value);
+                            let _ = completion.send(value);
                             Ok(())
                         }
                         Err(error) => Err(error),
@@ -332,39 +330,10 @@ impl Hash for TaskRef {
     }
 }
 
-enum CompletionState<T> {
-    Pending,
-    Completed(T),
-    Discarded,
-}
-
-pub(crate) struct Completion<T> {
-    state: Mutex<CompletionState<T>>,
-    changed: Signal,
-}
-
-impl<T> Completion<T> {
-    pub(crate) fn new(changed: Signal) -> Arc<Self> {
-        Arc::new(Self {
-            state: Mutex::new(CompletionState::Pending),
-            changed,
-        })
-    }
-
-    fn complete(&self, value: T) {
-        let mut state = self.state.lock().expect("completion mutex poisoned");
-        if matches!(*state, CompletionState::Pending) {
-            *state = CompletionState::Completed(value);
-            drop(state);
-            self.changed.pulse();
-        }
-    }
-}
-
 /// The sole claim to a one-shot task's typed completion value.
 #[must_use]
 pub struct OneShotTaskRef<T> {
-    completion: Arc<Completion<T>>,
+    completion: runtime::OneShotReceiver<T>,
     task: TaskRef,
 }
 
@@ -378,46 +347,17 @@ impl<T> fmt::Debug for OneShotTaskRef<T> {
 }
 
 impl<T> OneShotTaskRef<T> {
-    pub(crate) fn new(completion: Arc<Completion<T>>, task: TaskRef) -> Self {
+    pub(crate) fn new(completion: runtime::OneShotReceiver<T>, task: TaskRef) -> Self {
         Self { completion, task }
     }
 
     /// Consumes the claim and waits for the typed value or terminal exit.
     pub async fn wait(self) -> Result<T, Exit> {
-        let mut watcher = self.completion.changed.watcher();
-        loop {
-            {
-                let mut state = self
-                    .completion
-                    .state
-                    .lock()
-                    .expect("completion mutex poisoned");
-                if matches!(*state, CompletionState::Completed(_)) {
-                    let CompletionState::Completed(value) =
-                        std::mem::replace(&mut *state, CompletionState::Discarded)
-                    else {
-                        unreachable!()
-                    };
-                    return Ok(value);
-                }
-            }
-            if let MemberStage::Terminal(exit) = self.task.cell.record().stage {
-                return Err(exit);
-            }
-            watcher.changed().await;
-        }
-    }
-}
-
-impl<T> Drop for OneShotTaskRef<T> {
-    fn drop(&mut self) {
-        let mut state = self
-            .completion
-            .state
-            .lock()
-            .expect("completion mutex poisoned");
-        if matches!(*state, CompletionState::Completed(_)) {
-            *state = CompletionState::Discarded;
+        let Self { completion, task } = self;
+        if let Some(value) = completion.receive().await {
+            Ok(value)
+        } else {
+            Err(task.wait().await)
         }
     }
 }

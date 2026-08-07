@@ -22,8 +22,8 @@ use crate::{
     mailbox::MailboxCell,
     policy::{CommonOptions, IdError, ResolvedCommonOptions, ResolvedDefaults, resolve_common},
     raw::{RawConstruction, RawDef, RawOnceDef},
-    runtime::Latch,
-    task::{Completion, OnceTask, OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
+    runtime::{self, Latch},
+    task::{OnceTask, OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
 
 /// Whether a scope has fixed ordered membership or runtime-dynamic membership.
@@ -819,8 +819,8 @@ impl TaskSlot {
         definition: TaskOnceDef<T>,
     ) -> (TaskRef, OneShotTaskRef<T>) {
         let task = self.task_ref();
-        let completion = Completion::new(self.slot.member.change_signal());
-        let claim = OneShotTaskRef::new(Arc::clone(&completion), task.clone());
+        let (completion, receiver) = runtime::oneshot();
+        let claim = OneShotTaskRef::new(receiver, task.clone());
         self.slot
             .define(ChildConstruction::TaskOnce(definition.erase(completion)));
         (task, claim)
@@ -928,7 +928,12 @@ impl<H: Unpin> Future for Admission<H> {
                 Arc::clone(&reservation.slot),
                 self.fused_cancel.clone(),
             );
-            self.inner = Some(Box::pin(async move { response.wait().await }));
+            self.inner = Some(Box::pin(async move {
+                response
+                    .receive()
+                    .await
+                    .expect("admission response obligation must complete")
+            }));
         }
         let poll = self
             .inner
@@ -1166,9 +1171,9 @@ impl DynamicTaskSlot {
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
         let task = self.task_ref();
-        let completion = Completion::new(self.reservation().slot.member.change_signal());
+        let (completion, receiver) = runtime::oneshot();
         let reservation = self.take_reservation();
-        let claim = OneShotTaskRef::new(Arc::clone(&completion), task.clone());
+        let claim = OneShotTaskRef::new(receiver, task.clone());
         reservation
             .slot
             .define(ChildConstruction::TaskOnce(definition.erase(completion)));
@@ -1180,9 +1185,9 @@ impl DynamicTaskSlot {
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
         let task = self.task_ref();
-        let completion = Completion::new(self.reservation().slot.member.change_signal());
+        let (completion, receiver) = runtime::oneshot();
         let reservation = self.take_reservation();
-        let claim = OneShotTaskRef::new(Arc::clone(&completion), task.clone());
+        let claim = OneShotTaskRef::new(receiver, task.clone());
         reservation
             .slot
             .define(ChildConstruction::TaskOnce(definition.erase(completion)));
@@ -1300,9 +1305,14 @@ impl fmt::Debug for Removal {
 }
 
 impl Removal {
-    fn new(response: Arc<crate::driver::RemovalResponse>) -> Self {
+    fn new(response: crate::driver::RemovalResponse) -> Self {
         Self {
-            inner: Box::pin(async move { response.wait().await }),
+            inner: Box::pin(async move {
+                response
+                    .receive()
+                    .await
+                    .expect("removal response obligation must complete")
+            }),
         }
     }
 }
@@ -1317,7 +1327,7 @@ impl Future for Removal {
 
 /// A restartable subtree definition.
 pub struct SubtreeDef<T: Subtree> {
-    factory: Box<dyn Fn() -> T + Send + 'static>,
+    factory: Box<dyn Fn() -> T + Send + Sync + 'static>,
     options: CommonOptions,
     defaults: DefaultsInheritance,
 }
@@ -1334,7 +1344,7 @@ impl<T: Subtree> fmt::Debug for SubtreeDef<T> {
 
 impl<T: Subtree> SubtreeDef<T> {
     /// Creates a restartable subtree from a repeatable declaration source.
-    pub fn factory(factory: impl Fn() -> T + Send + 'static) -> Self {
+    pub fn factory(factory: impl Fn() -> T + Send + Sync + 'static) -> Self {
         Self {
             factory: Box::new(factory),
             options: CommonOptions::default(),
@@ -1380,9 +1390,9 @@ impl<T: Subtree> SubtreeDef<T> {
     fn erase(self) -> ScopeConstruction {
         let factory = self.factory;
         ScopeConstruction {
-            source: ScopeSource::Restartable(Arc::new(Mutex::new(Box::new(move || {
+            source: ScopeSource::Restartable(Arc::new(move || {
                 <T as sealed::Sealed>::into_core(factory())
-            })))),
+            })),
             options: self.options,
             defaults: self.defaults,
         }
@@ -1461,7 +1471,7 @@ pub(crate) struct ScopeConstruction {
     pub(crate) defaults: DefaultsInheritance,
 }
 
-pub(crate) type ScopeFactory = Arc<Mutex<Box<dyn Fn() -> BuilderCore + Send + 'static>>>;
+pub(crate) type ScopeFactory = Arc<dyn Fn() -> BuilderCore + Send + Sync + 'static>;
 
 impl ScopeConstruction {
     pub(crate) fn one_shot(&self) -> bool {

@@ -576,13 +576,35 @@ impl<M> Drop for Termination<M> {
     }
 }
 
+pub(crate) trait MailboxTermination: Send {}
+
+struct MailboxTeardown<M> {
+    changed: Signal,
+    queue: Option<VecDeque<Envelope<M>>>,
+    latest: Option<Envelope<M>>,
+    termination: Option<Termination<M>>,
+}
+
+impl<M> Drop for MailboxTeardown<M> {
+    fn drop(&mut self) {
+        self.changed.pulse();
+        drop(self.queue.take());
+        drop(self.latest.take());
+        if let Some(termination) = self.termination.take() {
+            termination.finish();
+        }
+    }
+}
+
+impl<M: Send> MailboxTermination for MailboxTeardown<M> {}
+
 /// Type-erased control used by the supervision driver.
 pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
     fn configure(&self, mailbox: Mailbox);
     fn bind(&self, incarnation: Incarnation);
     fn freeze(&self, incarnation: Incarnation);
     fn close(&self, incarnation: Incarnation);
-    fn terminate(&self);
+    fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>>;
     fn stats(&self) -> MailboxStats;
 }
 
@@ -943,10 +965,10 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         drop(latest);
     }
 
-    fn terminate(&self) {
+    fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         if matches!(state.status, BindingStatus::Terminal(_)) {
-            return;
+            return None;
         }
         let final_incarnation = state.last_bound;
         state.status = BindingStatus::Terminal(final_incarnation);
@@ -958,10 +980,12 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             final_incarnation,
         };
         drop(state);
-        self.changed.pulse();
-        drop(queue);
-        drop(latest);
-        termination.finish();
+        Some(Box::new(MailboxTeardown {
+            changed: self.changed.clone(),
+            queue: Some(queue),
+            latest,
+            termination: Some(termination),
+        }))
     }
 
     fn stats(&self) -> MailboxStats {
@@ -1683,7 +1707,7 @@ mod tests {
 
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
-                MailboxControl::terminate(&*mailbox);
+                drop(MailboxControl::prepare_termination(&*mailbox));
             }))
             .is_err()
         );

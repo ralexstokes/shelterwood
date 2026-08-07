@@ -6,7 +6,7 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -444,7 +444,7 @@ async fn resume_after_teardown<A, M: Send + 'static>(
     resume_unwind(payload)
 }
 
-type ArgsFactory<A> = Arc<Mutex<Box<dyn Fn() -> <A as Actor>::Args + Send + 'static>>>;
+type ArgsFactory<A> = Arc<dyn Fn() -> <A as Actor>::Args + Send + Sync + 'static>;
 
 /// Restartable handler-actor definition.
 pub struct ActorDef<A: Actor> {
@@ -465,15 +465,15 @@ impl<A: Actor> ActorDef<A> {
     /// Creates a restartable definition by cloning args inside each incarnation.
     pub fn cloned(args: A::Args) -> Self
     where
-        A::Args: Clone,
+        A::Args: Clone + Sync,
     {
         Self::factory(move || args.clone())
     }
 
     /// Creates a restartable definition from a fresh per-incarnation args source.
-    pub fn factory(factory: impl Fn() -> A::Args + Send + 'static) -> Self {
+    pub fn factory(factory: impl Fn() -> A::Args + Send + Sync + 'static) -> Self {
         Self {
-            factory: Arc::new(Mutex::new(Box::new(factory))),
+            factory: Arc::new(factory),
             options: CommonOptions::default(),
         }
     }
@@ -531,9 +531,7 @@ impl<A: Actor> ActorDef<A> {
         let factory = self.factory;
         let readiness = self.options.readiness.unwrap_or(Readiness::AfterInit);
         let mut raw = RawDef::factory(move || {
-            let args = (factory
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner))();
+            let args = factory();
             Handler::with_readiness(args, readiness)
         });
         raw.options = self.options;

@@ -1323,7 +1323,7 @@ impl DynamicControl {
         })
     }
 
-    fn close(&self) {
+    fn close(&self) -> HashMap<ChildId, DynamicEntry> {
         let mut state = self.state.lock().expect("dynamic-state mutex poisoned");
         state.accepting = false;
         let entries = std::mem::take(&mut state.entries);
@@ -1337,9 +1337,10 @@ impl DynamicControl {
                 }
             }
         }
-        // Dropping the entries completes every in-flight removal. The driver
-        // no longer needs a separate close-time completion loop.
-        drop(entries);
+        // The caller holds admitted entries across member terminality and
+        // residency removal. Dropping them then completes every in-flight
+        // removal without waking a remover before those observation edges.
+        entries
     }
 }
 
@@ -1723,6 +1724,7 @@ struct ActiveChild {
     ready_signal: Latch,
     construction_release: Latch,
     framework_abort: Option<Latch>,
+    framework_abort_ack: Option<Latch>,
     framework_abort_deadline: Option<Instant>,
 }
 
@@ -1843,6 +1845,7 @@ struct ScopeRuntime {
     ancestor_shutdown: Option<Latch>,
     ancestor_shutdown_seen: bool,
     ancestor_abort: Option<Latch>,
+    ancestor_abort_ack: Option<Latch>,
     ancestor_abort_seen: bool,
     completion: Option<ScopeCompletion>,
 }
@@ -1854,10 +1857,13 @@ struct ScopeCompletion {
 
 impl Drop for ScopeRuntime {
     fn drop(&mut self) {
-        if let Some(dynamic) = &self.dynamic {
-            dynamic.close();
+        let dynamic_entries = if let Some(dynamic) = &self.dynamic {
+            let entries = dynamic.close();
             self.root.set_dynamic(None);
-        }
+            Some(entries)
+        } else {
+            None
+        };
         for child in &mut self.children {
             if let Some(active) = child.active.take() {
                 if let Some(mailbox) = child.slot.member.mailbox() {
@@ -1876,6 +1882,9 @@ impl Drop for ScopeRuntime {
         // Residency owns the matching Removed edges. Clearing the set after
         // terminality discharges them all before the scope's final event.
         self.root.clear_residents();
+        // Dynamic entries own removal completions. Keep them armed until the
+        // corresponding members are terminal and no longer resident.
+        drop(dynamic_entries);
         self.children.clear();
         if !matches!(self.root.record().state, ScopeState::Stopped { .. }) {
             let completion = self.completion.take();
@@ -2115,6 +2124,8 @@ impl ScopeRuntime {
         let nested_cancel = shutdown.clone();
         let framework_abort = Latch::default();
         let nested_abort = framework_abort.clone();
+        let framework_abort_ack = Latch::default();
+        let nested_abort_ack = framework_abort_ack.clone();
         let constructed_sender = self.events.clone();
         let run_release = construction_release.clone();
         let handle = runtime::spawn(incarnation, async move {
@@ -2159,6 +2170,7 @@ impl ScopeRuntime {
                         nested_ready,
                         nested_cancel,
                         nested_abort,
+                        nested_abort_ack,
                     )
                     .await
                 }
@@ -2174,6 +2186,7 @@ impl ScopeRuntime {
                         nested_ready,
                         nested_cancel,
                         nested_abort,
+                        nested_abort_ack,
                     )
                     .await
                 }
@@ -2250,6 +2263,7 @@ impl ScopeRuntime {
             ready_signal: readiness_signal,
             construction_release,
             framework_abort: scope_child.then_some(framework_abort),
+            framework_abort_ack: scope_child.then_some(framework_abort_ack),
             framework_abort_deadline: None,
         });
     }
@@ -2382,7 +2396,13 @@ impl ScopeRuntime {
             .is_some_and(|deadline| now >= deadline)
         {
             active.framework_abort_deadline = None;
-            active.abort_handle.abort();
+            if active
+                .framework_abort_ack
+                .as_ref()
+                .is_none_or(|ack| !ack.is_fired())
+            {
+                active.abort_handle.abort();
+            }
         }
         if let Some(deadline) = ladder_deadline.or(active.framework_abort_deadline) {
             self.deadlines.push(
@@ -2835,14 +2855,18 @@ impl ScopeRuntime {
                     && !entry.admitted
             });
             if !matches_reservation || request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
-                if matches_reservation {
-                    state.entries.remove(id);
-                }
+                let removed = matches_reservation
+                    .then(|| state.entries.remove(id))
+                    .flatten();
                 drop(state);
                 request.slot.member.terminalize(Exit::never_started());
                 if let Some(scope) = &request.slot.scope {
                     scope.terminalize_never_started();
                 }
+                // The entry's drop completes its removal response; preserve
+                // the same terminality-before-completion ordering as every
+                // other reservation-cancellation path.
+                drop(removed);
                 request.complete(Err(ReserveError::NotAdmitting(
                     NotAdmittingCause::ReservationEnded,
                 )));
@@ -2981,6 +3005,7 @@ async fn run_nested_tree(
     ready: Latch,
     cancel: Latch,
     abort: Latch,
+    abort_ack: Latch,
 ) -> crate::ExitResult {
     let epoch = scope.begin_incarnation();
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
@@ -2994,7 +3019,17 @@ async fn run_nested_tree(
             return Err(crate::ExitError::from_startup_failure(failure));
         }
     };
-    match run_scope_incarnation(plan, false, Some(ready), Some(cancel), Some(abort), epoch).await {
+    match run_scope_incarnation(
+        plan,
+        false,
+        Some(ready),
+        Some(cancel),
+        Some(abort),
+        Some(abort_ack),
+        epoch,
+    )
+    .await
+    {
         StopReason::Finished | StopReason::ShutdownRequested => Ok(()),
         StopReason::IntensityTripped(trip) => Err(crate::ExitError::from_intensity_trip(trip)),
         StopReason::StartupFailed(failure) => Err(crate::ExitError::from_startup_failure(failure)),
@@ -3005,7 +3040,7 @@ async fn run_nested_tree(
 async fn run_scope(plan: ScopePlan, is_root: bool, parent_ready: Option<Latch>) -> StopReason {
     let root = Arc::clone(&plan.root);
     let epoch = root.begin_incarnation();
-    run_scope_incarnation(plan, is_root, parent_ready, None, None, epoch).await
+    run_scope_incarnation(plan, is_root, parent_ready, None, None, None, epoch).await
 }
 
 async fn run_scope_incarnation(
@@ -3014,6 +3049,7 @@ async fn run_scope_incarnation(
     parent_ready: Option<Latch>,
     incarnation_cancel: Option<Latch>,
     incarnation_abort: Option<Latch>,
+    incarnation_abort_ack: Option<Latch>,
     epoch: u64,
 ) -> StopReason {
     let root = Arc::clone(&plan.root);
@@ -3077,6 +3113,7 @@ async fn run_scope_incarnation(
         ancestor_shutdown: incarnation_cancel,
         ancestor_shutdown_seen: false,
         ancestor_abort: incarnation_abort,
+        ancestor_abort_ack: incarnation_abort_ack,
         ancestor_abort_seen: false,
         completion: None,
     };
@@ -3198,7 +3235,6 @@ async fn run_scope_incarnation(
         }
 
         arbitrate(&mut pending);
-        let mut abort_driver = false;
         for (_, event) in pending {
             match event {
                 Pending::Shutdown => {
@@ -3212,9 +3248,14 @@ async fn run_scope_incarnation(
                     scope.begin_drain(StopReason::ShutdownRequested);
                 }
                 Pending::AncestorAbort => {
-                    scope.begin_drain(StopReason::ShutdownRequested);
-                    abort_driver = true;
-                    break;
+                    if let Some(ack) = &scope.ancestor_abort_ack {
+                        ack.fire();
+                    }
+                    // A scheduled framework driver recursively hard-drains
+                    // and joins its children. Its parent only task-aborts it
+                    // at the tidy-beat backstop when this acknowledgement is
+                    // never published.
+                    scope.force_all();
                 }
                 Pending::Force => {
                     scope.force_all();
@@ -3244,14 +3285,6 @@ async fn run_scope_incarnation(
                 })) => scope.handle_exit(index, incarnation, recorded, join, cancelled),
                 Pending::Deadline(deadline) => scope.handle_deadline(deadline),
             }
-        }
-
-        if abort_driver {
-            // Abort commands kill user futures through ScopeRuntime's
-            // synchronous drop epilogue. The nested driver itself returns
-            // normally; its task abort is only the parent's deadline
-            // backstop if this loop cannot be scheduled.
-            return StopReason::ShutdownRequested;
         }
 
         if let Some(reason) = scope.finish_if_ready() {
@@ -3297,14 +3330,15 @@ mod tests {
 
     use crate::{
         ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind, LifecycleItem,
-        ScopeState,
+        RemoveOutcome, ScopeState,
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
+        tree::SlotCell,
     };
 
     use super::{
-        Latch, MemberCell, MemberStage, ScopeCell, ScopeFlavor, mint_child_incarnation,
-        report_channel,
+        DynamicControl, DynamicEntry, Latch, MemberCell, MemberStage, Obligation, RemovalResponse,
+        ScopeCell, ScopeFlavor, mint_child_incarnation, report_channel,
     };
 
     #[test]
@@ -3351,6 +3385,77 @@ mod tests {
         local_stop.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
         assert!(receiver.receive().cancelled);
+    }
+
+    #[test]
+    fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let root_member = MemberCell::new(
+            ChildId::from("root"),
+            identity
+                .mint_membership()
+                .expect("root membership available"),
+        );
+        let root = ScopeCell::new(
+            root_member,
+            ScopeFlavor::Dynamic,
+            ScopeIdentity::new().expect("child identity available"),
+        );
+        let member = MemberCell::new(
+            ChildId::from("worker"),
+            root.child_identity
+                .lock()
+                .expect("scope identity mutex poisoned")
+                .mint_membership()
+                .expect("child membership available"),
+        );
+        let slot = SlotCell::new(Arc::clone(&member), None);
+        root.set_admitted_children(vec![Arc::clone(&slot)]);
+        let (events, _receiver) = crate::runtime::bounded_mpsc(1);
+        let control = DynamicControl::new(&root, events);
+        let response = RemovalResponse::pending();
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entries
+            .insert(
+                ChildId::from("worker"),
+                DynamicEntry {
+                    slot,
+                    admitted: true,
+                    fused_cancel: None,
+                    removal: Obligation::new(Arc::clone(&response), |response| {
+                        response.complete(RemoveOutcome::Removed);
+                    }),
+                    removal_started: true,
+                },
+            );
+
+        let entries = control.close();
+        assert!(
+            response
+                .result
+                .lock()
+                .expect("removal mutex poisoned")
+                .is_none(),
+            "closing admission must not complete removal before teardown"
+        );
+        member.terminalize(Exit::never_started());
+        assert!(root.prune_child(&member));
+        assert!(
+            response
+                .result
+                .lock()
+                .expect("removal mutex poisoned")
+                .is_none(),
+            "terminality and Removed precede removal completion"
+        );
+        drop(entries);
+        assert_eq!(
+            *response.result.lock().expect("removal mutex poisoned"),
+            Some(RemoveOutcome::Removed)
+        );
     }
 
     #[crate::runtime::test]

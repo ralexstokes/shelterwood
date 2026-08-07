@@ -1719,13 +1719,6 @@ pub(crate) enum RawSpawn {
 }
 
 impl RawSpawn {
-    pub(crate) fn factory_guard(&self) -> Option<Box<dyn Send + 'static>> {
-        match self {
-            Self::Restartable(factory) => Some(Box::new(Arc::clone(factory))),
-            Self::OneShot(_) => None,
-        }
-    }
-
     pub(crate) fn construct(self) -> Box<dyn ErasedRawInstance> {
         match self {
             Self::Restartable(factory) => factory(),

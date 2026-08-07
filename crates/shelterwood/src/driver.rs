@@ -5,7 +5,6 @@ use std::{
     fmt,
     future::Future,
     ops::{Index, IndexMut},
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
@@ -1388,19 +1387,23 @@ impl DynamicControl {
         state.accepting = false;
         let entries = std::mem::take(&mut state.entries);
         drop(state);
-        for entry in entries.values() {
+        let mut retained = HashMap::new();
+        for (id, entry) in entries {
             if !entry.admitted {
-                drop(entry.slot.take_defined());
+                let definition = entry.slot.take_defined();
                 entry.slot.member.terminalize(Exit::never_started());
                 if let Some(scope) = &entry.slot.scope {
                     scope.terminalize_never_started();
                 }
+                dispose_definition_then(definition, move || drop(entry));
+            } else {
+                retained.insert(id, entry);
             }
         }
         // The caller holds admitted entries across member terminality and
         // residency removal. Dropping them then completes every in-flight
         // removal without waking a remover before those observation edges.
-        entries
+        retained
     }
 }
 
@@ -1613,12 +1616,10 @@ fn dispose_definition_then(
         completion();
         return;
     };
-    let disposal = runtime::spawn_blocking((), move || drop(construction));
-    runtime::spawn((), async move {
+    runtime::dispose_then(construction, move |_| {
         // A never-admitted definition has no incarnation verdict to publish,
         // but its destructor must still be isolated and complete before any
         // response releases ownership back to the caller.
-        let _ = runtime::join(disposal).await;
         completion();
     });
 }
@@ -2174,6 +2175,7 @@ struct ScopeRuntime {
     ancestor_abort: Option<Latch>,
     ancestor_abort_ack: Option<Latch>,
     ancestor_abort_seen: bool,
+    hard_forced: bool,
     completion: Option<ScopeCompletion>,
 }
 
@@ -2248,29 +2250,6 @@ enum SpawnBody {
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
     },
-}
-
-struct FactoryGuard(Option<Box<dyn Send + 'static>>);
-
-impl FactoryGuard {
-    fn new(factory: Option<Box<dyn Send + 'static>>) -> Self {
-        Self(factory)
-    }
-
-    fn finish(&mut self) -> Option<Box<dyn std::any::Any + Send + 'static>> {
-        let factory = self.0.take();
-        catch_unwind(AssertUnwindSafe(|| drop(factory))).err()
-    }
-}
-
-impl Drop for FactoryGuard {
-    fn drop(&mut self) {
-        let already_panicking = std::thread::panicking();
-        let panic = self.finish();
-        if !already_panicking && let Some(payload) = panic {
-            resume_unwind(payload);
-        }
-    }
 }
 
 impl ScopeRuntime {
@@ -2350,10 +2329,9 @@ impl ScopeRuntime {
         );
         let construction = child.construction.get_mut();
         let scope_child = matches!(construction, ChildConstruction::Scope(_));
-        let (body, factory_guard, declared_readiness) = match construction {
+        let (body, declared_readiness) = match construction {
             ChildConstruction::Raw(definition) => {
                 let spawn = definition.take_spawn();
-                let factory_guard = spawn.factory_guard();
                 (
                     SpawnBody::Raw {
                         spawn,
@@ -2371,26 +2349,22 @@ impl ScopeRuntime {
                             mailbox_shutdown: child.options.mailbox_shutdown,
                         },
                     },
-                    factory_guard,
                     None,
                 )
             }
             ChildConstruction::Task(definition) => {
                 let factory = Arc::clone(&definition.factory);
                 (
-                    SpawnBody::TaskRestartable(Arc::clone(&factory)),
-                    Some(Box::new(factory) as Box<dyn Send + 'static>),
+                    SpawnBody::TaskRestartable(factory),
                     Some(child.options.readiness),
                 )
             }
             ChildConstruction::TaskOnce(definition) => {
                 let body = std::mem::replace(&mut definition.body, OnceTaskBody::Spent);
                 match body {
-                    OnceTaskBody::Available(body) => (
-                        SpawnBody::TaskOnce(body),
-                        None,
-                        Some(child.options.readiness),
-                    ),
+                    OnceTaskBody::Available(body) => {
+                        (SpawnBody::TaskOnce(body), Some(child.options.readiness))
+                    }
                     OnceTaskBody::Spent => {
                         panic!("one-shot task construction invoked more than once")
                     }
@@ -2414,7 +2388,6 @@ impl ScopeRuntime {
                             ),
                             inherited,
                         },
-                        Some(Box::new(Arc::clone(factory)) as Box<dyn Send + 'static>),
                         Some(Readiness::Manual),
                     ),
                     ScopeSource::OneShot(_) => {
@@ -2434,7 +2407,6 @@ impl ScopeRuntime {
                                 ),
                                 inherited,
                             },
-                            None,
                             Some(Readiness::Manual),
                         )
                     }
@@ -2513,15 +2485,7 @@ impl ScopeRuntime {
         let constructed_sender = self.events.clone();
         let run_release = construction_release.clone();
         let child_readiness_override = child.options.readiness_override;
-        if child.options.restart.is_never() {
-            // `body` and `factory_guard` now own every live user value needed
-            // by this sole incarnation. Releasing the framework definition
-            // while those owners are still local makes its drop metadata-only;
-            // the final user destructor runs inside the task boundary below.
-            drop(child.construction.take());
-        }
         let handle = runtime::spawn(incarnation, async move {
-            let mut factory_guard = FactoryGuard::new(factory_guard);
             let body = async move {
                 match body {
                     SpawnBody::Raw { spawn, context } => {
@@ -2583,21 +2547,9 @@ impl ScopeRuntime {
                 }
             };
             let outcome = CatchUnwindFuture::new(body).await;
-            let factory_panic = factory_guard.finish();
             let result = match outcome {
-                Ok(result) => {
-                    if let Some(payload) = factory_panic {
-                        resume_unwind(payload);
-                    }
-                    result
-                }
-                Err(payload) => {
-                    // The execution panic is primary over a later factory
-                    // capture destructor panic, matching incarnation-owned
-                    // state and offload precedence.
-                    drop(factory_panic);
-                    resume_unwind(payload)
-                }
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
             };
             report.record(RecordedOutcome::Returned(result));
         });
@@ -2749,15 +2701,6 @@ impl ScopeRuntime {
                 }
                 return;
             }
-            // Scope drain and planned removal suppress restart. Every
-            // restartable spawn retains a matching factory guard in the
-            // incarnation task, so releasing the driver's Arc in those modes
-            // can only make that panic boundary the final capture owner.
-            let restart_suppressed =
-                self.phase.is_draining() || child.slot.member.record().removing;
-            if restart_suppressed && let Some(construction) = child.construction.take() {
-                drop(construction);
-            }
             self.root.transition_child(
                 &child.slot.member,
                 |record| record.stage = MemberStage::Stopping,
@@ -2793,14 +2736,11 @@ impl ScopeRuntime {
                 self.begin_terminal_disposal(key, exit, None, false);
                 self.children[key].terminalize(&self.root, Exit::never_started(), None, false);
             } else {
-                // Between incarnations, the recorded exit already owns the
-                // child verdict. Do not turn detached factory cleanup into a
-                // shutdown straggler solely because there is no incarnation
-                // left to host that cleanup.
-                child.terminalize(&self.root, exit, None, false);
-                if let Some(construction) = child.construction.take() {
-                    runtime::dispose_detached(construction);
-                }
+                // Between incarnations the retained factory is still member
+                // ownership. Classify its final destructor before publishing
+                // terminality, unless hard escalation has already made all
+                // remaining cleanup detached.
+                self.begin_terminal_disposal(key, exit, None, false);
             }
         }
     }
@@ -2910,6 +2850,7 @@ impl ScopeRuntime {
     }
 
     fn force_all(&mut self) {
+        self.hard_forced = true;
         if !self.phase.is_draining() {
             self.begin_drain(StopReason::ShutdownRequested);
         }
@@ -2927,6 +2868,19 @@ impl ScopeRuntime {
             active.abort.fire();
             active.ladder = Some(ladder);
             self.advance_ladder(key, now);
+        }
+        let disposing = self
+            .children
+            .keys()
+            .filter(|key| self.children[*key].pending_terminal.is_some())
+            .collect::<Vec<_>>();
+        for key in disposing {
+            if let Some(terminal) = self.children[key].pending_terminal.as_mut()
+                && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
+            {
+                terminal.exit = Exit::new(ExitKind::Aborted { after_grace: true }, true);
+            }
+            self.handle_construction_disposed(key, None);
         }
     }
 
@@ -3198,24 +3152,21 @@ impl ScopeRuntime {
             return;
         };
 
+        if self.hard_forced {
+            runtime::dispose_detached(construction);
+            self.handle_construction_disposed(key, None);
+            return;
+        }
+
         // The retained factory is user-owned. Destroy it on the blocking
-        // pool and join only its verdict; the scope driver remains free to
-        // advance unrelated children while the destructor runs.
-        let disposal = runtime::spawn_blocking((), move || drop(construction));
+        // pool. The disposal job itself owns completion, so cancellation or
+        // failure to spawn an auxiliary async joiner cannot strand the child.
         let sender = self.events.clone();
-        runtime::spawn((), async move {
-            let panic = match runtime::join(disposal).await {
-                runtime::JoinOutcome::Ok { .. } => None,
-                runtime::JoinOutcome::Panic { message } => Some(message),
-                runtime::JoinOutcome::Cancelled => Some(Some(
-                    "factory disposal task was cancelled before completion".to_owned(),
-                )),
-            };
-            let _ = runtime::mpsc_send(
-                &sender,
-                DriverEvent::Child(ChildEvent::ConstructionDisposed { child: key, panic }),
-            )
-            .await;
+        runtime::dispose_then(construction, move |panic| {
+            let _ = sender.blocking_send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
+                child: key,
+                panic,
+            }));
         });
     }
 
@@ -3740,6 +3691,7 @@ async fn run_scope_incarnation(
         ancestor_abort: incarnation_abort,
         ancestor_abort_ack: incarnation_abort_ack,
         ancestor_abort_seen: false,
+        hard_forced: false,
         completion: None,
     };
     #[cfg(test)]

@@ -648,12 +648,12 @@ pub(crate) struct MailboxStats {
     pub(crate) capacity: usize,
 }
 
-struct Promotion<M> {
+struct Promotion<M: Send + 'static> {
     displaced: Vec<Envelope<M>>,
     wakers: Vec<Waker>,
 }
 
-impl<M> Default for Promotion<M> {
+impl<M: Send + 'static> Default for Promotion<M> {
     fn default() -> Self {
         Self {
             displaced: Vec::new(),
@@ -662,16 +662,35 @@ impl<M> Default for Promotion<M> {
     }
 }
 
-impl<M> Promotion<M> {
+impl<M: Send + 'static> Promotion<M> {
     fn finish(self) {}
+
+    fn finish_isolated(mut self) {
+        let displaced = std::mem::take(&mut self.displaced);
+        if !displaced.is_empty() {
+            crate::runtime::dispose_detached(MailboxPayload {
+                queue: Some(displaced.into()),
+                latest: None,
+                retired: Vec::new(),
+            });
+        }
+        self.finish();
+    }
 }
 
-impl<M> Drop for Promotion<M> {
+impl<M: Send + 'static> Drop for Promotion<M> {
     fn drop(&mut self) {
         let already_panicking = std::thread::panicking();
         let mut first_panic = None;
         for waker in self.wakers.drain(..) {
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| waker.wake()))
+                && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
+        }
+        for displaced in self.displaced.drain(..) {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(displaced)))
                 && first_panic.is_none()
             {
                 first_panic = Some(payload);
@@ -1043,7 +1062,7 @@ impl<M: Send + 'static> MailboxCell<M> {
         if message.is_some() {
             self.changed.pulse();
         }
-        promotion.finish();
+        promotion.finish_isolated();
         message
     }
 
@@ -1231,7 +1250,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
     }
 }
 
-fn promote_waiters<M>(state: &mut MailboxState<M>) -> Promotion<M> {
+fn promote_waiters<M: Send + 'static>(state: &mut MailboxState<M>) -> Promotion<M> {
     let mut promotion = Promotion::default();
     let Some(kind) = state.kind else {
         return promotion;

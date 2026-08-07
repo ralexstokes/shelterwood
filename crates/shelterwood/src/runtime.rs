@@ -6,7 +6,7 @@ use std::{
     ops::RangeBounds,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -68,28 +68,98 @@ impl<T: Send + 'static> Drop for Isolated<T> {
     }
 }
 
-struct PanicSafeDrop<T>(Option<T>);
+struct DisposalJob<T, C>
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
+    state: Mutex<Option<(T, C)>>,
+}
 
-impl<T> Drop for PanicSafeDrop<T> {
+impl<T, C> DisposalJob<T, C>
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
+    fn new(value: T, completion: C) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(Some((value, completion))),
+        })
+    }
+
+    fn finish(&self) {
+        let Some((value, completion)) = self
+            .state
+            .lock()
+            .expect("disposal job mutex poisoned")
+            .take()
+        else {
+            return;
+        };
+        let panic = catch_unwind(AssertUnwindSafe(|| drop(value)))
+            .err()
+            .map(panic_message);
+        // Completion is framework bookkeeping. Contain it as well so a
+        // hostile waker or a runtime teardown race cannot unwind a blocking
+        // worker or double-panic while the job is being dropped.
+        let _ = catch_unwind(AssertUnwindSafe(|| completion(panic)));
+    }
+}
+
+impl<T, C> Drop for DisposalJob<T, C>
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
     fn drop(&mut self) {
-        if let Some(value) = self.0.take() {
-            let _ = catch_unwind(AssertUnwindSafe(|| drop(value)));
+        self.finish();
+    }
+}
+
+fn dispatch_disposal<T, C>(job: Arc<DisposalJob<T, C>>)
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
+    if is_available() {
+        let worker = Arc::clone(&job);
+        if let Ok(handle) = catch_unwind(AssertUnwindSafe(|| {
+            task::spawn_blocking(move || worker.finish())
+        })) {
+            drop(handle);
+            return;
         }
     }
+
+    let worker = Arc::clone(&job);
+    if std::thread::Builder::new()
+        .name("shelterwood-disposal".to_owned())
+        .spawn(move || worker.finish())
+        .is_ok()
+    {
+        return;
+    }
+
+    // Exhausted task and thread creation must not strand completion or expose
+    // a destructor panic. Blocking here is the only remaining safe fallback.
+    job.finish();
+}
+
+/// Runs potentially blocking user destruction away from the caller and then
+/// invokes framework completion with the contained panic diagnostic.
+pub(crate) fn dispose_then<T, C>(value: T, completion: C)
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
+    dispatch_disposal(DisposalJob::new(value, completion));
 }
 
 /// Detaches potentially blocking or panicking user destruction from the
 /// caller. The guard also contains a panic if task/thread creation itself
 /// fails and drops the closure on the submitting thread.
 pub(crate) fn dispose_detached<T: Send + 'static>(value: T) {
-    let guarded = PanicSafeDrop(Some(value));
-    if is_available() {
-        drop(task::spawn_blocking(move || drop(guarded)));
-    } else {
-        let _ = std::thread::Builder::new()
-            .name("shelterwood-disposal".to_owned())
-            .spawn(move || drop(guarded));
-    }
+    dispose_then(value, |_| {});
 }
 
 /// A one-shot, multi-waiter signal backed by Tokio's waiter queue.

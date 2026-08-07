@@ -308,9 +308,15 @@ pub(crate) struct MemberCell {
     id: ChildId,
     membership: Membership,
     record: runtime::WatchSender<MemberRecord>,
-    mailbox: Mutex<Option<Arc<dyn MailboxControl>>>,
+    mailbox: Mutex<MemberMailbox>,
     options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
     pub(crate) removal: Latch,
+}
+
+#[derive(Debug, Default)]
+struct MemberMailbox {
+    control: Option<Arc<dyn MailboxControl>>,
+    terminal: bool,
 }
 
 impl MemberCell {
@@ -329,7 +335,7 @@ impl MemberCell {
             id,
             membership,
             record,
-            mailbox: Mutex::new(None),
+            mailbox: Mutex::new(MemberMailbox::default()),
             options: Mutex::new(None),
             removal: Latch::default(),
         })
@@ -375,12 +381,13 @@ impl MemberCell {
     }
 
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
-        {
-            let mut current = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            assert!(current.is_none(), "a member can own only one mailbox");
-            *current = Some(Arc::clone(&mailbox));
-        }
-        if matches!(self.record().stage, MemberStage::Terminal(_)) {
+        let terminal = {
+            let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
+            assert!(state.control.is_none(), "a member can own only one mailbox");
+            state.control = Some(Arc::clone(&mailbox));
+            state.terminal
+        };
+        if terminal {
             mailbox.terminate();
         }
     }
@@ -389,10 +396,27 @@ impl MemberCell {
         self.mailbox
             .lock()
             .expect("member mailbox mutex poisoned")
+            .control
             .clone()
     }
 
     pub(crate) fn terminalize(&self, exit: Exit) {
+        let mailbox = {
+            let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
+            if state.terminal {
+                return;
+            }
+            state.terminal = true;
+            state.control.clone()
+        };
+        if let Some(mailbox) = mailbox {
+            mailbox.terminate();
+            let stats = mailbox.stats();
+            debug_assert!(stats.delivered <= stats.accepted);
+            debug_assert!(stats.conflated <= stats.accepted);
+            debug_assert!(stats.depth <= stats.capacity);
+            let _ = stats.sends_rejected;
+        }
         let _ = self.record.send_if_modified(|record| {
             if matches!(record.stage, MemberStage::Terminal(_)) {
                 false
@@ -401,16 +425,6 @@ impl MemberCell {
                 record.restart_at = None;
                 record.last_exit = Some(exit.clone());
                 record.stage = MemberStage::Terminal(exit);
-                // Complete mailbox terminality before watch wakes can expose
-                // the terminal member record.
-                if let Some(mailbox) = self.mailbox() {
-                    mailbox.terminate();
-                    let stats = mailbox.stats();
-                    debug_assert!(stats.delivered <= stats.accepted);
-                    debug_assert!(stats.conflated <= stats.accepted);
-                    debug_assert!(stats.depth <= stats.capacity);
-                    let _ = stats.sends_rejected;
-                }
                 true
             }
         });

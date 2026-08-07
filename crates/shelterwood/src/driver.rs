@@ -414,12 +414,14 @@ impl MemberCell {
     }
 
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
-        let previous = self
-            .mailbox
-            .lock()
-            .expect("member mailbox mutex poisoned")
-            .replace(mailbox);
-        assert!(previous.is_none(), "a member can own only one mailbox");
+        {
+            let mut current = self.mailbox.lock().expect("member mailbox mutex poisoned");
+            assert!(current.is_none(), "a member can own only one mailbox");
+            *current = Some(Arc::clone(&mailbox));
+        }
+        if matches!(self.record().stage, MemberStage::Terminal(_)) {
+            mailbox.terminate();
+        }
     }
 
     pub(crate) fn mailbox(&self) -> Option<Arc<dyn MailboxControl>> {
@@ -445,7 +447,6 @@ impl MemberCell {
         if !changed {
             return;
         }
-        self.changed.pulse();
         if let Some(mailbox) = self.mailbox() {
             mailbox.terminate();
             let stats = mailbox.stats();
@@ -454,6 +455,7 @@ impl MemberCell {
             debug_assert!(stats.depth <= stats.capacity);
             let _ = stats.sends_rejected;
         }
+        self.changed.pulse();
     }
 
     pub(crate) async fn wait_terminal(&self) -> Exit {
@@ -3326,13 +3328,14 @@ enum Pending {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{future::Future, sync::Arc, task::Poll, time::Duration};
 
     use crate::{
-        ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind, LifecycleItem,
-        RemoveOutcome, ScopeState,
+        ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind,
+        LifecycleItem, RemoveOutcome, ScopeState, SendErrorKind,
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
+        mailbox::MailboxCell,
         tree::SlotCell,
     };
 
@@ -3385,6 +3388,29 @@ mod tests {
         local_stop.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
         assert!(receiver.receive().cancelled);
+    }
+
+    #[crate::runtime::test]
+    async fn attaching_after_terminality_closes_the_mailbox() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let member = MemberCell::new(
+            ChildId::from("worker"),
+            identity.mint_membership().expect("membership available"),
+        );
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        let mut parked = Box::pin(actor.send(1));
+        let first_poll =
+            std::future::poll_fn(|context| Poll::Ready(parked.as_mut().poll(context))).await;
+        assert!(first_poll.is_pending());
+
+        member.terminalize(Exit::never_started());
+        member.attach_mailbox(mailbox);
+
+        let parked = parked.await.expect_err("parked send is terminated");
+        assert_eq!(parked.kind, SendErrorKind::Terminated);
+        let immediate = actor.try_send(2).expect_err("terminal send is rejected");
+        assert_eq!(immediate.kind, SendErrorKind::Terminated);
     }
 
     #[test]

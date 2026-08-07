@@ -73,17 +73,16 @@ impl Latch {
     }
 
     pub(crate) async fn fired(&self) {
-        loop {
-            if self.is_fired() {
-                return;
-            }
-
-            let notified = self.state.notify.notified();
-            if self.is_fired() {
-                return;
-            }
-            notified.await;
+        if self.is_fired() {
+            return;
         }
+
+        let notified = self.state.notify.notified();
+        if self.is_fired() {
+            return;
+        }
+        notified.await;
+        debug_assert!(self.is_fired());
     }
 }
 

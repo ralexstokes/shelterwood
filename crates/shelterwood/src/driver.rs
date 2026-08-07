@@ -272,8 +272,16 @@ impl MemberCell {
     }
 }
 
+struct RecordedReport {
+    outcome: Option<RecordedOutcome>,
+    cancelled: bool,
+}
+
 enum ReportState {
-    Armed(mpsc::Sender<Option<RecordedOutcome>>),
+    Armed {
+        sender: mpsc::Sender<RecordedReport>,
+        shutdown: Latch,
+    },
     Spent,
 }
 
@@ -281,13 +289,13 @@ pub(crate) struct ReportToken {
     state: ReportState,
 }
 
-pub(crate) struct ReportReceiver(mpsc::Receiver<Option<RecordedOutcome>>);
+pub(crate) struct ReportReceiver(mpsc::Receiver<RecordedReport>);
 
-pub(crate) fn report_channel() -> (ReportToken, ReportReceiver) {
+pub(crate) fn report_channel(shutdown: Latch) -> (ReportToken, ReportReceiver) {
     let (sender, receiver) = mpsc::channel();
     (
         ReportToken {
-            state: ReportState::Armed(sender),
+            state: ReportState::Armed { sender, shutdown },
         },
         ReportReceiver(receiver),
     )
@@ -296,8 +304,11 @@ pub(crate) fn report_channel() -> (ReportToken, ReportReceiver) {
 impl ReportToken {
     pub(crate) fn record(mut self, outcome: RecordedOutcome) {
         let state = std::mem::replace(&mut self.state, ReportState::Spent);
-        if let ReportState::Armed(sender) = state {
-            let _ = sender.send(Some(outcome));
+        if let ReportState::Armed { sender, shutdown } = state {
+            let _ = sender.send(RecordedReport {
+                outcome: Some(outcome),
+                cancelled: shutdown.is_fired(),
+            });
         }
     }
 }
@@ -305,14 +316,17 @@ impl ReportToken {
 impl Drop for ReportToken {
     fn drop(&mut self) {
         let state = std::mem::replace(&mut self.state, ReportState::Spent);
-        if let ReportState::Armed(sender) = state {
-            let _ = sender.send(None);
+        if let ReportState::Armed { sender, shutdown } = state {
+            let _ = sender.send(RecordedReport {
+                outcome: None,
+                cancelled: shutdown.is_fired(),
+            });
         }
     }
 }
 
 impl ReportReceiver {
-    pub(crate) fn receive(self) -> Option<RecordedOutcome> {
+    fn receive(self) -> RecordedReport {
         self.0
             .recv()
             .expect("owned report token must record or fall back")
@@ -697,12 +711,18 @@ impl DynamicControl {
     fn close(&self) {
         let mut state = self.state.lock().expect("dynamic-state mutex poisoned");
         state.accepting = false;
-        for entry in state.entries.values() {
-            if !entry.admitted {
-                entry.slot.member.terminalize(Exit::never_started());
-                if let Some(scope) = &entry.slot.scope {
-                    scope.terminalize_never_started();
-                }
+        let unadmitted = state
+            .entries
+            .values()
+            .filter(|entry| !entry.admitted)
+            .map(|entry| Arc::clone(&entry.slot))
+            .collect::<Vec<_>>();
+        drop(state);
+        for slot in unadmitted {
+            drop(slot.take_defined());
+            slot.member.terminalize(Exit::never_started());
+            if let Some(scope) = &slot.scope {
+                scope.terminalize_never_started();
             }
         }
     }
@@ -803,10 +823,15 @@ pub(crate) fn start_admission(
 pub(crate) fn cancel_dynamic_reservation(control: &Arc<DynamicControl>, slot: &Arc<SlotCell>) {
     let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
     let id = slot.member.id().clone();
-    if state.entries.get(&id).is_some_and(|entry| {
+    let cancelled = state.entries.get(&id).is_some_and(|entry| {
         entry.slot.member.membership() == slot.member.membership() && !entry.admitted
-    }) {
+    });
+    if cancelled {
         state.entries.remove(&id);
+    }
+    drop(state);
+    if cancelled {
+        drop(slot.take_defined());
         slot.member.terminalize(Exit::never_started());
         if let Some(scope) = &slot.scope {
             scope.terminalize_never_started();
@@ -845,6 +870,8 @@ pub(crate) fn remove_dynamic(
     let response = Arc::clone(&entry.removal);
     if !entry.admitted {
         let entry = state.entries.remove(id).expect("entry was just resolved");
+        drop(state);
+        drop(entry.slot.take_defined());
         entry.slot.member.terminalize(Exit::never_started());
         if let Some(scope) = &entry.slot.scope {
             scope.terminalize_never_started();
@@ -1029,7 +1056,7 @@ struct ActiveChild {
 
 struct ChildRuntime {
     slot: Arc<crate::tree::SlotCell>,
-    construction: ChildConstruction,
+    construction: Option<ChildConstruction>,
     options: crate::policy::ResolvedCommonOptions,
     incarnations: FenceCounter,
     restarts: RestartState,
@@ -1048,7 +1075,7 @@ impl ChildRuntime {
             .incarnation_counter(plan.slot.member.membership());
         Self {
             slot: plan.slot,
-            construction: plan.construction,
+            construction: Some(plan.construction),
             options: plan.options,
             incarnations,
             restarts: RestartState::new(),
@@ -1135,6 +1162,7 @@ impl ScopeRuntime {
         let child = &mut self.children[index];
         let Some(incarnation) = mint_child_incarnation(&child.slot.member, &mut child.incarnations)
         else {
+            child.construction.take();
             return;
         };
 
@@ -1150,9 +1178,13 @@ impl ScopeRuntime {
             abort.clone(),
             ready.clone(),
         );
-        let scope_child = matches!(child.construction, ChildConstruction::Scope(_));
+        let construction = child
+            .construction
+            .as_mut()
+            .expect("a live child retains its construction");
+        let scope_child = matches!(construction, ChildConstruction::Scope(_));
         let gated = scope_child || child.options.readiness == Readiness::Manual;
-        let body = match &mut child.construction {
+        let body = match construction {
             ChildConstruction::Task(definition) => {
                 SpawnBody::TaskRestartable(Arc::clone(&definition.factory))
             }
@@ -1234,7 +1266,7 @@ impl ScopeRuntime {
             ReadinessGate::Waiting { deadline }
         };
 
-        let (report, report_receiver) = report_channel();
+        let (report, report_receiver) = report_channel(shutdown.clone());
         let nested_ready = ready.clone();
         let nested_cancel = shutdown.clone();
         let handle = runtime::spawn(incarnation, async move {
@@ -1269,7 +1301,6 @@ impl ScopeRuntime {
         });
         let abort_handle = handle.abort_handle();
         let exit_sender = self.events.clone();
-        let exit_shutdown = shutdown.clone();
         let exit_ended = ended.clone();
         runtime::spawn((), async move {
             let join = match runtime::join(handle).await {
@@ -1280,15 +1311,15 @@ impl ScopeRuntime {
                 }
             };
             exit_ended.fire();
-            let recorded = report_receiver.receive();
+            let report = report_receiver.receive();
             let _ = runtime::mpsc_send(
                 &exit_sender,
                 DriverEvent::Child(ChildEvent::Exited {
                     index,
                     incarnation,
-                    recorded,
+                    recorded: report.outcome,
                     join,
-                    cancelled: exit_shutdown.is_fired(),
+                    cancelled: report.cancelled,
                 }),
             )
             .await;
@@ -1403,6 +1434,7 @@ impl ScopeRuntime {
                 .last_exit
                 .unwrap_or_else(Exit::never_started);
             child.slot.member.terminalize(exit);
+            child.construction.take();
         }
     }
 
@@ -1566,6 +1598,7 @@ impl ScopeRuntime {
             ExitDispatch::Terminal => {
                 let pre_ready = child.initial && !self.startup_complete && !child.initial_ready;
                 child.slot.member.terminalize(exit.clone());
+                child.construction.take();
                 let removing = child.slot.member.record().removing;
                 if removing {
                     self.finalize_removal(index);
@@ -1649,6 +1682,7 @@ impl ScopeRuntime {
                     if let Some(scope) = &self.children[later].slot.scope {
                         scope.terminalize_never_started();
                     }
+                    self.children[later].construction.take();
                 }
             }
         }
@@ -1767,6 +1801,34 @@ impl ScopeRuntime {
             construction: definition,
             options: resolved,
         };
+        {
+            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
+            let id = request.slot.member.id();
+            let matches_reservation = state.entries.get(id).is_some_and(|entry| {
+                entry.slot.member.membership() == request.slot.member.membership()
+                    && !entry.admitted
+            });
+            if !matches_reservation || request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
+                if matches_reservation {
+                    state.entries.remove(id);
+                }
+                drop(state);
+                request.slot.member.terminalize(Exit::never_started());
+                if let Some(scope) = &request.slot.scope {
+                    scope.terminalize_never_started();
+                }
+                request.response.complete(Err(ReserveError::NotAdmitting(
+                    NotAdmittingCause::ReservationEnded,
+                )));
+                return;
+            }
+            let entry = state
+                .entries
+                .get_mut(id)
+                .expect("the matching reservation was just resolved");
+            entry.admitted = true;
+            entry.fused_cancel = request.fused_cancel;
+        }
         let mut child = ChildRuntime::from_plan(plan, &self.root);
         child.initial = false;
         let index = self.children.len();
@@ -1776,21 +1838,6 @@ impl ScopeRuntime {
             .slot
             .member
             .update(|record| record.stage = MemberStage::Admitted);
-        {
-            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-            let Some(entry) = state.entries.get_mut(request.slot.member.id()) else {
-                request.response.complete(Err(ReserveError::NotAdmitting(
-                    NotAdmittingCause::ReservationEnded,
-                )));
-                self.children[index]
-                    .slot
-                    .member
-                    .terminalize(Exit::never_started());
-                return;
-            };
-            entry.admitted = true;
-            entry.fused_cancel = request.fused_cancel;
-        }
         request.response.complete(Ok(()));
         self.spawn_child(index);
     }
@@ -2167,20 +2214,42 @@ mod tests {
         identity::{FenceCounter, ScopeIdentity},
     };
 
-    use super::{MemberCell, MemberStage, mint_child_incarnation, report_channel};
+    use super::{Latch, MemberCell, MemberStage, mint_child_incarnation, report_channel};
 
     #[test]
     fn owned_report_token_consumes_or_falls_back_once() {
-        let (token, receiver) = report_channel();
+        let shutdown = Latch::default();
+        let (token, receiver) = report_channel(shutdown.clone());
         token.record(RecordedOutcome::Returned(Ok(())));
+        shutdown.fire();
+        let report = receiver.receive();
         assert!(matches!(
-            receiver.receive(),
+            report.outcome,
             Some(RecordedOutcome::Returned(Ok(())))
         ));
+        assert!(!report.cancelled);
 
-        let (token, receiver) = report_channel();
+        let shutdown = Latch::default();
+        let (token, receiver) = report_channel(shutdown.clone());
+        shutdown.fire();
         drop(token);
-        assert!(receiver.receive().is_none());
+        let report = receiver.receive();
+        assert!(report.outcome.is_none());
+        assert!(report.cancelled);
+    }
+
+    #[test]
+    fn owned_report_token_records_prior_cancellation() {
+        let shutdown = Latch::default();
+        let (token, receiver) = report_channel(shutdown.clone());
+        shutdown.fire();
+        token.record(RecordedOutcome::Returned(Ok(())));
+        let report = receiver.receive();
+        assert!(matches!(
+            report.outcome,
+            Some(RecordedOutcome::Returned(Ok(())))
+        ));
+        assert!(report.cancelled);
     }
 
     #[test]

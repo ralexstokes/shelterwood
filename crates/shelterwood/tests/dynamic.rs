@@ -16,6 +16,14 @@ use shelterwood::{
 };
 use shelterwood_test_support::{ReleaseGate, advance_time, assert_quiet, poll_until};
 
+struct DropProbe(Arc<AtomicBool>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 fn never() -> RestartPolicy {
     RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
 }
@@ -235,6 +243,7 @@ async fn removal_is_synchronous_detached_and_shared() {
 
 #[tokio::test]
 async fn reserved_cell_removal_wins_a_queued_split_definition() {
+    let factory_dropped = Arc::new(AtomicBool::new(false));
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
@@ -243,7 +252,16 @@ async fn reserved_cell_removal_wins_a_queued_split_definition() {
         .expect("reservation succeeds");
     let task = slot.task_ref();
     let removed = scope.remove("reserved");
-    let admission = slot.define(waiting_task());
+    let admission = slot.define(TaskDef::new({
+        let probe = DropProbe(Arc::clone(&factory_dropped));
+        move |context| {
+            let _ = &probe;
+            async move {
+                context.shutdown_token().cancelled().await;
+                Ok(())
+            }
+        }
+    }));
     assert_eq!(removed.await, RemoveOutcome::Removed);
     assert!(matches!(
         admission.await,
@@ -255,6 +273,7 @@ async fn reserved_cell_removal_wins_a_queued_split_definition() {
         task.wait().await.kind(),
         shelterwood::ExitKind::NeverStarted
     ));
+    assert!(factory_dropped.load(Ordering::SeqCst));
 
     let survivor = scope
         .add_task("survivor", waiting_task())
@@ -390,6 +409,48 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         scope.remove_task(&split_after_task).await,
         RemoveOutcome::Removed
     );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
+async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
+    let started = Arc::new(AtomicBool::new(false));
+    let factory_dropped = Arc::new(AtomicBool::new(false));
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+    let task = scope
+        .add_task(
+            "worker",
+            TaskDef::new({
+                let started = Arc::clone(&started);
+                let probe = DropProbe(Arc::clone(&factory_dropped));
+                move |context| {
+                    let _ = &probe;
+                    started.store(true, Ordering::SeqCst);
+                    async move {
+                        context.shutdown_token().cancelled().await;
+                        Ok(())
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("task admitted")
+        .into_handles();
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            started.load(Ordering::SeqCst)
+        })
+        .await
+    );
+
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert!(factory_dropped.load(Ordering::SeqCst));
+
     system
         .shutdown(Duration::from_secs(1))
         .await

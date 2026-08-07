@@ -56,6 +56,7 @@
                 cargo run --locked -p shelterwood-api-reachability -- \
                   target/doc/shelterwood.json
                 ${pkgs.bash}/bin/bash ./tools/check-runtime-paths.sh
+                ${pkgs.bash}/bin/bash ./tools/check-exit-paths.sh
               '';
               doInstallCargoArtifacts = false;
             }

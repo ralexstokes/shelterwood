@@ -2406,17 +2406,24 @@ Two remain:
    and provisional resolution in §4.3; the spike's job is to validate
    decorator ergonomics by porting the two largest acceptance scenarios,
    not to revisit the constraints.
-2. **Engine event arbitration** — the deterministic processing order when
-   one wake makes several events eligible (shutdown/remove command, child
-   exit, readiness deadline, backoff-due restart, other deadlines).
-   Constraints any resolution MUST satisfy: deterministic under virtual
-   time; a shutdown or removal observed before an exit suppresses that
-   exit's restart scheduling and its intensity charge; the chosen order is
-   pinned by decision-layer table tests (§1 implementation shape), never
-   left to select-arm luck. **Resolution deadline: M1**, alongside the
-   ladder/funnel state machines it orders (`part_i.md`) — the order
-   changes intensity charges and emitted history, so it cannot ride past
-   the first milestone.
+2. **Engine event arbitration — resolved in M1.** When one driver wake makes
+   several events eligible, the engine processes them in this order:
+   scope shutdown, membership removal, child exit, readiness signal,
+   readiness deadline, backoff-due restart, stop-ladder deadline, queued
+   admission. Items in one class retain their stable source order. Scope
+   shutdown precedes
+   removal because teardown owns all stops once it begins; both precede
+   child exits, so an already-observed stop suppresses restart scheduling
+   and its intensity charge. A readiness signal precedes its deadline, so
+   ready-at-deadline wins. Child exits precede both, making an incarnation
+   that has already ended in the same wake an exit rather than a spurious
+   readiness edge. Backoff work follows all newly observed terminal facts,
+   and ladder deadlines follow because the earlier facts can complete or
+   disarm them. Queued admissions run after all already-observed terminal and
+   temporal facts, so they cannot enter a scope that the same wake has made
+   non-admitting. The decision layer represents this as an ordered class and
+   pins the complete table without runtime selection; the driver drains all
+   currently eligible inputs into that table before applying effects.
 
 (Resolved elsewhere: stage-generic `handle` is rejected — drain-stage
 rejection stays value-level, §5.4; the conflating-mailbox control lane is

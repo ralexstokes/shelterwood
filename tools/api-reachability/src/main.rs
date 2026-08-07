@@ -53,6 +53,9 @@ fn find_leaks(document: &Value) -> Result<BTreeSet<String>, Box<dyn Error>> {
             let Some(item) = index.get(&id) else {
                 continue;
             };
+            if is_blanket_impl(item) {
+                continue;
+            }
             let mut references = Vec::new();
             collect_references(item, &known_ids, &mut references);
             for reference in references {
@@ -78,6 +81,11 @@ fn find_leaks(document: &Value) -> Result<BTreeSet<String>, Box<dyn Error>> {
     }
 
     Ok(leaks)
+}
+
+fn is_blanket_impl(item: &Value) -> bool {
+    item.pointer("/inner/impl/blanket_impl")
+        .is_some_and(|blanket| !blanket.is_null())
 }
 
 fn object_field<'a>(
@@ -202,6 +210,62 @@ mod tests {
             BTreeSet::from([
                 "shelterwood -> tokio::time::Instant".to_owned(),
                 "shelterwood::leak -> tokio::time::Instant".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn ignores_materialized_blanket_impls_but_follows_explicit_impls() {
+        let document = json!({
+            "index": {
+                "0": {
+                    "id": 0,
+                    "inner": { "module": { "items": [1, 4] } }
+                },
+                "1": {
+                    "id": 1,
+                    "inner": { "struct": { "impls": [2] } }
+                },
+                "2": {
+                    "id": 2,
+                    "inner": {
+                        "impl": {
+                            "trait": { "id": 3 },
+                            "blanket_impl": { "generic": "T" }
+                        }
+                    }
+                },
+                "4": {
+                    "id": 4,
+                    "inner": { "struct": { "impls": [5] } }
+                },
+                "5": {
+                    "id": 5,
+                    "inner": {
+                        "impl": {
+                            "trait": { "id": 3 },
+                            "blanket_impl": null
+                        }
+                    }
+                }
+            },
+            "paths": {
+                "0": { "crate_id": 0, "path": ["shelterwood"] },
+                "1": { "crate_id": 0, "path": ["shelterwood", "Blanketed"] },
+                "2": { "crate_id": 0, "path": ["shelterwood", "impl-blanket"] },
+                "3": { "crate_id": 7, "path": ["tokio_util", "future", "FutureExt"] },
+                "4": { "crate_id": 0, "path": ["shelterwood", "Explicit"] },
+                "5": { "crate_id": 0, "path": ["shelterwood", "impl-explicit"] }
+            }
+        });
+
+        let leaks = find_leaks(&document).expect("fixture must be valid rustdoc-shaped JSON");
+        assert_eq!(
+            leaks,
+            BTreeSet::from([
+                "shelterwood -> tokio_util::future::FutureExt".to_owned(),
+                "shelterwood::Explicit -> tokio_util::future::FutureExt".to_owned(),
+                "shelterwood::impl-explicit -> tokio_util::future::FutureExt".to_owned(),
             ])
         );
     }

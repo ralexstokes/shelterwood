@@ -1394,6 +1394,38 @@ impl<M, T> fmt::Debug for CallFuture<M, T> {
     }
 }
 
+impl<M, T> CallFuture<M, T> {
+    fn poll_reply(
+        &self,
+        context: &mut Context<'_>,
+        incarnation: Incarnation,
+        deadline_elapsed: bool,
+    ) -> Poll<Result<Replied<T>, CallError>> {
+        let reply = self
+            .reply
+            .as_ref()
+            .expect("accepted call retains reply state");
+        match reply.poll(context) {
+            Poll::Ready(Ok(value)) => Poll::Ready(Ok(Replied { value, incarnation })),
+            Poll::Ready(Err(ReplyError::Dropped)) => Poll::Ready(Err(CallError {
+                actor_id: self.actor.id().clone(),
+                incarnation_observed: Some(incarnation),
+                kind: CallErrorKind::ReplyDropped,
+            })),
+            Poll::Ready(Err(ReplyError::Timeout)) => unreachable!(),
+            Poll::Pending if deadline_elapsed => {
+                reply.close_receiver();
+                Poll::Ready(Err(CallError {
+                    actor_id: self.actor.id().clone(),
+                    incarnation_observed: Some(incarnation),
+                    kind: CallErrorKind::ResponseTimedOut,
+                }))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
     type Output = Result<Replied<T>, CallError>;
 
@@ -1458,30 +1490,11 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
             }
         }
 
-        if let Some(accepted) = self.accepted {
-            let reply = self
-                .reply
-                .as_ref()
-                .expect("accepted call retains reply state");
-            match reply.poll(context) {
-                Poll::Ready(Ok(value)) => {
-                    self.done = true;
-                    return Poll::Ready(Ok(Replied {
-                        value,
-                        incarnation: accepted,
-                    }));
-                }
-                Poll::Ready(Err(ReplyError::Dropped)) => {
-                    self.done = true;
-                    return Poll::Ready(Err(CallError {
-                        actor_id: self.actor.id().clone(),
-                        incarnation_observed: Some(accepted),
-                        kind: CallErrorKind::ReplyDropped,
-                    }));
-                }
-                Poll::Ready(Err(ReplyError::Timeout)) => unreachable!(),
-                Poll::Pending => {}
-            }
+        if let Some(accepted) = self.accepted
+            && let Poll::Ready(result) = self.poll_reply(context, accepted, false)
+        {
+            self.done = true;
+            return Poll::Ready(result);
         }
 
         if self
@@ -1496,37 +1509,9 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
         }
 
         if let Some(accepted) = self.accepted {
-            let reply = self
-                .reply
-                .as_ref()
-                .expect("accepted call retains reply state");
-            match reply.poll(context) {
-                Poll::Ready(Ok(value)) => {
-                    self.done = true;
-                    Poll::Ready(Ok(Replied {
-                        value,
-                        incarnation: accepted,
-                    }))
-                }
-                Poll::Ready(Err(ReplyError::Dropped)) => {
-                    self.done = true;
-                    Poll::Ready(Err(CallError {
-                        actor_id: self.actor.id().clone(),
-                        incarnation_observed: Some(accepted),
-                        kind: CallErrorKind::ReplyDropped,
-                    }))
-                }
-                Poll::Ready(Err(ReplyError::Timeout)) => unreachable!(),
-                Poll::Pending => {
-                    reply.close_receiver();
-                    self.done = true;
-                    Poll::Ready(Err(CallError {
-                        actor_id: self.actor.id().clone(),
-                        incarnation_observed: Some(accepted),
-                        kind: CallErrorKind::ResponseTimedOut,
-                    }))
-                }
-            }
+            let result = self.poll_reply(context, accepted, true);
+            self.done = true;
+            result
         } else {
             let actor_id = self.actor.id().clone();
             let send = self
@@ -1540,29 +1525,9 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
                     kind: CallErrorKind::AcceptanceTimedOut,
                 },
                 Withdrawal::Accepted(incarnation) => {
-                    if let Some(reply) = &self.reply {
-                        match reply.poll(context) {
-                            Poll::Ready(Ok(value)) => {
-                                self.done = true;
-                                return Poll::Ready(Ok(Replied { value, incarnation }));
-                            }
-                            Poll::Ready(Err(ReplyError::Dropped)) => {
-                                self.done = true;
-                                return Poll::Ready(Err(CallError {
-                                    actor_id,
-                                    incarnation_observed: Some(incarnation),
-                                    kind: CallErrorKind::ReplyDropped,
-                                }));
-                            }
-                            Poll::Ready(Err(ReplyError::Timeout)) => unreachable!(),
-                            Poll::Pending => reply.close_receiver(),
-                        }
-                    }
-                    CallError {
-                        actor_id,
-                        incarnation_observed: Some(incarnation),
-                        kind: CallErrorKind::ResponseTimedOut,
-                    }
+                    let result = self.poll_reply(context, incarnation, true);
+                    self.done = true;
+                    return result;
                 }
                 Withdrawal::Terminated { observed, .. } => CallError {
                     actor_id,

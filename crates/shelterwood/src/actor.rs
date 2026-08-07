@@ -368,51 +368,51 @@ impl<A: Actor> RawActor for Handler<A> {
             raw.mark_ready();
         }
 
-        loop {
+        let live_failure = loop {
             let received = CatchUnwindFuture::new(raw.recv()).await;
             let message = match received {
                 Ok(Some(message)) => message,
-                Ok(None) => break,
+                Ok(None) => break None,
                 Err(payload) => resume_unwind(payload),
             };
-            let handled = {
-                let actor = self
-                    .actor
-                    .as_mut()
-                    .expect("initialized handler retains its actor");
-                let mut context = Context::<A>::new(raw, false);
-                CatchUnwindFuture::new(actor.handle(message, &mut context)).await
-            };
-            match handled {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return fail_after_teardown(raw, error).await,
-                Err(payload) => resume_unwind(payload),
+            let actor = self
+                .actor
+                .as_mut()
+                .expect("initialized handler retains its actor");
+            if let Err(failure) = handle_message(actor, raw, message, false).await {
+                break Some(failure);
             }
-        }
+        };
 
-        match raw.mailbox_shutdown() {
-            MailboxShutdown::Drain => {
+        let failure = match (live_failure, raw.mailbox_shutdown()) {
+            (Some(failure), _) => Some(failure),
+            (None, MailboxShutdown::Drain) => {
+                let mut failure = None;
                 while let Some(message) = raw.try_recv() {
-                    let handled = {
-                        let actor = self
-                            .actor
-                            .as_mut()
-                            .expect("initialized handler retains its actor");
-                        let mut context = Context::<A>::new(raw, true);
-                        CatchUnwindFuture::new(actor.handle(message, &mut context)).await
-                    };
-                    match handled {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => return fail_after_teardown(raw, error).await,
-                        Err(payload) => resume_unwind(payload),
+                    let actor = self
+                        .actor
+                        .as_mut()
+                        .expect("initialized handler retains its actor");
+                    if let Err(current) = handle_message(actor, raw, message, true).await {
+                        failure = Some(current);
+                        break;
                     }
                 }
+                failure
             }
-            MailboxShutdown::Discard => {
+            (None, MailboxShutdown::Discard) => {
                 while let Some(message) = raw.try_recv() {
                     drop(message);
                 }
+                None
             }
+        };
+
+        if let Some(failure) = failure {
+            return match failure {
+                HandlerFailure::Returned(error) => fail_after_teardown(raw, error).await,
+                HandlerFailure::Panicked(payload) => resume_unwind(payload),
+            };
         }
 
         let mut context = StopContext::<A>::new(raw);
@@ -424,6 +424,25 @@ impl<A: Actor> RawActor for Handler<A> {
             resume_unwind(payload);
         }
         Ok(())
+    }
+}
+
+enum HandlerFailure {
+    Returned(ExitError),
+    Panicked(Box<dyn std::any::Any + Send + 'static>),
+}
+
+async fn handle_message<A: Actor>(
+    actor: &mut A,
+    raw: &mut RawContext<A::Msg>,
+    message: A::Msg,
+    draining: bool,
+) -> Result<(), HandlerFailure> {
+    let mut context = Context::<A>::new(raw, draining);
+    match CatchUnwindFuture::new(actor.handle(message, &mut context)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(HandlerFailure::Returned(error)),
+        Err(payload) => Err(HandlerFailure::Panicked(payload)),
     }
 }
 

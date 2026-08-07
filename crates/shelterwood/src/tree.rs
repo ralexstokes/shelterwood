@@ -1581,10 +1581,8 @@ mod sealed {
         type Ref = ScopeRef;
         const FLAVOR: ScopeFlavor = ScopeFlavor::Ordered;
 
-        fn into_core(mut self) -> BuilderCore {
-            let mut replacement = BuilderCore::new(ScopeFlavor::Ordered);
-            replacement.armed = false;
-            std::mem::replace(&mut self.core, replacement)
+        fn into_core(self) -> BuilderCore {
+            self.core
         }
 
         fn make_ref(scope: ScopeRef) -> Self::Ref {
@@ -1596,10 +1594,8 @@ mod sealed {
         type Ref = DynamicScopeRef;
         const FLAVOR: ScopeFlavor = ScopeFlavor::Dynamic;
 
-        fn into_core(mut self) -> BuilderCore {
-            let mut replacement = BuilderCore::new(ScopeFlavor::Dynamic);
-            replacement.armed = false;
-            std::mem::replace(&mut self.core, replacement)
+        fn into_core(self) -> BuilderCore {
+            self.core
         }
 
         fn make_ref(scope: ScopeRef) -> Self::Ref {
@@ -1614,6 +1610,27 @@ pub trait Subtree: sealed::Sealed + fmt::Debug + Send + 'static {}
 impl Subtree for Tree {}
 
 impl Subtree for DynamicTree {}
+
+#[cfg(test)]
+mod tests {
+    use super::{DynamicTree, Tree, sealed::Sealed};
+    use crate::identity::ScopeIdentity;
+
+    #[test]
+    fn subtree_conversion_moves_without_minting_a_phantom_scope() {
+        let tree = Tree::new();
+        let after_tree = ScopeIdentity::current_thread_creations();
+        let core = <Tree as Sealed>::into_core(tree);
+        assert_eq!(ScopeIdentity::current_thread_creations(), after_tree);
+        drop(core);
+
+        let tree = DynamicTree::new();
+        let after_tree = ScopeIdentity::current_thread_creations();
+        let core = <DynamicTree as Sealed>::into_core(tree);
+        assert_eq!(ScopeIdentity::current_thread_creations(), after_tree);
+        drop(core);
+    }
+}
 
 /// A cheap, membership-addressed ordered scope handle.
 #[derive(Clone)]

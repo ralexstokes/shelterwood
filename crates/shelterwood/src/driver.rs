@@ -23,7 +23,9 @@ use crate::{
     },
     exit::{JoinVerdict, RecordedOutcome, classify_exit},
     identity::{FenceCounter, ScopeIdentity},
+    mailbox::MailboxControl,
     policy::{DefaultsInheritance, ResolvedDefaults},
+    raw::{RawRunContext, RawSpawn},
     runtime,
     task::{OnceTaskBody, TaskContext, TaskFactory},
     tree::{
@@ -32,6 +34,28 @@ use crate::{
         StopReason,
     },
 };
+
+pub(crate) type DriverSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+pub(crate) fn sleep(duration: Duration) -> DriverSleep {
+    Box::pin(runtime::sleep(duration))
+}
+
+pub(crate) enum Selected<A, B> {
+    First(A),
+    Second(B),
+}
+
+pub(crate) async fn select<A, B>(first: A, second: B) -> Selected<A::Output, B::Output>
+where
+    A: Future + Send,
+    B: Future + Send,
+{
+    match runtime::select_two(first, second).await {
+        runtime::Either::Left(value) => Selected::First(value),
+        runtime::Either::Right(value) => Selected::Second(value),
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct Signal {
@@ -198,6 +222,7 @@ pub(crate) struct MemberCell {
     record: Mutex<MemberRecord>,
     changed: Signal,
     terminal_signals: Mutex<Vec<Signal>>,
+    mailbox: Mutex<Option<Arc<dyn MailboxControl>>>,
     pub(crate) removal: Latch,
 }
 
@@ -215,6 +240,7 @@ impl MemberCell {
             }),
             changed: Signal::default(),
             terminal_signals: Mutex::new(Vec::new()),
+            mailbox: Mutex::new(None),
             removal: Latch::default(),
         })
     }
@@ -243,14 +269,46 @@ impl MemberCell {
             .push(signal);
     }
 
+    pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
+        let previous = self
+            .mailbox
+            .lock()
+            .expect("member mailbox mutex poisoned")
+            .replace(mailbox);
+        assert!(previous.is_none(), "a member can own only one mailbox");
+    }
+
+    pub(crate) fn mailbox(&self) -> Option<Arc<dyn MailboxControl>> {
+        self.mailbox
+            .lock()
+            .expect("member mailbox mutex poisoned")
+            .clone()
+    }
+
     pub(crate) fn terminalize(&self, exit: Exit) {
-        self.update(|record| {
-            if !matches!(record.stage, MemberStage::Terminal(_)) {
+        let changed = {
+            let mut record = self.record.lock().expect("member mutex poisoned");
+            if matches!(record.stage, MemberStage::Terminal(_)) {
+                false
+            } else {
                 record.incarnation = None;
                 record.last_exit = Some(exit.clone());
                 record.stage = MemberStage::Terminal(exit);
+                true
             }
-        });
+        };
+        if !changed {
+            return;
+        }
+        self.changed.pulse();
+        if let Some(mailbox) = self.mailbox() {
+            mailbox.terminate();
+            let stats = mailbox.stats();
+            debug_assert!(stats.delivered <= stats.accepted);
+            debug_assert!(stats.conflated <= stats.accepted);
+            debug_assert!(stats.depth <= stats.capacity);
+            let _ = stats.sends_rejected;
+        }
         for signal in self
             .terminal_signals
             .lock()
@@ -987,6 +1045,11 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
 }
 
 enum ChildEvent {
+    Constructed {
+        index: usize,
+        incarnation: Incarnation,
+        readiness: Readiness,
+    },
     Ready {
         index: usize,
         incarnation: Incarnation,
@@ -1025,6 +1088,7 @@ struct ActiveChild {
     hard_abort_after_grace: Option<bool>,
     readiness: ReadinessGate,
     ready_signal: Latch,
+    construction_release: Latch,
 }
 
 struct ChildRuntime {
@@ -1046,6 +1110,9 @@ impl ChildRuntime {
             .lock()
             .expect("scope identity mutex poisoned")
             .incarnation_counter(plan.slot.member.membership());
+        if let Some(mailbox) = plan.slot.member.mailbox() {
+            mailbox.configure(plan.options.mailbox);
+        }
         Self {
             slot: plan.slot,
             construction: plan.construction,
@@ -1094,6 +1161,10 @@ impl Drop for ScopeRuntime {
         }
         for child in &mut self.children {
             if let Some(active) = child.active.take() {
+                if let Some(mailbox) = child.slot.member.mailbox() {
+                    mailbox.freeze(active.incarnation);
+                    mailbox.close(active.incarnation);
+                }
                 active.shutdown.fire();
                 active.abort.fire();
                 active.abort_handle.abort();
@@ -1113,6 +1184,10 @@ impl Drop for ScopeRuntime {
 }
 
 enum SpawnBody {
+    Raw {
+        spawn: RawSpawn,
+        context: RawRunContext,
+    },
     TaskRestartable(TaskFactory),
     TaskOnce(Box<dyn FnOnce(TaskContext) -> crate::task::TaskFuture + Send + 'static>),
     ScopeRestartable {
@@ -1142,24 +1217,45 @@ impl ScopeRuntime {
         let abort = Latch::default();
         let ready = Latch::default();
         let ended = Latch::default();
+        let construction_release = Latch::default();
         let id = child.slot.member.id().clone();
-        let context = TaskContext::new(
-            id,
+        let task_context = TaskContext::new(
+            id.clone(),
             incarnation,
             shutdown.clone(),
             abort.clone(),
             ready.clone(),
         );
         let scope_child = matches!(child.construction, ChildConstruction::Scope(_));
-        let gated = scope_child || child.options.readiness == Readiness::Manual;
-        let body = match &mut child.construction {
-            ChildConstruction::Task(definition) => {
-                SpawnBody::TaskRestartable(Arc::clone(&definition.factory))
-            }
+        let (body, declared_readiness) = match &mut child.construction {
+            ChildConstruction::Raw(definition) => (
+                SpawnBody::Raw {
+                    spawn: definition.take_spawn(),
+                    context: RawRunContext {
+                        id,
+                        incarnation,
+                        member: Arc::clone(&child.slot.member),
+                        scope: crate::ScopeRef {
+                            cell: Arc::clone(&self.root),
+                        },
+                        shutdown: shutdown.clone(),
+                        abort: abort.clone(),
+                        ready: ready.clone(),
+                        mailbox_shutdown: child.options.mailbox_shutdown,
+                    },
+                },
+                None,
+            ),
+            ChildConstruction::Task(definition) => (
+                SpawnBody::TaskRestartable(Arc::clone(&definition.factory)),
+                Some(child.options.readiness),
+            ),
             ChildConstruction::TaskOnce(definition) => {
                 let body = std::mem::replace(&mut definition.body, OnceTaskBody::Spent);
                 match body {
-                    OnceTaskBody::Available(body) => SpawnBody::TaskOnce(body),
+                    OnceTaskBody::Available(body) => {
+                        (SpawnBody::TaskOnce(body), Some(child.options.readiness))
+                    }
                     OnceTaskBody::Spent => {
                         panic!("one-shot task construction invoked more than once")
                     }
@@ -1171,24 +1267,9 @@ impl ScopeRuntime {
                     DefaultsInheritance::Reset => ResolvedDefaults::default(),
                 };
                 match &mut definition.source {
-                    ScopeSource::Restartable(factory) => SpawnBody::ScopeRestartable {
-                        factory: Arc::clone(factory),
-                        scope: Arc::clone(
-                            child
-                                .slot
-                                .scope
-                                .as_ref()
-                                .expect("scope construction needs a scope cell"),
-                        ),
-                        inherited,
-                    },
-                    ScopeSource::OneShot(_) => {
-                        let source = std::mem::replace(&mut definition.source, ScopeSource::Spent);
-                        let ScopeSource::OneShot(tree) = source else {
-                            unreachable!()
-                        };
-                        SpawnBody::ScopeOnce {
-                            tree,
+                    ScopeSource::Restartable(factory) => (
+                        SpawnBody::ScopeRestartable {
+                            factory: Arc::clone(factory),
                             scope: Arc::clone(
                                 child
                                     .slot
@@ -1197,7 +1278,28 @@ impl ScopeRuntime {
                                     .expect("scope construction needs a scope cell"),
                             ),
                             inherited,
-                        }
+                        },
+                        Some(Readiness::Manual),
+                    ),
+                    ScopeSource::OneShot(_) => {
+                        let source = std::mem::replace(&mut definition.source, ScopeSource::Spent);
+                        let ScopeSource::OneShot(tree) = source else {
+                            unreachable!()
+                        };
+                        (
+                            SpawnBody::ScopeOnce {
+                                tree,
+                                scope: Arc::clone(
+                                    child
+                                        .slot
+                                        .scope
+                                        .as_ref()
+                                        .expect("scope construction needs a scope cell"),
+                                ),
+                                inherited,
+                            },
+                            Some(Readiness::Manual),
+                        )
                     }
                     ScopeSource::Spent => {
                         panic!("one-shot subtree construction invoked more than once")
@@ -1205,6 +1307,9 @@ impl ScopeRuntime {
                 }
             }
         };
+        let construction_pending = declared_readiness.is_none();
+        let gated = scope_child
+            || declared_readiness.is_none_or(|readiness| readiness != Readiness::Immediate);
 
         let now = runtime::now();
         child.spawned_once = true;
@@ -1212,8 +1317,13 @@ impl ScopeRuntime {
             record.stage = MemberStage::Starting;
             record.incarnation = Some(incarnation);
         });
+        if let Some(mailbox) = child.slot.member.mailbox() {
+            mailbox.bind(incarnation);
+        }
 
-        let readiness = if !gated {
+        let readiness = if construction_pending {
+            ReadinessGate::Waiting { deadline: None }
+        } else if !gated {
             ready.fire();
             child.initial_ready = true;
             child
@@ -1237,17 +1347,34 @@ impl ScopeRuntime {
         let (report, report_receiver) = report_channel();
         let nested_ready = ready.clone();
         let nested_cancel = shutdown.clone();
+        let constructed_sender = self.events.clone();
+        let run_release = construction_release.clone();
         let handle = runtime::spawn(incarnation, async move {
             let result = match body {
+                SpawnBody::Raw { spawn, context } => {
+                    let instance = spawn.construct();
+                    let readiness = instance.readiness();
+                    let _ = runtime::mpsc_send(
+                        &constructed_sender,
+                        DriverEvent::Child(ChildEvent::Constructed {
+                            index,
+                            incarnation,
+                            readiness,
+                        }),
+                    )
+                    .await;
+                    run_release.fired().await;
+                    instance.run(context).await
+                }
                 SpawnBody::TaskRestartable(factory) => {
                     let future = (factory
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner))(
-                        context
+                        task_context
                     );
                     future.await
                 }
-                SpawnBody::TaskOnce(body) => body(context).await,
+                SpawnBody::TaskOnce(body) => body(task_context).await,
                 SpawnBody::ScopeRestartable {
                     factory,
                     scope,
@@ -1322,6 +1449,7 @@ impl ScopeRuntime {
             hard_abort_after_grace: None,
             readiness,
             ready_signal: readiness_signal,
+            construction_release,
         });
     }
 
@@ -1389,6 +1517,9 @@ impl ScopeRuntime {
                 .slot
                 .member
                 .update(|record| record.stage = MemberStage::Stopping);
+            if let Some(mailbox) = child.slot.member.mailbox() {
+                mailbox.freeze(active.incarnation);
+            }
             active.forced_outcome = forced;
             if active.forced_outcome.is_none() {
                 active.readiness.step(ReadinessEvent::Shutdown);
@@ -1496,6 +1627,57 @@ impl ScopeRuntime {
         }
     }
 
+    fn handle_constructed(&mut self, index: usize, incarnation: Incarnation, declared: Readiness) {
+        let mut became_ready = false;
+        let mut deadline_to_arm = None;
+        {
+            let child = &mut self.children[index];
+            let Some(active) = child.active.as_mut() else {
+                return;
+            };
+            if active.incarnation != incarnation {
+                return;
+            }
+            if active.ladder.is_some() {
+                active.construction_release.fire();
+                return;
+            }
+            let readiness = child.options.readiness_override.unwrap_or(declared);
+            if readiness == Readiness::Immediate {
+                active.readiness = ReadinessGate::Immediate;
+                active.ready_signal.fire();
+                if !self.startup_complete {
+                    child.initial_ready = true;
+                }
+                child
+                    .slot
+                    .member
+                    .update(|record| record.stage = MemberStage::Running);
+                became_ready = true;
+            } else {
+                let deadline = match child.options.readiness_deadline {
+                    ReadinessDeadline::Bounded(duration) => Some(
+                        active
+                            .started_at
+                            .checked_add(duration)
+                            .unwrap_or(active.started_at),
+                    ),
+                    ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
+                };
+                active.readiness = ReadinessGate::Waiting { deadline };
+                deadline_to_arm = deadline;
+            }
+            active.construction_release.fire();
+        }
+        if let Some(deadline) = deadline_to_arm {
+            self.deadlines
+                .push(deadline, DeadlineKind::Readiness { index, incarnation });
+        }
+        if became_ready {
+            self.progress_startup();
+        }
+    }
+
     fn handle_ready(&mut self, index: usize, incarnation: Incarnation) {
         let child = &mut self.children[index];
         let Some(active) = child.active.as_mut() else {
@@ -1534,6 +1716,9 @@ impl ScopeRuntime {
         if active.incarnation != incarnation {
             child.active = Some(active);
             return;
+        }
+        if let Some(mailbox) = child.slot.member.mailbox() {
+            mailbox.close(incarnation);
         }
         active.readiness.step(ReadinessEvent::Exit);
         if let (JoinVerdict::Cancelled { .. }, Some(after_grace)) =
@@ -1756,6 +1941,7 @@ impl ScopeRuntime {
             return;
         };
         let (options, one_shot) = match &definition {
+            ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
             ChildConstruction::Task(definition) => (&definition.options, false),
             ChildConstruction::TaskOnce(definition) => (&definition.options, true),
             ChildConstruction::Scope(definition) => (&definition.options, definition.one_shot()),
@@ -2037,7 +2223,8 @@ async fn run_scope_incarnation(
         }
         while let Some(event) = runtime::mpsc_try_recv(&mut event_receiver) {
             let class = match event {
-                DriverEvent::Child(ChildEvent::Ready { .. }) => ArbitrationClass::ReadinessSignal,
+                DriverEvent::Child(ChildEvent::Constructed { .. })
+                | DriverEvent::Child(ChildEvent::Ready { .. }) => ArbitrationClass::ReadinessSignal,
                 DriverEvent::Child(ChildEvent::Exited { .. }) => ArbitrationClass::ChildExit,
                 DriverEvent::Admission(_) => ArbitrationClass::Admission,
             };
@@ -2076,7 +2263,8 @@ async fn run_scope_incarnation(
                 | runtime::ScopeWake::Deadline => continue,
                 runtime::ScopeWake::Message(Some(event)) => {
                     let class = match event {
-                        DriverEvent::Child(ChildEvent::Ready { .. }) => {
+                        DriverEvent::Child(ChildEvent::Constructed { .. })
+                        | DriverEvent::Child(ChildEvent::Ready { .. }) => {
                             ArbitrationClass::ReadinessSignal
                         }
                         DriverEvent::Child(ChildEvent::Exited { .. }) => {
@@ -2110,6 +2298,11 @@ async fn run_scope_incarnation(
                 Pending::Driver(DriverEvent::Admission(request)) => {
                     scope.handle_admission(request);
                 }
+                Pending::Driver(DriverEvent::Child(ChildEvent::Constructed {
+                    index,
+                    incarnation,
+                    readiness,
+                })) => scope.handle_constructed(index, incarnation, readiness),
                 Pending::Driver(DriverEvent::Child(ChildEvent::Ready { index, incarnation })) => {
                     scope.handle_ready(index, incarnation);
                 }

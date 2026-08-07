@@ -13,11 +13,14 @@ use std::{
 };
 
 use crate::{
-    ChildId, DefaultsInheritance, Exit, Intensity, IntensityTrip, Membership, ReadinessDeadline,
-    RestartPolicy, Retention, ScopeDefaults, Shutdown, ShutdownTimeout, StartupFailure, Strategy,
+    ActorRef, ChildId, DefaultsInheritance, Exit, Intensity, IntensityTrip, Membership,
+    ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults, Shutdown, ShutdownTimeout,
+    StartupFailure, Strategy,
     driver::{DynamicReservation, Latch, MemberCell, ScopeCell},
     identity::ScopeIdentity,
+    mailbox::MailboxCell,
     policy::{CommonOptions, IdError, ResolvedCommonOptions, ResolvedDefaults, resolve_common},
+    raw::{RawConstruction, RawDef, RawOnceDef},
     task::{Completion, OnceTask, OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
 
@@ -159,6 +162,7 @@ pub(crate) struct ScopeConfig {
 }
 
 pub(crate) enum ChildConstruction {
+    Raw(RawConstruction),
     Task(TaskDef),
     TaskOnce(OnceTask),
     Scope(Box<ScopeConstruction>),
@@ -290,6 +294,7 @@ impl BuilderCore {
                 .take_definition()
                 .expect("validated slot must have a definition");
             let (options, one_shot) = match &definition {
+                ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
                 ChildConstruction::Task(definition) => (&definition.options, false),
                 ChildConstruction::TaskOnce(definition) => (&definition.options, true),
                 ChildConstruction::Scope(definition) => {
@@ -354,6 +359,12 @@ fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError> {
     })
 }
 
+fn attach_actor_slot<M: Send + 'static>(slot: Arc<SlotCell>) -> ActorSlot<M> {
+    let mailbox = MailboxCell::new(slot.member.id().clone());
+    slot.member.attach_mailbox(mailbox.clone());
+    ActorSlot { slot, mailbox }
+}
+
 /// A fixed-membership, readiness-ordered tree declaration.
 pub struct Tree {
     core: BuilderCore,
@@ -400,6 +411,34 @@ impl Tree {
     pub fn defaults(&mut self, defaults: ScopeDefaults) -> &mut Self {
         self.core.config.defaults = defaults;
         self
+    }
+
+    /// Reserves an actor membership and returns its pre-spawn handle slot.
+    pub fn reserve_actor<M: Send + 'static>(
+        &mut self,
+        id: impl Into<ChildId>,
+    ) -> Result<ActorSlot<M>, ReserveError> {
+        self.core.reserve(id, None).map(attach_actor_slot)
+    }
+
+    /// Adds a restartable raw actor.
+    pub fn add_raw<R: crate::RawActor>(
+        &mut self,
+        id: impl Into<ChildId>,
+        definition: RawDef<R>,
+    ) -> Result<ActorRef<R::Msg>, ReserveError> {
+        self.reserve_actor(id)
+            .map(|slot| slot.define_raw(definition))
+    }
+
+    /// Adds a consuming one-shot raw actor.
+    pub fn add_raw_once<R: crate::RawActor>(
+        &mut self,
+        id: impl Into<ChildId>,
+        definition: RawOnceDef<R>,
+    ) -> Result<ActorRef<R::Msg>, ReserveError> {
+        self.reserve_actor(id)
+            .map(|slot| slot.define_once_raw(definition))
     }
 
     /// Reserves a task membership and returns its pre-spawn handle slot.
@@ -507,6 +546,34 @@ impl DynamicTree {
         self
     }
 
+    /// Reserves an initial actor membership.
+    pub fn reserve_actor<M: Send + 'static>(
+        &mut self,
+        id: impl Into<ChildId>,
+    ) -> Result<ActorSlot<M>, ReserveError> {
+        self.core.reserve(id, None).map(attach_actor_slot)
+    }
+
+    /// Adds an initial restartable raw actor.
+    pub fn add_raw<R: crate::RawActor>(
+        &mut self,
+        id: impl Into<ChildId>,
+        definition: RawDef<R>,
+    ) -> Result<ActorRef<R::Msg>, ReserveError> {
+        self.reserve_actor(id)
+            .map(|slot| slot.define_raw(definition))
+    }
+
+    /// Adds an initial consuming one-shot raw actor.
+    pub fn add_raw_once<R: crate::RawActor>(
+        &mut self,
+        id: impl Into<ChildId>,
+        definition: RawOnceDef<R>,
+    ) -> Result<ActorRef<R::Msg>, ReserveError> {
+        self.reserve_actor(id)
+            .map(|slot| slot.define_once_raw(definition))
+    }
+
     /// Reserves an initial task membership.
     pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
         self.core.reserve(id, None).map(|slot| TaskSlot { slot })
@@ -588,6 +655,53 @@ fn spawn_builder<R>(
         run,
         armed: true,
     })
+}
+
+/// An owned pre-spawn actor slot with a stable mailbox binding.
+pub struct ActorSlot<M> {
+    slot: Arc<SlotCell>,
+    mailbox: Arc<MailboxCell<M>>,
+}
+
+impl<M> fmt::Debug for ActorSlot<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActorSlot")
+            .field("id", self.slot.member.id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M: Send + 'static> ActorSlot<M> {
+    /// Returns the membership-addressed handle before definition or spawn.
+    #[must_use]
+    pub fn actor_ref(&self) -> ActorRef<M> {
+        ActorRef::new(Arc::clone(&self.slot.member), Arc::clone(&self.mailbox))
+    }
+
+    /// Defines a restartable raw actor and consumes the slot.
+    #[must_use]
+    pub fn define_raw<R>(self, definition: RawDef<R>) -> ActorRef<M>
+    where
+        R: crate::RawActor<Msg = M>,
+    {
+        let actor = self.actor_ref();
+        self.slot
+            .define(ChildConstruction::Raw(definition.erase(self.mailbox)));
+        actor
+    }
+
+    /// Defines a consuming one-shot raw actor and consumes the slot.
+    #[must_use]
+    pub fn define_once_raw<R>(self, definition: RawOnceDef<R>) -> ActorRef<M>
+    where
+        R: crate::RawActor<Msg = M>,
+    {
+        let actor = self.actor_ref();
+        self.slot
+            .define(ChildConstruction::Raw(definition.erase(self.mailbox)));
+        actor
+    }
 }
 
 /// An owned pre-spawn task slot.
@@ -772,6 +886,118 @@ impl<H> Drop for Admission<H> {
             crate::driver::signal_fused_cancel(&reservation.control, cancel);
             crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
         } else if !self.polled {
+            crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
+        }
+    }
+}
+
+/// A split dynamic actor reservation with a stable mailbox binding.
+pub struct DynamicActorSlot<M> {
+    reservation: Option<DynamicReservation>,
+    mailbox: Arc<MailboxCell<M>>,
+}
+
+impl<M> fmt::Debug for DynamicActorSlot<M> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DynamicActorSlot")
+            .field(
+                "id",
+                self.reservation
+                    .as_ref()
+                    .expect("dynamic actor slot reservation was already consumed")
+                    .slot
+                    .member
+                    .id(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M: Send + 'static> DynamicActorSlot<M> {
+    fn reservation(&self) -> &DynamicReservation {
+        self.reservation
+            .as_ref()
+            .expect("dynamic actor slot reservation was already consumed")
+    }
+
+    fn take_reservation(&mut self) -> DynamicReservation {
+        self.reservation
+            .take()
+            .expect("dynamic actor slot reservation was already consumed")
+    }
+
+    /// Returns the exact actor handle before admission.
+    #[must_use]
+    pub fn actor_ref(&self) -> ActorRef<M> {
+        ActorRef::new(
+            Arc::clone(&self.reservation().slot.member),
+            Arc::clone(&self.mailbox),
+        )
+    }
+
+    /// Defines a restartable raw actor; dropping after first poll detaches.
+    pub fn define_raw<R>(mut self, definition: RawDef<R>) -> Admission<ActorRef<M>>
+    where
+        R: crate::RawActor<Msg = M>,
+    {
+        self.define_raw_with(definition, false)
+    }
+
+    fn define_raw_fused<R>(mut self, definition: RawDef<R>) -> Admission<ActorRef<M>>
+    where
+        R: crate::RawActor<Msg = M>,
+    {
+        self.define_raw_with(definition, true)
+    }
+
+    fn define_raw_with<R>(&mut self, definition: RawDef<R>, fused: bool) -> Admission<ActorRef<M>>
+    where
+        R: crate::RawActor<Msg = M>,
+    {
+        let actor = self.actor_ref();
+        let reservation = self.take_reservation();
+        reservation.slot.define(ChildConstruction::Raw(
+            definition.erase(Arc::clone(&self.mailbox)),
+        ));
+        Admission::new(reservation, actor, fused)
+    }
+
+    /// Defines a one-shot raw actor; dropping after first poll detaches.
+    pub fn define_once_raw<R>(mut self, definition: RawOnceDef<R>) -> Admission<ActorRef<M>>
+    where
+        R: crate::RawActor<Msg = M>,
+    {
+        self.define_once_raw_with(definition, false)
+    }
+
+    fn define_once_raw_fused<R>(mut self, definition: RawOnceDef<R>) -> Admission<ActorRef<M>>
+    where
+        R: crate::RawActor<Msg = M>,
+    {
+        self.define_once_raw_with(definition, true)
+    }
+
+    fn define_once_raw_with<R>(
+        &mut self,
+        definition: RawOnceDef<R>,
+        fused: bool,
+    ) -> Admission<ActorRef<M>>
+    where
+        R: crate::RawActor<Msg = M>,
+    {
+        let actor = self.actor_ref();
+        let reservation = self.take_reservation();
+        reservation.slot.define(ChildConstruction::Raw(
+            definition.erase(Arc::clone(&self.mailbox)),
+        ));
+        Admission::new(reservation, actor, fused)
+    }
+}
+
+impl<M> Drop for DynamicActorSlot<M> {
+    fn drop(&mut self) {
+        if let Some(reservation) = &self.reservation {
             crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
         }
     }
@@ -1347,6 +1573,46 @@ impl DynamicScopeRef {
         self.0.shutdown_and_wait(timeout).await
     }
 
+    /// Reserves an actor id synchronously and exposes its exact handle.
+    pub fn reserve_actor<M: Send + 'static>(
+        &self,
+        id: impl Into<ChildId>,
+    ) -> Result<DynamicActorSlot<M>, ReserveError> {
+        let id = checked_id(id)?;
+        crate::driver::reserve_dynamic(&self.0.cell, id, None).map(|reservation| {
+            let mailbox = MailboxCell::new(reservation.slot.member.id().clone());
+            reservation.slot.member.attach_mailbox(mailbox.clone());
+            DynamicActorSlot {
+                reservation: Some(reservation),
+                mailbox,
+            }
+        })
+    }
+
+    /// Adds a restartable raw actor, resolving at admission.
+    pub fn add_raw<R: crate::RawActor>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: RawDef<R>,
+    ) -> Admission<ActorRef<R::Msg>> {
+        match self.reserve_actor(id) {
+            Ok(slot) => slot.define_raw_fused(definition),
+            Err(error) => Admission::error(error),
+        }
+    }
+
+    /// Adds a consuming one-shot raw actor, resolving at admission.
+    pub fn add_raw_once<R: crate::RawActor>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: RawOnceDef<R>,
+    ) -> Admission<ActorRef<R::Msg>> {
+        match self.reserve_actor(id) {
+            Ok(slot) => slot.define_once_raw_fused(definition),
+            Err(error) => Admission::error(error),
+        }
+    }
+
     /// Reserves a task id synchronously and exposes its exact handle.
     pub fn reserve_task(&self, id: impl Into<ChildId>) -> Result<DynamicTaskSlot, ReserveError> {
         let id = checked_id(id)?;
@@ -1426,6 +1692,15 @@ impl DynamicScopeRef {
             &self.0.cell,
             task.id(),
             Some(task.membership()),
+        ))
+    }
+
+    /// Removes exactly the held actor membership, never a same-id successor.
+    pub fn remove_actor<M>(&self, actor: &ActorRef<M>) -> Removal {
+        Removal::new(crate::driver::remove_dynamic(
+            &self.0.cell,
+            actor.id(),
+            Some(actor.membership()),
         ))
     }
 

@@ -473,6 +473,8 @@ pub(crate) fn tidy_abort_beat(grace: Duration) -> Duration {
 pub(crate) struct CommonOptions {
     pub(crate) restart: Option<RestartPolicy>,
     pub(crate) shutdown: Option<Shutdown>,
+    pub(crate) mailbox: Option<Mailbox>,
+    pub(crate) mailbox_shutdown: Option<MailboxShutdown>,
     pub(crate) readiness: Option<Readiness>,
     pub(crate) readiness_deadline: ReadinessDeadline,
     pub(crate) retention: Option<Retention>,
@@ -529,7 +531,10 @@ fn resolve_default_mailbox(value: Option<Mailbox>, inherited: Mailbox) -> Mailbo
 pub(crate) struct ResolvedCommonOptions {
     pub(crate) restart: RestartPolicy,
     pub(crate) shutdown: Shutdown,
+    pub(crate) mailbox: Mailbox,
+    pub(crate) mailbox_shutdown: MailboxShutdown,
     pub(crate) readiness: Readiness,
+    pub(crate) readiness_override: Option<Readiness>,
     pub(crate) readiness_deadline: ReadinessDeadline,
     pub(crate) retention: Retention,
 }
@@ -551,7 +556,12 @@ pub(crate) fn resolve_common(
             options.restart.unwrap_or(defaults.child_restart)
         },
         shutdown: options.shutdown.unwrap_or(defaults.child_shutdown),
+        mailbox: resolve_default_mailbox(options.mailbox, defaults.mailbox),
+        mailbox_shutdown: options
+            .mailbox_shutdown
+            .unwrap_or(defaults.mailbox_shutdown),
         readiness: options.readiness.unwrap_or(default_readiness),
+        readiness_override: options.readiness,
         readiness_deadline,
         retention: options.retention.unwrap_or(if one_shot {
             Retention::Remove

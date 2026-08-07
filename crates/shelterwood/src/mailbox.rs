@@ -1100,7 +1100,8 @@ impl<M: Send + 'static> ActorRef<M> {
 
     /// Sends a request built around one reply capability and awaits its reply.
     ///
-    /// One deadline covers binding, mailbox acceptance, and response. The
+    /// One deadline covers message construction, binding, mailbox acceptance,
+    /// and response, starting when the returned future is first polled. The
     /// returned [`Replied`] identifies the accepting incarnation; [`CallError`]
     /// distinguishes a guaranteed-unaccepted timeout from an accepted request
     /// with an unknown outcome. See [`CallError`] for the required retry
@@ -1404,6 +1405,18 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
                 self.make_msg
                     .take()
                     .expect("unstarted call retains its message constructor")(reply);
+            // The normal polling order lets an acceptance already available
+            // at the exact deadline win. Construction is different: no send
+            // existed before it completed, so do not start one after the
+            // captured budget is strictly in the past.
+            if budget.is_overdue(crate::driver::now()) {
+                self.done = true;
+                return Poll::Ready(Err(CallError {
+                    actor_id: self.actor.id().clone(),
+                    incarnation_observed: self.actor.mailbox.current_observation(),
+                    kind: CallErrorKind::AcceptanceTimedOut,
+                }));
+            }
             self.reply = receiver.shared.take();
             self.send = Some(self.actor.send(message));
             self.timer = Some(crate::driver::sleep_deadline(budget));

@@ -2638,6 +2638,12 @@ impl ScopeRuntime {
                     effects.first(),
                     Some(crate::engine::RestartEffect::Scheduled { .. })
                 ));
+                let scheduled_at = match effects.first() {
+                    Some(crate::engine::RestartEffect::Scheduled { restart_at, .. }) => *restart_at,
+                    Some(crate::engine::RestartEffect::IntensityTripped { .. }) | None => {
+                        unreachable!("restart scheduling emits its schedule first")
+                    }
+                };
                 let delay = child
                     .options
                     .restart
@@ -2649,7 +2655,10 @@ impl ScopeRuntime {
                         record.incarnation = None;
                         record.last_exit = Some(exit.clone());
                         record.restart_count = decision.restart_count;
-                        record.restart_at = decision.restart_at;
+                        // Publish the derived schedule even when intensity
+                        // prevents spawning it. `None` then remains reserved
+                        // for an unrepresentable clock deadline.
+                        record.restart_at = scheduled_at;
                         record.stage = MemberStage::Restarting;
                     },
                     LifecycleEventKind::Exited {

@@ -25,6 +25,11 @@ temporarily absent. For an event emitted by the subscribed scope itself, compare
 `snapshot.watermark(event.scope)` finds the matching watermark. An event is
 already reflected when `event.seq <= watermark`.
 
+A child in `Restarting` normally exposes its absolute backoff deadline through
+`restart_at`. If the requested delay is too large for the platform clock to
+represent, `restart_at` is `None`; the child remains in `Restarting` until
+removal or shutdown rather than restarting immediately.
+
 If the event's scope token is absent from the snapshot, use causal introduction:
 
 - if you applied a later `Added` whose membership is that scope token, the new
@@ -58,9 +63,13 @@ restart wait should accept any incarnation that `supersedes` the saved one.
 Pin the returned `membership` when a same-id replacement would not satisfy the
 logical wait.
 
-All waits need a finite deadline. A missing child does not match yet because a
-future `Added` under that label may satisfy the wait. If the containing scope
-terminalizes first, `wait_for_child` returns its terminal scope state.
+Use a finite deadline for operational waits. `Duration::ZERO` still examines
+the current snapshot once, so an already-satisfied predicate succeeds. A
+duration too large for the platform clock to represent (including
+`Duration::MAX`) behaves as an unbounded wait rather than an immediate timeout.
+A missing child does not match yet because a future `Added` under that label may
+satisfy the wait. If the containing scope terminalizes first, `wait_for_child`
+returns its terminal scope state.
 
 ## Terminal state is not pruning
 

@@ -602,16 +602,34 @@ mod tests {
             Backoff::fixed(Duration::from_millis(10), Jitter::Equal).expect("valid backoff");
         assert_eq!(jittered.next_delay(1, 0.0), Duration::from_millis(5));
         assert_eq!(jittered.next_delay(1, 0.5), Duration::from_micros(7_500));
+    }
 
-        let extreme_max = Duration::MAX - Duration::from_nanos(1);
-        let extreme = Backoff::exponential(
-            extreme_max,
-            BackoffFactor::new(1.0).expect("valid factor"),
-            extreme_max,
-            Jitter::None,
-        )
-        .expect("valid extreme backoff");
-        assert_eq!(extreme.next_delay(u64::MAX, 1.0), extreme_max);
+    #[test]
+    fn extreme_backoffs_never_round_above_their_exact_maximum() {
+        let maximum = Duration::MAX - Duration::from_nanos(1);
+        for jitter in [Jitter::None, Jitter::Equal] {
+            let backoff = Backoff::exponential(
+                Duration::from_nanos(1),
+                BackoffFactor::new(f64::MAX).expect("finite factor"),
+                maximum,
+                jitter,
+            )
+            .expect("valid extreme backoff");
+            for sample in [
+                f64::NEG_INFINITY,
+                -1.0,
+                0.0,
+                1.0 - f64::EPSILON,
+                1.0,
+                f64::INFINITY,
+                f64::NAN,
+            ] {
+                assert!(backoff.next_delay(u64::MAX, sample) <= maximum);
+            }
+        }
+
+        let fixed = Backoff::fixed(maximum, Jitter::Equal).expect("valid fixed backoff");
+        assert!(fixed.next_delay(u64::MAX, 1.0) <= maximum);
     }
 
     #[test]

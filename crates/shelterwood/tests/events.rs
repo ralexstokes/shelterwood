@@ -393,7 +393,7 @@ impl Actor for OverflowTimerActor {
 
 /// A delay too large for the clock is a deadline that never arrives — not an
 /// immediate fire (and for intervals, not an immediate-fire loop).
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn overflowing_timer_deadlines_never_fire() {
     for interval in [false, true] {
         let fired = Arc::new(AtomicUsize::new(0));
@@ -405,7 +405,8 @@ async fn overflowing_timer_deadlines_never_fire() {
         .expect("valid actor");
         let system = tree.spawn().expect("runtime is available");
         system.wait_started().await.expect("actor starts");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
         assert_eq!(
             fired.load(Ordering::SeqCst),
             0,

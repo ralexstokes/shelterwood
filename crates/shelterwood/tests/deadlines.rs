@@ -283,34 +283,19 @@ async fn call_uses_one_budget_across_acceptance_and_response() {
 
 #[tokio::test(start_paused = true)]
 async fn message_construction_consumes_the_call_budget() {
-    let gate = ReleaseGate::default();
     let values = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
     let actor = tree
         .add_raw_once(
             "constructor-budget",
-            RawOnceDef::new(boundary_actor(Some(gate.clone()), &values, &calls, false))
+            RawOnceDef::new(boundary_actor(None, &values, &calls, false))
                 .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
-    actor
-        .try_send(Message::Value(1))
-        .expect("the only mailbox slot is occupied");
 
-    // Keep runnable work in the executor so paused time cannot auto-advance
-    // to a timer incorrectly started after construction.
-    let keep_clock_fixed = Arc::new(AtomicBool::new(true));
-    let busy = tokio::spawn({
-        let keep_clock_fixed = Arc::clone(&keep_clock_fixed);
-        async move {
-            while keep_clock_fixed.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        }
-    });
     let budget = Duration::from_secs(10);
     let mut call = Box::pin(actor.call(
         move |reply| {
@@ -324,24 +309,21 @@ async fn message_construction_consumes_the_call_budget() {
         budget,
     ));
 
-    assert!(poll_once(call.as_mut()).is_pending());
-    let mut result = None;
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-        if let Poll::Ready(value) = poll_once(call.as_mut()) {
-            result = Some(value);
-            break;
-        }
-    }
-    keep_clock_fixed.store(false, Ordering::SeqCst);
-    busy.await.expect("busy task joins");
-    let error = result
-        .expect("the captured budget expires without advancing time again")
-        .expect_err("the blocked call times out");
+    let Poll::Ready(result) = poll_once(call.as_mut()) else {
+        panic!("construction itself exhausts the captured budget");
+    };
+    let error = result.expect_err("the over-budget call times out");
     assert_eq!(error.kind, CallErrorKind::AcceptanceTimedOut);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "an available mailbox must not accept work after construction exhausts the budget"
+    );
 
-    gate.release();
     system
         .shutdown(Duration::from_secs(1))
         .await

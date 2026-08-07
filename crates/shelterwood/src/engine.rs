@@ -515,7 +515,13 @@ mod tests {
         assert_eq!(decision.charge.total_restarts, 1);
         assert!(decision.charge.tripped);
         assert_eq!(decision.restart_at, None);
-        assert!(matches!(effects[0], RestartEffect::Scheduled { .. }));
+        assert!(matches!(
+            effects[0],
+            RestartEffect::Scheduled {
+                restart_at: Some(restart_at),
+                ..
+            } if restart_at == now
+        ));
         assert!(matches!(effects[1], RestartEffect::IntensityTripped { .. }));
     }
 

@@ -125,6 +125,12 @@ pub(crate) struct WatchSender<T>(watch::Sender<T>);
 /// Observing half of a runtime-backed conflating state channel.
 pub(crate) struct WatchReceiver<T>(watch::Receiver<T>);
 
+impl<T> Clone for WatchSender<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 pub(crate) fn watch<T>(initial: T) -> (WatchSender<T>, WatchReceiver<T>) {
     let (sender, receiver) = watch::channel(initial);
     (WatchSender(sender), WatchReceiver(receiver))
@@ -401,7 +407,6 @@ fn panic_message(payload: Box<dyn std::any::Any + Send + 'static>) -> Option<Str
     }
 }
 
-#[cfg(test)]
 pub(crate) async fn yield_now() {
     task::yield_now().await;
 }

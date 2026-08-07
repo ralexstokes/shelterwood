@@ -393,10 +393,9 @@ mod tests {
         std::sync::Arc<MemberCell>,
     ) {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
-        let member = MemberCell::new(
-            ChildId::from("task"),
-            identity.mint_membership().expect("membership available"),
-        );
+        let id = ChildId::from("task");
+        let membership = identity.mint_membership(&id).expect("membership available");
+        let member = MemberCell::new(id, membership);
         let (sender, receiver) = runtime::oneshot();
         let claim = OneShotTaskRef::new(receiver, TaskRef::new(std::sync::Arc::clone(&member)));
         (sender, claim, member)

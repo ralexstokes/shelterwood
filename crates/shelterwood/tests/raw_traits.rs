@@ -23,7 +23,7 @@ fn assert_send<T: Send>(_: T) {}
 fn assert_send_sync<T: Send + Sync>() {}
 
 #[test]
-fn m2_public_types_obey_the_trait_and_future_matrix_without_payload_debug_bounds() {
+fn public_types_obey_the_trait_and_future_matrix_without_payload_debug_bounds() {
     assert_debug::<RawOnceDef<OpaqueRaw>>();
     assert_debug::<SendError<Message>>();
     assert_debug::<Replied<Message>>();

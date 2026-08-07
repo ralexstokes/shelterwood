@@ -931,3 +931,102 @@ async fn never_ran_members_stop_rather_than_report_startup_abort() {
         snapshot.child("never-ran")
     );
 }
+
+/// A descendant path may end at any child kind: a direct task, a leaf actor
+/// through a scope, or a scope itself — the nested snapshot is required only
+/// to advance past a component, never of the final one.
+#[tokio::test]
+async fn descendant_resolves_leaf_and_scope_path_endings() {
+    let mut nested = Tree::new();
+    nested
+        .add_task("worker", waiting_task())
+        .expect("valid nested task");
+    let mut root = Tree::new();
+    root.add_task("direct", waiting_task())
+        .expect("valid direct task");
+    root.add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    let snapshot = system.scope().snapshot();
+    assert_eq!(
+        snapshot
+            .descendant(["direct"])
+            .expect("a path may end at a direct task")
+            .id
+            .as_str(),
+        "direct"
+    );
+    assert_eq!(
+        snapshot
+            .descendant(["nested"])
+            .expect("a path may end at a scope")
+            .id
+            .as_str(),
+        "nested"
+    );
+    assert_eq!(
+        snapshot
+            .descendant(["nested", "worker"])
+            .expect("a path may end at a leaf below a scope")
+            .id
+            .as_str(),
+        "worker"
+    );
+    assert!(snapshot.descendant(["nested", "missing"]).is_none());
+    assert!(snapshot.descendant(["direct", "too-deep"]).is_none());
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}
+
+/// A wait deadline too large for the clock is a deadline that never
+/// arrives — not one that is already due.
+#[tokio::test]
+async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
+    let gate = shelterwood_test_support::ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "gated",
+        TaskDef::new({
+            let gate = gate.clone();
+            move |context| {
+                let gate = gate.clone();
+                async move {
+                    gate.wait().await;
+                    context.mark_ready();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        })
+        .readiness(shelterwood::Readiness::Manual)
+        .expect("manual readiness"),
+    )
+    .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    let waiter = tokio::spawn({
+        let scope = scope.clone();
+        async move {
+            scope
+                .wait_for_child(
+                    "gated",
+                    |child| matches!(child.state, ChildState::Running),
+                    Duration::MAX,
+                )
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    gate.release();
+    waiter
+        .await
+        .expect("waiter joins")
+        .expect("a far-future deadline waits for the condition instead of expiring");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}

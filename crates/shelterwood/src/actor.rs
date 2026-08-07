@@ -382,7 +382,8 @@ impl<A: Actor> RawActor for Handler<A> {
                 CatchUnwindFuture::new(actor.handle(message, &mut context)).await
             };
             match handled {
-                Ok(outcome) => outcome?,
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return fail_after_teardown(raw, error).await,
                 Err(payload) => resume_after_teardown(raw, actor, payload).await,
             }
         }
@@ -395,7 +396,8 @@ impl<A: Actor> RawActor for Handler<A> {
                         CatchUnwindFuture::new(actor.handle(message, &mut context)).await
                     };
                     match handled {
-                        Ok(outcome) => outcome?,
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return fail_after_teardown(raw, error).await,
                         Err(payload) => resume_after_teardown(raw, actor, payload).await,
                     }
                 }
@@ -413,6 +415,18 @@ impl<A: Actor> RawActor for Handler<A> {
         }
         Ok(())
     }
+}
+
+/// Propagates a handler error after §5.5's teardown order: incarnation-owned
+/// work is frozen, cancelled, and joined before actor state — which the
+/// caller still owns — is dropped at its frame's exit.
+async fn fail_after_teardown<M: Send + 'static>(
+    raw: &mut RawContext<M>,
+    error: ExitError,
+) -> ExitResult {
+    raw.freeze_resources();
+    raw.join_resources().await;
+    Err(error)
 }
 
 /// Resumes a caught callback panic after §5.5's teardown order: offloads and

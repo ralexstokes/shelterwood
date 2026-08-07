@@ -1620,9 +1620,9 @@ impl ScopeRef {
         P: FnMut(&crate::ChildSnapshot) -> bool + Send,
     {
         let id = id.into();
-        let expires = crate::runtime::now()
-            .checked_add(deadline)
-            .unwrap_or_else(crate::runtime::now);
+        // A deadline too large for the clock is a deadline that never
+        // arrives, never one that is already due.
+        let expires = crate::runtime::now().checked_add(deadline);
         let mut snapshots = self.subscribe_snapshots();
 
         loop {
@@ -1643,10 +1643,12 @@ impl ScopeRef {
                     state: snapshot.state.clone(),
                 });
             }
-            match crate::runtime::select_two(
-                snapshots.changed(),
-                crate::runtime::sleep_until_std(expires),
-            )
+            match crate::runtime::select_two(snapshots.changed(), async {
+                match expires {
+                    Some(expires) => crate::runtime::sleep_until_std(expires).await,
+                    None => std::future::pending().await,
+                }
+            })
             .await
             {
                 crate::runtime::Either::Left(Ok(_)) => {}

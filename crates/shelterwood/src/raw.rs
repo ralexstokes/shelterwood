@@ -459,6 +459,10 @@ impl<M> Default for RawResources<M> {
 }
 
 impl<M> RawResources<M> {
+    fn prune_finished_offloads(&mut self) {
+        self.offloads.retain(|offload| !offload.finished.is_fired());
+    }
+
     fn pop_monitor_through(&mut self, limit: u64) -> Option<MonitorDelivery<M>> {
         self.watches.retain(|watch| watch.sink.is_active());
         if self.watches.is_empty() {
@@ -1028,9 +1032,7 @@ impl<M: Send + 'static> RawContext<M> {
         // Completed offloads no longer need their resources; prune them here
         // so a long-lived incarnation's ledger stays O(in-flight), not
         // O(offloads-ever-issued).
-        self.resources
-            .offloads
-            .retain(|offload| !offload.finished.is_fired());
+        self.resources.prune_finished_offloads();
 
         let cancellation = Latch::default();
         let finished = Latch::default();
@@ -1111,6 +1113,10 @@ impl<M: Send + 'static> RawContext<M> {
         finished: Latch,
         operation: impl Future<Output = ()> + Send + 'static,
     ) -> Guard {
+        // Cross-incarnation timers share the offload ledger. Prune completed
+        // entries here too so sequential timers do not retain their tasks for
+        // the rest of a long-lived incarnation.
+        self.resources.prune_finished_offloads();
         let state: SharedWork = Arc::new(Mutex::new(Some(Box::pin(operation))));
         let task = crate::driver::spawn_actor_work(SharedOffloadFuture(Arc::clone(&state)));
         self.resources.offloads.push(OffloadResource {
@@ -1790,4 +1796,26 @@ pub(crate) struct RawRunContext {
     pub(crate) local_stop: Latch,
     pub(crate) readiness_override: Option<Readiness>,
     pub(crate) mailbox_shutdown: MailboxShutdown,
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::{Latch, OffloadResource, RawResources};
+
+    #[test]
+    fn pruning_drops_finished_incarnation_resources() {
+        let finished = Latch::default();
+        finished.fire();
+        let mut resources = RawResources::<()>::default();
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished,
+            state: None,
+            task: None,
+        });
+
+        resources.prune_finished_offloads();
+
+        assert!(resources.offloads.is_empty());
+    }
 }

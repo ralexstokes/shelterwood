@@ -37,6 +37,26 @@ pub(crate) fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
 
+#[derive(Clone)]
+pub(crate) struct RuntimeSpawner(tokio::runtime::Handle);
+
+impl RuntimeSpawner {
+    pub(crate) fn current() -> Option<Self> {
+        tokio::runtime::Handle::try_current().ok().map(Self)
+    }
+
+    pub(crate) fn spawn<I, F>(&self, id: I, future: F) -> JoinHandle<I, F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        JoinHandle {
+            id,
+            inner: self.0.spawn(future),
+        }
+    }
+}
+
 /// A spawned operation whose identity is retained through joining.
 pub(crate) struct JoinHandle<I, T> {
     id: I,

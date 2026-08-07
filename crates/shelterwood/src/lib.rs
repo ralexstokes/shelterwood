@@ -6,10 +6,14 @@ mod actor;
 mod driver;
 mod engine;
 mod exit;
+#[cfg(feature = "host")]
+pub mod host;
 mod identity;
 mod mailbox;
 mod monitor;
 mod observe;
+#[cfg(feature = "serde")]
+mod outline;
 mod policy;
 mod raw;
 mod task;
@@ -24,6 +28,10 @@ pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use exit::{
     Exit, ExitError, ExitKind, ExitResult, IntensityTrip, ShutdownStraggler, ShutdownTimeout,
     StartupFailure, StartupFailureCause,
+};
+#[cfg(feature = "host")]
+pub use host::{
+    HostError, HostOptions, Hosted, HostedHandle, HostedRaw, HostedReadyError, HostedTask,
 };
 pub use identity::{Incarnation, Membership};
 pub use mailbox::{
@@ -42,6 +50,11 @@ pub use observe::{
     RestartCounter, ScopeKind, ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver,
     WaitError,
 };
+#[cfg(feature = "serde")]
+pub use outline::{
+    ChildOutline, Outline, OutlineChildKind, OutlineError, OutlineInterior, ResolvedMailbox,
+    ResolvedScopeDefaults, ScopeOutline,
+};
 pub use policy::{
     Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, Jitter, KeyedCapacity,
     Mailbox, MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, RestartCondition,
@@ -49,9 +62,12 @@ pub use policy::{
 };
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,
-    RejectedKind,
+    RejectedKind, SiblingReadyError,
 };
-pub use task::{CancellationToken, OneShotTaskRef, TaskContext, TaskDef, TaskOnceDef, TaskRef};
+pub use task::{
+    CancellationToken, OneShotTaskRef, RunUntilAllResult, TaskCompletion, TaskContext, TaskDef,
+    TaskOnceDef, TaskRef,
+};
 pub use tree::{
     ActorSlot, Admission, AdmissionReceipt, BuildError, DynamicActorSlot, DynamicScopeRef,
     DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, NotAdmittingCause, Removal, RemoveOutcome,

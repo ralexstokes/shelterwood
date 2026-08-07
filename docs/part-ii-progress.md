@@ -20,5 +20,5 @@ validation, and deviations for review.
 | M8 — keyed conflation and peer monitoring | complete | control/priority lane remains open until M12 | focused M8 tests pass; `just ci` passes with 172 tests; rustdoc/API reachability clean | none |
 | M9 — group strategies | complete | none | focused M9 tests pass; `just ci` passes with 179 tests; rustdoc/API reachability clean | none |
 | M10 — observation extensions | complete | none | focused M10 tests pass; `just ci` passes with 186 tests; rustdoc/API reachability and every feature lane clean | none |
-| M11 — outline, hosting, conveniences | pending | none | pending | none |
+| M11 — outline, hosting, conveniences | complete | none | 21 focused M11 tests pass; `just ci` passes with 207 tests; serde/host isolation, rustdoc, and API reachability clean | none |
 | M12 — acceptance wave two | pending | control/priority lane and `project` final verdicts due | pending | none |

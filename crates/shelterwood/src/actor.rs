@@ -181,6 +181,41 @@ impl<'a, A: Actor> Context<'a, A> {
         }
     }
 
+    /// Sends one message to another actor after a delay.
+    pub fn send_after_to<M>(
+        &mut self,
+        target: &ActorRef<M>,
+        message: M,
+        after: Duration,
+    ) -> Result<Guard, Rejected<M>>
+    where
+        M: Send + 'static,
+    {
+        self.raw.send_after_to(target, message, after)
+    }
+
+    /// Tries to send a cloned message to another actor once per period.
+    pub fn interval_to<M>(
+        &mut self,
+        target: &ActorRef<M>,
+        message: M,
+        period: Duration,
+    ) -> Result<Guard, Rejected<M>>
+    where
+        M: Clone + Send + 'static,
+    {
+        self.raw.interval_to(target, message, period)
+    }
+
+    /// Waits for a named sibling's readiness relative to this actor's scope.
+    pub async fn await_sibling_ready(
+        &mut self,
+        id: impl Into<ChildId>,
+        deadline: Duration,
+    ) -> Result<crate::ChildSnapshot, crate::SiblingReadyError> {
+        self.raw.await_sibling_ready(id, deadline).await
+    }
+
     /// Retracts a keyed timer or rejects the operation while draining.
     pub fn clear_timer<K>(&mut self, key: &K) -> Result<bool, Rejected<()>>
     where

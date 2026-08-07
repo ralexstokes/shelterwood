@@ -331,6 +331,24 @@ impl Hash for TaskRef {
     }
 }
 
+/// One selected task's retained completion, in caller input order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskCompletion {
+    /// Stable task membership identity.
+    pub membership: Membership,
+    /// Terminal task exit.
+    pub exit: Exit,
+}
+
+/// Result of awaiting selected tasks and then shutting their owning system down.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunUntilAllResult {
+    /// Selected completions in caller input order, including duplicates.
+    pub tasks: Vec<TaskCompletion>,
+    /// Outcome of the ensuing structured system shutdown.
+    pub shutdown: Result<(), crate::ShutdownTimeout>,
+}
+
 enum CompletionState<T> {
     Pending,
     Completed(T),

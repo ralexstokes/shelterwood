@@ -6,6 +6,12 @@ then consume the `System` with bounded shutdown. A fresh tree can repeat that
 cycle in the same process; the sidecar acceptance test runs two complete
 embed/start/stop cycles over shared host-owned state.
 
+For a single structurally non-restarting actor or task, enable the `host`
+feature and use `Hosted`, `HostedRaw`, or `HostedTask`. Their owner exposes the
+same readiness, typed exit (including panic classification), and joined
+shutdown behavior without requiring an application tree. See
+[outlines, direct hosting, and finite lifetimes](outline-hosting-and-lifetime.md).
+
 Plain `TaskDef` and `TaskOnceDef` children are first-class siblings of actors
 and subtrees. A task-first service can therefore supervise config loading,
 telemetry, serving, and cleanup directly, adding an actor subtree only where a

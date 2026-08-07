@@ -179,6 +179,7 @@ dependencies = [
  "fastrand",
  "metrics",
  "serde",
+ "serde_json",
  "shelterwood-test-support",
  "slab",
  "thiserror",

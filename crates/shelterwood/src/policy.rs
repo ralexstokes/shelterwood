@@ -10,6 +10,7 @@ pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub const DEFAULT_READINESS_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A child identifier within one scope.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ChildId(String);
 
@@ -54,6 +55,8 @@ pub(crate) enum IdError {
 }
 
 /// The condition under which an exited child is restarted.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RestartCondition {
     /// Restart after every exit, including successful completion.
@@ -65,6 +68,8 @@ pub enum RestartCondition {
 }
 
 /// Whether equal jitter is applied to a backoff delay.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Jitter {
     /// Use the derived delay exactly.
@@ -74,6 +79,7 @@ pub enum Jitter {
 }
 
 /// A validated exponential-backoff multiplier.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy)]
 pub struct BackoffFactor(f64);
 
@@ -113,6 +119,8 @@ impl std::hash::Hash for BackoffFactor {
 }
 
 /// Delay policy for a scheduled restart.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Backoff {
     /// Restart without a delay.
@@ -222,6 +230,8 @@ fn duration_from_nanos(nanos: f64) -> Duration {
 }
 
 /// Restart condition and delay policy for one child.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RestartPolicy {
     condition: RestartCondition,
@@ -269,6 +279,8 @@ impl Default for RestartPolicy {
 }
 
 /// Per-child shutdown behavior.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Shutdown {
     /// Request cooperative shutdown for up to the supplied grace.
@@ -289,6 +301,8 @@ impl Default for Shutdown {
 }
 
 /// A child's readiness mode.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Readiness {
     /// Ready as soon as the incarnation starts.
@@ -300,6 +314,8 @@ pub enum Readiness {
 }
 
 /// Resolution state for a gated-readiness deadline.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum ReadinessDeadline {
     /// Resolve from the nearest scope default.
@@ -323,6 +339,8 @@ impl ReadinessDeadline {
 }
 
 /// The scope-wide restart budget.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Intensity {
     /// Maximum restart charges allowed inside the rolling window.
@@ -355,6 +373,8 @@ impl Default for Intensity {
 }
 
 /// Core mailbox declarations carried as L1 policy data.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum Mailbox {
@@ -401,6 +421,8 @@ impl Default for Mailbox {
 }
 
 /// Fate of the frozen accepted mailbox prefix during shutdown.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum MailboxShutdown {
     /// Deliver the frozen accepted prefix before stopping.
@@ -411,6 +433,8 @@ pub enum MailboxShutdown {
 }
 
 /// Whether a terminal child remains resident as a tombstone.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Retention {
     /// Retain the terminal membership until explicit removal or scope exit.
@@ -420,6 +444,8 @@ pub enum Retention {
 }
 
 /// Ordered-scope fate-sharing strategy.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum Strategy {

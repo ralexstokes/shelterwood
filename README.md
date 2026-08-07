@@ -7,10 +7,11 @@ shutdown, and observation. Stable membership and incarnation identities make
 failure recovery explicit without a global registry.
 
 The current `0.1` surface is the core described by [SPEC.md](SPEC.md) plus the
-accepted Part II milestones through M10: incarnation-aware calls and mapping,
-keyed conflation and peer monitoring, ordered group strategies, and structured
-observation extensions. Later Part II sections remain staged by their status
-markers in the specification.
+accepted Part II milestones through M11: incarnation-aware calls and mapping,
+keyed conflation and peer monitoring, ordered group strategies, structured
+observation extensions, resolved outlines, one-incarnation hosting, and finite
+lifetime conveniences. The final acceptance wave remains staged by its status
+marker in the specification.
 
 ## Getting started
 
@@ -63,6 +64,7 @@ scope, and subtrees compose both recursively.
 - [Shutdown and resource ownership](docs/shutdown-and-resources.md)
 - [Snapshots and lifecycle events](docs/observation.md)
 - [Actor statistics and loss-recovering reducers](docs/observation-extensions.md)
+- [Outlines, direct hosting, and finite lifetimes](docs/outline-hosting-and-lifetime.md)
 - [Embedding Shelterwood in a host process](docs/embedding.md)
 
 The executable application-scale examples live in the M5 acceptance tests:

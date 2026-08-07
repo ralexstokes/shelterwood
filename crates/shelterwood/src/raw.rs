@@ -16,7 +16,7 @@ use std::{
 use crate::{
     ActorRef, CancellationToken, ChildId, ExitResult, Incarnation, KeyedCapacity, Mailbox,
     MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef,
-    SendPayload, Shutdown, WatchTarget,
+    ScopeState, SendErrorKind, SendPayload, Shutdown, WaitError, WatchTarget,
     driver::{ActorWork, Latch, Signal, SignalWatcher},
     mailbox::{
         MailboxCell, MailboxControl, MailboxKeyExtractor, MailboxReceiver, MessageSizeObserver,
@@ -35,12 +35,38 @@ type SharedWork = Arc<Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send + 'sta
 #[error("the offload deadline elapsed")]
 pub struct DeadlineElapsed;
 
+/// Failure to observe a scope-relative sibling readiness barrier.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SiblingReadyError {
+    /// The calling incarnation is already draining or stopping.
+    #[error("actor incarnation is draining")]
+    Draining,
+    /// An ordered child tried to await itself or a later declaration.
+    #[error("ordered sibling wait would deadlock startup")]
+    WouldDeadlock,
+    /// No such sibling is declared in this ordered scope.
+    #[error("unknown sibling in ordered scope")]
+    UnknownSibling,
+    /// The deadline elapsed before the sibling became ready.
+    #[error("sibling readiness wait timed out")]
+    TimedOut,
+    /// The containing scope terminated before the sibling became ready.
+    #[error("scope terminated before sibling readiness")]
+    ScopeTerminated {
+        /// Final scope state.
+        state: ScopeState,
+    },
+}
+
 /// The kind of a rejected actor-context operation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum RejectedKind {
     /// The actor incarnation is already draining or stopping.
     Draining,
+    /// An interval period was zero.
+    ZeroPeriod,
 }
 
 /// An operation rejected by the actor's current callback stage.
@@ -60,9 +86,13 @@ impl<T> fmt::Debug for Rejected<T> {
 
 impl<T> Rejected<T> {
     pub(crate) fn new(payload: T) -> Self {
+        Self::with_kind(payload, RejectedKind::Draining)
+    }
+
+    fn with_kind(payload: T, kind: RejectedKind) -> Self {
         Self {
             payload: SendPayload::Recovered(payload),
-            kind: RejectedKind::Draining,
+            kind,
         }
     }
 
@@ -696,6 +726,128 @@ impl<M: Send + 'static> RawContext<M> {
         Ok(())
     }
 
+    /// Sends one message to another actor after a delay.
+    ///
+    /// The send uses ordinary backpressure and rebind semantics. The returned
+    /// guard and this sender incarnation jointly own the timer.
+    pub fn send_after_to<T>(
+        &mut self,
+        target: &ActorRef<T>,
+        message: T,
+        after: Duration,
+    ) -> Result<Guard, Rejected<T>>
+    where
+        T: Send + 'static,
+    {
+        if self.is_stopping() || !self.resources.accepting {
+            return Err(Rejected::new(message));
+        }
+        let cancellation = Latch::default();
+        let finished = Latch::default();
+        let token = self.shutdown.child(cancellation.clone());
+        let target = target.clone();
+        let target_member = target.member_cell();
+        let operation_finished = finished.clone();
+        let operation = async move {
+            let delivery = async move {
+                crate::driver::sleep(after).await;
+                let _ = target.send(message).await;
+            };
+            let delivery_or_terminal =
+                async move { crate::driver::select(delivery, target_member.wait_terminal()).await };
+            let _ = crate::driver::select(token.cancelled(), delivery_or_terminal).await;
+            operation_finished.fire();
+        };
+        Ok(self.start_cross_timer(cancellation, finished, operation))
+    }
+
+    /// Tries to send a cloned message to another actor once per period.
+    ///
+    /// The first tick occurs after one full period. Full or temporarily
+    /// unbound targets skip a tick, and no missed ticks are replayed.
+    pub fn interval_to<T>(
+        &mut self,
+        target: &ActorRef<T>,
+        message: T,
+        period: Duration,
+    ) -> Result<Guard, Rejected<T>>
+    where
+        T: Clone + Send + 'static,
+    {
+        if period.is_zero() {
+            return Err(Rejected::with_kind(message, RejectedKind::ZeroPeriod));
+        }
+        if self.is_stopping() || !self.resources.accepting {
+            return Err(Rejected::new(message));
+        }
+        let cancellation = Latch::default();
+        let finished = Latch::default();
+        let token = self.shutdown.child(cancellation.clone());
+        let target = target.clone();
+        let target_member = target.member_cell();
+        let operation_finished = finished.clone();
+        let operation = async move {
+            loop {
+                let tick_or_terminal = async {
+                    crate::driver::select(
+                        crate::driver::sleep(period),
+                        target_member.wait_terminal(),
+                    )
+                    .await
+                };
+                match crate::driver::select(token.cancelled(), tick_or_terminal).await {
+                    crate::driver::Selected::First(())
+                    | crate::driver::Selected::Second(crate::driver::Selected::Second(_)) => break,
+                    crate::driver::Selected::Second(crate::driver::Selected::First(())) => {}
+                }
+                match target.try_send(message.clone()) {
+                    Ok(_) => {}
+                    Err(error) if error.kind == SendErrorKind::Terminated => break,
+                    Err(_) => {}
+                }
+            }
+            operation_finished.fire();
+        };
+        Ok(self.start_cross_timer(cancellation, finished, operation))
+    }
+
+    /// Waits for a named sibling's readiness relative to this actor's scope.
+    pub async fn await_sibling_ready(
+        &mut self,
+        id: impl Into<ChildId>,
+        deadline: Duration,
+    ) -> Result<crate::ChildSnapshot, SiblingReadyError> {
+        if self.is_stopping() || !self.resources.accepting {
+            return Err(SiblingReadyError::Draining);
+        }
+        let id = id.into();
+        if self.scope.cell.flavor == crate::tree::ScopeFlavor::Ordered {
+            match self.scope.cell.sibling_order(&self.id, &id) {
+                Some(std::cmp::Ordering::Less) => {}
+                Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater) => {
+                    return Err(SiblingReadyError::WouldDeadlock);
+                }
+                None => return Err(SiblingReadyError::UnknownSibling),
+            }
+        }
+        let scope = self.scope.clone();
+        let shutdown = self.shutdown.clone();
+        let wait = scope.wait_for_child(
+            id,
+            |child| matches!(child.state, crate::ChildState::Running),
+            deadline,
+        );
+        match crate::driver::select(shutdown.cancelled(), wait).await {
+            crate::driver::Selected::First(()) => Err(SiblingReadyError::Draining),
+            crate::driver::Selected::Second(result) => result.map_err(|error| match error {
+                WaitError::TimedOut => SiblingReadyError::TimedOut,
+                WaitError::ScopeTerminated { state } => {
+                    SiblingReadyError::ScopeTerminated { state }
+                }
+            }),
+        }
+    }
+
     /// Retracts a keyed timer, including an elapsed timer not yet delivered.
     pub fn clear_timer<K>(&mut self, key: &K) -> bool
     where
@@ -951,6 +1103,28 @@ impl<M: Send + 'static> RawContext<M> {
             task: Some(task),
         });
         Ok(guard)
+    }
+
+    fn start_cross_timer(
+        &mut self,
+        cancellation: Latch,
+        finished: Latch,
+        operation: impl Future<Output = ()> + Send + 'static,
+    ) -> Guard {
+        let state: SharedWork = Arc::new(Mutex::new(Some(Box::pin(operation))));
+        let task = crate::driver::spawn_actor_work(SharedOffloadFuture(Arc::clone(&state)));
+        self.resources.offloads.push(OffloadResource {
+            cancellation: cancellation.clone(),
+            finished: finished.clone(),
+            state: Some(state),
+            task: Some(task),
+        });
+        Guard {
+            cancellation,
+            finished,
+            cancel_action: None,
+            armed: true,
+        }
     }
 
     fn start_watch<T, W>(

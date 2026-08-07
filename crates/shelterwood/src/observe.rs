@@ -246,6 +246,8 @@ impl ScopeState {
 }
 
 /// Static flavor of a scope snapshot.
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ScopeKind {
     /// Fixed, readiness-ordered membership.

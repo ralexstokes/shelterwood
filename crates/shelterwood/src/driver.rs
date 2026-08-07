@@ -640,6 +640,7 @@ pub(crate) struct ScopeCell {
     control: Mutex<ScopeControl>,
     current_dynamic: Mutex<Option<Arc<DynamicControl>>>,
     current_children: Mutex<Vec<Arc<SlotCell>>>,
+    declaration_order: Mutex<Vec<ChildId>>,
     parent: Mutex<Option<Weak<ScopeCell>>>,
     lifecycle_sequence: Mutex<FenceCounter>,
     root_incarnations: Mutex<FenceCounter>,
@@ -689,6 +690,7 @@ impl ScopeCell {
             control: Mutex::new(ScopeControl::default()),
             current_dynamic: Mutex::new(None),
             current_children: Mutex::new(Vec::new()),
+            declaration_order: Mutex::new(Vec::new()),
             parent: Mutex::new(None),
             lifecycle_sequence: Mutex::new(FenceCounter::new(0)),
             root_incarnations: Mutex::new(FenceCounter::new(0)),
@@ -1268,6 +1270,13 @@ impl ScopeCell {
                 "scope restart found unpruned residents of a previous incarnation"
             );
         }
+        *self
+            .declaration_order
+            .lock()
+            .expect("scope declaration-order mutex poisoned") = children
+            .iter()
+            .map(|child| child.member.id().clone())
+            .collect();
         self.current_children
             .lock()
             .expect("scope children mutex poisoned")
@@ -1290,6 +1299,20 @@ impl ScopeCell {
                 membership: child.member.membership(),
             });
         }
+    }
+
+    pub(crate) fn sibling_order(
+        &self,
+        own: &ChildId,
+        target: &ChildId,
+    ) -> Option<std::cmp::Ordering> {
+        let declared = self
+            .declaration_order
+            .lock()
+            .expect("scope declaration-order mutex poisoned");
+        let own = declared.iter().position(|id| id == own)?;
+        let target = declared.iter().position(|id| id == target)?;
+        Some(target.cmp(&own))
     }
 
     fn admit_child(self: &Arc<Self>, child: &Arc<SlotCell>) {

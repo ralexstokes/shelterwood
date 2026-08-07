@@ -329,6 +329,140 @@ impl BuilderCore {
         })
     }
 
+    #[cfg(feature = "serde")]
+    fn outline_scope(
+        &self,
+        inherited: ResolvedDefaults,
+        prefix: &mut Vec<ChildId>,
+        unfilled: &mut Vec<Vec<ChildId>>,
+    ) -> crate::ScopeOutline {
+        let defaults = inherited.overlay(&self.config.defaults);
+        let mut children = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            let state = slot.definition.lock().expect("definition mutex poisoned");
+            let DefinitionState::Defined(definition) = &*state else {
+                match &*state {
+                    DefinitionState::Undefined => {
+                        prefix.push(slot.member.id().clone());
+                        unfilled.push(prefix.clone());
+                        prefix.pop();
+                        continue;
+                    }
+                    DefinitionState::Lowered => {
+                        unreachable!("an owned declaration cannot be outlined after lowering")
+                    }
+                    DefinitionState::Defined(_) => unreachable!(),
+                }
+            };
+            children.push(self.outline_child(slot, definition, &defaults, prefix, unfilled));
+        }
+        crate::ScopeOutline {
+            kind: match self.flavor {
+                ScopeFlavor::Ordered => crate::ScopeKind::Ordered,
+                ScopeFlavor::Dynamic => crate::ScopeKind::Dynamic,
+            },
+            strategy: (self.flavor == ScopeFlavor::Ordered).then_some(self.config.strategy),
+            intensity: self.config.intensity,
+            defaults: outline_defaults(&defaults),
+            children,
+        }
+    }
+
+    #[cfg(feature = "serde")]
+    fn outline_child(
+        &self,
+        slot: &SlotCell,
+        definition: &ChildConstruction,
+        defaults: &ResolvedDefaults,
+        prefix: &mut Vec<ChildId>,
+        unfilled: &mut Vec<Vec<ChildId>>,
+    ) -> crate::ChildOutline {
+        let (options, one_shot, default_readiness, kind) = match definition {
+            ChildConstruction::Raw(definition) => {
+                let kind = match slot
+                    .actor_kind()
+                    .expect("raw construction retains typed actor metadata")
+                {
+                    crate::ActorKind::Actor => crate::OutlineChildKind::Actor,
+                    crate::ActorKind::RawActor => crate::OutlineChildKind::RawActor,
+                };
+                let readiness = if kind == crate::OutlineChildKind::Actor {
+                    crate::Readiness::AfterInit
+                } else {
+                    crate::Readiness::Immediate
+                };
+                (&definition.options, definition.one_shot(), readiness, kind)
+            }
+            ChildConstruction::Task(definition) => (
+                &definition.options,
+                false,
+                crate::Readiness::Immediate,
+                crate::OutlineChildKind::Task,
+            ),
+            ChildConstruction::TaskOnce(definition) => (
+                &definition.options,
+                true,
+                crate::Readiness::Immediate,
+                crate::OutlineChildKind::Task,
+            ),
+            ChildConstruction::Scope(definition) => {
+                let kind = match slot
+                    .scope
+                    .as_ref()
+                    .expect("scope construction retains a scope cell")
+                    .flavor
+                {
+                    ScopeFlavor::Ordered => crate::OutlineChildKind::OrderedScope,
+                    ScopeFlavor::Dynamic => crate::OutlineChildKind::DynamicScope,
+                };
+                (
+                    &definition.options,
+                    definition.one_shot(),
+                    crate::Readiness::Manual,
+                    kind,
+                )
+            }
+        };
+        let resolved = resolve_common(options, defaults, one_shot, default_readiness);
+        let actor = matches!(
+            kind,
+            crate::OutlineChildKind::Actor | crate::OutlineChildKind::RawActor
+        );
+        let interior = match definition {
+            ChildConstruction::Scope(definition) => Some(match &definition.source {
+                ScopeSource::Restartable(_) => crate::OutlineInterior::Opaque,
+                ScopeSource::OneShot(tree) => {
+                    let inherited = match definition.defaults {
+                        DefaultsInheritance::Inherit => defaults.clone(),
+                        DefaultsInheritance::Reset => ResolvedDefaults::default(),
+                    };
+                    prefix.push(slot.member.id().clone());
+                    let nested = tree.outline_scope(inherited, prefix, unfilled);
+                    prefix.pop();
+                    crate::OutlineInterior::Recursive(nested)
+                }
+                ScopeSource::Spent => {
+                    unreachable!("an owned declaration cannot contain a spent subtree")
+                }
+            }),
+            ChildConstruction::Raw(_)
+            | ChildConstruction::Task(_)
+            | ChildConstruction::TaskOnce(_) => None,
+        };
+        crate::ChildOutline {
+            id: slot.member.id().clone(),
+            kind,
+            restart: resolved.restart,
+            shutdown: resolved.shutdown,
+            readiness: resolved.readiness,
+            readiness_deadline: resolved.readiness_deadline,
+            retention: resolved.retention,
+            mailbox: actor.then(|| outline_mailbox(&resolved)),
+            mailbox_shutdown: actor.then_some(resolved.mailbox_shutdown),
+            interior,
+        }
+    }
+
     fn terminalize(&self) {
         for slot in &self.slots {
             slot.member.terminalize(Exit::never_started());
@@ -338,6 +472,38 @@ impl BuilderCore {
         }
         self.root.terminalize_never_started();
     }
+}
+
+#[cfg(feature = "serde")]
+fn outline_defaults(defaults: &ResolvedDefaults) -> crate::ResolvedScopeDefaults {
+    crate::ResolvedScopeDefaults {
+        child_restart: defaults.child_restart,
+        child_shutdown: defaults.child_shutdown,
+        mailbox: outline_core_mailbox(defaults.mailbox),
+        mailbox_shutdown: defaults.mailbox_shutdown,
+        readiness_deadline: defaults.readiness_deadline,
+    }
+}
+
+#[cfg(feature = "serde")]
+fn outline_core_mailbox(mailbox: crate::Mailbox) -> crate::ResolvedMailbox {
+    match mailbox {
+        crate::Mailbox::Queue(capacity) => crate::ResolvedMailbox::Queue {
+            capacity: capacity.unwrap_or_else(|| {
+                std::num::NonZeroUsize::new(crate::policy::DEFAULT_MAILBOX_CAPACITY)
+                    .expect("library mailbox capacity is non-zero")
+            }),
+        },
+        crate::Mailbox::Latest => crate::ResolvedMailbox::Latest,
+    }
+}
+
+#[cfg(feature = "serde")]
+fn outline_mailbox(options: &ResolvedCommonOptions) -> crate::ResolvedMailbox {
+    options.keyed_capacity.map_or_else(
+        || outline_core_mailbox(options.mailbox),
+        |capacity| crate::ResolvedMailbox::LatestByKey { capacity },
+    )
 }
 
 impl Drop for BuilderCore {
@@ -421,6 +587,20 @@ impl Tree {
     pub fn defaults(&mut self, defaults: ScopeDefaults) -> &mut Self {
         self.core.config.defaults = defaults;
         self
+    }
+
+    /// Borrows this declaration as a fully resolved serializable outline.
+    #[cfg(feature = "serde")]
+    pub fn outline(&self) -> Result<crate::Outline, crate::OutlineError> {
+        let mut unfilled = Vec::new();
+        let root =
+            self.core
+                .outline_scope(ResolvedDefaults::default(), &mut Vec::new(), &mut unfilled);
+        if unfilled.is_empty() {
+            Ok(crate::Outline { root })
+        } else {
+            Err(crate::OutlineError::UnfilledReservations { paths: unfilled })
+        }
     }
 
     /// Reserves an actor membership and returns its pre-spawn handle slot.
@@ -573,6 +753,20 @@ impl DynamicTree {
     pub fn defaults(&mut self, defaults: ScopeDefaults) -> &mut Self {
         self.core.config.defaults = defaults;
         self
+    }
+
+    /// Borrows this declaration as a fully resolved serializable outline.
+    #[cfg(feature = "serde")]
+    pub fn outline(&self) -> Result<crate::Outline, crate::OutlineError> {
+        let mut unfilled = Vec::new();
+        let root =
+            self.core
+                .outline_scope(ResolvedDefaults::default(), &mut Vec::new(), &mut unfilled);
+        if unfilled.is_empty() {
+            Ok(crate::Outline { root })
+        } else {
+            Err(crate::OutlineError::UnfilledReservations { paths: unfilled })
+        }
     }
 
     /// Reserves an initial actor membership.
@@ -2080,6 +2274,36 @@ impl<R: Clone> System<R> {
     /// Waits until the declared tree is ready or startup terminally fails.
     pub async fn wait_started(&self) -> Result<(), StartupError> {
         self.run.root.wait_started().await
+    }
+
+    /// Waits for every selected task, then shuts down and consumes the system.
+    ///
+    /// Completion rows retain caller input order. An empty selection proceeds
+    /// directly to shutdown.
+    pub fn run_until_all<I>(
+        self,
+        tasks: I,
+        grace: Duration,
+    ) -> impl Future<Output = crate::RunUntilAllResult> + Send
+    where
+        I: IntoIterator<Item = TaskRef>,
+        R: Send + 'static,
+    {
+        let tasks = tasks.into_iter().collect::<Vec<_>>();
+        async move {
+            let mut completions = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                completions.push(crate::TaskCompletion {
+                    membership: task.membership(),
+                    exit: task.wait().await,
+                });
+            }
+            let shutdown = self.shutdown(grace).await;
+            crate::RunUntilAllResult {
+                tasks: completions,
+                shutdown,
+            }
+        }
     }
 
     /// Rolls a startup failure back through full shutdown.

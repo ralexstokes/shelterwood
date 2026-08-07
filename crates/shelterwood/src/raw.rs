@@ -1277,6 +1277,60 @@ struct RawInstance<R: RawActor> {
     mailbox: Arc<MailboxCell<R::Msg>>,
 }
 
+struct RawIncarnationOwner<R: RawActor> {
+    raw: Option<RawContext<R::Msg>>,
+    actor: Option<R>,
+}
+
+impl<R: RawActor> RawIncarnationOwner<R> {
+    fn new(raw: RawContext<R::Msg>, actor: R) -> Self {
+        Self {
+            raw: Some(raw),
+            actor: Some(actor),
+        }
+    }
+
+    fn parts(&mut self) -> (&mut R, &mut RawContext<R::Msg>) {
+        let actor = self.actor.as_mut().expect("raw actor owner is armed");
+        let raw = self.raw.as_mut().expect("raw context owner is armed");
+        (actor, raw)
+    }
+
+    fn raw(&mut self) -> &mut RawContext<R::Msg> {
+        self.raw.as_mut().expect("raw context owner is armed")
+    }
+
+    fn drop_raw(&mut self) {
+        drop(self.raw.take());
+    }
+
+    fn drop_actor(&mut self) {
+        drop(self.actor.take());
+    }
+
+    fn drop_actor_catching(&mut self) {
+        let actor = self.actor.take();
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(actor)));
+    }
+}
+
+impl<R: RawActor> Drop for RawIncarnationOwner<R> {
+    fn drop(&mut self) {
+        // A hard abort destroys the incarnation future instead of polling its
+        // teardown epilogue. Preserve §5.5's resource-before-actor order, but
+        // put a boundary around each destructor so two panics cannot abort the
+        // process. The resource panic is primary: it may be an owned offload
+        // panic that completed before cancellation was requested.
+        let raw_panic = catch_unwind(AssertUnwindSafe(|| self.drop_raw())).err();
+        let actor_panic = catch_unwind(AssertUnwindSafe(|| self.drop_actor())).err();
+        if !std::thread::panicking()
+            && let Some(payload) = raw_panic.or(actor_panic)
+        {
+            resume_unwind(payload);
+        }
+    }
+}
+
 impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
     fn readiness(&self) -> Readiness {
         self.actor.readiness()
@@ -1284,23 +1338,27 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
 
     fn run(self: Box<Self>, context: RawRunContext) -> RawFuture {
         Box::pin(async move {
-            let Self { mut actor, mailbox } = *self;
+            let Self { actor, mailbox } = *self;
             let incarnation = context.incarnation;
             let myself = ActorRef::new(Arc::clone(&context.member), Arc::clone(&mailbox));
             let readiness = context.readiness_override.unwrap_or(actor.readiness());
-            let mut raw = RawContext::new(context, myself, Arc::clone(&mailbox), readiness);
-            let outcome = CatchUnwindFuture::new(actor.run(&mut raw)).await;
+            let raw = RawContext::new(context, myself, Arc::clone(&mailbox), readiness);
+            let mut owner = RawIncarnationOwner::new(raw, actor);
+            let outcome = {
+                let (actor, raw) = owner.parts();
+                CatchUnwindFuture::new(actor.run(raw)).await
+            };
             mailbox.freeze(incarnation);
-            raw.freeze_resources();
-            raw.join_resources().await;
-            drop(raw);
+            owner.raw().freeze_resources();
+            owner.raw().join_resources().await;
+            owner.drop_raw();
             match outcome {
                 Ok(result) => {
-                    drop(actor);
+                    owner.drop_actor();
                     result
                 }
                 Err(payload) => {
-                    let _ = catch_unwind(AssertUnwindSafe(|| drop(actor)));
+                    owner.drop_actor_catching();
                     resume_unwind(payload)
                 }
             }

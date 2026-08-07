@@ -1568,12 +1568,10 @@ impl SystemRun {
             runtime::JoinOutcome::Ok { .. } => {}
             runtime::JoinOutcome::Panic { message, .. } => {
                 let exit = Exit::new(ExitKind::Panicked { message }, false);
-                self.root.set_startup(Err(StartupError::ShutdownRequested));
                 self.root
                     .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
             }
-            runtime::JoinOutcome::Cancelled { .. } => {
-                self.root.set_startup(Err(StartupError::ShutdownRequested));
+            runtime::JoinOutcome::Cancelled => {
                 self.root.finish_live_root_incarnation(
                     StopReason::ShutdownRequested,
                     Exit::new(ExitKind::Aborted { after_grace: false }, true),
@@ -1668,12 +1666,10 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
             runtime::JoinOutcome::Ok { value, .. } => value,
             runtime::JoinOutcome::Panic { message, .. } => {
                 let exit = Exit::new(ExitKind::Panicked { message }, false);
-                monitor_root.set_startup(Err(StartupError::ShutdownRequested));
                 monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
                 StopReason::ShutdownRequested
             }
-            runtime::JoinOutcome::Cancelled { .. } => {
-                monitor_root.set_startup(Err(StartupError::ShutdownRequested));
+            runtime::JoinOutcome::Cancelled => {
                 monitor_root.finish_live_root_incarnation(
                     StopReason::ShutdownRequested,
                     Exit::new(ExitKind::Aborted { after_grace: false }, true),
@@ -2216,9 +2212,7 @@ impl ScopeRuntime {
             let join = match runtime::join(handle).await {
                 runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
                 runtime::JoinOutcome::Panic { message, .. } => JoinVerdict::Panicked { message },
-                runtime::JoinOutcome::Cancelled { .. } => {
-                    JoinVerdict::Cancelled { after_grace: false }
-                }
+                runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled { after_grace: false },
             };
             exit_ended.fire();
             let report = report_receiver.receive();
@@ -3355,11 +3349,10 @@ enum Pending {
 #[cfg(test)]
 mod tests {
     use std::{
-        future,
-        future::Future,
+        future::{self, Future},
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::Arc,
-        task::{Context, Poll, Waker},
+        sync::{Arc, Mutex},
+        task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
 
@@ -3441,7 +3434,12 @@ mod tests {
         member.terminalize(Exit::never_started());
         member.attach_mailbox(mailbox);
 
-        let parked = parked.await.expect_err("parked send is terminated");
+        let parked = match crate::runtime::timeout(Duration::from_secs(1), parked).await {
+            crate::runtime::Timeout::Completed(result) => {
+                result.expect_err("parked send is terminated")
+            }
+            crate::runtime::Timeout::Elapsed => panic!("parked send must not remain pending"),
+        };
         assert_eq!(parked.kind, SendErrorKind::Terminated);
         let immediate = actor.try_send(2).expect_err("terminal send is rejected");
         assert_eq!(immediate.kind, SendErrorKind::Terminated);
@@ -3476,19 +3474,21 @@ mod tests {
             crate::runtime::Timeout::Completed(())
         ));
         let waiter_scope = Arc::clone(&scope);
-        let waiter = crate::runtime::spawn((), async move { waiter_scope.wait_started().await });
-        crate::runtime::yield_now().await;
+        let mut waiter = Box::pin(waiter_scope.wait_started());
+        let first_poll =
+            std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
+        assert!(first_poll.is_pending());
 
         abort.abort();
         assert!(matches!(
             crate::runtime::join(driver).await,
-            crate::runtime::JoinOutcome::Cancelled { .. }
+            crate::runtime::JoinOutcome::Cancelled
         ));
-        let crate::runtime::JoinOutcome::Ok { value, .. } = crate::runtime::join(waiter).await
-        else {
-            panic!("startup waiter must join normally");
-        };
-        assert_eq!(value, Err(crate::StartupError::ShutdownRequested));
+        let result = crate::runtime::timeout(Duration::from_secs(1), waiter).await;
+        assert!(matches!(
+            result,
+            crate::runtime::Timeout::Completed(Err(crate::StartupError::ShutdownRequested))
+        ));
         assert!(matches!(scope.record().state, ScopeState::Stopped { .. }));
         assert!(scope.record().startup.is_some());
     }
@@ -3624,6 +3624,61 @@ mod tests {
             }
         }
         assert_eq!(removed, 2, "every Added edge needs a matching Removed edge");
+    }
+
+    struct TrySendOnWake {
+        actor: ActorRef<u8>,
+        observed: Mutex<Option<SendErrorKind>>,
+    }
+
+    impl TrySendOnWake {
+        fn observe(&self) {
+            let error = self
+                .actor
+                .try_send(1)
+                .expect_err("a terminality-derived wake observes a closed mailbox");
+            *self.observed.lock().expect("observation mutex poisoned") = Some(error.kind);
+        }
+    }
+
+    impl Wake for TrySendOnWake {
+        fn wake(self: Arc<Self>) {
+            self.observe();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observe();
+        }
+    }
+
+    #[test]
+    fn terminality_signal_follows_mailbox_termination() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let member = MemberCell::new(
+            ChildId::from("worker"),
+            identity.mint_membership().expect("membership available"),
+        );
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+
+        let probe = Arc::new(TrySendOnWake {
+            actor,
+            observed: Mutex::new(None),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut context = Context::from_waker(&waker);
+        let mut watcher = member.change_signal().watcher();
+        let mut changed = Box::pin(watcher.changed());
+        assert!(changed.as_mut().poll(&mut context).is_pending());
+
+        member.terminalize(Exit::never_started());
+
+        assert_eq!(
+            *probe.observed.lock().expect("observation mutex poisoned"),
+            Some(SendErrorKind::Terminated)
+        );
+        assert!(changed.as_mut().poll(&mut context).is_ready());
     }
 
     #[test]

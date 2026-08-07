@@ -10,7 +10,7 @@ use crate::common::{ReleaseGate, poll_until};
 use shelterwood::{
     DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
     RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ScopeDefaults,
-    SendErrorKind, Tree,
+    SendErrorKind, Shutdown, Tree,
 };
 
 struct FactoryTaskActor {
@@ -375,4 +375,75 @@ async fn raw_run_panic_with_panicking_destructor_publishes_one_report() {
         ),
         "the run panic's payload wins: {exit:?}"
     );
+}
+
+struct OffloadDoublePanicActor {
+    queued: Arc<AtomicBool>,
+}
+
+impl RawActor for OffloadDoublePanicActor {
+    type Msg = ();
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        let guard = context
+            .offload_scoped(
+                async {
+                    panic!("injected offload panic");
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("offload accepted");
+        guard.finished().await;
+        self.queued.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+impl Drop for OffloadDoublePanicActor {
+    fn drop(&mut self) {
+        panic!("injected destructor panic");
+    }
+}
+
+#[tokio::test]
+async fn hard_abort_offload_panic_with_panicking_raw_destructor_is_contained() {
+    let queued = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "double-panic",
+        RawOnceDef::new(OffloadDoublePanicActor {
+            queued: Arc::clone(&queued),
+        })
+        .shutdown(Shutdown::Abort),
+    )
+    .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    system.wait_started().await.expect("actor starts");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            queued.load(Ordering::SeqCst)
+        })
+        .await,
+        "offload panic is queued before hard abort"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the two panics remain contained");
+
+    let mut panic_message = None;
+    while let Some(item) = events.recv().await {
+        let shelterwood::LifecycleItem::Event(event) = item else {
+            panic!("small fixture must not lag");
+        };
+        if let shelterwood::LifecycleEventKind::Exited { id, exit, .. } = event.kind
+            && id.as_str() == "double-panic"
+            && let shelterwood::ExitKind::Panicked { message } = exit.kind()
+        {
+            panic_message = message.clone();
+        }
+    }
+    assert_eq!(panic_message.as_deref(), Some("injected offload panic"));
 }

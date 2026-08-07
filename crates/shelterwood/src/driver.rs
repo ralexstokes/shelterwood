@@ -78,9 +78,9 @@ impl<T> Obligation<T> {
         }
     }
 
-    fn payload(&self) -> &T {
+    fn payload_mut(&mut self) -> &mut T {
         self.payload
-            .as_ref()
+            .as_mut()
             .expect("a completed obligation has no payload")
     }
 
@@ -346,10 +346,6 @@ impl MemberCell {
 
     pub(crate) fn record(&self) -> MemberRecord {
         self.record.lock().expect("member mutex poisoned").clone()
-    }
-
-    pub(crate) fn change_signal(&self) -> Signal {
-        self.changed.clone()
     }
 
     pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
@@ -1196,89 +1192,42 @@ pub(crate) struct SystemRun {
     driver: Option<runtime::JoinHandle<(), StopReason>>,
 }
 
-pub(crate) struct AdmissionResponse {
-    result: Mutex<Option<Result<(), ReserveError>>>,
-    changed: Signal,
-}
+pub(crate) type RemovalResponse = runtime::OneShotReceiver<RemoveOutcome>;
 
-impl AdmissionResponse {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            result: Mutex::new(None),
-            changed: Signal::default(),
-        })
+#[derive(Default)]
+struct RemovalResponses(Vec<runtime::OneShotSender<RemoveOutcome>>);
+
+impl RemovalResponses {
+    fn subscribe(&mut self) -> RemovalResponse {
+        let (sender, receiver) = runtime::oneshot();
+        self.0.push(sender);
+        receiver
     }
 
-    fn complete(&self, result: Result<(), ReserveError>) {
-        let mut current = self.result.lock().expect("admission mutex poisoned");
-        if current.is_none() {
-            *current = Some(result);
-            drop(current);
-            self.changed.pulse();
-        }
-    }
-
-    pub(crate) async fn wait(&self) -> Result<(), ReserveError> {
-        let mut watcher = self.changed.watcher();
-        loop {
-            if let Some(result) = self
-                .result
-                .lock()
-                .expect("admission mutex poisoned")
-                .clone()
-            {
-                return result;
-            }
-            watcher.changed().await;
+    fn complete(self, outcome: RemoveOutcome) {
+        for sender in self.0 {
+            let _ = sender.send(outcome);
         }
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct RemovalResponse {
-    result: Mutex<Option<RemoveOutcome>>,
-    changed: Signal,
+fn complete_removals(responses: RemovalResponses) {
+    responses.complete(RemoveOutcome::Removed);
 }
 
-impl RemovalResponse {
-    fn pending() -> Arc<Self> {
-        Arc::new(Self {
-            result: Mutex::new(None),
-            changed: Signal::default(),
-        })
-    }
-
-    fn completed(outcome: RemoveOutcome) -> Arc<Self> {
-        let response = Self::pending();
-        response.complete(outcome);
-        response
-    }
-
-    fn complete(&self, outcome: RemoveOutcome) {
-        let mut current = self.result.lock().expect("removal mutex poisoned");
-        if current.is_none() {
-            *current = Some(outcome);
-            drop(current);
-            self.changed.pulse();
-        }
-    }
-
-    pub(crate) async fn wait(&self) -> RemoveOutcome {
-        let mut watcher = self.changed.watcher();
-        loop {
-            if let Some(result) = *self.result.lock().expect("removal mutex poisoned") {
-                return result;
-            }
-            watcher.changed().await;
-        }
-    }
+fn completed_removal(outcome: RemoveOutcome) -> RemovalResponse {
+    let (sender, receiver) = runtime::oneshot();
+    sender
+        .send(outcome)
+        .expect("a fresh removal receiver must be open");
+    receiver
 }
 
 struct DynamicEntry {
     slot: Arc<SlotCell>,
     admitted: bool,
     fused_cancel: Option<Latch>,
-    removal: Obligation<Arc<RemovalResponse>>,
+    removal: Obligation<RemovalResponses>,
     removal_started: bool,
 }
 
@@ -1384,9 +1333,7 @@ pub(crate) fn reserve_dynamic(
             slot: Arc::clone(&slot),
             admitted: false,
             fused_cancel: None,
-            removal: Obligation::new(RemovalResponse::pending(), |response| {
-                response.complete(RemoveOutcome::Removed);
-            }),
+            removal: Obligation::new(RemovalResponses::default(), complete_removals),
             removal_started: false,
         },
     );
@@ -1400,14 +1347,14 @@ pub(crate) fn start_admission(
     control: Arc<DynamicControl>,
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
-) -> Arc<AdmissionResponse> {
-    let response = AdmissionResponse::new();
+) -> runtime::OneShotReceiver<Result<(), ReserveError>> {
+    let (sender, response) = runtime::oneshot();
     let request = AdmissionRequest {
         control: Arc::downgrade(&control),
         slot,
         fused_cancel,
-        response: Obligation::new(Arc::clone(&response), |response| {
-            response.complete(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
+        response: Obligation::new(sender, |sender| {
+            let _ = sender.send(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
         }),
     };
     runtime::spawn((), async move {
@@ -1447,24 +1394,24 @@ pub(crate) fn remove_dynamic(
     scope: &Arc<ScopeCell>,
     id: &ChildId,
     exact: Option<Membership>,
-) -> Arc<RemovalResponse> {
+) -> RemovalResponse {
     if matches!(
         scope.record().state,
         ScopeState::Draining | ScopeState::Stopped { .. }
     ) {
-        return RemovalResponse::completed(RemoveOutcome::AlreadyAbsent);
+        return completed_removal(RemoveOutcome::AlreadyAbsent);
     }
     let Some(control) = scope.dynamic() else {
-        return RemovalResponse::completed(RemoveOutcome::AlreadyAbsent);
+        return completed_removal(RemoveOutcome::AlreadyAbsent);
     };
     let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
     let Some(entry) = state.entries.get_mut(id) else {
-        return RemovalResponse::completed(RemoveOutcome::AlreadyAbsent);
+        return completed_removal(RemoveOutcome::AlreadyAbsent);
     };
     if exact.is_some_and(|membership| membership != entry.slot.member.membership()) {
-        return RemovalResponse::completed(RemoveOutcome::AlreadyAbsent);
+        return completed_removal(RemoveOutcome::AlreadyAbsent);
     }
-    let response = Arc::clone(entry.removal.payload());
+    let response = entry.removal.payload_mut().subscribe();
     if !entry.admitted {
         let entry = state.entries.remove(id).expect("entry was just resolved");
         drop(state);
@@ -1497,12 +1444,14 @@ struct AdmissionRequest {
     control: Weak<DynamicControl>,
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
-    response: Obligation<Arc<AdmissionResponse>>,
+    response: Obligation<runtime::OneShotSender<Result<(), ReserveError>>>,
 }
 
 impl AdmissionRequest {
     fn complete(&mut self, result: Result<(), ReserveError>) {
-        self.response.complete(|response| response.complete(result));
+        self.response.complete(|sender| {
+            let _ = sender.send(result);
+        });
     }
 }
 
@@ -3048,9 +2997,7 @@ async fn run_scope_incarnation(
                     slot: Arc::clone(&child.slot),
                     admitted: true,
                     fused_cancel: None,
-                    removal: Obligation::new(RemovalResponse::pending(), |response| {
-                        response.complete(RemoveOutcome::Removed);
-                    }),
+                    removal: Obligation::new(RemovalResponses::default(), complete_removals),
                     removal_started: false,
                 },
             );
@@ -3329,8 +3276,9 @@ mod tests {
     };
 
     use super::{
-        DynamicControl, DynamicEntry, MemberCell, MemberStage, Obligation, RemovalResponse,
-        ScopeCell, ScopeFlavor, mint_child_incarnation, report_channel, run_scope_incarnation,
+        DynamicControl, DynamicEntry, MemberCell, MemberStage, Obligation, RemovalResponses,
+        ScopeCell, ScopeFlavor, complete_removals, mint_child_incarnation, report_channel,
+        run_scope_incarnation,
     };
 
     #[test]
@@ -3630,7 +3578,7 @@ mod tests {
         });
         let waker = Waker::from(Arc::clone(&probe));
         let mut context = Context::from_waker(&waker);
-        let mut watcher = member.change_signal().watcher();
+        let mut watcher = member.changed.watcher();
         let mut changed = Box::pin(watcher.changed());
         assert!(changed.as_mut().poll(&mut context).is_pending());
 
@@ -3669,7 +3617,9 @@ mod tests {
         root.set_admitted_children(vec![Arc::clone(&slot)]);
         let (events, _receiver) = crate::runtime::bounded_mpsc(1);
         let control = DynamicControl::new(&root, events);
-        let response = RemovalResponse::pending();
+        let (sender, mut response) = crate::runtime::oneshot();
+        let mut responses = RemovalResponses::default();
+        responses.0.push(sender);
         control
             .state
             .lock()
@@ -3681,37 +3631,24 @@ mod tests {
                     slot,
                     admitted: true,
                     fused_cancel: None,
-                    removal: Obligation::new(Arc::clone(&response), |response| {
-                        response.complete(RemoveOutcome::Removed);
-                    }),
+                    removal: Obligation::new(responses, complete_removals),
                     removal_started: true,
                 },
             );
 
         let entries = control.close();
         assert!(
-            response
-                .result
-                .lock()
-                .expect("removal mutex poisoned")
-                .is_none(),
+            response.try_receive().is_none(),
             "closing admission must not complete removal before teardown"
         );
         member.terminalize(Exit::never_started());
         assert!(root.prune_child(&member));
         assert!(
-            response
-                .result
-                .lock()
-                .expect("removal mutex poisoned")
-                .is_none(),
+            response.try_receive().is_none(),
             "terminality and Removed precede removal completion"
         );
         drop(entries);
-        assert_eq!(
-            *response.result.lock().expect("removal mutex poisoned"),
-            Some(RemoveOutcome::Removed)
-        );
+        assert_eq!(response.try_receive(), Some(RemoveOutcome::Removed));
     }
 
     #[crate::runtime::test]

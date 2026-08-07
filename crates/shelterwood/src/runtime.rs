@@ -11,7 +11,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{Notify, mpsc},
+    sync::{Notify, mpsc, oneshot},
     task, time,
 };
 
@@ -83,6 +83,34 @@ impl Latch {
         }
         notified.await;
         debug_assert!(self.is_fired());
+    }
+}
+
+/// Sending half of a runtime-backed single-delivery channel.
+pub(crate) struct OneShotSender<T>(oneshot::Sender<T>);
+
+/// Receiving half of a runtime-backed single-delivery channel.
+pub(crate) struct OneShotReceiver<T>(oneshot::Receiver<T>);
+
+pub(crate) fn oneshot<T>() -> (OneShotSender<T>, OneShotReceiver<T>) {
+    let (sender, receiver) = oneshot::channel();
+    (OneShotSender(sender), OneShotReceiver(receiver))
+}
+
+impl<T> OneShotSender<T> {
+    pub(crate) fn send(self, value: T) -> Result<(), T> {
+        self.0.send(value)
+    }
+}
+
+impl<T> OneShotReceiver<T> {
+    pub(crate) async fn receive(self) -> Option<T> {
+        self.0.await.ok()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_receive(&mut self) -> Option<T> {
+        self.0.try_recv().ok()
     }
 }
 

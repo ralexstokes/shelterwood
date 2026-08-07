@@ -22,8 +22,8 @@ use crate::{
     mailbox::MailboxCell,
     policy::{CommonOptions, IdError, ResolvedCommonOptions, ResolvedDefaults, resolve_common},
     raw::{RawConstruction, RawDef, RawOnceDef},
-    runtime::Latch,
-    task::{Completion, OnceTask, OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
+    runtime::{self, Latch},
+    task::{OnceTask, OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
 
 /// Whether a scope has fixed ordered membership or runtime-dynamic membership.
@@ -819,8 +819,8 @@ impl TaskSlot {
         definition: TaskOnceDef<T>,
     ) -> (TaskRef, OneShotTaskRef<T>) {
         let task = self.task_ref();
-        let completion = Completion::new(self.slot.member.change_signal());
-        let claim = OneShotTaskRef::new(Arc::clone(&completion), task.clone());
+        let (completion, receiver) = runtime::oneshot();
+        let claim = OneShotTaskRef::new(receiver, task.clone());
         self.slot
             .define(ChildConstruction::TaskOnce(definition.erase(completion)));
         (task, claim)
@@ -928,7 +928,12 @@ impl<H: Unpin> Future for Admission<H> {
                 Arc::clone(&reservation.slot),
                 self.fused_cancel.clone(),
             );
-            self.inner = Some(Box::pin(async move { response.wait().await }));
+            self.inner = Some(Box::pin(async move {
+                response
+                    .receive()
+                    .await
+                    .expect("admission response obligation must complete")
+            }));
         }
         let poll = self
             .inner
@@ -1166,9 +1171,9 @@ impl DynamicTaskSlot {
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
         let task = self.task_ref();
-        let completion = Completion::new(self.reservation().slot.member.change_signal());
+        let (completion, receiver) = runtime::oneshot();
         let reservation = self.take_reservation();
-        let claim = OneShotTaskRef::new(Arc::clone(&completion), task.clone());
+        let claim = OneShotTaskRef::new(receiver, task.clone());
         reservation
             .slot
             .define(ChildConstruction::TaskOnce(definition.erase(completion)));
@@ -1180,9 +1185,9 @@ impl DynamicTaskSlot {
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
         let task = self.task_ref();
-        let completion = Completion::new(self.reservation().slot.member.change_signal());
+        let (completion, receiver) = runtime::oneshot();
         let reservation = self.take_reservation();
-        let claim = OneShotTaskRef::new(Arc::clone(&completion), task.clone());
+        let claim = OneShotTaskRef::new(receiver, task.clone());
         reservation
             .slot
             .define(ChildConstruction::TaskOnce(definition.erase(completion)));
@@ -1300,9 +1305,14 @@ impl fmt::Debug for Removal {
 }
 
 impl Removal {
-    fn new(response: Arc<crate::driver::RemovalResponse>) -> Self {
+    fn new(response: crate::driver::RemovalResponse) -> Self {
         Self {
-            inner: Box::pin(async move { response.wait().await }),
+            inner: Box::pin(async move {
+                response
+                    .receive()
+                    .await
+                    .expect("removal response obligation must complete")
+            }),
         }
     }
 }

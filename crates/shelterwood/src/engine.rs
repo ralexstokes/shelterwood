@@ -6,7 +6,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Exit, Intensity, RestartPolicy, Shutdown, policy::tidy_abort_beat};
+use crate::{
+    Exit, Intensity, RestartPolicy, Shutdown, deadline::Deadline, policy::tidy_abort_beat,
+};
 
 pub(crate) trait EffectSink<E> {
     fn emit(&mut self, effect: E);
@@ -79,7 +81,7 @@ impl StopLadder {
                 self.phase = StopPhase::Cooperative;
                 match self.policy {
                     Shutdown::Graceful { grace } => {
-                        self.deadline = Some(now.checked_add(grace).unwrap_or(now));
+                        self.deadline = Deadline::after(now, grace).instant();
                     }
                     Shutdown::Abort => {
                         self.deadline = Some(now);
@@ -96,7 +98,7 @@ impl StopLadder {
                     Shutdown::Abort => Duration::ZERO,
                 };
                 self.phase = StopPhase::Escalated;
-                self.deadline = Some(now.checked_add(tidy_abort_beat(grace)).unwrap_or(now));
+                self.deadline = Deadline::after(now, tidy_abort_beat(grace)).instant();
                 Some(StopAction::Escalate)
             }
             StopPhase::Escalated if self.deadline.is_some_and(|deadline| now >= deadline) => {
@@ -208,7 +210,7 @@ pub(crate) enum RestartEffect {
         attempt: u64,
         restart_count: u64,
         total_restarts: u64,
-        restart_at: Instant,
+        restart_at: Option<Instant>,
     },
     IntensityTripped {
         in_window: u64,
@@ -235,7 +237,7 @@ pub(crate) fn schedule_restart(
 ) -> RestartDecision {
     let (attempt, restart_count) = restarts.schedule();
     let delay = restart_policy.backoff().next_delay(attempt, jitter_sample);
-    let restart_at = now.checked_add(delay).unwrap_or(now);
+    let restart_at = Deadline::after(now, delay).instant();
     let charge = intensity.charge(intensity_policy, now);
     effects.emit(RestartEffect::Scheduled {
         attempt,
@@ -253,7 +255,7 @@ pub(crate) fn schedule_restart(
         attempt,
         restart_count,
         charge,
-        restart_at: (!charge.tripped).then_some(restart_at),
+        restart_at: (!charge.tripped).then_some(restart_at).flatten(),
     }
 }
 
@@ -429,6 +431,18 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_grace_never_becomes_immediately_due() {
+        let start = Instant::now();
+        let mut ladder = StopLadder::new(Shutdown::Graceful {
+            grace: Duration::MAX,
+        });
+
+        assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
+        assert_eq!(ladder.deadline(), None);
+        assert_eq!(ladder.advance(start), None);
+    }
+
+    #[test]
     fn funnel_dispatch_depends_on_mode_and_membership_state() {
         let failure = Exit::new(ExitKind::Failed(crate::ExitError::message("boom")), false);
         let restart = RestartPolicy::new(RestartCondition::OnFailure, Backoff::Immediate);
@@ -503,6 +517,38 @@ mod tests {
         assert_eq!(decision.restart_at, None);
         assert!(matches!(effects[0], RestartEffect::Scheduled { .. }));
         assert!(matches!(effects[1], RestartEffect::IntensityTripped { .. }));
+    }
+
+    #[test]
+    fn overflowing_restart_delay_has_no_immediate_spawn_deadline() {
+        let now = Instant::now();
+        let intensity_policy = Intensity::new(5, Duration::from_secs(10)).expect("valid intensity");
+        let restart_policy = RestartPolicy::new(
+            RestartCondition::OnFailure,
+            Backoff::fixed(Duration::MAX, crate::Jitter::None).expect("valid backoff"),
+        );
+        let mut restarts = RestartState::new();
+        let mut intensity = IntensityState::default();
+        let mut effects = Vec::new();
+
+        let decision = schedule_restart(
+            &mut restarts,
+            &mut intensity,
+            intensity_policy,
+            restart_policy,
+            now,
+            0.5,
+            &mut effects,
+        );
+
+        assert_eq!(decision.restart_at, None);
+        assert!(matches!(
+            effects[0],
+            RestartEffect::Scheduled {
+                restart_at: None,
+                ..
+            }
+        ));
     }
 
     #[test]

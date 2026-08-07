@@ -17,6 +17,7 @@ use std::{
 use crate::{
     ChildId, Exit, ExitKind, Incarnation, IntensityTrip, Membership, Readiness, ReadinessDeadline,
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    deadline::Deadline,
     engine::{
         ArbitrationClass, DeadlineQueue, ExitDispatch, IntensityState, MembershipMode,
         ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode, StopAction,
@@ -48,8 +49,17 @@ static OBSERVATION_GATE: Mutex<()> = Mutex::new(());
 
 pub(crate) type DriverSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-pub(crate) fn sleep(duration: Duration) -> DriverSleep {
-    Box::pin(runtime::sleep(duration))
+pub(crate) fn deadline(duration: Duration) -> Deadline {
+    Deadline::after(runtime::now(), duration)
+}
+
+pub(crate) fn sleep_deadline(deadline: Deadline) -> DriverSleep {
+    Box::pin(async move {
+        match deadline.instant() {
+            Some(deadline) => runtime::sleep_until_std(deadline).await,
+            None => std::future::pending().await,
+        }
+    })
 }
 
 pub(crate) fn sleep_until(deadline: Instant) -> DriverSleep {
@@ -2094,10 +2104,12 @@ impl ScopeRuntime {
         } else {
             let deadline = match child.options.readiness_deadline {
                 ReadinessDeadline::Bounded(duration) => {
-                    let deadline = now.checked_add(duration).unwrap_or(now);
-                    self.deadlines
-                        .push(deadline, DeadlineKind::Readiness { index, incarnation });
-                    Some(deadline)
+                    let deadline = Deadline::after(now, duration).instant();
+                    if let Some(deadline) = deadline {
+                        self.deadlines
+                            .push(deadline, DeadlineKind::Readiness { index, incarnation });
+                    }
+                    deadline
                 }
                 ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
             };
@@ -2356,10 +2368,9 @@ impl ScopeRuntime {
                             active.forced_outcome = Some(RecordedOutcome::Aborted { after_grace });
                         }
                         abort.fire();
-                        active.framework_abort_deadline = Some(
-                            now.checked_add(crate::policy::tidy_abort_beat(Duration::ZERO))
-                                .unwrap_or(now),
-                        );
+                        active.framework_abort_deadline =
+                            Deadline::after(now, crate::policy::tidy_abort_beat(Duration::ZERO))
+                                .instant();
                     } else {
                         active.abort_handle.abort();
                     }
@@ -2482,12 +2493,9 @@ impl ScopeRuntime {
                 became_ready = true;
             } else {
                 let deadline = match child.options.readiness_deadline {
-                    ReadinessDeadline::Bounded(duration) => Some(
-                        active
-                            .started_at
-                            .checked_add(duration)
-                            .unwrap_or(active.started_at),
-                    ),
+                    ReadinessDeadline::Bounded(duration) => {
+                        Deadline::after(active.started_at, duration).instant()
+                    }
                     ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
                 };
                 active.readiness = ReadinessGate::Waiting { deadline };
@@ -2635,16 +2643,13 @@ impl ScopeRuntime {
                     .restart
                     .backoff()
                     .next_delay(decision.attempt, sample);
-                let restart_at = decision
-                    .restart_at
-                    .unwrap_or_else(|| now.checked_add(delay).unwrap_or(now));
                 self.root.schedule_child_restart(
                     &child.slot.member,
                     |record| {
                         record.incarnation = None;
                         record.last_exit = Some(exit.clone());
                         record.restart_count = decision.restart_count;
-                        record.restart_at = Some(restart_at);
+                        record.restart_at = decision.restart_at;
                         record.stage = MemberStage::Restarting;
                     },
                     LifecycleEventKind::Exited {
@@ -2672,8 +2677,10 @@ impl ScopeRuntime {
                     }
                     self.begin_drain(StopReason::IntensityTripped(trip));
                 } else {
-                    self.deadlines
-                        .push(restart_at, DeadlineKind::Restart { index });
+                    if let Some(restart_at) = decision.restart_at {
+                        self.deadlines
+                            .push(restart_at, DeadlineKind::Restart { index });
+                    }
                 }
             }
         }

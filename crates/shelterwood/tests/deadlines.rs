@@ -9,8 +9,9 @@ use std::{
 
 use crate::common::{ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
-    CallErrorKind, ExitResult, Mailbox, RawActor, RawContext, RawOnceDef, Reply, ReplyError,
-    SendErrorKind, Tree,
+    Backoff, CallErrorKind, ChildState, ExitError, ExitResult, Jitter, Mailbox, RawActor,
+    RawContext, RawOnceDef, Readiness, ReadinessDeadline, Reply, ReplyError, RestartCondition,
+    RestartPolicy, SendErrorKind, Shutdown, TaskDef, Tree,
 };
 
 #[derive(Debug)]
@@ -25,6 +26,14 @@ struct BoundaryActor {
     calls: Arc<AtomicUsize>,
     hold_reply: bool,
     held: Option<Reply<usize>>,
+}
+
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 impl RawActor for BoundaryActor {
@@ -270,6 +279,235 @@ async fn call_uses_one_budget_across_acceptance_and_response() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn message_construction_consumes_the_call_budget() {
+    let gate = ReleaseGate::default();
+    let values = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "constructor-budget",
+            RawOnceDef::new(boundary_actor(Some(gate.clone()), &values, &calls, false))
+                .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor
+        .try_send(Message::Value(1))
+        .expect("the only mailbox slot is occupied");
+
+    // Keep runnable work in the executor so paused time cannot auto-advance
+    // to a timer incorrectly started after construction.
+    let keep_clock_fixed = Arc::new(AtomicBool::new(true));
+    let busy = tokio::spawn({
+        let keep_clock_fixed = Arc::clone(&keep_clock_fixed);
+        async move {
+            while keep_clock_fixed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+    let budget = Duration::from_secs(10);
+    let mut call = Box::pin(actor.call(
+        move |reply| {
+            // Advance the paused clock synchronously while the user
+            // constructor is running. Its first poll advances before the
+            // yield point, so this does not depend on scheduler timing.
+            let mut advance = Box::pin(tokio::time::advance(budget + Duration::from_nanos(1)));
+            assert!(poll_once(advance.as_mut()).is_pending());
+            Message::Ask(reply)
+        },
+        budget,
+    ));
+
+    assert!(poll_once(call.as_mut()).is_pending());
+    let mut result = None;
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+        if let Poll::Ready(value) = poll_once(call.as_mut()) {
+            result = Some(value);
+            break;
+        }
+    }
+    keep_clock_fixed.store(false, Ordering::SeqCst);
+    busy.await.expect("busy task joins");
+    let error = result
+        .expect("the captured budget expires without advancing time again")
+        .expect_err("the blocked call times out");
+    assert_eq!(error.kind, CallErrorKind::AcceptanceTimedOut);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    gate.release();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("actor stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn overflowing_readiness_deadline_remains_pending() {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "manual",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::bounded(Duration::MAX).expect("non-zero deadline")),
+    )
+    .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    let mut startup = Box::pin(system.wait_started());
+    assert!(poll_once(startup.as_mut()).is_pending());
+    assert!(matches!(
+        system
+            .scope()
+            .child("manual")
+            .expect("manual task is resident")
+            .state,
+        ChildState::Starting
+    ));
+    drop(startup);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("cooperative task stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn overflowing_shutdown_grace_does_not_escalate() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_task(
+        "stubborn",
+        TaskDef::new({
+            let dropped = Arc::clone(&dropped);
+            move |context| {
+                let dropped = Arc::clone(&dropped);
+                async move {
+                    let _drop = DropFlag(dropped);
+                    context.shutdown_token().cancelled().await;
+                    std::future::pending::<ExitResult>().await
+                }
+            }
+        })
+        .shutdown(Shutdown::Graceful {
+            grace: Duration::MAX,
+        }),
+    )
+    .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("task starts");
+
+    system.scope().request_shutdown();
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !dropped.load(Ordering::SeqCst),
+        "an overflowing grace must not trigger immediate escalation"
+    );
+
+    let shutdown = system.shutdown(Duration::ZERO).await;
+    assert!(shutdown.is_err(), "forced cleanup reports the straggler");
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn overflowing_restart_delay_never_restarts_immediately() {
+    let release_failure = ReleaseGate::default();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    tree.add_task(
+        "restart",
+        TaskDef::new({
+            let release_failure = release_failure.clone();
+            let starts = Arc::clone(&starts);
+            move |_| {
+                let release_failure = release_failure.clone();
+                let attempt = starts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        release_failure.wait().await;
+                        Err(ExitError::message("restart me"))
+                    } else {
+                        std::future::pending().await
+                    }
+                }
+            }
+        })
+        .restart(RestartPolicy::new(
+            RestartCondition::OnFailure,
+            Backoff::fixed(Duration::MAX, Jitter::None).expect("non-zero backoff"),
+        )),
+    )
+    .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("first incarnation starts");
+    release_failure.release();
+
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            system.scope().child("restart").is_some_and(|child| {
+                matches!(child.state, ChildState::Restarting) && child.restart_at.is_none()
+            })
+        })
+        .await
+    );
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("restart window shuts down");
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_duration_wait_observes_an_already_satisfied_child() {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "ready",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        }),
+    )
+    .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("task starts");
+
+    let child = system
+        .scope()
+        .wait_for_child(
+            "ready",
+            |child| matches!(child.state, ChildState::Running),
+            Duration::ZERO,
+        )
+        .await
+        .expect("the current snapshot satisfies the predicate");
+    assert_eq!(child.id.as_str(), "ready");
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("task stops");
 }
 
 #[tokio::test]

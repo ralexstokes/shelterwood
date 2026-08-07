@@ -1211,6 +1211,7 @@ impl ScopeCell {
 
 pub(crate) struct SystemRun {
     pub(crate) root: Arc<ScopeCell>,
+    driver: Option<runtime::JoinHandle<(), StopReason>>,
 }
 
 pub(crate) struct AdmissionResponse {
@@ -1427,9 +1428,7 @@ pub(crate) fn start_admission(
         }),
     };
     runtime::spawn((), async move {
-        let _ = runtime::mpsc_send(&control.events, DriverEvent::Admission(request))
-            .await
-            .is_err();
+        let _ = runtime::mpsc_send(&control.events, DriverEvent::Admission(request)).await;
     });
     response
 }
@@ -1530,8 +1529,38 @@ impl SystemRun {
         self.root.request_shutdown();
     }
 
-    pub(crate) async fn shutdown(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
-        shutdown_scope(Arc::clone(&self.root), timeout).await
+    pub(crate) async fn shutdown(&mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
+        let result = shutdown_scope(Arc::clone(&self.root), timeout).await;
+        self.join_driver().await;
+        result
+    }
+
+    pub(crate) async fn wait(&mut self) -> StopReason {
+        let reason = self.root.wait_stopped().await;
+        self.join_driver().await;
+        reason
+    }
+
+    async fn join_driver(&mut self) {
+        let Some(driver) = self.driver.take() else {
+            return;
+        };
+        match runtime::join(driver).await {
+            runtime::JoinOutcome::Ok { .. } => {}
+            runtime::JoinOutcome::Panic { message, .. } => {
+                let exit = Exit::new(ExitKind::Panicked { message }, false);
+                self.root.set_startup(Err(StartupError::ShutdownRequested));
+                self.root
+                    .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
+            }
+            runtime::JoinOutcome::Cancelled { .. } => {
+                self.root.set_startup(Err(StartupError::ShutdownRequested));
+                self.root.finish_live_root_incarnation(
+                    StopReason::ShutdownRequested,
+                    Exit::new(ExitKind::Aborted { after_grace: false }, true),
+                );
+            }
+        }
     }
 }
 
@@ -1614,14 +1643,15 @@ pub(crate) async fn shutdown_scope(
 pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
     let root = Arc::clone(&plan.root);
     let monitor_root = Arc::clone(&root);
-    let handle = runtime::spawn((), async move { run_scope(plan, true, None).await });
-    runtime::spawn((), async move {
-        match runtime::join(handle).await {
-            runtime::JoinOutcome::Ok { .. } => {}
+    let driver = runtime::spawn((), async move { run_scope(plan, true, None).await });
+    let lifecycle = runtime::spawn((), async move {
+        match runtime::join(driver).await {
+            runtime::JoinOutcome::Ok { value, .. } => value,
             runtime::JoinOutcome::Panic { message, .. } => {
                 let exit = Exit::new(ExitKind::Panicked { message }, false);
                 monitor_root.set_startup(Err(StartupError::ShutdownRequested));
                 monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
+                StopReason::ShutdownRequested
             }
             runtime::JoinOutcome::Cancelled { .. } => {
                 monitor_root.set_startup(Err(StartupError::ShutdownRequested));
@@ -1629,10 +1659,14 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
                     StopReason::ShutdownRequested,
                     Exit::new(ExitKind::Aborted { after_grace: false }, true),
                 );
+                StopReason::ShutdownRequested
             }
         }
     });
-    SystemRun { root }
+    SystemRun {
+        root,
+        driver: Some(lifecycle),
+    }
 }
 
 enum ChildEvent {
@@ -1684,6 +1718,8 @@ struct ActiveChild {
     readiness: ReadinessGate,
     ready_signal: Latch,
     construction_release: Latch,
+    framework_abort: Option<Latch>,
+    framework_abort_deadline: Option<Instant>,
 }
 
 struct ChildTerminality {
@@ -1802,6 +1838,14 @@ struct ScopeRuntime {
     epoch: u64,
     ancestor_shutdown: Option<Latch>,
     ancestor_shutdown_seen: bool,
+    ancestor_abort: Option<Latch>,
+    ancestor_abort_seen: bool,
+    completion: Option<ScopeCompletion>,
+}
+
+struct ScopeCompletion {
+    reason: StopReason,
+    root_exit: Option<Exit>,
 }
 
 impl Drop for ScopeRuntime {
@@ -1828,13 +1872,19 @@ impl Drop for ScopeRuntime {
         // Residency owns the matching Removed edges. Clearing the set after
         // terminality discharges them all before the scope's final event.
         self.root.clear_residents();
+        self.children.clear();
         if !matches!(self.root.record().state, ScopeState::Stopped { .. }) {
-            self.root.finish_incarnation(
-                self.epoch,
-                self.draining
-                    .clone()
-                    .unwrap_or(StopReason::ShutdownRequested),
-            );
+            let completion = self.completion.take();
+            let reason = completion
+                .as_ref()
+                .map(|completion| completion.reason.clone())
+                .or_else(|| self.draining.clone())
+                .unwrap_or(StopReason::ShutdownRequested);
+            if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
+                self.root.finish_root_incarnation(self.epoch, reason, exit);
+            } else {
+                self.root.finish_incarnation(self.epoch, reason);
+            }
         }
     }
 }
@@ -2059,6 +2109,8 @@ impl ScopeRuntime {
         let (report, report_receiver) = report_channel(shutdown.clone(), Some(local_stop.clone()));
         let nested_ready = ready.clone();
         let nested_cancel = shutdown.clone();
+        let framework_abort = Latch::default();
+        let nested_abort = framework_abort.clone();
         let constructed_sender = self.events.clone();
         let run_release = construction_release.clone();
         let handle = runtime::spawn(incarnation, async move {
@@ -2096,13 +2148,31 @@ impl ScopeRuntime {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner))(
                     );
-                    run_nested_tree(tree, scope, inherited, nested_ready, nested_cancel).await
+                    run_nested_tree(
+                        tree,
+                        scope,
+                        inherited,
+                        nested_ready,
+                        nested_cancel,
+                        nested_abort,
+                    )
+                    .await
                 }
                 SpawnBody::ScopeOnce {
                     tree,
                     scope,
                     inherited,
-                } => run_nested_tree(*tree, scope, inherited, nested_ready, nested_cancel).await,
+                } => {
+                    run_nested_tree(
+                        *tree,
+                        scope,
+                        inherited,
+                        nested_ready,
+                        nested_cancel,
+                        nested_abort,
+                    )
+                    .await
+                }
             };
             report.record(RecordedOutcome::Returned(result));
         });
@@ -2175,6 +2245,8 @@ impl ScopeRuntime {
             readiness,
             ready_signal: readiness_signal,
             construction_release,
+            framework_abort: scope_child.then_some(framework_abort),
+            framework_abort_deadline: None,
         });
     }
 
@@ -2285,11 +2357,30 @@ impl ScopeRuntime {
                 }
                 StopAction::HardAbort { after_grace } => {
                     active.hard_abort_after_grace = Some(after_grace);
-                    active.abort_handle.abort();
+                    if let Some(abort) = &active.framework_abort {
+                        if active.forced_outcome.is_none() {
+                            active.forced_outcome = Some(RecordedOutcome::Aborted { after_grace });
+                        }
+                        abort.fire();
+                        active.framework_abort_deadline = Some(
+                            now.checked_add(crate::policy::tidy_abort_beat(Duration::ZERO))
+                                .unwrap_or(now),
+                        );
+                    } else {
+                        active.abort_handle.abort();
+                    }
                 }
             }
         }
-        if let Some(deadline) = ladder.deadline() {
+        let ladder_deadline = ladder.deadline();
+        if active
+            .framework_abort_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            active.framework_abort_deadline = None;
+            active.abort_handle.abort();
+        }
+        if let Some(deadline) = ladder_deadline.or(active.framework_abort_deadline) {
             self.deadlines.push(
                 deadline,
                 DeadlineKind::Stop {
@@ -2857,14 +2948,6 @@ impl ScopeRuntime {
         }
         self.root.prune_child(&child.slot.member);
     }
-
-    fn prune_terminal_members(&mut self) {
-        for index in 0..self.children.len() {
-            if self.children[index].is_terminal() {
-                self.prune_terminal(index);
-            }
-        }
-    }
 }
 
 fn mint_child_incarnation(
@@ -2888,6 +2971,7 @@ async fn run_nested_tree(
     inherited: ResolvedDefaults,
     ready: Latch,
     cancel: Latch,
+    abort: Latch,
 ) -> crate::ExitResult {
     let epoch = scope.begin_incarnation();
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
@@ -2901,7 +2985,7 @@ async fn run_nested_tree(
             return Err(crate::ExitError::from_startup_failure(failure));
         }
     };
-    match run_scope_incarnation(plan, false, Some(ready), Some(cancel), epoch).await {
+    match run_scope_incarnation(plan, false, Some(ready), Some(cancel), Some(abort), epoch).await {
         StopReason::Finished | StopReason::ShutdownRequested => Ok(()),
         StopReason::IntensityTripped(trip) => Err(crate::ExitError::from_intensity_trip(trip)),
         StopReason::StartupFailed(failure) => Err(crate::ExitError::from_startup_failure(failure)),
@@ -2912,7 +2996,7 @@ async fn run_nested_tree(
 async fn run_scope(plan: ScopePlan, is_root: bool, parent_ready: Option<Latch>) -> StopReason {
     let root = Arc::clone(&plan.root);
     let epoch = root.begin_incarnation();
-    run_scope_incarnation(plan, is_root, parent_ready, None, epoch).await
+    run_scope_incarnation(plan, is_root, parent_ready, None, None, epoch).await
 }
 
 async fn run_scope_incarnation(
@@ -2920,6 +3004,7 @@ async fn run_scope_incarnation(
     is_root: bool,
     parent_ready: Option<Latch>,
     incarnation_cancel: Option<Latch>,
+    incarnation_abort: Option<Latch>,
     epoch: u64,
 ) -> StopReason {
     let root = Arc::clone(&plan.root);
@@ -2982,6 +3067,9 @@ async fn run_scope_incarnation(
         epoch,
         ancestor_shutdown: incarnation_cancel,
         ancestor_shutdown_seen: false,
+        ancestor_abort: incarnation_abort,
+        ancestor_abort_seen: false,
+        completion: None,
     };
 
     match scope.flavor {
@@ -3008,6 +3096,11 @@ async fn run_scope_incarnation(
         {
             scope.ancestor_shutdown_seen = true;
             pending.push((ArbitrationClass::ScopeShutdown, Pending::AncestorShutdown));
+        }
+        if !scope.ancestor_abort_seen && scope.ancestor_abort.as_ref().is_some_and(Latch::is_fired)
+        {
+            scope.ancestor_abort_seen = true;
+            pending.push((ArbitrationClass::ScopeShutdown, Pending::AncestorAbort));
         }
         if root.take_force_request(epoch) {
             pending.push((ArbitrationClass::StopDeadline, Pending::Force));
@@ -3041,18 +3134,32 @@ async fn run_scope_incarnation(
         }
 
         if pending.is_empty() {
-            let ancestor_shutdown = async {
-                if !scope.ancestor_shutdown_seen
-                    && let Some(shutdown) = &scope.ancestor_shutdown
-                {
-                    shutdown.fired().await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
+            let ancestor_shutdown = (!scope.ancestor_shutdown_seen)
+                .then(|| scope.ancestor_shutdown.clone())
+                .flatten();
+            let ancestor_abort = (!scope.ancestor_abort_seen)
+                .then(|| scope.ancestor_abort.clone())
+                .flatten();
+            let ancestor_command = async move {
+                let shutdown = async move {
+                    if let Some(shutdown) = ancestor_shutdown {
+                        shutdown.fired().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                let abort = async move {
+                    if let Some(abort) = ancestor_abort {
+                        abort.fired().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                let _ = runtime::select_two(shutdown, abort).await;
             };
             match runtime::wait_scope(
                 signal.changed(),
-                ancestor_shutdown,
+                ancestor_command,
                 &mut event_receiver,
                 scope.deadlines.next(),
             )
@@ -3082,6 +3189,7 @@ async fn run_scope_incarnation(
         }
 
         arbitrate(&mut pending);
+        let mut abort_driver = false;
         for (_, event) in pending {
             match event {
                 Pending::Shutdown => {
@@ -3093,6 +3201,11 @@ async fn run_scope_incarnation(
                 }
                 Pending::AncestorShutdown => {
                     scope.begin_drain(StopReason::ShutdownRequested);
+                }
+                Pending::AncestorAbort => {
+                    scope.begin_drain(StopReason::ShutdownRequested);
+                    abort_driver = true;
+                    break;
                 }
                 Pending::Force => {
                     scope.force_all();
@@ -3124,31 +3237,36 @@ async fn run_scope_incarnation(
             }
         }
 
+        if abort_driver {
+            // Abort commands kill user futures through ScopeRuntime's
+            // synchronous drop epilogue. The nested driver itself returns
+            // normally; its task abort is only the parent's deadline
+            // backstop if this loop cannot be scheduled.
+            return StopReason::ShutdownRequested;
+        }
+
         if let Some(reason) = scope.finish_if_ready() {
-            // Terminality is decided before retention-based pruning. Scope
-            // termination then prunes every remaining tombstone and publishes
-            // those Removed edges before the final ScopeState event.
-            scope.prune_terminal_members();
-            if is_root {
-                let exit = match &reason {
-                    StopReason::Finished | StopReason::ShutdownRequested => {
-                        Exit::new(ExitKind::Completed, reason == StopReason::ShutdownRequested)
-                    }
-                    StopReason::IntensityTripped(trip) => Exit::new(
-                        ExitKind::Failed(crate::ExitError::from_intensity_trip(trip.clone())),
-                        false,
-                    ),
-                    StopReason::StartupFailed(failure) => Exit::new(
-                        ExitKind::Failed(crate::ExitError::from_startup_failure(failure.clone())),
-                        false,
-                    ),
-                    StopReason::NeverStarted => Exit::never_started(),
-                };
-                root.finish_root_incarnation(epoch, reason.clone(), exit);
-            } else {
-                root.finish_incarnation(epoch, reason.clone());
-            }
-            scope.children.clear();
+            let root_exit = is_root.then(|| match &reason {
+                StopReason::Finished | StopReason::ShutdownRequested => {
+                    Exit::new(ExitKind::Completed, reason == StopReason::ShutdownRequested)
+                }
+                StopReason::IntensityTripped(trip) => Exit::new(
+                    ExitKind::Failed(crate::ExitError::from_intensity_trip(trip.clone())),
+                    false,
+                ),
+                StopReason::StartupFailed(failure) => Exit::new(
+                    ExitKind::Failed(crate::ExitError::from_startup_failure(failure.clone())),
+                    false,
+                ),
+                StopReason::NeverStarted => Exit::never_started(),
+            });
+            // ScopeRuntime's synchronous epilogue clears dynamic state,
+            // discharges child obligations and residency, and only then
+            // publishes the scope's terminal state.
+            scope.completion = Some(ScopeCompletion {
+                reason: reason.clone(),
+                root_exit,
+            });
             return reason;
         }
     }
@@ -3157,6 +3275,7 @@ async fn run_scope_incarnation(
 enum Pending {
     Shutdown,
     AncestorShutdown,
+    AncestorAbort,
     Force,
     Removal(Membership),
     Driver(DriverEvent),
@@ -3165,8 +3284,11 @@ enum Pending {
 
 #[cfg(test)]
 mod tests {
+    use std::{sync::Arc, time::Duration};
+
     use crate::{
-        ChildId, Exit, ExitError, ExitKind, LifecycleEventKind, LifecycleItem, ScopeState,
+        ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind, LifecycleItem,
+        ScopeState,
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
     };
@@ -3220,6 +3342,30 @@ mod tests {
         local_stop.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
         assert!(receiver.receive().cancelled);
+    }
+
+    #[crate::runtime::test]
+    async fn system_shutdown_joins_root_driver_teardown() {
+        let system = DynamicTree::new().spawn().expect("runtime is available");
+        let root = system.scope();
+        system.wait_started().await.expect("dynamic root starts");
+        let control = root
+            .as_scope()
+            .cell
+            .dynamic()
+            .expect("running dynamic root has a control");
+        let weak = Arc::downgrade(&control);
+        drop(control);
+
+        system
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("empty dynamic root shuts down");
+
+        assert!(
+            weak.upgrade().is_none(),
+            "shutdown returns only after root driver teardown drops dynamic state"
+        );
     }
 
     #[test]

@@ -7,6 +7,9 @@ use tokio::{
     task, time,
 };
 
+#[cfg(test)]
+pub(crate) use tokio::test;
+
 /// A runtime-owned monotonic instant.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Instant(time::Instant);

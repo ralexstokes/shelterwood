@@ -2031,7 +2031,7 @@ impl<R: Clone> System<R> {
     /// Waits for natural or externally requested terminal state.
     pub async fn wait(mut self) -> StopReason {
         self.armed = false;
-        self.run.root.wait_stopped().await
+        self.run.wait().await
     }
 }
 

@@ -996,6 +996,10 @@ handlers non-blocking. Contracts:
   'static` with `T: Send + 'static`; the continuation is
   `FnOnce(Result<T, DeadlineElapsed>) -> Msg + Send + 'static` and runs
   on the actor task.
+  `Guard::is_finished` / `finished()` report either ordinary work
+  completion or an incarnation-teardown cancellation request. They are not
+  a join guarantee: a hard-aborted task can still be unwinding after the
+  notification.
 - Any higher-level helper that composes `call` inside `offload` MUST
   preserve: incarnation ownership; completion through the actor loop; a
   total timeout continuation; and no await inside the handler.
@@ -1012,9 +1016,15 @@ handlers non-blocking. Contracts:
   where the future is awaited — on the actor task, the ordinary
   actor-panic path (§7) — while a future dropped before completion
   discards a later panic along with the detached thread (documented).
-- Offloads, lifetime tasks, and monitor leases are destroyed before actor
-  state on incarnation teardown, and the mailbox binding outlives actor
-  destruction.
+- On orderly return, error, or caught-panic teardown, offloads, lifetime
+  tasks, and monitor leases are frozen, cancelled, and joined before actor
+  state is dropped. Hard abort necessarily drops the handler future (and
+  therefore handler-owned actor state) before `RawResources::drop` can
+  synchronously cancel the remaining async resources; it cannot join from
+  `Drop`. `run_blocking` is outside the resource ledger by design and its
+  thread detaches after a cancellation request; `StopContext::run_blocking`
+  may therefore start work after the async-resource freeze. The mailbox
+  binding outlives actor destruction on every path.
 
 ## 6. Readiness [#363]
 
@@ -3012,6 +3022,10 @@ events it replaces may have come from many scopes, so it can truthfully
 carry no `scope_path` and no `seq` — only the per-subscriber dropped
 count. One leading, coalesced marker per overflow episode (§12); the
 aligned snapshot is the resync.
+The retained events delivered after that leading marker may be older than
+the resync snapshot. This is intentional: the post-`Lagged` watermark
+protocol below discards those already-reflected events and applies only the
+newer suffix.
 
 Ordering and delivery contract:
 
@@ -3236,6 +3250,9 @@ Scheduled/owned work (scoped offloads; with Part II: cross-actor timers,
 scoped watches) returns a `Guard`: consuming `cancel(self)` and
 `detach(self)`; by-reference probes `is_cancelled()`, `is_finished()`,
 and the awaitable `finished()`; **drop = cancel**.
+For core offloads, "finished" is a completion-or-cancellation notification,
+not a hard-abort join: incarnation teardown may fire it when cancellation is
+requested while the task is still unwinding (§5.5).
 `detach(self)` releases only the guard's cancel-on-drop; the underlying
 facility's ownership rule is unchanged (offloads stay incarnation-owned,
 §5.5; cross-actor timers stay sender-incarnation-owned, §23).

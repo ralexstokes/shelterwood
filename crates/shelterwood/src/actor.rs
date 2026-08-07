@@ -417,7 +417,7 @@ impl<A: Actor> RawActor for Handler<A> {
     }
 }
 
-/// Propagates a handler error after §5.5's teardown order: incarnation-owned
+/// Propagates a handler error after §5.5's orderly teardown order: incarnation-owned
 /// work is frozen, cancelled, and joined before actor state — which the
 /// caller still owns — is dropped at its frame's exit.
 async fn fail_after_teardown<M: Send + 'static>(
@@ -429,7 +429,7 @@ async fn fail_after_teardown<M: Send + 'static>(
     Err(error)
 }
 
-/// Resumes a caught callback panic after §5.5's teardown order: offloads and
+/// Resumes a caught callback panic after §5.5's orderly teardown order: offloads and
 /// other incarnation-owned work are destroyed (frozen, cancelled, joined)
 /// before actor state, and the destructor runs outside the callback's unwind
 /// per §7's containment boundary.

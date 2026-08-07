@@ -311,6 +311,7 @@ impl BuilderCore {
             config: self.config.clone(),
             defaults,
             children,
+            armed: true,
         })
     }
 
@@ -339,6 +340,26 @@ pub(crate) struct ScopePlan {
     pub(crate) config: ScopeConfig,
     pub(crate) defaults: ResolvedDefaults,
     pub(crate) children: Vec<ChildPlan>,
+    pub(crate) armed: bool,
+}
+
+impl Drop for ScopePlan {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for child in &self.children {
+            child.slot.member.terminalize(Exit::never_started());
+            if let Some(scope) = &child.slot.scope {
+                scope.terminalize_never_started();
+            }
+        }
+        // Lowering can publish the planned children before ScopeRuntime takes
+        // ownership. If construction then unwinds, the plan fallback also
+        // owns those residencies and their matching Removed edges.
+        self.root.clear_residents();
+        self.root.terminalize_never_started();
+    }
 }
 
 pub(crate) struct ChildPlan {
@@ -688,6 +709,13 @@ fn spawn_builder<R>(
         run,
         armed: true,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn lower_tree_for_test(tree: Tree) -> ScopePlan {
+    tree.core
+        .lower(ResolvedDefaults::default(), None)
+        .expect("test tree must be fully defined")
 }
 
 /// An owned pre-spawn actor slot with a stable mailbox binding.
@@ -2008,8 +2036,8 @@ impl<R: Clone> System<R> {
         match self.wait_started().await {
             Ok(()) => Ok(self),
             Err(startup) => {
-                self.armed = false;
                 let rollback_timeout = self.run.shutdown(timeout).await.err();
+                self.armed = false;
                 Err(StartOrShutdownError {
                     startup,
                     rollback_timeout,
@@ -2024,14 +2052,16 @@ impl<R: Clone> System<R> {
     /// wall-clock return: after escalation every actor future is still joined.
     /// Blocking threads created by `run_blocking` detach past hard abort.
     pub async fn shutdown(mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
+        let result = self.run.shutdown(timeout).await;
         self.armed = false;
-        self.run.shutdown(timeout).await
+        result
     }
 
     /// Waits for natural or externally requested terminal state.
     pub async fn wait(mut self) -> StopReason {
+        let reason = self.run.wait().await;
         self.armed = false;
-        self.run.wait().await
+        reason
     }
 }
 

@@ -78,13 +78,18 @@ impl Guard {
         self.cancellation.is_fired()
     }
 
-    /// Reports whether the guarded work has stopped running.
+    /// Reports whether the work completed or incarnation teardown requested cancellation.
+    ///
+    /// A teardown notification is not a join: under hard abort the task may
+    /// still be unwinding when this becomes true.
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.finished.is_fired()
     }
 
-    /// Waits until the guarded work has stopped running.
+    /// Waits for work completion or an incarnation-teardown cancellation request.
+    ///
+    /// This notification does not join work that is being hard-aborted.
     pub async fn finished(&self) {
         self.finished.fired().await;
     }
@@ -200,10 +205,27 @@ enum QueuedEvent<M> {
         cancellation: Latch,
         make_message: DeferredMessage<M>,
     },
-    Panic {
-        cancellation: Latch,
-        payload: PanicPayload,
-    },
+}
+
+#[derive(Default)]
+struct PanicSlot {
+    payload: Mutex<Option<PanicPayload>>,
+}
+
+impl PanicSlot {
+    fn record(&self, payload: PanicPayload) {
+        let mut pending = self.payload.lock().expect("offload panic mutex poisoned");
+        if pending.is_none() {
+            *pending = Some(payload);
+        }
+    }
+
+    fn take(&self) -> Option<PanicPayload> {
+        self.payload
+            .lock()
+            .expect("offload panic mutex poisoned")
+            .take()
+    }
 }
 
 struct SequencedEvent<M> {
@@ -360,6 +382,7 @@ struct RawResources<M> {
     next_timer_order: u64,
     fired_batch: Option<FiredTimerBatch>,
     events: Arc<EventQueue<M>>,
+    panic: Arc<PanicSlot>,
     event_watcher: SignalWatcher,
     offloads: Vec<OffloadResource>,
 }
@@ -376,6 +399,7 @@ impl<M> Default for RawResources<M> {
             next_timer_order: 0,
             fired_batch: None,
             events,
+            panic: Arc::new(PanicSlot::default()),
             event_watcher,
             offloads: Vec::new(),
         }
@@ -392,11 +416,17 @@ impl<M> RawResources<M> {
         self.continuations.clear();
         self.timers.clear();
         self.fired_batch = None;
-        self.events.clear();
         for offload in &mut self.offloads {
             offload.cancel();
         }
+        self.events.clear();
         dropped_continuations
+    }
+
+    fn resume_pending_panic(&self) {
+        if let Some(payload) = self.panic.take() {
+            resume_unwind(payload);
+        }
     }
 
     async fn join_offloads(&mut self) {
@@ -407,12 +437,16 @@ impl<M> RawResources<M> {
         }
         self.events.clear();
         self.offloads.clear();
+        self.resume_pending_panic();
     }
 }
 
 impl<M> Drop for RawResources<M> {
     fn drop(&mut self) {
         let _ = self.freeze();
+        if !std::thread::panicking() {
+            self.resume_pending_panic();
+        }
     }
 }
 
@@ -784,6 +818,7 @@ impl<M: Send + 'static> RawContext<M> {
             armed: true,
         });
         let events = Arc::clone(&self.resources.events);
+        let panic = Arc::clone(&self.resources.panic);
         if deadline.is_zero() {
             drop(work);
             events.push(QueuedEvent::Deliver {
@@ -827,10 +862,8 @@ impl<M: Send + 'static> RawContext<M> {
                     });
                 }
                 crate::driver::Selected::Second(Err(payload)) => {
-                    events.push(QueuedEvent::Panic {
-                        cancellation: event_cancellation,
-                        payload,
-                    });
+                    panic.record(payload);
+                    events.signal.pulse();
                 }
             }
             event_finished.fire();
@@ -848,6 +881,7 @@ impl<M: Send + 'static> RawContext<M> {
 
     fn next_ready(&mut self, allow_frozen_mailbox: bool) -> Option<M> {
         loop {
+            self.resources.resume_pending_panic();
             self.begin_fired_batch();
             if let Some(mut batch) = self.resources.fired_batch.take() {
                 if !self.resources.continuation_needs_external
@@ -946,16 +980,6 @@ impl<M: Send + 'static> RawContext<M> {
                 cancellation,
                 make_message,
             } => (!cancellation.is_fired()).then(make_message),
-            QueuedEvent::Panic {
-                cancellation,
-                payload,
-            } => {
-                if cancellation.is_fired() {
-                    None
-                } else {
-                    resume_unwind(payload)
-                }
-            }
         }
     }
 
@@ -1059,6 +1083,7 @@ impl<M: Send + 'static> RawContext<M> {
                 "queued continuations discarded at the stop freeze"
             );
         }
+        self.resources.resume_pending_panic();
     }
 
     pub(crate) async fn join_resources(&mut self) {
@@ -1252,6 +1277,60 @@ struct RawInstance<R: RawActor> {
     mailbox: Arc<MailboxCell<R::Msg>>,
 }
 
+struct RawIncarnationOwner<R: RawActor> {
+    raw: Option<RawContext<R::Msg>>,
+    actor: Option<R>,
+}
+
+impl<R: RawActor> RawIncarnationOwner<R> {
+    fn new(raw: RawContext<R::Msg>, actor: R) -> Self {
+        Self {
+            raw: Some(raw),
+            actor: Some(actor),
+        }
+    }
+
+    fn parts(&mut self) -> (&mut R, &mut RawContext<R::Msg>) {
+        let actor = self.actor.as_mut().expect("raw actor owner is armed");
+        let raw = self.raw.as_mut().expect("raw context owner is armed");
+        (actor, raw)
+    }
+
+    fn raw(&mut self) -> &mut RawContext<R::Msg> {
+        self.raw.as_mut().expect("raw context owner is armed")
+    }
+
+    fn drop_raw(&mut self) {
+        drop(self.raw.take());
+    }
+
+    fn drop_actor(&mut self) {
+        drop(self.actor.take());
+    }
+
+    fn drop_actor_catching(&mut self) {
+        let actor = self.actor.take();
+        let _ = catch_unwind(AssertUnwindSafe(|| drop(actor)));
+    }
+}
+
+impl<R: RawActor> Drop for RawIncarnationOwner<R> {
+    fn drop(&mut self) {
+        // A hard abort destroys the incarnation future instead of polling its
+        // teardown epilogue. Preserve §5.5's resource-before-actor order, but
+        // put a boundary around each destructor so two panics cannot abort the
+        // process. The resource panic is primary: it may be an owned offload
+        // panic that completed before cancellation was requested.
+        let raw_panic = catch_unwind(AssertUnwindSafe(|| self.drop_raw())).err();
+        let actor_panic = catch_unwind(AssertUnwindSafe(|| self.drop_actor())).err();
+        if !std::thread::panicking()
+            && let Some(payload) = raw_panic.or(actor_panic)
+        {
+            resume_unwind(payload);
+        }
+    }
+}
+
 impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
     fn readiness(&self) -> Readiness {
         self.actor.readiness()
@@ -1259,23 +1338,27 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
 
     fn run(self: Box<Self>, context: RawRunContext) -> RawFuture {
         Box::pin(async move {
-            let Self { mut actor, mailbox } = *self;
+            let Self { actor, mailbox } = *self;
             let incarnation = context.incarnation;
             let myself = ActorRef::new(Arc::clone(&context.member), Arc::clone(&mailbox));
             let readiness = context.readiness_override.unwrap_or(actor.readiness());
-            let mut raw = RawContext::new(context, myself, Arc::clone(&mailbox), readiness);
-            let outcome = CatchUnwindFuture::new(actor.run(&mut raw)).await;
+            let raw = RawContext::new(context, myself, Arc::clone(&mailbox), readiness);
+            let mut owner = RawIncarnationOwner::new(raw, actor);
+            let outcome = {
+                let (actor, raw) = owner.parts();
+                CatchUnwindFuture::new(actor.run(raw)).await
+            };
             mailbox.freeze(incarnation);
-            raw.freeze_resources();
-            raw.join_resources().await;
-            drop(raw);
+            owner.raw().freeze_resources();
+            owner.raw().join_resources().await;
+            owner.drop_raw();
             match outcome {
                 Ok(result) => {
-                    drop(actor);
+                    owner.drop_actor();
                     result
                 }
                 Err(payload) => {
-                    let _ = catch_unwind(AssertUnwindSafe(|| drop(actor)));
+                    owner.drop_actor_catching();
                     resume_unwind(payload)
                 }
             }

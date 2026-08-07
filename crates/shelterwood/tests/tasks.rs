@@ -145,3 +145,36 @@ async fn dropping_the_owner_requests_cooperative_shutdown() {
     .await
     .expect("task future dropped");
 }
+
+#[tokio::test]
+async fn cancelling_system_wait_keeps_drop_shutdown_armed() {
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "worker",
+            TaskDef::new(|context| async move {
+                context.shutdown_token().cancelled().await;
+                Ok(())
+            }),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    let scope = system.scope();
+    let mut waiting = Box::pin(system.wait());
+
+    tokio::select! {
+        biased;
+        _ = &mut waiting => panic!("live system must not stop naturally"),
+        () = std::future::ready(()) => {}
+    }
+    drop(waiting);
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), scope.wait_stopped())
+            .await
+            .expect("dropping the cancelled wait requests shutdown"),
+        StopReason::ShutdownRequested
+    );
+    assert!(task.wait().await.cancelled());
+}

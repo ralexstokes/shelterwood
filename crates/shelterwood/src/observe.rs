@@ -267,7 +267,10 @@ impl ScopeSnapshot {
         found
     }
 
-    /// Looks up the lifecycle watermark for an emitting scope membership.
+    /// Looks up the lifecycle watermark for a descendant emitting scope.
+    ///
+    /// For the scope represented by this snapshot itself, compare the event's
+    /// membership with the corresponding scope handle and use [`Self::lifecycle_seq`].
     #[must_use]
     pub fn watermark(&self, membership: Membership) -> Option<u64> {
         self.children.iter().find_map(|child| {

@@ -49,20 +49,22 @@ pub use tree::{
 
 // Keep the repository-facing examples in the same rustdoc compilation lane as
 // the crate API without adding documentation-only modules to the public surface.
+// These synchronized copies live inside the crate so packaged doctests use the
+// same sources as repository doctests.
 #[cfg(doctest)]
 mod repository_docs {
-    #[doc = include_str!("../../../README.md")]
+    #[doc = include_str!("../doctests/README.md")]
     mod readme {}
 
-    #[doc = include_str!("../../../docs/embedding.md")]
+    #[doc = include_str!("../doctests/docs/embedding.md")]
     mod embedding {}
 
-    #[doc = include_str!("../../../docs/observation.md")]
+    #[doc = include_str!("../doctests/docs/observation.md")]
     mod observation {}
 
-    #[doc = include_str!("../../../docs/retry-and-ordering.md")]
+    #[doc = include_str!("../doctests/docs/retry-and-ordering.md")]
     mod retry_and_ordering {}
 
-    #[doc = include_str!("../../../docs/shutdown-and-resources.md")]
+    #[doc = include_str!("../doctests/docs/shutdown-and-resources.md")]
     mod shutdown_and_resources {}
 }

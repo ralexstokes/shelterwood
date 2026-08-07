@@ -16,8 +16,8 @@
     }:
     rust-env.lib.mkRustProject {
       src = ./.;
-      # Repository docs are compiled as crate doctests, so keep Markdown
-      # alongside Cargo sources in the clean build sandbox.
+      # Repository docs and their packaged doctest copies are compared in the
+      # clean build sandbox, so keep Markdown alongside Cargo sources.
       extraSourceFilter =
         path: type: type == "regular" && builtins.match ".*\\.md" (toString path) != null;
       extraChecks =
@@ -37,7 +37,8 @@
               path: type:
               type == "directory"
               || craneLib.filterCargoSources path type
-              || pkgs.lib.hasSuffix ".sh" (toString path);
+              || pkgs.lib.hasSuffix ".sh" (toString path)
+              || pkgs.lib.hasSuffix ".md" (toString path);
           };
           commonArgs = {
             pname = "shelterwood-part0-enforcement";
@@ -61,6 +62,8 @@
                   target/doc/shelterwood.json
                 ${pkgs.bash}/bin/bash ./tools/check-runtime-paths.sh
                 ${pkgs.bash}/bin/bash ./tools/check-exit-paths.sh
+                ${pkgs.bash}/bin/bash ./tools/sync-packaged-docs.sh --check
+                ${pkgs.bash}/bin/bash ./tools/check-packaged-crate.sh
               '';
               doInstallCargoArtifacts = false;
             }

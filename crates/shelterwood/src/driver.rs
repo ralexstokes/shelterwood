@@ -950,14 +950,19 @@ impl ScopeCell {
     }
 
     pub(crate) fn set_startup(&self, startup: Result<(), StartupError>) {
-        if self.record.send_if_modified(|record| {
-            if record.startup.is_some() {
-                return false;
+        let mut published = false;
+        self.record.modify_silently(|record| {
+            if record.startup.is_none() {
+                record.startup = Some(startup);
+                published = true;
             }
-            record.startup = Some(startup);
-            true
-        }) {
+        });
+        if published {
+            // Before the record became watch-backed, startup waiters shared
+            // the member signal. Preserve that ordering boundary: publish the
+            // member-plane wake before releasing the startup result itself.
             self.member.record.pulse();
+            self.record.pulse();
         }
     }
 
@@ -991,7 +996,7 @@ impl ScopeCell {
         let state = ScopeState::Stopped {
             reason: reason.clone(),
         };
-        self.record.send_modify(|record| {
+        self.record.modify_silently(|record| {
             if record.startup.is_none() {
                 record.startup = Some(Err(StartupError::ShutdownRequested));
             }
@@ -1017,6 +1022,9 @@ impl ScopeCell {
         }
         drop(control);
         self.member.record.pulse();
+        // `wait_started` must not observe terminal startup until the member
+        // and incarnation-control planes above are consistent.
+        self.record.pulse();
         self.emit_locked(LifecycleEventKind::ScopeState { state });
         if terminal {
             self.close_observation_locked();
@@ -1035,7 +1043,7 @@ impl ScopeCell {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let state = ScopeState::Stopped { reason };
-            self.record.send_modify(|record| {
+            self.record.modify_silently(|record| {
                 if record.startup.is_none() {
                     record.startup = Some(Err(StartupError::ShutdownRequested));
                 }
@@ -1043,6 +1051,7 @@ impl ScopeCell {
             });
             self.member.terminalize(exit);
             self.member.record.pulse();
+            self.record.pulse();
             self.emit_locked(LifecycleEventKind::ScopeState { state });
             self.close_observation_locked();
         }
@@ -1158,7 +1167,7 @@ impl ScopeCell {
     fn clear_residents_locked(&self) {
         let residents = self.current_children.take();
         // Each entry's owned completion emits Removed. Drop the vector only
-        // after releasing the child-set mutex so snapshot publication can
+        // after releasing the child-set watch value guard so snapshot publication can
         // project the now-empty set while this observation gate stays held.
         drop(residents);
     }
@@ -1212,7 +1221,7 @@ impl ScopeCell {
             return;
         }
         self.member.terminalize(Exit::never_started());
-        self.record.send_modify(|record| {
+        self.record.modify_silently(|record| {
             if record.startup.is_none() {
                 record.startup = Some(Err(StartupError::ShutdownRequested));
             }
@@ -1221,6 +1230,7 @@ impl ScopeCell {
             };
         });
         self.member.record.pulse();
+        self.record.pulse();
         self.emit_locked(LifecycleEventKind::ScopeState {
             state: ScopeState::Stopped {
                 reason: StopReason::NeverStarted,
@@ -3628,6 +3638,33 @@ mod tests {
         }
     }
 
+    struct ObserveScopeOnStartupWake {
+        scope: Arc<ScopeCell>,
+        epoch: Option<u64>,
+        observed: Mutex<Option<(MemberStage, Option<bool>)>>,
+    }
+
+    impl ObserveScopeOnStartupWake {
+        fn observe(&self) {
+            let member = self.scope.member.record().stage;
+            let incarnation_finished = self
+                .epoch
+                .map(|epoch| self.scope.incarnation_finished(epoch));
+            *self.observed.lock().expect("observation mutex poisoned") =
+                Some((member, incarnation_finished));
+        }
+    }
+
+    impl Wake for ObserveScopeOnStartupWake {
+        fn wake(self: Arc<Self>) {
+            self.observe();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observe();
+        }
+    }
+
     #[test]
     fn terminality_signal_follows_mailbox_termination() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
@@ -3772,6 +3809,97 @@ mod tests {
             panic!("one terminal record must be visible");
         };
         assert_eq!(record.last_exit, Some(exit));
+    }
+
+    #[test]
+    fn terminal_startup_wake_follows_member_and_incarnation_publication() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let member = MemberCell::new(
+            ChildId::from("root"),
+            identity.mint_membership().expect("membership available"),
+        );
+        let scope = ScopeCell::new(
+            member,
+            ScopeFlavor::Ordered,
+            ScopeIdentity::new().expect("child identity available"),
+        );
+        let epoch = scope.begin_incarnation();
+        let probe = Arc::new(ObserveScopeOnStartupWake {
+            scope: Arc::clone(&scope),
+            epoch: Some(epoch),
+            observed: Mutex::new(None),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut watcher = scope.record.watcher();
+        let mut changed = Box::pin(watcher.changed());
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        scope.finish_root_incarnation(epoch, StopReason::ShutdownRequested, Exit::never_started());
+
+        let observed = probe
+            .observed
+            .lock()
+            .expect("observation mutex poisoned")
+            .clone()
+            .expect("terminal startup wakes the scope watcher");
+        assert!(matches!(observed.0, MemberStage::Terminal(_)));
+        assert_eq!(observed.1, Some(true));
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+    }
+
+    #[test]
+    fn no_live_root_startup_wake_follows_member_publication() {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let member = MemberCell::new(
+            ChildId::from("root"),
+            identity.mint_membership().expect("membership available"),
+        );
+        let scope = ScopeCell::new(
+            member,
+            ScopeFlavor::Ordered,
+            ScopeIdentity::new().expect("child identity available"),
+        );
+        let probe = Arc::new(ObserveScopeOnStartupWake {
+            scope: Arc::clone(&scope),
+            epoch: None,
+            observed: Mutex::new(None),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut watcher = scope.record.watcher();
+        let mut changed = Box::pin(watcher.changed());
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        scope.finish_live_root_incarnation(StopReason::ShutdownRequested, Exit::never_started());
+
+        let observed = probe
+            .observed
+            .lock()
+            .expect("observation mutex poisoned")
+            .clone()
+            .expect("terminal startup wakes the scope watcher");
+        assert!(matches!(observed.0, MemberStage::Terminal(_)));
+        assert_eq!(observed.1, None);
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
     }
 
     #[test]

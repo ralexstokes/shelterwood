@@ -217,6 +217,18 @@ impl SlotCell {
             DefinitionState::Lowered => panic!("a tree was lowered more than once"),
         }
     }
+
+    pub(crate) fn take_defined(&self) -> Option<ChildConstruction> {
+        let mut state = self.definition.lock().expect("definition mutex poisoned");
+        match std::mem::replace(&mut *state, DefinitionState::Lowered) {
+            DefinitionState::Defined(definition) => Some(definition),
+            DefinitionState::Undefined => {
+                *state = DefinitionState::Undefined;
+                None
+            }
+            DefinitionState::Lowered => None,
+        }
+    }
 }
 
 pub(crate) struct BuilderCore {

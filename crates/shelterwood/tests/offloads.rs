@@ -489,6 +489,112 @@ enum PanicMessage {
     Delivery,
 }
 
+#[derive(Clone, Copy)]
+enum CancellationDropMode {
+    Cleanup,
+    PolledCancellation,
+    Actor,
+}
+
+struct PendingDropFuture {
+    drops: Arc<AtomicUsize>,
+    panic_on_drop: bool,
+    polled: Option<Arc<tokio::sync::Notify>>,
+    dropped: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl std::future::Future for PendingDropFuture {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if let Some(polled) = &self.polled {
+            polled.notify_one();
+        }
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for PendingDropFuture {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+        if let Some(dropped) = &self.dropped {
+            dropped.notify_one();
+        }
+        if self.panic_on_drop {
+            panic!("offload cancellation destructor panic");
+        }
+    }
+}
+
+struct CancellationDropActor;
+
+impl Actor for CancellationDropActor {
+    type Msg = ();
+    type Args = (CancellationDropMode, Arc<AtomicUsize>, Arc<AtomicBool>);
+
+    async fn init(
+        (mode, drops, signalled): Self::Args,
+        context: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        let polled = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let first = context
+            .offload_scoped(
+                PendingDropFuture {
+                    drops: Arc::clone(&drops),
+                    panic_on_drop: true,
+                    polled: Some(Arc::clone(&polled)),
+                    dropped: Some(Arc::clone(&dropped)),
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("first offload accepted");
+        let second = context
+            .offload_scoped(
+                PendingDropFuture {
+                    drops,
+                    panic_on_drop: false,
+                    polled: None,
+                    dropped: None,
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("second offload accepted");
+
+        match mode {
+            CancellationDropMode::Cleanup => {
+                context.stop();
+                signalled.store(
+                    first.is_finished() && second.is_finished(),
+                    Ordering::SeqCst,
+                );
+                first.detach();
+                second.detach();
+                Ok(Self)
+            }
+            CancellationDropMode::PolledCancellation => {
+                polled.notified().await;
+                first.cancel();
+                dropped.notified().await;
+                context.stop();
+                signalled.store(second.is_finished(), Ordering::SeqCst);
+                second.detach();
+                Ok(Self)
+            }
+            CancellationDropMode::Actor => panic!("primary actor panic"),
+        }
+    }
+
+    async fn handle(&mut self, (): Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
 struct PanicActor {
     mode: PanicMode,
 }
@@ -585,6 +691,64 @@ async fn assert_pre_ready_panic(mode: PanicMode, expected: &str, trigger: bool) 
         .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root shuts down");
+}
+
+async fn assert_cancellation_drop_panic(mode: CancellationDropMode, expected: &str) {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let signalled = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "cancellation-drop",
+        ActorOnceDef::<CancellationDropActor>::new((
+            mode,
+            Arc::clone(&drops),
+            Arc::clone(&signalled),
+        ))
+        .readiness(Readiness::Manual),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    let message = startup_panic_message(
+        system
+            .wait_started()
+            .await
+            .expect_err("the pre-ready panic fails startup"),
+    );
+    assert_eq!(message.as_deref(), Some(expected));
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    if !matches!(mode, CancellationDropMode::Actor) {
+        assert!(
+            signalled.load(Ordering::SeqCst),
+            "every cancellation signals completion despite one destructor panic"
+        );
+    }
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root shuts down");
+}
+
+#[tokio::test]
+async fn cancellation_destructor_panics_do_not_poison_or_short_circuit_cleanup() {
+    assert_cancellation_drop_panic(
+        CancellationDropMode::Cleanup,
+        "offload cancellation destructor panic",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn polled_cancellation_destructor_panic_does_not_poison_offload_state() {
+    assert_cancellation_drop_panic(
+        CancellationDropMode::PolledCancellation,
+        "offload cancellation destructor panic",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cancellation_destructor_panic_does_not_mask_actor_panic() {
+    assert_cancellation_drop_panic(CancellationDropMode::Actor, "primary actor panic").await;
 }
 
 #[tokio::test]
@@ -722,6 +886,85 @@ async fn queued_offload_panic_survives_hard_abort() {
         }
     }
     assert_eq!(panic_message.as_deref(), Some("owned offload panic"));
+}
+
+struct HandlerOffloadDoublePanicActor {
+    queued: Arc<AtomicBool>,
+}
+
+impl Actor for HandlerOffloadDoublePanicActor {
+    type Msg = ();
+    type Args = Arc<AtomicBool>;
+
+    async fn init(queued: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self { queued })
+    }
+
+    async fn handle(&mut self, (): Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        let guard = context
+            .offload_scoped(
+                async {
+                    panic!("handler owned offload panic");
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("offload accepted");
+        guard.finished().await;
+        self.queued.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+impl Drop for HandlerOffloadDoublePanicActor {
+    fn drop(&mut self) {
+        panic!("handler destructor panic");
+    }
+}
+
+#[tokio::test]
+async fn hard_abort_preserves_owned_offload_panic_over_handler_destructor() {
+    let queued = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "handler-double-panic",
+            ActorOnceDef::<HandlerOffloadDoublePanicActor>::new(Arc::clone(&queued))
+                .shutdown(Shutdown::Abort),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    system.wait_started().await.expect("actor starts");
+    actor.send(()).await.expect("actor accepts trigger");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            queued.load(Ordering::SeqCst)
+        })
+        .await,
+        "offload panic is owned before hard abort"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the two panics remain contained");
+
+    let mut panic_message = None;
+    while let Some(item) = events.recv().await {
+        let LifecycleItem::Event(event) = item else {
+            panic!("small fixture must not lag");
+        };
+        if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+            && id.as_str() == "handler-double-panic"
+            && let ExitKind::Panicked { message } = exit.kind()
+        {
+            panic_message = message.clone();
+        }
+    }
+    assert_eq!(
+        panic_message.as_deref(),
+        Some("handler owned offload panic")
+    );
 }
 
 #[tokio::test]

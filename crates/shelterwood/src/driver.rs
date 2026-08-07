@@ -1568,12 +1568,10 @@ impl SystemRun {
             runtime::JoinOutcome::Ok { .. } => {}
             runtime::JoinOutcome::Panic { message, .. } => {
                 let exit = Exit::new(ExitKind::Panicked { message }, false);
-                self.root.set_startup(Err(StartupError::ShutdownRequested));
                 self.root
                     .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
             }
             runtime::JoinOutcome::Cancelled { .. } => {
-                self.root.set_startup(Err(StartupError::ShutdownRequested));
                 self.root.finish_live_root_incarnation(
                     StopReason::ShutdownRequested,
                     Exit::new(ExitKind::Aborted { after_grace: false }, true),
@@ -1668,12 +1666,10 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
             runtime::JoinOutcome::Ok { value, .. } => value,
             runtime::JoinOutcome::Panic { message, .. } => {
                 let exit = Exit::new(ExitKind::Panicked { message }, false);
-                monitor_root.set_startup(Err(StartupError::ShutdownRequested));
                 monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
                 StopReason::ShutdownRequested
             }
             runtime::JoinOutcome::Cancelled { .. } => {
-                monitor_root.set_startup(Err(StartupError::ShutdownRequested));
                 monitor_root.finish_live_root_incarnation(
                     StopReason::ShutdownRequested,
                     Exit::new(ExitKind::Aborted { after_grace: false }, true),
@@ -3454,19 +3450,21 @@ mod tests {
             crate::runtime::Timeout::Completed(())
         ));
         let waiter_scope = Arc::clone(&scope);
-        let waiter = crate::runtime::spawn((), async move { waiter_scope.wait_started().await });
-        crate::runtime::yield_now().await;
+        let mut waiter = Box::pin(waiter_scope.wait_started());
+        let first_poll =
+            std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
+        assert!(first_poll.is_pending());
 
         abort.abort();
         assert!(matches!(
             crate::runtime::join(driver).await,
             crate::runtime::JoinOutcome::Cancelled { .. }
         ));
-        let crate::runtime::JoinOutcome::Ok { value, .. } = crate::runtime::join(waiter).await
-        else {
-            panic!("startup waiter must join normally");
-        };
-        assert_eq!(value, Err(crate::StartupError::ShutdownRequested));
+        let result = crate::runtime::timeout(Duration::from_secs(1), waiter).await;
+        assert!(matches!(
+            result,
+            crate::runtime::Timeout::Completed(Err(crate::StartupError::ShutdownRequested))
+        ));
         assert!(matches!(scope.record().state, ScopeState::Stopped { .. }));
         assert!(scope.record().startup.is_some());
     }

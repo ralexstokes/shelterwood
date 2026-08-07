@@ -126,9 +126,9 @@ below is a reachable escape hatch:
 - **L4 — observation**: snapshots and lifecycle events over L1's single
   publication path.
 
-**Implementation shape.** Two cross-cutting constraints on *how* the layers
-are built — they determine testability and reviewability more than any
-single design rule:
+**Implementation shape.** Three cross-cutting constraints on *how* the
+layers are built — they determine testability and reviewability more than
+any single design rule:
 
 - **Policies are plain data.** Every policy and configuration surface —
   `RestartPolicy`, `Backoff`, `Shutdown`, `Readiness` and its deadline,
@@ -158,6 +158,25 @@ single design rule:
   and timer retraction): decide the next action as a function of observed
   loop state, then await it. User code — actor bodies — is of course
   effectful; the constraint binds the engine.
+- **Promises are owned completions.** Every cross-task promise — an
+  admission or removal awaiting resolution, an exit report awaiting
+  publication, a resident child awaiting its `Removed` edge, a member
+  cell awaiting terminality, a waiter awaiting a wake — is held as an
+  owned value whose destructor discharges it, fail-closed, with a
+  **synchronous** fallback: complete with the terminal rejection,
+  publish the coarse exit, emit the edge, pulse the signal — never an
+  await, never a join. The event loop that services the orderly path is
+  an optimization of these values' consumption, never the sole
+  guarantor: when a driver future is destroyed at any await point —
+  hard-abort cascade, panic, natural return with events still queued —
+  unwinding alone MUST discharge every outstanding promise (§10's
+  driver-death rule, §13.17's test anchor). Two corollaries are
+  normative. Residency in a scope's observed child set is itself such a
+  value — its drop emits `Removed`, making §3.2's exact pairing
+  structural rather than remembered. And each cell has exactly **one**
+  change signal from which every compound wait derives — a second wake
+  path is a lost wakeup waiting to be written. (Structural adoption is
+  tracked as #17; the discharge behavior is required now.)
 
 **Performance posture.** The decision layer is a control plane — its
 events are exits, restarts, commands, and deadlines, rare even in a
@@ -1780,6 +1799,19 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   advances to the next sibling. Dynamic scopes cancel the group at once and
   drain concurrently (grace clocks run in parallel, not summed). Aborting an
   ancestor arms a recursive hard-abort cascade.
+- **Driver death discharges; it never absolves.** A scope driver
+  destroyed with obligations outstanding resolves all of them on the way
+  down: still-active descendants publish the coarse kill verdict —
+  `Aborted { after_grace: false }` with `cancelled: true` — memberships
+  terminalize (sends fail `Terminated`, exit-awaiting surfaces resolve),
+  in-flight admissions and removals resolve their enumerated rejections,
+  and every `Added` is paired with its `Removed` before the scope's own
+  final event. First publication wins: an orderly post-join report that
+  already landed is never overwritten. §7's post-join precision is an
+  orderly-path property, deliberately traded for promptness on the kill
+  path — the future was destroyed, so "what would it have reported"
+  is unknowable in bounded time; this is the same trade `brutal_kill` →
+  `killed` makes, decided here once rather than per call site.
 - "Drained" has exactly one definition, derived from child state (no
   hand-maintained live counter).
 - Child exits are consumed through one funnel regardless of which await
@@ -2397,6 +2429,23 @@ integration toolkit for the driver shell and the end-to-end invariants.
     terminalized, and an ordered scope holding one `Always`-policy child
     all stay alive until the owner acts; a retained terminal sibling
     does not block completion.
+17. **Every pending completion resolves under driver death.** The
+    provocation is fault-shaped: provoke a hard abort of an ancestor
+    (grace-expiry escalation, `Shutdown::Abort`, forced shutdown) with
+    each obligation class provably outstanding — a stubborn descendant
+    holding exit-waiters and a parked send, an admission first-polled
+    but not yet dequeued, a removal latched mid-flight, a lifecycle
+    subscriber holding the stream, a `shutdown_and_wait` parked on a
+    restart-window membership — and assert, bounded, that every one
+    resolves: exit-awaiting surfaces yield `Aborted`, `try_send` fails
+    `Terminated` (never a permanent `NotRunning`), parked sends resolve
+    `Terminated`, add/remove futures yield their enumerated rejections,
+    the stream pairs every `Added` with `Exited`/`Removed` before the
+    final scope event, and no snapshot of a stopped scope carries a live
+    incarnation (§1's owned-completion constraint, §10's driver-death
+    rule). Where a fault-injection harness can destroy the driver at
+    arbitrary await points, run the same assertions there; the fixed
+    provocations above are the floor, not the ceiling.
 
 ## 14. Core-spike decisions
 

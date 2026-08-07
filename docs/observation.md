@@ -19,8 +19,11 @@ protocol both at initial attachment and after `LifecycleItem::Lagged`:
 Every emitting scope has a membership token and sequence. A recursive
 `ScopeSnapshot` carries `lifecycle_seq` for itself; a scope child also carries
 `scope_seq`, including during a restart window when its nested snapshot is
-temporarily absent. `ScopeSnapshot::watermark(event.scope)` finds the matching
-watermark. An event is already reflected when `event.seq <= watermark`.
+temporarily absent. For an event emitted by the subscribed scope itself, compare
+`event.scope` with the scope handle's `membership()` and use
+`snapshot.lifecycle_seq`. For a descendant event,
+`snapshot.watermark(event.scope)` finds the matching watermark. An event is
+already reflected when `event.seq <= watermark`.
 
 If the event's scope token is absent from the snapshot, use causal introduction:
 

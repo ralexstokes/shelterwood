@@ -145,7 +145,6 @@ name = "shelterwood"
 version = "0.1.0"
 dependencies = [
  "fastrand",
- "slab",
  "thiserror",
  "tokio",
  "tokio-util",

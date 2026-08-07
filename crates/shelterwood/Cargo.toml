@@ -8,7 +8,6 @@ autotests = false
 
 [dependencies]
 fastrand.workspace = true
-slab.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

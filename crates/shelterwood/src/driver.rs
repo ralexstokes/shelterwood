@@ -3443,16 +3443,19 @@ mod tests {
             run_scope_incarnation(plan, false, Some(Latch::default()), None, None, None, epoch),
         );
         let abort = driver.abort_handle();
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let reached_startup = crate::runtime::timeout(Duration::from_secs(1), async {
             while !matches!(scope.record().state, ScopeState::Starting) {
-                tokio::task::yield_now().await;
+                crate::runtime::yield_now().await;
             }
         })
-        .await
-        .expect("scope driver reaches startup");
+        .await;
+        assert!(matches!(
+            reached_startup,
+            crate::runtime::Timeout::Completed(())
+        ));
         let waiter_scope = Arc::clone(&scope);
         let waiter = crate::runtime::spawn((), async move { waiter_scope.wait_started().await });
-        tokio::task::yield_now().await;
+        crate::runtime::yield_now().await;
 
         abort.abort();
         assert!(matches!(

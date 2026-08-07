@@ -2,31 +2,10 @@
 
 use std::{future::Future, ops::RangeBounds, time::Duration};
 
-use tokio::{
-    sync::{mpsc, oneshot, watch},
-    task, time,
-};
+use tokio::{sync::mpsc, task, time};
 
 #[cfg(test)]
 pub(crate) use tokio::test;
-
-/// A runtime-owned monotonic instant.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct Instant(time::Instant);
-
-impl Instant {
-    pub(crate) fn now() -> Self {
-        Self(time::Instant::now())
-    }
-
-    pub(crate) fn checked_add(self, duration: Duration) -> Option<Self> {
-        self.0.checked_add(duration).map(Self)
-    }
-
-    pub(crate) fn saturating_duration_since(self, earlier: Self) -> Duration {
-        self.0.saturating_duration_since(earlier.0)
-    }
-}
 
 pub(crate) fn now() -> std::time::Instant {
     time::Instant::now().into_std()
@@ -52,14 +31,6 @@ impl AbortHandle {
 }
 
 impl<I, T> JoinHandle<I, T> {
-    pub(crate) fn id(&self) -> &I {
-        &self.id
-    }
-
-    pub(crate) fn abort(&self) {
-        self.inner.abort();
-    }
-
     pub(crate) fn abort_handle(&self) -> AbortHandle {
         AbortHandle(self.inner.abort_handle())
     }
@@ -85,10 +56,10 @@ where
 }
 
 /// The runtime-level outcome consumed by the exit classifier.
-pub(crate) enum JoinOutcome<I, T> {
-    Ok { id: I, value: T },
-    Panic { id: I, message: Option<String> },
-    Cancelled { id: I },
+pub(crate) enum JoinOutcome<T> {
+    Ok { value: T },
+    Panic { message: Option<String> },
+    Cancelled,
 }
 
 pub(crate) fn spawn<I, F>(id: I, future: F) -> JoinHandle<I, F::Output>
@@ -113,17 +84,16 @@ where
     }
 }
 
-pub(crate) async fn join<I, T>(handle: JoinHandle<I, T>) -> JoinOutcome<I, T> {
-    let JoinHandle { id, inner } = handle;
+pub(crate) async fn join<I, T>(handle: JoinHandle<I, T>) -> JoinOutcome<T> {
+    let JoinHandle { inner, .. } = handle;
     match inner.await {
-        Ok(value) => JoinOutcome::Ok { id, value },
+        Ok(value) => JoinOutcome::Ok { value },
         Err(error) if error.is_panic() => JoinOutcome::Panic {
-            id,
             message: panic_message(error.into_panic()),
         },
         Err(error) => {
             debug_assert!(error.is_cancelled());
-            JoinOutcome::Cancelled { id }
+            JoinOutcome::Cancelled
         }
     }
 }
@@ -152,10 +122,6 @@ pub(crate) async fn sleep(duration: Duration) {
     time::sleep(duration).await;
 }
 
-pub(crate) async fn sleep_until(deadline: Instant) {
-    time::sleep_until(deadline.0).await;
-}
-
 pub(crate) async fn sleep_until_std(deadline: std::time::Instant) {
     time::sleep_until(time::Instant::from_std(deadline)).await;
 }
@@ -173,20 +139,6 @@ where
         Ok(value) => Timeout::Completed(value),
         Err(_) => Timeout::Elapsed,
     }
-}
-
-pub(crate) type WatchSender<T> = watch::Sender<T>;
-pub(crate) type WatchReceiver<T> = watch::Receiver<T>;
-
-pub(crate) fn watch_channel<T>(initial: T) -> (WatchSender<T>, WatchReceiver<T>) {
-    watch::channel(initial)
-}
-
-pub(crate) type OneshotSender<T> = oneshot::Sender<T>;
-pub(crate) type OneshotReceiver<T> = oneshot::Receiver<T>;
-
-pub(crate) fn oneshot_channel<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
-    oneshot::channel()
 }
 
 pub(crate) type MpscSender<T> = mpsc::Sender<T>;
@@ -240,31 +192,6 @@ where
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct CancellationToken(tokio_util::sync::CancellationToken);
-
-impl CancellationToken {
-    pub(crate) fn new() -> Self {
-        Self(tokio_util::sync::CancellationToken::new())
-    }
-
-    pub(crate) fn child_token(&self) -> Self {
-        Self(self.0.child_token())
-    }
-
-    pub(crate) fn cancel(&self) {
-        self.0.cancel();
-    }
-
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.0.is_cancelled()
-    }
-
-    pub(crate) async fn cancelled(&self) {
-        self.0.cancelled().await;
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct JitterRng(fastrand::Rng);
 
@@ -279,8 +206,4 @@ impl JitterRng {
     {
         self.0.u64(range)
     }
-}
-
-pub(crate) async fn yield_now() {
-    task::yield_now().await;
 }

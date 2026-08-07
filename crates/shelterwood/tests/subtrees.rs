@@ -8,9 +8,9 @@ use std::{
 };
 
 use shelterwood::{
-    Backoff, DynamicTree, ExitError, ExitKind, Intensity, RestartCondition, RestartPolicy,
-    Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
-    TaskOnceDef, TaskRef, Tree,
+    Backoff, DynamicTree, ExitError, ExitKind, Intensity, Readiness, RestartCondition,
+    RestartPolicy, Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeDef,
+    SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, Tree,
 };
 use shelterwood_test_support::{advance_time, poll_until};
 
@@ -525,4 +525,62 @@ async fn shutdown_and_wait_wakes_when_a_parent_drain_terminalizes_a_restarting_s
         .expect("parent drain terminalizes the restarting subtree and wakes waiters")
         .expect("waiter joins")
         .expect("teardown completes in bound");
+}
+
+/// A subtree that shuts itself down records a cancelled exit: the stop
+/// request was observed before the outcome, whether it came from an
+/// ancestor's latch or the scope's own `request_scope_shutdown` (§7's
+/// `cancelled` definition is observation, not provenance).
+#[tokio::test]
+async fn locally_requested_subtree_shutdown_reads_cancelled() {
+    let started = Arc::new(AtomicBool::new(false));
+    let mut nested = Tree::new();
+    nested
+        .add_task(
+            "parked",
+            TaskDef::new({
+                let started = Arc::clone(&started);
+                move |context| {
+                    let started = Arc::clone(&started);
+                    async move {
+                        started.store(true, Ordering::SeqCst);
+                        context.shutdown_token().cancelled().await;
+                        Ok(())
+                    }
+                }
+            })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness"),
+        )
+        .expect("valid task");
+    let mut root = Tree::new();
+    let sub = root
+        .add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            started.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    // The stop request comes from the subtree's own handle, not an
+    // ancestor's ladder.
+    sub.request_shutdown();
+    let startup = system
+        .wait_started()
+        .await
+        .expect_err("the nested self-shutdown aborts parent startup pre-ready");
+    let StartupError::StartupFailed(failure) = startup else {
+        panic!("unexpected startup error: {startup:?}");
+    };
+    let StartupFailureCause::Child { id, exit, .. } = &failure.cause else {
+        panic!("unexpected failure cause: {:?}", failure.cause);
+    };
+    assert_eq!(id.as_str(), "nested");
+    assert!(matches!(exit.kind(), ExitKind::Completed));
+    assert!(
+        exit.cancelled(),
+        "a locally requested shutdown is still a stop request: {exit:?}"
+    );
 }

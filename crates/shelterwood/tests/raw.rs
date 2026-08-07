@@ -441,3 +441,53 @@ async fn deferred_queue_capacity_ignores_a_latest_scope_default() {
         .await
         .expect("actor stops");
 }
+
+struct DoublePanicActor;
+
+impl RawActor for DoublePanicActor {
+    type Msg = ();
+
+    fn readiness(&self) -> Readiness {
+        Readiness::Manual
+    }
+
+    async fn run(&mut self, _: &mut RawContext<Self::Msg>) -> ExitResult {
+        panic!("injected run panic");
+    }
+}
+
+impl Drop for DoublePanicActor {
+    fn drop(&mut self) {
+        panic!("injected destructor panic");
+    }
+}
+
+/// §7's containment boundary at the raw layer: a `run` panic is caught
+/// before the actor value is destroyed, so a destructor that also panics is
+/// a second contained panic — the process survives and exactly one
+/// `Panicked` report publishes, carrying the run panic's payload.
+#[tokio::test]
+async fn raw_run_panic_with_panicking_destructor_publishes_one_report() {
+    let mut tree = Tree::new();
+    tree.add_raw_once("double-panic", RawOnceDef::new(DoublePanicActor))
+        .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+    let startup = system
+        .wait_started()
+        .await
+        .expect_err("the pre-ready panic aborts startup");
+    let shelterwood::StartupError::StartupFailed(failure) = startup else {
+        panic!("unexpected startup error: {startup:?}");
+    };
+    let shelterwood::StartupFailureCause::Child { exit, .. } = &failure.cause else {
+        panic!("unexpected failure cause: {:?}", failure.cause);
+    };
+    assert!(
+        matches!(
+            exit.kind(),
+            shelterwood::ExitKind::Panicked { message: Some(message) }
+                if message.contains("injected run panic")
+        ),
+        "the run panic's payload wins: {exit:?}"
+    );
+}

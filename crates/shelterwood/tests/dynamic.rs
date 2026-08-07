@@ -14,13 +14,10 @@ use shelterwood::{
 };
 use shelterwood_test_support::{ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 
-#[path = "common/policy.rs"]
-mod policy;
-#[path = "common/waiting.rs"]
-mod waiting;
-
-use policy::never;
-use waiting::{task as waiting_task, tree as waiting_tree};
+use crate::common::{
+    policy::never,
+    waiting::{task as waiting_task, tree as waiting_tree},
+};
 
 struct DropProbe(Arc<AtomicBool>);
 

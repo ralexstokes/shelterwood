@@ -15,10 +15,7 @@ use shelterwood::{
 };
 use shelterwood_test_support::poll_until;
 
-#[path = "common/waiting.rs"]
-mod waiting;
-
-use waiting::{task as waiting_task, tree as waiting_tree};
+use crate::common::waiting::{task as waiting_task, tree as waiting_tree};
 
 async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
     tokio::time::timeout(Duration::from_secs(2), events.recv())

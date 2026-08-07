@@ -14,10 +14,7 @@ use shelterwood::{
 };
 use shelterwood_test_support::{ReleaseGate, poll_until};
 
-#[path = "../common/policy.rs"]
-mod policy;
-
-use policy::never;
+use crate::common::policy::never;
 
 type JournalEvent = (usize, &'static str, &'static str);
 type JournalEntries = Arc<Mutex<Vec<JournalEvent>>>;

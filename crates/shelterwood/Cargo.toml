@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "MIT OR Apache-2.0"
+autotests = false
 
 [dependencies]
 fastrand.workspace = true
@@ -15,3 +16,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 shelterwood-test-support = { path = "../test-support" }
+
+[[test]]
+name = "integration"
+path = "tests/mod.rs"

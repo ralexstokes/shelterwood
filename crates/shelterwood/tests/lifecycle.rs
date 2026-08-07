@@ -14,10 +14,7 @@ use shelterwood::{
 };
 use shelterwood_test_support::{PanicOnDrop, ReleaseGate, assert_quiet, poll_until};
 
-#[path = "common/policy.rs"]
-mod policy;
-
-use policy::never;
+use crate::common::policy::never;
 
 #[tokio::test]
 async fn non_owners_are_quiet_and_an_empty_root_needs_its_owner() {

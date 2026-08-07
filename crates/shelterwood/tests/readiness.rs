@@ -12,10 +12,7 @@ use shelterwood::{
 };
 use shelterwood_test_support::{ReleaseGate, advance_time, assert_quiet, poll_until};
 
-#[path = "common/policy.rs"]
-mod policy;
-
-use policy::never;
+use crate::common::policy::never;
 
 #[tokio::test]
 async fn ordered_startup_waits_for_manual_readiness() {

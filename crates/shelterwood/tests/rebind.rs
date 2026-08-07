@@ -14,10 +14,7 @@ use shelterwood_test_support::{
     DestructorBlocker, DestructorGate, ReleaseGate, poll_once, poll_until,
 };
 
-#[path = "common/policy.rs"]
-mod policy;
-
-use policy::never;
+use crate::common::policy::never;
 
 struct RestartActor {
     generation: usize,

@@ -6,10 +6,7 @@ use shelterwood::{
 };
 use shelterwood_test_support::{ConsumeCount, ConsumeGuard};
 
-#[path = "common/policy.rs"]
-mod policy;
-
-use policy::never;
+use crate::common::policy::never;
 
 #[derive(Clone, Copy)]
 enum RawResourceMode {

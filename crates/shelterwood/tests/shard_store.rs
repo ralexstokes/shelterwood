@@ -375,10 +375,17 @@ async fn replace_with_retry(
 ) -> Route {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     for _ in 0..4 {
+        // Every attempt spends from the one overall budget (§3.3 step 1),
+        // the call's own acceptance deadline included.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "the overall deadline bounds the whole logical operation"
+        );
         match router
             .call(
                 move |reply| RouterMessage::Replace { operation, reply },
-                Duration::from_secs(1),
+                Duration::from_secs(1).min(remaining),
             )
             .await
         {
@@ -629,9 +636,13 @@ async fn shard_store_retire_waits_for_accepted_requests() {
                 .await
         }
     });
-    while !entered.load(std::sync::atomic::Ordering::SeqCst) {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the accepted write reaches the handler");
 
     // Retirement starts while the accepted write is mid-handling;
     // `membership_status` flips synchronously at the call (§13.12).

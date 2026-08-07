@@ -835,4 +835,8 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
         [5],
         "no value leaks past cancellation"
     );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the remaining root joins teardown before the runtime drops");
 }

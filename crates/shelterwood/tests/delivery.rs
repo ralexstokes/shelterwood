@@ -11,7 +11,7 @@ use std::{
 
 use shelterwood::{
     CallErrorKind, ExitError, ExitResult, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Reply,
-    SendErrorKind, Tree,
+    SendErrorKind, Shutdown, SubtreeOnceDef, Tree,
 };
 use shelterwood_test_support::{ReleaseGate, assert_quiet, poll_until};
 
@@ -445,4 +445,105 @@ async fn call_cancellation_withdraws_before_acceptance_but_processes_after() {
             .await
             .expect("actor stops");
     }
+}
+
+struct PoisonedCallActor {
+    gate: ReleaseGate,
+}
+
+impl RawActor for PoisonedCallActor {
+    type Msg = CallMessage;
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        self.gate.wait().await;
+        match context.recv().await {
+            Some(CallMessage::Marker) => {
+                Err(ExitError::message("poisoned before the call was delivered"))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// An accepted-but-undelivered call whose envelope is destroyed at
+/// incarnation close still surfaces `ReplyDropped` with the accepting
+/// incarnation (§5.1, B.3) — the close path, not a handler-side drop.
+#[tokio::test]
+async fn undelivered_call_killed_at_incarnation_close_reports_reply_dropped() {
+    let gate = ReleaseGate::default();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "poisoned-call",
+            RawOnceDef::new(PoisonedCallActor { gate: gate.clone() })
+                .mailbox(Mailbox::queue(2).expect("non-zero capacity")),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    let accepting = actor.try_send(CallMessage::Marker).expect("marker accepts");
+    let call_actor = actor.clone();
+    let call = tokio::spawn(async move {
+        call_actor
+            .call(CallMessage::Ask, Duration::from_secs(1))
+            .await
+    });
+    tokio::task::yield_now().await;
+    gate.release();
+    let error = call
+        .await
+        .expect("call task joins")
+        .expect_err("the undelivered call loses its reply at close");
+    assert_eq!(error.kind, CallErrorKind::ReplyDropped);
+    assert_eq!(error.incarnation_observed, Some(accepting));
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+struct StubbornActor;
+
+impl RawActor for StubbornActor {
+    type Msg = u64;
+
+    async fn run(&mut self, _: &mut RawContext<Self::Msg>) -> ExitResult {
+        std::future::pending::<ExitResult>().await
+    }
+}
+
+/// After a forced teardown hard-aborts a nested scope, its members are
+/// terminal: `try_send` fails `Terminated` (not the transient `NotRunning`)
+/// and a parked `send` resolves instead of parking forever (§13.2, §3.4).
+#[tokio::test]
+async fn forced_teardown_terminalizes_nested_mailboxes() {
+    let mut nested = Tree::new();
+    let actor = nested
+        .add_raw(
+            "stubborn",
+            RawDef::factory(|| StubbornActor).shutdown(Shutdown::Graceful {
+                grace: Duration::from_secs(30),
+            }),
+        )
+        .expect("valid actor");
+    let mut root = Tree::new();
+    root.add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    let timeout = system
+        .shutdown(Duration::from_millis(50))
+        .await
+        .expect_err("the stubborn grace outlives the shutdown budget");
+    assert!(!timeout.stragglers.is_empty());
+    let error = actor
+        .try_send(7)
+        .expect_err("a dead membership rejects sends");
+    assert_eq!(error.kind, SendErrorKind::Terminated);
+    let parked = tokio::time::timeout(Duration::from_secs(1), actor.send(8))
+        .await
+        .expect("sends to a terminal membership resolve rather than park");
+    assert_eq!(
+        parked
+            .expect_err("terminality is the only hard send failure")
+            .kind,
+        SendErrorKind::Terminated
+    );
 }

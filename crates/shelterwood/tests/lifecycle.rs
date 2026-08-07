@@ -369,3 +369,53 @@ async fn retained_terminal_children_count_toward_ordered_completion() {
     system.wait_started().await.expect("tree starts");
     assert_eq!(system.wait().await, StopReason::Finished);
 }
+
+#[tokio::test]
+async fn abort_policy_task_exits_aborted_without_grace() {
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "stubborn",
+            TaskDef::new(|_| future::pending()).shutdown(Shutdown::Abort),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("abort policy bounds teardown");
+    let exit = task.wait().await;
+    assert!(
+        matches!(exit.kind(), ExitKind::Aborted { after_grace: false }),
+        "no grace ever ran, so the abort is not after-grace: {exit:?}"
+    );
+    assert!(exit.cancelled());
+}
+
+#[tokio::test]
+async fn completion_during_the_tidy_beat_is_not_reclassified_as_abort() {
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "prompt",
+            TaskDef::new(|context| async move {
+                context.abort_token().cancelled().await;
+                Ok(())
+            })
+            .shutdown(Shutdown::Abort),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("completion within the tidy beat bounds teardown");
+    let exit = task.wait().await;
+    assert!(
+        matches!(exit.kind(), ExitKind::Completed),
+        "the policy does not pre-decide the classification: {exit:?}"
+    );
+    assert!(exit.cancelled());
+}

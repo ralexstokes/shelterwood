@@ -33,7 +33,7 @@ fn assert_send_sync<T: Send + Sync>() {}
 fn assert_static<T: 'static>() {}
 
 #[test]
-fn m3_public_types_obey_callback_resource_and_payload_trait_contracts() {
+fn public_types_obey_callback_resource_and_payload_trait_contracts() {
     assert_debug::<ActorDef<OpaqueActor>>();
     assert_debug::<ActorOnceDef<OpaqueActor>>();
     assert_debug::<Rejected<OpaqueMessage>>();

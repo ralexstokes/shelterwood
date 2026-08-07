@@ -11,7 +11,7 @@ fn assert_error<T: Error>() {}
 fn assert_send_sync<T: Send + Sync>() {}
 
 #[test]
-fn m4_public_observation_types_obey_the_trait_matrix() {
+fn public_observation_types_obey_the_trait_matrix() {
     assert_debug::<ChildSnapshot>();
     assert_debug::<ChildState>();
     assert_debug::<LifecycleEvent>();

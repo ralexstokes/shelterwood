@@ -96,6 +96,65 @@ async fn raw_readiness_is_resolved_once_per_incarnation() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
+struct RestartingReadiness {
+    generation: usize,
+    calls: Arc<AtomicUsize>,
+}
+
+impl RawActor for RestartingReadiness {
+    type Msg = ();
+
+    fn readiness(&self) -> Readiness {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.generation == 0 {
+            Readiness::Immediate
+        } else {
+            Readiness::Manual
+        }
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        let expected = if self.generation == 0 {
+            Readiness::Immediate
+        } else {
+            Readiness::Manual
+        };
+        assert_eq!(context.readiness(), expected);
+        if expected == Readiness::Manual {
+            context.mark_ready();
+        }
+        if self.generation == 0 {
+            Err(ExitError::message("restart once"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn raw_readiness_is_resolved_once_for_each_restartable_incarnation() {
+    let generations = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    tree.add_raw(
+        "restartable-readiness",
+        RawDef::factory({
+            let generations = Arc::clone(&generations);
+            let calls = Arc::clone(&calls);
+            move || RestartingReadiness {
+                generation: generations.fetch_add(1, Ordering::SeqCst),
+                calls: Arc::clone(&calls),
+            }
+        }),
+    )
+    .expect("valid actor");
+
+    let system = tree.spawn().expect("runtime is available");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(generations.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
 struct OverrideReadiness {
     calls: Arc<AtomicUsize>,
 }

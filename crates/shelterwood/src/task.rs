@@ -372,11 +372,60 @@ impl<T> OneShotTaskRef<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        future::Future,
+        task::{Context, Poll, Waker},
+        time::Duration,
+    };
 
-    use crate::runtime::{self, JoinOutcome, Latch, Timeout};
+    use crate::{
+        ChildId, Exit, ExitKind,
+        driver::MemberCell,
+        identity::ScopeIdentity,
+        runtime::{self, JoinOutcome, Latch, Timeout},
+    };
 
-    use super::CancellationToken;
+    use super::{CancellationToken, OneShotTaskRef, TaskRef};
+
+    fn one_shot_claim<T>() -> (
+        runtime::OneShotSender<T>,
+        OneShotTaskRef<T>,
+        std::sync::Arc<MemberCell>,
+    ) {
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let member = MemberCell::new(
+            ChildId::from("task"),
+            identity.mint_membership().expect("membership available"),
+        );
+        let (sender, receiver) = runtime::oneshot();
+        let claim = OneShotTaskRef::new(receiver, TaskRef::new(std::sync::Arc::clone(&member)));
+        (sender, claim, member)
+    }
+
+    #[crate::runtime::test]
+    async fn typed_value_waits_for_completed_terminal_publication() {
+        let (sender, claim, member) = one_shot_claim();
+        sender.send(42_u8).expect("claim remains open");
+        let mut waiting = Box::pin(claim.wait());
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+        member.terminalize(Exit::new(ExitKind::Completed, false));
+        assert_eq!(waiting.await, Ok(42));
+    }
+
+    #[crate::runtime::test]
+    async fn non_completed_terminal_publication_hides_a_queued_typed_value() {
+        let (sender, claim, member) = one_shot_claim();
+        sender.send(42_u8).expect("claim remains open");
+        let mut waiting = Box::pin(claim.wait());
+        let mut context = Context::from_waker(Waker::noop());
+        let exit = Exit::new(ExitKind::Aborted { after_grace: false }, true);
+
+        assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
+        member.terminalize(exit.clone());
+        assert_eq!(waiting.await, Err(exit));
+    }
 
     #[crate::runtime::test]
     async fn local_cancellation_cancels_only_the_derived_token() {

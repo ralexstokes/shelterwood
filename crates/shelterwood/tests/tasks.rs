@@ -184,11 +184,13 @@ async fn one_shot_completion_reports_abort_verdict() {
 #[tokio::test(start_paused = true)]
 async fn one_shot_value_cannot_override_readiness_timeout_verdict() {
     let readiness_width = Duration::from_secs(10);
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let mut tree = Tree::new();
     let (_task, completion) = tree
         .add_task_once(
             "late-value",
-            TaskOnceDef::new(|context| async move {
+            TaskOnceDef::new(move |context| async move {
+                entered.send(()).expect("test still waits for task entry");
                 context.shutdown_token().cancelled().await;
                 Ok::<_, ExitError>(42_u8)
             })
@@ -202,6 +204,7 @@ async fn one_shot_value_cannot_override_readiness_timeout_verdict() {
         .expect("valid declaration");
     let system = tree.spawn().expect("runtime is available");
 
+    entered_rx.await.expect("task body entered");
     tokio::time::advance(readiness_width).await;
     assert!(matches!(
         completion

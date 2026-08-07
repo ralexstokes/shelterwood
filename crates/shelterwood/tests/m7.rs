@@ -428,6 +428,50 @@ async fn idempotent_reply_drop_retries_only_on_a_superseding_incarnation() {
         .expect("reply-drop actor stops");
 }
 
+#[tokio::test]
+async fn idempotent_constructor_time_cannot_extend_the_overall_budget() {
+    let gate = ReleaseGate::default();
+    gate.release();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "constructor-budget",
+            RawOnceDef::new(MappingActor {
+                gate,
+                values: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .expect("valid constructor-budget actor");
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("constructor-budget actor starts");
+
+    let error = actor
+        .call_idempotent(
+            |reply| {
+                std::thread::sleep(Duration::from_millis(20));
+                MappingMessage::Ask(1, reply)
+            },
+            RetryPolicy::new(Duration::from_secs(1), Backoff::Immediate)
+                .expect("valid retry policy"),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("message construction cannot create time beyond the overall budget");
+    assert_eq!(error.kind, IdempotentCallErrorKind::BudgetExhausted);
+    assert!(
+        error.attempts.is_empty(),
+        "no request reached actor ingress"
+    );
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("constructor-budget actor stops");
+}
+
 enum SliceMessage {
     Fill,
     Ask(Reply<usize>),

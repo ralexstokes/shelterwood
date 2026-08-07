@@ -1814,9 +1814,16 @@ where
                 kind: IdempotentCallErrorKind::BudgetExhausted,
             });
         }
-        let slice = policy.per_attempt.min(remaining);
         let (reply, mut receiver) = Reply::channel();
         let message = make_msg(reply);
+        let remaining = overall_remaining(started, overall_deadline);
+        if remaining.is_zero() {
+            return Err(IdempotentCallError {
+                attempts,
+                kind: IdempotentCallErrorKind::BudgetExhausted,
+            });
+        }
+        let slice = policy.per_attempt.min(remaining);
         let reply = receiver
             .shared
             .take()

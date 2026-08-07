@@ -343,15 +343,11 @@ pub(crate) struct Completion<T> {
 }
 
 impl<T> Completion<T> {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(changed: Signal) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(CompletionState::Pending),
-            changed: Signal::default(),
+            changed,
         })
-    }
-
-    pub(crate) fn signal(&self) -> Signal {
-        self.changed.clone()
     }
 
     fn complete(&self, value: T) {

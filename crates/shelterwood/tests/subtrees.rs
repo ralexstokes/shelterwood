@@ -1,7 +1,7 @@
 use std::{
     future,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -457,6 +457,86 @@ async fn hard_aborted_subtree_descendants_still_publish_exits() {
         .expect("hard-aborted descendants terminalize");
     assert!(matches!(exit.kind(), ExitKind::Aborted { .. }));
     assert!(exit.cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
+    let held = Arc::new(());
+    let weak = Arc::downgrade(&held);
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let mut inner = Tree::new();
+    inner
+        .add_task(
+            "leaf",
+            TaskDef::new({
+                let held = Arc::clone(&held);
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                move |_| {
+                    let held = Arc::clone(&held);
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    async move {
+                        let _held = held;
+                        started.store(true, Ordering::Release);
+                        let (released, wake) = &*release;
+                        let mut released = released.lock().expect("release mutex poisoned");
+                        while !*released {
+                            released = wake.wait(released).expect("release mutex poisoned");
+                        }
+                        Ok(())
+                    }
+                }
+            })
+            .shutdown(Shutdown::Graceful {
+                grace: Duration::from_secs(60),
+            }),
+        )
+        .expect("valid leaf");
+    drop(held);
+
+    let mut outer = Tree::new();
+    outer
+        .add_subtree_once("inner", SubtreeOnceDef::new(inner))
+        .expect("valid inner subtree");
+    let mut root = Tree::new();
+    root.add_subtree_once(
+        "outer",
+        SubtreeOnceDef::new(outer).shutdown(Shutdown::Abort),
+    )
+    .expect("valid outer subtree");
+
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            started.load(Ordering::Acquire)
+        })
+        .await,
+        "leaf starts polling"
+    );
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(5)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let returned_before_leaf_dropped = shutdown.is_finished();
+    {
+        let (released, wake) = &*release;
+        *released.lock().expect("release mutex poisoned") = true;
+        wake.notify_all();
+    }
+    shutdown
+        .await
+        .expect("shutdown task does not panic")
+        .expect("root shuts down");
+
+    assert!(
+        weak.upgrade().is_none(),
+        "shutdown returns only after every nested driver and construction drops"
+    );
+    assert!(
+        !returned_before_leaf_dropped,
+        "shutdown must not return while a recursively aborted child future is still polling"
+    );
 }
 
 #[tokio::test]

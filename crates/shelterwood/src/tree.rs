@@ -790,8 +790,7 @@ impl TaskSlot {
         definition: TaskOnceDef<T>,
     ) -> (TaskRef, OneShotTaskRef<T>) {
         let task = self.task_ref();
-        let completion = Completion::new();
-        self.slot.member.add_terminal_signal(completion.signal());
+        let completion = Completion::new(self.slot.member.change_signal());
         let claim = OneShotTaskRef::new(Arc::clone(&completion), task.clone());
         self.slot
             .define(ChildConstruction::TaskOnce(definition.erase(completion)));
@@ -1138,12 +1137,8 @@ impl DynamicTaskSlot {
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
         let task = self.task_ref();
-        let completion = Completion::new();
+        let completion = Completion::new(self.reservation().slot.member.change_signal());
         let reservation = self.take_reservation();
-        reservation
-            .slot
-            .member
-            .add_terminal_signal(completion.signal());
         let claim = OneShotTaskRef::new(Arc::clone(&completion), task.clone());
         reservation
             .slot
@@ -1156,12 +1151,8 @@ impl DynamicTaskSlot {
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
         let task = self.task_ref();
-        let completion = Completion::new();
+        let completion = Completion::new(self.reservation().slot.member.change_signal());
         let reservation = self.take_reservation();
-        reservation
-            .slot
-            .member
-            .add_terminal_signal(completion.signal());
         let claim = OneShotTaskRef::new(Arc::clone(&completion), task.clone());
         reservation
             .slot
@@ -2040,7 +2031,7 @@ impl<R: Clone> System<R> {
     /// Waits for natural or externally requested terminal state.
     pub async fn wait(mut self) -> StopReason {
         self.armed = false;
-        self.run.root.wait_stopped().await
+        self.run.wait().await
     }
 }
 

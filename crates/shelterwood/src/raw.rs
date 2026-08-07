@@ -226,6 +226,17 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
     }
 }
 
+impl<F> Drop for CatchUnwindFuture<F> {
+    fn drop(&mut self) {
+        let already_panicking = std::thread::panicking();
+        let future = self.future.take();
+        let panic = catch_unwind(AssertUnwindSafe(|| drop(future))).err();
+        if !already_panicking && let Some(payload) = panic {
+            resume_unwind(payload);
+        }
+    }
+}
+
 enum QueuedEvent<M> {
     Deliver {
         cancellation: Latch,

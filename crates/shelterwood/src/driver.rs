@@ -31,7 +31,7 @@ use crate::{
         LifecycleHub, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
     },
     policy::{DefaultsInheritance, ResolvedDefaults},
-    raw::{RawRunContext, RawSpawn},
+    raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
     runtime::{self, Latch},
     task::{OnceTaskBody, TaskContext, TaskFactory},
     tree::{
@@ -260,6 +260,7 @@ pub(crate) struct MemberCell {
     id: ChildId,
     membership: Mutex<Membership>,
     record: runtime::WatchSender<MemberRecord>,
+    terminal_disposal_pending: AtomicBool,
     mailbox: Mutex<MemberMailbox>,
     options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
     pub(crate) removal: Latch,
@@ -299,6 +300,7 @@ impl MemberCell {
             id,
             membership: Mutex::new(membership),
             record,
+            terminal_disposal_pending: AtomicBool::new(false),
             mailbox: Mutex::new(MemberMailbox::default()),
             options: Mutex::new(None),
             removal: Latch::default(),
@@ -332,6 +334,15 @@ impl MemberCell {
 
     pub(crate) fn record(&self) -> MemberRecord {
         self.record.read_cloned()
+    }
+
+    fn terminal_disposal_pending(&self) -> bool {
+        self.terminal_disposal_pending.load(Ordering::Acquire)
+    }
+
+    fn set_terminal_disposal_pending(&self, pending: bool) {
+        self.terminal_disposal_pending
+            .store(pending, Ordering::Release);
     }
 
     pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
@@ -429,7 +440,11 @@ impl MemberCell {
             .expect("member mailbox mutex poisoned")
             .teardown
             .take();
-        drop(teardown);
+        if let Some(teardown) = teardown
+            && let Some(payload) = teardown.finish()
+        {
+            runtime::dispose_detached(payload);
+        }
         if published {
             self.record.pulse();
         }
@@ -1383,19 +1398,23 @@ impl DynamicControl {
         state.accepting = false;
         let entries = std::mem::take(&mut state.entries);
         drop(state);
-        for entry in entries.values() {
+        let mut retained = HashMap::new();
+        for (id, entry) in entries {
             if !entry.admitted {
-                drop(entry.slot.take_defined());
+                let definition = entry.slot.take_defined();
                 entry.slot.member.terminalize(Exit::never_started());
                 if let Some(scope) = &entry.slot.scope {
                     scope.terminalize_never_started();
                 }
+                dispose_definition_then(definition, move || drop(entry));
+            } else {
+                retained.insert(id, entry);
             }
         }
         // The caller holds admitted entries across member terminality and
         // residency removal. Dropping them then completes every in-flight
         // removal without waking a remover before those observation edges.
-        entries
+        retained
     }
 }
 
@@ -1487,7 +1506,13 @@ pub(crate) fn start_admission(
     response
 }
 
-pub(crate) fn cancel_dynamic_reservation(control: &Arc<DynamicControl>, slot: &Arc<SlotCell>) {
+fn cancel_dynamic_reservation_parts(
+    control: &Arc<DynamicControl>,
+    slot: &Arc<SlotCell>,
+) -> (
+    Option<runtime::Isolated<ChildConstruction>>,
+    Option<DynamicEntry>,
+) {
     let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
     let id = slot.member.id().clone();
     let cancelled = state.entries.get(&id).is_some_and(|entry| {
@@ -1495,16 +1520,24 @@ pub(crate) fn cancel_dynamic_reservation(control: &Arc<DynamicControl>, slot: &A
     });
     let removed = cancelled.then(|| state.entries.remove(&id)).flatten();
     drop(state);
-    if cancelled {
-        drop(slot.take_defined());
+    let definition = if cancelled {
+        let definition = slot.take_defined();
         slot.member.terminalize(Exit::never_started());
         if let Some(scope) = &slot.scope {
             scope.terminalize_never_started();
         }
-    }
+        definition
+    } else {
+        None
+    };
+    (definition, removed)
+}
+
+pub(crate) fn cancel_dynamic_reservation(control: &Arc<DynamicControl>, slot: &Arc<SlotCell>) {
+    let (definition, removed) = cancel_dynamic_reservation_parts(control, slot);
     // The entry's drop completes its removal response; it must follow the
-    // member's terminal publication.
-    drop(removed);
+    // member's terminal publication and isolated definition disposal.
+    dispose_definition_then(definition, move || drop(removed));
 }
 
 pub(crate) fn signal_fused_cancel(control: &Arc<DynamicControl>, latch: &Latch) {
@@ -1539,11 +1572,12 @@ pub(crate) fn remove_dynamic(
     if !entry.admitted {
         let entry = state.entries.remove(id).expect("entry was just resolved");
         drop(state);
-        drop(entry.slot.take_defined());
+        let definition = entry.slot.take_defined();
         entry.slot.member.terminalize(Exit::never_started());
         if let Some(scope) = &entry.slot.scope {
             scope.terminalize_never_started();
         }
+        dispose_definition_then(definition, move || drop(entry));
         return response;
     }
     // Terminal residents still have a driver registration. Route them
@@ -1570,6 +1604,35 @@ impl AdmissionRequest {
             let _ = sender.send(result);
         });
     }
+}
+
+fn reject_admission_after_disposal(
+    mut request: AdmissionRequest,
+    definition: Option<runtime::Isolated<ChildConstruction>>,
+    removed: Option<DynamicEntry>,
+    error: ReserveError,
+) {
+    dispose_definition_then(definition, move || {
+        drop(removed);
+        request.complete(Err(error));
+    });
+}
+
+fn dispose_definition_then(
+    mut definition: Option<runtime::Isolated<ChildConstruction>>,
+    completion: impl FnOnce() + Send + 'static,
+) {
+    let construction = definition.as_mut().and_then(runtime::Isolated::take);
+    let Some(construction) = construction else {
+        completion();
+        return;
+    };
+    runtime::dispose_then(construction, move |_| {
+        // A never-admitted definition has no incarnation verdict to publish,
+        // but its destructor must still be isolated and complete before any
+        // response releases ownership back to the caller.
+        completion();
+    });
 }
 
 enum DriverEvent {
@@ -1627,7 +1690,9 @@ fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<Shutd
             .collect::<Vec<_>>()
     });
     for child in children {
-        if matches!(child.member.record().stage, MemberStage::Terminal(_)) {
+        if matches!(child.member.record().stage, MemberStage::Terminal(_))
+            || child.member.terminal_disposal_pending()
+        {
             continue;
         }
         let mut path = prefix.to_vec();
@@ -1685,7 +1750,11 @@ pub(crate) async fn shutdown_scope(
             collect_stragglers(&scope, &[], &mut stragglers);
             scope.force_shutdown(epoch);
             wait_for_incarnation(&scope, epoch).await;
-            Err(ShutdownTimeout { stragglers })
+            if stragglers.is_empty() {
+                Ok(())
+            } else {
+                Err(ShutdownTimeout { stragglers })
+            }
         }
     }
 }
@@ -1737,6 +1806,10 @@ enum ChildEvent {
         recorded: Option<RecordedOutcome>,
         join: JoinVerdict,
         cancelled: bool,
+    },
+    ConstructionDisposed {
+        child: ChildKey,
+        panic: Option<Option<String>>,
     },
 }
 
@@ -1804,7 +1877,8 @@ fn discharge_child_terminality(completion: ChildTerminality) {
 struct ChildRuntime {
     slot: Arc<crate::tree::SlotCell>,
     terminality: Obligation<ChildTerminality>,
-    construction: Option<ChildConstruction>,
+    construction: runtime::Isolated<ChildConstruction>,
+    pending_terminal: Option<PendingTerminal>,
     options: crate::policy::ResolvedCommonOptions,
     incarnations: FenceCounter,
     restarts: RestartState,
@@ -1813,6 +1887,12 @@ struct ChildRuntime {
     initial_ready: bool,
     initial: bool,
     spawned_once: bool,
+}
+
+struct PendingTerminal {
+    exit: Exit,
+    exited_incarnation: Option<Incarnation>,
+    startup_aborted: bool,
 }
 
 impl ChildRuntime {
@@ -1843,7 +1923,8 @@ impl ChildRuntime {
         Self {
             terminality,
             slot,
-            construction: Some(construction),
+            construction,
+            pending_terminal: None,
             options,
             incarnations,
             restarts: RestartState::new(),
@@ -1853,6 +1934,10 @@ impl ChildRuntime {
             initial: true,
             spawned_once: false,
         }
+    }
+
+    fn is_disposing(&self) -> bool {
+        self.pending_terminal.is_some()
     }
 
     fn is_terminal(&self) -> bool {
@@ -2107,6 +2192,7 @@ struct ScopeRuntime {
     ancestor_abort: Option<Latch>,
     ancestor_abort_ack: Option<Latch>,
     ancestor_abort_seen: bool,
+    hard_forced: bool,
     completion: Option<ScopeCompletion>,
 }
 
@@ -2128,7 +2214,9 @@ impl Drop for ScopeRuntime {
             if let Some(active) = child.active.take() {
                 if let Some(mailbox) = child.slot.member.mailbox() {
                     mailbox.freeze(active.incarnation);
-                    mailbox.close(active.incarnation);
+                    if let Some(teardown) = mailbox.close(active.incarnation) {
+                        runtime::dispose_detached(teardown);
+                    }
                 }
                 active.shutdown.fire();
                 active.abort.fire();
@@ -2200,7 +2288,7 @@ impl ScopeRuntime {
         let Some(child) = self.children.get(key) else {
             return;
         };
-        if self.phase.is_draining() || child.is_terminal() {
+        if self.phase.is_draining() || child.is_terminal() || child.is_disposing() {
             return;
         }
         let child = &mut self.children[key];
@@ -2217,7 +2305,9 @@ impl ScopeRuntime {
             if child.options.retention == crate::Retention::Remove {
                 self.root.prune_child(&child.slot.member);
             }
-            child.construction.take();
+            if let Some(construction) = child.construction.take() {
+                runtime::dispose_detached(construction);
+            }
             let exit = match child.slot.member.record().stage {
                 MemberStage::Terminal(exit) => exit,
                 _ => Exit::never_started(),
@@ -2254,41 +2344,49 @@ impl ScopeRuntime {
             abort.clone(),
             ready.clone(),
         );
-        let construction = child
-            .construction
-            .as_mut()
-            .expect("a live child retains its construction");
+        let construction = child.construction.get_mut();
         let scope_child = matches!(construction, ChildConstruction::Scope(_));
-        let (body, declared_readiness) = match construction {
-            ChildConstruction::Raw(definition) => (
-                SpawnBody::Raw {
-                    spawn: definition.take_spawn(),
-                    context: RawRunContext {
-                        id,
-                        incarnation,
-                        member: Arc::clone(&child.slot.member),
-                        scope: crate::ScopeRef {
-                            cell: Arc::clone(&self.root),
+        let (body, declared_readiness, construction_spent) = match construction {
+            ChildConstruction::Raw(definition) => {
+                let one_shot = definition.one_shot();
+                let spawn = definition.take_spawn();
+                (
+                    SpawnBody::Raw {
+                        spawn,
+                        context: RawRunContext {
+                            id,
+                            incarnation,
+                            member: Arc::clone(&child.slot.member),
+                            scope: crate::ScopeRef {
+                                cell: Arc::clone(&self.root),
+                            },
+                            shutdown: shutdown.clone(),
+                            abort: abort.clone(),
+                            ready: ready.clone(),
+                            local_stop: local_stop.clone(),
+                            mailbox_shutdown: child.options.mailbox_shutdown,
                         },
-                        shutdown: shutdown.clone(),
-                        abort: abort.clone(),
-                        ready: ready.clone(),
-                        local_stop: local_stop.clone(),
-                        mailbox_shutdown: child.options.mailbox_shutdown,
                     },
-                },
-                None,
-            ),
-            ChildConstruction::Task(definition) => (
-                SpawnBody::TaskRestartable(Arc::clone(&definition.factory)),
-                Some(child.options.readiness),
-            ),
+                    None,
+                    one_shot,
+                )
+            }
+            ChildConstruction::Task(definition) => {
+                let factory = Arc::clone(&definition.factory);
+                (
+                    SpawnBody::TaskRestartable(factory),
+                    Some(child.options.readiness),
+                    false,
+                )
+            }
             ChildConstruction::TaskOnce(definition) => {
                 let body = std::mem::replace(&mut definition.body, OnceTaskBody::Spent);
                 match body {
-                    OnceTaskBody::Available(body) => {
-                        (SpawnBody::TaskOnce(body), Some(child.options.readiness))
-                    }
+                    OnceTaskBody::Available(body) => (
+                        SpawnBody::TaskOnce(body),
+                        Some(child.options.readiness),
+                        true,
+                    ),
                     OnceTaskBody::Spent => {
                         panic!("one-shot task construction invoked more than once")
                     }
@@ -2313,6 +2411,7 @@ impl ScopeRuntime {
                             inherited,
                         },
                         Some(Readiness::Manual),
+                        false,
                     ),
                     ScopeSource::OneShot(_) => {
                         let source = std::mem::replace(&mut definition.source, ScopeSource::Spent);
@@ -2332,6 +2431,7 @@ impl ScopeRuntime {
                                 inherited,
                             },
                             Some(Readiness::Manual),
+                            true,
                         )
                     }
                     ScopeSource::Spent => {
@@ -2409,64 +2509,78 @@ impl ScopeRuntime {
         let constructed_sender = self.events.clone();
         let run_release = construction_release.clone();
         let child_readiness_override = child.options.readiness_override;
+        if construction_spent {
+            // One-shot actor/task/subtree state has moved into `body`; the
+            // retained construction is now framework-only spent metadata.
+            // Release it without adding a blocking-pool scheduling edge to
+            // terminal publication or restart-window arbitration.
+            drop(child.construction.take());
+        }
         let handle = runtime::spawn(incarnation, async move {
-            let result = match body {
-                SpawnBody::Raw { spawn, context } => {
-                    let instance = spawn.construct();
-                    let readiness = match child_readiness_override {
-                        Some(readiness) => readiness,
-                        None => instance.readiness(),
-                    };
-                    let _ = runtime::mpsc_send(
-                        &constructed_sender,
-                        DriverEvent::Child(ChildEvent::Constructed {
-                            child: key,
-                            incarnation,
-                            readiness,
-                        }),
-                    )
-                    .await;
-                    run_release.fired().await;
-                    instance.run(context, readiness).await
-                }
-                SpawnBody::TaskRestartable(factory) => {
-                    let future = factory(task_context);
-                    future.await
-                }
-                SpawnBody::TaskOnce(body) => body(task_context).await,
-                SpawnBody::ScopeRestartable {
-                    factory,
-                    scope,
-                    inherited,
-                } => {
-                    let tree = factory();
-                    run_nested_tree(
+            let body = async move {
+                match body {
+                    SpawnBody::Raw { spawn, context } => {
+                        let instance = spawn.construct();
+                        let readiness = match child_readiness_override {
+                            Some(readiness) => readiness,
+                            None => instance.readiness(),
+                        };
+                        let _ = runtime::mpsc_send(
+                            &constructed_sender,
+                            DriverEvent::Child(ChildEvent::Constructed {
+                                child: key,
+                                incarnation,
+                                readiness,
+                            }),
+                        )
+                        .await;
+                        run_release.fired().await;
+                        instance.run(context, readiness).await
+                    }
+                    SpawnBody::TaskRestartable(factory) => {
+                        let future = factory(task_context);
+                        future.await
+                    }
+                    SpawnBody::TaskOnce(body) => body(task_context).await,
+                    SpawnBody::ScopeRestartable {
+                        factory,
+                        scope,
+                        inherited,
+                    } => {
+                        let tree = factory();
+                        run_nested_tree(
+                            tree,
+                            scope,
+                            inherited,
+                            nested_ready,
+                            nested_cancel,
+                            nested_abort,
+                            nested_abort_ack,
+                        )
+                        .await
+                    }
+                    SpawnBody::ScopeOnce {
                         tree,
                         scope,
                         inherited,
-                        nested_ready,
-                        nested_cancel,
-                        nested_abort,
-                        nested_abort_ack,
-                    )
-                    .await
+                    } => {
+                        run_nested_tree(
+                            *tree,
+                            scope,
+                            inherited,
+                            nested_ready,
+                            nested_cancel,
+                            nested_abort,
+                            nested_abort_ack,
+                        )
+                        .await
+                    }
                 }
-                SpawnBody::ScopeOnce {
-                    tree,
-                    scope,
-                    inherited,
-                } => {
-                    run_nested_tree(
-                        *tree,
-                        scope,
-                        inherited,
-                        nested_ready,
-                        nested_cancel,
-                        nested_abort,
-                        nested_abort_ack,
-                    )
-                    .await
-                }
+            };
+            let outcome = CatchUnwindFuture::new(body).await;
+            let result = match outcome {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
             };
             report.record(RecordedOutcome::Returned(result));
         });
@@ -2608,7 +2722,7 @@ impl ScopeRuntime {
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
-        if child.is_terminal() {
+        if child.is_terminal() || child.is_disposing() {
             return;
         }
         if let Some(active) = &mut child.active {
@@ -2641,15 +2755,28 @@ impl ScopeRuntime {
             }
             let record = child.slot.member.record();
             let exit = record.last_exit.unwrap_or_else(Exit::never_started);
-            if record.last_incarnation.is_none()
-                && let Some(scope) = &child.slot.scope
-            {
-                scope.terminalize_never_started();
+            if record.last_incarnation.is_none() {
+                if let Some(scope) = &child.slot.scope {
+                    scope.terminalize_never_started();
+                }
+                // A never-ran terminal is the plain `Stopped { NeverStarted }`
+                // state (B.6), not a §6 startup abort. Its definition still
+                // owns the only user resource, so join disposal before
+                // completing the scope, while publishing the never-started
+                // member state synchronously for startup observation.
+                self.begin_terminal_disposal(key, exit, None, false);
+                self.children[key].terminalize(&self.root, Exit::never_started(), None, false);
+            } else {
+                // Between incarnations, the recorded exit already owns the
+                // child verdict. There is no incarnation left to classify a
+                // later factory destructor, so publish synchronously and
+                // isolate cleanup without turning it into a shutdown
+                // straggler (including for a zero shutdown budget).
+                child.terminalize(&self.root, exit, None, false);
+                if let Some(construction) = child.construction.take() {
+                    runtime::dispose_detached(construction);
+                }
             }
-            // A never-ran terminal is the plain `Stopped { NeverStarted }`
-            // state (B.6), not a §6 startup abort.
-            child.terminalize(&self.root, exit, None, false);
-            child.construction.take();
         }
     }
 
@@ -2740,22 +2867,20 @@ impl ScopeRuntime {
             return;
         }
         loop {
-            let Some(key) = self
-                .children
-                .keys()
-                .rev()
-                .find(|key| !self.children[*key].is_terminal())
-            else {
+            let Some(key) = self.children.keys().rev().find(|key| {
+                !self.children[*key].is_terminal() || self.children[*key].is_disposing()
+            }) else {
                 return;
             };
             self.begin_stop_child(key, None);
-            if self.children[key].active.is_some() {
+            if self.children[key].active.is_some() || self.children[key].is_disposing() {
                 return;
             }
         }
     }
 
     fn force_all(&mut self) {
+        self.hard_forced = true;
         if !self.phase.is_draining() {
             self.begin_drain(StopReason::ShutdownRequested);
         }
@@ -2773,6 +2898,17 @@ impl ScopeRuntime {
             active.abort.fire();
             active.ladder = Some(ladder);
             self.advance_ladder(key, now);
+        }
+        let disposing = self
+            .children
+            .keys()
+            .filter(|key| self.children[*key].pending_terminal.is_some())
+            .collect::<Vec<_>>();
+        for key in disposing {
+            // The incarnation has already exited; only its retained factory
+            // remains. Hard escalation detaches that cleanup, but must not
+            // rewrite the actor's recorded verdict.
+            self.handle_construction_disposed(key, None);
         }
     }
 
@@ -2917,8 +3053,10 @@ impl ScopeRuntime {
         if let Some(deadline) = active.stop_deadline.take() {
             self.deadlines.cancel(deadline);
         }
-        if let Some(mailbox) = child.slot.member.mailbox() {
-            mailbox.close(incarnation);
+        if let Some(mailbox) = child.slot.member.mailbox()
+            && let Some(teardown) = mailbox.close(incarnation)
+        {
+            runtime::dispose_detached(teardown);
         }
         active.readiness.step(ReadinessEvent::Exit);
         if let (JoinVerdict::Cancelled { .. }, Some(after_grace)) =
@@ -2951,24 +3089,7 @@ impl ScopeRuntime {
                 // does not rewind it.
                 let pre_ready =
                     child.initial && !self.phase.startup_complete() && !child.initial_ready;
-                child.terminalize(&self.root, exit.clone(), Some(incarnation), pre_ready);
-                child.construction.take();
-                let removing = child.slot.member.record().removing;
-                if removing {
-                    self.finalize_removal(key);
-                } else if pre_ready && !self.phase.is_draining() {
-                    self.fail_startup(key, exit);
-                    if self.children[key].options.retention == crate::Retention::Remove {
-                        self.prune_terminal(key);
-                    }
-                } else {
-                    if child.options.retention == crate::Retention::Remove {
-                        self.prune_terminal(key);
-                    }
-                    if self.phase.is_draining() {
-                        self.stop_next_ordered();
-                    }
-                }
+                self.begin_terminal_disposal(key, exit, Some(incarnation), pre_ready);
             }
             ExitDispatch::ScheduleRestart => {
                 if !self.phase.startup_complete() {
@@ -3033,6 +3154,90 @@ impl ScopeRuntime {
         }
     }
 
+    fn begin_terminal_disposal(
+        &mut self,
+        key: ChildKey,
+        exit: Exit,
+        exited_incarnation: Option<Incarnation>,
+        startup_aborted: bool,
+    ) {
+        let construction = {
+            let Some(child) = self.children.get_mut(key) else {
+                return;
+            };
+            if child.pending_terminal.is_some() {
+                return;
+            }
+            child.pending_terminal = Some(PendingTerminal {
+                exit,
+                exited_incarnation,
+                startup_aborted,
+            });
+            child.slot.member.set_terminal_disposal_pending(true);
+            child.construction.take()
+        };
+        let Some(construction) = construction else {
+            self.handle_construction_disposed(key, None);
+            return;
+        };
+
+        if self.hard_forced {
+            runtime::dispose_detached(construction);
+            self.handle_construction_disposed(key, None);
+            return;
+        }
+
+        // The retained factory is user-owned. Destroy it on the blocking
+        // pool. The disposal job itself owns completion, so cancellation or
+        // failure to spawn an auxiliary async joiner cannot strand the child.
+        let sender = self.events.clone();
+        runtime::dispose_then(construction, move |panic| {
+            let _ = sender.blocking_send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
+                child: key,
+                panic,
+            }));
+        });
+    }
+
+    fn handle_construction_disposed(&mut self, key: ChildKey, panic: Option<Option<String>>) {
+        let Some(child) = self.children.get_mut(key) else {
+            return;
+        };
+        let Some(mut terminal) = child.pending_terminal.take() else {
+            return;
+        };
+        child.slot.member.set_terminal_disposal_pending(false);
+        if let Some(message) = panic
+            && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
+        {
+            terminal.exit = Exit::new(ExitKind::Panicked { message }, terminal.exit.cancelled());
+        }
+
+        let exit = terminal.exit;
+        self.children[key].terminalize(
+            &self.root,
+            exit.clone(),
+            terminal.exited_incarnation,
+            terminal.startup_aborted,
+        );
+        let removing = self.children[key].slot.member.record().removing;
+        if removing {
+            self.finalize_removal(key);
+        } else if terminal.startup_aborted && !self.phase.is_draining() {
+            self.fail_startup(key, exit);
+            if self.children[key].options.retention == crate::Retention::Remove {
+                self.prune_terminal(key);
+            }
+        } else {
+            if self.children[key].options.retention == crate::Retention::Remove {
+                self.prune_terminal(key);
+            }
+            if self.phase.is_draining() {
+                self.stop_next_ordered();
+            }
+        }
+    }
+
     fn fail_startup(&mut self, key: ChildKey, exit: Exit) {
         let child = &self.children[key];
         let failure = StartupFailure {
@@ -3051,20 +3256,20 @@ impl ScopeRuntime {
                     .children
                     .key_at(later_index)
                     .expect("ordered children are never reclaimed during startup");
-                if !self.children[later].spawned_once {
+                if !self.children[later].spawned_once
+                    && !self.children[later].is_disposing()
+                    && !self.children[later].is_terminal()
+                {
                     if let Some(scope) = &self.children[later].slot.scope {
                         scope.terminalize_never_started();
                     }
+                    self.begin_terminal_disposal(later, Exit::never_started(), None, false);
                     self.children[later].terminalize(
                         &self.root,
                         Exit::never_started(),
                         None,
                         false,
                     );
-                    if self.children[later].options.retention == crate::Retention::Remove {
-                        self.prune_terminal(later);
-                    }
-                    self.children[later].construction.take();
                 }
             }
         }
@@ -3125,7 +3330,11 @@ impl ScopeRuntime {
 
     fn finish_if_ready(&mut self) -> Option<StopReason> {
         if let Some(reason) = self.phase.draining_reason() {
-            if self.children.values().all(ChildRuntime::is_terminal) {
+            if self
+                .children
+                .values()
+                .all(|child| child.is_terminal() && !child.is_disposing())
+            {
                 return Some(reason.clone());
             }
             return None;
@@ -3133,7 +3342,10 @@ impl ScopeRuntime {
         if !self.phase.startup_failed()
             && self.flavor == ScopeFlavor::Ordered
             && !self.children.is_empty()
-            && self.children.values().all(ChildRuntime::is_terminal)
+            && self
+                .children
+                .values()
+                .all(|child| child.is_terminal() && !child.is_disposing())
         {
             return Some(StopReason::Finished);
         }
@@ -3152,7 +3364,6 @@ impl ScopeRuntime {
             || self.phase.is_draining()
             || self.phase.startup_failed()
         {
-            cancel_dynamic_reservation(&control, &request.slot);
             let cause = if self.phase.is_draining() {
                 NotAdmittingCause::Draining
             } else if self.phase.startup_failed() {
@@ -3160,25 +3371,37 @@ impl ScopeRuntime {
             } else {
                 NotAdmittingCause::NoLiveIncarnation
             };
-            request.complete(Err(ReserveError::NotAdmitting(cause)));
+            let (definition, removed) = cancel_dynamic_reservation_parts(&control, &request.slot);
+            reject_admission_after_disposal(
+                request,
+                definition,
+                removed,
+                ReserveError::NotAdmitting(cause),
+            );
             return;
         }
         if request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
-            cancel_dynamic_reservation(&control, &request.slot);
-            request.complete(Err(ReserveError::NotAdmitting(
-                NotAdmittingCause::ReservationEnded,
-            )));
+            let (definition, removed) = cancel_dynamic_reservation_parts(&control, &request.slot);
+            reject_admission_after_disposal(
+                request,
+                definition,
+                removed,
+                ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
+            );
             return;
         }
 
         let Some(definition) = request.slot.take_defined() else {
-            cancel_dynamic_reservation(&control, &request.slot);
-            request.complete(Err(ReserveError::NotAdmitting(
-                NotAdmittingCause::ReservationEnded,
-            )));
+            let (_, removed) = cancel_dynamic_reservation_parts(&control, &request.slot);
+            reject_admission_after_disposal(
+                request,
+                None,
+                removed,
+                ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
+            );
             return;
         };
-        let (options, one_shot) = match &definition {
+        let (options, one_shot) = match definition.get() {
             ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
             ChildConstruction::Task(definition) => (&definition.options, false),
             ChildConstruction::TaskOnce(definition) => (&definition.options, true),
@@ -3210,11 +3433,15 @@ impl ScopeRuntime {
                 }
                 // The entry's drop completes its removal response; preserve
                 // the same terminality-before-completion ordering as every
-                // other reservation-cancellation path.
-                drop(removed);
-                request.complete(Err(ReserveError::NotAdmitting(
-                    NotAdmittingCause::ReservationEnded,
-                )));
+                // other reservation-cancellation path. Definition disposal
+                // is also complete before either waiter regains ownership.
+                let ChildPlan { construction, .. } = plan;
+                reject_admission_after_disposal(
+                    request,
+                    Some(construction),
+                    removed,
+                    ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
+                );
                 return;
             }
             let entry = state
@@ -3385,14 +3612,20 @@ async fn run_nested_tree(
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
         Err(error) => {
-            let failure = StartupFailure {
-                cause: match error {
-                    LowerError::Undefined(undefined) => StartupFailureCause::Lowering { undefined },
-                    LowerError::IdentityExhausted(id) => {
-                        StartupFailureCause::IdentityExhausted { id }
-                    }
-                },
+            let (cause, disposal) = match error {
+                LowerError::Undefined { paths, disposal } => {
+                    (StartupFailureCause::Lowering { undefined: paths }, disposal)
+                }
+                LowerError::IdentityExhausted { id, disposal } => {
+                    (StartupFailureCause::IdentityExhausted { id }, disposal)
+                }
             };
+            // Lowering never created a nested driver to own teardown. Keep
+            // its isolated definitions attached to this incarnation until
+            // they finish; hard-aborting the incarnation still detaches the
+            // cancellation-safe disposal jobs.
+            disposal.fired().await;
+            let failure = StartupFailure { cause };
             scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
             scope.finish_incarnation(epoch, StopReason::StartupFailed(failure.clone()));
             return Err(crate::ExitError::from_startup_failure(failure));
@@ -3494,6 +3727,7 @@ async fn run_scope_incarnation(
         ancestor_abort: incarnation_abort,
         ancestor_abort_ack: incarnation_abort_ack,
         ancestor_abort_seen: false,
+        hard_forced: false,
         completion: None,
     };
     #[cfg(test)]
@@ -3548,7 +3782,9 @@ async fn run_scope_incarnation(
                 }
                 DriverEvent::Child(ChildEvent::Constructed { .. })
                 | DriverEvent::Child(ChildEvent::Ready { .. }) => ArbitrationClass::ReadinessSignal,
-                DriverEvent::Child(ChildEvent::Exited { .. }) => ArbitrationClass::ChildExit,
+                DriverEvent::Child(
+                    ChildEvent::Exited { .. } | ChildEvent::ConstructionDisposed { .. },
+                ) => ArbitrationClass::ChildExit,
                 DriverEvent::Admission(_) => ArbitrationClass::Admission,
             };
             pending.push((class, Pending::Driver(event)));
@@ -3613,9 +3849,9 @@ async fn run_scope_incarnation(
                         | DriverEvent::Child(ChildEvent::Ready { .. }) => {
                             ArbitrationClass::ReadinessSignal
                         }
-                        DriverEvent::Child(ChildEvent::Exited { .. }) => {
-                            ArbitrationClass::ChildExit
-                        }
+                        DriverEvent::Child(
+                            ChildEvent::Exited { .. } | ChildEvent::ConstructionDisposed { .. },
+                        ) => ArbitrationClass::ChildExit,
                         DriverEvent::Admission(_) => ArbitrationClass::Admission,
                     };
                     pending.push((class, Pending::Driver(event)));
@@ -3673,6 +3909,10 @@ async fn run_scope_incarnation(
                     join,
                     cancelled,
                 })) => scope.handle_exit(child, incarnation, recorded, join, cancelled),
+                Pending::Driver(DriverEvent::Child(ChildEvent::ConstructionDisposed {
+                    child,
+                    panic,
+                })) => scope.handle_construction_disposed(child, panic),
                 Pending::Deadline(deadline) => scope.handle_deadline(deadline),
             }
         }

@@ -6,6 +6,7 @@ mod api_trait_conformance;
 mod common;
 mod deadlines;
 mod delivery;
+mod disposal;
 mod drain;
 mod dynamic;
 mod events;

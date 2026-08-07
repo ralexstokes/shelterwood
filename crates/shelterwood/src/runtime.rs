@@ -4,9 +4,10 @@ use std::{
     fmt,
     future::Future,
     ops::RangeBounds,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -25,6 +26,164 @@ pub(crate) fn now() -> std::time::Instant {
 
 pub(crate) fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
+}
+
+/// Ownership wrapper for user values retained by framework state.
+///
+/// Dropping the wrapper transfers the value to an isolated blocking task, so
+/// framework futures never run user destruction as part of their own drop
+/// glue. Callers that need to classify destruction can take the value and
+/// join a dedicated blocking task explicitly.
+pub(crate) struct Isolated<T: Send + 'static> {
+    value: Option<T>,
+}
+
+impl<T: Send + 'static> Isolated<T> {
+    pub(crate) const fn new(value: T) -> Self {
+        Self { value: Some(value) }
+    }
+
+    pub(crate) fn get(&self) -> &T {
+        self.value
+            .as_ref()
+            .expect("isolated user value was already taken")
+    }
+
+    pub(crate) fn get_mut(&mut self) -> &mut T {
+        self.value
+            .as_mut()
+            .expect("isolated user value was already taken")
+    }
+
+    pub(crate) fn take(&mut self) -> Option<T> {
+        self.value.take()
+    }
+}
+
+impl<T: Send + 'static> Drop for Isolated<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            dispose_detached(value);
+        }
+    }
+}
+
+struct DisposalJob<T, C>
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
+    state: Mutex<Option<(T, C)>>,
+}
+
+impl<T, C> DisposalJob<T, C>
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
+    fn new(value: T, completion: C) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(Some((value, completion))),
+        })
+    }
+
+    fn finish(&self) {
+        let Some((value, completion)) = self
+            .state
+            .lock()
+            .expect("disposal job mutex poisoned")
+            .take()
+        else {
+            return;
+        };
+        let panic = catch_unwind(AssertUnwindSafe(|| drop(value)))
+            .err()
+            .map(contain_panic_payload);
+        // Completion is framework bookkeeping. Contain it as well so a
+        // hostile waker or a runtime teardown race cannot unwind a blocking
+        // worker or double-panic while the job is being dropped.
+        let _ = catch_unwind(AssertUnwindSafe(|| completion(panic)));
+    }
+}
+
+impl<T, C> Drop for DisposalJob<T, C>
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn dispatch_disposal<T, C>(job: Arc<DisposalJob<T, C>>)
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
+    if is_available() {
+        let worker = Arc::clone(&job);
+        if let Ok(handle) = catch_unwind(AssertUnwindSafe(|| {
+            task::spawn_blocking(move || worker.finish())
+        })) {
+            drop(handle);
+            return;
+        }
+    }
+
+    let worker = Arc::clone(&job);
+    if std::thread::Builder::new()
+        .name("shelterwood-disposal".to_owned())
+        .spawn(move || worker.finish())
+        .is_ok()
+    {
+        return;
+    }
+
+    // Exhausted task and thread creation must not strand completion or expose
+    // a destructor panic. Blocking here is the only remaining safe fallback.
+    job.finish();
+}
+
+/// Runs potentially blocking user destruction away from the caller and then
+/// invokes framework completion with the contained panic diagnostic.
+pub(crate) fn dispose_then<T, C>(value: T, completion: C)
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
+    dispatch_disposal(DisposalJob::new(value, completion));
+}
+
+/// Detaches potentially blocking or panicking user destruction from the
+/// caller. The guard also contains a panic if task/thread creation itself
+/// fails and drops the closure on the submitting thread.
+pub(crate) fn dispose_detached<T: Send + 'static>(value: T) {
+    dispose_then(value, |_| {});
+}
+
+/// Starts isolated disposal for every value and fires once all jobs finish.
+///
+/// Each value gets its own unwind boundary, so one destructor panic cannot
+/// prevent the remaining values or the aggregate completion from running.
+pub(crate) fn dispose_all<T: Send + 'static>(values: Vec<T>) -> Latch {
+    let completion = Latch::default();
+    if values.is_empty() {
+        completion.fire();
+        return completion;
+    }
+
+    let remaining = Arc::new(AtomicUsize::new(values.len()));
+    for value in values {
+        let remaining = Arc::clone(&remaining);
+        let value_completion = completion.clone();
+        dispose_then(value, move |_| {
+            if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                value_completion.fire();
+            }
+        });
+    }
+    completion
 }
 
 /// A one-shot, multi-waiter signal backed by Tokio's waiter queue.
@@ -378,7 +537,7 @@ pub(crate) async fn join<I, T>(handle: JoinHandle<I, T>) -> JoinOutcome<T> {
     match inner.await {
         Ok(value) => JoinOutcome::Ok { value },
         Err(error) if error.is_panic() => JoinOutcome::Panic {
-            message: panic_message(error.into_panic()),
+            message: contain_panic_payload(error.into_panic()),
         },
         Err(error) => {
             debug_assert!(error.is_cancelled());
@@ -399,7 +558,17 @@ pub(crate) async fn join_resuming<I, T>(handle: JoinHandle<I, T>) -> (I, T) {
     }
 }
 
-fn panic_message(payload: Box<dyn std::any::Any + Send + 'static>) -> Option<String> {
+fn contain_panic_payload(payload: Box<dyn std::any::Any + Send + 'static>) -> Option<String> {
+    let message = catch_unwind(AssertUnwindSafe(|| panic_message(payload.as_ref())))
+        .ok()
+        .flatten();
+    // A custom panic payload is user-owned too. Its destructor may panic, so
+    // discard it under a fresh unwind boundary before publishing completion.
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+    message
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send + 'static)) -> Option<String> {
     if let Some(message) = payload.downcast_ref::<&str>() {
         Some((*message).to_owned())
     } else {
@@ -502,14 +671,44 @@ mod tests {
     use std::{
         future::Future,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::Poll,
         time::Duration,
     };
 
-    use super::{JoinOutcome, Latch, Timeout, join, spawn, timeout, yield_now};
+    use super::{DisposalJob, JoinOutcome, Latch, Timeout, join, spawn, timeout, yield_now};
+
+    struct PanickingDrop(Arc<AtomicUsize>);
+
+    impl Drop for PanickingDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("cancelled disposal job payload");
+        }
+    }
+
+    #[test]
+    fn dropping_an_unstarted_disposal_job_contains_panic_and_completes_once() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let diagnostic = Arc::new(Mutex::new(None));
+        let completion_diagnostic = Arc::clone(&diagnostic);
+        let job = DisposalJob::new(PanickingDrop(Arc::clone(&drops)), move |panic| {
+            *completion_diagnostic
+                .lock()
+                .expect("diagnostic mutex poisoned") = Some(panic);
+        });
+
+        drop(job);
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let diagnostic = diagnostic.lock().expect("diagnostic mutex poisoned");
+        assert!(matches!(
+            diagnostic.as_ref(),
+            Some(Some(Some(message))) if message == "cancelled disposal job payload"
+        ));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn exactly_one_concurrent_fire_performs_the_transition() {

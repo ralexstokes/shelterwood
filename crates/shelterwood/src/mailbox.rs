@@ -648,12 +648,12 @@ pub(crate) struct MailboxStats {
     pub(crate) capacity: usize,
 }
 
-struct Promotion<M> {
+struct Promotion<M: Send + 'static> {
     displaced: Vec<Envelope<M>>,
     wakers: Vec<Waker>,
 }
 
-impl<M> Default for Promotion<M> {
+impl<M: Send + 'static> Default for Promotion<M> {
     fn default() -> Self {
         Self {
             displaced: Vec::new(),
@@ -662,16 +662,35 @@ impl<M> Default for Promotion<M> {
     }
 }
 
-impl<M> Promotion<M> {
+impl<M: Send + 'static> Promotion<M> {
     fn finish(self) {}
+
+    fn finish_isolated(mut self) {
+        let displaced = std::mem::take(&mut self.displaced);
+        if !displaced.is_empty() {
+            crate::runtime::dispose_detached(MailboxPayload {
+                queue: Some(displaced.into()),
+                latest: None,
+                retired: Vec::new(),
+            });
+        }
+        self.finish();
+    }
 }
 
-impl<M> Drop for Promotion<M> {
+impl<M: Send + 'static> Drop for Promotion<M> {
     fn drop(&mut self) {
         let already_panicking = std::thread::panicking();
         let mut first_panic = None;
         for waker in self.wakers.drain(..) {
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| waker.wake()))
+                && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
+        }
+        for displaced in self.displaced.drain(..) {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(displaced)))
                 && first_panic.is_none()
             {
                 first_panic = Some(payload);
@@ -689,16 +708,58 @@ struct Termination<M> {
 }
 
 impl<M> Termination<M> {
-    fn finish(self) {}
-
-    fn drain(&mut self) {
-        let already_panicking = std::thread::panicking();
+    fn finish(
+        &mut self,
+        retired: &mut Vec<Arc<SendOperation<M>>>,
+    ) -> Option<Box<dyn std::any::Any + Send + 'static>> {
         let mut first_panic = None;
+        let final_incarnation = self.final_incarnation;
         while let Some((registration, waiter)) = self.waiters.pop_front() {
             waiter.clear_registration(registration);
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
-                waiter.terminate(self.final_incarnation);
+                waiter.terminate(final_incarnation);
             })) && first_panic.is_none()
+            {
+                first_panic = Some(payload);
+            }
+            // A withdrawn sender may leave this as the final operation owner,
+            // so retain it for the same isolated path as unread messages.
+            retired.push(waiter);
+        }
+        first_panic
+    }
+}
+
+pub(crate) trait MailboxDisposal: Send {}
+
+struct MailboxPayload<M> {
+    queue: Option<VecDeque<Envelope<M>>>,
+    latest: Option<Envelope<M>>,
+    retired: Vec<Arc<SendOperation<M>>>,
+}
+
+impl<M> Drop for MailboxPayload<M> {
+    fn drop(&mut self) {
+        let already_panicking = std::thread::panicking();
+        let mut first_panic = None;
+        if let Some(mut queue) = self.queue.take() {
+            while let Some(envelope) = queue.pop_front() {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(envelope)))
+                    && first_panic.is_none()
+                {
+                    first_panic = Some(payload);
+                }
+            }
+        }
+        if let Some(latest) = self.latest.take()
+            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(latest)))
+            && first_panic.is_none()
+        {
+            first_panic = Some(payload);
+        }
+        for waiter in self.retired.drain(..) {
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(waiter)))
+                && first_panic.is_none()
             {
                 first_panic = Some(payload);
             }
@@ -709,40 +770,72 @@ impl<M> Termination<M> {
     }
 }
 
-impl<M> Drop for Termination<M> {
-    fn drop(&mut self) {
-        self.drain();
-    }
+impl<M: Send> MailboxDisposal for MailboxPayload<M> {}
+
+pub(crate) trait MailboxTermination: Send {
+    fn finish(self: Box<Self>) -> Option<Box<dyn MailboxDisposal>>;
 }
 
-pub(crate) trait MailboxTermination: Send {}
-
-struct MailboxTeardown<M> {
-    changed: Signal,
-    queue: Option<VecDeque<Envelope<M>>>,
-    latest: Option<Envelope<M>>,
+struct MailboxTeardown<M: Send + 'static> {
+    changed: Option<Signal>,
+    payload: crate::runtime::Isolated<MailboxPayload<M>>,
     termination: Option<Termination<M>>,
 }
 
-impl<M> Drop for MailboxTeardown<M> {
-    fn drop(&mut self) {
-        self.changed.pulse();
-        drop(self.queue.take());
-        drop(self.latest.take());
-        if let Some(termination) = self.termination.take() {
-            termination.finish();
+impl<M: Send + 'static> MailboxTeardown<M> {
+    fn finish_framework(&mut self) -> Option<Box<dyn std::any::Any + Send + 'static>> {
+        let mut first_panic = None;
+        if let Some(changed) = self.changed.take()
+            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| changed.pulse()))
+        {
+            first_panic = Some(payload);
         }
+        if let Some(mut termination) = self.termination.take() {
+            let panic = termination.finish(&mut self.payload.get_mut().retired);
+            if first_panic.is_none() {
+                first_panic = panic;
+            }
+        }
+        first_panic
     }
 }
 
-impl<M: Send> MailboxTermination for MailboxTeardown<M> {}
+impl<M: Send + 'static> MailboxTermination for MailboxTeardown<M> {
+    fn finish(mut self: Box<Self>) -> Option<Box<dyn MailboxDisposal>> {
+        let panic = self.finish_framework();
+        let payload = self
+            .payload
+            .take()
+            .map(|payload| Box::new(payload) as Box<dyn MailboxDisposal>);
+        if let Some(panic) = panic {
+            if let Some(payload) = payload {
+                crate::runtime::dispose_detached(payload);
+            }
+            resume_unwind(panic);
+        }
+        payload
+    }
+}
+
+impl<M: Send + 'static> Drop for MailboxTeardown<M> {
+    fn drop(&mut self) {
+        let already_panicking = std::thread::panicking();
+        let panic = self.finish_framework();
+        if let Some(payload) = self.payload.take() {
+            crate::runtime::dispose_detached(payload);
+        }
+        if !already_panicking && let Some(panic) = panic {
+            resume_unwind(panic);
+        }
+    }
+}
 
 /// Type-erased control used by the supervision driver.
 pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
     fn configure(&self, mailbox: Mailbox);
     fn bind(&self, incarnation: Incarnation);
     fn freeze(&self, incarnation: Incarnation);
-    fn close(&self, incarnation: Incarnation);
+    fn close(&self, incarnation: Incarnation) -> Option<Box<dyn MailboxDisposal>>;
     fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>>;
     fn stats(&self) -> MailboxStats;
 }
@@ -1093,7 +1186,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         let promotion = promote_waiters(&mut state);
         drop(state);
         self.changed.pulse();
-        promotion.finish();
+        promotion.finish_isolated();
     }
 
     fn freeze(&self, incarnation: Incarnation) {
@@ -1105,22 +1198,25 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }
     }
 
-    fn close(&self, incarnation: Incarnation) {
+    fn close(&self, incarnation: Incarnation) -> Option<Box<dyn MailboxDisposal>> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         if !matches!(
             state.status,
             BindingStatus::Bound(current) | BindingStatus::Frozen(current)
                 if current == incarnation
         ) {
-            return;
+            return None;
         }
         state.status = BindingStatus::Unbound;
         let queue = std::mem::take(&mut state.queue);
         let latest = state.latest.take();
         drop(state);
         self.changed.pulse();
-        drop(queue);
-        drop(latest);
+        Some(Box::new(MailboxPayload {
+            queue: Some(queue),
+            latest,
+            retired: Vec::new(),
+        }))
     }
 
     fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>> {
@@ -1139,9 +1235,12 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         };
         drop(state);
         Some(Box::new(MailboxTeardown {
-            changed: self.changed.clone(),
-            queue: Some(queue),
-            latest,
+            changed: Some(self.changed.clone()),
+            payload: crate::runtime::Isolated::new(MailboxPayload {
+                queue: Some(queue),
+                latest,
+                retired: Vec::new(),
+            }),
             termination: Some(termination),
         }))
     }
@@ -1151,7 +1250,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
     }
 }
 
-fn promote_waiters<M>(state: &mut MailboxState<M>) -> Promotion<M> {
+fn promote_waiters<M: Send + 'static>(state: &mut MailboxState<M>) -> Promotion<M> {
     let mut promotion = Promotion::default();
     let Some(kind) = state.kind else {
         return promotion;

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::poll_until;
+use crate::common::{assert_quiet, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
     LifecycleEventKind, LifecycleItem, Readiness, Shutdown, StartupError, StartupFailureCause,
@@ -158,6 +158,7 @@ enum DeadlineMessage {
 
 struct ExactDeadlineActor {
     armed: Arc<AtomicBool>,
+    offload_started: Arc<AtomicBool>,
     result: Arc<Mutex<Option<Result<usize, DeadlineElapsed>>>>,
 }
 
@@ -165,22 +166,26 @@ impl Actor for ExactDeadlineActor {
     type Msg = DeadlineMessage;
     type Args = (
         Arc<AtomicBool>,
+        Arc<AtomicBool>,
         Arc<Mutex<Option<Result<usize, DeadlineElapsed>>>>,
     );
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
         Ok(Self {
             armed: args.0,
-            result: args.1,
+            offload_started: args.1,
+            result: args.2,
         })
     }
 
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         match message {
             DeadlineMessage::Start => {
+                let offload_started = Arc::clone(&self.offload_started);
                 context
                     .offload(
-                        async {
+                        async move {
+                            offload_started.store(true, Ordering::SeqCst);
                             tokio::time::sleep(Duration::from_secs(10)).await;
                             42usize
                         },
@@ -202,12 +207,17 @@ impl Actor for ExactDeadlineActor {
 #[tokio::test(start_paused = true)]
 async fn offload_completion_wins_at_the_exact_deadline() {
     let armed = Arc::new(AtomicBool::new(false));
+    let offload_started = Arc::new(AtomicBool::new(false));
     let result = Arc::new(Mutex::new(None));
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "deadline",
-            ActorOnceDef::<ExactDeadlineActor>::new((Arc::clone(&armed), Arc::clone(&result))),
+            ActorOnceDef::<ExactDeadlineActor>::new((
+                Arc::clone(&armed),
+                Arc::clone(&offload_started),
+                Arc::clone(&result),
+            )),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -216,10 +226,13 @@ async fn offload_completion_wins_at_the_exact_deadline() {
         .send(DeadlineMessage::Start)
         .await
         .expect("actor live");
-    while !armed.load(Ordering::SeqCst) {
-        tokio::task::yield_now().await;
-    }
-    tokio::task::yield_now().await;
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            armed.load(Ordering::SeqCst) && offload_started.load(Ordering::SeqCst)
+        })
+        .await,
+        "the offload is polled and its deadline is registered before time moves"
+    );
     tokio::time::advance(Duration::from_secs(10)).await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(*result.lock().expect("result mutex poisoned"), Some(Ok(42)));
@@ -233,14 +246,18 @@ enum GuardMessage {
 
 struct GuardedActor {
     deliveries: Arc<AtomicUsize>,
+    guard_dropped: Arc<AtomicBool>,
 }
 
 impl Actor for GuardedActor {
     type Msg = GuardMessage;
-    type Args = Arc<AtomicUsize>;
+    type Args = (Arc<AtomicUsize>, Arc<AtomicBool>);
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
-        Ok(Self { deliveries: args })
+        Ok(Self {
+            deliveries: args.0,
+            guard_dropped: args.1,
+        })
     }
 
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
@@ -254,6 +271,7 @@ impl Actor for GuardedActor {
                     )
                     .expect("guarded offload accepted");
                 drop(guard);
+                self.guard_dropped.store(true, Ordering::SeqCst);
             }
             GuardMessage::Unexpected => {
                 self.deliveries.fetch_add(1, Ordering::SeqCst);
@@ -264,22 +282,34 @@ impl Actor for GuardedActor {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dropping_scoped_guard_suppresses_the_continuation() {
     let deliveries = Arc::new(AtomicUsize::new(0));
+    let guard_dropped = Arc::new(AtomicBool::new(false));
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "guarded",
-            ActorOnceDef::<GuardedActor>::new(Arc::clone(&deliveries)),
+            ActorOnceDef::<GuardedActor>::new((
+                Arc::clone(&deliveries),
+                Arc::clone(&guard_dropped),
+            )),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     actor.send(GuardMessage::Start).await.expect("actor live");
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            guard_dropped.load(Ordering::SeqCst)
+        })
+        .await,
+        "the actor drops the guard before the negative window begins"
+    );
+    assert_quiet(Duration::from_secs(1), || {
+        deliveries.load(Ordering::SeqCst) != 0
+    })
+    .await;
     actor.send(GuardMessage::Stop).await.expect("actor live");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(deliveries.load(Ordering::SeqCst), 0);

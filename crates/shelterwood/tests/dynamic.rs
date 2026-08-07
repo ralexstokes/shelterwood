@@ -701,7 +701,7 @@ async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
         .expect("root stops");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn pre_spawn_shutdown_waits_for_teardown_to_exist() {
     let gate = ReleaseGate::default();
     let mut nested = Tree::new();
@@ -724,23 +724,18 @@ async fn pre_spawn_shutdown_waits_for_teardown_to_exist() {
     let mut root = Tree::new();
     let slot = root.reserve_subtree::<Tree>("nested").expect("reservation");
     let scope = slot.scope_ref();
-    let scope_for_wait = scope.clone();
-    let waiter = tokio::spawn(async move {
-        scope_for_wait
-            .shutdown_and_wait(Duration::from_millis(10))
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    let mut waiter = Box::pin(scope.shutdown_and_wait(Duration::from_millis(10)));
     assert!(
-        !waiter.is_finished(),
-        "timeout must not arm before an incarnation starts"
+        poll_once(waiter.as_mut()).is_pending(),
+        "the pre-spawn shutdown request registers without completing"
     );
+    assert_quiet(Duration::from_millis(25), || {
+        poll_once(waiter.as_mut()).is_ready()
+    })
+    .await;
     let _nested_handle = slot.define_once(SubtreeOnceDef::new(nested));
     let system = root.spawn().expect("runtime is available");
-    let timeout = waiter
-        .await
-        .expect("waiter joins")
-        .expect_err("live teardown exceeds its bound");
+    let timeout = waiter.await.expect_err("live teardown exceeds its bound");
     assert_eq!(timeout.stragglers.len(), 1);
     assert_eq!(timeout.stragglers[0].path[0].as_str(), "worker");
     gate.release();

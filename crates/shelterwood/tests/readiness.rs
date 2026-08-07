@@ -122,18 +122,22 @@ async fn readiness_deadline_is_typed_and_absolute() {
 async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
     let width = Duration::from_secs(10);
     let ready_started = Arc::new(AtomicBool::new(false));
+    let ready_marked = ReleaseGate::default();
     let mut ready_tree = Tree::new();
     let ready_task = ready_tree
         .add_task(
             "edge",
             TaskDef::new({
                 let ready_started = Arc::clone(&ready_started);
+                let ready_marked = ready_marked.clone();
                 move |context| {
                     let ready_started = Arc::clone(&ready_started);
+                    let ready_marked = ready_marked.clone();
                     async move {
                         ready_started.store(true, Ordering::SeqCst);
                         tokio::time::sleep(width).await;
                         context.mark_ready();
+                        ready_marked.release();
                         context.shutdown_token().cancelled().await;
                         Ok(())
                     }
@@ -152,7 +156,7 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
         .await
     );
     advance_time(width).await;
-    tokio::task::yield_now().await;
+    ready_marked.wait().await;
     ready_system
         .wait_started()
         .await

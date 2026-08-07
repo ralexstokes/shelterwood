@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BinaryHeap, VecDeque},
+    collections::{BinaryHeap, HashMap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -274,28 +274,21 @@ impl ReadinessGate {
     }
 }
 
-#[derive(Debug)]
-struct DeadlineEntry<K> {
-    at: Instant,
-    order: u64,
-    key: K,
-}
-
-impl<K> PartialEq for DeadlineEntry<K> {
+impl PartialEq for DeadlineEntry {
     fn eq(&self, other: &Self) -> bool {
         self.at == other.at && self.order == other.order
     }
 }
 
-impl<K> Eq for DeadlineEntry<K> {}
+impl Eq for DeadlineEntry {}
 
-impl<K> PartialOrd for DeadlineEntry<K> {
+impl PartialOrd for DeadlineEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<K> Ord for DeadlineEntry<K> {
+impl Ord for DeadlineEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         other
             .at
@@ -308,7 +301,19 @@ impl<K> Ord for DeadlineEntry<K> {
 #[derive(Debug)]
 pub(crate) struct DeadlineQueue<K> {
     next_order: u64,
-    entries: BinaryHeap<DeadlineEntry<K>>,
+    entries: BinaryHeap<DeadlineEntry>,
+    active: HashMap<DeadlineHandle, K>,
+}
+
+/// A non-reused registration for one armed deadline.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct DeadlineHandle(u64);
+
+#[derive(Debug)]
+struct DeadlineEntry {
+    at: Instant,
+    order: u64,
+    handle: DeadlineHandle,
 }
 
 impl<K> Default for DeadlineQueue<K> {
@@ -316,27 +321,73 @@ impl<K> Default for DeadlineQueue<K> {
         Self {
             next_order: 0,
             entries: BinaryHeap::new(),
+            active: HashMap::new(),
         }
     }
 }
 
 impl<K> DeadlineQueue<K> {
-    pub(crate) fn push(&mut self, at: Instant, key: K) {
+    pub(crate) fn push(&mut self, at: Instant, key: K) -> DeadlineHandle {
         let order = self.next_order;
-        self.next_order = self.next_order.saturating_add(1);
-        self.entries.push(DeadlineEntry { at, order, key });
+        self.next_order = self
+            .next_order
+            .checked_add(1)
+            .expect("deadline registration generation exhausted");
+        let handle = DeadlineHandle(order);
+        let replaced = self.active.insert(handle, key);
+        debug_assert!(replaced.is_none());
+        self.entries.push(DeadlineEntry { at, order, handle });
+        handle
     }
 
-    pub(crate) fn next(&self) -> Option<Instant> {
+    pub(crate) fn cancel(&mut self, handle: DeadlineHandle) -> bool {
+        let removed = self.active.remove(&handle).is_some();
+        if removed {
+            self.compact_if_sparse();
+        }
+        removed
+    }
+
+    pub(crate) fn next(&mut self) -> Option<Instant> {
+        self.prune_stale_head();
         self.entries.peek().map(|entry| entry.at)
     }
 
     pub(crate) fn pop_due(&mut self, now: Instant) -> Option<K> {
+        self.prune_stale_head();
         if self.entries.peek().is_some_and(|entry| entry.at <= now) {
-            self.entries.pop().map(|entry| entry.key)
+            let entry = self.entries.pop().expect("the due entry was just observed");
+            self.active.remove(&entry.handle)
         } else {
             None
         }
+    }
+
+    fn prune_stale_head(&mut self) {
+        while self
+            .entries
+            .peek()
+            .is_some_and(|entry| !self.active.contains_key(&entry.handle))
+        {
+            self.entries.pop();
+        }
+    }
+
+    fn compact_if_sparse(&mut self) {
+        if self.entries.len() > self.active.len().saturating_mul(2) {
+            self.entries
+                .retain(|entry| self.active.contains_key(&entry.handle));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.active.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -535,5 +586,26 @@ mod tests {
         assert_eq!(deadlines.next(), Some(now));
         assert_eq!(deadlines.pop_due(now), Some("first"));
         assert_eq!(deadlines.pop_due(now), Some("second"));
+    }
+
+    #[test]
+    fn cancelled_deadlines_release_keys_and_bound_heap_storage() {
+        let far_future = Instant::now() + Duration::from_secs(60 * 60);
+        let mut deadlines = DeadlineQueue::default();
+        let persistent = deadlines.push(far_future, "persistent");
+
+        for _ in 0..10_000 {
+            let cancelled = deadlines.push(far_future, "cancelled");
+            assert!(deadlines.cancel(cancelled));
+            assert_eq!(deadlines.len(), 1);
+            assert!(
+                deadlines.storage_len() <= 2,
+                "heap tombstones must stay proportional to live deadlines"
+            );
+        }
+
+        assert!(deadlines.cancel(persistent));
+        assert_eq!(deadlines.len(), 0);
+        assert_eq!(deadlines.storage_len(), 0);
     }
 }

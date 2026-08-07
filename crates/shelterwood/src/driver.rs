@@ -4,13 +4,13 @@ use std::{
     collections::HashMap,
     fmt,
     future::Future,
+    ops::{Index, IndexMut},
     pin::Pin,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
-    task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
 
@@ -19,9 +19,9 @@ use crate::{
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     deadline::Deadline,
     engine::{
-        ArbitrationClass, DeadlineQueue, ExitDispatch, IntensityState, MembershipMode,
-        ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode, StopAction,
-        StopLadder, arbitrate, dispatch_exit, schedule_restart,
+        ArbitrationClass, DeadlineHandle, DeadlineQueue, ExitDispatch, IntensityState,
+        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode,
+        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
     },
     exit::{JoinVerdict, RecordedOutcome, classify_exit},
     identity::{FenceCounter, ScopeIdentity},
@@ -186,109 +186,56 @@ where
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Signal {
-    inner: Arc<SignalInner>,
+    inner: runtime::WatchSender<()>,
 }
 
-#[derive(Debug, Default)]
-struct SignalInner {
-    generation: AtomicU64,
-    waiters: Mutex<Vec<Weak<Waiter>>>,
+impl Default for Signal {
+    fn default() -> Self {
+        Self {
+            inner: runtime::watch(()).0,
+        }
+    }
 }
 
 impl Clone for Signal {
     fn clone(&self) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
+            inner: self.inner.clone(),
         }
     }
 }
 
 impl Signal {
     pub(crate) fn pulse(&self) {
-        self.inner.generation.fetch_add(1, Ordering::AcqRel);
-        let mut waiters = self.inner.waiters.lock().expect("signal mutex poisoned");
-        waiters.retain(|waiter| {
-            if let Some(waiter) = waiter.upgrade() {
-                waiter.notify();
-                true
-            } else {
-                false
-            }
-        });
+        self.inner.pulse();
     }
 
     pub(crate) fn watcher(&self) -> SignalWatcher {
         SignalWatcher {
-            signal: self.clone(),
-            seen: self.inner.generation.load(Ordering::Acquire),
+            inner: self.inner.watcher(),
+            _signal: self.clone(),
         }
+    }
+
+    #[cfg(test)]
+    fn watcher_count(&self) -> usize {
+        self.inner.receiver_count()
     }
 }
 
 pub(crate) struct SignalWatcher {
-    signal: Signal,
-    seen: u64,
+    inner: runtime::WatchReceiver<()>,
+    // The previous signal implementation kept the source alive through each
+    // watcher. Preserve that ownership so `changed` cannot turn channel
+    // closure into a spurious pulse.
+    _signal: Signal,
 }
 
 impl SignalWatcher {
     pub(crate) async fn changed(&mut self) {
-        loop {
-            let current = self.signal.inner.generation.load(Ordering::Acquire);
-            if current != self.seen {
-                self.seen = current;
-                return;
-            }
-
-            let waiter = Arc::new(Waiter::default());
-            self.signal
-                .inner
-                .waiters
-                .lock()
-                .expect("signal mutex poisoned")
-                .push(Arc::downgrade(&waiter));
-
-            let current = self.signal.inner.generation.load(Ordering::Acquire);
-            if current != self.seen {
-                self.seen = current;
-                return;
-            }
-            WaiterFuture(waiter).await;
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct Waiter {
-    notified: AtomicBool,
-    waker: Mutex<Option<Waker>>,
-}
-
-impl Waiter {
-    fn notify(&self) {
-        self.notified.store(true, Ordering::Release);
-        if let Some(waker) = self.waker.lock().expect("waiter mutex poisoned").take() {
-            waker.wake();
-        }
-    }
-}
-
-struct WaiterFuture(Arc<Waiter>);
-
-impl Future for WaiterFuture {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.0.notified.load(Ordering::Acquire) {
-            return Poll::Ready(());
-        }
-        *self.0.waker.lock().expect("waiter mutex poisoned") = Some(context.waker().clone());
-        if self.0.notified.load(Ordering::Acquire) {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
+        self.inner.changed().await;
     }
 }
 
@@ -640,6 +587,17 @@ pub(crate) struct ScopeCell {
     lifecycle: LifecycleHub,
     snapshots: SnapshotHub,
     observation_closed: AtomicBool,
+    #[cfg(test)]
+    runtime_storage: Mutex<RuntimeStorage>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RuntimeStorage {
+    children: usize,
+    child_slots: usize,
+    deadlines: usize,
+    deadline_slots: usize,
 }
 
 #[derive(Debug, Default)]
@@ -686,11 +644,21 @@ impl ScopeCell {
             lifecycle: LifecycleHub::default(),
             snapshots: SnapshotHub::default(),
             observation_closed: AtomicBool::new(false),
+            #[cfg(test)]
+            runtime_storage: Mutex::new(RuntimeStorage::default()),
         })
     }
 
     pub(crate) fn record(&self) -> ScopeRecord {
         self.record.read_cloned()
+    }
+
+    #[cfg(test)]
+    fn runtime_storage(&self) -> RuntimeStorage {
+        *self
+            .runtime_storage
+            .lock()
+            .expect("runtime-storage mutex poisoned")
     }
 
     pub(crate) fn set_state(&self, state: ScopeState) {
@@ -1510,12 +1478,13 @@ pub(crate) fn remove_dynamic(
     }
     if matches!(entry.slot.member.record().stage, MemberStage::Terminal(_)) {
         let member = Arc::clone(&entry.slot.member);
-        let entry = state.entries.remove(id).expect("entry was just resolved");
+        scope.transition_child(&member, |record| record.removing = true, None);
+        entry.slot.member.removal.fire();
         drop(state);
-        scope.prune_child(&member);
-        // The entry's drop completes the removal response; it must follow
-        // the Removed edge so a woken remover never sees the child resident.
-        drop(entry);
+        // Terminal residents still have a driver registration. Route them
+        // through the normal removal path so that registration is reclaimed
+        // before the removal response completes.
+        scope.signal().pulse();
         return response;
     }
     let member = Arc::clone(&entry.slot.member);
@@ -1688,20 +1657,20 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
 
 enum ChildEvent {
     Constructed {
-        index: usize,
+        child: ChildKey,
         incarnation: Incarnation,
         readiness: Readiness,
     },
     Ready {
-        index: usize,
+        child: ChildKey,
         incarnation: Incarnation,
     },
     SelfStop {
-        index: usize,
+        child: ChildKey,
         incarnation: Incarnation,
     },
     Exited {
-        index: usize,
+        child: ChildKey,
         incarnation: Incarnation,
         recorded: Option<RecordedOutcome>,
         join: JoinVerdict,
@@ -1711,14 +1680,14 @@ enum ChildEvent {
 
 enum DeadlineKind {
     Readiness {
-        index: usize,
+        child: ChildKey,
         incarnation: Incarnation,
     },
     Restart {
-        index: usize,
+        child: ChildKey,
     },
     Stop {
-        index: usize,
+        child: ChildKey,
         incarnation: Incarnation,
     },
 }
@@ -1733,11 +1702,13 @@ struct ActiveChild {
     forced_outcome: Option<RecordedOutcome>,
     hard_abort_after_grace: Option<bool>,
     readiness: ReadinessGate,
+    readiness_deadline: Option<DeadlineHandle>,
     ready_signal: Latch,
     construction_release: Latch,
     framework_abort: Option<Latch>,
     framework_abort_ack: Option<Latch>,
     framework_abort_deadline: Option<Instant>,
+    stop_deadline: Option<DeadlineHandle>,
 }
 
 struct ChildTerminality {
@@ -1775,6 +1746,7 @@ struct ChildRuntime {
     options: crate::policy::ResolvedCommonOptions,
     incarnations: FenceCounter,
     restarts: RestartState,
+    restart_deadline: Option<DeadlineHandle>,
     active: Option<ActiveChild>,
     initial_ready: bool,
     initial: bool,
@@ -1813,6 +1785,7 @@ impl ChildRuntime {
             options,
             incarnations,
             restarts: RestartState::new(),
+            restart_deadline: None,
             active: None,
             initial_ready: false,
             initial: true,
@@ -1910,13 +1883,154 @@ impl ScopePhase {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ChildKey {
+    index: usize,
+    generation: u64,
+}
+
+struct ChildArenaSlot {
+    generation: u64,
+    child: Option<ChildRuntime>,
+}
+
+#[derive(Default)]
+struct ChildArena {
+    // Vacancies are reused, but every reuse advances the generation carried
+    // by driver events and deadlines. A late event can therefore miss; it
+    // can never address the new resident of the same physical slot.
+    slots: Vec<ChildArenaSlot>,
+    free: Vec<usize>,
+    len: usize,
+}
+
+impl ChildArena {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(capacity),
+            free: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn insert(&mut self, child: ChildRuntime) -> ChildKey {
+        self.len += 1;
+        if let Some(index) = self.free.pop() {
+            let slot = &mut self.slots[index];
+            debug_assert!(slot.child.is_none());
+            slot.child = Some(child);
+            ChildKey {
+                index,
+                generation: slot.generation,
+            }
+        } else {
+            let index = self.slots.len();
+            self.slots.push(ChildArenaSlot {
+                generation: 0,
+                child: Some(child),
+            });
+            ChildKey {
+                index,
+                generation: 0,
+            }
+        }
+    }
+
+    fn get(&self, key: ChildKey) -> Option<&ChildRuntime> {
+        self.slots
+            .get(key.index)
+            .filter(|slot| slot.generation == key.generation)
+            .and_then(|slot| slot.child.as_ref())
+    }
+
+    fn get_mut(&mut self, key: ChildKey) -> Option<&mut ChildRuntime> {
+        self.slots
+            .get_mut(key.index)
+            .filter(|slot| slot.generation == key.generation)
+            .and_then(|slot| slot.child.as_mut())
+    }
+
+    fn remove(&mut self, key: ChildKey) -> Option<ChildRuntime> {
+        let slot = self.slots.get_mut(key.index)?;
+        if slot.generation != key.generation {
+            return None;
+        }
+        let child = slot.child.take()?;
+        self.len -= 1;
+        if let Some(next) = slot.generation.checked_add(1) {
+            slot.generation = next;
+            self.free.push(key.index);
+        }
+        Some(child)
+    }
+
+    fn key_at(&self, index: usize) -> Option<ChildKey> {
+        self.slots.get(index).and_then(|slot| {
+            slot.child.as_ref().map(|_| ChildKey {
+                index,
+                generation: slot.generation,
+            })
+        })
+    }
+
+    fn keys(&self) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
+        self.slots.iter().enumerate().filter_map(|(index, slot)| {
+            slot.child.as_ref().map(|_| ChildKey {
+                index,
+                generation: slot.generation,
+            })
+        })
+    }
+
+    fn values(&self) -> impl Iterator<Item = &ChildRuntime> {
+        self.slots.iter().filter_map(|slot| slot.child.as_ref())
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut ChildRuntime> {
+        self.slots.iter_mut().filter_map(|slot| slot.child.as_mut())
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.free.clear();
+        self.len = 0;
+    }
+
+    #[cfg(test)]
+    fn storage_len(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+impl Index<ChildKey> for ChildArena {
+    type Output = ChildRuntime;
+
+    fn index(&self, key: ChildKey) -> &Self::Output {
+        self.get(key).expect("live child key")
+    }
+}
+
+impl IndexMut<ChildKey> for ChildArena {
+    fn index_mut(&mut self, key: ChildKey) -> &mut Self::Output {
+        self.get_mut(key).expect("live child key")
+    }
+}
+
 struct ScopeRuntime {
     root: Arc<ScopeCell>,
     flavor: ScopeFlavor,
     defaults: ResolvedDefaults,
     intensity_policy: crate::Intensity,
     intensity: IntensityState,
-    children: Vec<ChildRuntime>,
+    children: ChildArena,
     events: runtime::MpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
@@ -1948,7 +2062,7 @@ impl Drop for ScopeRuntime {
         } else {
             None
         };
-        for child in &mut self.children {
+        for child in self.children.values_mut() {
             if let Some(active) = child.active.take() {
                 if let Some(mailbox) = child.slot.member.mailbox() {
                     mailbox.freeze(active.incarnation);
@@ -2006,11 +2120,31 @@ enum SpawnBody {
 }
 
 impl ScopeRuntime {
-    fn spawn_child(&mut self, index: usize) {
-        if self.phase.is_draining() || self.children[index].is_terminal() {
+    #[cfg(test)]
+    fn record_storage(&self) {
+        *self
+            .root
+            .runtime_storage
+            .lock()
+            .expect("runtime-storage mutex poisoned") = RuntimeStorage {
+            children: self.children.len(),
+            child_slots: self.children.storage_len(),
+            deadlines: self.deadlines.len(),
+            deadline_slots: self.deadlines.storage_len(),
+        };
+    }
+
+    fn spawn_child(&mut self, key: ChildKey) {
+        let Some(child) = self.children.get(key) else {
+            return;
+        };
+        if self.phase.is_draining() || child.is_terminal() {
             return;
         }
-        let child = &mut self.children[index];
+        let child = &mut self.children[key];
+        if let Some(deadline) = child.restart_deadline.take() {
+            self.deadlines.cancel(deadline);
+        }
         let Some(incarnation) = mint_child_incarnation(&child.slot, &mut child.incarnations) else {
             child.complete_terminality();
             // Incarnation exhaustion terminalized the membership (§3.1):
@@ -2030,12 +2164,12 @@ impl ScopeRuntime {
             let removing = child.slot.member.record().removing;
             let retention_remove = child.options.retention == crate::Retention::Remove;
             if removing {
-                self.finalize_removal(index);
+                self.finalize_removal(key);
             } else if pre_ready && !self.phase.is_draining() {
-                self.fail_startup(index, exit);
+                self.fail_startup(key, exit);
             } else {
                 if retention_remove {
-                    self.prune_terminal(index);
+                    self.prune_terminal(key);
                 }
                 if self.phase.is_draining() {
                     self.stop_next_ordered();
@@ -2168,8 +2302,8 @@ impl ScopeRuntime {
             }),
         );
 
-        let readiness = if construction_pending {
-            ReadinessGate::Waiting { deadline: None }
+        let (readiness, readiness_deadline) = if construction_pending {
+            (ReadinessGate::Waiting { deadline: None }, None)
         } else if !gated {
             ready.fire();
             child.initial_ready = true;
@@ -2182,20 +2316,25 @@ impl ScopeRuntime {
                     incarnation,
                 }),
             );
-            ReadinessGate::Immediate
+            (ReadinessGate::Immediate, None)
         } else {
-            let deadline = match child.options.readiness_deadline {
+            let (deadline, handle) = match child.options.readiness_deadline {
                 ReadinessDeadline::Bounded(duration) => {
                     let deadline = Deadline::after(now, duration).instant();
-                    if let Some(deadline) = deadline {
-                        self.deadlines
-                            .push(deadline, DeadlineKind::Readiness { index, incarnation });
-                    }
-                    deadline
+                    let handle = deadline.map(|deadline| {
+                        self.deadlines.push(
+                            deadline,
+                            DeadlineKind::Readiness {
+                                child: key,
+                                incarnation,
+                            },
+                        )
+                    });
+                    (deadline, handle)
                 }
-                ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
+                ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => (None, None),
             };
-            ReadinessGate::Waiting { deadline }
+            (ReadinessGate::Waiting { deadline }, handle)
         };
 
         let (report, report_receiver) = report_channel(shutdown.clone(), Some(local_stop.clone()));
@@ -2219,7 +2358,7 @@ impl ScopeRuntime {
                     let _ = runtime::mpsc_send(
                         &constructed_sender,
                         DriverEvent::Child(ChildEvent::Constructed {
-                            index,
+                            child: key,
                             incarnation,
                             readiness,
                         }),
@@ -2283,7 +2422,7 @@ impl ScopeRuntime {
             let _ = runtime::mpsc_send(
                 &exit_sender,
                 DriverEvent::Child(ChildEvent::Exited {
-                    index,
+                    child: key,
                     incarnation,
                     recorded: report.outcome,
                     join,
@@ -2304,7 +2443,10 @@ impl ScopeRuntime {
                 ) {
                     let _ = runtime::mpsc_send(
                         &ready_sender,
-                        DriverEvent::Child(ChildEvent::Ready { index, incarnation }),
+                        DriverEvent::Child(ChildEvent::Ready {
+                            child: key,
+                            incarnation,
+                        }),
                     )
                     .await;
                 }
@@ -2318,7 +2460,10 @@ impl ScopeRuntime {
             ) {
                 let _ = runtime::mpsc_send(
                     &self_stop_sender,
-                    DriverEvent::Child(ChildEvent::SelfStop { index, incarnation }),
+                    DriverEvent::Child(ChildEvent::SelfStop {
+                        child: key,
+                        incarnation,
+                    }),
                 )
                 .await;
             }
@@ -2334,12 +2479,16 @@ impl ScopeRuntime {
             forced_outcome: None,
             hard_abort_after_grace: None,
             readiness,
+            readiness_deadline,
             ready_signal: readiness_signal,
             construction_release,
             framework_abort: scope_child.then_some(framework_abort),
             framework_abort_ack: scope_child.then_some(framework_abort_ack),
             framework_abort_deadline: None,
+            stop_deadline: None,
         });
+        #[cfg(test)]
+        self.record_storage();
     }
 
     fn progress_startup(&mut self) {
@@ -2349,11 +2498,14 @@ impl ScopeRuntime {
         match self.flavor {
             ScopeFlavor::Ordered => {
                 while self.next_ordered_start < self.children.len() {
-                    let index = self.next_ordered_start;
-                    if !self.children[index].spawned_once {
-                        self.spawn_child(index);
+                    let key = self
+                        .children
+                        .key_at(self.next_ordered_start)
+                        .expect("ordered children are never reclaimed during startup");
+                    if !self.children[key].spawned_once {
+                        self.spawn_child(key);
                     }
-                    if self.children[index].initial_ready {
+                    if self.children[key].initial_ready {
                         self.next_ordered_start += 1;
                     } else {
                         return;
@@ -2361,7 +2513,7 @@ impl ScopeRuntime {
                 }
                 if self
                     .children
-                    .iter()
+                    .values()
                     .filter(|child| child.initial)
                     .all(|child| child.initial_ready)
                 {
@@ -2371,7 +2523,7 @@ impl ScopeRuntime {
             ScopeFlavor::Dynamic => {
                 if self
                     .children
-                    .iter()
+                    .values()
                     .filter(|child| child.initial)
                     .all(|child| child.initial_ready)
                 {
@@ -2390,8 +2542,10 @@ impl ScopeRuntime {
         }
     }
 
-    fn begin_stop_child(&mut self, index: usize, forced: Option<RecordedOutcome>) {
-        let child = &mut self.children[index];
+    fn begin_stop_child(&mut self, key: ChildKey, forced: Option<RecordedOutcome>) {
+        let Some(child) = self.children.get_mut(key) else {
+            return;
+        };
         if child.is_terminal() {
             return;
         }
@@ -2411,12 +2565,18 @@ impl ScopeRuntime {
                 mailbox.freeze(active.incarnation);
             }
             active.forced_outcome = forced;
+            if let Some(deadline) = active.readiness_deadline.take() {
+                self.deadlines.cancel(deadline);
+            }
             if active.forced_outcome.is_none() {
                 active.readiness.step(ReadinessEvent::Shutdown);
             }
             active.ladder = Some(StopLadder::new(child.options.shutdown));
-            self.advance_ladder(index, runtime::now());
+            self.advance_ladder(key, runtime::now());
         } else {
+            if let Some(deadline) = child.restart_deadline.take() {
+                self.deadlines.cancel(deadline);
+            }
             let record = child.slot.member.record();
             let exit = record.last_exit.unwrap_or_else(Exit::never_started);
             if record.last_incarnation.is_none()
@@ -2431,11 +2591,16 @@ impl ScopeRuntime {
         }
     }
 
-    fn advance_ladder(&mut self, index: usize, now: Instant) {
-        let child = &mut self.children[index];
+    fn advance_ladder(&mut self, key: ChildKey, now: Instant) {
+        let Some(child) = self.children.get_mut(key) else {
+            return;
+        };
         let Some(active) = &mut child.active else {
             return;
         };
+        if let Some(deadline) = active.stop_deadline.take() {
+            self.deadlines.cancel(deadline);
+        }
         let Some(ladder) = &mut active.ladder else {
             return;
         };
@@ -2478,13 +2643,13 @@ impl ScopeRuntime {
             }
         }
         if let Some(deadline) = ladder_deadline.or(active.framework_abort_deadline) {
-            self.deadlines.push(
+            active.stop_deadline = Some(self.deadlines.push(
                 deadline,
                 DeadlineKind::Stop {
-                    index,
+                    child: key,
                     incarnation: active.incarnation,
                 },
-            );
+            ));
         }
     }
 
@@ -2500,8 +2665,9 @@ impl ScopeRuntime {
         match self.flavor {
             ScopeFlavor::Ordered => self.stop_next_ordered(),
             ScopeFlavor::Dynamic => {
-                for index in 0..self.children.len() {
-                    self.begin_stop_child(index, None);
+                let children: Vec<_> = self.children.keys().collect();
+                for child in children {
+                    self.begin_stop_child(child, None);
                 }
             }
         }
@@ -2512,14 +2678,16 @@ impl ScopeRuntime {
             return;
         }
         loop {
-            let Some(index) = (0..self.children.len())
+            let Some(key) = self
+                .children
+                .keys()
                 .rev()
-                .find(|index| !self.children[*index].is_terminal())
+                .find(|key| !self.children[*key].is_terminal())
             else {
                 return;
             };
-            self.begin_stop_child(index, None);
-            if self.children[index].active.is_some() {
+            self.begin_stop_child(key, None);
+            if self.children[key].active.is_some() {
                 return;
             }
         }
@@ -2530,8 +2698,9 @@ impl ScopeRuntime {
             self.begin_drain(StopReason::ShutdownRequested);
         }
         let now = runtime::now();
-        for index in 0..self.children.len() {
-            let child = &mut self.children[index];
+        let children: Vec<_> = self.children.keys().collect();
+        for key in children {
+            let child = &mut self.children[key];
             let Some(active) = &mut child.active else {
                 continue;
             };
@@ -2541,15 +2710,17 @@ impl ScopeRuntime {
             active.shutdown.fire();
             active.abort.fire();
             active.ladder = Some(ladder);
-            self.advance_ladder(index, now);
+            self.advance_ladder(key, now);
         }
     }
 
-    fn handle_constructed(&mut self, index: usize, incarnation: Incarnation, readiness: Readiness) {
+    fn handle_constructed(&mut self, key: ChildKey, incarnation: Incarnation, readiness: Readiness) {
         let mut became_ready = false;
         let mut deadline_to_arm = None;
         {
-            let child = &mut self.children[index];
+            let Some(child) = self.children.get_mut(key) else {
+                return;
+            };
             let Some(active) = child.active.as_mut() else {
                 return;
             };
@@ -2589,16 +2760,30 @@ impl ScopeRuntime {
             active.construction_release.fire();
         }
         if let Some(deadline) = deadline_to_arm {
-            self.deadlines
-                .push(deadline, DeadlineKind::Readiness { index, incarnation });
+            let handle = self.deadlines.push(
+                deadline,
+                DeadlineKind::Readiness {
+                    child: key,
+                    incarnation,
+                },
+            );
+            if let Some(active) = self.children[key].active.as_mut()
+                && active.incarnation == incarnation
+            {
+                active.readiness_deadline = Some(handle);
+            } else {
+                self.deadlines.cancel(handle);
+            }
         }
         if became_ready {
             self.progress_startup();
         }
     }
 
-    fn handle_ready(&mut self, index: usize, incarnation: Incarnation) {
-        let child = &mut self.children[index];
+    fn handle_ready(&mut self, key: ChildKey, incarnation: Incarnation) {
+        let Some(child) = self.children.get_mut(key) else {
+            return;
+        };
         let Some(active) = child.active.as_mut() else {
             return;
         };
@@ -2609,6 +2794,9 @@ impl ScopeRuntime {
             )
         {
             return;
+        }
+        if let Some(deadline) = active.readiness_deadline.take() {
+            self.deadlines.cancel(deadline);
         }
         if !self.phase.startup_complete() {
             child.initial_ready = true;
@@ -2622,34 +2810,45 @@ impl ScopeRuntime {
                 incarnation,
             }),
         );
+        #[cfg(test)]
+        self.record_storage();
         self.progress_startup();
     }
 
-    fn handle_self_stop(&mut self, index: usize, incarnation: Incarnation) {
-        if self.children[index]
-            .active
-            .as_ref()
+    fn handle_self_stop(&mut self, key: ChildKey, incarnation: Incarnation) {
+        if self
+            .children
+            .get(key)
+            .and_then(|child| child.active.as_ref())
             .is_some_and(|active| active.incarnation == incarnation)
         {
-            self.begin_stop_child(index, None);
+            self.begin_stop_child(key, None);
         }
     }
 
     fn handle_exit(
         &mut self,
-        index: usize,
+        key: ChildKey,
         incarnation: Incarnation,
         recorded: Option<RecordedOutcome>,
         mut join: JoinVerdict,
         cancelled: bool,
     ) {
-        let child = &mut self.children[index];
+        let Some(child) = self.children.get_mut(key) else {
+            return;
+        };
         let Some(mut active) = child.active.take() else {
             return;
         };
         if active.incarnation != incarnation {
             child.active = Some(active);
             return;
+        }
+        if let Some(deadline) = active.readiness_deadline.take() {
+            self.deadlines.cancel(deadline);
+        }
+        if let Some(deadline) = active.stop_deadline.take() {
+            self.deadlines.cancel(deadline);
         }
         if let Some(mailbox) = child.slot.member.mailbox() {
             mailbox.close(incarnation);
@@ -2689,15 +2888,15 @@ impl ScopeRuntime {
                 child.construction.take();
                 let removing = child.slot.member.record().removing;
                 if removing {
-                    self.finalize_removal(index);
+                    self.finalize_removal(key);
                 } else if pre_ready && !self.phase.is_draining() {
-                    self.fail_startup(index, exit);
-                    if self.children[index].options.retention == crate::Retention::Remove {
-                        self.prune_terminal(index);
+                    self.fail_startup(key, exit);
+                    if self.children[key].options.retention == crate::Retention::Remove {
+                        self.prune_terminal(key);
                     }
                 } else {
                     if child.options.retention == crate::Retention::Remove {
-                        self.prune_terminal(index);
+                        self.prune_terminal(key);
                     }
                     if self.phase.is_draining() {
                         self.stop_next_ordered();
@@ -2757,16 +2956,18 @@ impl ScopeRuntime {
                     self.begin_drain(StopReason::IntensityTripped(trip));
                 } else {
                     if let Some(restart_at) = decision.restart_at {
-                        self.deadlines
-                            .push(restart_at, DeadlineKind::Restart { index });
+                        child.restart_deadline = Some(
+                            self.deadlines
+                                .push(restart_at, DeadlineKind::Restart { child: key }),
+                        );
                     }
                 }
             }
         }
     }
 
-    fn fail_startup(&mut self, index: usize, exit: Exit) {
-        let child = &self.children[index];
+    fn fail_startup(&mut self, key: ChildKey, exit: Exit) {
+        let child = &self.children[key];
         let failure = StartupFailure {
             cause: StartupFailureCause::Child {
                 id: child.slot.member.id().clone(),
@@ -2778,7 +2979,11 @@ impl ScopeRuntime {
         self.root
             .set_startup(Err(StartupError::StartupFailed(failure.clone())));
         if self.flavor == ScopeFlavor::Ordered {
-            for later in index + 1..self.children.len() {
+            for later_index in key.index + 1..self.children.len() {
+                let later = self
+                    .children
+                    .key_at(later_index)
+                    .expect("ordered children are never reclaimed during startup");
                 if !self.children[later].spawned_once {
                     if let Some(scope) = &self.children[later].slot.scope {
                         scope.terminalize_never_started();
@@ -2805,14 +3010,24 @@ impl ScopeRuntime {
 
     fn handle_deadline(&mut self, deadline: DeadlineKind) {
         match deadline {
-            DeadlineKind::Readiness { index, incarnation } => {
-                if self.children[index].active.as_ref().is_some_and(|active| {
-                    active.incarnation == incarnation && active.ready_signal.is_fired()
-                }) {
-                    self.handle_ready(index, incarnation);
+            DeadlineKind::Readiness {
+                child: key,
+                incarnation,
+            } => {
+                if self
+                    .children
+                    .get(key)
+                    .and_then(|child| child.active.as_ref())
+                    .is_some_and(|active| {
+                        active.incarnation == incarnation && active.ready_signal.is_fired()
+                    })
+                {
+                    self.handle_ready(key, incarnation);
                     return;
                 }
-                let child = &mut self.children[index];
+                let Some(child) = self.children.get_mut(key) else {
+                    return;
+                };
                 let Some(active) = child.active.as_mut() else {
                     return;
                 };
@@ -2825,16 +3040,17 @@ impl ScopeRuntime {
                 else {
                     return;
                 };
-                self.begin_stop_child(index, Some(RecordedOutcome::ReadinessTimedOut { deadline }));
+                self.begin_stop_child(key, Some(RecordedOutcome::ReadinessTimedOut { deadline }));
             }
-            DeadlineKind::Restart { index } => self.spawn_child(index),
-            DeadlineKind::Stop { index, incarnation } => {
-                if self.children[index]
-                    .active
-                    .as_ref()
+            DeadlineKind::Restart { child } => self.spawn_child(child),
+            DeadlineKind::Stop { child, incarnation } => {
+                if self
+                    .children
+                    .get(child)
+                    .and_then(|child| child.active.as_ref())
                     .is_some_and(|active| active.incarnation == incarnation)
                 {
-                    self.advance_ladder(index, runtime::now());
+                    self.advance_ladder(child, runtime::now());
                 }
             }
         }
@@ -2842,7 +3058,7 @@ impl ScopeRuntime {
 
     fn finish_if_ready(&mut self) -> Option<StopReason> {
         if let Some(reason) = self.phase.draining_reason() {
-            if self.children.iter().all(ChildRuntime::is_terminal) {
+            if self.children.values().all(ChildRuntime::is_terminal) {
                 return Some(reason.clone());
             }
             return None;
@@ -2850,7 +3066,7 @@ impl ScopeRuntime {
         if !self.phase.startup_failed()
             && self.flavor == ScopeFlavor::Ordered
             && !self.children.is_empty()
-            && self.children.iter().all(ChildRuntime::is_terminal)
+            && self.children.values().all(ChildRuntime::is_terminal)
         {
             return Some(StopReason::Finished);
         }
@@ -2943,11 +3159,12 @@ impl ScopeRuntime {
         }
         let mut child = ChildRuntime::from_plan(plan, &self.root);
         child.initial = false;
-        let index = self.children.len();
         self.root.admit_child(&request.slot);
-        self.children.push(child);
+        let key = self.children.insert(child);
+        #[cfg(test)]
+        self.record_storage();
         request.complete(Ok(()));
-        self.spawn_child(index);
+        self.spawn_child(key);
     }
 
     fn pending_removals(&self) -> Vec<Membership> {
@@ -2984,64 +3201,89 @@ impl ScopeRuntime {
                 entry.removal_started = true;
             }
         }
-        let Some(index) = self
+        let Some(key) = self
             .children
-            .iter()
-            .position(|child| child.slot.member.membership() == membership)
+            .keys()
+            .find(|key| self.children[*key].slot.member.membership() == membership)
         else {
             return;
         };
         self.root.transition_child(
-            &self.children[index].slot.member,
+            &self.children[key].slot.member,
             |record| record.removing = true,
             None,
         );
-        if self.children[index].is_terminal() {
-            self.finalize_removal(index);
+        if self.children[key].is_terminal() {
+            self.finalize_removal(key);
         } else {
-            self.begin_stop_child(index, None);
-            if self.children[index].is_terminal() {
-                self.finalize_removal(index);
+            self.begin_stop_child(key, None);
+            if self.children[key].is_terminal() {
+                self.finalize_removal(key);
             }
         }
     }
 
-    fn finalize_removal(&mut self, index: usize) {
+    fn finalize_removal(&mut self, key: ChildKey) {
         let Some(control) = &self.dynamic else {
             return;
         };
-        let child = &self.children[index];
-        let id = child.slot.member.id().clone();
+        let member = Arc::clone(&self.children[key].slot.member);
+        let id = member.id().clone();
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
         if state
             .entries
             .get(&id)
-            .is_some_and(|entry| entry.slot.member.membership() == child.slot.member.membership())
+            .is_some_and(|entry| entry.slot.member.membership() == member.membership())
         {
             let entry = state.entries.remove(&id).expect("entry was just resolved");
             drop(state);
-            self.root.prune_child(&child.slot.member);
+            self.root.prune_child(&member);
+            self.reclaim_child(key);
             drop(entry);
         }
     }
 
-    fn prune_terminal(&mut self, index: usize) {
-        let child = &self.children[index];
+    fn prune_terminal(&mut self, key: ChildKey) {
+        let member = Arc::clone(&self.children[key].slot.member);
         let mut removed = None;
         if let Some(control) = &self.dynamic {
-            let id = child.slot.member.id().clone();
+            let id = member.id().clone();
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-            if state.entries.get(&id).is_some_and(|entry| {
-                entry.slot.member.membership() == child.slot.member.membership()
-            }) {
+            if state
+                .entries
+                .get(&id)
+                .is_some_and(|entry| entry.slot.member.membership() == member.membership())
+            {
                 removed = state.entries.remove(&id);
             }
         }
-        self.root.prune_child(&child.slot.member);
+        self.root.prune_child(&member);
+        if self.flavor == ScopeFlavor::Dynamic {
+            self.reclaim_child(key);
+        }
         // The entry's drop completes any in-flight removal response; it must
         // follow the Removed edge so a woken remover never sees the child
         // resident.
         drop(removed);
+    }
+
+    fn reclaim_child(&mut self, key: ChildKey) {
+        let Some(mut child) = self.children.remove(key) else {
+            return;
+        };
+        if let Some(deadline) = child.restart_deadline.take() {
+            self.deadlines.cancel(deadline);
+        }
+        if let Some(mut active) = child.active.take() {
+            if let Some(deadline) = active.readiness_deadline.take() {
+                self.deadlines.cancel(deadline);
+            }
+            if let Some(deadline) = active.stop_deadline.take() {
+                self.deadlines.cancel(deadline);
+            }
+        }
+        #[cfg(test)]
+        self.record_storage();
     }
 }
 
@@ -3162,10 +3404,10 @@ async fn run_scope_incarnation(
     // owned by ScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
     // exactly one terminality owner for every child.
-    let mut children = Vec::with_capacity(plan.children.len());
+    let mut children = ChildArena::with_capacity(plan.children.len());
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
-        children.push(ChildRuntime::from_plan(child, &root));
+        children.insert(ChildRuntime::from_plan(child, &root));
     }
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
@@ -3190,14 +3432,17 @@ async fn run_scope_incarnation(
         ancestor_abort_seen: false,
         completion: None,
     };
+    #[cfg(test)]
+    scope.record_storage();
     plan.armed = false;
     drop(plan);
 
     match scope.flavor {
         ScopeFlavor::Ordered => scope.progress_startup(),
         ScopeFlavor::Dynamic => {
-            for index in 0..scope.children.len() {
-                scope.spawn_child(index);
+            let children: Vec<_> = scope.children.keys().collect();
+            for child in children {
+                scope.spawn_child(child);
             }
             scope.progress_startup();
         }
@@ -3286,9 +3531,15 @@ async fn run_scope_incarnation(
             )
             .await
             {
-                runtime::ScopeWake::Signal
-                | runtime::ScopeWake::ParentShutdown
-                | runtime::ScopeWake::Deadline => continue,
+                runtime::ScopeWake::Signal | runtime::ScopeWake::ParentShutdown => continue,
+                runtime::ScopeWake::Deadline => {
+                    // A producer becoming ready at the same instant owns the
+                    // tie over its deadline. Give tasks woken by that clock
+                    // edge one turn to publish their retained readiness
+                    // latch before collecting due registrations.
+                    runtime::yield_now().await;
+                    continue;
+                }
                 runtime::ScopeWake::Message(Some(event)) => {
                     let class = match event {
                         DriverEvent::Child(ChildEvent::SelfStop { .. }) => {
@@ -3340,24 +3591,24 @@ async fn run_scope_incarnation(
                     scope.handle_admission(request);
                 }
                 Pending::Driver(DriverEvent::Child(ChildEvent::Constructed {
-                    index,
+                    child,
                     incarnation,
                     readiness,
-                })) => scope.handle_constructed(index, incarnation, readiness),
-                Pending::Driver(DriverEvent::Child(ChildEvent::Ready { index, incarnation })) => {
-                    scope.handle_ready(index, incarnation);
+                })) => scope.handle_constructed(child, incarnation, readiness),
+                Pending::Driver(DriverEvent::Child(ChildEvent::Ready { child, incarnation })) => {
+                    scope.handle_ready(child, incarnation);
                 }
                 Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop {
-                    index,
+                    child,
                     incarnation,
-                })) => scope.handle_self_stop(index, incarnation),
+                })) => scope.handle_self_stop(child, incarnation),
                 Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
-                    index,
+                    child,
                     incarnation,
                     recorded,
                     join,
                     cancelled,
-                })) => scope.handle_exit(index, incarnation, recorded, join, cancelled),
+                })) => scope.handle_exit(child, incarnation, recorded, join, cancelled),
                 Pending::Deadline(deadline) => scope.handle_deadline(deadline),
             }
         }
@@ -3411,8 +3662,9 @@ mod tests {
 
     use crate::{
         ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind,
-        LifecycleItem, LifecycleTryRecvError, Readiness, RemoveOutcome, ScopeState, SendErrorKind,
-        StartupError, StartupFailureCause, StopReason, SubtreeOnceDef, TaskDef, Tree,
+        LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline, RemoveOutcome,
+        ScopeState, SendErrorKind, StartupError, StartupFailureCause, StopReason, SubtreeOnceDef,
+        TaskDef, Tree,
         exit::RecordedOutcome,
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
@@ -3421,9 +3673,10 @@ mod tests {
     };
 
     use super::{
-        DynamicControl, DynamicEntry, MemberCell, MemberStage, Obligation, RemovalResponses,
-        ScopeCell, ScopeFlavor, ScopePhase, StartupPhase, complete_removals,
-        mint_child_incarnation, report_channel, run_nested_tree, run_scope_incarnation,
+        ChildArena, ChildRuntime, DynamicControl, DynamicEntry, MemberCell, MemberStage,
+        Obligation, RemovalResponses, RuntimeStorage, ScopeCell, ScopeFlavor, Signal,
+        ScopePhase, StartupPhase, complete_removals, mint_child_incarnation, report_channel,
+        run_nested_tree, run_scope_incarnation,
     };
 
     #[test]
@@ -3443,6 +3696,96 @@ mod tests {
             );
             assert!(!phase.begin_drain(StopReason::Finished));
         }
+    }
+
+    #[test]
+    fn quiet_signal_wait_cancellation_keeps_one_watch_registration() {
+        let signal = Signal::default();
+        let mut watcher = signal.watcher();
+        assert_eq!(signal.watcher_count(), 1);
+
+        for _ in 0..10_000 {
+            let mut changed = Box::pin(watcher.changed());
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(changed.as_mut().poll(&mut context).is_pending());
+            drop(changed);
+            assert_eq!(signal.watcher_count(), 1);
+        }
+    }
+
+    #[test]
+    fn stale_child_keys_cannot_target_reused_slots() {
+        let mut tree = Tree::new();
+        tree.add_task("worker", TaskDef::new(|_| future::pending()))
+            .expect("valid task");
+        let mut plan = lower_tree_for_test(tree);
+        let child =
+            ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &plan.root);
+        let mut arena = ChildArena::default();
+        let stale = arena.insert(child);
+        let child = arena.remove(stale).expect("live key removes its child");
+        let current = arena.insert(child);
+
+        assert_eq!(stale.index, current.index, "the vacant slot is reused");
+        assert_ne!(stale.generation, current.generation);
+        assert!(arena.get(stale).is_none());
+        assert!(arena.remove(stale).is_none());
+        assert!(arena.get(current).is_some());
+    }
+
+    #[crate::runtime::test]
+    async fn dynamic_high_cycle_add_remove_reuses_runtime_storage() {
+        const CYCLES: usize = 1_000;
+
+        let system = DynamicTree::new().spawn().expect("runtime is available");
+        system.wait_started().await.expect("dynamic root starts");
+        let scope = system.scope();
+        let cell = Arc::clone(&scope.as_scope().cell);
+
+        for cycle in 0..CYCLES {
+            let task = scope
+                .add_task(
+                    "worker",
+                    TaskDef::new(|_| future::pending())
+                        .readiness(Readiness::Manual)
+                        .expect("manual readiness is valid")
+                        .readiness_deadline(
+                            ReadinessDeadline::bounded(Duration::from_secs(60 * 60))
+                                .expect("non-zero readiness deadline"),
+                        )
+                        .shutdown(crate::Shutdown::Abort),
+                )
+                .await
+                .expect("task admission")
+                .into_handles();
+            assert_eq!(
+                cell.runtime_storage(),
+                RuntimeStorage {
+                    children: 1,
+                    child_slots: 1,
+                    deadlines: 1,
+                    deadline_slots: 1,
+                },
+                "cycle {cycle} must reuse the sole runtime slot"
+            );
+
+            assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+            assert_eq!(
+                cell.runtime_storage(),
+                RuntimeStorage {
+                    children: 0,
+                    child_slots: 1,
+                    deadlines: 0,
+                    deadline_slots: 0,
+                },
+                "cycle {cycle} must reclaim the removed child"
+            );
+        }
+
+        system
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("empty dynamic scope shuts down");
     }
 
     #[test]

@@ -1199,6 +1199,10 @@ struct RemovalResponses(Vec<runtime::OneShotSender<RemoveOutcome>>);
 
 impl RemovalResponses {
     fn subscribe(&mut self) -> RemovalResponse {
+        // Callers may re-request removal and drop the returned future while
+        // the child is still stopping; discard those abandoned senders so the
+        // entry retains space proportional to live waiters only.
+        self.0.retain(|sender| !sender.is_closed());
         let (sender, receiver) = runtime::oneshot();
         self.0.push(sender);
         receiver
@@ -3589,6 +3593,22 @@ mod tests {
             Some(SendErrorKind::Terminated)
         );
         assert!(changed.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn removal_subscription_discards_abandoned_waiters() {
+        let mut responses = RemovalResponses::default();
+        for _ in 0..8 {
+            drop(responses.subscribe());
+        }
+        let mut retained = responses.subscribe();
+        assert_eq!(
+            responses.0.len(),
+            1,
+            "abandoned removal waiters are pruned on subscription"
+        );
+        responses.complete(RemoveOutcome::Removed);
+        assert_eq!(retained.try_receive(), Some(RemoveOutcome::Removed));
     }
 
     #[test]

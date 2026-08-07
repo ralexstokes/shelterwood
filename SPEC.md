@@ -1627,10 +1627,9 @@ Rules (normative):
 
 ### 9.1 Fate-sharing strategy
 
-Core ships `OneForOne` only: a child's exit affects that child alone. The
-group strategies (`OneForAll`, `RestForOne`) are Part II §19 — they are the
-single largest block of deferred engine complexity, and §10's mode-based
-exit funnel is designed so they land without restructuring. The `Strategy`
+`OneForOne` is the baseline: a child's exit affects that child alone. The
+group strategies (`OneForAll`, `RestForOne`) are implemented by Part II §19
+through §10's mode-based exit funnel. The `Strategy`
 type is non-exhaustive from day one, is a property of **ordered** scopes
 only (§2), and does not exist on dynamic scope builders, configs, or
 snapshots.
@@ -2852,6 +2851,13 @@ membership publication sources. `unwatch` returns whether the key existed.
 
 **Status: Accepted (M9).** Exactly one group cycle may own an affected
 subset; concurrent exits do not merge, widen, or recursively schedule it.
+
+**M9 implementation evidence.** Both public strategy variants run through a
+single frozen cycle in the existing exit funnel. `tests/m9.rs` covers resident
+selection, `Never` exclusion, reverse ladder drain, trigger backoff,
+declared-order readiness, non-merging outside exits, readiness-failure
+re-entry, per-sibling accounting, and atomic over-budget failure without a
+partial respawn.
 
 New variants on the non-exhaustive `Strategy` (§9.1). Group restarts drain
 the affected set, re-mint the group cancellation context, and respawn in

@@ -18,7 +18,7 @@ validation, and deviations for review.
 |---|---|---|---|---|
 | M7 — incarnation refinements and `contramap` | complete | `call_idempotent`: **build** — repaired shard-store re-port passed; `project`: open | focused M7 and shard-store tests pass; `just ci` passes with 165 tests | none |
 | M8 — keyed conflation and peer monitoring | complete | control/priority lane remains open until M12 | focused M8 tests pass; `just ci` passes with 172 tests; rustdoc/API reachability clean | none |
-| M9 — group strategies | pending | none | pending | none |
+| M9 — group strategies | complete | none | focused M9 tests pass; `just ci` passes with 179 tests; rustdoc/API reachability clean | none |
 | M10 — observation extensions | pending | none | pending | none |
 | M11 — outline, hosting, conveniences | pending | none | pending | none |
 | M12 — acceptance wave two | pending | control/priority lane and `project` final verdicts due | pending | none |

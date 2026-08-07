@@ -426,6 +426,10 @@ pub enum Strategy {
     /// Restart only the exiting child.
     #[default]
     OneForOne,
+    /// Restart every resident restartable child when one would restart.
+    OneForAll,
+    /// Restart the trigger and later resident restartable children.
+    RestForOne,
 }
 
 /// Scope defaults inherited by child declarations.

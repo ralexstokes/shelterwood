@@ -175,6 +175,15 @@ impl IntensityState {
             tripped: in_window > policy.max_restarts,
         }
     }
+
+    pub(crate) fn charge_batch(
+        &mut self,
+        policy: Intensity,
+        now: Instant,
+        count: usize,
+    ) -> Option<IntensityCharge> {
+        (0..count).map(|_| self.charge(policy, now)).last()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,6 +202,11 @@ impl RestartState {
 
     pub(crate) fn schedule(&mut self) -> (u64, u64) {
         self.attempt = self.attempt.saturating_add(1);
+        self.cumulative = self.cumulative.saturating_add(1);
+        (self.attempt, self.cumulative)
+    }
+
+    pub(crate) fn schedule_forced(&mut self) -> (u64, u64) {
         self.cumulative = self.cumulative.saturating_add(1);
         (self.attempt, self.cumulative)
     }
@@ -476,6 +490,25 @@ mod tests {
         assert!(!aged.tripped);
         assert_eq!(aged.in_window, 1);
         assert_eq!(aged.total_restarts, 3);
+    }
+
+    #[test]
+    fn group_batch_charges_atomically_without_advancing_sibling_attempts() {
+        let now = Instant::now();
+        let policy = Intensity::new(2, Duration::from_secs(10)).expect("valid intensity");
+        let mut intensity = IntensityState::default();
+        let charge = intensity
+            .charge_batch(policy, now, 3)
+            .expect("non-empty group has a final charge");
+        assert!(charge.tripped);
+        assert_eq!(charge.in_window, 3);
+        assert_eq!(charge.total_restarts, 3);
+
+        let mut trigger = RestartState::new();
+        let mut sibling = RestartState::new();
+        assert_eq!(trigger.schedule(), (1, 1));
+        assert_eq!(sibling.schedule_forced(), (0, 1));
+        assert_eq!(sibling.schedule_forced(), (0, 2));
     }
 
     #[test]

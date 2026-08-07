@@ -1,7 +1,7 @@
 //! Mutable runtime shell and shared handle state.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -29,7 +29,7 @@ use crate::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
         LifecycleHub, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
     },
-    policy::{DefaultsInheritance, ResolvedDefaults},
+    policy::{DefaultsInheritance, ResolvedDefaults, Strategy},
     raw::{RawRunContext, RawSpawn},
     runtime,
     task::{OnceTaskBody, TaskContext, TaskFactory},
@@ -713,6 +713,41 @@ impl ScopeCell {
             member.publish_monitor_exited(*incarnation, exit.clone());
         }
         self.emit_locked(exited);
+        self.emit_locked(scheduled);
+    }
+
+    pub(crate) fn record_group_restart_charges(&self, count: usize) {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut scope = self.record.lock().expect("scope mutex poisoned");
+        scope.total_restarts = scope
+            .total_restarts
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        drop(scope);
+        self.publish_snapshot_chain_locked();
+    }
+
+    pub(crate) fn schedule_group_restart(
+        &self,
+        member: &MemberCell,
+        update: impl FnOnce(&mut MemberRecord),
+        exited: Option<LifecycleEventKind>,
+        scheduled: LifecycleEventKind,
+    ) {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        member.update_locked(update);
+        if let Some(LifecycleEventKind::Exited {
+            incarnation, exit, ..
+        }) = &exited
+        {
+            member.publish_monitor_exited(*incarnation, exit.clone());
+        }
+        if let Some(exited) = exited {
+            self.emit_locked(exited);
+        }
         self.emit_locked(scheduled);
     }
 
@@ -1718,6 +1753,9 @@ enum DeadlineKind {
     Restart {
         index: usize,
     },
+    GroupRestart {
+        generation: u64,
+    },
     Stop {
         index: usize,
         incarnation: Incarnation,
@@ -1748,6 +1786,50 @@ struct ChildRuntime {
     initial_ready: bool,
     initial: bool,
     spawned_once: bool,
+}
+
+struct PendingChildExit {
+    index: usize,
+    incarnation: Incarnation,
+    exit: Exit,
+    pre_ready: bool,
+}
+
+#[derive(Clone, Copy)]
+struct GroupRestartPlan {
+    index: usize,
+    attempt: u64,
+    restart_count: u64,
+    delay: Duration,
+    restart_at: Instant,
+}
+
+enum GroupPhase {
+    Draining,
+    Backoff,
+    Starting { next: usize, waiting: Option<usize> },
+}
+
+struct GroupCycle {
+    generation: u64,
+    trigger: usize,
+    plans: Vec<GroupRestartPlan>,
+    phase: GroupPhase,
+    trip: Option<IntensityTrip>,
+}
+
+impl GroupCycle {
+    fn contains(&self, index: usize) -> bool {
+        self.plans.iter().any(|plan| plan.index == index)
+    }
+
+    fn plan(&self, index: usize) -> GroupRestartPlan {
+        *self
+            .plans
+            .iter()
+            .find(|plan| plan.index == index)
+            .expect("group member has a restart plan")
+    }
 }
 
 impl ChildRuntime {
@@ -1784,6 +1866,7 @@ struct ScopeRuntime {
     defaults: ResolvedDefaults,
     intensity_policy: crate::Intensity,
     intensity: IntensityState,
+    strategy: Strategy,
     children: Vec<ChildRuntime>,
     events: runtime::MpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
@@ -1792,6 +1875,9 @@ struct ScopeRuntime {
     startup_failed: bool,
     next_ordered_start: usize,
     draining: Option<StopReason>,
+    group: Option<GroupCycle>,
+    deferred_exits: VecDeque<PendingChildExit>,
+    next_group_generation: u64,
     is_root: bool,
     parent_ready: Option<Latch>,
     dynamic: Option<Arc<DynamicControl>>,
@@ -1867,7 +1953,10 @@ enum SpawnBody {
 
 impl ScopeRuntime {
     fn spawn_child(&mut self, index: usize) {
-        if self.draining.is_some() || self.children[index].is_terminal() {
+        if self.draining.is_some()
+            || self.children[index].is_terminal()
+            || self.children[index].active.is_some()
+        {
             return;
         }
         let child = &mut self.children[index];
@@ -2198,7 +2287,11 @@ impl ScopeRuntime {
     }
 
     fn progress_startup(&mut self) {
-        if self.startup_complete || self.startup_failed || self.draining.is_some() {
+        if self.startup_complete
+            || self.startup_failed
+            || self.draining.is_some()
+            || self.group.is_some()
+        {
             return;
         }
         match self.flavor {
@@ -2329,6 +2422,8 @@ impl ScopeRuntime {
         }
         self.draining = Some(reason);
         self.root.set_state(ScopeState::Draining);
+        self.group = None;
+        self.process_deferred_exits();
         match self.flavor {
             ScopeFlavor::Ordered => self.stop_next_ordered(),
             ScopeFlavor::Dynamic => {
@@ -2430,6 +2525,7 @@ impl ScopeRuntime {
         }
         if became_ready {
             self.progress_startup();
+            self.progress_group_start();
         }
     }
 
@@ -2459,6 +2555,7 @@ impl ScopeRuntime {
             }),
         );
         self.progress_startup();
+        self.progress_group_start();
     }
 
     fn handle_self_stop(&mut self, index: usize, incarnation: Incarnation) {
@@ -2467,7 +2564,13 @@ impl ScopeRuntime {
             .as_ref()
             .is_some_and(|active| active.incarnation == incarnation)
         {
-            self.begin_stop_child(index, None);
+            if self.group.as_ref().is_some_and(|group| {
+                matches!(group.phase, GroupPhase::Draining) && group.contains(index)
+            }) {
+                self.stop_next_group_member();
+            } else {
+                self.begin_stop_child(index, None);
+            }
         }
     }
 
@@ -2502,7 +2605,31 @@ impl ScopeRuntime {
         if ran_for >= self.intensity_policy.within {
             child.restarts.settled();
         }
+        let pending = PendingChildExit {
+            index,
+            incarnation,
+            exit,
+            pre_ready: child.initial && !self.startup_complete && !child.initial_ready,
+        };
 
+        if let Some(group) = &self.group {
+            if matches!(group.phase, GroupPhase::Draining) && group.contains(index) {
+                self.record_group_drain_exit(pending);
+                self.stop_next_group_member();
+            } else {
+                self.deferred_exits.push_back(pending);
+                if matches!(group.phase, GroupPhase::Starting { .. }) {
+                    self.progress_group_start();
+                }
+            }
+            return;
+        }
+        self.dispatch_pending_exit(pending);
+    }
+
+    fn dispatch_pending_exit(&mut self, pending: PendingChildExit) {
+        let index = pending.index;
+        let child = &self.children[index];
         let mode = if self.draining.is_some() {
             ScopeMode::Draining
         } else {
@@ -2513,103 +2640,394 @@ impl ScopeRuntime {
         } else {
             MembershipMode::Active
         };
-        match dispatch_exit(&exit, child.options.restart, mode, member_mode) {
-            ExitDispatch::Terminal => {
-                // §6's startup abort is a startup-sequence property: the
-                // membership failed before its *initial* readiness edge. A
-                // later incarnation stopped pre-ready (e.g. during drain)
-                // does not rewind it.
-                let pre_ready = child.initial && !self.startup_complete && !child.initial_ready;
-                self.root.terminalize_child(
-                    &child.slot.member,
-                    exit.clone(),
-                    Some(incarnation),
-                    pre_ready,
-                );
-                child.construction.take();
-                let removing = child.slot.member.record().removing;
-                if removing {
-                    self.finalize_removal(index);
-                } else if pre_ready && self.draining.is_none() {
-                    self.fail_startup(index, exit);
-                    if self.children[index].options.retention == crate::Retention::Remove {
-                        self.prune_terminal(index);
-                    }
-                } else {
-                    if child.options.retention == crate::Retention::Remove {
-                        self.prune_terminal(index);
-                    }
-                    if self.draining.is_some() {
-                        self.stop_next_ordered();
-                    }
-                }
-            }
+        match dispatch_exit(&pending.exit, child.options.restart, mode, member_mode) {
+            ExitDispatch::Terminal => self.terminalize_pending_exit(pending),
             ExitDispatch::ScheduleRestart => {
-                if !self.startup_complete {
-                    child.initial_ready = false;
-                }
-                let sample = self.jitter.sample(0..u64::MAX) as f64 / u64::MAX as f64;
-                let now = runtime::now();
-                let mut effects = Vec::new();
-                let decision = schedule_restart(
-                    &mut child.restarts,
-                    &mut self.intensity,
-                    self.intensity_policy,
-                    child.options.restart,
-                    now,
-                    sample,
-                    &mut effects,
-                );
-                debug_assert!(matches!(
-                    effects.first(),
-                    Some(crate::engine::RestartEffect::Scheduled { .. })
-                ));
-                let delay = child
-                    .options
-                    .restart
-                    .backoff()
-                    .next_delay(decision.attempt, sample);
-                let restart_at = decision
-                    .restart_at
-                    .unwrap_or_else(|| now.checked_add(delay).unwrap_or(now));
-                self.root.schedule_child_restart(
-                    &child.slot.member,
-                    |record| {
-                        record.incarnation = None;
-                        record.last_exit = Some(exit.clone());
-                        record.restart_count = decision.restart_count;
-                        record.restart_at = Some(restart_at);
-                        record.stage = MemberStage::Restarting;
-                    },
-                    LifecycleEventKind::Exited {
-                        id: child.slot.member.id().clone(),
-                        membership: child.slot.member.membership(),
-                        incarnation,
-                        exit: exit.clone(),
-                    },
-                    LifecycleEventKind::RestartScheduled {
-                        id: child.slot.member.id().clone(),
-                        membership: child.slot.member.membership(),
-                        attempt: decision.attempt,
-                        delay,
-                    },
-                );
-                if decision.charge.tripped {
-                    let trip = IntensityTrip {
-                        max_restarts: self.intensity_policy.max_restarts,
-                        observed_restarts: decision.charge.in_window,
-                        within: self.intensity_policy.within,
-                    };
-                    if !self.startup_complete && !self.startup_failed {
-                        self.root
-                            .set_startup(Err(StartupError::IntensityTripped(trip.clone())));
-                    }
-                    self.begin_drain(StopReason::IntensityTripped(trip));
+                if self.flavor == ScopeFlavor::Ordered && self.strategy != Strategy::OneForOne {
+                    self.start_group_restart(pending);
                 } else {
-                    self.deadlines
-                        .push(restart_at, DeadlineKind::Restart { index });
+                    self.schedule_one_for_one(pending);
                 }
             }
+        }
+    }
+
+    fn terminalize_pending_exit(&mut self, pending: PendingChildExit) {
+        let index = pending.index;
+        let child = &mut self.children[index];
+        self.root.terminalize_child(
+            &child.slot.member,
+            pending.exit.clone(),
+            Some(pending.incarnation),
+            pending.pre_ready,
+        );
+        child.construction.take();
+        let removing = child.slot.member.record().removing;
+        if removing {
+            self.finalize_removal(index);
+        } else if pending.pre_ready && self.draining.is_none() {
+            self.fail_startup(index, pending.exit);
+            if self.children[index].options.retention == crate::Retention::Remove {
+                self.prune_terminal(index);
+            }
+        } else {
+            if child.options.retention == crate::Retention::Remove {
+                self.prune_terminal(index);
+            }
+            if self.draining.is_some() {
+                self.stop_next_ordered();
+            }
+        }
+    }
+
+    fn schedule_one_for_one(&mut self, pending: PendingChildExit) {
+        let index = pending.index;
+        let child = &mut self.children[index];
+        if !self.startup_complete {
+            child.initial_ready = false;
+        }
+        let sample = self.jitter.sample(0..u64::MAX) as f64 / u64::MAX as f64;
+        let now = runtime::now();
+        let mut effects = Vec::new();
+        let decision = schedule_restart(
+            &mut child.restarts,
+            &mut self.intensity,
+            self.intensity_policy,
+            child.options.restart,
+            now,
+            sample,
+            &mut effects,
+        );
+        debug_assert!(matches!(
+            effects.first(),
+            Some(crate::engine::RestartEffect::Scheduled { .. })
+        ));
+        let delay = child
+            .options
+            .restart
+            .backoff()
+            .next_delay(decision.attempt, sample);
+        let restart_at = decision
+            .restart_at
+            .unwrap_or_else(|| now.checked_add(delay).unwrap_or(now));
+        self.root.schedule_child_restart(
+            &child.slot.member,
+            |record| {
+                record.incarnation = None;
+                record.last_exit = Some(pending.exit.clone());
+                record.restart_count = decision.restart_count;
+                record.restart_at = Some(restart_at);
+                record.stage = MemberStage::Restarting;
+            },
+            LifecycleEventKind::Exited {
+                id: child.slot.member.id().clone(),
+                membership: child.slot.member.membership(),
+                incarnation: pending.incarnation,
+                exit: pending.exit.clone(),
+            },
+            LifecycleEventKind::RestartScheduled {
+                id: child.slot.member.id().clone(),
+                membership: child.slot.member.membership(),
+                attempt: decision.attempt,
+                delay,
+            },
+        );
+        if decision.charge.tripped {
+            self.trip_intensity(decision.charge.in_window);
+        } else {
+            self.deadlines
+                .push(restart_at, DeadlineKind::Restart { index });
+        }
+    }
+
+    fn trip_intensity(&mut self, observed_restarts: u64) {
+        let trip = IntensityTrip {
+            max_restarts: self.intensity_policy.max_restarts,
+            observed_restarts,
+            within: self.intensity_policy.within,
+        };
+        if !self.startup_complete && !self.startup_failed {
+            self.root
+                .set_startup(Err(StartupError::IntensityTripped(trip.clone())));
+        }
+        self.begin_drain(StopReason::IntensityTripped(trip));
+    }
+
+    fn start_group_restart(&mut self, pending: PendingChildExit) {
+        debug_assert!(self.group.is_none());
+        let trigger = pending.index;
+        let members = self
+            .children
+            .iter()
+            .enumerate()
+            .filter_map(|(index, child)| {
+                if index == trigger {
+                    return Some(index);
+                }
+                let in_strategy = match self.strategy {
+                    Strategy::OneForAll => true,
+                    Strategy::RestForOne => index > trigger,
+                    Strategy::OneForOne => false,
+                };
+                let resident = child.active.is_some()
+                    || matches!(child.slot.member.record().stage, MemberStage::Restarting);
+                (in_strategy
+                    && resident
+                    && !child.is_terminal()
+                    && !child.options.restart.is_never())
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        let now = runtime::now();
+        let sample = self.jitter.sample(0..u64::MAX) as f64 / u64::MAX as f64;
+        let (trigger_attempt, trigger_restart_count) = self.children[trigger].restarts.schedule();
+        let delay = self.children[trigger]
+            .options
+            .restart
+            .backoff()
+            .next_delay(trigger_attempt, sample);
+        let restart_at = now.checked_add(delay).unwrap_or(now);
+        let plans = members
+            .iter()
+            .map(|index| {
+                let (attempt, restart_count) = if *index == trigger {
+                    (trigger_attempt, trigger_restart_count)
+                } else {
+                    self.children[*index].restarts.schedule_forced()
+                };
+                GroupRestartPlan {
+                    index: *index,
+                    attempt,
+                    restart_count,
+                    delay,
+                    restart_at,
+                }
+            })
+            .collect::<Vec<_>>();
+        let charge = self
+            .intensity
+            .charge_batch(self.intensity_policy, now, plans.len())
+            .expect("a group restart always contains its trigger");
+        self.root.record_group_restart_charges(plans.len());
+
+        for plan in &plans {
+            let child = &mut self.children[plan.index];
+            if !self.startup_complete {
+                child.initial_ready = false;
+            }
+            let inactive = child.active.is_none();
+            let exit = (plan.index == trigger).then(|| LifecycleEventKind::Exited {
+                id: child.slot.member.id().clone(),
+                membership: child.slot.member.membership(),
+                incarnation: pending.incarnation,
+                exit: pending.exit.clone(),
+            });
+            if plan.index != trigger && !inactive {
+                continue;
+            }
+            self.root.schedule_group_restart(
+                &child.slot.member,
+                |record| {
+                    record.restart_count = plan.restart_count;
+                    if plan.index == trigger {
+                        record.incarnation = None;
+                        record.last_exit = Some(pending.exit.clone());
+                        record.restart_at = Some(plan.restart_at);
+                        record.stage = MemberStage::Restarting;
+                    } else if inactive {
+                        record.incarnation = None;
+                        record.restart_at = Some(plan.restart_at);
+                        record.stage = MemberStage::Restarting;
+                    }
+                },
+                exit,
+                LifecycleEventKind::RestartScheduled {
+                    id: child.slot.member.id().clone(),
+                    membership: child.slot.member.membership(),
+                    attempt: plan.attempt,
+                    delay: plan.delay,
+                },
+            );
+        }
+
+        let trip = charge.tripped.then_some(IntensityTrip {
+            max_restarts: self.intensity_policy.max_restarts,
+            observed_restarts: charge.in_window,
+            within: self.intensity_policy.within,
+        });
+        if let Some(trip) = &trip
+            && !self.startup_complete
+            && !self.startup_failed
+        {
+            self.root
+                .set_startup(Err(StartupError::IntensityTripped(trip.clone())));
+        }
+
+        self.next_group_generation = self.next_group_generation.saturating_add(1);
+        self.group = Some(GroupCycle {
+            generation: self.next_group_generation,
+            trigger,
+            plans,
+            phase: GroupPhase::Draining,
+            trip,
+        });
+        self.stop_next_group_member();
+    }
+
+    fn record_group_drain_exit(&mut self, pending: PendingChildExit) {
+        let plan = self
+            .group
+            .as_ref()
+            .expect("group drain owns this exit")
+            .plan(pending.index);
+        let child = &mut self.children[pending.index];
+        let record_exit = pending.exit.clone();
+        self.root.schedule_group_restart(
+            &child.slot.member,
+            move |record| {
+                record.incarnation = None;
+                record.last_exit = Some(record_exit);
+                record.restart_count = plan.restart_count;
+                record.restart_at = Some(plan.restart_at);
+                record.stage = MemberStage::Restarting;
+            },
+            Some(LifecycleEventKind::Exited {
+                id: child.slot.member.id().clone(),
+                membership: child.slot.member.membership(),
+                incarnation: pending.incarnation,
+                exit: pending.exit,
+            }),
+            LifecycleEventKind::RestartScheduled {
+                id: child.slot.member.id().clone(),
+                membership: child.slot.member.membership(),
+                attempt: plan.attempt,
+                delay: plan.delay,
+            },
+        );
+    }
+
+    fn stop_next_group_member(&mut self) {
+        loop {
+            let Some(group) = &self.group else {
+                return;
+            };
+            if !matches!(group.phase, GroupPhase::Draining) {
+                return;
+            }
+            let next = group
+                .plans
+                .iter()
+                .rev()
+                .map(|plan| plan.index)
+                .find(|index| self.children[*index].active.is_some());
+            let Some(index) = next else {
+                if let Some(trip) = self
+                    .group
+                    .as_ref()
+                    .expect("group still exists")
+                    .trip
+                    .clone()
+                {
+                    self.group = None;
+                    self.begin_drain(StopReason::IntensityTripped(trip));
+                    return;
+                }
+                let group = self.group.as_mut().expect("group still exists");
+                group.phase = GroupPhase::Backoff;
+                let restart_at = group
+                    .plans
+                    .iter()
+                    .find(|plan| plan.index == group.trigger)
+                    .expect("group retains trigger plan")
+                    .restart_at;
+                self.deadlines.push(
+                    restart_at,
+                    DeadlineKind::GroupRestart {
+                        generation: group.generation,
+                    },
+                );
+                return;
+            };
+            if self.children[index]
+                .active
+                .as_ref()
+                .is_some_and(|active| active.ladder.is_some())
+            {
+                return;
+            }
+            self.begin_stop_child(index, None);
+            if self.children[index].active.is_some() {
+                return;
+            }
+        }
+    }
+
+    fn begin_group_start(&mut self, generation: u64) {
+        let Some(group) = self.group.as_mut() else {
+            return;
+        };
+        if group.generation != generation || !matches!(group.phase, GroupPhase::Backoff) {
+            return;
+        }
+        group.phase = GroupPhase::Starting {
+            next: 0,
+            waiting: None,
+        };
+        self.progress_group_start();
+    }
+
+    fn progress_group_start(&mut self) {
+        loop {
+            let mut spawn = None;
+            let mut finished = false;
+            {
+                let Some(group) = self.group.as_mut() else {
+                    return;
+                };
+                let GroupPhase::Starting { next, waiting } = &mut group.phase else {
+                    return;
+                };
+                if let Some(index) = *waiting {
+                    let ready_or_exited =
+                        self.children[index].active.as_ref().is_none_or(|active| {
+                            matches!(
+                                active.readiness,
+                                ReadinessGate::Immediate | ReadinessGate::Ready
+                            )
+                        });
+                    if !ready_or_exited {
+                        return;
+                    }
+                    *waiting = None;
+                }
+                if *next == group.plans.len() {
+                    finished = true;
+                } else {
+                    let index = group.plans[*next].index;
+                    *next += 1;
+                    *waiting = Some(index);
+                    spawn = Some(index);
+                }
+            }
+            if finished {
+                self.group = None;
+                self.progress_startup();
+                self.process_deferred_exits();
+                return;
+            }
+            if let Some(index) = spawn {
+                self.spawn_child(index);
+            }
+        }
+    }
+
+    fn process_deferred_exits(&mut self) {
+        while self.group.is_none() {
+            let Some(pending) = self.deferred_exits.pop_front() else {
+                return;
+            };
+            self.dispatch_pending_exit(pending);
         }
     }
 
@@ -2675,7 +3093,24 @@ impl ScopeRuntime {
                 };
                 self.begin_stop_child(index, Some(RecordedOutcome::ReadinessTimedOut { deadline }));
             }
-            DeadlineKind::Restart { index } => self.spawn_child(index),
+            DeadlineKind::Restart { index } => {
+                if self
+                    .group
+                    .as_ref()
+                    .is_some_and(|group| group.contains(index))
+                {
+                    return;
+                }
+                if self.children[index].active.is_none()
+                    && matches!(
+                        self.children[index].slot.member.record().stage,
+                        MemberStage::Restarting
+                    )
+                {
+                    self.spawn_child(index);
+                }
+            }
+            DeadlineKind::GroupRestart { generation } => self.begin_group_start(generation),
             DeadlineKind::Stop { index, incarnation } => {
                 if self.children[index]
                     .active
@@ -2995,6 +3430,7 @@ async fn run_scope_incarnation(
         defaults: plan.defaults,
         intensity_policy: plan.config.intensity,
         intensity: IntensityState::default(),
+        strategy: plan.config.strategy,
         children,
         events,
         deadlines: DeadlineQueue::default(),
@@ -3003,6 +3439,9 @@ async fn run_scope_incarnation(
         startup_failed: false,
         next_ordered_start: 0,
         draining: None,
+        group: None,
+        deferred_exits: VecDeque::new(),
+        next_group_generation: 0,
         is_root,
         parent_ready,
         dynamic,
@@ -3061,7 +3500,9 @@ async fn run_scope_incarnation(
         while let Some(deadline) = scope.deadlines.pop_due(now) {
             let class = match deadline {
                 DeadlineKind::Readiness { .. } => ArbitrationClass::ReadinessDeadline,
-                DeadlineKind::Restart { .. } => ArbitrationClass::BackoffDue,
+                DeadlineKind::Restart { .. } | DeadlineKind::GroupRestart { .. } => {
+                    ArbitrationClass::BackoffDue
+                }
                 DeadlineKind::Stop { .. } => ArbitrationClass::StopDeadline,
             };
             pending.push((class, Pending::Deadline(deadline)));

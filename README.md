@@ -59,6 +59,7 @@ scope, and subtrees compose both recursively.
 
 - [Calls, retries, and message ordering](docs/retry-and-ordering.md)
 - [Keyed mailboxes and peer monitoring](docs/keyed-mailboxes-and-monitoring.md)
+- [Group restart strategies](docs/group-restart-strategies.md)
 - [Shutdown and resource ownership](docs/shutdown-and-resources.md)
 - [Snapshots and lifecycle events](docs/observation.md)
 - [Embedding Shelterwood in a host process](docs/embedding.md)

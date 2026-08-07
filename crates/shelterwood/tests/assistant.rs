@@ -11,7 +11,7 @@ use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, Backoff, ChildState, Context, DeadlineElapsed,
     DynamicScopeRef, DynamicTree, ExitError, ExitResult, LifecycleEvent, LifecycleEventKind,
     LifecycleEvents, LifecycleItem, Mailbox, Membership, RemoveOutcome, Reply, ReserveError,
-    RestartCondition, RestartPolicy, ScopeState, StopContext, SubtreeOnceDef, Tree,
+    RestartCondition, RestartPolicy, ScopeState, StopContext, Strategy, SubtreeOnceDef, Tree,
 };
 use shelterwood_test_support::{ReleaseGate, poll_until};
 
@@ -37,11 +37,13 @@ struct TransportState {
     processed: Arc<AtomicUsize>,
     duplicate_notices: Arc<AtomicUsize>,
     fail_once: Arc<AtomicBool>,
+    journal_events: Arc<AtomicUsize>,
 }
 
 enum IngressMessage {
     Deliver { id: u64, reply: Reply<()> },
     DuplicateObserved,
+    JournalEvent,
 }
 
 enum JournalMessage {
@@ -52,6 +54,7 @@ enum JournalMessage {
 struct IngressArgs {
     journal: ActorRef<JournalMessage>,
     duplicate_notices: Arc<AtomicUsize>,
+    journal_events: Arc<AtomicUsize>,
 }
 
 struct IngressActor(IngressArgs);
@@ -60,7 +63,10 @@ impl Actor for IngressActor {
     type Msg = IngressMessage;
     type Args = IngressArgs;
 
-    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+    async fn init(args: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        context
+            .watch(&args.journal, |_| IngressMessage::JournalEvent)
+            .map_err(|_| ExitError::message("journal peer watch rejected"))?;
         Ok(Self(args))
     }
 
@@ -84,6 +90,9 @@ impl Actor for IngressActor {
             }
             IngressMessage::DuplicateObserved => {
                 self.0.duplicate_notices.fetch_add(1, Ordering::SeqCst);
+            }
+            IngressMessage::JournalEvent => {
+                self.0.journal_events.fetch_add(1, Ordering::SeqCst);
             }
         }
         Ok(())
@@ -177,6 +186,7 @@ struct GatewayFixture {
 
 fn gateway(state: TransportState) -> GatewayFixture {
     let mut tree = Tree::new();
+    tree.strategy(Strategy::OneForAll);
     let ingress_slot = tree
         .reserve_actor::<IngressMessage>("ingress")
         .expect("ingress slot reserved");
@@ -191,6 +201,7 @@ fn gateway(state: TransportState) -> GatewayFixture {
     let _defined_ingress = ingress_slot.define(ActorDef::<IngressActor>::cloned(IngressArgs {
         journal: journal.clone(),
         duplicate_notices: Arc::clone(&state.duplicate_notices),
+        journal_events: Arc::clone(&state.journal_events),
     }));
     let _defined_journal = journal_slot.define(ActorDef::<JournalActor>::cloned(JournalArgs {
         ingress: ingress.clone(),
@@ -348,6 +359,7 @@ struct SessionFixture {
 fn session_fixture() -> SessionFixture {
     let tools_tree = DynamicTree::new();
     let mut tree = Tree::new();
+    tree.strategy(Strategy::RestForOne);
     let tools = tree
         .add_subtree_once("tools", SubtreeOnceDef::new(tools_tree))
         .expect("nested tool scope declared");
@@ -620,6 +632,10 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
             transport.duplicate_notices.load(Ordering::SeqCst) == 1
         })
         .await
+    );
+    assert!(
+        transport.journal_events.load(Ordering::SeqCst) >= 2,
+        "peer watch observes journal lifecycle across group recovery"
     );
 
     let mut saw_control_restart = false;

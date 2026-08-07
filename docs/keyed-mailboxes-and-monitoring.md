@@ -37,9 +37,12 @@ not accepted and the actor does not exit.
 
 A keyed mailbox is not a priority or control lane. A reserved “control” key
 can still be evicted by enough distinct data keys, and an older pending key is
-not delivered ahead of newer keys by priority. Put barriers and urgent control
-traffic on a non-conflating protocol path. The first-class control-lane design
-remains evidence-gated until M12.
+not delivered ahead of newer keys by priority. M12's trading-engine acceptance
+port showed that a capacity sized to the expected data/control key cardinality
+admits an urgent `try_send` under same-key data flood, so the evidence gate
+closed **do not build** for a first-class control lane. This does not make a
+keyed mailbox safe for irreplaceable barriers: put traffic that must never be
+replaced or evicted on a non-conflating protocol path.
 
 ## Peer watches
 

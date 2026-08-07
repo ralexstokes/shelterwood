@@ -946,11 +946,10 @@ stage. Within one callback, stage narrowing is value-level; a stage earns a
 context type only by arriving with its own callback. Revisit only if
 value-level checking demonstrably causes a shipped bug. `Rejected`
 outcomes use B.3's `SendPayload`-shaped carrier: ordinary context operations
-return `Recovered(payload)`, while a mapped `project` path may return
-`Projected` after its injection consumed the inner value. Thus an unmapped
-rejection returns the continuation or timer message, or the not-yet-started
-offload work, rather than dropping it. Exact types are per-operation; the
-recovery/projected distinction is normative. The
+return `Recovered(payload)`. Thus a rejection returns the continuation or
+timer message, or the not-yet-started offload work, rather than dropping it.
+Exact types are per-operation. B.3's `Projected` arm remains necessary for
+eagerly mapped `contramap` ingress, not actor-context mapping. The
 full per-stage capability matrix is Appendix B.1.
 
 **`for_actor` — same-`Msg` re-entry — is core, and its contract lives
@@ -960,8 +959,9 @@ Context<'_, B>` — the same operation on the drain series (yielding the
 drain-stage context), and on `StopContext` yielding `StopContext<'_, B>`,
 the only re-entry `on_stop` has (B.1); absent from `RawContext`. It is a
 zero-cost reborrow of the same underlying context — no boxing, no
-mapping layer (Part II §17's `project` is the paying, boxed cousin; the
-`Msg`-equality bound is what makes the free identity possible). The
+mapping layer (the rejected Part II §17 `project` candidate would have been
+the paying, boxed cousin; the `Msg`-equality bound is what makes the free
+identity possible). The
 returned context therefore *is* the outer actor's: same incarnation and
 identity (`id()`, `incarnation()`, `myself()`), same mailbox and shared
 resources, same incarnation-owned timer table (§5.3's heterogeneous keys
@@ -2505,8 +2505,8 @@ the status line in each section is the detailed authority.
 | Section | M6 status | Implementation boundary |
 |---|---|---|
 | §15 incarnation refinements | **Accepted (M7)** | pinning, next-incarnation wait, and the bounded idempotent-call helper are implemented; the helper's shard-store gate verdict is **build** |
-| §16 keyed conflation | **Accepted (M8)** | keyed latest-wins only; a priority/control lane is evidence-gated to M12 |
-| §17 message mapping | **Accepted (M7) / Evidence-gated** | `contramap` is accepted; `project` waits for the durability consumer |
+| §16 keyed conflation | **Accepted (M8); gate closed (M12)** | keyed latest-wins only; the trading-engine port closes the priority/control-lane gate **do not build** |
+| §17 message mapping | **Accepted (M7); gate closed (M12)** | `contramap` is accepted; all five acceptance ports close `project` **do not build** |
 | §18 peer monitoring | **Accepted (M8)** | actor, task, and scope memberships through a separate event source |
 | §19 group strategies | **Accepted (M9)** | one non-merging group cycle through the existing exit funnel |
 | §20 observation extensions | **Accepted (M10)** | cumulative stats, reducer views, and optional metric emission |
@@ -2520,8 +2520,8 @@ ported, and the implementation plus this row change together.
 | Gate | Deciding artifact | Verdict |
 |---|---|---|
 | §15 `call_idempotent` | repaired shard-store retry loop re-ported onto the candidate API in M7 | **build** — the synchronous constructor closure carries the operation ledger id without friction; response timeout remains an external reconciliation arm |
-| §17 `project` | provenance-sensitive durability prototype | open; no consumer has yet demonstrated the provenance wall |
-| §16 control/priority lane | M12 trading-engine urgent-control-under-flood port | open |
+| §17 `project` | provenance-sensitive durability prototype, including all five full-fidelity acceptance ports in M12 | **do not build** — the durability-bearing shard-store, build-farm, and assistant ports preserve their required provenance with actor boundaries, `for_actor`, and `contramap`; no consumer demonstrates the provenance wall |
+| §16 control/priority lane | M12 trading-engine urgent-control-under-flood port | **do not build** — a keyed capacity equal to the expected data/control cardinality admits urgent control with `try_send` under same-key data flood; this is an admission guarantee, not priority ordering |
 
 ## 15. Incarnation refinements
 
@@ -2659,16 +2659,17 @@ Activates the pinning clause of invariant §13.2.
 
 ## 16. Keyed conflation: `latest_by_key`
 
-**Status: Accepted (M8).** The keyed mailbox is implementable; a
-first-class control/priority lane is *Evidence-gated (M12)* unless the trading-engine
-acceptance scenario produces contrary evidence.
+**Status: Accepted (M8); control/priority-lane gate closed (M12): do not
+build.** The keyed mailbox is implemented. The full trading-engine acceptance
+port demonstrated that `try_send` plus a capacity sized to the expected
+data/control key cardinality admits urgent control under same-key data flood.
+That is an admission guarantee only; it does not add priority ordering.
 
 **M8 implementation evidence.** The typed raw and handler definition
 surfaces, inherited and explicit capacity resolution, sender-path key
 extraction, in-place conflation, oldest-key eviction, and the internal
 eviction counter are implemented and covered by `tests/m8.rs`. The public
-counter remains intentionally deferred to §20; the control/priority gate
-remains open for M12.
+counter remained intentionally deferred to §20 and shipped there in M10.
 
 `latest_by_key(capacity, key_fn)` — a typed extension on `ActorDef<A>` and
 `RawActorDef<M>`, with `K: Eq + Hash + Send + 'static` and
@@ -2715,33 +2716,35 @@ where
 `RawActorDef<M>`. `KeyedCapacity::Explicit` is already non-zero, so the method
 has no deferred validation error.
 
-Decided: documentation-guided — no first-class control/priority lane,
-gated the same way as `project` (§17). If the trading-engine port's
-urgent-control-under-flood pattern cannot be written acceptably with
-`try_send` plus adequate key capacity, that artifact justifies a lane;
-otherwise it never gets built. Already decided either way: per-view
-conflation machinery is rejected (§17), and the state-plane/control-plane
-split is real — a barrier cannot safely share a keyed conflating mailbox
+M12 gate verdict: documentation-guided — no first-class control/priority
+lane. The trading-engine port's urgent-control-under-flood pattern composes
+with `try_send` plus adequate key capacity, so the lane does not get built.
+Per-view conflation machinery remains rejected (§17), and the
+state-plane/control-plane split is real: a barrier that must never be
+replaced or evicted still cannot safely share a keyed conflating mailbox
 with replaceable state.
 
 ## 17. Message mapping: `contramap` and `project` [#351]
 
-**Status: Accepted (M7) / Evidence-gated.** `contramap` is accepted; `project` remains
-*Evidence-gated* on a durability consumer that needs provenance-preserving
-context mapping; it is absent until that artifact exists.
+**Status: `contramap` accepted (M7); `project` gate closed (M12): do not
+build.** All five full-fidelity acceptance ports, including the
+durability-bearing shard store, build farm, and assistant journal, compose
+with explicit actor boundaries, same-message `for_actor`, and `contramap`.
+No consumer demonstrates the provenance wall required to justify mapped
+actor context.
 
-Two primitives, preserving identity and fencing semantics of the underlying
-ref. Their settled design decisions are normative for whoever implements
-them:
+The accepted reference primitive preserves identity and fencing semantics of
+the underlying ref:
 
 ```rust
 impl<M: Send + 'static> ActorRef<M> {
     fn contramap<N: Send + 'static>(&self, wrap: impl Fn(N) -> M + Send + Sync + 'static) -> ActorRef<N>;
 }
-impl<'a, A: Actor + ?Sized> Context<'a, A> {
-    fn project<B: Actor + ?Sized>(&mut self, wrap: impl Fn(B::Msg) -> A::Msg + Send + Sync + 'static) -> Context<'_, B>;
-}
 ```
+
+The rejected `project` candidate would have extended the same mapping into a
+borrowed actor context. The design constraints below remain the record of the
+gate evaluation, but they do not specify a public `project` API.
 
 - The wrap is a **pure, cheap injection executed eagerly at every ingress
   point**; everything stateful, ordered, or observable belongs to the outer
@@ -2775,12 +2778,13 @@ impl<'a, A: Actor + ?Sized> Context<'a, A> {
   same-`Msg` re-entry (`for_actor`, core) stays as the zero-cost identity
   case.
 - Sequence: `contramap` first (independently motivated, testable in
-  isolation). **Gate `project` on a concrete consumer** that demonstrates
+  isolation). The M12 gate required a concrete consumer that demonstrates
   the provenance wall: an origin-blind journal (same-`Msg` middleware)
   cannot distinguish externally-sent messages from self-regenerated
   effects, which breaks replay-correct durability (a replayed `Compact`
   both replays and regenerates — the effect runs twice). If a durability
-  prototype gets by origin-blind, `project` never gets built.
+  prototype gets by origin-blind, `project` never gets built. Every retained
+  acceptance consumer does, so the gate is closed **do not build**.
 
 ## 18. Peer monitoring
 
@@ -3304,7 +3308,7 @@ the same series during shutdown drain; **Stop** = `StopContext<'_, A>` in
 | `watch` / `watch_scoped` *(II §18)* | ✓ | ✓ | **R** | — |
 | `await_sibling_ready` *(II §23)* | ✓ | ✓ | **R** | — |
 | `offload` / `offload_scoped` (§5.5) | ✓ | ✓ | **R** | — |
-| Re-entry/mapping: `for_actor` (same-`Msg`, core); `project` *(II §17)* | — | ✓ | ✓ | `for_actor` only |
+| Re-entry: `for_actor` (same-`Msg`, core); mapped `project` rejected by the M12 evidence gate | — | ✓ | ✓ | ✓ |
 
 `StopContext` withholds everything that queues future work for this
 incarnation — there is no one left to deliver to; `myself()` is present but
@@ -3972,10 +3976,11 @@ this spec's API-shape requirements. Port them early; they are executable
 acceptance tests, not demos — every wait in them is a bounded event,
 lifecycle, snapshot, or state poll, never a sleep-and-hope.
 
-**Wave mapping:** scenarios 1, 2, and 5 validate core (with their Part II
-touches — peer watches, keyed conflation, metrics — stubbed or simplified
-until those land); scenarios 3 and 4 exercise Part II surface (watch, keyed
-conflation, outlines, metrics) and port in full alongside it.
+**Wave mapping:** M5 first retained scenarios 1, 2, and 5 with their then-later
+Part II touches stubbed or simplified. M12 completes the full-fidelity suite:
+scenarios 1–5 now exercise their accepted Part II surfaces, and scenarios 3
+and 4 are retained as executable application-scale tests rather than compile
+spikes.
 
 1. **Shard store — deliberate topology change over durable state.** An
    ordered root of a directory actor (atomic rebind registry), a dynamic
@@ -4035,18 +4040,21 @@ conflation, outlines, metrics) and port in full alongside it.
    `RestForOne` scope flavors and peer watches join with Part II §18/§19;
    the core port uses `OneForOne` scopes and lifecycle subscriptions.)
 
-**M6 compile-spike findings.** Throwaway, type-only trading-engine and
-build-farm skeletons were checked against the candidate shapes and then
-discarded; they are not a retained probe suite. The trading skeleton confirmed
-that typed keyed-mailbox extractors, `contramap`, all-three-kind watch targets,
-membership-cumulative stats, and the restart reducer compose without a
-registry or priority lane. The build-farm skeleton confirmed that keeping
+**M6 compile-spike and M12 port findings.** Throwaway, type-only
+trading-engine and build-farm skeletons first checked the candidate shapes;
+M12 replaces them with retained, full-fidelity executable ports. The trading
+port confirms that typed keyed-mailbox extractors, `contramap`, peer watches,
+membership-cumulative stats, metrics, and the restart reducer compose without
+a registry or priority lane. The build-farm port confirms that keeping
 `TaskRef` as the non-owning completion input while retaining the separate
 owned `OneShotTaskRef<T>` result capability makes `run_until_all` compose;
 outlining by shared borrow before `Tree::spawn` avoids consuming or invoking
 declaration code. It also exposed the outline asymmetry now made normative:
 restartable factory interiors cannot be inspected without executing code and
-must serialize as `Opaque`.
+must serialize as `Opaque`. Across all five ports, no durability consumer
+requires provenance-preserving context mapping, closing §17's `project` gate
+**do not build**; the trading urgent-control-under-flood evidence likewise
+closes §16's first-class control/priority-lane gate **do not build**.
 
 **Patterns that must remain expressible** (they composed well in the origin
 and later designs must not regress them): slot-before-define wiring for

@@ -16,9 +16,36 @@ validation, and deviations for review.
 
 | Milestone | Status | Evidence gates | Validation | Deviations |
 |---|---|---|---|---|
-| M7 — incarnation refinements and `contramap` | complete | `call_idempotent`: **build** — repaired shard-store re-port passed; `project`: open | focused M7 and shard-store tests pass; `just ci` passes with 165 tests | none |
-| M8 — keyed conflation and peer monitoring | complete | control/priority lane remains open until M12 | focused M8 tests pass; `just ci` passes with 172 tests; rustdoc/API reachability clean | none |
+| M7 — incarnation refinements and `contramap` | complete | `call_idempotent`: **build** — repaired shard-store re-port passed; `project` deferred to M12 | focused M7 and shard-store tests pass; `just ci` passes with 165 tests | none |
+| M8 — keyed conflation and peer monitoring | complete | control/priority lane deferred to M12 | focused M8 tests pass; `just ci` passes with 172 tests; rustdoc/API reachability clean | none |
 | M9 — group strategies | complete | none | focused M9 tests pass; `just ci` passes with 179 tests; rustdoc/API reachability clean | none |
 | M10 — observation extensions | complete | none | focused M10 tests pass; `just ci` passes with 186 tests; rustdoc/API reachability and every feature lane clean | none |
 | M11 — outline, hosting, conveniences | complete | none | 21 focused M11 tests pass; `just ci` passes with 207 tests; serde/host isolation, rustdoc, and API reachability clean | none |
-| M12 — acceptance wave two | pending | control/priority lane and `project` final verdicts due | pending | none |
+| M12 — acceptance wave two | complete | control/priority lane: **do not build** — adequate keyed capacity admits urgent control under same-key flood; `project`: **do not build** — no full-fidelity durability consumer demonstrates the provenance wall | trading-engine, build-farm, and upgraded assistant acceptance tests pass; no-default-feature all-target check passes; full `just ci` and `just ci-nix` recorded below | none |
+
+## M12 acceptance evidence
+
+- The trading engine uses slot-before-define cyclic wiring, a
+  restart-budgeted venue subtree, bounded FIFO and keyed mailboxes, three
+  simultaneously outstanding deadline-budgeted calls, feed peer watches, a
+  restart-count breaker, and the metrics feature. With the feed parked in
+  initialization, eight same-key updates conflate to one slot and urgent
+  control is admitted as the second expected key.
+- The build farm dynamically admits consuming one-shot workers, automatically
+  removes completed workers, restarts a readiness-gated lease task with
+  backoff, conflates progress by key, retires one exact wedged worker, uses
+  `run_until_all`, verifies its pre-spawn outline, and performs a warm rebuild
+  over retained durable state.
+- The assistant port now exercises `OneForAll`, `RestForOne`, and peer watches.
+  Along with the repaired shard store and warm build farm, it supplies the
+  durability evidence for closing `project` without adding an API.
+
+## Final validation
+
+Validated on 2026-08-07 from the M12 tree:
+
+- `./scripts/dev just ci`: clean; 209/209 tests passed, with every locked
+  feature lane, warnings-denied clippy, rustdoc, public-API reachability,
+  runtime/exit path enforcement, and formatting checks passing.
+- `./scripts/dev just ci-nix`: clean; all nine authoritative flake checks
+  passed on `x86_64-linux`.

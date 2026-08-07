@@ -7,11 +7,12 @@ shutdown, and observation. Stable membership and incarnation identities make
 failure recovery explicit without a global registry.
 
 The current `0.1` surface is the core described by [SPEC.md](SPEC.md) plus the
-accepted Part II milestones through M11: incarnation-aware calls and mapping,
+complete Part II implementation: incarnation-aware calls and mapping,
 keyed conflation and peer monitoring, ordered group strategies, structured
 observation extensions, resolved outlines, one-incarnation hosting, and finite
-lifetime conveniences. The final acceptance wave remains staged by its status
-marker in the specification.
+lifetime conveniences. Five application-scale acceptance ports validate the
+combined surface. Their final evidence gates rejected a first-class priority
+lane and mapped actor context as unjustified additions.
 
 ## Getting started
 
@@ -66,11 +67,14 @@ scope, and subtrees compose both recursively.
 - [Actor statistics and loss-recovering reducers](docs/observation-extensions.md)
 - [Outlines, direct hosting, and finite lifetimes](docs/outline-hosting-and-lifetime.md)
 - [Embedding Shelterwood in a host process](docs/embedding.md)
+- [Part II acceptance evidence](docs/part-ii-acceptance.md)
 
-The executable application-scale examples live in the M5 acceptance tests:
+The executable application-scale examples live in the acceptance tests:
 [shard store](crates/shelterwood/tests/shard_store.rs),
 [sidecar](crates/shelterwood/tests/sidecar.rs), and
-[assistant control plane](crates/shelterwood/tests/assistant.rs).
+[assistant control plane](crates/shelterwood/tests/assistant.rs),
+[trading engine](crates/shelterwood/tests/trading_engine.rs), and
+[build farm](crates/shelterwood/tests/build_farm.rs).
 
 ## Operational preconditions
 

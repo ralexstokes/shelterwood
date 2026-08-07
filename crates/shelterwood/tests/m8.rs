@@ -14,7 +14,7 @@ use std::{
 use shelterwood::{
     ActorRef, ExitError, ExitResult, Guard, Intensity, KeyedCapacity, MonitorEvent,
     MonitorEventKind, MonitorMemberKind, RawActor, RawContext, RawDef, RawOnceDef, ScopeRef,
-    SubtreeOnceDef, TaskDef, TaskRef, Tree, WatchTarget,
+    SendErrorKind, SubtreeOnceDef, TaskDef, TaskRef, Tree, WatchTarget,
 };
 use shelterwood_test_support::{ReleaseGate, poll_until};
 
@@ -127,6 +127,15 @@ async fn latest_by_key_replaces_in_place_and_evicts_the_oldest_distinct_key() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("keyed actor stops");
+    let calls_before_terminal_send = key_calls.load(Ordering::SeqCst);
+    let error = actor
+        .try_send(KeyedMessage {
+            key: "panic",
+            value: 7,
+        })
+        .expect_err("terminal keyed actor rejects without key extraction");
+    assert_eq!(error.kind, SendErrorKind::Terminated);
+    assert_eq!(key_calls.load(Ordering::SeqCst), calls_before_terminal_send);
 }
 
 #[tokio::test]

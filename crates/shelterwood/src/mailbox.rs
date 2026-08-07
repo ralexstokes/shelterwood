@@ -1154,8 +1154,20 @@ impl<M: Send + 'static> MailboxCell<M> {
         message: M,
         pinned: Option<Incarnation>,
     ) -> Result<Incarnation, SendError<M>> {
-        let key = self.prepare_key(&message);
-        let mut state = self.state.lock().expect("mailbox mutex poisoned");
+        let mut key = None;
+        let mut state = loop {
+            let state = self.state.lock().expect("mailbox mutex poisoned");
+            let needs_key = key.is_none()
+                && matches!(state.status, BindingStatus::Bound(incarnation)
+                    if pinned.is_none_or(|pinned| pinned == incarnation))
+                && matches!(state.kind, Some(MailboxKind::LatestByKey(_)));
+            if needs_key {
+                drop(state);
+                key = self.prepare_key(&message);
+                continue;
+            }
+            break state;
+        };
         match state.status {
             BindingStatus::Terminal(final_incarnation) => {
                 state.sends_rejected = state.sends_rejected.saturating_add(1);

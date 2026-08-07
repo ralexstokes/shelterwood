@@ -3617,14 +3617,20 @@ async fn run_nested_tree(
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
         Err(error) => {
-            let failure = StartupFailure {
-                cause: match error {
-                    LowerError::Undefined(undefined) => StartupFailureCause::Lowering { undefined },
-                    LowerError::IdentityExhausted(id) => {
-                        StartupFailureCause::IdentityExhausted { id }
-                    }
-                },
+            let (cause, disposal) = match error {
+                LowerError::Undefined { paths, disposal } => {
+                    (StartupFailureCause::Lowering { undefined: paths }, disposal)
+                }
+                LowerError::IdentityExhausted { id, disposal } => {
+                    (StartupFailureCause::IdentityExhausted { id }, disposal)
+                }
             };
+            // Lowering never created a nested driver to own teardown. Keep
+            // its isolated definitions attached to this incarnation until
+            // they finish; hard-aborting the incarnation still detaches the
+            // cancellation-safe disposal jobs.
+            disposal.fired().await;
+            let failure = StartupFailure { cause };
             scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
             scope.finish_incarnation(epoch, StopReason::StartupFailed(failure.clone()));
             return Err(crate::ExitError::from_startup_failure(failure));

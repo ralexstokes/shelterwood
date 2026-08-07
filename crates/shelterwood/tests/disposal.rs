@@ -16,7 +16,7 @@ use crate::common::{
 use shelterwood::{
     Backoff, ChildState, DynamicTree, ExitError, ExitKind, ExitResult, Jitter, LifecycleEventKind,
     LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Readiness, RemoveOutcome,
-    RestartCondition, RestartPolicy, TaskDef, TaskOnceDef, Tree,
+    RestartCondition, RestartPolicy, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe {
@@ -549,6 +549,46 @@ async fn startup_rollback_detaches_never_started_one_shot_state_after_escalation
             .kind(),
         ExitKind::NeverStarted
     ));
+}
+
+#[tokio::test]
+async fn hard_shutdown_detaches_failed_nested_lowering_disposal() {
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut nested = Tree::new();
+    let _undefined = nested.reserve_task("undefined").expect("task reservation");
+    let (_task, _completion) = nested
+        .add_task_once(
+            "blocked-definition",
+            TaskOnceDef::new({
+                let state = BlockingDropProbe::new(&gate, dropped);
+                move |_| {
+                    let _ = &state;
+                    async { Ok::<_, ExitError>(()) }
+                }
+            }),
+        )
+        .expect("valid one-shot definition");
+    let mut tree = Tree::new();
+    tree.add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid one-shot subtree");
+
+    let system = tree.spawn().expect("runtime is available");
+    wait_for_destructor(&gate).await;
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("failed definition disposal reports its thread"),
+        thread::current().id()
+    );
+    let mut shutdown = tokio::spawn(system.shutdown(Duration::ZERO));
+    let bounded = tokio::time::timeout(Duration::from_secs(1), &mut shutdown).await;
+    gate.release();
+    let result = bounded
+        .expect("hard shutdown is not held by failed lowering disposal")
+        .expect("shutdown task joins");
+    assert!(result.is_err(), "the still-live subtree is a straggler");
 }
 
 #[tokio::test]

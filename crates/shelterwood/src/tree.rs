@@ -128,8 +128,14 @@ pub enum BuildError {
 
 #[derive(Debug)]
 pub(crate) enum LowerError {
-    Undefined(Vec<Vec<ChildId>>),
-    IdentityExhausted(ChildId),
+    Undefined {
+        paths: Vec<Vec<ChildId>>,
+        disposal: crate::runtime::Latch,
+    },
+    IdentityExhausted {
+        id: ChildId,
+        disposal: crate::runtime::Latch,
+    },
 }
 
 /// Outcome of an idempotent dynamic removal.
@@ -230,6 +236,16 @@ pub(crate) struct BuilderCore {
 }
 
 impl BuilderCore {
+    fn begin_failed_disposal(&self) -> crate::runtime::Latch {
+        let definitions = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.take_defined())
+            .filter_map(|mut definition| definition.take())
+            .collect();
+        crate::runtime::dispose_all(definitions)
+    }
+
     fn new(flavor: ScopeFlavor) -> Self {
         let root_id = ChildId::from("$root");
         let mut root_identity =
@@ -290,7 +306,11 @@ impl BuilderCore {
             .map(|slot| vec![slot.member.id().clone()])
             .collect();
         if !undefined.is_empty() {
-            return Err(LowerError::Undefined(undefined));
+            let disposal = self.begin_failed_disposal();
+            return Err(LowerError::Undefined {
+                paths: undefined,
+                disposal,
+            });
         }
         if !Arc::ptr_eq(&root, &self.root) {
             let mut identity = root
@@ -298,9 +318,14 @@ impl BuilderCore {
                 .lock()
                 .expect("scope identity mutex poisoned");
             for slot in &self.slots {
-                let membership = identity
-                    .adopt_or_mint_membership(slot.member.id(), slot.member.membership())
-                    .ok_or_else(|| LowerError::IdentityExhausted(slot.member.id().clone()))?;
+                let Some(membership) =
+                    identity.adopt_or_mint_membership(slot.member.id(), slot.member.membership())
+                else {
+                    let id = slot.member.id().clone();
+                    drop(identity);
+                    let disposal = self.begin_failed_disposal();
+                    return Err(LowerError::IdentityExhausted { id, disposal });
+                };
                 if membership != slot.member.membership() {
                     slot.member.rebase_membership(membership);
                 }
@@ -728,8 +753,8 @@ fn spawn_builder<R>(
     let plan = core
         .lower(ResolvedDefaults::default(), None)
         .map_err(|error| match error {
-            LowerError::Undefined(paths) => BuildError::UnfilledReservations { paths },
-            LowerError::IdentityExhausted(_) => {
+            LowerError::Undefined { paths, .. } => BuildError::UnfilledReservations { paths },
+            LowerError::IdentityExhausted { .. } => {
                 unreachable!("root lowering does not mint memberships")
             }
         })?;

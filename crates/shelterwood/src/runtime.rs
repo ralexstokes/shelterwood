@@ -7,7 +7,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -160,6 +160,30 @@ where
 /// fails and drops the closure on the submitting thread.
 pub(crate) fn dispose_detached<T: Send + 'static>(value: T) {
     dispose_then(value, |_| {});
+}
+
+/// Starts isolated disposal for every value and fires once all jobs finish.
+///
+/// Each value gets its own unwind boundary, so one destructor panic cannot
+/// prevent the remaining values or the aggregate completion from running.
+pub(crate) fn dispose_all<T: Send + 'static>(values: Vec<T>) -> Latch {
+    let completion = Latch::default();
+    if values.is_empty() {
+        completion.fire();
+        return completion;
+    }
+
+    let remaining = Arc::new(AtomicUsize::new(values.len()));
+    for value in values {
+        let remaining = Arc::clone(&remaining);
+        let value_completion = completion.clone();
+        dispose_then(value, move |_| {
+            if remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                value_completion.fire();
+            }
+        });
+    }
+    completion
 }
 
 /// A one-shot, multi-waiter signal backed by Tokio's waiter queue.

@@ -11,13 +11,9 @@ mod mailbox;
 mod observe;
 mod policy;
 mod raw;
+mod runtime;
 mod task;
 mod tree;
-
-// M0 deliberately establishes the complete runtime boundary before its first
-// consumer lands in M1.
-#[allow(dead_code)]
-mod runtime;
 
 pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use exit::{

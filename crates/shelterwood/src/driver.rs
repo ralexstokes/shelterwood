@@ -542,6 +542,42 @@ impl ReportReceiver {
     }
 }
 
+struct ResidencyCompletion {
+    parent: Weak<ScopeCell>,
+    slot: Arc<SlotCell>,
+}
+
+fn discharge_residency(completion: ResidencyCompletion) {
+    let Some(parent) = completion.parent.upgrade() else {
+        return;
+    };
+    parent.emit_locked(LifecycleEventKind::Removed {
+        id: completion.slot.member.id().clone(),
+        membership: completion.slot.member.membership(),
+        last_incarnation: completion.slot.member.record().last_incarnation,
+    });
+}
+
+struct ResidentChild {
+    slot: Arc<SlotCell>,
+    _removal: Obligation<ResidencyCompletion>,
+}
+
+impl ResidentChild {
+    fn new(parent: &Arc<ScopeCell>, slot: Arc<SlotCell>) -> Self {
+        Self {
+            _removal: Obligation::new(
+                ResidencyCompletion {
+                    parent: Arc::downgrade(parent),
+                    slot: Arc::clone(&slot),
+                },
+                discharge_residency,
+            ),
+            slot,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ScopeRecord {
     pub(crate) state: ScopeState,
@@ -558,7 +594,7 @@ pub(crate) struct ScopeCell {
     changed: Signal,
     control: Mutex<ScopeControl>,
     current_dynamic: Mutex<Option<Arc<DynamicControl>>>,
-    current_children: Mutex<Vec<Arc<SlotCell>>>,
+    current_children: Mutex<Vec<ResidentChild>>,
     parent: Mutex<Option<Weak<ScopeCell>>>,
     lifecycle_sequence: Mutex<FenceCounter>,
     lifecycle_seq: AtomicU64,
@@ -713,8 +749,8 @@ impl ScopeCell {
             .lock()
             .expect("scope children mutex poisoned")
             .iter()
-            .find(|slot| slot.member.membership() == member.membership())
-            .and_then(|slot| slot.scope.as_ref())
+            .find(|resident| resident.slot.member.membership() == member.membership())
+            .and_then(|resident| resident.slot.scope.as_ref())
         {
             scope.close_observation_locked();
         }
@@ -726,25 +762,23 @@ impl ScopeCell {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let membership = member.membership();
-        let removed = {
+        let resident = {
             let mut children = self
                 .current_children
                 .lock()
                 .expect("scope children mutex poisoned");
             let Some(index) = children
                 .iter()
-                .position(|child| child.member.membership() == membership)
+                .position(|child| child.slot.member.membership() == membership)
             else {
                 return false;
             };
             children.remove(index)
         };
-        debug_assert_eq!(removed.member.membership(), membership);
-        self.emit_locked(LifecycleEventKind::Removed {
-            id: member.id().clone(),
-            membership,
-            last_incarnation: member.record().last_incarnation,
-        });
+        debug_assert_eq!(resident.slot.member.membership(), membership);
+        // Dropping residency while the observation gate is held emits the
+        // matching Removed edge through its owned completion.
+        drop(resident);
         true
     }
 
@@ -788,7 +822,9 @@ impl ScopeCell {
             .current_children
             .lock()
             .expect("scope children mutex poisoned")
-            .clone()
+            .iter()
+            .map(|resident| Arc::clone(&resident.slot))
+            .collect::<Vec<_>>()
             .into_iter()
             .map(|slot| self.child_snapshot_locked(&slot))
             .collect::<Vec<_>>();
@@ -1065,23 +1101,7 @@ impl ScopeCell {
         let _gate = OBSERVATION_GATE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        {
-            let residents = self
-                .current_children
-                .lock()
-                .expect("scope children mutex poisoned");
-            // A previous incarnation's residents must have been pruned with
-            // their Removed edges (§3.2's exact pairing) — clearing here is
-            // never allowed to be the edge that loses them.
-            debug_assert!(
-                residents.is_empty(),
-                "scope restart found unpruned residents of a previous incarnation"
-            );
-        }
-        self.current_children
-            .lock()
-            .expect("scope children mutex poisoned")
-            .clear();
+        self.clear_residents_locked();
         for child in children {
             if let Some(scope) = &child.scope {
                 *scope.parent.lock().expect("scope parent mutex poisoned") =
@@ -1093,7 +1113,7 @@ impl ScopeCell {
             self.current_children
                 .lock()
                 .expect("scope children mutex poisoned")
-                .push(Arc::clone(&child));
+                .push(ResidentChild::new(self, Arc::clone(&child)));
             self.emit_locked(LifecycleEventKind::Added {
                 id: child.member.id().clone(),
                 membership: child.member.membership(),
@@ -1111,7 +1131,7 @@ impl ScopeCell {
         self.current_children
             .lock()
             .expect("scope children mutex poisoned")
-            .push(Arc::clone(child));
+            .push(ResidentChild::new(self, Arc::clone(child)));
         child
             .member
             .update_locked(|record| record.stage = MemberStage::Admitted);
@@ -1119,6 +1139,26 @@ impl ScopeCell {
             id: child.member.id().clone(),
             membership: child.member.membership(),
         });
+    }
+
+    fn clear_residents(&self) {
+        let _gate = OBSERVATION_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.clear_residents_locked();
+    }
+
+    fn clear_residents_locked(&self) {
+        let residents = std::mem::take(
+            &mut *self
+                .current_children
+                .lock()
+                .expect("scope children mutex poisoned"),
+        );
+        // Each entry's owned completion emits Removed. Drop the vector only
+        // after releasing the child-set mutex so snapshot publication can
+        // project the now-empty set while this observation gate stays held.
+        drop(residents);
     }
 
     fn set_dynamic(&self, control: Option<Arc<DynamicControl>>) {
@@ -1524,7 +1564,9 @@ fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<Shutd
         .current_children
         .lock()
         .expect("scope children mutex poisoned")
-        .clone();
+        .iter()
+        .map(|resident| Arc::clone(&resident.slot))
+        .collect::<Vec<_>>();
     for child in children {
         if matches!(child.member.record().stage, MemberStage::Terminal(_)) {
             continue;
@@ -1803,11 +1845,9 @@ impl Drop for ScopeRuntime {
             // coarse kill verdict synchronously.
             child.terminality.discharge();
         }
-        // Every membership above is now terminal; emit the Removed edges
-        // before the scope's own final event so a subscriber never sees a
-        // Stopped scope still holding resident children of a dead
-        // incarnation, and a restarting scope never silently clears them.
-        self.prune_terminal_members();
+        // Residency owns the matching Removed edges. Clearing the set after
+        // terminality discharges them all before the scope's final event.
+        self.root.clear_residents();
         if !matches!(self.root.record().state, ScopeState::Stopped { .. }) {
             self.root.finish_incarnation(
                 self.epoch,

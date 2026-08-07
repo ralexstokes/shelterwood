@@ -1,24 +1,17 @@
 use std::{
-    future::Future,
-    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    task::{Context, Poll, Waker},
+    task::Poll,
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, assert_quiet, poll_once, poll_until};
 use shelterwood::{
     CallErrorKind, ExitError, ExitResult, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Reply,
     SendErrorKind, Shutdown, SubtreeOnceDef, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, assert_quiet, poll_until};
-
-fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.poll(&mut context)
-}
 
 struct PrefixActor {
     generation: usize,

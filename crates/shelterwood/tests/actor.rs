@@ -6,11 +6,11 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DynamicTree, ExitError, ExitResult, Handler, RawActor,
     RawContext, RawOnceDef, Readiness, StopContext, TaskDef, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, poll_until};
 
 #[derive(Clone)]
 struct BasicArgs {
@@ -62,6 +62,46 @@ impl Actor for BasicActor {
     }
 }
 
+struct Audited<A: Actor> {
+    inner: A,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl<A: Actor> Actor for Audited<A> {
+    type Msg = A::Msg;
+    type Args = (A::Args, Arc<Mutex<Vec<&'static str>>>);
+
+    async fn init(args: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        args.1
+            .lock()
+            .expect("events mutex poisoned")
+            .push("audit-init");
+        let inner = A::init(args.0, &mut context.for_actor::<A>()).await?;
+        Ok(Self {
+            inner,
+            events: args.1,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        self.events
+            .lock()
+            .expect("events mutex poisoned")
+            .push("audit-handle");
+        self.inner
+            .handle(message, &mut context.for_actor::<A>())
+            .await
+    }
+
+    async fn on_stop(&mut self, context: &mut StopContext<'_, Self>) {
+        self.events
+            .lock()
+            .expect("events mutex poisoned")
+            .push("audit-stop");
+        self.inner.on_stop(&mut context.for_actor::<A>()).await;
+    }
+}
+
 #[tokio::test]
 async fn handler_actor_runs_init_handle_and_stop_through_the_raw_wrapper() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -81,6 +121,38 @@ async fn handler_actor_runs_init_handle_and_stop_through_the_raw_wrapper() {
     assert_eq!(
         *events.lock().expect("events mutex poisoned"),
         ["init", "handle", "stop"]
+    );
+}
+
+#[tokio::test]
+async fn handler_decorator_reenters_the_inner_actor_context_across_callbacks() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<Audited<BasicActor>>::new((
+                BasicArgs {
+                    events: Arc::clone(&events),
+                },
+                Arc::clone(&events),
+            )),
+        )
+        .expect("valid decorated actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor initializes");
+    actor.send(BasicMessage::Stop).await.expect("actor is live");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(
+        *events.lock().expect("events mutex poisoned"),
+        [
+            "audit-init",
+            "init",
+            "audit-handle",
+            "handle",
+            "audit-stop",
+            "stop"
+        ]
     );
 }
 

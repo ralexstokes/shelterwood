@@ -1,10 +1,10 @@
 use std::time::Duration;
 
+use crate::common::LiveFlag;
 use shelterwood::{
     BuildError, DynamicTree, ExitKind, Readiness, RemoveOutcome, StopReason, TaskDef, TaskOnceDef,
     Tree,
 };
-use shelterwood_test_support::LiveFlag;
 
 #[test]
 fn spawn_without_runtime_is_a_build_error() {

@@ -6,15 +6,11 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, advance_time, assert_quiet, policy::never, poll_until};
 use shelterwood::{
-    Backoff, DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, RestartCondition,
-    RestartPolicy, Shutdown, StartupError, StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
+    DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, Shutdown, StartupError,
+    StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
 };
-use shelterwood_test_support::{ReleaseGate, advance_time, assert_quiet, poll_until};
-
-fn never() -> RestartPolicy {
-    RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
-}
 
 #[tokio::test]
 async fn ordered_startup_waits_for_manual_readiness() {

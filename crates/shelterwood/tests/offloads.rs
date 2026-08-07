@@ -6,11 +6,11 @@ use std::{
     time::Duration,
 };
 
+use crate::common::poll_until;
 use shelterwood::{
-    Actor, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult, Readiness,
-    StartupError, StartupFailureCause, Tree,
+    Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
+    Readiness, StartupError, StartupFailureCause, Tree,
 };
-use shelterwood_test_support::poll_until;
 
 enum ZeroMessage {
     Done,
@@ -63,6 +63,91 @@ async fn zero_budget_offload_never_polls_work_and_times_out_on_actor_task() {
     let system = tree.spawn().expect("runtime is available");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert!(!polled.load(Ordering::SeqCst));
+}
+
+enum RestartMessage {
+    Poison,
+    Fresh,
+    StaleTimer,
+    StaleOffload,
+}
+
+struct RestartActor {
+    generation: usize,
+    stale_seen: Arc<AtomicBool>,
+}
+
+impl Actor for RestartActor {
+    type Msg = RestartMessage;
+    type Args = (usize, Arc<AtomicBool>);
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            generation: args.0,
+            stale_seen: args.1,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            RestartMessage::Poison => {
+                assert_eq!(self.generation, 1);
+                context
+                    .set_timeout("stale", RestartMessage::StaleTimer, Duration::ZERO)
+                    .expect("timer accepted");
+                context
+                    .offload(async {}, |_| RestartMessage::StaleOffload, Duration::MAX)
+                    .expect("offload accepted");
+                Err(ExitError::message("poisoned incarnation"))
+            }
+            RestartMessage::Fresh => {
+                assert_eq!(self.generation, 2);
+                context.stop();
+                Ok(())
+            }
+            RestartMessage::StaleTimer | RestartMessage::StaleOffload => {
+                self.stale_seen.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn timers_and_offload_completions_never_cross_an_incarnation_boundary() {
+    let generations = Arc::new(AtomicUsize::new(0));
+    let stale_seen = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    let next = Arc::clone(&generations);
+    let stale = Arc::clone(&stale_seen);
+    let actor = tree
+        .add_actor(
+            "actor",
+            ActorDef::<RestartActor>::factory(move || {
+                let generation = next.fetch_add(1, Ordering::SeqCst) + 1;
+                (generation, Arc::clone(&stale))
+            })
+            .restart(Default::default()),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("first actor starts");
+    actor
+        .send(RestartMessage::Poison)
+        .await
+        .expect("actor live");
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            generations.load(Ordering::SeqCst) >= 2
+        })
+        .await
+    );
+    actor
+        .send(RestartMessage::Fresh)
+        .await
+        .expect("replacement live");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert!(!stale_seen.load(Ordering::SeqCst));
 }
 
 enum DeadlineMessage {

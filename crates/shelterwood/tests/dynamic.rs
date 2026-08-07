@@ -1,20 +1,23 @@
 use std::{
-    future::Future,
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    task::{Context, Poll, Waker},
     time::Duration,
 };
 
-use shelterwood::{
-    Backoff, DynamicTree, ExitError, ExitKind, NotAdmittingCause, Readiness, RemoveOutcome,
-    ReserveError, RestartCondition, RestartPolicy, Retention, Shutdown, StopReason, SubtreeDef,
-    SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+use crate::common::{
+    ReleaseGate, advance_time, assert_quiet,
+    policy::never,
+    poll_once, poll_until,
+    waiting::{task as waiting_task, tree as waiting_tree},
 };
-use shelterwood_test_support::{ReleaseGate, advance_time, assert_quiet, poll_until};
+use shelterwood::{
+    Actor, ActorOnceDef, Backoff, Context as ActorContext, DynamicTree, ExitError, ExitKind,
+    ExitResult, NotAdmittingCause, Readiness, RemoveOutcome, ReserveError, RestartCondition,
+    RestartPolicy, Retention, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
+    TaskOnceDef, Tree,
+};
 
 struct DropProbe(Arc<AtomicBool>);
 
@@ -24,26 +27,48 @@ impl Drop for DropProbe {
     }
 }
 
-fn never() -> RestartPolicy {
-    RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
-}
+struct GatedDynamicActor;
 
-fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
-    let mut context = Context::from_waker(Waker::noop());
-    future.poll(&mut context)
-}
+impl Actor for GatedDynamicActor {
+    type Msg = ();
+    type Args = ReleaseGate;
 
-fn waiting_task() -> TaskDef {
-    TaskDef::new(|context| async move {
-        context.shutdown_token().cancelled().await;
+    async fn init(gate: Self::Args, _: &mut ActorContext<'_, Self>) -> Result<Self, ExitError> {
+        gate.wait().await;
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), _: &mut ActorContext<'_, Self>) -> ExitResult {
         Ok(())
-    })
+    }
 }
 
-fn waiting_tree() -> Tree {
-    let mut tree = Tree::new();
-    tree.add_task("worker", waiting_task()).expect("valid task");
-    tree
+#[tokio::test]
+async fn dynamic_actor_add_resolves_at_admission_without_awaiting_init() {
+    let tree = DynamicTree::new();
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+    let gate = ReleaseGate::default();
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(1),
+        scope.add_actor_once(
+            "gated",
+            ActorOnceDef::<GatedDynamicActor>::new(gate)
+                .readiness(Readiness::Manual)
+                .shutdown(Shutdown::Abort),
+        ),
+    )
+    .await
+    .expect("admission does not wait for init")
+    .expect("actor admitted");
+    let actor = receipt.into_handles();
+    actor.send(()).await.expect("admitted mailbox is usable");
+    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
 }
 
 #[tokio::test]

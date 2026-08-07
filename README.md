@@ -63,9 +63,9 @@ scope, and subtrees compose both recursively.
 - [Embedding Shelterwood in a host process](docs/embedding.md)
 
 The executable application-scale examples live in the M5 acceptance tests:
-[shard store](crates/shelterwood/tests/shard_store.rs),
-[sidecar](crates/shelterwood/tests/sidecar.rs), and
-[assistant control plane](crates/shelterwood/tests/assistant.rs).
+[shard store](crates/shelterwood/tests/acceptance/shard_store.rs),
+[sidecar](crates/shelterwood/tests/acceptance/sidecar.rs), and
+[assistant control plane](crates/shelterwood/tests/acceptance/assistant.rs).
 
 ## Operational preconditions
 

@@ -7,12 +7,12 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, advance_time, poll_until};
 use shelterwood::{
     Backoff, DynamicTree, ExitError, ExitKind, Intensity, Readiness, RestartCondition,
     RestartPolicy, Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeDef,
     SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, Tree,
 };
-use shelterwood_test_support::{advance_time, poll_until};
 
 #[tokio::test]
 async fn a_restartable_subtree_can_heal_an_unfilled_lowering_failure() {
@@ -461,7 +461,7 @@ async fn hard_aborted_subtree_descendants_still_publish_exits() {
 
 #[tokio::test]
 async fn shutdown_and_wait_wakes_when_a_parent_drain_terminalizes_a_restarting_subtree() {
-    let gate = shelterwood_test_support::ReleaseGate::default();
+    let gate = ReleaseGate::default();
     let inner = Arc::new(Mutex::new(None::<TaskRef>));
     let definition = SubtreeDef::factory({
         let gate = gate.clone();

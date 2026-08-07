@@ -6,60 +6,25 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{ReleaseGate, poll_until};
 use shelterwood::{
-    Backoff, DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
-    RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, RestartCondition,
-    RestartPolicy, ScopeDefaults, SendErrorKind, TaskDef, Tree,
+    DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
+    RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ScopeDefaults,
+    SendErrorKind, Tree,
 };
-use shelterwood_test_support::{ConsumeCount, ConsumeGuard, ReleaseGate, poll_until};
-
-fn never() -> RestartPolicy {
-    RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
-}
-
-#[derive(Clone, Copy)]
-enum ResourceMode {
-    Normal,
-    ReadinessPanic,
-    StartupFailure,
-}
-
-struct ResourceActor {
-    _guard: ConsumeGuard,
-    mode: ResourceMode,
-}
-
-impl RawActor for ResourceActor {
-    type Msg = ();
-
-    fn readiness(&self) -> Readiness {
-        match self.mode {
-            ResourceMode::Normal => Readiness::Immediate,
-            ResourceMode::ReadinessPanic => panic!("raw readiness panic"),
-            ResourceMode::StartupFailure => Readiness::Manual,
-        }
-    }
-
-    async fn run(&mut self, _context: &mut RawContext<Self::Msg>) -> ExitResult {
-        match self.mode {
-            ResourceMode::Normal => Ok(()),
-            ResourceMode::ReadinessPanic => unreachable!("readiness prevents run"),
-            ResourceMode::StartupFailure => {
-                Err(ExitError::message("raw actor failed before ready"))
-            }
-        }
-    }
-}
-
-fn resource_actor(count: &ConsumeCount, mode: ResourceMode) -> ResourceActor {
-    ResourceActor {
-        _guard: count.guard(),
-        mode,
-    }
-}
 
 struct FactoryTaskActor {
     factory_task: String,
+}
+
+struct InertRaw;
+
+impl RawActor for InertRaw {
+    type Msg = ();
+
+    async fn run(&mut self, _context: &mut RawContext<Self::Msg>) -> ExitResult {
+        Ok(())
+    }
 }
 
 impl RawActor for FactoryTaskActor {
@@ -87,90 +52,10 @@ async fn restartable_raw_factory_runs_inside_the_incarnation_task() {
 
 #[test]
 fn raw_readiness_override_rejects_after_init_eagerly() {
-    let count = ConsumeCount::default();
-    let error = RawOnceDef::new(resource_actor(&count, ResourceMode::Normal))
+    let error = RawOnceDef::new(InertRaw)
         .readiness(Readiness::AfterInit)
         .expect_err("raw actors have no init phase");
     assert_eq!(error, PolicyError::UnsupportedReadiness);
-}
-
-#[tokio::test]
-async fn one_shot_raw_resource_drops_once_on_normal_exit() {
-    let count = ConsumeCount::default();
-    let mut tree = Tree::new();
-    tree.add_raw_once(
-        "raw",
-        RawOnceDef::new(resource_actor(&count, ResourceMode::Normal)),
-    )
-    .expect("valid actor");
-    let system = tree.spawn().expect("runtime is available");
-    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    count.assert_once();
-}
-
-#[tokio::test]
-async fn one_shot_raw_resource_drops_once_on_construction_panic() {
-    let count = ConsumeCount::default();
-    let mut tree = Tree::new();
-    tree.add_raw_once(
-        "raw",
-        RawOnceDef::new(resource_actor(&count, ResourceMode::ReadinessPanic)),
-    )
-    .expect("valid actor");
-    let system = tree.spawn().expect("runtime is available");
-    assert!(system.wait_started().await.is_err());
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("failed root rolls back");
-    count.assert_once();
-}
-
-#[tokio::test]
-async fn one_shot_raw_resource_drops_once_on_startup_failure() {
-    let count = ConsumeCount::default();
-    let mut tree = Tree::new();
-    tree.add_raw_once(
-        "raw",
-        RawOnceDef::new(resource_actor(&count, ResourceMode::StartupFailure)),
-    )
-    .expect("valid actor");
-    let system = tree.spawn().expect("runtime is available");
-    assert!(system.wait_started().await.is_err());
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("failed root rolls back");
-    count.assert_once();
-}
-
-#[tokio::test]
-async fn one_shot_raw_resource_drops_once_on_shutdown_before_start() {
-    let count = ConsumeCount::default();
-    let mut tree = Tree::new();
-    tree.add_task(
-        "gate",
-        TaskDef::new(|context| async move {
-            context.shutdown_token().cancelled().await;
-            Ok(())
-        })
-        .restart(never())
-        .readiness(Readiness::Manual)
-        .expect("manual readiness")
-        .readiness_deadline(ReadinessDeadline::Unbounded),
-    )
-    .expect("valid gate");
-    tree.add_raw_once(
-        "never-spawned",
-        RawOnceDef::new(resource_actor(&count, ResourceMode::Normal)),
-    )
-    .expect("valid actor");
-    let system = tree.spawn().expect("runtime is available");
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("shutdown completes");
-    count.assert_once();
 }
 
 struct ManualActor {

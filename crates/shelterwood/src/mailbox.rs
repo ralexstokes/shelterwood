@@ -184,6 +184,13 @@ trait DeadlineOperation {
         budget: crate::deadline::Deadline,
         elapsed: bool,
     ) -> Poll<Self::Output>;
+
+    /// Resolves a zero-width budget without ever attempting the operation.
+    ///
+    /// A zero budget is a short-circuit, not a raced deadline: nothing is
+    /// submitted and no completion is observed, so this reports the
+    /// operation's timeout outcome and performs only its own cleanup.
+    fn short_circuit(&mut self) -> Self::Output;
 }
 
 /// First-poll deadline capture shared by every public mailbox deadline future.
@@ -193,6 +200,7 @@ struct Deadlined<F> {
     budget: Option<crate::deadline::Deadline>,
     timer: Option<crate::runtime::BoxedSleep>,
     started: bool,
+    elapsed: bool,
     done: bool,
 }
 
@@ -204,6 +212,7 @@ impl<F> Deadlined<F> {
             budget: None,
             timer: None,
             started: false,
+            elapsed: false,
             done: false,
         }
     }
@@ -222,27 +231,37 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
                 this.timer = Some(crate::runtime::sleep_deadline(budget));
             }
         }
+        // A zero budget short-circuits: the operation is never attempted, so
+        // nothing is submitted and no completion is observed. The expiry
+        // boundary below governs only non-zero budgets, and the two rules
+        // therefore never compete.
+        if this.duration.is_zero() {
+            this.done = true;
+            return Poll::Ready(this.operation.short_circuit());
+        }
         let budget = this
             .budget
             .expect("a started deadline future retains its captured budget");
-        if this.duration.is_zero() {
-            let result = this.operation.poll_deadlined(context, budget, true);
-            this.done = result.is_ready();
-            return result;
-        }
         if let Poll::Ready(result) = this.operation.poll_deadlined(context, budget, false) {
             this.done = true;
             return Poll::Ready(result);
         }
-        if this
-            .timer
-            .as_mut()
-            .expect("a non-zero deadline future retains its timer")
-            .as_mut()
-            .poll(context)
-            .is_pending()
-        {
-            return Poll::Pending;
+        if !this.elapsed {
+            if this
+                .timer
+                .as_mut()
+                .expect("an unelapsed deadline future retains its timer")
+                .as_mut()
+                .poll(context)
+                .is_pending()
+            {
+                return Poll::Pending;
+            }
+            // The timer is a one-shot future: polling it again after it
+            // resolves panics. Latch the transition and release it, so an
+            // elapsed poll that stays pending re-polls only the operation.
+            this.elapsed = true;
+            this.timer = None;
         }
         let result = this.operation.poll_deadlined(context, budget, true);
         this.done = result.is_ready();
@@ -347,6 +366,11 @@ impl<T> DeadlineOperation for ReplyOperation<T> {
             },
             Poll::Pending => Poll::Pending,
         }
+    }
+
+    fn short_circuit(&mut self) -> Self::Output {
+        self.receiver.close();
+        Err(ReplyError::Timeout)
     }
 }
 
@@ -1518,6 +1542,13 @@ impl<M: Send + 'static> DeadlineOperation for TimedSend<M> {
             Poll::Ready(withdraw_send(&mut self.send))
         }
     }
+
+    fn short_circuit(&mut self) -> Self::Output {
+        // The send was never polled, so it was never submitted: withdrawal
+        // recovers the message and reports the mailbox's current binding as
+        // the newest incarnation observed during the attempt.
+        withdraw_send(&mut self.send)
+    }
 }
 
 impl<M: Send + 'static> Future for SendTimeout<M> {
@@ -1607,11 +1638,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
     ) -> Poll<Self::Output> {
         if self.make_msg.is_some() {
             if elapsed {
-                return Poll::Ready(Err(CallError {
-                    actor_id: self.actor.id().clone(),
-                    incarnation_observed: self.actor.mailbox.current_observation(),
-                    kind: CallErrorKind::AcceptanceTimedOut,
-                }));
+                return Poll::Ready(self.short_circuit());
             }
             // Capture the one overall budget before invoking user code. A
             // slow message constructor consumes acceptance/response time. The
@@ -1626,11 +1653,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             // existed before it completed, so do not start one after the
             // captured budget is strictly in the past.
             if budget.is_overdue(crate::runtime::now()) {
-                return Poll::Ready(Err(CallError {
-                    actor_id: self.actor.id().clone(),
-                    incarnation_observed: self.actor.mailbox.current_observation(),
-                    kind: CallErrorKind::AcceptanceTimedOut,
-                }));
+                return Poll::Ready(self.short_circuit());
             }
             self.reply = receiver.receiver.take();
             self.send = Some(self.actor.send(message));
@@ -1658,10 +1681,13 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             }
         }
 
-        if let Some(accepted) = self.accepted
-            && let Poll::Ready(result) = self.poll_reply(context, accepted, elapsed)
-        {
-            return Poll::Ready(result);
+        // Acceptance released the send future, so the reply is the only
+        // remaining source of an outcome. An elapsed reply poll may still be
+        // pending when a completion transition won without publishing its
+        // payload yet; that transition wakes the registered waker, so waiting
+        // is the answer rather than reaching for a send that no longer exists.
+        if let Some(accepted) = self.accepted {
+            return self.poll_reply(context, accepted, elapsed);
         }
 
         if !elapsed {
@@ -1694,6 +1720,16 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
                 }))
             }
         }
+    }
+
+    fn short_circuit(&mut self) -> Self::Output {
+        // No message was ever constructed, so there is nothing to withdraw
+        // and no accepting incarnation to report.
+        Err(CallError {
+            actor_id: self.actor.id().clone(),
+            incarnation_observed: self.actor.mailbox.current_observation(),
+            kind: CallErrorKind::AcceptanceTimedOut,
+        })
     }
 }
 
@@ -2026,6 +2062,73 @@ mod tests {
             }))
             .is_err(),
             "the exhausted domain stays poisoned"
+        );
+    }
+
+    /// Stays pending on its first elapsed poll, modelling an atomic
+    /// completion transition that won without publishing its payload yet.
+    #[derive(Default)]
+    struct PendingOnFirstExpiry {
+        elapsed_polls: usize,
+    }
+
+    impl super::DeadlineOperation for PendingOnFirstExpiry {
+        type Output = usize;
+
+        fn poll_deadlined(
+            &mut self,
+            _context: &mut Context<'_>,
+            _budget: crate::deadline::Deadline,
+            elapsed: bool,
+        ) -> Poll<usize> {
+            if !elapsed {
+                return Poll::Pending;
+            }
+            self.elapsed_polls += 1;
+            if self.elapsed_polls < 2 {
+                Poll::Pending
+            } else {
+                Poll::Ready(self.elapsed_polls)
+            }
+        }
+
+        fn short_circuit(&mut self) -> usize {
+            0
+        }
+    }
+
+    #[crate::runtime::test(start_paused = true)]
+    async fn an_expired_deadline_future_never_repolls_its_resolved_timer() {
+        let width = std::time::Duration::from_secs(1);
+        let mut future = Box::pin(super::Deadlined::new(
+            PendingOnFirstExpiry::default(),
+            width,
+        ));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        assert!(future.as_mut().poll(&mut context).is_pending());
+        crate::runtime::advance(width * 2).await;
+        // The timer resolves here and the operation stays pending, so the
+        // scaffold must latch the expiry rather than poll the timer again.
+        assert!(future.as_mut().poll(&mut context).is_pending());
+
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(2)));
+    }
+
+    #[test]
+    fn a_zero_budget_short_circuits_without_polling_the_operation() {
+        let mut future = Box::pin(super::Deadlined::new(
+            PendingOnFirstExpiry::default(),
+            std::time::Duration::ZERO,
+        ));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(0)));
+        assert_eq!(
+            future.operation.elapsed_polls, 0,
+            "a zero budget never attempts the operation"
         );
     }
 }

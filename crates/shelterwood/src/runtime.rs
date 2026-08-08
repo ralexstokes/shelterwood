@@ -23,6 +23,12 @@ use crate::deadline::Deadline;
 #[cfg(test)]
 pub(crate) use tokio::test;
 
+/// Advances a paused test clock, keeping timer control in this module.
+#[cfg(test)]
+pub(crate) async fn advance(duration: Duration) {
+    time::advance(duration).await;
+}
+
 pub(crate) fn now() -> std::time::Instant {
     time::Instant::now().into_std()
 }

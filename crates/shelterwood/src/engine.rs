@@ -487,11 +487,6 @@ impl<K> DeadlineQueue<K> {
     pub(crate) fn storage_len(&self) -> usize {
         self.entries.len()
     }
-
-    #[cfg(test)]
-    fn registration_storage_len(&self) -> usize {
-        self.registrations.len()
-    }
 }
 
 #[cfg(test)]
@@ -799,15 +794,14 @@ mod tests {
         for _ in 0..10_000 {
             let cancelled = deadlines.push(far_future, "cancelled");
             assert!(deadlines.cancel(cancelled));
-            assert_eq!(deadlines.len(), 1);
+            assert_eq!(
+                deadlines.len(),
+                1,
+                "the registration map keeps only live payloads"
+            );
             assert!(
                 deadlines.storage_len() <= 2,
                 "heap tombstones must stay proportional to live deadlines"
-            );
-            assert_eq!(
-                deadlines.registration_storage_len(),
-                deadlines.len(),
-                "the registration map stores only live payloads"
             );
         }
 

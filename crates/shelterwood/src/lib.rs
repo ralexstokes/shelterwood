@@ -2,6 +2,8 @@
 
 //! Structured supervision and actors for asynchronous Rust systems.
 
+#[macro_use]
+mod definition;
 mod actor;
 mod cells;
 mod deadline;

@@ -17,6 +17,7 @@ use crate::{
     ActorRef, CancellationToken, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown,
     PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef, Shutdown,
     cells::{MailboxControl, MemberCell},
+    definition::DefinitionSource,
     mailbox::{MailboxCell, MailboxReceiver},
     policy::CommonOptions,
     runtime::{self, ActorWork, Latch, Signal, SignalWatcher},
@@ -1426,61 +1427,20 @@ impl<R: RawActor> RawDef<R> {
         }
     }
 
-    /// Overrides the restart policy.
-    #[must_use]
-    pub fn restart(mut self, restart: RestartPolicy) -> Self {
-        self.options.restart = Some(restart);
-        self
-    }
-
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor mailbox kind and capacity.
-    #[must_use]
-    pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
-        self.options.mailbox = Some(mailbox);
-        self
-    }
-
-    /// Overrides frozen-prefix drain versus discard behavior.
-    #[must_use]
-    pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
-        self.options.mailbox_shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor's declared readiness mode.
-    pub fn readiness(mut self, readiness: Readiness) -> Result<Self, PolicyError> {
-        if readiness == Readiness::AfterInit {
-            return Err(PolicyError::UnsupportedReadiness);
-        }
-        self.options.readiness = Some(readiness);
-        Ok(self)
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(
+        restart,
+        shutdown,
+        mailbox,
+        mailbox_shutdown,
+        raw_readiness,
+        structural_readiness_deadline,
+        retention,
+    );
 
     pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
         let factory = self.factory;
         RawConstruction {
-            source: RawSource::Restartable(Arc::new(move || {
+            source: DefinitionSource::Restartable(Arc::new(move || {
                 let actor = factory();
                 Box::new(RawInstance {
                     actor,
@@ -1517,56 +1477,21 @@ impl<R: RawActor> RawOnceDef<R> {
         }
     }
 
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor mailbox kind and capacity.
-    #[must_use]
-    pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
-        self.options.mailbox = Some(mailbox);
-        self
-    }
-
-    /// Overrides frozen-prefix drain versus discard behavior.
-    #[must_use]
-    pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
-        self.options.mailbox_shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor's declared readiness mode.
-    pub fn readiness(mut self, readiness: Readiness) -> Result<Self, PolicyError> {
-        if readiness == Readiness::AfterInit {
-            return Err(PolicyError::UnsupportedReadiness);
-        }
-        self.options.readiness = Some(readiness);
-        Ok(self)
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(
+        shutdown,
+        mailbox,
+        mailbox_shutdown,
+        raw_readiness,
+        structural_readiness_deadline,
+        retention,
+    );
 
     pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
         RawConstruction {
-            source: RawSource::OneShot(Some(Box::new(RawInstance {
+            source: DefinitionSource::OneShot(Box::new(RawInstance {
                 actor: self.actor,
                 mailbox,
-            }))),
+            })),
             options: self.options,
         }
     }
@@ -1700,26 +1625,24 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
 }
 
 pub(crate) struct RawConstruction {
-    pub(crate) source: RawSource,
+    pub(crate) source: DefinitionSource<RawFactory, Box<dyn ErasedRawInstance>>,
     pub(crate) options: CommonOptions,
 }
 
 impl RawConstruction {
     pub(crate) fn one_shot(&self) -> bool {
-        matches!(self.source, RawSource::OneShot(_) | RawSource::Spent)
+        self.source.is_one_shot()
     }
 
     pub(crate) fn take_spawn(&mut self) -> RawSpawn {
-        match &mut self.source {
-            RawSource::Restartable(factory) => RawSpawn::Restartable(Arc::clone(factory)),
-            RawSource::OneShot(instance) => {
-                let instance = instance
-                    .take()
-                    .expect("one-shot raw actor construction invoked more than once");
-                self.source = RawSource::Spent;
-                RawSpawn::OneShot(instance)
-            }
-            RawSource::Spent => panic!("one-shot raw actor construction invoked more than once"),
+        if let Some(factory) = self.source.restartable() {
+            RawSpawn::Restartable(Arc::clone(factory))
+        } else {
+            RawSpawn::OneShot(
+                self.source
+                    .take_one_shot()
+                    .expect("one-shot raw actor construction invoked more than once"),
+            )
         }
     }
 }
@@ -1736,12 +1659,6 @@ impl RawSpawn {
             Self::OneShot(instance) => instance,
         }
     }
-}
-
-pub(crate) enum RawSource {
-    Restartable(RawFactory),
-    OneShot(Option<Box<dyn ErasedRawInstance>>),
-    Spent,
 }
 
 pub(crate) struct RawRunContext {

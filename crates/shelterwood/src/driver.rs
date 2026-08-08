@@ -22,12 +22,12 @@ use crate::{
     observe::LifecycleEventKind,
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, NotAdmittingCause, RemoveOutcome,
-        ReserveError, ScopeFactory, ScopePlan, ScopeSource, SlotCell,
+        ReserveError, ScopeFactory, ScopePlan, SlotCell,
     },
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
     runtime::{self, Latch},
-    task::{OnceTaskBody, TaskContext, TaskFactory},
+    task::{TaskContext, TaskFactory},
 };
 
 #[cfg(test)]
@@ -1216,25 +1216,20 @@ impl ScopeRuntime {
                 )
             }
             ChildConstruction::TaskOnce(definition) => {
-                let body = std::mem::replace(&mut definition.body, OnceTaskBody::Spent);
-                match body {
-                    OnceTaskBody::Available(body) => (
-                        SpawnBody::TaskOnce(body),
-                        Some(child.options.readiness),
-                        true,
-                    ),
-                    OnceTaskBody::Spent => {
-                        panic!("one-shot task construction invoked more than once")
-                    }
-                }
+                let body = definition.take_body();
+                (
+                    SpawnBody::TaskOnce(body),
+                    Some(child.options.readiness),
+                    true,
+                )
             }
             ChildConstruction::Scope(definition) => {
                 let inherited = match definition.defaults {
                     DefaultsInheritance::Inherit => self.defaults.clone(),
                     DefaultsInheritance::Reset => ResolvedDefaults::default(),
                 };
-                match &mut definition.source {
-                    ScopeSource::Restartable(factory) => (
+                if let Some(factory) = definition.restartable() {
+                    (
                         SpawnBody::ScopeRestartable {
                             factory: Arc::clone(factory),
                             scope: Arc::clone(
@@ -1248,31 +1243,26 @@ impl ScopeRuntime {
                         },
                         Some(Readiness::Manual),
                         false,
-                    ),
-                    ScopeSource::OneShot(_) => {
-                        let source = std::mem::replace(&mut definition.source, ScopeSource::Spent);
-                        let ScopeSource::OneShot(tree) = source else {
-                            unreachable!()
-                        };
-                        (
-                            SpawnBody::ScopeOnce {
-                                tree,
-                                scope: Arc::clone(
-                                    child
-                                        .slot
-                                        .scope
-                                        .as_ref()
-                                        .expect("scope construction needs a scope cell"),
-                                ),
-                                inherited,
-                            },
-                            Some(Readiness::Manual),
-                            true,
-                        )
-                    }
-                    ScopeSource::Spent => {
-                        panic!("one-shot subtree construction invoked more than once")
-                    }
+                    )
+                } else {
+                    let tree = definition
+                        .take_one_shot()
+                        .expect("one-shot subtree construction invoked more than once");
+                    (
+                        SpawnBody::ScopeOnce {
+                            tree,
+                            scope: Arc::clone(
+                                child
+                                    .slot
+                                    .scope
+                                    .as_ref()
+                                    .expect("scope construction needs a scope cell"),
+                            ),
+                            inherited,
+                        },
+                        Some(Readiness::Manual),
+                        true,
+                    )
                 }
             }
         };

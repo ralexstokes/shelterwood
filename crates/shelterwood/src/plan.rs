@@ -8,6 +8,7 @@ use std::{
 use crate::{
     ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults, Strategy,
     cells::{MemberCell, ScopeCell},
+    definition::DefinitionSource,
     identity::ScopeIdentity,
     policy::{
         CommonOptions, IdError, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor,
@@ -347,7 +348,7 @@ pub(crate) enum LowerError {
 }
 
 pub(crate) struct ScopeConstruction {
-    pub(crate) source: ScopeSource,
+    pub(crate) source: DefinitionSource<ScopeFactory, Box<BuilderCore>>,
     pub(crate) options: CommonOptions,
     pub(crate) defaults: DefaultsInheritance,
 }
@@ -356,14 +357,16 @@ pub(crate) type ScopeFactory = Arc<dyn Fn() -> BuilderCore + Send + Sync + 'stat
 
 impl ScopeConstruction {
     pub(crate) fn one_shot(&self) -> bool {
-        matches!(self.source, ScopeSource::OneShot(_) | ScopeSource::Spent)
+        self.source.is_one_shot()
     }
-}
 
-pub(crate) enum ScopeSource {
-    Restartable(ScopeFactory),
-    OneShot(Box<BuilderCore>),
-    Spent,
+    pub(crate) fn restartable(&self) -> Option<&ScopeFactory> {
+        self.source.restartable()
+    }
+
+    pub(crate) fn take_one_shot(&mut self) -> Option<Box<BuilderCore>> {
+        self.source.take_one_shot()
+    }
 }
 
 pub(crate) fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError> {

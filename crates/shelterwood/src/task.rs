@@ -1,6 +1,7 @@
 //! Supervised task definitions, contexts, and handles.
 
 use std::{
+    convert::Infallible,
     fmt,
     future::Future,
     hash::{Hash, Hasher},
@@ -12,6 +13,7 @@ use crate::{
     ChildId, Exit, ExitError, ExitResult, Incarnation, Membership, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
     cells::MemberCell,
+    definition::DefinitionSource,
     policy::CommonOptions,
     runtime::{self, Latch},
 };
@@ -157,42 +159,13 @@ impl TaskDef {
         }
     }
 
-    /// Overrides the restart policy.
-    #[must_use]
-    pub fn restart(mut self, restart: RestartPolicy) -> Self {
-        self.options.restart = Some(restart);
-        self
-    }
-
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides task readiness (`Immediate` or `Manual`).
-    pub fn readiness(mut self, readiness: Readiness) -> Result<Self, PolicyError> {
-        if readiness == Readiness::AfterInit {
-            return Err(PolicyError::UnsupportedReadiness);
-        }
-        self.options.readiness = Some(readiness);
-        Ok(self)
-    }
-
-    /// Overrides the readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(
+        restart,
+        shutdown,
+        task_readiness,
+        task_readiness_deadline,
+        retention,
+    );
 }
 
 type OnceTaskFuture<T> = Pin<Box<dyn Future<Output = Result<T, ExitError>> + Send + 'static>>;
@@ -228,40 +201,12 @@ impl<T: Send + 'static> TaskOnceDef<T> {
         }
     }
 
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides task readiness (`Immediate` or `Manual`).
-    pub fn readiness(mut self, readiness: Readiness) -> Result<Self, PolicyError> {
-        if readiness == Readiness::AfterInit {
-            return Err(PolicyError::UnsupportedReadiness);
-        }
-        self.options.readiness = Some(readiness);
-        Ok(self)
-    }
-
-    /// Overrides the readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(shutdown, task_readiness, task_readiness_deadline, retention,);
 
     pub(crate) fn erase(self, completion: runtime::OneShotSender<T>) -> OnceTask {
         let body = self.body;
         OnceTask {
-            body: OnceTaskBody::Available(Box::new(move |context| {
+            source: DefinitionSource::OneShot(Box::new(move |context| {
                 Box::pin(async move {
                     match body(context).await {
                         Ok(value) => {
@@ -278,13 +223,18 @@ impl<T: Send + 'static> TaskOnceDef<T> {
 }
 
 pub(crate) struct OnceTask {
-    pub(crate) body: OnceTaskBody,
+    source: DefinitionSource<Infallible, OnceTaskFactory>,
     pub(crate) options: CommonOptions,
 }
 
-pub(crate) enum OnceTaskBody {
-    Available(Box<dyn FnOnce(TaskContext) -> TaskFuture + Send + 'static>),
-    Spent,
+type OnceTaskFactory = Box<dyn FnOnce(TaskContext) -> TaskFuture + Send + 'static>;
+
+impl OnceTask {
+    pub(crate) fn take_body(&mut self) -> OnceTaskFactory {
+        self.source
+            .take_one_shot()
+            .expect("one-shot task construction invoked more than once")
+    }
 }
 
 /// A cheap membership-addressed task handle.

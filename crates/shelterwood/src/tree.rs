@@ -16,12 +16,13 @@ use crate::{
     Membership, ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults, ScopeSnapshot,
     Shutdown, ShutdownTimeout, SnapshotReceiver, Strategy, WaitError,
     cells::{MemberStage, ScopeCell},
+    definition::DefinitionSource,
     driver::DynamicReservation,
     exit::{StartupError, StopReason},
     mailbox::MailboxCell,
     plan::{
         BuilderCore, ChildConstruction, LowerError, RemoveOutcome, ReserveError, ScopeConstruction,
-        ScopeSource, SlotCell, checked_id,
+        SlotCell, checked_id,
     },
     policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
     raw::{RawDef, RawOnceDef},
@@ -1041,33 +1042,7 @@ impl<T: Subtree> SubtreeDef<T> {
         }
     }
 
-    /// Overrides the restart policy.
-    #[must_use]
-    pub fn restart(mut self, restart: RestartPolicy) -> Self {
-        self.options.restart = Some(restart);
-        self
-    }
-
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(restart, shutdown, structural_readiness_deadline, retention,);
 
     /// Selects inheritance or reset for unset nested defaults.
     #[must_use]
@@ -1079,7 +1054,7 @@ impl<T: Subtree> SubtreeDef<T> {
     fn erase(self) -> ScopeConstruction {
         let factory = self.factory;
         ScopeConstruction {
-            source: ScopeSource::Restartable(Arc::new(move || {
+            source: DefinitionSource::Restartable(Arc::new(move || {
                 <T as sealed::Sealed>::into_core(factory())
             })),
             options: self.options,
@@ -1117,26 +1092,7 @@ impl<T: Subtree> SubtreeOnceDef<T> {
         }
     }
 
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(shutdown, structural_readiness_deadline, retention,);
 
     /// Selects inheritance or reset for unset nested defaults.
     #[must_use]
@@ -1147,7 +1103,9 @@ impl<T: Subtree> SubtreeOnceDef<T> {
 
     fn erase(self) -> ScopeConstruction {
         ScopeConstruction {
-            source: ScopeSource::OneShot(Box::new(<T as sealed::Sealed>::into_core(self.tree))),
+            source: DefinitionSource::OneShot(Box::new(<T as sealed::Sealed>::into_core(
+                self.tree,
+            ))),
             options: self.options,
             defaults: self.defaults,
         }

@@ -5,6 +5,7 @@ readonly below_driver_layers=(
   crates/shelterwood/src/actor.rs
   crates/shelterwood/src/cells.rs
   crates/shelterwood/src/deadline.rs
+  crates/shelterwood/src/definition.rs
   crates/shelterwood/src/engine.rs
   crates/shelterwood/src/exit.rs
   crates/shelterwood/src/identity.rs

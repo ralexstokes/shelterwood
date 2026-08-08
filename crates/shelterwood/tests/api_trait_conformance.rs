@@ -2,12 +2,14 @@ use std::{cell::Cell, error::Error, hash::Hash, time::Duration};
 
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ActorSlot, Admission, Blocking, CallError, CallFuture,
-    CancellationToken, Context, DeadlineElapsed, DynamicActorSlot, DynamicScopeRef,
-    DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError, ExitResult, Guard, Handler,
-    Incarnation, LifecycleEvents, LifecycleTryRecvError, Membership, OneShotTaskRef, RawActor,
-    RawContext, RawDef, RawOnceDef, Removal, Reply, ReplyReceive, ReplyReceiver, ScopeRef,
-    SendError, SendFuture, SendTimeout, SnapshotClosed, SnapshotReceiver, StopContext, SubtreeDef,
-    SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, Tree, WaitError,
+    CancellationToken, Context, DeadlineElapsed, DefaultsInheritance, DynamicActorSlot,
+    DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError, ExitResult,
+    Guard, Handler, Incarnation, LifecycleEvents, LifecycleTryRecvError, Mailbox, MailboxShutdown,
+    Membership, OneShotTaskRef, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
+    ReadinessDeadline, Removal, Reply, ReplyReceive, ReplyReceiver, RestartPolicy, Retention,
+    ScopeRef, SendError, SendFuture, SendTimeout, Shutdown, SnapshotClosed, SnapshotReceiver,
+    StopContext, SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef,
+    TaskSlot, Tree, WaitError,
 };
 
 fn assert_error<T: Error>() {}
@@ -193,6 +195,77 @@ fn raw_types_obey_error_and_future_trait_contracts() {
     let (reply, receiver) = Reply::<Cell<()>>::channel();
     assert_send(reply);
     assert_send(receiver);
+}
+
+#[test]
+fn all_definition_option_setters_compile() {
+    let _ = RawDef::<OpaqueRaw>::factory(|| OpaqueRaw {
+        _not_sync: Cell::new(()),
+    })
+    .restart(RestartPolicy::default())
+    .shutdown(Shutdown::default())
+    .mailbox(Mailbox::default())
+    .mailbox_shutdown(MailboxShutdown::default())
+    .readiness(Readiness::Immediate)
+    .expect("immediate raw readiness is supported")
+    .readiness_deadline(ReadinessDeadline::Inherit)
+    .retention(Retention::Retain);
+
+    let _ = RawOnceDef::new(OpaqueRaw {
+        _not_sync: Cell::new(()),
+    })
+    .shutdown(Shutdown::default())
+    .mailbox(Mailbox::default())
+    .mailbox_shutdown(MailboxShutdown::default())
+    .readiness(Readiness::Manual)
+    .expect("manual raw readiness is supported")
+    .readiness_deadline(ReadinessDeadline::Inherit)
+    .retention(Retention::Retain);
+
+    let _ = ActorDef::<OpaqueActor>::factory(|| Cell::new(()))
+        .restart(RestartPolicy::default())
+        .shutdown(Shutdown::default())
+        .mailbox(Mailbox::default())
+        .mailbox_shutdown(MailboxShutdown::default())
+        .readiness(Readiness::AfterInit)
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain);
+
+    let _ = ActorOnceDef::<OpaqueActor>::new(Cell::new(()))
+        .shutdown(Shutdown::default())
+        .mailbox(Mailbox::default())
+        .mailbox_shutdown(MailboxShutdown::default())
+        .readiness(Readiness::AfterInit)
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain);
+
+    let _ = TaskDef::new(|_| async { Ok(()) })
+        .restart(RestartPolicy::default())
+        .shutdown(Shutdown::default())
+        .readiness(Readiness::Immediate)
+        .expect("immediate task readiness is supported")
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain);
+
+    let _ = TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) })
+        .shutdown(Shutdown::default())
+        .readiness(Readiness::Manual)
+        .expect("manual task readiness is supported")
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain);
+
+    let _ = SubtreeDef::factory(Tree::new)
+        .restart(RestartPolicy::default())
+        .shutdown(Shutdown::default())
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain)
+        .defaults(DefaultsInheritance::Inherit);
+
+    let _ = SubtreeOnceDef::new(Tree::new())
+        .shutdown(Shutdown::default())
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain)
+        .defaults(DefaultsInheritance::Reset);
 }
 
 #[test]

@@ -505,54 +505,15 @@ impl<A: Actor> ActorDef<A> {
         }
     }
 
-    /// Overrides the restart policy.
-    #[must_use]
-    pub fn restart(mut self, restart: RestartPolicy) -> Self {
-        self.options.restart = Some(restart);
-        self
-    }
-
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor mailbox kind and capacity.
-    #[must_use]
-    pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
-        self.options.mailbox = Some(mailbox);
-        self
-    }
-
-    /// Overrides frozen-prefix drain versus discard behavior.
-    #[must_use]
-    pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
-        self.options.mailbox_shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor's declared readiness mode.
-    #[must_use]
-    pub fn readiness(mut self, readiness: Readiness) -> Self {
-        self.options.readiness = Some(readiness);
-        self
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(
+        restart,
+        shutdown,
+        mailbox,
+        mailbox_shutdown,
+        actor_readiness,
+        structural_readiness_deadline,
+        retention,
+    );
 
     pub(crate) fn into_raw(self) -> RawDef<Handler<A>> {
         let factory = self.factory;
@@ -594,47 +555,14 @@ impl<A: Actor> ActorOnceDef<A> {
         }
     }
 
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor mailbox kind and capacity.
-    #[must_use]
-    pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
-        self.options.mailbox = Some(mailbox);
-        self
-    }
-
-    /// Overrides frozen-prefix drain versus discard behavior.
-    #[must_use]
-    pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
-        self.options.mailbox_shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor's declared readiness mode.
-    #[must_use]
-    pub fn readiness(mut self, readiness: Readiness) -> Self {
-        self.options.readiness = Some(readiness);
-        self
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(
+        shutdown,
+        mailbox,
+        mailbox_shutdown,
+        actor_readiness,
+        structural_readiness_deadline,
+        retention,
+    );
 
     pub(crate) fn into_raw(self) -> RawOnceDef<Handler<A>> {
         let readiness = self.options.readiness.unwrap_or(Readiness::AfterInit);

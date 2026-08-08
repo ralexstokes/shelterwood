@@ -67,11 +67,40 @@ pub(crate) fn keep_first_panic(first: &mut Option<PanicPayload>, candidate: Opti
 
 /// Resumes the primary panic, or the cleanup panic when there is no primary.
 /// During an existing unwind both are contained to prevent a double panic.
+///
+/// Containment is only correct where losing the diagnostic is the lesser
+/// outcome, which is true in a destructor and false on a normal return path.
+/// Callers that own the sole surviving copy of an authoritative panic must use
+/// [`resume_preferred_panic_outside_unwind`] instead.
 pub(crate) fn resume_preferred_panic(primary: Option<PanicPayload>, cleanup: Option<PanicPayload>) {
     if std::thread::panicking() {
         discard_panic(primary);
         discard_panic(cleanup);
     } else if let Some(payload) = primary {
+        discard_panic(cleanup);
+        resume_panic(payload);
+    } else if let Some(payload) = cleanup {
+        resume_panic(payload);
+    }
+}
+
+/// Resumes exactly as [`resume_preferred_panic`], but never contains the
+/// payload.
+///
+/// This is the variant for call sites that are not destructors and have
+/// already taken sole ownership of the panic. Silently discarding there would
+/// erase the authoritative diagnostic and let the caller continue past a
+/// failure it believes it re-raised, so the caller's non-unwinding precondition
+/// is asserted rather than absorbed.
+pub(crate) fn resume_preferred_panic_outside_unwind(
+    primary: Option<PanicPayload>,
+    cleanup: Option<PanicPayload>,
+) {
+    debug_assert!(
+        !std::thread::panicking(),
+        "an unwinding caller must contain its payloads with resume_preferred_panic"
+    );
+    if let Some(payload) = primary {
         discard_panic(cleanup);
         resume_panic(payload);
     } else if let Some(payload) = cleanup {

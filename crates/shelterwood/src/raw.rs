@@ -566,11 +566,17 @@ struct SharedOffloadState {
     // it, always after releasing the lock.
     state: Mutex<OffloadFutureState>,
     panic: Arc<PanicSlot>,
+    signal: Signal,
     finished: Latch,
 }
 
 impl SharedOffloadState {
-    fn new(future: OffloadFuture, panic: Arc<PanicSlot>, finished: Latch) -> SharedWork {
+    fn new(
+        future: OffloadFuture,
+        panic: Arc<PanicSlot>,
+        signal: Signal,
+        finished: Latch,
+    ) -> SharedWork {
         Arc::new(Self {
             state: Mutex::new(OffloadFutureState {
                 future: Some(future),
@@ -578,6 +584,7 @@ impl SharedOffloadState {
                 cancelled: false,
             }),
             panic,
+            signal,
             finished,
         })
     }
@@ -606,6 +613,10 @@ impl SharedOffloadState {
 
     fn record(&self, payload: PanicPayload) {
         self.panic.record(payload);
+        // Dropping a losing or cancelled operation can panic after its body
+        // has stopped running, so every retained panic must wake the actor's
+        // control plane independently of ordinary event delivery.
+        self.signal.pulse();
     }
 
     fn dispose(&self, future: Option<OffloadFuture>) {
@@ -1176,6 +1187,7 @@ impl<M: Send + 'static> RawContext<M> {
         let state = SharedOffloadState::new(
             Box::pin(operation),
             Arc::clone(&self.resources.panic),
+            self.resources.events.signal.clone(),
             finished.clone(),
         );
         let task = crate::driver::spawn_actor_work(SharedOffloadFuture(Arc::clone(&state)));
@@ -1764,7 +1776,7 @@ mod tests {
         EventQueue, OffloadResource, PanicPayload, PanicSlot, QueuedEvent, RawResources,
         SharedOffloadFuture, SharedOffloadState, resume_preferred_panic,
     };
-    use crate::runtime::Latch;
+    use crate::{driver::Signal, runtime::Latch};
 
     fn marker(value: usize) -> QueuedEvent<usize> {
         QueuedEvent::Deliver {
@@ -1974,6 +1986,7 @@ mod tests {
                 panic_on_drop: true,
             }),
             Arc::clone(&panic),
+            Signal::default(),
             finished.clone(),
         );
         let poller = {
@@ -2021,6 +2034,7 @@ mod tests {
                     panic_on_drop,
                 }),
                 Arc::clone(&resources.panic),
+                resources.events.signal.clone(),
                 completion.clone(),
             );
             resources.offloads.push(OffloadResource {

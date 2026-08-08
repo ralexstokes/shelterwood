@@ -9,8 +9,8 @@ use std::{
 use crate::common::{assert_quiet, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
-    LifecycleEventKind, LifecycleItem, Readiness, Shutdown, StartupError, StartupFailureCause,
-    Tree,
+    Guard, LifecycleEventKind, LifecycleItem, Readiness, Shutdown, StartupError,
+    StartupFailureCause, Tree,
 };
 
 enum ZeroMessage {
@@ -557,6 +557,95 @@ impl Drop for PendingDropFuture {
             panic!("offload cancellation destructor panic");
         }
     }
+}
+
+struct ExternallyCancelledOffloadActor;
+
+impl Actor for ExternallyCancelledOffloadActor {
+    type Msg = ();
+    type Args = (
+        tokio::sync::oneshot::Sender<Guard>,
+        Arc<tokio::sync::Notify>,
+        Arc<AtomicUsize>,
+    );
+
+    async fn init(
+        (guard_sender, polled, drops): Self::Args,
+        context: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        let guard = context
+            .offload_scoped(
+                PendingDropFuture {
+                    drops,
+                    panic_on_drop: true,
+                    polled: Some(polled),
+                    dropped: None,
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("offload accepted");
+        guard_sender
+            .send(guard)
+            .expect("test receives the cancellation guard");
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn cancellation_destructor_panic_wakes_an_otherwise_idle_actor() {
+    let (guard_sender, guard_receiver) = tokio::sync::oneshot::channel();
+    let polled = Arc::new(tokio::sync::Notify::new());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "idle-offload",
+        ActorOnceDef::<ExternallyCancelledOffloadActor>::new((
+            guard_sender,
+            Arc::clone(&polled),
+            Arc::clone(&drops),
+        )),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    system.wait_started().await.expect("actor becomes idle");
+    let guard = guard_receiver.await.expect("actor exports its guard");
+    polled.notified().await;
+
+    guard.cancel();
+
+    let exit = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let item = events.recv().await.expect("lifecycle remains open");
+            let LifecycleItem::Event(event) = item else {
+                panic!("small fixture must not lag");
+            };
+            if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+                && id.as_str() == "idle-offload"
+            {
+                break exit;
+            }
+        }
+    })
+    .await
+    .expect("the retained panic wakes the idle actor");
+    let ExitKind::Panicked { message } = exit.kind() else {
+        panic!("expected destructor panic, got {:?}", exit.kind());
+    };
+    assert_eq!(
+        message.as_deref(),
+        Some("offload cancellation destructor panic")
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed actor scope shuts down");
 }
 
 struct CancellationDropActor;

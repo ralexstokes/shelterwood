@@ -907,11 +907,9 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
         .expect("root stops");
 }
 
-#[tokio::test(start_paused = true)]
-async fn pending_restart_window_stop_targets_the_next_incarnation_once() {
+async fn assert_pending_restart_shutdown_is_expedited(width: Duration) {
     let factories = Arc::new(AtomicUsize::new(0));
     let starts = Arc::new(AtomicUsize::new(0));
-    let width = Duration::from_secs(10);
     let subtree = SubtreeDef::factory({
         let factories = Arc::clone(&factories);
         let starts = Arc::clone(&starts);
@@ -978,29 +976,37 @@ async fn pending_restart_window_stop_targets_the_next_incarnation_once() {
         .await
         .expect("the first incarnation enters its explicit restart window");
 
-    let nested_wait = nested.clone();
-    let stop_started = ReleaseGate::default();
-    let stop = tokio::spawn({
-        let stop_started = stop_started.clone();
-        async move {
-            stop_started.release();
-            nested_wait.shutdown_and_wait(Duration::from_secs(1)).await
-        }
-    });
-    stop_started.wait().await;
-    assert_quiet(Duration::from_secs(1), || stop.is_finished()).await;
-    advance_time(width).await;
-    stop.await
-        .expect("stop waiter joins")
-        .expect("next incarnation cooperates");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        nested.shutdown_and_wait(Duration::from_secs(1)),
+    )
+    .await
+    .expect("shutdown does not wait for the pending restart deadline")
+    .expect("the pending incarnation stops cooperatively");
     assert_eq!(starts.load(Ordering::SeqCst), 2);
-    advance_time(width / 2).await;
+    assert_eq!(
+        factories.load(Ordering::SeqCst),
+        2,
+        "shutdown must start exactly the pending incarnation without waiting for backoff"
+    );
+    let quiet_window = if width == Duration::MAX {
+        Duration::from_secs(1)
+    } else {
+        width / 2
+    };
+    advance_time(quiet_window).await;
     assert_eq!(
         starts.load(Ordering::SeqCst),
         2,
-        "a consumed per-incarnation latch must not cause a stop/restart storm"
+        "a consumed per-incarnation request must not cause a restart storm"
     );
     system.shutdown(Duration::ZERO).await.expect("root stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_restart_shutdown_expedites_finite_and_unrepresentable_backoff() {
+    assert_pending_restart_shutdown_is_expedited(Duration::from_secs(60 * 60)).await;
+    assert_pending_restart_shutdown_is_expedited(Duration::MAX).await;
 }
 
 #[tokio::test]

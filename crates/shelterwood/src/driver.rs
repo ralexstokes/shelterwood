@@ -1143,6 +1143,7 @@ impl ScopeCell {
 
     pub(crate) fn request_shutdown(&self) -> u64 {
         let mut control = self.control.lock().expect("scope control mutex poisoned");
+        let pending_incarnation = !control.live;
         let target = if control.live {
             control.current_epoch
         } else {
@@ -1159,7 +1160,24 @@ impl ScopeCell {
         }
         drop(control);
         self.member.record.pulse();
+        // A nested scope has no live driver while its parent is retaining it
+        // in restart backoff. Wake that parent as well so it can start the
+        // pending incarnation immediately; that incarnation consumes the
+        // stop and begins the timeout-bounded teardown required by B.9.
+        if pending_incarnation
+            && let Some(parent) = self.parent.read_cloned().as_ref().and_then(Weak::upgrade)
+        {
+            parent.member.record.pulse();
+        }
         target
+    }
+
+    fn has_pending_incarnation_shutdown(&self) -> bool {
+        let control = self.control.lock().expect("scope control mutex poisoned");
+        !control.live
+            && control.shutdown.is_some_and(|request| {
+                !request.consumed && request.epoch > control.last_stopped_epoch
+            })
     }
 
     fn take_shutdown_request(&self, epoch: u64) -> bool {
@@ -2270,6 +2288,22 @@ enum SpawnBody {
 }
 
 impl ScopeRuntime {
+    fn pending_restart_shutdowns(&self) -> Vec<ChildKey> {
+        self.children
+            .keys()
+            .filter(|key| {
+                let child = &self.children[*key];
+                child.active.is_none()
+                    && matches!(child.slot.member.record().stage, MemberStage::Restarting)
+                    && child
+                        .slot
+                        .scope
+                        .as_ref()
+                        .is_some_and(|scope| scope.has_pending_incarnation_shutdown())
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     fn record_storage(&self) {
         *self
@@ -2288,7 +2322,11 @@ impl ScopeRuntime {
         let Some(child) = self.children.get(key) else {
             return;
         };
-        if self.phase.is_draining() || child.is_terminal() || child.is_disposing() {
+        if self.phase.is_draining()
+            || child.active.is_some()
+            || child.is_terminal()
+            || child.is_disposing()
+        {
             return;
         }
         let child = &mut self.children[key];
@@ -3752,6 +3790,12 @@ async fn run_scope_incarnation(
         if root.take_shutdown_request(epoch) {
             pending.push((ArbitrationClass::ScopeShutdown, Pending::Shutdown));
         }
+        for child in scope.pending_restart_shutdowns() {
+            pending.push((
+                ArbitrationClass::ScopeShutdown,
+                Pending::RestartShutdown(child),
+            ));
+        }
         if !scope.ancestor_shutdown_seen
             && scope
                 .ancestor_shutdown
@@ -3870,6 +3914,7 @@ async fn run_scope_incarnation(
                     }
                     scope.begin_drain(StopReason::ShutdownRequested);
                 }
+                Pending::RestartShutdown(child) => scope.spawn_child(child),
                 Pending::AncestorShutdown => {
                     scope.begin_drain(StopReason::ShutdownRequested);
                 }
@@ -3946,6 +3991,7 @@ async fn run_scope_incarnation(
 
 enum Pending {
     Shutdown,
+    RestartShutdown(ChildKey),
     AncestorShutdown,
     AncestorAbort,
     Force,

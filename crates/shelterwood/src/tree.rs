@@ -61,6 +61,138 @@ fn attach_actor_slot<M: Send + 'static>(slot: Arc<SlotCell>) -> ActorSlot<M> {
     ActorSlot { slot, mailbox }
 }
 
+macro_rules! impl_common_builder_surface {
+    (
+        reserve_actor: $reserve_actor_doc:literal,
+        add_actor: $add_actor_doc:literal,
+        add_actor_once: $add_actor_once_doc:literal,
+        add_raw: $add_raw_doc:literal,
+        add_raw_once: $add_raw_once_doc:literal,
+        reserve_task: $reserve_task_doc:literal,
+        add_task: $add_task_doc:literal,
+        add_task_once: $add_task_once_doc:literal,
+        reserve_subtree: $reserve_subtree_doc:literal,
+        add_subtree: $add_subtree_doc:literal,
+        add_subtree_once: $add_subtree_once_doc:literal $(,)?
+    ) => {
+        /// Sets the scope restart-intensity budget.
+        pub fn intensity(&mut self, intensity: Intensity) -> &mut Self {
+            self.core.config.intensity = intensity;
+            self
+        }
+
+        /// Sets child policy defaults for this scope.
+        pub fn defaults(&mut self, defaults: ScopeDefaults) -> &mut Self {
+            self.core.config.defaults = defaults;
+            self
+        }
+
+        #[doc = $reserve_actor_doc]
+        pub fn reserve_actor<M: Send + 'static>(
+            &mut self,
+            id: impl Into<ChildId>,
+        ) -> Result<ActorSlot<M>, ReserveError> {
+            self.core.reserve(id, None).map(attach_actor_slot)
+        }
+
+        #[doc = $add_actor_doc]
+        pub fn add_actor<A: crate::Actor>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: ActorDef<A>,
+        ) -> Result<ActorRef<A::Msg>, ReserveError> {
+            self.reserve_actor(id).map(|slot| slot.define(definition))
+        }
+
+        #[doc = $add_actor_once_doc]
+        pub fn add_actor_once<A: crate::Actor>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: ActorOnceDef<A>,
+        ) -> Result<ActorRef<A::Msg>, ReserveError> {
+            self.reserve_actor(id)
+                .map(|slot| slot.define_once(definition))
+        }
+
+        #[doc = $add_raw_doc]
+        pub fn add_raw<R: crate::RawActor>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: RawDef<R>,
+        ) -> Result<ActorRef<R::Msg>, ReserveError> {
+            self.reserve_actor(id)
+                .map(|slot| slot.define_raw(definition))
+        }
+
+        #[doc = $add_raw_once_doc]
+        pub fn add_raw_once<R: crate::RawActor>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: RawOnceDef<R>,
+        ) -> Result<ActorRef<R::Msg>, ReserveError> {
+            self.reserve_actor(id)
+                .map(|slot| slot.define_once_raw(definition))
+        }
+
+        #[doc = $reserve_task_doc]
+        pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
+            self.core.reserve(id, None).map(|slot| TaskSlot { slot })
+        }
+
+        #[doc = $add_task_doc]
+        pub fn add_task(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: TaskDef,
+        ) -> Result<TaskRef, ReserveError> {
+            self.reserve_task(id).map(|slot| slot.define(definition))
+        }
+
+        #[doc = $add_task_once_doc]
+        pub fn add_task_once<T: Send + 'static>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: TaskOnceDef<T>,
+        ) -> Result<(TaskRef, OneShotTaskRef<T>), ReserveError> {
+            self.reserve_task(id)
+                .map(|slot| slot.define_once(definition))
+        }
+
+        #[doc = $reserve_subtree_doc]
+        pub fn reserve_subtree<T: Subtree>(
+            &mut self,
+            id: impl Into<ChildId>,
+        ) -> Result<SubtreeSlot<T>, ReserveError> {
+            self.core
+                .reserve(id, Some(<T as sealed::Sealed>::FLAVOR))
+                .map(|slot| SubtreeSlot {
+                    slot,
+                    marker: PhantomData,
+                })
+        }
+
+        #[doc = $add_subtree_doc]
+        pub fn add_subtree<T: Subtree>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: SubtreeDef<T>,
+        ) -> Result<T::Ref, ReserveError> {
+            self.reserve_subtree::<T>(id)
+                .map(|slot| slot.define(definition))
+        }
+
+        #[doc = $add_subtree_once_doc]
+        pub fn add_subtree_once<T: Subtree>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: SubtreeOnceDef<T>,
+        ) -> Result<T::Ref, ReserveError> {
+            self.reserve_subtree::<T>(id)
+                .map(|slot| slot.define_once(definition))
+        }
+    };
+}
+
 /// A fixed-membership, readiness-ordered tree declaration.
 pub struct Tree {
     core: BuilderCore,
@@ -97,120 +229,18 @@ impl Tree {
         self
     }
 
-    /// Sets the scope restart-intensity budget.
-    pub fn intensity(&mut self, intensity: Intensity) -> &mut Self {
-        self.core.config.intensity = intensity;
-        self
-    }
-
-    /// Sets child policy defaults for this scope.
-    pub fn defaults(&mut self, defaults: ScopeDefaults) -> &mut Self {
-        self.core.config.defaults = defaults;
-        self
-    }
-
-    /// Reserves an actor membership and returns its pre-spawn handle slot.
-    pub fn reserve_actor<M: Send + 'static>(
-        &mut self,
-        id: impl Into<ChildId>,
-    ) -> Result<ActorSlot<M>, ReserveError> {
-        self.core.reserve(id, None).map(attach_actor_slot)
-    }
-
-    /// Adds a restartable callback-oriented actor.
-    pub fn add_actor<A: crate::Actor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: ActorDef<A>,
-    ) -> Result<ActorRef<A::Msg>, ReserveError> {
-        self.reserve_actor(id).map(|slot| slot.define(definition))
-    }
-
-    /// Adds a consuming one-shot callback-oriented actor.
-    pub fn add_actor_once<A: crate::Actor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: ActorOnceDef<A>,
-    ) -> Result<ActorRef<A::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_once(definition))
-    }
-
-    /// Adds a restartable raw actor.
-    pub fn add_raw<R: crate::RawActor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: RawDef<R>,
-    ) -> Result<ActorRef<R::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_raw(definition))
-    }
-
-    /// Adds a consuming one-shot raw actor.
-    pub fn add_raw_once<R: crate::RawActor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: RawOnceDef<R>,
-    ) -> Result<ActorRef<R::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_once_raw(definition))
-    }
-
-    /// Reserves a task membership and returns its pre-spawn handle slot.
-    pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
-        self.core.reserve(id, None).map(|slot| TaskSlot { slot })
-    }
-
-    /// Adds a restartable task.
-    pub fn add_task(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: TaskDef,
-    ) -> Result<TaskRef, ReserveError> {
-        self.reserve_task(id).map(|slot| slot.define(definition))
-    }
-
-    /// Adds a consuming one-shot task and its typed completion claim.
-    pub fn add_task_once<T: Send + 'static>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: TaskOnceDef<T>,
-    ) -> Result<(TaskRef, OneShotTaskRef<T>), ReserveError> {
-        self.reserve_task(id)
-            .map(|slot| slot.define_once(definition))
-    }
-
-    /// Reserves a typed subtree membership.
-    pub fn reserve_subtree<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-    ) -> Result<SubtreeSlot<T>, ReserveError> {
-        self.core
-            .reserve(id, Some(<T as sealed::Sealed>::FLAVOR))
-            .map(|slot| SubtreeSlot {
-                slot,
-                marker: PhantomData,
-            })
-    }
-
-    /// Adds a restartable subtree.
-    pub fn add_subtree<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: SubtreeDef<T>,
-    ) -> Result<T::Ref, ReserveError> {
-        self.reserve_subtree::<T>(id)
-            .map(|slot| slot.define(definition))
-    }
-
-    /// Adds a consuming one-shot subtree.
-    pub fn add_subtree_once<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: SubtreeOnceDef<T>,
-    ) -> Result<T::Ref, ReserveError> {
-        self.reserve_subtree::<T>(id)
-            .map(|slot| slot.define_once(definition))
+    impl_common_builder_surface! {
+        reserve_actor: "Reserves an actor membership and returns its pre-spawn handle slot.",
+        add_actor: "Adds a restartable callback-oriented actor.",
+        add_actor_once: "Adds a consuming one-shot callback-oriented actor.",
+        add_raw: "Adds a restartable raw actor.",
+        add_raw_once: "Adds a consuming one-shot raw actor.",
+        reserve_task: "Reserves a task membership and returns its pre-spawn handle slot.",
+        add_task: "Adds a restartable task.",
+        add_task_once: "Adds a consuming one-shot task and its typed completion claim.",
+        reserve_subtree: "Reserves a typed subtree membership.",
+        add_subtree: "Adds a restartable subtree.",
+        add_subtree_once: "Adds a consuming one-shot subtree.",
     }
 
     /// Lowers and starts this tree synchronously.
@@ -249,120 +279,18 @@ impl DynamicTree {
         }
     }
 
-    /// Sets the scope restart-intensity budget.
-    pub fn intensity(&mut self, intensity: Intensity) -> &mut Self {
-        self.core.config.intensity = intensity;
-        self
-    }
-
-    /// Sets child policy defaults for this scope.
-    pub fn defaults(&mut self, defaults: ScopeDefaults) -> &mut Self {
-        self.core.config.defaults = defaults;
-        self
-    }
-
-    /// Reserves an initial actor membership.
-    pub fn reserve_actor<M: Send + 'static>(
-        &mut self,
-        id: impl Into<ChildId>,
-    ) -> Result<ActorSlot<M>, ReserveError> {
-        self.core.reserve(id, None).map(attach_actor_slot)
-    }
-
-    /// Adds an initial restartable callback-oriented actor.
-    pub fn add_actor<A: crate::Actor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: ActorDef<A>,
-    ) -> Result<ActorRef<A::Msg>, ReserveError> {
-        self.reserve_actor(id).map(|slot| slot.define(definition))
-    }
-
-    /// Adds an initial consuming one-shot callback-oriented actor.
-    pub fn add_actor_once<A: crate::Actor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: ActorOnceDef<A>,
-    ) -> Result<ActorRef<A::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_once(definition))
-    }
-
-    /// Adds an initial restartable raw actor.
-    pub fn add_raw<R: crate::RawActor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: RawDef<R>,
-    ) -> Result<ActorRef<R::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_raw(definition))
-    }
-
-    /// Adds an initial consuming one-shot raw actor.
-    pub fn add_raw_once<R: crate::RawActor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: RawOnceDef<R>,
-    ) -> Result<ActorRef<R::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_once_raw(definition))
-    }
-
-    /// Reserves an initial task membership.
-    pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
-        self.core.reserve(id, None).map(|slot| TaskSlot { slot })
-    }
-
-    /// Adds an initial restartable task.
-    pub fn add_task(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: TaskDef,
-    ) -> Result<TaskRef, ReserveError> {
-        self.reserve_task(id).map(|slot| slot.define(definition))
-    }
-
-    /// Adds an initial one-shot task.
-    pub fn add_task_once<T: Send + 'static>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: TaskOnceDef<T>,
-    ) -> Result<(TaskRef, OneShotTaskRef<T>), ReserveError> {
-        self.reserve_task(id)
-            .map(|slot| slot.define_once(definition))
-    }
-
-    /// Reserves an initial typed subtree membership.
-    pub fn reserve_subtree<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-    ) -> Result<SubtreeSlot<T>, ReserveError> {
-        self.core
-            .reserve(id, Some(<T as sealed::Sealed>::FLAVOR))
-            .map(|slot| SubtreeSlot {
-                slot,
-                marker: PhantomData,
-            })
-    }
-
-    /// Adds an initial restartable subtree.
-    pub fn add_subtree<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: SubtreeDef<T>,
-    ) -> Result<T::Ref, ReserveError> {
-        self.reserve_subtree::<T>(id)
-            .map(|slot| slot.define(definition))
-    }
-
-    /// Adds an initial one-shot subtree.
-    pub fn add_subtree_once<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: SubtreeOnceDef<T>,
-    ) -> Result<T::Ref, ReserveError> {
-        self.reserve_subtree::<T>(id)
-            .map(|slot| slot.define_once(definition))
+    impl_common_builder_surface! {
+        reserve_actor: "Reserves an initial actor membership.",
+        add_actor: "Adds an initial restartable callback-oriented actor.",
+        add_actor_once: "Adds an initial consuming one-shot callback-oriented actor.",
+        add_raw: "Adds an initial restartable raw actor.",
+        add_raw_once: "Adds an initial consuming one-shot raw actor.",
+        reserve_task: "Reserves an initial task membership.",
+        add_task: "Adds an initial restartable task.",
+        add_task_once: "Adds an initial one-shot task.",
+        reserve_subtree: "Reserves an initial typed subtree membership.",
+        add_subtree: "Adds an initial restartable subtree.",
+        add_subtree_once: "Adds an initial one-shot subtree.",
     }
 
     /// Lowers and starts this tree synchronously.

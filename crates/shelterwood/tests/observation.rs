@@ -987,6 +987,14 @@ async fn never_ran_members_stop_rather_than_report_startup_abort() {
         .wait_started()
         .await
         .expect_err("pre-ready terminal exit aborts startup");
+    scope
+        .wait_for_child(
+            "never-ran",
+            |child| matches!(child.state, ChildState::Stopped { .. }),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("joined suffix disposal publishes terminality");
     let snapshot = scope.snapshot();
     assert!(matches!(
         snapshot

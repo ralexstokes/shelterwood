@@ -1109,37 +1109,17 @@ impl ScopeRuntime {
             self.deadlines.cancel(deadline);
         }
         let Some(incarnation) = mint_child_incarnation(&child.slot, &mut child.incarnations) else {
-            child.complete_terminality();
-            // Incarnation exhaustion terminalized the membership (§3.1):
-            // publish the observation edges, then route the terminal outcome
-            // through the same paths as a terminal exit so ordered startup
-            // fails or draining advances instead of wedging the scope.
-            self.root.transition_child(&child.slot.member, |_| {}, None);
-            if child.options.retention == crate::Retention::Remove {
-                self.root.prune_child(&child.slot.member);
-            }
-            if let Some(construction) = child.construction.take() {
-                runtime::dispose_detached(construction);
-            }
-            let exit = match child.slot.member.record().stage {
-                MemberStage::Terminal(exit) => exit,
-                _ => Exit::never_started(),
-            };
+            let exit = child
+                .slot
+                .member
+                .record()
+                .last_exit
+                .unwrap_or_else(Exit::never_started);
             let pre_ready = child.initial && !self.phase.startup_complete() && !child.initial_ready;
-            let removing = child.slot.member.record().removing;
-            let retention_remove = child.options.retention == crate::Retention::Remove;
-            if removing {
-                self.finalize_removal(key);
-            } else if pre_ready && !self.phase.is_draining() {
-                self.fail_startup(key, exit);
-            } else {
-                if retention_remove {
-                    self.prune_terminal(key);
-                }
-                if self.phase.is_draining() {
-                    self.stop_next_ordered();
-                }
-            }
+            // Exhaustion is a terminal outcome, not an exceptional cleanup
+            // path. Join retained-definition disposal before terminality,
+            // retention, removal completion, or ordered-scope progression.
+            self.begin_terminal_disposal(key, exit, None, pre_ready);
             return;
         };
 
@@ -1554,28 +1534,10 @@ impl ScopeRuntime {
             }
             let record = child.slot.member.record();
             let exit = record.last_exit.unwrap_or_else(Exit::never_started);
-            if record.last_incarnation.is_none() {
-                if let Some(scope) = &child.slot.scope {
-                    scope.terminalize_never_started();
-                }
-                // A never-ran terminal is the plain `Stopped { NeverStarted }`
-                // state (B.6), not a §6 startup abort. Its definition still
-                // owns the only user resource, so join disposal before
-                // completing the scope, while publishing the never-started
-                // member state synchronously for startup observation.
-                self.begin_terminal_disposal(key, exit, None, false);
-                self.children[key].terminalize(&self.root, Exit::never_started(), None, false);
-            } else {
-                // Between incarnations, the recorded exit already owns the
-                // child verdict. There is no incarnation left to classify a
-                // later factory destructor, so publish synchronously and
-                // isolate cleanup without turning it into a shutdown
-                // straggler (including for a zero shutdown budget).
-                child.terminalize(&self.root, exit, None, false);
-                if let Some(construction) = child.construction.take() {
-                    runtime::dispose_detached(construction);
-                }
-            }
+            // A never-ran child and a child stopped between restart
+            // incarnations share the same post-disposal terminal route. Hard
+            // shutdown still detaches disposal through `hard_forced` below.
+            self.begin_terminal_disposal(key, exit, None, false);
         }
     }
 
@@ -2006,9 +1968,14 @@ impl ScopeRuntime {
             return;
         };
         child.slot.member.set_terminal_disposal_pending(false);
-        if let Some(message) = panic
+        if terminal.exited_incarnation.is_some()
+            && let Some(message) = panic
             && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
         {
+            // Only an exited incarnation can own a destructor failure. A
+            // never-started child or a child between restart incarnations
+            // keeps its already-authoritative verdict while disposal remains
+            // ordered ahead of terminal routing.
             terminal.exit = Exit::new(ExitKind::Panicked { message }, terminal.exit.cancelled());
         }
 
@@ -2056,16 +2023,7 @@ impl ScopeRuntime {
                     && !self.children[later].is_disposing()
                     && !self.children[later].is_terminal()
                 {
-                    if let Some(scope) = &self.children[later].slot.scope {
-                        scope.terminalize_never_started();
-                    }
                     self.begin_terminal_disposal(later, Exit::never_started(), None, false);
-                    self.children[later].terminalize(
-                        &self.root,
-                        Exit::never_started(),
-                        None,
-                        false,
-                    );
                 }
             }
         }
@@ -2388,21 +2346,7 @@ impl ScopeRuntime {
 }
 
 fn mint_child_incarnation(slot: &Arc<SlotCell>, counter: &mut FenceCounter) -> Option<Incarnation> {
-    let member = &slot.member;
-    let incarnation = ScopeIdentity::mint_incarnation(member.membership(), counter);
-    if incarnation.is_none() {
-        let record = member.record();
-        let exit = record.last_exit.unwrap_or_else(Exit::never_started);
-        member.terminalize(exit);
-        if let Some(scope) = &slot.scope {
-            if record.last_incarnation.is_none() {
-                scope.terminalize_never_started();
-            } else {
-                scope.close_observation();
-            }
-        }
-    }
-    incarnation
+    ScopeIdentity::mint_incarnation(slot.member.membership(), counter)
 }
 
 async fn run_nested_tree(
@@ -2781,10 +2725,10 @@ mod tests {
     };
 
     use crate::{
-        ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, Intensity, LifecycleEventKind,
-        LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline, RemoveOutcome,
-        Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause, StopReason,
-        SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+        ActorRef, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind, Intensity,
+        LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline,
+        RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause,
+        StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
         engine::arbitrate,
         exit::{JoinVerdict, RecordedOutcome},
         identity::{FenceCounter, ScopeIdentity},
@@ -3959,7 +3903,7 @@ mod tests {
     }
 
     #[test]
-    fn incarnation_exhaustion_terminalizes_the_membership_as_never_restart() {
+    fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
         let mut identity = ScopeIdentity::new().expect("scope identity available");
         let id = ChildId::from("worker");
         let membership = identity.mint_membership(&id).expect("membership available");
@@ -3977,11 +3921,107 @@ mod tests {
 
         assert!(mint_child_incarnation(&slot, &mut counter).is_some());
         assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(matches!(member.record().stage, MemberStage::Restarting));
+        assert_eq!(member.record().last_exit, Some(previous));
+        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+    }
+
+    #[crate::runtime::test]
+    async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "worker",
+            TaskDef::new(|_| future::pending::<crate::ExitResult>()).retention(Retention::Remove),
+        )
+        .expect("valid task");
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root.begin_incarnation();
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(64);
+        let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+        let mut children = ChildArena::default();
+        let key = children
+            .insert(child)
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            phase: ScopePhase::Running,
+            next_ordered_start: Some(key),
+            is_root: true,
+            parent_ready: None,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown: None,
+            ancestor_shutdown_seen: false,
+            ancestor_abort: None,
+            ancestor_abort_ack: None,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        scope.children[key].incarnations = FenceCounter::near_exhaustion(71);
+        let first = {
+            let child = &mut scope.children[key];
+            mint_child_incarnation(&child.slot, &mut child.incarnations)
+                .expect("the last usable incarnation mints")
+        };
+        let previous = Exit::new(
+            ExitKind::Failed(ExitError::message("last completed incarnation")),
+            false,
+        );
+        root.transition_child(
+            &scope.children[key].slot.member,
+            |record| {
+                record.incarnation = None;
+                record.last_incarnation = Some(first);
+                record.last_exit = Some(previous.clone());
+                record.stage = MemberStage::Restarting;
+            },
+            None,
+        );
+
+        scope.spawn_child(key);
+        assert!(scope.children[key].is_disposing());
         assert!(matches!(
-            member.record().stage,
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Restarting
+        ));
+        assert_eq!(root.snapshot().children.len(), 1);
+
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = event_receiver
+            .recv()
+            .await
+            .expect("disposal reports completion")
+        else {
+            panic!("only construction disposal was armed")
+        };
+        scope.handle_construction_disposed(child, panic);
+
+        assert!(!scope.children[key].is_disposing());
+        assert!(matches!(
+            scope.children[key].slot.member.record().stage,
             MemberStage::Terminal(ref exit) if exit == &previous
         ));
-        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(
+            root.snapshot().children.is_empty(),
+            "retention pruning follows joined disposal"
+        );
     }
 
     #[crate::runtime::test]
@@ -4045,6 +4085,7 @@ mod tests {
 
     #[crate::runtime::test]
     async fn scope_incarnation_exhaustion_closes_nested_observation() {
+        let parent = isolated_scope("parent", ScopeFlavor::Ordered);
         let mut identity = ScopeIdentity::new().expect("scope identity available");
         let id = ChildId::from("nested");
         let membership = identity.mint_membership(&id).expect("membership available");
@@ -4055,6 +4096,7 @@ mod tests {
             ScopeIdentity::new().expect("child identity available"),
         );
         let slot = SlotCell::new(Arc::clone(&member), Some(Arc::clone(&scope)));
+        parent.set_admitted_children(vec![resident_projection(&slot)]);
         let mut snapshots = scope.subscribe_snapshots();
         let mut events = scope.subscribe_lifecycle();
         let mut counter = FenceCounter::near_exhaustion(83);
@@ -4069,6 +4111,7 @@ mod tests {
         });
 
         assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(matches!(member.record().stage, MemberStage::Restarting));
         assert!(matches!(
             events.try_recv(),
             Ok(LifecycleItem::Event(crate::LifecycleEvent {
@@ -4079,6 +4122,13 @@ mod tests {
                 },
                 ..
             }))
+        ));
+        assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
+        assert!(parent.terminalize_child(
+            &member,
+            Exit::new(ExitKind::Completed, false),
+            None,
+            false
         ));
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
         snapshots
@@ -4092,6 +4142,36 @@ mod tests {
             }
         ));
         assert!(snapshots.changed().await.is_err());
+    }
+
+    #[crate::runtime::test]
+    async fn never_started_nested_terminal_publishes_one_final_parent_snapshot() {
+        let parent = isolated_scope("parent", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+        let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        parent.set_admitted_children(vec![resident_projection(&slot)]);
+        let mut snapshots = parent.subscribe_snapshots();
+
+        assert!(parent.terminalize_child(&nested.member, Exit::never_started(), None, false));
+        snapshots
+            .changed()
+            .await
+            .expect("no-incarnation terminal publishes the parent projection");
+
+        assert!(matches!(
+            snapshots
+                .borrow_latest()
+                .child("nested")
+                .expect("retained nested child remains resident")
+                .state,
+            ChildState::Stopped { ref exit } if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(
+            nested.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::NeverStarted
+            }
+        ));
     }
 
     #[test]

@@ -686,18 +686,9 @@ impl ScopeCell {
         startup_aborted: bool,
     ) -> bool {
         self.with_observation_gate(|| {
-            if matches!(member.record().stage, MemberStage::Terminal(_)) {
+            let record = member.record();
+            if matches!(record.stage, MemberStage::Terminal(_)) {
                 return false;
-            }
-            member.update_locked(|record| record.startup_aborted = startup_aborted);
-            member.terminalize(exit.clone());
-            if let Some(incarnation) = exited_incarnation {
-                self.emit_locked(LifecycleEventKind::Exited {
-                    id: member.id().clone(),
-                    membership: member.membership(),
-                    incarnation,
-                    exit: exit.clone(),
-                });
             }
             let nested = self.current_children.read_with(|children| {
                 children
@@ -706,6 +697,27 @@ impl ScopeCell {
                     .and_then(|resident| resident.projection.scope.as_ref())
                     .cloned()
             });
+            member.update_locked(|record| record.startup_aborted = startup_aborted);
+            member.terminalize(exit.clone());
+            if record.last_incarnation.is_none()
+                && let Some(scope) = &nested
+            {
+                scope.publish_never_started_locked();
+            }
+            if let Some(incarnation) = exited_incarnation {
+                self.emit_locked(LifecycleEventKind::Exited {
+                    id: member.id().clone(),
+                    membership: member.membership(),
+                    incarnation,
+                    exit: exit.clone(),
+                });
+            } else {
+                // Terminals without a current incarnation have no Exited
+                // event to carry snapshot publication. Publish the final
+                // parent projection explicitly before nested observation
+                // closes.
+                self.publish_snapshot_chain_locked();
+            }
             if let Some(scope) = nested {
                 scope.close_observation_locked();
             }
@@ -889,10 +901,6 @@ impl ScopeCell {
         // by the caller while this same observation gate remains held.
         self.snapshots.close();
         self.lifecycle.close();
-    }
-
-    pub(crate) fn close_observation(&self) {
-        self.with_observation_gate(|| self.close_observation_locked());
     }
 
     #[cfg(test)]
@@ -1189,27 +1197,31 @@ impl ScopeCell {
         }
     }
 
+    fn publish_never_started_locked(&self) {
+        self.record.modify_silently(|record| {
+            if record.startup.is_none() {
+                record.startup = Some(Err(StartupError::ShutdownRequested));
+            }
+            record.state = ScopeState::Stopped {
+                reason: StopReason::NeverStarted,
+            };
+        });
+        self.member.record.pulse();
+        self.record.pulse();
+        self.emit_locked(LifecycleEventKind::ScopeState {
+            state: ScopeState::Stopped {
+                reason: StopReason::NeverStarted,
+            },
+        });
+    }
+
     pub(crate) fn terminalize_never_started(&self) {
         self.with_observation_gate(|| {
             if self.observation_closed.load(Ordering::Acquire) {
                 return;
             }
             self.member.terminalize(Exit::never_started());
-            self.record.modify_silently(|record| {
-                if record.startup.is_none() {
-                    record.startup = Some(Err(StartupError::ShutdownRequested));
-                }
-                record.state = ScopeState::Stopped {
-                    reason: StopReason::NeverStarted,
-                };
-            });
-            self.member.record.pulse();
-            self.record.pulse();
-            self.emit_locked(LifecycleEventKind::ScopeState {
-                state: ScopeState::Stopped {
-                    reason: StopReason::NeverStarted,
-                },
-            });
+            self.publish_never_started_locked();
             self.close_observation_locked();
         });
     }

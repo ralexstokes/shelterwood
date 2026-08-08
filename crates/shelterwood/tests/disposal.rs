@@ -500,6 +500,68 @@ async fn unadmitted_removal_completes_after_blocking_definition_disposal() {
         .expect("dynamic root shuts down");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_window_removal_joins_factory_disposal_before_terminality() {
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = DynamicTree::new();
+    let task = tree
+        .add_task(
+            "restarting",
+            TaskDef::new({
+                let capture = BlockingDropProbe::new(&gate, dropped);
+                move |_| {
+                    let _ = &capture;
+                    async { Err(ExitError::message("restart me")) }
+                }
+            })
+            .restart(RestartPolicy::new(
+                RestartCondition::OnFailure,
+                Backoff::fixed(Duration::from_secs(60), Jitter::None).expect("fixed backoff"),
+            )),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    system
+        .wait_started()
+        .await
+        .expect("first incarnation starts");
+    scope
+        .wait_for_child(
+            "restarting",
+            |child| matches!(child.state, ChildState::Restarting),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("task enters restart backoff");
+
+    let mut removal = Box::pin(scope.remove_task(&task));
+    poll_pending(&mut removal).await;
+    wait_for_destructor(&gate).await;
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("factory disposal reports its thread"),
+        thread::current().id()
+    );
+    poll_pending(&mut removal).await;
+    let mut terminal = Box::pin(task.wait());
+    poll_pending(&mut terminal).await;
+
+    gate.release();
+    assert!(matches!(
+        terminal.await.kind(),
+        ExitKind::Failed(error) if error.to_string() == "restart me"
+    ));
+    assert_eq!(removal.await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root shuts down");
+}
+
 #[tokio::test]
 async fn unadmitted_removal_completes_when_the_panic_payload_destructor_panics() {
     let tree = DynamicTree::new();
@@ -687,6 +749,58 @@ async fn startup_rollback_detaches_never_started_one_shot_state_after_escalation
     assert!(matches!(
         completion
             .wait()
+            .await
+            .expect_err("the ordered suffix never ran")
+            .kind(),
+        ExitKind::NeverStarted
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_rollback_joins_never_started_disposal_before_terminality() {
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "fails",
+        TaskDef::new(|_| async { Err(ExitError::message("startup failure")) })
+            .restart(never())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness"),
+    )
+    .expect("valid failing task");
+    let (_never_started, completion) = tree
+        .add_task_once(
+            "never-started",
+            TaskOnceDef::new({
+                let state = BlockingDropProbe::new(&gate, dropped);
+                move |_| {
+                    let _ = &state;
+                    async { Ok::<_, ExitError>(()) }
+                }
+            }),
+        )
+        .expect("valid one-shot suffix");
+
+    let system = tree.spawn().expect("runtime is available");
+    let mut rollback = Box::pin(system.start_or_shutdown(Duration::from_secs(5)));
+    poll_pending(&mut rollback).await;
+    wait_for_destructor(&gate).await;
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("one-shot state reports its thread"),
+        thread::current().id()
+    );
+    poll_pending(&mut rollback).await;
+    let mut terminal = Box::pin(completion.wait());
+    poll_pending(&mut terminal).await;
+
+    gate.release();
+    assert!(rollback.await.is_err(), "startup failure is preserved");
+    assert!(matches!(
+        terminal
             .await
             .expect_err("the ordered suffix never ran")
             .kind(),

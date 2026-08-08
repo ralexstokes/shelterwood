@@ -1,10 +1,11 @@
 //! The only boundary between the library and its async runtime.
 
 use std::{
+    any::Any,
     fmt,
     future::Future,
     ops::RangeBounds,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -27,6 +28,84 @@ pub(crate) use tokio::test;
 #[cfg(test)]
 pub(crate) async fn advance(duration: Duration) {
     time::advance(duration).await;
+}
+
+/// Runtime-owned spelling for an unwind payload crossing a framework boundary.
+pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
+
+/// Catches application code without requiring every caller to repeat the
+/// `AssertUnwindSafe` boundary vocabulary.
+pub(crate) fn catch_panic<T>(operation: impl FnOnce() -> T) -> Result<T, PanicPayload> {
+    catch_unwind(AssertUnwindSafe(operation))
+}
+
+/// Discards an optional panic payload without trusting its destructor.
+pub(crate) fn discard_panic(payload: Option<PanicPayload>) {
+    if let Some(payload) = payload
+        && let Err(hostile_payload) = catch_panic(|| drop(payload))
+    {
+        // A payload whose own destructor panics cannot be dropped safely:
+        // dropping the replacement payload would merely recurse outside the
+        // boundary. Leak only this already-panicking diagnostic.
+        std::mem::forget(hostile_payload);
+    }
+}
+
+/// Resumes one captured panic payload at the framework boundary.
+pub(crate) fn resume_panic(payload: PanicPayload) -> ! {
+    resume_unwind(payload)
+}
+
+/// Retains the first panic and safely discards a later cleanup panic.
+pub(crate) fn keep_first_panic(first: &mut Option<PanicPayload>, candidate: Option<PanicPayload>) {
+    if first.is_none() {
+        *first = candidate;
+    } else {
+        discard_panic(candidate);
+    }
+}
+
+/// Resumes the primary panic, or the cleanup panic when there is no primary.
+/// During an existing unwind both are contained to prevent a double panic.
+pub(crate) fn resume_preferred_panic(primary: Option<PanicPayload>, cleanup: Option<PanicPayload>) {
+    if std::thread::panicking() {
+        discard_panic(primary);
+        discard_panic(cleanup);
+    } else if let Some(payload) = primary {
+        discard_panic(cleanup);
+        resume_panic(payload);
+    } else if let Some(payload) = cleanup {
+        resume_panic(payload);
+    }
+}
+
+/// Collects independent cleanup panics while allowing every cleanup step to
+/// run. Dropping the accumulator resumes the first panic unless another unwind
+/// is already in progress; callers that need to defer that decision can
+/// [`take`](Self::take) the payload.
+#[derive(Default)]
+pub(crate) struct PanicAccumulator {
+    first: Option<PanicPayload>,
+}
+
+impl PanicAccumulator {
+    pub(crate) fn run(&mut self, operation: impl FnOnce()) {
+        self.record(catch_panic(operation).err());
+    }
+
+    pub(crate) fn record(&mut self, candidate: Option<PanicPayload>) {
+        keep_first_panic(&mut self.first, candidate);
+    }
+
+    pub(crate) fn take(&mut self) -> Option<PanicPayload> {
+        self.first.take()
+    }
+}
+
+impl Drop for PanicAccumulator {
+    fn drop(&mut self) {
+        resume_preferred_panic(None, self.first.take());
+    }
 }
 
 pub(crate) fn now() -> std::time::Instant {
@@ -229,13 +308,11 @@ where
         else {
             return;
         };
-        let panic = catch_unwind(AssertUnwindSafe(|| drop(value)))
-            .err()
-            .map(contain_panic_payload);
+        let panic = catch_panic(|| drop(value)).err().map(contain_panic_payload);
         // Completion is framework bookkeeping. Contain it as well so a
         // hostile waker or a runtime teardown race cannot unwind a blocking
         // worker or double-panic while the job is being dropped.
-        let _ = catch_unwind(AssertUnwindSafe(|| completion(panic)));
+        discard_panic(catch_panic(|| completion(panic)).err());
     }
 }
 
@@ -256,11 +333,12 @@ where
 {
     if is_available() {
         let worker = Arc::clone(&job);
-        if let Ok(handle) = catch_unwind(AssertUnwindSafe(|| {
-            task::spawn_blocking(move || worker.finish())
-        })) {
-            drop(handle);
-            return;
+        match catch_panic(|| task::spawn_blocking(move || worker.finish())) {
+            Ok(handle) => {
+                drop(handle);
+                return;
+            }
+            Err(payload) => discard_panic(Some(payload)),
         }
     }
 
@@ -802,7 +880,7 @@ pub(crate) async fn join_resuming<T>(handle: JoinHandle<T>) -> T {
     let JoinHandle { inner } = handle;
     match inner.await {
         Ok(value) => value,
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
         Err(error) => {
             debug_assert!(error.is_cancelled());
             panic!("library-owned operation task was unexpectedly cancelled")
@@ -810,17 +888,21 @@ pub(crate) async fn join_resuming<T>(handle: JoinHandle<T>) -> T {
     }
 }
 
-fn contain_panic_payload(payload: Box<dyn std::any::Any + Send + 'static>) -> Option<String> {
-    let message = catch_unwind(AssertUnwindSafe(|| panic_message(payload.as_ref())))
-        .ok()
-        .flatten();
+fn contain_panic_payload(payload: PanicPayload) -> Option<String> {
+    let message = match catch_panic(|| panic_message(payload.as_ref())) {
+        Ok(message) => message,
+        Err(inspection_panic) => {
+            discard_panic(Some(inspection_panic));
+            None
+        }
+    };
     // A custom panic payload is user-owned too. Its destructor may panic, so
     // discard it under a fresh unwind boundary before publishing completion.
-    let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+    discard_panic(Some(payload));
     message
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send + 'static)) -> Option<String> {
+fn panic_message(payload: &(dyn Any + Send + 'static)) -> Option<String> {
     if let Some(message) = payload.downcast_ref::<&str>() {
         Some((*message).to_owned())
     } else {
@@ -945,9 +1027,22 @@ mod tests {
     };
 
     use super::{
-        DisposalJob, JoinOutcome, Latch, OneShotClose, Signal, Timeout, join, oneshot, spawn,
-        timeout, yield_now,
+        DisposalJob, JoinOutcome, Latch, OneShotClose, Signal, Timeout, discard_panic, join,
+        oneshot, spawn, timeout, yield_now,
     };
+
+    struct RecursivelyPanickingPayload;
+
+    impl Drop for RecursivelyPanickingPayload {
+        fn drop(&mut self) {
+            std::panic::panic_any(RecursivelyPanickingPayload);
+        }
+    }
+
+    #[test]
+    fn discarding_a_recursively_hostile_panic_payload_is_contained() {
+        discard_panic(Some(Box::new(RecursivelyPanickingPayload)));
+    }
 
     struct PanickingDrop(Arc<AtomicUsize>);
 

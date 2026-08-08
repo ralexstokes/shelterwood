@@ -110,6 +110,9 @@ enum DefinitionState {
     Lowered,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DefinitionAlreadyLowered;
+
 /// Stable declaration slot joining identity, observation, and owned construction.
 pub(crate) struct SlotCell {
     pub(crate) member: Arc<MemberCell>,
@@ -145,27 +148,17 @@ impl SlotCell {
         )
     }
 
-    pub(crate) fn take_definition(&self) -> Option<Isolated<ChildConstruction>> {
+    pub(crate) fn take_definition(
+        &self,
+    ) -> Result<Option<Isolated<ChildConstruction>>, DefinitionAlreadyLowered> {
         let mut state = self.definition.lock().expect("definition mutex poisoned");
         match std::mem::replace(&mut *state, DefinitionState::Lowered) {
-            DefinitionState::Defined(definition) => Some(definition),
+            DefinitionState::Defined(definition) => Ok(Some(definition)),
             DefinitionState::Undefined => {
                 *state = DefinitionState::Undefined;
-                None
+                Ok(None)
             }
-            DefinitionState::Lowered => panic!("a tree was lowered more than once"),
-        }
-    }
-
-    pub(crate) fn take_defined(&self) -> Option<Isolated<ChildConstruction>> {
-        let mut state = self.definition.lock().expect("definition mutex poisoned");
-        match std::mem::replace(&mut *state, DefinitionState::Lowered) {
-            DefinitionState::Defined(definition) => Some(definition),
-            DefinitionState::Undefined => {
-                *state = DefinitionState::Undefined;
-                None
-            }
-            DefinitionState::Lowered => None,
+            DefinitionState::Lowered => Err(DefinitionAlreadyLowered),
         }
     }
 
@@ -183,7 +176,7 @@ impl SlotCell {
 
     /// Claims an unlowered definition and publishes never-started terminality.
     pub(crate) fn take_never_started(&self) -> Option<Isolated<ChildConstruction>> {
-        let definition = self.take_defined();
+        let definition = self.take_definition().ok().flatten();
         self.terminalize_never_started();
         definition
     }
@@ -269,7 +262,7 @@ impl BuilderCore {
         let definitions = self
             .slots
             .iter()
-            .filter_map(|slot| slot.take_defined())
+            .filter_map(|slot| slot.take_definition().ok().flatten())
             .filter_map(|mut definition| definition.take())
             .collect();
         runtime::dispose_all(definitions)
@@ -364,6 +357,7 @@ impl BuilderCore {
             let resolved = resolved.expect("validated slot must have resolved options");
             let definition = slot
                 .take_definition()
+                .expect("a tree must be lowered at most once")
                 .expect("validated slot must have a definition");
             children.push(ChildPlan::with_options(
                 Arc::clone(slot),
@@ -562,6 +556,7 @@ mod tests {
             .expect("dynamic slot is defined");
         let dynamic_definition = dynamic_slot
             .take_definition()
+            .expect("dynamic slot must not already be lowered")
             .expect("dynamic slot remains claimable");
         let dynamic_plan =
             ChildPlan::with_options(dynamic_slot, dynamic_definition, dynamic_options);
@@ -583,7 +578,7 @@ mod tests {
         let competing_race = Arc::clone(&race);
         let competing_claim = std::thread::spawn(move || {
             competing_race.wait();
-            competing_slot.take_defined()
+            competing_slot.take_definition().ok().flatten()
         });
 
         let claim = slot
@@ -635,6 +630,7 @@ mod tests {
             .expect("one-shot slot is defined");
         let construction = slot
             .take_definition()
+            .expect("one-shot slot must not already be lowered")
             .expect("one-shot slot remains claimable");
         let plan = ChildPlan::with_options(slot, construction, options);
         assert!(plan.options.restart.is_never());

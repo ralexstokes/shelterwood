@@ -30,22 +30,12 @@ use crate::{
 
 /// Isolated payload returned after mailbox termination has synchronously
 /// published all waiter outcomes.
-pub(crate) trait MailboxDisposal: Send {}
+pub(crate) type MailboxDisposal = Box<dyn Send>;
 
 /// Prepared terminal mailbox transition. Finishing it wakes terminal waiters
 /// before returning unread payload ownership for detached disposal.
 pub(crate) trait MailboxTermination: Send {
-    fn finish(self: Box<Self>) -> Option<Box<dyn MailboxDisposal>>;
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct MailboxStats {
-    pub(crate) accepted: u64,
-    pub(crate) delivered: u64,
-    pub(crate) conflated: u64,
-    pub(crate) sends_rejected: u64,
-    pub(crate) depth: usize,
-    pub(crate) capacity: usize,
+    fn finish(self: Box<Self>) -> Option<MailboxDisposal>;
 }
 
 /// Type-erased mailbox lifecycle surface owned by a member cell.
@@ -57,13 +47,24 @@ pub(crate) struct MailboxStats {
 /// intentionally ignored.
 pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
     /// Installs the declaration-time mailbox policy before the first bind.
+    /// Reconfiguration may only repeat the same resolved policy.
     fn configure(&self, mailbox: Mailbox);
     /// Makes one incarnation live after configuration and prior-close cleanup.
+    /// A bind after terminal preparation is deliberately ignored because
+    /// terminality wins that race permanently.
     fn bind(&self, incarnation: Incarnation);
+    /// Stops new acceptance for the matching live incarnation.
     fn freeze(&self, incarnation: Incarnation);
-    fn close(&self, incarnation: Incarnation) -> Option<Box<dyn MailboxDisposal>>;
+    /// Unbinds the matching incarnation and returns its unread payload.
+    /// Every successful bind must be followed by this close before a rebind;
+    /// skipping it would deliver the old incarnation's messages to the new.
+    fn close(&self, incarnation: Incarnation) -> Option<MailboxDisposal>;
+    /// Irreversibly terminalizes the membership and prepares synchronous
+    /// waiter completion followed by isolated unread-payload disposal.
     fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>>;
-    fn stats(&self) -> MailboxStats;
+    /// Debug-only check for the driver's configure/close-before-bind contract.
+    #[cfg(debug_assertions)]
+    fn bind_order_valid(&self) -> bool;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,6 +192,11 @@ impl MemberCell {
             .store(pending, Ordering::Release);
     }
 
+    /// Mutates a member record and pulses the watch channel.
+    ///
+    /// The driver also treats this channel as its control-plane wake bus: any
+    /// field read by a loop precondition must be changed through a pulsing path
+    /// like this one, never by a silent write outside an observation gate.
     pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
         self.record.send_modify(update);
     }
@@ -245,9 +251,9 @@ impl MemberCell {
     }
 
     pub(crate) fn terminalize(&self, exit: Exit) {
-        let (terminal_exit, mailbox) = {
+        let terminal_exit = {
             let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            let terminal_exit = if let Some(terminal_exit) = &state.terminal {
+            if let Some(terminal_exit) = &state.terminal {
                 terminal_exit.clone()
             } else {
                 let teardown = state
@@ -257,17 +263,9 @@ impl MemberCell {
                 state.terminal = Some(exit.clone());
                 state.teardown = teardown;
                 exit
-            };
-            (terminal_exit, state.control.clone())
+            }
         };
         self.publish_terminal(terminal_exit);
-        if let Some(mailbox) = mailbox {
-            let stats = mailbox.stats();
-            debug_assert!(stats.delivered <= stats.accepted);
-            debug_assert!(stats.conflated <= stats.accepted);
-            debug_assert!(stats.depth <= stats.capacity);
-            let _ = stats.sends_rejected;
-        }
     }
 
     fn publish_terminal(&self, terminal_exit: Exit) {

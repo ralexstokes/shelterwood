@@ -6,7 +6,6 @@ use std::{
     future::Future,
     hash::{Hash, Hasher},
     num::NonZeroUsize,
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
@@ -15,8 +14,11 @@ use std::{
 
 use crate::{
     ChildId, Incarnation, Mailbox, Membership,
-    cells::{MailboxControl, MailboxDisposal, MailboxStats, MailboxTermination, MemberCell},
-    runtime::{OneShotClose, OneShotReceiver, OneShotSender, Signal, SignalWatcher},
+    cells::{MailboxControl, MailboxDisposal, MailboxTermination, MemberCell},
+    runtime::{
+        OneShotClose, OneShotReceiver, OneShotSender, PanicAccumulator, PanicPayload, Signal,
+        SignalWatcher, resume_panic,
+    },
 };
 
 /// The kind of a failed actor send.
@@ -528,9 +530,6 @@ struct MailboxState<M> {
     latest: Option<Envelope<M>>,
     waiters: WaiterQueue<M>,
     accepted: u64,
-    delivered: u64,
-    conflated: u64,
-    sends_rejected: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -630,6 +629,9 @@ impl<M: Send + 'static> Default for Promotion<M> {
 }
 
 impl<M: Send + 'static> Promotion<M> {
+    // Drop is the completion path on every ownership edge. `finish` only
+    // names the intentional consume point; its Drop still wakes all accepted
+    // senders and isolates every displaced-message destructor.
     fn finish(self) {}
 
     fn finish_isolated(mut self) {
@@ -647,24 +649,12 @@ impl<M: Send + 'static> Promotion<M> {
 
 impl<M: Send + 'static> Drop for Promotion<M> {
     fn drop(&mut self) {
-        let already_panicking = std::thread::panicking();
-        let mut first_panic = None;
+        let mut panics = PanicAccumulator::default();
         for waker in self.wakers.drain(..) {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| waker.wake()))
-                && first_panic.is_none()
-            {
-                first_panic = Some(payload);
-            }
+            panics.run(|| waker.wake());
         }
         for displaced in self.displaced.drain(..) {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(displaced)))
-                && first_panic.is_none()
-            {
-                first_panic = Some(payload);
-            }
-        }
-        if !already_panicking && let Some(payload) = first_panic {
-            resume_unwind(payload);
+            panics.run(|| drop(displaced));
         }
     }
 }
@@ -675,25 +665,19 @@ struct Termination<M> {
 }
 
 impl<M> Termination<M> {
-    fn finish(
-        &mut self,
-        retired: &mut Vec<Arc<SendOperation<M>>>,
-    ) -> Option<Box<dyn std::any::Any + Send + 'static>> {
-        let mut first_panic = None;
+    fn finish(&mut self, retired: &mut Vec<Arc<SendOperation<M>>>) -> Option<PanicPayload> {
+        let mut panics = PanicAccumulator::default();
         let final_incarnation = self.final_incarnation;
         while let Some((registration, waiter)) = self.waiters.pop_front() {
             waiter.clear_registration(registration);
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+            panics.run(|| {
                 waiter.terminate(final_incarnation);
-            })) && first_panic.is_none()
-            {
-                first_panic = Some(payload);
-            }
+            });
             // A withdrawn sender may leave this as the final operation owner,
             // so retain it for the same isolated path as unread messages.
             retired.push(waiter);
         }
-        first_panic
+        panics.take()
     }
 }
 
@@ -705,37 +689,20 @@ struct MailboxPayload<M> {
 
 impl<M> Drop for MailboxPayload<M> {
     fn drop(&mut self) {
-        let already_panicking = std::thread::panicking();
-        let mut first_panic = None;
+        let mut panics = PanicAccumulator::default();
         if let Some(mut queue) = self.queue.take() {
             while let Some(envelope) = queue.pop_front() {
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(envelope)))
-                    && first_panic.is_none()
-                {
-                    first_panic = Some(payload);
-                }
+                panics.run(|| drop(envelope));
             }
         }
-        if let Some(latest) = self.latest.take()
-            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(latest)))
-            && first_panic.is_none()
-        {
-            first_panic = Some(payload);
+        if let Some(latest) = self.latest.take() {
+            panics.run(|| drop(latest));
         }
         for waiter in self.retired.drain(..) {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(waiter)))
-                && first_panic.is_none()
-            {
-                first_panic = Some(payload);
-            }
-        }
-        if !already_panicking && let Some(payload) = first_panic {
-            resume_unwind(payload);
+            panics.run(|| drop(waiter));
         }
     }
 }
-
-impl<M: Send> MailboxDisposal for MailboxPayload<M> {}
 
 struct MailboxTeardown<M: Send + 'static> {
     changed: Option<Signal>,
@@ -744,35 +711,30 @@ struct MailboxTeardown<M: Send + 'static> {
 }
 
 impl<M: Send + 'static> MailboxTeardown<M> {
-    fn finish_framework(&mut self) -> Option<Box<dyn std::any::Any + Send + 'static>> {
-        let mut first_panic = None;
-        if let Some(changed) = self.changed.take()
-            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| changed.pulse()))
-        {
-            first_panic = Some(payload);
+    fn finish_framework(&mut self) -> Option<PanicPayload> {
+        let mut panics = PanicAccumulator::default();
+        if let Some(changed) = self.changed.take() {
+            panics.run(|| changed.pulse());
         }
         if let Some(mut termination) = self.termination.take() {
-            let panic = termination.finish(&mut self.payload.get_mut().retired);
-            if first_panic.is_none() {
-                first_panic = panic;
-            }
+            panics.record(termination.finish(&mut self.payload.get_mut().retired));
         }
-        first_panic
+        panics.take()
     }
 }
 
 impl<M: Send + 'static> MailboxTermination for MailboxTeardown<M> {
-    fn finish(mut self: Box<Self>) -> Option<Box<dyn MailboxDisposal>> {
+    fn finish(mut self: Box<Self>) -> Option<MailboxDisposal> {
         let panic = self.finish_framework();
         let payload = self
             .payload
             .take()
-            .map(|payload| Box::new(payload) as Box<dyn MailboxDisposal>);
+            .map(|payload| Box::new(payload) as MailboxDisposal);
         if let Some(panic) = panic {
             if let Some(payload) = payload {
                 crate::runtime::dispose_detached(payload);
             }
-            resume_unwind(panic);
+            resume_panic(panic);
         }
         payload
     }
@@ -780,13 +742,10 @@ impl<M: Send + 'static> MailboxTermination for MailboxTeardown<M> {
 
 impl<M: Send + 'static> Drop for MailboxTeardown<M> {
     fn drop(&mut self) {
-        let already_panicking = std::thread::panicking();
-        let panic = self.finish_framework();
+        let mut panics = PanicAccumulator::default();
+        panics.record(self.finish_framework());
         if let Some(payload) = self.payload.take() {
             crate::runtime::dispose_detached(payload);
-        }
-        if !already_panicking && let Some(panic) = panic {
-            resume_unwind(panic);
         }
     }
 }
@@ -818,9 +777,6 @@ impl<M: Send + 'static> MailboxCell<M> {
                 latest: None,
                 waiters: WaiterQueue::default(),
                 accepted: 0,
-                delivered: 0,
-                conflated: 0,
-                sends_rejected: 0,
             }),
             changed: Signal::default(),
         })
@@ -856,16 +812,10 @@ impl<M: Send + 'static> MailboxCell<M> {
                             });
                             None
                         }
-                        Some(MailboxKind::Latest) => {
-                            let displaced = state.latest.replace(Envelope {
-                                message,
-                                accepted_sequence,
-                            });
-                            state.conflated = state
-                                .conflated
-                                .saturating_add(u64::from(displaced.is_some()));
-                            displaced
-                        }
+                        Some(MailboxKind::Latest) => state.latest.replace(Envelope {
+                            message,
+                            accepted_sequence,
+                        }),
                         None => unreachable!(),
                     };
                     drop(state);
@@ -889,38 +839,28 @@ impl<M: Send + 'static> MailboxCell<M> {
     fn try_send(&self, message: M) -> Result<Incarnation, SendError<M>> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         match state.status {
-            BindingStatus::Terminal(final_incarnation) => {
-                state.sends_rejected = state.sends_rejected.saturating_add(1);
-                Err(SendError {
-                    actor_id: self.actor_id.clone(),
-                    incarnation_observed: final_incarnation,
-                    message,
-                    kind: SendErrorKind::Terminated,
-                })
-            }
-            BindingStatus::Unbound => {
-                state.sends_rejected = state.sends_rejected.saturating_add(1);
-                Err(SendError {
-                    actor_id: self.actor_id.clone(),
-                    incarnation_observed: None,
-                    message,
-                    kind: SendErrorKind::NotRunning,
-                })
-            }
-            BindingStatus::Frozen(incarnation) => {
-                state.sends_rejected = state.sends_rejected.saturating_add(1);
-                Err(SendError {
-                    actor_id: self.actor_id.clone(),
-                    incarnation_observed: Some(incarnation),
-                    message,
-                    kind: SendErrorKind::NotRunning,
-                })
-            }
+            BindingStatus::Terminal(final_incarnation) => Err(SendError {
+                actor_id: self.actor_id.clone(),
+                incarnation_observed: final_incarnation,
+                message,
+                kind: SendErrorKind::Terminated,
+            }),
+            BindingStatus::Unbound => Err(SendError {
+                actor_id: self.actor_id.clone(),
+                incarnation_observed: None,
+                message,
+                kind: SendErrorKind::NotRunning,
+            }),
+            BindingStatus::Frozen(incarnation) => Err(SendError {
+                actor_id: self.actor_id.clone(),
+                incarnation_observed: Some(incarnation),
+                message,
+                kind: SendErrorKind::NotRunning,
+            }),
             BindingStatus::Bound(incarnation) => match state.kind {
                 Some(MailboxKind::Queue(capacity))
                     if !state.waiters.is_empty() || state.queue.len() >= capacity.get() =>
                 {
-                    state.sends_rejected = state.sends_rejected.saturating_add(1);
                     Err(SendError {
                         actor_id: self.actor_id.clone(),
                         incarnation_observed: Some(incarnation),
@@ -946,23 +886,17 @@ impl<M: Send + 'static> MailboxCell<M> {
                         message,
                         accepted_sequence,
                     });
-                    state.conflated = state
-                        .conflated
-                        .saturating_add(u64::from(displaced.is_some()));
                     drop(state);
                     self.changed.pulse();
                     drop(displaced);
                     Ok(incarnation)
                 }
-                None => {
-                    state.sends_rejected = state.sends_rejected.saturating_add(1);
-                    Err(SendError {
-                        actor_id: self.actor_id.clone(),
-                        incarnation_observed: None,
-                        message,
-                        kind: SendErrorKind::NotRunning,
-                    })
-                }
+                None => Err(SendError {
+                    actor_id: self.actor_id.clone(),
+                    incarnation_observed: None,
+                    message,
+                    kind: SendErrorKind::NotRunning,
+                }),
             },
         }
     }
@@ -1008,7 +942,6 @@ impl<M: Send + 'static> MailboxCell<M> {
         } else {
             Promotion::default()
         };
-        state.delivered = state.delivered.saturating_add(u64::from(message.is_some()));
         drop(state);
         if message.is_some() {
             self.changed.pulse();
@@ -1030,21 +963,8 @@ impl<M: Send + 'static> MailboxCell<M> {
         self.changed.watcher()
     }
 
-    pub(crate) fn stats(&self) -> MailboxStats {
-        let state = self.state.lock().expect("mailbox mutex poisoned");
-        let (depth, capacity) = match state.kind {
-            Some(MailboxKind::Queue(capacity)) => (state.queue.len(), capacity.get()),
-            Some(MailboxKind::Latest) => (usize::from(state.latest.is_some()), 1),
-            None => (0, 0),
-        };
-        MailboxStats {
-            accepted: state.accepted,
-            delivered: state.delivered,
-            conflated: state.conflated,
-            sends_rejected: state.sends_rejected,
-            depth,
-            capacity,
-        }
+    fn accepted_sequence(&self) -> u64 {
+        self.state.lock().expect("mailbox mutex poisoned").accepted
     }
 }
 
@@ -1168,7 +1088,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }
     }
 
-    fn close(&self, incarnation: Incarnation) -> Option<Box<dyn MailboxDisposal>> {
+    fn close(&self, incarnation: Incarnation) -> Option<MailboxDisposal> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         if !matches!(
             state.status,
@@ -1186,7 +1106,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             queue: Some(queue),
             latest,
             retired: Vec::new(),
-        }))
+        }) as MailboxDisposal)
     }
 
     fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>> {
@@ -1215,8 +1135,14 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }))
     }
 
-    fn stats(&self) -> MailboxStats {
-        self.stats()
+    #[cfg(debug_assertions)]
+    fn bind_order_valid(&self) -> bool {
+        let state = self.state.lock().expect("mailbox mutex poisoned");
+        state.kind.is_some()
+            && matches!(
+                state.status,
+                BindingStatus::Unbound | BindingStatus::Terminal(_)
+            )
     }
 }
 
@@ -1257,7 +1183,6 @@ fn promote_waiters<M: Send + 'static>(state: &mut MailboxState<M>) -> Promotion<
                     message,
                     accepted_sequence,
                 }) {
-                    state.conflated = state.conflated.saturating_add(1);
                     promotion.displaced.push(displaced);
                 }
             }
@@ -1771,7 +1696,7 @@ impl<M: Send + 'static> MailboxReceiver<M> {
     }
 
     pub(crate) fn accepted_sequence(&self) -> u64 {
-        self.mailbox.stats().accepted
+        self.mailbox.accepted_sequence()
     }
 
     pub(crate) async fn changed(&mut self) {
@@ -1842,6 +1767,26 @@ mod tests {
             .expect("incarnation available");
 
         MailboxControl::bind(&*mailbox, incarnation);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "mailbox must close the prior incarnation before rebinding")]
+    fn rebinding_before_close_trips_the_driver_contract() {
+        let (mailbox, _) = actor();
+        MailboxControl::configure(&*mailbox, Mailbox::default());
+        let mut identity = ScopeIdentity::new();
+        let membership = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available");
+        let mut incarnations = identity.incarnation_counter(membership);
+        let first = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+            .expect("first incarnation available");
+        let second = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+            .expect("second incarnation available");
+
+        MailboxControl::bind(&*mailbox, first);
+        MailboxControl::bind(&*mailbox, second);
     }
 
     #[test]

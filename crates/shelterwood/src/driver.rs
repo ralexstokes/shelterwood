@@ -98,6 +98,15 @@ pub(crate) struct ReportToken {
 
 pub(crate) struct ReportReceiver(mpsc::Receiver<RecordedReport>);
 
+/// Couples the child task's outcome report to its join verdict without an
+/// asynchronous handoff race.
+///
+/// `ReportToken` is owned by the child task and its fail-closed `Drop` sends a
+/// fallback synchronously. Rust drops those task locals before the join handle
+/// becomes ready, so the exit joiner may safely perform the blocking receive:
+/// a report has already been sent on every return, panic, and cancellation
+/// edge. The shutdown/local-stop latches are sampled by that same send, making
+/// the report and its cancellation evidence one ordered observation.
 pub(crate) fn report_channel(
     shutdown: Latch,
     local_stop: Option<Latch>,
@@ -1382,6 +1391,14 @@ impl ScopeRuntime {
             return;
         };
 
+        // Per-incarnation latch topology:
+        // - shutdown/abort flow from the ladder into application code;
+        // - ready and local_stop flow from application code back to helpers;
+        // - ended terminates those helpers when the child exits first;
+        // - construction_release keeps a raw actor behind the driver-owned
+        //   readiness transition after its construction report is accepted;
+        // - framework_abort/ack join nested-scope escalation before exit.
+        // Each edge is level-triggered, so helper startup cannot lose a pulse.
         let latches = SpawnLatches {
             shutdown: Latch::default(),
             abort: Latch::default(),
@@ -1401,6 +1418,11 @@ impl ScopeRuntime {
         let now = runtime::now();
         child.spawned_once = true;
         if let Some(mailbox) = child.slot.member.mailbox() {
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                mailbox.bind_order_valid(),
+                "driver must configure before bind and close before rebind"
+            );
             mailbox.bind(incarnation);
         }
         self.root.transition_child(

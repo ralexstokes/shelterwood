@@ -823,6 +823,13 @@ mod tests {
     }
 
     #[test]
+    fn restart_policy_is_never_matches_only_the_never_condition() {
+        assert!(RestartPolicy::new(RestartCondition::Never, Backoff::Immediate).is_never());
+        assert!(!RestartPolicy::new(RestartCondition::OnFailure, Backoff::Immediate).is_never());
+        assert!(!RestartPolicy::new(RestartCondition::Always, Backoff::Immediate).is_never());
+    }
+
+    #[test]
     fn defaults_overlay_as_one_value_and_mailbox_capacity_resolves_by_kind() {
         let library = ResolvedDefaults::default();
         let latest = library

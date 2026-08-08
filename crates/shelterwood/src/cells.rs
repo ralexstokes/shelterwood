@@ -982,7 +982,17 @@ impl ScopeCell {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             if !control.epochs.finish(epoch) {
                 // A stale driver must not overwrite the observation
-                // projection of a newer live incarnation.
+                // projection of a newer live incarnation. Membership
+                // terminality is not part of that projection: whoever owns a
+                // terminal exit still publishes it exactly once, so declining
+                // the epoch can never strand `wait_terminal`.
+                drop(control);
+                if let Some(exit) = terminal_exit {
+                    self.member.terminalize(exit);
+                    self.member.record.pulse();
+                    self.record.pulse();
+                    self.close_observation_locked();
+                }
                 return;
             }
             if control

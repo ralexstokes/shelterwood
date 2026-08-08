@@ -2951,6 +2951,36 @@ mod tests {
     }
 
     #[test]
+    fn a_declined_epoch_still_publishes_its_owned_terminal_exit() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let epoch = scope.begin_incarnation().expect("scope epoch is available");
+        // The orderly finisher retires the epoch without a terminal exit, so
+        // a second owner still holds the only membership verdict.
+        scope.finish_incarnation(epoch, StopReason::Finished);
+        assert!(!matches!(
+            scope.member.record().stage,
+            MemberStage::Terminal(_)
+        ));
+
+        scope.finish_root_incarnation(
+            epoch,
+            StopReason::ShutdownRequested,
+            Exit::new(ExitKind::Aborted { after_grace: false }, true),
+        );
+        assert!(matches!(
+            scope.member.record().stage,
+            MemberStage::Terminal(_)
+        ));
+        assert_eq!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::Finished,
+            },
+            "a declined epoch must not rewrite the retired stop reason"
+        );
+    }
+
+    #[test]
     fn admitted_subtrees_share_their_parent_observation_gate() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);

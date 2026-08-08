@@ -162,6 +162,25 @@ impl SlotCell {
             DefinitionState::Lowered => None,
         }
     }
+
+    /// Publishes the canonical never-started terminal state for this slot.
+    ///
+    /// Member terminality closes any mailbox before the nested scope closes
+    /// its observation surfaces. Every static and dynamic path uses this
+    /// method so those edges cannot drift independently.
+    pub(crate) fn terminalize_never_started(&self) {
+        self.member.terminalize(Exit::never_started());
+        if let Some(scope) = &self.scope {
+            scope.terminalize_never_started();
+        }
+    }
+
+    /// Claims an unlowered definition and publishes never-started terminality.
+    pub(crate) fn take_never_started(&self) -> Option<Isolated<ChildConstruction>> {
+        let definition = self.take_defined();
+        self.terminalize_never_started();
+        definition
+    }
 }
 
 /// Erased declaration storage before inherited defaults and identities are lowered.
@@ -277,10 +296,7 @@ impl BuilderCore {
 
     fn terminalize(&self) {
         for slot in &self.slots {
-            slot.member.terminalize(Exit::never_started());
-            if let Some(scope) = &slot.scope {
-                scope.terminalize_never_started();
-            }
+            slot.terminalize_never_started();
         }
         self.root.terminalize_never_started();
     }
@@ -309,10 +325,7 @@ impl Drop for ScopePlan {
             return;
         }
         for child in &self.children {
-            child.slot.member.terminalize(Exit::never_started());
-            if let Some(scope) = &child.slot.scope {
-                scope.terminalize_never_started();
-            }
+            child.slot.terminalize_never_started();
         }
         // Lowering can publish the planned children before ScopeRuntime takes
         // ownership. If construction then unwinds, the plan fallback also

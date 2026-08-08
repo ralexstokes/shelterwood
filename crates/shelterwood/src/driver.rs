@@ -218,11 +218,7 @@ impl DynamicControl {
         let mut retained = HashMap::new();
         for (id, entry) in entries {
             if !entry.admitted {
-                let definition = entry.slot.take_defined();
-                entry.slot.member.terminalize(Exit::never_started());
-                if let Some(scope) = &entry.slot.scope {
-                    scope.terminalize_never_started();
-                }
+                let definition = entry.slot.take_never_started();
                 dispose_definition_then(definition, move || drop(entry));
             } else {
                 retained.insert(id, entry);
@@ -345,12 +341,7 @@ fn cancel_dynamic_reservation_parts(
     let removed = cancelled.then(|| state.entries.remove(&id)).flatten();
     drop(state);
     let definition = if cancelled {
-        let definition = slot.take_defined();
-        slot.member.terminalize(Exit::never_started());
-        if let Some(scope) = &slot.scope {
-            scope.terminalize_never_started();
-        }
-        definition
+        slot.take_never_started()
     } else {
         None
     };
@@ -396,11 +387,7 @@ pub(crate) fn remove_dynamic(
     if !entry.admitted {
         let entry = state.entries.remove(id).expect("entry was just resolved");
         drop(state);
-        let definition = entry.slot.take_defined();
-        entry.slot.member.terminalize(Exit::never_started());
-        if let Some(scope) = &entry.slot.scope {
-            scope.terminalize_never_started();
-        }
+        let definition = entry.slot.take_never_started();
         dispose_definition_then(definition, move || drop(entry));
         return response;
     }
@@ -2223,10 +2210,7 @@ impl ScopeRuntime {
                     .then(|| state.entries.remove(id))
                     .flatten();
                 drop(state);
-                request.slot.member.terminalize(Exit::never_started());
-                if let Some(scope) = &request.slot.scope {
-                    scope.terminalize_never_started();
-                }
+                request.slot.terminalize_never_started();
                 // The entry's drop completes its removal response; preserve
                 // the same terminality-before-completion ordering as every
                 // other reservation-cancellation path. Definition disposal
@@ -2264,10 +2248,7 @@ impl ScopeRuntime {
                         .then(|| state.entries.remove(id))
                         .flatten()
                 };
-                request.slot.member.terminalize(Exit::never_started());
-                if let Some(scope) = &request.slot.scope {
-                    scope.terminalize_never_started();
-                }
+                request.slot.terminalize_never_started();
                 child.complete_terminality();
                 let ChildRuntime { construction, .. } = child;
                 reject_admission_after_disposal(

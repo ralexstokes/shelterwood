@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, poll_until};
+use crate::common::{ReleaseGate, assert_quiet, poll_until};
 use shelterwood::{
     DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
     RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ScopeDefaults,
@@ -230,7 +230,7 @@ impl RawActor for ManualActor {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn raw_manual_readiness_gates_ordered_startup_but_not_mailbox_acceptance() {
     let release_ready = ReleaseGate::default();
     let entered = Arc::new(AtomicBool::new(false));
@@ -267,7 +267,10 @@ async fn raw_manual_readiness_gates_ordered_startup_but_not_mailbox_acceptance()
         })
         .await
     );
-    assert!(!sibling_started.load(Ordering::SeqCst));
+    assert_quiet(Duration::from_millis(20), || {
+        sibling_started.load(Ordering::SeqCst)
+    })
+    .await;
     actor
         .send(7)
         .await

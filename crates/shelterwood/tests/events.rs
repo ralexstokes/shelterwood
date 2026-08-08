@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::ReleaseGate;
+use crate::common::{ReleaseGate, assert_quiet};
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Tree};
 
 #[derive(Clone, Copy, Debug)]
@@ -300,23 +300,34 @@ enum IntervalMessage {
 
 struct IntervalActor {
     ticks: Arc<AtomicUsize>,
+    armed: ReleaseGate,
+    ticked: ReleaseGate,
 }
 
 impl Actor for IntervalActor {
     type Msg = IntervalMessage;
-    type Args = Arc<AtomicUsize>;
+    type Args = (Arc<AtomicUsize>, ReleaseGate, ReleaseGate);
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
-        Ok(Self { ticks: args })
+        Ok(Self {
+            ticks: args.0,
+            armed: args.1,
+            ticked: args.2,
+        })
     }
 
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         match message {
-            IntervalMessage::Arm => context
-                .set_interval("interval", IntervalMessage::Tick, Duration::from_secs(10))
-                .expect("interval accepted"),
+            IntervalMessage::Arm => {
+                context
+                    .set_interval("interval", IntervalMessage::Tick, Duration::from_secs(10))
+                    .expect("interval accepted");
+                self.armed.release();
+            }
             IntervalMessage::Tick => {
-                if self.ticks.fetch_add(1, Ordering::SeqCst) == 1 {
+                let prior = self.ticks.fetch_add(1, Ordering::SeqCst);
+                self.ticked.release();
+                if prior == 1 {
                     assert_eq!(context.clear_timer(&"interval"), Ok(true));
                     context.stop();
                 }
@@ -329,24 +340,24 @@ impl Actor for IntervalActor {
 #[tokio::test(start_paused = true)]
 async fn intervals_start_after_one_period_and_skip_missed_ticks() {
     let ticks = Arc::new(AtomicUsize::new(0));
+    let armed = ReleaseGate::default();
+    let ticked = ReleaseGate::default();
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "interval",
-            ActorOnceDef::<IntervalActor>::new(Arc::clone(&ticks)),
+            ActorOnceDef::<IntervalActor>::new((Arc::clone(&ticks), armed.clone(), ticked.clone())),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     actor.send(IntervalMessage::Arm).await.expect("actor live");
-    tokio::task::yield_now().await;
+    armed.wait().await;
 
     tokio::time::advance(Duration::from_secs(35)).await;
-    tokio::task::yield_now().await;
+    ticked.wait().await;
     assert_eq!(ticks.load(Ordering::SeqCst), 1);
-    tokio::time::advance(Duration::from_secs(9)).await;
-    tokio::task::yield_now().await;
-    assert_eq!(ticks.load(Ordering::SeqCst), 1);
+    assert_quiet(Duration::from_secs(9), || ticks.load(Ordering::SeqCst) != 1).await;
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(ticks.load(Ordering::SeqCst), 2);
@@ -405,13 +416,7 @@ async fn overflowing_timer_deadlines_never_fire() {
         .expect("valid actor");
         let system = tree.spawn().expect("runtime is available");
         system.wait_started().await.expect("actor starts");
-        tokio::time::advance(Duration::from_secs(1)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            fired.load(Ordering::SeqCst),
-            0,
-            "an overflowed deadline (interval: {interval}) must never fire"
-        );
+        assert_quiet(Duration::from_secs(1), || fired.load(Ordering::SeqCst) != 0).await;
         system
             .shutdown(Duration::from_secs(1))
             .await

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, poll_until};
+use crate::common::{ReleaseGate, assert_quiet, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DynamicTree, ExitError, ExitResult, Handler, RawActor,
     RawContext, RawOnceDef, Readiness, StopContext, TaskDef, Tree,
@@ -160,9 +160,10 @@ struct ManualActor;
 
 impl Actor for ManualActor {
     type Msg = ();
-    type Args = ();
+    type Args = ReleaseGate;
 
-    async fn init(_: (), _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+    async fn init(entered: ReleaseGate, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        entered.release();
         Ok(Self)
     }
 
@@ -172,14 +173,15 @@ impl Actor for ManualActor {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn manual_handler_readiness_is_not_released_automatically_after_init() {
+    let init_entered = ReleaseGate::default();
     let sibling_started = Arc::new(AtomicBool::new(false));
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "actor",
-            ActorOnceDef::<ManualActor>::new(()).readiness(Readiness::Manual),
+            ActorOnceDef::<ManualActor>::new(init_entered.clone()).readiness(Readiness::Manual),
         )
         .expect("valid actor");
     let observed = Arc::clone(&sibling_started);
@@ -193,8 +195,11 @@ async fn manual_handler_readiness_is_not_released_automatically_after_init() {
         )
         .expect("valid sibling");
     let system = tree.spawn().expect("runtime is available");
-    tokio::task::yield_now().await;
-    assert!(!sibling_started.load(Ordering::SeqCst));
+    init_entered.wait().await;
+    assert_quiet(Duration::from_millis(20), || {
+        sibling_started.load(Ordering::SeqCst)
+    })
+    .await;
     actor
         .send(())
         .await
@@ -225,6 +230,8 @@ impl Actor for GatedActor {
 
 struct AwaitingDecorator<R> {
     inner: R,
+    entered: ReleaseGate,
+    release: ReleaseGate,
 }
 
 impl<R: RawActor> RawActor for AwaitingDecorator<R> {
@@ -235,20 +242,25 @@ impl<R: RawActor> RawActor for AwaitingDecorator<R> {
     }
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
-        tokio::task::yield_now().await;
+        self.entered.release();
+        self.release.wait().await;
         self.inner.run(context).await
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn raw_decorator_await_before_handler_delegate_preserves_declared_readiness() {
-    let gate = ReleaseGate::default();
+    let decorator_entered = ReleaseGate::default();
+    let release_decorator = ReleaseGate::default();
+    let release_init = ReleaseGate::default();
     let sibling_started = Arc::new(AtomicBool::new(false));
     let mut tree = Tree::new();
     tree.add_raw_once(
         "actor",
         RawOnceDef::new(AwaitingDecorator {
-            inner: Handler::<GatedActor>::new(gate.clone()),
+            inner: Handler::<GatedActor>::new(release_init.clone()),
+            entered: decorator_entered.clone(),
+            release: release_decorator.clone(),
         }),
     )
     .expect("valid decorated actor");
@@ -266,9 +278,13 @@ async fn raw_decorator_await_before_handler_delegate_preserves_declared_readines
     )
     .expect("valid sibling");
     let system = tree.spawn().expect("runtime is available");
-    tokio::task::yield_now().await;
-    assert!(!sibling_started.load(Ordering::SeqCst));
-    gate.release();
+    decorator_entered.wait().await;
+    assert_quiet(Duration::from_millis(20), || {
+        sibling_started.load(Ordering::SeqCst)
+    })
+    .await;
+    release_decorator.release();
+    release_init.release();
     system
         .wait_started()
         .await
@@ -336,9 +352,10 @@ struct InertActor;
 
 impl Actor for InertActor {
     type Msg = ();
-    type Args = ();
+    type Args = ReleaseGate;
 
-    async fn init(_: (), _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+    async fn init(entered: ReleaseGate, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        entered.release();
         Ok(Self)
     }
 
@@ -348,26 +365,28 @@ impl Actor for InertActor {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn manual_readiness_override_on_a_wrapped_handler_stays_gated() {
+    let init_entered = ReleaseGate::default();
     let mut tree = Tree::new();
     let actor = tree
         .add_raw_once(
             "gated",
-            RawOnceDef::new(Handler::<InertActor>::new(()))
+            RawOnceDef::new(Handler::<InertActor>::new(init_entered.clone()))
                 .readiness(Readiness::Manual)
                 .expect("manual readiness override"),
         )
         .expect("valid raw actor");
     let system = tree.spawn().expect("runtime is available");
+    init_entered.wait().await;
     // The engine gates on the Manual override; the blanket handler loop must
     // consult the same resolved mode instead of auto-firing after init.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), system.wait_started())
-            .await
-            .is_err(),
-        "a Manual override must not be released by the handler's post-init mark_ready"
-    );
+    let mut started = Box::pin(system.wait_started());
+    assert_quiet(Duration::from_millis(50), || {
+        crate::common::poll_once(started.as_mut()).is_ready()
+    })
+    .await;
+    drop(started);
     actor.send(()).await.expect("gated actor accepts messages");
     system
         .wait_started()

@@ -8,8 +8,8 @@ use std::{
 
 use crate::common::{ReleaseGate, advance_time, assert_quiet, policy::never, poll_until};
 use shelterwood::{
-    DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, Shutdown, StartupError,
-    StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
+    ChildState, DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, ScopeState,
+    Shutdown, StartupError, StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
 };
 
 #[tokio::test]
@@ -122,18 +122,22 @@ async fn readiness_deadline_is_typed_and_absolute() {
 async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
     let width = Duration::from_secs(10);
     let ready_started = Arc::new(AtomicBool::new(false));
+    let ready_marked = ReleaseGate::default();
     let mut ready_tree = Tree::new();
     let ready_task = ready_tree
         .add_task(
             "edge",
             TaskDef::new({
                 let ready_started = Arc::clone(&ready_started);
+                let ready_marked = ready_marked.clone();
                 move |context| {
                     let ready_started = Arc::clone(&ready_started);
+                    let ready_marked = ready_marked.clone();
                     async move {
                         ready_started.store(true, Ordering::SeqCst);
                         tokio::time::sleep(width).await;
                         context.mark_ready();
+                        ready_marked.release();
                         context.shutdown_token().cancelled().await;
                         Ok(())
                     }
@@ -152,7 +156,7 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
         .await
     );
     advance_time(width).await;
-    tokio::task::yield_now().await;
+    ready_marked.wait().await;
     ready_system
         .wait_started()
         .await
@@ -573,4 +577,195 @@ async fn start_or_shutdown_preserves_startup_error_and_rolls_back_the_prefix() {
     assert!(matches!(error.startup, StartupError::StartupFailed(_)));
     assert!(error.rollback_timeout.is_none());
     assert!(prefix_cancelled.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stragglers() {
+    let mut tree = Tree::new();
+    let prefix = tree
+        .add_task(
+            "prefix",
+            TaskDef::new(|_| std::future::pending::<shelterwood::ExitResult>()).shutdown(
+                Shutdown::Graceful {
+                    grace: Duration::from_secs(60),
+                },
+            ),
+        )
+        .expect("valid prefix");
+    tree.add_task(
+        "failure",
+        TaskDef::new(|_| async { Err(ExitError::message("original startup cause")) })
+            .restart(never())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness"),
+    )
+    .expect("valid failure");
+
+    let error = tree
+        .spawn()
+        .expect("runtime is available")
+        .start_or_shutdown(Duration::ZERO)
+        .await
+        .expect_err("startup fails and zero-budget rollback reports its live prefix");
+
+    let StartupError::StartupFailed(failure) = error.startup else {
+        panic!("expected the original structured startup failure");
+    };
+    assert!(matches!(
+        failure.cause,
+        StartupFailureCause::Child { ref id, ref exit, .. }
+            if id.as_str() == "failure"
+                && matches!(exit.kind(), ExitKind::Failed(cause) if cause.to_string() == "original startup cause")
+    ));
+    let rollback = error
+        .rollback_timeout
+        .expect("the still-live prefix is retained as rollback evidence");
+    assert_eq!(rollback.stragglers.len(), 1);
+    assert_eq!(rollback.stragglers[0].path[0].as_str(), "prefix");
+    assert_eq!(rollback.stragglers[0].membership, prefix.membership());
+    assert!(matches!(
+        prefix.wait().await.kind(),
+        ExitKind::Aborted { .. }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn aggregate_readiness_stays_monotonic_after_a_ready_child_restarts() {
+    let incarnation = Arc::new(AtomicUsize::new(0));
+    let fail_first = ReleaseGate::default();
+    let second_started = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "worker",
+        TaskDef::new({
+            let incarnation = Arc::clone(&incarnation);
+            let fail_first = fail_first.clone();
+            let second_started = second_started.clone();
+            move |context| {
+                let current = incarnation.fetch_add(1, Ordering::SeqCst) + 1;
+                let fail_first = fail_first.clone();
+                let second_started = second_started.clone();
+                async move {
+                    if current == 1 {
+                        context.mark_ready();
+                        fail_first.wait().await;
+                        return Err(ExitError::message("restart after aggregate readiness"));
+                    }
+                    second_started.release();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded)
+        .shutdown(Shutdown::Abort),
+    )
+    .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("the first incarnation releases aggregate readiness");
+
+    fail_first.release();
+    second_started.wait().await;
+    let snapshot = system.scope().snapshot();
+    assert_eq!(snapshot.state, ScopeState::Running);
+    assert!(matches!(
+        snapshot
+            .child("worker")
+            .expect("worker remains resident")
+            .state,
+        ChildState::Starting
+    ));
+    system
+        .wait_started()
+        .await
+        .expect("published aggregate readiness never regresses");
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
+async fn nested_startup_rollback_includes_runtime_added_members() {
+    let failure_entered = ReleaseGate::default();
+    let fail = ReleaseGate::default();
+    let runtime_started = ReleaseGate::default();
+    let runtime_cancelled = ReleaseGate::default();
+    let mut nested = DynamicTree::new();
+    nested
+        .add_task(
+            "failure",
+            TaskDef::new({
+                let failure_entered = failure_entered.clone();
+                let fail = fail.clone();
+                move |_| {
+                    let failure_entered = failure_entered.clone();
+                    let fail = fail.clone();
+                    async move {
+                        failure_entered.release();
+                        fail.wait().await;
+                        Err(ExitError::message("nested startup failure"))
+                    }
+                }
+            })
+            .restart(never())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+        )
+        .expect("valid failure");
+    let mut root = Tree::new();
+    let nested = root
+        .add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid nested scope");
+    let system = root.spawn().expect("runtime is available");
+    failure_entered.wait().await;
+
+    let runtime = nested
+        .add_task(
+            "runtime",
+            TaskDef::new({
+                let runtime_started = runtime_started.clone();
+                let runtime_cancelled = runtime_cancelled.clone();
+                move |context| {
+                    let runtime_started = runtime_started.clone();
+                    let runtime_cancelled = runtime_cancelled.clone();
+                    async move {
+                        runtime_started.release();
+                        context.shutdown_token().cancelled().await;
+                        runtime_cancelled.release();
+                        Ok(())
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("runtime member is admitted during nested startup")
+        .into_handles();
+    runtime_started.wait().await;
+
+    fail.release();
+    assert!(matches!(
+        system.wait_started().await,
+        Err(StartupError::StartupFailed(_))
+    ));
+    runtime_cancelled.wait().await;
+    let runtime_exit = runtime.wait().await;
+    assert!(matches!(runtime_exit.kind(), ExitKind::Completed));
+    assert!(runtime_exit.cancelled());
+    assert!(matches!(
+        nested.wait_stopped().await,
+        shelterwood::StopReason::StartupFailed(_)
+    ));
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root rolls back");
 }

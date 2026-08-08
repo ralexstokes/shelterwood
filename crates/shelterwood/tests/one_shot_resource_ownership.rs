@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::common::{ConsumeCount, ConsumeGuard, policy::never};
+use crate::common::{ConsumeCount, ConsumeGuard, ReleaseGate, policy::never};
 use shelterwood::{
     Actor, ActorOnceDef, Context, ExitError, ExitResult, RawActor, RawContext, RawOnceDef,
     Readiness, ReadinessDeadline, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
@@ -220,12 +220,20 @@ async fn one_shot_actor_args_drop_once_on_init_panic_and_startup_failure() {
 #[tokio::test]
 async fn one_shot_actor_args_drop_once_when_shutdown_prevents_start() {
     let count = ConsumeCount::default();
+    let gate_started = ReleaseGate::default();
     let mut tree = Tree::new();
     tree.add_task(
         "gate",
-        TaskDef::new(|context| async move {
-            context.shutdown_token().cancelled().await;
-            Ok(())
+        TaskDef::new({
+            let gate_started = gate_started.clone();
+            move |context| {
+                let gate_started = gate_started.clone();
+                async move {
+                    gate_started.release();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
         })
         .readiness(Readiness::Manual)
         .expect("manual task readiness is valid"),
@@ -240,7 +248,7 @@ async fn one_shot_actor_args_drop_once_when_shutdown_prevents_start() {
     )
     .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
-    tokio::task::yield_now().await;
+    gate_started.wait().await;
     system
         .shutdown(Duration::from_secs(1))
         .await

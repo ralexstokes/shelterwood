@@ -22,6 +22,7 @@ enum Message {
 
 struct BoundaryActor {
     gate: Option<ReleaseGate>,
+    call_seen: Option<ReleaseGate>,
     values: Arc<Mutex<Vec<usize>>>,
     calls: Arc<AtomicUsize>,
     hold_reply: bool,
@@ -52,6 +53,9 @@ impl RawActor for BoundaryActor {
                     .push(value),
                 Message::Ask(reply) => {
                     self.calls.fetch_add(1, Ordering::SeqCst);
+                    if let Some(call_seen) = &self.call_seen {
+                        call_seen.release();
+                    }
                     if self.hold_reply {
                         self.held = Some(reply);
                     } else {
@@ -72,6 +76,7 @@ fn boundary_actor(
 ) -> BoundaryActor {
     BoundaryActor {
         gate,
+        call_seen: None,
         values: Arc::clone(values),
         calls: Arc::clone(calls),
         hold_reply,
@@ -283,26 +288,17 @@ async fn preacceptance_expiry_and_terminality_follow_the_identity_table() {
         .expect("valid actor");
     let width = Duration::from_secs(10);
 
-    let timed_actor = actor.clone();
-    let timed =
-        tokio::spawn(async move { timed_actor.send_timeout(Message::Value(1), width).await });
-    tokio::task::yield_now().await;
+    let mut timed = Box::pin(actor.send_timeout(Message::Value(1), width));
+    assert!(poll_once(timed.as_mut()).is_pending());
     advance_time(width).await;
-    let timed = timed
-        .await
-        .expect("timed send joins")
-        .expect_err("unbound send expires");
+    let timed = timed.await.expect_err("unbound send expires");
     assert_eq!(timed.kind, SendErrorKind::TimedOut);
     assert_eq!(timed.incarnation_observed, None);
 
-    let call_actor = actor.clone();
-    let call = tokio::spawn(async move { call_actor.call(Message::Ask, width).await });
-    tokio::task::yield_now().await;
+    let mut call = Box::pin(actor.call(Message::Ask, width));
+    assert!(poll_once(call.as_mut()).is_pending());
     advance_time(width).await;
-    let call = call
-        .await
-        .expect("call task joins")
-        .expect_err("unbound call expires");
+    let call = call.await.expect_err("unbound call expires");
     assert_eq!(call.kind, CallErrorKind::AcceptanceTimedOut);
     assert_eq!(call.incarnation_observed, None);
 
@@ -324,42 +320,35 @@ async fn preacceptance_expiry_and_terminality_follow_the_identity_table() {
 #[tokio::test(start_paused = true)]
 async fn call_uses_one_budget_across_acceptance_and_response() {
     let gate = ReleaseGate::default();
+    let call_seen = ReleaseGate::default();
     let values = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
+    let mut definition = boundary_actor(Some(gate.clone()), &values, &calls, true);
+    definition.call_seen = Some(call_seen.clone());
     let actor = tree
         .add_raw_once(
             "one-budget",
-            RawOnceDef::new(boundary_actor(Some(gate.clone()), &values, &calls, true))
-                .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
+            RawOnceDef::new(definition).mailbox(Mailbox::queue(1).expect("non-zero capacity")),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     let accepting = actor.try_send(Message::Value(1)).expect("queue fills");
     let budget = Duration::from_secs(10);
-    let call_actor = actor.clone();
-    let call = tokio::spawn(async move { call_actor.call(Message::Ask, budget).await });
-    tokio::task::yield_now().await;
+    let mut call = Box::pin(actor.call(Message::Ask, budget));
+    assert!(poll_once(call.as_mut()).is_pending());
 
     advance_time(Duration::from_secs(6)).await;
     gate.release();
-    for _ in 0..32 {
-        if calls.load(Ordering::SeqCst) == 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
+    call_seen.wait().await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(
-        !call.is_finished(),
-        "response still has the remaining budget"
-    );
-    advance_time(Duration::from_secs(4)).await;
-    let error = call
-        .await
-        .expect("call task joins")
-        .expect_err("one overall budget expires");
+    assert_quiet(Duration::from_secs(3), || {
+        poll_once(call.as_mut()).is_ready()
+    })
+    .await;
+    advance_time(Duration::from_secs(1)).await;
+    let error = call.await.expect_err("one overall budget expires");
     assert_eq!(error.kind, CallErrorKind::ResponseTimedOut);
     assert_eq!(error.incarnation_observed, Some(accepting));
     system
@@ -402,14 +391,7 @@ async fn message_construction_consumes_the_call_budget() {
     let error = result.expect_err("the over-budget call times out");
     assert_eq!(error.kind, CallErrorKind::AcceptanceTimedOut);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "an available mailbox must not accept work after construction exhausts the budget"
-    );
+    assert_quiet(Duration::from_secs(1), || calls.load(Ordering::SeqCst) != 0).await;
 
     system
         .shutdown(Duration::from_secs(1))
@@ -419,12 +401,20 @@ async fn message_construction_consumes_the_call_budget() {
 
 #[tokio::test(start_paused = true)]
 async fn overflowing_readiness_deadline_remains_pending() {
+    let task_started = ReleaseGate::default();
     let mut tree = Tree::new();
     tree.add_task(
         "manual",
-        TaskDef::new(|context| async move {
-            context.shutdown_token().cancelled().await;
-            Ok(())
+        TaskDef::new({
+            let task_started = task_started.clone();
+            move |context| {
+                let task_started = task_started.clone();
+                async move {
+                    task_started.release();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
         })
         .readiness(Readiness::Manual)
         .expect("manual readiness")
@@ -433,9 +423,7 @@ async fn overflowing_readiness_deadline_remains_pending() {
     .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
 
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
+    task_started.wait().await;
     let mut startup = Box::pin(system.wait_started());
     assert!(poll_once(startup.as_mut()).is_pending());
     assert!(matches!(
@@ -457,16 +445,20 @@ async fn overflowing_readiness_deadline_remains_pending() {
 #[tokio::test(start_paused = true)]
 async fn overflowing_shutdown_grace_does_not_escalate() {
     let dropped = Arc::new(AtomicBool::new(false));
+    let shutdown_seen = ReleaseGate::default();
     let mut tree = Tree::new();
     tree.add_task(
         "stubborn",
         TaskDef::new({
             let dropped = Arc::clone(&dropped);
+            let shutdown_seen = shutdown_seen.clone();
             move |context| {
                 let dropped = Arc::clone(&dropped);
+                let shutdown_seen = shutdown_seen.clone();
                 async move {
                     let _drop = DropFlag(dropped);
                     context.shutdown_token().cancelled().await;
+                    shutdown_seen.release();
                     std::future::pending::<ExitResult>().await
                 }
             }
@@ -480,13 +472,8 @@ async fn overflowing_shutdown_grace_does_not_escalate() {
     system.wait_started().await.expect("task starts");
 
     system.scope().request_shutdown();
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        !dropped.load(Ordering::SeqCst),
-        "an overflowing grace must not trigger immediate escalation"
-    );
+    shutdown_seen.wait().await;
+    assert_quiet(Duration::from_secs(1), || dropped.load(Ordering::SeqCst)).await;
 
     let shutdown = system.shutdown(Duration::ZERO).await;
     assert!(shutdown.is_err(), "forced cleanup reports the straggler");
@@ -537,10 +524,10 @@ async fn overflowing_restart_delay_never_restarts_immediately() {
         })
         .await
     );
-    for _ in 0..16 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_quiet(Duration::from_secs(1), || {
+        starts.load(Ordering::SeqCst) != 1
+    })
+    .await;
 
     system
         .shutdown(Duration::from_secs(1))

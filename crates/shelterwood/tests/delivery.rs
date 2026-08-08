@@ -142,18 +142,13 @@ async fn accepted_then_killed_call_reports_reply_dropped_with_accepting_identity
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     let accepting = actor.try_send(CallMessage::Marker).expect("marker accepts");
-    let call_actor = actor.clone();
-    let call = tokio::spawn(async move {
-        call_actor
-            .call(CallMessage::Ask, Duration::from_secs(1))
-            .await
-    });
-    tokio::task::yield_now().await;
+    let mut call = Box::pin(actor.call(CallMessage::Ask, Duration::from_secs(1)));
+    assert!(
+        poll_once(call.as_mut()).is_pending(),
+        "the call is registered behind the marker before the actor is released"
+    );
     gate.release();
-    let error = call
-        .await
-        .expect("call task joins")
-        .expect_err("killed call loses its reply");
+    let error = call.await.expect_err("killed call loses its reply");
     assert_eq!(error.kind, CallErrorKind::ReplyDropped);
     assert_eq!(error.incarnation_observed, Some(accepting));
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
@@ -475,17 +470,14 @@ async fn undelivered_call_killed_at_incarnation_close_reports_reply_dropped() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     let accepting = actor.try_send(CallMessage::Marker).expect("marker accepts");
-    let call_actor = actor.clone();
-    let call = tokio::spawn(async move {
-        call_actor
-            .call(CallMessage::Ask, Duration::from_secs(1))
-            .await
-    });
-    tokio::task::yield_now().await;
+    let mut call = Box::pin(actor.call(CallMessage::Ask, Duration::from_secs(1)));
+    assert!(
+        poll_once(call.as_mut()).is_pending(),
+        "the accepted call is queued before the marker terminates the incarnation"
+    );
     gate.release();
     let error = call
         .await
-        .expect("call task joins")
         .expect_err("the undelivered call loses its reply at close");
     assert_eq!(error.kind, CallErrorKind::ReplyDropped);
     assert_eq!(error.incarnation_observed, Some(accepting));

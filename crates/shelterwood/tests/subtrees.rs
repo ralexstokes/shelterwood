@@ -7,11 +7,13 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, advance_time, poll_until};
+use crate::common::{ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
-    Backoff, DynamicTree, ExitError, ExitKind, Intensity, Readiness, RestartCondition,
-    RestartPolicy, Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeDef,
-    SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, Tree,
+    Actor, ActorOnceDef, Backoff, ChildState, Context, DefaultsInheritance, DynamicTree, ExitError,
+    ExitKind, ExitResult, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
+    Mailbox, MailboxShutdown, Readiness, ReadinessDeadline, RestartCondition, RestartPolicy,
+    ScopeDefaults, SendErrorKind, Shutdown, StartupError, StartupFailureCause, StopReason,
+    SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, Tree,
 };
 
 #[tokio::test]
@@ -363,7 +365,7 @@ async fn ordered_graces_sum_while_dynamic_graces_overlap() {
     assert!(dynamic_elapsed < Duration::from_secs(15));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dynamic_and_always_members_do_not_finish_naturally() {
     let mut dynamic = DynamicTree::new();
     let (_task, _completion) = dynamic
@@ -374,11 +376,13 @@ async fn dynamic_and_always_members_do_not_finish_naturally() {
         .expect("valid task");
     let dynamic = dynamic.spawn().expect("runtime is available");
     dynamic.wait_started().await.expect("dynamic starts");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), dynamic.scope().wait_stopped())
-            .await
-            .is_err()
-    );
+    let dynamic_scope = dynamic.scope();
+    let mut dynamic_stopped = Box::pin(dynamic_scope.wait_stopped());
+    assert_quiet(Duration::from_millis(20), || {
+        poll_once(dynamic_stopped.as_mut()).is_ready()
+    })
+    .await;
+    drop(dynamic_stopped);
     dynamic
         .shutdown(Duration::from_secs(1))
         .await
@@ -418,11 +422,13 @@ async fn dynamic_and_always_members_do_not_finish_naturally() {
         })
         .await
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), ordered.scope().wait_stopped())
-            .await
-            .is_err()
-    );
+    let ordered_scope = ordered.scope();
+    let mut ordered_stopped = Box::pin(ordered_scope.wait_stopped());
+    assert_quiet(Duration::from_millis(20), || {
+        poll_once(ordered_stopped.as_mut()).is_ready()
+    })
+    .await;
+    drop(ordered_stopped);
     ordered
         .shutdown(Duration::from_secs(1))
         .await
@@ -517,8 +523,7 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
         "leaf starts polling"
     );
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(5)));
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let returned_before_leaf_dropped = shutdown.is_finished();
+    assert_quiet(Duration::from_millis(50), || shutdown.is_finished()).await;
     {
         let (released, wake) = &*release;
         *released.lock().expect("release mutex poisoned") = true;
@@ -532,10 +537,6 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
     assert!(
         weak.upgrade().is_none(),
         "shutdown returns only after every nested driver and construction drops"
-    );
-    assert!(
-        !returned_before_leaf_dropped,
-        "shutdown must not return while a recursively aborted child future is still polling"
     );
 }
 
@@ -592,18 +593,24 @@ async fn shutdown_and_wait_wakes_when_a_parent_drain_terminalizes_a_restarting_s
     // schedules the subtree restart far in the future, so the membership
     // sits in its restart window with no live incarnation.
     assert!(matches!(inner.wait().await.kind(), ExitKind::Failed(_)));
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let waiter = tokio::spawn({
-        let sub = sub.clone();
-        async move { sub.shutdown_and_wait(Duration::from_secs(1)).await }
-    });
-    // Give the waiter time to park on the scope signal before draining.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    system
+        .scope()
+        .wait_for_child(
+            "nested",
+            |child| matches!(child.state, ChildState::Restarting),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the parent publishes the subtree restart window");
+    let mut waiter = Box::pin(sub.shutdown_and_wait(Duration::from_secs(1)));
+    assert!(
+        poll_once(waiter.as_mut()).is_pending(),
+        "the restart-window stop request is registered before parent teardown"
+    );
     drop(system);
     tokio::time::timeout(Duration::from_secs(3), waiter)
         .await
         .expect("parent drain terminalizes the restarting subtree and wakes waiters")
-        .expect("waiter joins")
         .expect("teardown completes in bound");
 }
 
@@ -663,4 +670,558 @@ async fn locally_requested_subtree_shutdown_reads_cancelled() {
         exit.cancelled(),
         "a locally requested shutdown is still a stop request: {exit:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn restart_attempt_resets_after_a_ready_incarnation_settles() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let replacement_started = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.intensity(Intensity::new(100, Duration::from_secs(10)).expect("valid intensity"));
+    tree.add_task(
+        "worker",
+        TaskDef::new({
+            let starts = Arc::clone(&starts);
+            let replacement_started = replacement_started.clone();
+            move |context| {
+                let generation = starts.fetch_add(1, Ordering::SeqCst) + 1;
+                let replacement_started = replacement_started.clone();
+                async move {
+                    match generation {
+                        1 => Err(ExitError::message("pre-ready failure")),
+                        2 => {
+                            context.mark_ready();
+                            tokio::time::sleep(Duration::from_secs(11)).await;
+                            Err(ExitError::message("post-ready failure"))
+                        }
+                        _ => {
+                            replacement_started.release();
+                            context.mark_ready();
+                            context.shutdown_token().cancelled().await;
+                            Ok(())
+                        }
+                    }
+                }
+            }
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded)
+        .shutdown(Shutdown::Abort),
+    )
+    .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    system
+        .wait_started()
+        .await
+        .expect("the second incarnation settles aggregate readiness");
+
+    advance_time(Duration::from_secs(11)).await;
+    replacement_started.wait().await;
+
+    let mut attempts = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(LifecycleItem::Event(event)) => {
+                if let LifecycleEventKind::RestartScheduled { attempt, .. } = event.kind {
+                    attempts.push(attempt);
+                }
+            }
+            Ok(LifecycleItem::Lagged { dropped }) => {
+                panic!("short restart trace unexpectedly lagged by {dropped}")
+            }
+            Err(LifecycleTryRecvError::Empty) => break,
+            Err(LifecycleTryRecvError::Closed) => panic!("live root stream closed"),
+            Ok(_) | Err(_) => panic!("unexpected future lifecycle variant"),
+        }
+    }
+    assert_eq!(attempts, [1, 1]);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[derive(Clone, Copy)]
+enum CapacityMessage {
+    Hold,
+    Queued,
+}
+
+struct CapacityActor {
+    entered: ReleaseGate,
+    release: ReleaseGate,
+}
+
+impl Actor for CapacityActor {
+    type Msg = CapacityMessage;
+    type Args = (ReleaseGate, ReleaseGate);
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            entered: args.0,
+            release: args.1,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+        if matches!(message, CapacityMessage::Hold) {
+            self.entered.release();
+            self.release.wait().await;
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn subtree_defaults_inherit_or_reset_end_to_end() {
+    let inherited_entered = ReleaseGate::default();
+    let inherited_release = ReleaseGate::default();
+    let reset_entered = ReleaseGate::default();
+    let reset_release = ReleaseGate::default();
+
+    let mut inherited_tree = Tree::new();
+    let inherited_actor = inherited_tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<CapacityActor>::new((
+                inherited_entered.clone(),
+                inherited_release.clone(),
+            )),
+        )
+        .expect("valid inherited actor");
+    let mut reset_tree = Tree::new();
+    let reset_actor = reset_tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<CapacityActor>::new((reset_entered.clone(), reset_release.clone())),
+        )
+        .expect("valid reset actor");
+
+    let mut root = Tree::new();
+    root.defaults(ScopeDefaults {
+        mailbox: Some(Mailbox::queue(1).expect("valid inherited capacity")),
+        ..ScopeDefaults::default()
+    });
+    root.add_subtree_once(
+        "inherited",
+        SubtreeOnceDef::new(inherited_tree).defaults(DefaultsInheritance::Inherit),
+    )
+    .expect("valid inherited subtree");
+    root.add_subtree_once(
+        "reset",
+        SubtreeOnceDef::new(reset_tree).defaults(DefaultsInheritance::Reset),
+    )
+    .expect("valid reset subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("both subtrees start");
+
+    inherited_actor
+        .send(CapacityMessage::Hold)
+        .await
+        .expect("inherited actor accepts hold");
+    reset_actor
+        .send(CapacityMessage::Hold)
+        .await
+        .expect("reset actor accepts hold");
+    inherited_entered.wait().await;
+    reset_entered.wait().await;
+
+    inherited_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("the inherited one-slot queue accepts one pending message");
+    let inherited_full = inherited_actor
+        .try_send(CapacityMessage::Queued)
+        .expect_err("the second pending message observes the inherited capacity");
+    assert_eq!(inherited_full.kind, SendErrorKind::Full);
+
+    reset_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("reset uses the library queue capacity");
+    reset_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("reset does not inherit the parent's one-slot capacity");
+
+    inherited_release.release();
+    reset_release.release();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
+async fn subtree_restart_defaults_inherit_or_reset_end_to_end() {
+    let inherited_starts = Arc::new(AtomicUsize::new(0));
+    let inherited_fail = ReleaseGate::default();
+    let reset_starts = Arc::new(AtomicUsize::new(0));
+    let reset_fail = ReleaseGate::default();
+    let reset_restarted = ReleaseGate::default();
+
+    let mut inherited_tree = Tree::new();
+    let inherited_task = inherited_tree
+        .add_task(
+            "worker",
+            TaskDef::new({
+                let starts = Arc::clone(&inherited_starts);
+                let fail = inherited_fail.clone();
+                move |context| {
+                    let starts = Arc::clone(&starts);
+                    let fail = fail.clone();
+                    async move {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        context.mark_ready();
+                        fail.wait().await;
+                        Err(ExitError::message("inherited restart default"))
+                    }
+                }
+            })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness"),
+        )
+        .expect("valid inherited worker");
+
+    let mut reset_tree = Tree::new();
+    let reset_task = reset_tree
+        .add_task(
+            "worker",
+            TaskDef::new({
+                let starts = Arc::clone(&reset_starts);
+                let fail = reset_fail.clone();
+                let restarted = reset_restarted.clone();
+                move |context| {
+                    let starts = Arc::clone(&starts);
+                    let fail = fail.clone();
+                    let restarted = restarted.clone();
+                    async move {
+                        let attempt = starts.fetch_add(1, Ordering::SeqCst);
+                        context.mark_ready();
+                        if attempt == 0 {
+                            fail.wait().await;
+                            Err(ExitError::message("reset restart default"))
+                        } else {
+                            restarted.release();
+                            context.shutdown_token().cancelled().await;
+                            Ok(())
+                        }
+                    }
+                }
+            })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness"),
+        )
+        .expect("valid reset worker");
+
+    let mut root = Tree::new();
+    root.defaults(ScopeDefaults {
+        child_restart: Some(RestartPolicy::new(
+            RestartCondition::Never,
+            Backoff::Immediate,
+        )),
+        ..ScopeDefaults::default()
+    });
+    root.add_subtree_once(
+        "inherited",
+        SubtreeOnceDef::new(inherited_tree).defaults(DefaultsInheritance::Inherit),
+    )
+    .expect("valid inherited subtree");
+    root.add_subtree_once(
+        "reset",
+        SubtreeOnceDef::new(reset_tree).defaults(DefaultsInheritance::Reset),
+    )
+    .expect("valid reset subtree");
+    let system = root.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("both workers become ready");
+
+    inherited_fail.release();
+    reset_fail.release();
+    assert!(matches!(
+        inherited_task.wait().await.kind(),
+        ExitKind::Failed(cause) if cause.to_string() == "inherited restart default"
+    ));
+    reset_restarted.wait().await;
+    assert_eq!(inherited_starts.load(Ordering::SeqCst), 1);
+    assert_eq!(reset_starts.load(Ordering::SeqCst), 2);
+    let mut reset_wait = Box::pin(reset_task.wait());
+    assert!(poll_once(reset_wait.as_mut()).is_pending());
+    drop(reset_wait);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn subtree_shutdown_defaults_inherit_or_reset_end_to_end() {
+    fn stubborn_tree(started: ReleaseGate) -> (Tree, TaskRef) {
+        let mut tree = Tree::new();
+        let task = tree
+            .add_task(
+                "worker",
+                TaskDef::new(move |context| {
+                    let started = started.clone();
+                    async move {
+                        started.release();
+                        context.shutdown_token().cancelled().await;
+                        std::future::pending::<ExitResult>().await
+                    }
+                }),
+            )
+            .expect("valid stubborn worker");
+        (tree, task)
+    }
+
+    let inherited_started = ReleaseGate::default();
+    let reset_started = ReleaseGate::default();
+    let (inherited_tree, inherited_task) = stubborn_tree(inherited_started.clone());
+    let (reset_tree, reset_task) = stubborn_tree(reset_started.clone());
+    let mut root = Tree::new();
+    root.defaults(ScopeDefaults {
+        child_shutdown: Some(Shutdown::Abort),
+        ..ScopeDefaults::default()
+    });
+    let inherited_scope = root
+        .add_subtree_once(
+            "inherited",
+            SubtreeOnceDef::new(inherited_tree).defaults(DefaultsInheritance::Inherit),
+        )
+        .expect("valid inherited subtree");
+    let reset_scope = root
+        .add_subtree_once(
+            "reset",
+            SubtreeOnceDef::new(reset_tree).defaults(DefaultsInheritance::Reset),
+        )
+        .expect("valid reset subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("both workers start");
+    inherited_started.wait().await;
+    reset_started.wait().await;
+
+    inherited_scope
+        .shutdown_and_wait(Duration::from_secs(30))
+        .await
+        .expect("inherited abort policy stops immediately");
+    reset_scope
+        .shutdown_and_wait(Duration::from_secs(30))
+        .await
+        .expect("reset library grace eventually escalates");
+    assert!(matches!(
+        inherited_task.wait().await.kind(),
+        ExitKind::Aborted { after_grace: false }
+    ));
+    assert!(matches!(
+        reset_task.wait().await.kind(),
+        ExitKind::Aborted { after_grace: true }
+    ));
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+struct DefaultMailboxActor {
+    entered: ReleaseGate,
+    release: ReleaseGate,
+    handled: Arc<AtomicUsize>,
+}
+
+impl Actor for DefaultMailboxActor {
+    type Msg = CapacityMessage;
+    type Args = (ReleaseGate, ReleaseGate, ReleaseGate, Arc<AtomicUsize>);
+
+    async fn init(args: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        let shutdown = context.shutdown_token();
+        let shutdown_seen = args.2.clone();
+        tokio::spawn(async move {
+            shutdown.cancelled().await;
+            shutdown_seen.release();
+        });
+        Ok(Self {
+            entered: args.0,
+            release: args.1,
+            handled: args.3,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            CapacityMessage::Hold => {
+                self.entered.release();
+                self.release.wait().await;
+            }
+            CapacityMessage::Queued => {
+                self.handled.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn subtree_mailbox_shutdown_defaults_inherit_or_reset_end_to_end() {
+    let inherited_entered = ReleaseGate::default();
+    let inherited_release = ReleaseGate::default();
+    let inherited_shutdown = ReleaseGate::default();
+    let inherited_handled = Arc::new(AtomicUsize::new(0));
+    let reset_entered = ReleaseGate::default();
+    let reset_release = ReleaseGate::default();
+    let reset_shutdown = ReleaseGate::default();
+    let reset_handled = Arc::new(AtomicUsize::new(0));
+
+    let mut inherited_tree = Tree::new();
+    let inherited_actor = inherited_tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<DefaultMailboxActor>::new((
+                inherited_entered.clone(),
+                inherited_release.clone(),
+                inherited_shutdown.clone(),
+                Arc::clone(&inherited_handled),
+            )),
+        )
+        .expect("valid inherited actor");
+    let mut reset_tree = Tree::new();
+    let reset_actor = reset_tree
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<DefaultMailboxActor>::new((
+                reset_entered.clone(),
+                reset_release.clone(),
+                reset_shutdown.clone(),
+                Arc::clone(&reset_handled),
+            )),
+        )
+        .expect("valid reset actor");
+
+    let mut root = Tree::new();
+    root.defaults(ScopeDefaults {
+        mailbox_shutdown: Some(MailboxShutdown::Discard),
+        ..ScopeDefaults::default()
+    });
+    let inherited_scope = root
+        .add_subtree_once(
+            "inherited",
+            SubtreeOnceDef::new(inherited_tree).defaults(DefaultsInheritance::Inherit),
+        )
+        .expect("valid inherited subtree");
+    let reset_scope = root
+        .add_subtree_once(
+            "reset",
+            SubtreeOnceDef::new(reset_tree).defaults(DefaultsInheritance::Reset),
+        )
+        .expect("valid reset subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("both actors start");
+    inherited_actor
+        .send(CapacityMessage::Hold)
+        .await
+        .expect("inherited hold is accepted");
+    reset_actor
+        .send(CapacityMessage::Hold)
+        .await
+        .expect("reset hold is accepted");
+    inherited_entered.wait().await;
+    reset_entered.wait().await;
+    inherited_actor
+        .send(CapacityMessage::Queued)
+        .await
+        .expect("inherited prefix is accepted");
+    reset_actor
+        .send(CapacityMessage::Queued)
+        .await
+        .expect("reset prefix is accepted");
+
+    inherited_scope.request_shutdown();
+    reset_scope.request_shutdown();
+    inherited_shutdown.wait().await;
+    reset_shutdown.wait().await;
+    inherited_release.release();
+    reset_release.release();
+    inherited_scope.wait_stopped().await;
+    reset_scope.wait_stopped().await;
+    assert_eq!(inherited_handled.load(Ordering::SeqCst), 0);
+    assert_eq!(reset_handled.load(Ordering::SeqCst), 1);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn subtree_readiness_deadline_defaults_inherit_or_reset_end_to_end() {
+    fn manual_tree(started: ReleaseGate) -> (Tree, TaskRef) {
+        let mut tree = Tree::new();
+        let task = tree
+            .add_task(
+                "manual",
+                TaskDef::new(move |context| {
+                    let started = started.clone();
+                    async move {
+                        started.release();
+                        context.shutdown_token().cancelled().await;
+                        Ok(())
+                    }
+                })
+                .restart(RestartPolicy::new(
+                    RestartCondition::Never,
+                    Backoff::Immediate,
+                ))
+                .readiness(Readiness::Manual)
+                .expect("manual readiness"),
+            )
+            .expect("valid manual worker");
+        (tree, task)
+    }
+
+    let inherited_started = ReleaseGate::default();
+    let reset_started = ReleaseGate::default();
+    let (inherited_tree, inherited_task) = manual_tree(inherited_started.clone());
+    let (reset_tree, reset_task) = manual_tree(reset_started.clone());
+    let mut root = DynamicTree::new();
+    root.defaults(ScopeDefaults {
+        readiness_deadline: Some(ReadinessDeadline::Unbounded),
+        ..ScopeDefaults::default()
+    });
+    let inherited_scope = root
+        .add_subtree_once(
+            "inherited",
+            SubtreeOnceDef::new(inherited_tree).defaults(DefaultsInheritance::Inherit),
+        )
+        .expect("valid inherited subtree");
+    root.add_subtree_once(
+        "reset",
+        SubtreeOnceDef::new(reset_tree).defaults(DefaultsInheritance::Reset),
+    )
+    .expect("valid reset subtree");
+    let system = root.spawn().expect("runtime is available");
+    inherited_started.wait().await;
+    reset_started.wait().await;
+
+    assert!(matches!(
+        reset_task.wait().await.kind(),
+        ExitKind::ReadinessTimedOut { .. }
+    ));
+    assert!(matches!(
+        inherited_scope
+            .child("manual")
+            .expect("inherited manual worker remains resident")
+            .state,
+        ChildState::Starting
+    ));
+    let mut inherited_wait = Box::pin(inherited_task.wait());
+    assert!(poll_once(inherited_wait.as_mut()).is_pending());
+    drop(inherited_wait);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
 }

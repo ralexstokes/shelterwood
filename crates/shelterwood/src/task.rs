@@ -115,7 +115,13 @@ impl TaskContext {
 
     /// Releases manual readiness. Repeated calls are no-ops.
     pub fn mark_ready(&self) {
-        self.ready.fire();
+        if !self.is_stopping() {
+            self.ready.fire();
+        }
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.shutdown.is_cancelled() || self.abort.is_cancelled()
     }
 }
 
@@ -385,7 +391,63 @@ mod tests {
         runtime::{self, JoinOutcome, Latch, Timeout},
     };
 
-    use super::{CancellationToken, OneShotTaskRef, TaskRef};
+    use super::{CancellationToken, OneShotTaskRef, TaskContext, TaskRef};
+
+    fn task_context() -> (TaskContext, Latch, Latch, Latch) {
+        let id = ChildId::from("task");
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let membership = identity.mint_membership(&id).expect("membership available");
+        let mut incarnations = identity.incarnation_counter(membership);
+        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+            .expect("incarnation available");
+        let shutdown = Latch::default();
+        let abort = Latch::default();
+        let ready = Latch::default();
+        let context = TaskContext::new(
+            id,
+            incarnation,
+            shutdown.clone(),
+            abort.clone(),
+            ready.clone(),
+        );
+        (context, shutdown, abort, ready)
+    }
+
+    #[test]
+    fn live_task_context_can_publish_readiness() {
+        let (context, shutdown, abort, ready) = task_context();
+
+        assert!(!context.is_stopping());
+        context.mark_ready();
+
+        assert!(ready.is_fired());
+        assert!(!shutdown.is_fired());
+        assert!(!abort.is_fired());
+    }
+
+    #[test]
+    fn shutdown_first_prevents_task_readiness_publication() {
+        let (context, shutdown, abort, ready) = task_context();
+
+        assert!(shutdown.fire());
+        assert!(context.is_stopping());
+        context.mark_ready();
+
+        assert!(!ready.is_fired());
+        assert!(!abort.is_fired());
+    }
+
+    #[test]
+    fn abort_first_prevents_task_readiness_publication() {
+        let (context, shutdown, abort, ready) = task_context();
+
+        assert!(abort.fire());
+        assert!(context.is_stopping());
+        context.mark_ready();
+
+        assert!(!ready.is_fired());
+        assert!(!shutdown.is_fired());
+    }
 
     fn one_shot_claim<T>() -> (
         runtime::OneShotSender<T>,

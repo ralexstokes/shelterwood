@@ -6,7 +6,7 @@ use shelterwood::{
     DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError, ExitResult, Guard, Handler,
     Incarnation, LifecycleEvents, LifecycleTryRecvError, Membership, OneShotTaskRef, RawActor,
     RawContext, RawDef, RawOnceDef, Removal, Reply, ReplyReceive, ReplyReceiver, ScopeRef,
-    SendError, SendFuture, SendTimeout, SnapshotClosed, SnapshotReceiver, SubtreeDef,
+    SendError, SendFuture, SendTimeout, SnapshotClosed, SnapshotReceiver, StopContext, SubtreeDef,
     SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, Tree, WaitError,
 };
 
@@ -123,6 +123,8 @@ impl Actor for ClonedActor {
 fn actor_types_obey_resource_and_payload_trait_contracts() {
     assert_error::<DeadlineElapsed>();
     assert_raw::<Handler<OpaqueActor>>();
+    assert_send_type::<Context<'static, OpaqueActor>>();
+    assert_send_type::<StopContext<'static, OpaqueActor>>();
     assert_send_type::<Blocking<Cell<()>>>();
     assert_static::<Blocking<Cell<()>>>();
     assert_send_type::<Guard>();

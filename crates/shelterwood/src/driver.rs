@@ -236,7 +236,16 @@ impl DynamicControl {
 }
 
 fn dynamic_control(scope: &ScopeCell) -> Option<Arc<DynamicControl>> {
-    scope.dynamic_route()?.resolve().ok()
+    // The cells layer stores the route erased because it may not name a driver
+    // type. `set_dynamic_route` is the only writer, so a failed downcast is a
+    // driver bug, not an absent route: resolving it to `None` would fail open,
+    // reporting `NoLiveIncarnation` and `AlreadyAbsent` for a live scope.
+    Some(
+        scope
+            .dynamic_route()?
+            .resolve()
+            .unwrap_or_else(|_| panic!("the dynamic route is always a DynamicControl")),
+    )
 }
 
 fn resident_projection(slot: &SlotCell) -> ResidentProjection {

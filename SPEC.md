@@ -1232,14 +1232,36 @@ One classification, produced at one point, used by every consumer.
   already says nothing ran.
 - **Verdict precedence.** When one incarnation's end admits several
   readings, classification picks the highest of: `Panicked` >
-  `ReadinessTimedOut` > `Aborted` > `Failed` > `Completed`; `cancelled` is
+  `ReadinessTimedOut` > `Failed` > `Aborted` > `Completed`; `cancelled` is
   orthogonal and never competes. Concretely: a panic is never masked,
   wherever it lands (`run`, `on_stop` — superseding the run's outcome,
-  §4.1 — or a destructor, via the fallback report token); a
+  §4.1 — or a destructor, via the fallback report token); and a
   readiness-deadline expiry names the *cause* even when the teardown it
-  triggers ends in a grace-expiry abort (the mechanism); and `Aborted`
-  describes a future destroyed before yielding an outcome, so it cannot
-  genuinely conflict with `Failed`/`Completed`, which require one.
+  triggers ends in a grace-expiry abort (the mechanism).
+- **`Aborted` genuinely competes with a recorded outcome, and the rule is
+  asymmetric.** `Aborted` describes a future destroyed before yielding an
+  outcome, so it reads as if it could never conflict with
+  `Failed`/`Completed`, which require one. It conflicts anyway, by race:
+  the body can record its result and the destruction still land before
+  the join retires, and §10's ladder can arm a supervisor-forced abort
+  verdict against a membership that has already recorded one. Precedence
+  resolves that race in one direction only, and the asymmetry is
+  deliberate rather than an artifact of the ordering:
+  - A recorded `Failed(error)` **survives** a later abort. Destruction
+    proves only that teardown ended the task; it must not erase the
+    structured application error the task already produced, which is the
+    only evidence naming *why* the child was failing.
+  - A recorded `Completed` does **not** survive: cancellation overrides
+    it and the exit reads `Aborted { after_grace }` with
+    `cancelled: true`. A supervisor that destroyed a child before its
+    success was observable did not get a successful child. Concretely, a
+    one-shot task whose body returned `Ok(value)` inside that window
+    exits `Aborted` and `OneShotTaskRef::wait` yields `Err(exit)` — the
+    typed value is dropped rather than released past a stop the
+    supervisor had already committed to.
+
+  Only the recorded-vs-abort pair is asymmetric this way; the ordering
+  above is otherwise a total precedence over the whole variant set.
 - **Failure classification (feeds §9.2):** an exit is a *failure* iff it is
   not `Completed`. So `Failed`, `Panicked`, `ReadinessTimedOut`, and
   `Aborted` all restart under `OnFailure`; `Always` restarts even clean
@@ -1799,7 +1821,11 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   exits `Completed`/`Failed` (with `cancelled: true`), and
   `Aborted { after_grace: false }` records only a hard abort actually
   reached — the future destroyed before yielding — distinguishable from
-  grace-expiry abort (`after_grace: true`). Grace is a supervisor-side
+  grace-expiry abort (`after_grace: true`). The one boundary case, where
+  the beat expires and the hard abort lands *after* the body recorded its
+  outcome but before the join retires, is settled by §7's precedence and
+  not here: a recorded `Failed` survives that abort, a recorded
+  `Completed` does not. Grace is a supervisor-side
   upper bound; child-local time after
   cancellation wakeup is scheduler-dependent — this is documented
   contract. Cancellation-before-escalation ordering is observable to the

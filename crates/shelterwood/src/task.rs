@@ -319,7 +319,11 @@ impl<T> OneShotTaskRef<T> {
     /// The typed value is released only when terminal publication classifies
     /// the membership as [`crate::ExitKind::Completed`]. Any competing
     /// failure, panic, abort, readiness timeout, or never-started verdict wins
-    /// even if the task body produced a value first.
+    /// even if the task body produced a value first. That precedence is
+    /// deliberately asymmetric: a body that returned `Err` keeps its
+    /// [`crate::ExitKind::Failed`] verdict through a racing forced abort,
+    /// while a body that returned `Ok` does not — the value is dropped and
+    /// the claim resolves `Err` with the abort verdict.
     pub async fn wait(self) -> Result<T, Exit> {
         let Self { completion, task } = self;
         let exit = task.wait().await;

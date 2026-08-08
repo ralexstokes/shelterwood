@@ -406,9 +406,12 @@ pub(crate) fn remove_dynamic(
     // registration is reclaimed before the removal response completes.
     let member = Arc::clone(&entry.slot.member);
     // Dynamic-state protects admission/removal bookkeeping; the observation
-    // gate protects the public projection. Never nest the former around the
-    // latter: shutdown takes the same resources in the opposite order while
-    // clearing residents and closing dynamic state.
+    // gate protects the public projection. Release the former before entering
+    // the latter. No path takes the two in the opposite order, so this is not
+    // breaking an existing cycle; it keeps an unbounded wait out of the
+    // bookkeeping mutex. Any thread may hold the gate across arbitrary
+    // observation work, and blocking there while holding dynamic state would
+    // stall every concurrent reservation, removal, and driver admission.
     drop(state);
     scope.transition_child(&member, |record| record.removing = true, None);
     member.removal.fire();
@@ -2676,6 +2679,16 @@ async fn run_scope_incarnation(
             let class = driver_event_class(&event);
             pending.push((class, Pending::Driver(event)));
         }
+        // Disposal completions drain after the bounded lane, and `arbitrate`
+        // sorts stably, so a `ConstructionDisposed` always trails every
+        // same-class `Exited` collected in the same wake — even one produced
+        // later. A disposal is therefore a batch-tail event: the exit it
+        // trails may begin a drain first, after which
+        // `handle_construction_disposed` sees `is_draining` and routes the
+        // disposed child through stop progression instead of `fail_startup`.
+        // That is a widening of an order that was already reachable, not a new
+        // one: disposal runs on the blocking pool, so its completion never had
+        // a fixed position relative to concurrent exits.
         while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut disposal_event_receiver) {
             let class = driver_event_class(&event);
             pending.push((class, Pending::Driver(event)));

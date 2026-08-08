@@ -11,6 +11,7 @@ mod exit;
 mod identity;
 mod mailbox;
 mod observe;
+mod plan;
 mod policy;
 mod raw;
 mod runtime;
@@ -32,6 +33,7 @@ pub use observe::{
     LifecycleEvents, LifecycleItem, LifecycleTryRecvError, MembershipStatus, ScopeKind,
     ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
 };
+pub use plan::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use policy::{
     Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, Jitter, Mailbox,
     MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, RestartCondition, RestartPolicy,
@@ -43,9 +45,8 @@ pub use raw::{
 pub use task::{CancellationToken, OneShotTaskRef, TaskContext, TaskDef, TaskOnceDef, TaskRef};
 pub use tree::{
     ActorSlot, Admission, AdmissionReceipt, BuildError, DynamicActorSlot, DynamicScopeRef,
-    DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, NotAdmittingCause, Removal, RemoveOutcome,
-    ReserveError, ScopeRef, StartOrShutdownError, Subtree, SubtreeDef, SubtreeOnceDef, SubtreeSlot,
-    System, TaskSlot, Tree,
+    DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, Removal, ScopeRef, StartOrShutdownError,
+    Subtree, SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskSlot, Tree,
 };
 
 // Keep the repository-facing examples in the same rustdoc compilation lane as

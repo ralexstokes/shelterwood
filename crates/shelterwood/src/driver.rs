@@ -20,14 +20,14 @@ use crate::{
     exit::{JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit},
     identity::{FenceCounter, ScopeIdentity},
     observe::LifecycleEventKind,
+    plan::{
+        BuilderCore, ChildConstruction, ChildPlan, LowerError, NotAdmittingCause, RemoveOutcome,
+        ReserveError, ScopeFactory, ScopePlan, ScopeSource, SlotCell,
+    },
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
     runtime::{self, Latch},
     task::{OnceTaskBody, TaskContext, TaskFactory},
-    tree::{
-        BuilderCore, ChildConstruction, ChildPlan, LowerError, NotAdmittingCause, RemoveOutcome,
-        ReserveError, ScopeFactory, ScopePlan, ScopeSource, SlotCell,
-    },
 };
 
 #[cfg(test)]
@@ -691,7 +691,7 @@ fn discharge_child_terminality(completion: ChildTerminality) {
 }
 
 struct ChildRuntime {
-    slot: Arc<crate::tree::SlotCell>,
+    slot: Arc<SlotCell>,
     terminality: Obligation<ChildTerminality>,
     construction: runtime::Isolated<ChildConstruction>,
     pending_terminal: Option<PendingTerminal>,
@@ -2834,8 +2834,9 @@ mod tests {
         exit::{JoinVerdict, RecordedOutcome},
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
+        plan::SlotCell,
         runtime::Latch,
-        tree::{SlotCell, into_core_for_test, lower_tree_for_test},
+        tree::{into_core_for_test, lower_tree_for_test},
     };
 
     use super::{

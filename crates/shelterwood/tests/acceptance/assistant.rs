@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DeadlineElapsed, DynamicScopeRef,
     DynamicTree, ExitError, ExitResult, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
@@ -420,7 +420,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     let mut lifecycle = root.subscribe_lifecycle();
 
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             gateway_scope
                 .snapshot()
                 .child("bridge")
@@ -456,7 +456,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     let session_membership = session.membership();
 
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             session
                 .snapshot()
                 .child("stream")
@@ -477,14 +477,14 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .await
         .expect("session aggregate readiness completes");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             *stream_values.lock().expect("stream values mutex poisoned") == [3]
         })
         .await,
         "latest mailbox keeps the newest accepted streaming update"
     );
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             rehydrated.load(Ordering::SeqCst) >= 1
         })
         .await
@@ -521,7 +521,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .await
         .expect("control panic request accepted");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             session.snapshot().child("control").is_some_and(|child| {
                 matches!(child.state, ChildState::Running)
                     && child.restart_count == 1
@@ -559,7 +559,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .await
         .expect("tool panic request accepted");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             tools
                 .snapshot()
                 .child("temporary-tool")
@@ -578,7 +578,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .await
         .expect("offload request accepted");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             tool_args.completions.load(Ordering::SeqCst) == 1
         })
         .await,
@@ -612,7 +612,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .expect("redelivery of the same journal id is acknowledged");
     assert_eq!(transport.processed.load(Ordering::SeqCst), 1);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             transport.duplicate_notices.load(Ordering::SeqCst) == 1
         })
         .await
@@ -633,7 +633,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
 
     let removal = sessions.remove_scope(&session);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             stop_entered.load(Ordering::SeqCst)
         })
         .await
@@ -778,7 +778,7 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
     // Mid-life streaming works and the idle timer is armed from init.
     stream.send(5).await.expect("stream accepts mid-life value");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             stream_values
                 .lock()
                 .expect("stream values mutex poisoned")
@@ -794,7 +794,7 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
         .await
         .expect("live session accepts activity");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             activities.load(Ordering::SeqCst) == 1
         })
         .await,

@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
     Backoff, CallErrorKind, ChildState, ExitError, ExitResult, Jitter, Mailbox, RawActor,
     RawContext, RawOnceDef, Readiness, ReadinessDeadline, Reply, ReplyError, RestartCondition,
@@ -155,7 +155,7 @@ async fn acceptance_winning_the_deadline_withdrawal_race_succeeds() {
     advance_time(deadline).await;
     gate.release();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             values.lock().expect("values mutex poisoned").contains(&1)
         })
         .await
@@ -165,7 +165,7 @@ async fn acceptance_winning_the_deadline_withdrawal_race_succeeds() {
         "acceptance is checked before successful withdrawal at the boundary"
     );
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             values.lock().expect("values mutex poisoned").as_slice() == [1, 2]
         })
         .await
@@ -199,7 +199,7 @@ async fn call_promotion_winning_the_deadline_race_reports_response_timeout() {
     advance_time(deadline).await;
     gate.release();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             calls.load(Ordering::SeqCst) == 1
         })
         .await
@@ -260,7 +260,7 @@ async fn zero_deadlines_short_circuit_without_acceptance_or_message_construction
 
     gate.release();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             values.lock().expect("values mutex poisoned").as_slice() == [1]
         })
         .await
@@ -519,7 +519,7 @@ async fn overflowing_restart_delay_never_restarts_immediately() {
     release_failure.release();
 
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             system.scope().child("restart").is_some_and(|child| {
                 matches!(child.state, ChildState::Restarting) && child.restart_at.is_none()
             })

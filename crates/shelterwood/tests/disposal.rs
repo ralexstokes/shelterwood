@@ -11,7 +11,8 @@ use std::{
 };
 
 use crate::common::{
-    DestructorBlocker, DestructorGate, PanicOnDrop, ReleaseGate, policy::never, poll_until,
+    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, policy::never,
+    poll_until,
 };
 use shelterwood::{
     Backoff, ChildState, DynamicTree, ExitError, ExitKind, ExitResult, Jitter, LifecycleEventKind,
@@ -225,7 +226,7 @@ async fn panicking_unread_messages_are_all_disposed_without_reclassifying_the_ac
         .await
         .expect("payload panics do not unwind the scope driver");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             drops.load(Ordering::SeqCst) == 2
         })
         .await,

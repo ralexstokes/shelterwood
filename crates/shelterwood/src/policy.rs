@@ -732,13 +732,49 @@ pub(crate) fn resolve_common(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{num::NonZeroUsize, time::Duration};
 
     use super::{
         Backoff, BackoffFactor, Intensity, InvalidPolicy, Jitter, Mailbox, PolicyError,
         PolicyField, ReadinessDeadline, ResolvedDefaults, RestartCondition, RestartPolicy,
-        ScopeDefaults,
+        ScopeDefaults, Shutdown, tidy_abort_beat,
     };
+
+    #[test]
+    fn shipped_defaults_match_the_normative_policy() {
+        assert_eq!(Mailbox::default(), Mailbox::Queue(NonZeroUsize::new(64)));
+        assert_eq!(
+            Shutdown::default(),
+            Shutdown::Graceful {
+                grace: Duration::from_secs(5),
+            }
+        );
+        assert_eq!(
+            ResolvedDefaults::default().readiness_deadline,
+            ReadinessDeadline::Bounded(Duration::from_secs(30))
+        );
+        assert_eq!(
+            Intensity::default(),
+            Intensity {
+                max_restarts: 5,
+                within: Duration::from_secs(30),
+            }
+        );
+
+        assert_eq!(tidy_abort_beat(Duration::ZERO), Duration::from_millis(1));
+        assert_eq!(
+            tidy_abort_beat(Duration::from_millis(50)),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            tidy_abort_beat(Duration::from_millis(100)),
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            tidy_abort_beat(Duration::from_secs(5)),
+            Duration::from_millis(10)
+        );
+    }
 
     #[test]
     fn backoff_progression_and_jitter_are_pure_math() {

@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::common::{
-    ReleaseGate, advance_time, assert_quiet,
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet,
     policy::never,
     poll_once, poll_until,
     waiting::{task as waiting_task, tree as waiting_tree},
@@ -35,7 +35,7 @@ use shelterwood::{
 /// id is free again.
 async fn wait_for_id_release(scope: &DynamicScopeRef, id: &str) {
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             scope.child(id).is_none()
         })
         .await,
@@ -132,6 +132,38 @@ fn signalled_waiting_tree(started: Arc<AtomicBool>, cancelled: Arc<AtomicBool>) 
         .expect("valid signalled task");
     drop(completion);
     tree
+}
+
+#[tokio::test]
+async fn scope_dynamic_conversion_and_exact_dynamic_scope_removal_are_publicly_usable() {
+    let ordered = Tree::new().spawn().expect("runtime is available");
+    let ordered_scope: ScopeRef = ordered.scope();
+    assert!(ordered_scope.dynamic().is_none());
+    ordered
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("ordered root stops");
+
+    let dynamic = DynamicTree::new().spawn().expect("runtime is available");
+    dynamic.wait_started().await.expect("dynamic root starts");
+    let dynamic_scope = dynamic.scope();
+    let erased: &ScopeRef = dynamic_scope.as_scope();
+    let recovered = erased.dynamic().expect("dynamic capability is recoverable");
+    assert_eq!(recovered.as_scope(), erased);
+
+    let nested = dynamic_scope
+        .add_subtree_once("nested-dynamic", SubtreeOnceDef::new(DynamicTree::new()))
+        .await
+        .expect("dynamic subtree is admitted")
+        .into_handles();
+    assert_eq!(
+        dynamic_scope.remove_dynamic_scope(&nested).await,
+        RemoveOutcome::Removed
+    );
+    dynamic
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root stops");
 }
 
 #[tokio::test]
@@ -512,7 +544,7 @@ async fn removal_is_synchronous_detached_and_shared() {
     ));
     drop(first);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             cancelled.load(Ordering::SeqCst)
         })
         .await
@@ -699,7 +731,7 @@ async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
             .is_err()
     );
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             split_started.load(Ordering::SeqCst)
         })
         .await,
@@ -757,14 +789,14 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     ));
     assert!(poll_once(fused.as_mut()).is_pending());
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             fused_started.load(Ordering::SeqCst)
         })
         .await
     );
     drop(fused);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             fused_cancelled.load(Ordering::SeqCst)
         })
         .await
@@ -798,7 +830,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     assert!(poll_once(split.as_mut()).is_pending());
     drop(split);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             split_started.load(Ordering::SeqCst)
         })
         .await
@@ -831,7 +863,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     })));
     assert!(poll_once(split_after.as_mut()).is_pending());
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             split_after_started.load(Ordering::SeqCst)
         })
         .await
@@ -872,14 +904,14 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
     ));
     assert!(poll_once(fused_actor.as_mut()).is_pending());
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             actor_started.load(Ordering::SeqCst)
         })
         .await
     );
     drop(fused_actor);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             actor_cancelled.load(Ordering::SeqCst)
         })
         .await
@@ -903,14 +935,14 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
     ));
     assert!(poll_once(fused_subtree.as_mut()).is_pending());
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             subtree_started.load(Ordering::SeqCst)
         })
         .await
     );
     drop(fused_subtree);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             subtree_cancelled.load(Ordering::SeqCst)
         })
         .await
@@ -935,7 +967,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
     })));
     assert!(poll_once(split_actor.as_mut()).is_pending());
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             actor_started.load(Ordering::SeqCst)
         })
         .await
@@ -959,7 +991,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
     )));
     assert!(poll_once(split_subtree.as_mut()).is_pending());
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             subtree_started.load(Ordering::SeqCst)
         })
         .await
@@ -1005,7 +1037,7 @@ async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
         .expect("task admitted")
         .into_handles();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             started.load(Ordering::SeqCst)
         })
         .await
@@ -1203,7 +1235,7 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
     let system = root.spawn().expect("runtime is available");
 
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             first_started.load(Ordering::SeqCst)
         })
         .await
@@ -1296,7 +1328,7 @@ fn pending_restart_subtree(
 
 async fn await_first_restart_window(root: &ScopeRef, starts: &Arc<AtomicUsize>) {
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             starts.load(Ordering::SeqCst) == 1
         })
         .await
@@ -1495,7 +1527,7 @@ async fn draining_scopes_reject_admission_and_treat_removal_as_absent() {
     let scope = system.scope();
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             cancelled.load(Ordering::SeqCst)
         })
         .await

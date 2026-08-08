@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
     CallErrorKind, ExitResult, Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, Reply,
     ReplyError, SendErrorKind, Tree,
@@ -143,7 +143,7 @@ async fn queue_backpressure_and_send_error_identity_are_exact() {
         accepting
     );
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             values.lock().expect("values mutex poisoned").as_slice() == [1, 2]
         })
         .await
@@ -187,7 +187,7 @@ async fn latest_mailbox_keeps_only_the_newest_accepted_value() {
     actor.try_send(Message::Value(3)).expect("replace two");
     gate.release();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             values.lock().expect("values mutex poisoned").as_slice() == [3]
         })
         .await
@@ -237,7 +237,7 @@ async fn timed_send_withdraws_and_recovers_the_message() {
     drop(cancelled);
     gate.release();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             values.lock().expect("values mutex poisoned").as_slice() == [1]
         })
         .await
@@ -247,7 +247,7 @@ async fn timed_send_withdraws_and_recovers_the_message() {
         .await
         .expect("recovered message is safe to resend");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             values.lock().expect("values mutex poisoned").as_slice() == [1, 2]
         })
         .await
@@ -290,7 +290,7 @@ async fn call_distinguishes_success_drop_and_response_timeout() {
                 async move { call_actor.call(|reply| Message::Ask(7, reply), width).await },
             );
         assert!(
-            poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
                 asks.load(Ordering::SeqCst) == 1
             })
             .await

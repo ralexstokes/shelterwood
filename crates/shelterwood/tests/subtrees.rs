@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, ChildState, Context, DefaultsInheritance, DynamicTree, ExitError,
     ExitKind, ExitResult, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
@@ -225,14 +225,14 @@ async fn intensity_window_ages_out_between_restart_schedules() {
     system.wait_started().await.expect("root starts");
     advance_time(Duration::from_secs(11)).await;
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             starts.load(Ordering::SeqCst) >= 2
         })
         .await
     );
     advance_time(Duration::from_secs(11)).await;
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             starts.load(Ordering::SeqCst) >= 3
         })
         .await
@@ -417,7 +417,7 @@ async fn dynamic_and_always_members_do_not_finish_naturally() {
     let ordered = ordered.spawn().expect("runtime is available");
     ordered.wait_started().await.expect("ordered starts");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             starts.load(Ordering::SeqCst) >= 2
         })
         .await
@@ -514,7 +514,7 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             started.load(Ordering::Acquire)
         })
         .await,
@@ -651,7 +651,7 @@ async fn locally_requested_subtree_shutdown_reads_cancelled() {
         .expect("valid subtree");
     let system = root.spawn().expect("runtime is available");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             started.load(Ordering::SeqCst)
         })
         .await

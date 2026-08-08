@@ -2,9 +2,33 @@ use std::time::Duration;
 
 use crate::common::LiveFlag;
 use shelterwood::{
-    BuildError, DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, RemoveOutcome,
-    ReserveError, Shutdown, StopReason, TaskDef, TaskOnceDef, Tree,
+    BuildError, DynamicTree, Exit, ExitError, ExitKind, Readiness, ReadinessDeadline,
+    RemoveOutcome, ReserveError, Shutdown, StopReason, TaskDef, TaskOnceDef, Tree,
 };
+
+#[test]
+fn public_exit_constructor_preserves_evidence_and_classifies_failures() {
+    let completed = Exit::new(ExitKind::Completed, true);
+    assert!(completed.cancelled());
+    assert!(matches!(completed.kind(), ExitKind::Completed));
+    assert!(!completed.is_failure());
+
+    for kind in [
+        ExitKind::Failed(ExitError::message("failed")),
+        ExitKind::Panicked {
+            message: Some("panicked".to_owned()),
+        },
+        ExitKind::ReadinessTimedOut {
+            deadline: std::time::Instant::now(),
+        },
+        ExitKind::Aborted { after_grace: true },
+        ExitKind::NeverStarted,
+    ] {
+        let exit = Exit::new(kind, false);
+        assert!(!exit.cancelled());
+        assert!(exit.is_failure(), "non-completed exit: {:?}", exit.kind());
+    }
+}
 
 #[test]
 fn spawn_without_runtime_is_a_build_error() {

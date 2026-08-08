@@ -16,6 +16,13 @@ pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// The default gated-readiness deadline.
 pub const DEFAULT_READINESS_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Whether a scope has fixed ordered membership or runtime-dynamic membership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScopeFlavor {
+    Ordered,
+    Dynamic,
+}
+
 /// A child identifier within one scope.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ChildId(String);

@@ -48,8 +48,16 @@ pub(crate) struct MailboxStats {
 }
 
 /// Type-erased mailbox lifecycle surface owned by a member cell.
+///
+/// The driver must configure a mailbox before its first bind. Every live
+/// incarnation must then be closed before a later incarnation is bound; if
+/// close is skipped, messages accepted for the prior incarnation can leak
+/// into the replacement. Once termination is prepared, later binds are
+/// intentionally ignored.
 pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
+    /// Installs the declaration-time mailbox policy before the first bind.
     fn configure(&self, mailbox: Mailbox);
+    /// Makes one incarnation live after configuration and prior-close cleanup.
     fn bind(&self, incarnation: Incarnation);
     fn freeze(&self, incarnation: Incarnation);
     fn close(&self, incarnation: Incarnation) -> Option<Box<dyn MailboxDisposal>>;

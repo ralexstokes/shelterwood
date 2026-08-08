@@ -1150,6 +1150,14 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         if matches!(state.status, BindingStatus::Terminal(_)) {
             return;
         }
+        debug_assert!(
+            state.kind.is_some(),
+            "mailbox must be configured before its first bind"
+        );
+        debug_assert!(
+            matches!(state.status, BindingStatus::Unbound),
+            "mailbox must close the prior incarnation before rebinding"
+        );
         state.status = BindingStatus::Bound(incarnation);
         state.last_bound = Some(incarnation);
         // Binding is an observation edge for every operation that remained
@@ -1863,6 +1871,22 @@ mod tests {
     fn park_with(future: &mut std::pin::Pin<Box<super::SendFuture<u8>>>, waker: &Waker) {
         let mut context = Context::from_waker(waker);
         assert!(future.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "mailbox must be configured before its first bind")]
+    fn binding_before_configuration_trips_the_driver_contract() {
+        let (mailbox, _) = actor();
+        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let membership = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available");
+        let mut incarnations = identity.incarnation_counter(membership);
+        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+            .expect("incarnation available");
+
+        MailboxControl::bind(&*mailbox, incarnation);
     }
 
     #[test]

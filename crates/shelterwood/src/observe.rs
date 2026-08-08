@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    ChildId, Exit, Incarnation, Intensity, Membership, RestartPolicy, Retention, StopReason,
-    Strategy, runtime,
+    ChildId, Exit, Incarnation, Intensity, Membership, RestartPolicy, Retention, Strategy,
+    exit::StopReason, runtime,
 };
 
 /// Number of lifecycle events retained independently for each subscriber.

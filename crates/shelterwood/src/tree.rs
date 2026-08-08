@@ -22,7 +22,7 @@ use crate::{
     mailbox::MailboxCell,
     plan::{
         BuilderCore, ChildConstruction, LowerError, RemoveOutcome, ReserveError, ScopeConstruction,
-        SlotCell, checked_id,
+        SlotCell,
     },
     policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
     raw::{RawDef, RawOnceDef},
@@ -1368,8 +1368,7 @@ impl DynamicScopeRef {
         &self,
         id: impl Into<ChildId>,
     ) -> Result<DynamicActorSlot<M>, ReserveError> {
-        let id = checked_id(id)?;
-        crate::driver::reserve_dynamic(&self.0.cell, id, None).map(|reservation| {
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
             let mailbox = MailboxCell::new(reservation.slot.member.id().clone());
             reservation.slot.member.attach_mailbox(mailbox.clone());
             DynamicActorSlot {
@@ -1434,9 +1433,10 @@ impl DynamicScopeRef {
 
     /// Reserves a task id synchronously and exposes its exact handle.
     pub fn reserve_task(&self, id: impl Into<ChildId>) -> Result<DynamicTaskSlot, ReserveError> {
-        let id = checked_id(id)?;
-        crate::driver::reserve_dynamic(&self.0.cell, id, None).map(|reservation| DynamicTaskSlot {
-            core: TaskSlotCore::new(DynamicSlotEndpoint(Some(reservation))),
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
+            DynamicTaskSlot {
+                core: TaskSlotCore::new(DynamicSlotEndpoint(Some(reservation))),
+            }
         })
     }
 
@@ -1465,12 +1465,10 @@ impl DynamicScopeRef {
         &self,
         id: impl Into<ChildId>,
     ) -> Result<DynamicSubtreeSlot<T>, ReserveError> {
-        let id = checked_id(id)?;
-        crate::driver::reserve_dynamic(&self.0.cell, id, Some(<T as sealed::Sealed>::FLAVOR)).map(
-            |reservation| DynamicSubtreeSlot {
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), Some(<T as sealed::Sealed>::FLAVOR))
+            .map(|reservation| DynamicSubtreeSlot {
                 core: SubtreeSlotCore::new(DynamicSlotEndpoint(Some(reservation))),
-            },
-        )
+            })
     }
 
     /// Adds a restartable subtree, resolving at admission.

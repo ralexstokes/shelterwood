@@ -10,7 +10,7 @@ use std::{
 use crate::{
     ChildId, Exit, ExitKind, Incarnation, IntensityTrip, Membership, Readiness, ReadinessDeadline,
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
-    cells::{DynamicRoute, MemberCell, MemberStage, ResidentProjection, ScopeCell},
+    cells::{DynamicRoute, MemberStage, ResidentProjection, ScopeCell},
     deadline::Deadline,
     engine::{
         ArbitrationClass, DeadlineHandle, DeadlineQueue, ExitDispatch, IntensityState,
@@ -22,7 +22,7 @@ use crate::{
     observe::LifecycleEventKind,
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, NotAdmittingCause, RemoveOutcome,
-        ReserveError, ScopeFactory, ScopePlan, SlotCell,
+        ReserveError, ScopeFactory, ScopePlan, SlotCell, checked_id, mint_reserved_slot,
     },
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
@@ -31,7 +31,7 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::cells::RuntimeStorage;
+use crate::cells::{MemberCell, RuntimeStorage};
 
 /// An exactly-once synchronous completion.
 ///
@@ -262,6 +262,7 @@ pub(crate) fn reserve_dynamic(
     id: ChildId,
     child_scope: Option<ScopeFlavor>,
 ) -> Result<DynamicReservation, ReserveError> {
+    let id = checked_id(id)?;
     if matches!(scope.member.record().stage, MemberStage::Terminal(_)) {
         return Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal));
     }
@@ -292,18 +293,7 @@ pub(crate) fn reserve_dynamic(
         }
         return Err(ReserveError::DuplicateId(id));
     }
-    let membership = scope
-        .child_identity
-        .lock()
-        .expect("scope identity mutex poisoned")
-        .mint_membership(&id)
-        .ok_or(ReserveError::IdentityExhausted)?;
-    let member = MemberCell::new(id.clone(), membership);
-    let child_scope = child_scope.map(|flavor| {
-        let identity = ScopeIdentity::new().expect("global scope identity space exhausted");
-        ScopeCell::new(Arc::clone(&member), flavor, identity)
-    });
-    let slot = SlotCell::new(member, child_scope);
+    let slot = mint_reserved_slot(scope, &id, child_scope)?;
     state.entries.insert(
         id,
         DynamicEntry {
@@ -2220,20 +2210,7 @@ impl ScopeRuntime {
             );
             return;
         };
-        let (options, one_shot) = match definition.get() {
-            ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
-            ChildConstruction::Task(definition) => (&definition.options, false),
-            ChildConstruction::TaskOnce(definition) => (&definition.options, true),
-            ChildConstruction::Scope(definition) => (&definition.options, definition.one_shot()),
-        };
-        let resolved =
-            crate::policy::resolve_common(options, &self.defaults, one_shot, Readiness::Immediate);
-        request.slot.member.set_options(resolved.clone());
-        let plan = ChildPlan {
-            slot: Arc::clone(&request.slot),
-            construction: definition,
-            options: resolved,
-        };
+        let plan = ChildPlan::resolve(Arc::clone(&request.slot), definition, &self.defaults);
         {
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
             let id = request.slot.member.id();

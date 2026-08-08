@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::common::LiveFlag;
 use shelterwood::{
     BuildError, DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, RemoveOutcome,
-    Shutdown, StopReason, TaskDef, TaskOnceDef, Tree,
+    ReserveError, Shutdown, StopReason, TaskDef, TaskOnceDef, Tree,
 };
 
 #[test]
@@ -36,6 +36,25 @@ fn declaration_errors_are_eager_and_root_lowering_is_the_only_other_build_error(
         ));
         assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     });
+}
+
+#[tokio::test]
+async fn dynamic_reservation_validates_ids_at_the_driver_boundary() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+
+    assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root stops");
+
+    assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
+    assert!(matches!(
+        scope.reserve_task("worker"),
+        Err(ReserveError::NotAdmitting(_))
+    ));
 }
 
 #[tokio::test]

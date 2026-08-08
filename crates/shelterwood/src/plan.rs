@@ -79,6 +79,25 @@ pub(crate) enum ChildConstruction {
     Scope(Box<ScopeConstruction>),
 }
 
+pub(crate) fn mint_reserved_slot(
+    parent: &ScopeCell,
+    id: &ChildId,
+    child_scope: Option<ScopeFlavor>,
+) -> Result<Arc<SlotCell>, ReserveError> {
+    let membership = parent
+        .child_identity
+        .lock()
+        .expect("scope identity mutex poisoned")
+        .mint_membership(id)
+        .ok_or(ReserveError::IdentityExhausted)?;
+    let member = MemberCell::new(id.clone(), membership);
+    let scope = child_scope.map(|flavor| {
+        let identity = ScopeIdentity::new().expect("global scope identity space exhausted");
+        ScopeCell::new(Arc::clone(&member), flavor, identity)
+    });
+    Ok(SlotCell::new(member, scope))
+}
+
 enum DefinitionState {
     Undefined,
     Defined(Isolated<ChildConstruction>),
@@ -193,19 +212,7 @@ impl BuilderCore {
         if self.ids.contains_key(&id) {
             return Err(ReserveError::DuplicateId(id));
         }
-        let membership = self
-            .root
-            .child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .mint_membership(&id)
-            .ok_or(ReserveError::IdentityExhausted)?;
-        let member = MemberCell::new(id.clone(), membership);
-        let scope = scope.map(|flavor| {
-            let identity = ScopeIdentity::new().expect("global scope identity space exhausted");
-            ScopeCell::new(Arc::clone(&member), flavor, identity)
-        });
-        let slot = SlotCell::new(member, scope);
+        let slot = mint_reserved_slot(&self.root, &id, scope)?;
         self.ids.insert(id, Arc::clone(&slot));
         self.slots.push(Arc::clone(&slot));
         Ok(slot)
@@ -256,21 +263,7 @@ impl BuilderCore {
             let definition = slot
                 .take_definition()
                 .expect("validated slot must have a definition");
-            let (options, one_shot) = match definition.get() {
-                ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
-                ChildConstruction::Task(definition) => (&definition.options, false),
-                ChildConstruction::TaskOnce(definition) => (&definition.options, true),
-                ChildConstruction::Scope(definition) => {
-                    (&definition.options, definition.one_shot())
-                }
-            };
-            let resolved = resolve_common(options, &defaults, one_shot, Readiness::Immediate);
-            slot.member.set_options(resolved.clone());
-            children.push(ChildPlan {
-                slot: Arc::clone(slot),
-                construction: definition,
-                options: resolved,
-            });
+            children.push(ChildPlan::resolve(Arc::clone(slot), definition, &defaults));
         }
         self.armed = false;
         Ok(ScopePlan {
@@ -335,6 +328,28 @@ pub(crate) struct ChildPlan {
     pub(crate) options: ResolvedCommonOptions,
 }
 
+impl ChildPlan {
+    pub(crate) fn resolve(
+        slot: Arc<SlotCell>,
+        construction: Isolated<ChildConstruction>,
+        defaults: &ResolvedDefaults,
+    ) -> Self {
+        let (options, one_shot) = match construction.get() {
+            ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
+            ChildConstruction::Task(definition) => (&definition.options, false),
+            ChildConstruction::TaskOnce(definition) => (&definition.options, true),
+            ChildConstruction::Scope(definition) => (&definition.options, definition.one_shot()),
+        };
+        let options = resolve_common(options, defaults, one_shot, Readiness::Immediate);
+        slot.member.set_options(options.clone());
+        Self {
+            slot,
+            construction,
+            options,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum LowerError {
     Undefined {
@@ -374,4 +389,104 @@ pub(crate) fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError
     ChildId::validate(id.as_str().to_owned()).map_err(|error| match error {
         IdError::Empty => ReserveError::EmptyId,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    use crate::{
+        Backoff, ExitError, Readiness, RestartCondition, RestartPolicy, Retention, Shutdown,
+        TaskOnceDef,
+        policy::{ResolvedDefaults, ScopeFlavor},
+        runtime::{self, Isolated, Timeout},
+        task::TaskDef,
+    };
+
+    use super::{BuilderCore, ChildConstruction, ChildPlan};
+
+    fn configured_task() -> TaskDef {
+        TaskDef::new(|_| async { Ok(()) })
+            .restart(RestartPolicy::new(
+                RestartCondition::Always,
+                Backoff::Immediate,
+            ))
+            .shutdown(Shutdown::Abort)
+            .readiness(Readiness::Manual)
+            .expect("manual task readiness is valid")
+            .retention(Retention::Remove)
+    }
+
+    #[test]
+    fn static_and_dynamic_constructions_share_option_resolution() {
+        let defaults = ResolvedDefaults::default();
+        let mut declaration = BuilderCore::new(ScopeFlavor::Ordered);
+        let static_slot = declaration
+            .reserve("static", None)
+            .expect("static reservation succeeds");
+        static_slot.define(ChildConstruction::Task(configured_task()));
+        let static_plan = declaration
+            .lower(defaults.clone(), None)
+            .expect("defined declaration lowers");
+
+        let mut admission = BuilderCore::new(ScopeFlavor::Dynamic);
+        let dynamic_slot = admission
+            .reserve("dynamic", None)
+            .expect("dynamic reservation succeeds");
+        let dynamic_plan = ChildPlan::resolve(
+            dynamic_slot,
+            Isolated::new(ChildConstruction::Task(configured_task())),
+            &defaults,
+        );
+
+        assert_eq!(static_plan.children[0].options, dynamic_plan.options);
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[crate::runtime::test]
+    async fn resolving_one_shot_construction_preserves_owned_drop() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let capture = DropFlag(Arc::clone(&dropped));
+        let (completion, _claim) = runtime::oneshot();
+        let construction = TaskOnceDef::new(move |_| {
+            let _ = &capture;
+            async { Ok::<_, ExitError>(()) }
+        })
+        .erase(completion);
+        let mut declaration = BuilderCore::new(ScopeFlavor::Dynamic);
+        let slot = declaration
+            .reserve("one-shot", None)
+            .expect("reservation succeeds");
+
+        let plan = ChildPlan::resolve(
+            slot,
+            Isolated::new(ChildConstruction::TaskOnce(construction)),
+            &ResolvedDefaults::default(),
+        );
+        assert!(plan.options.restart.is_never());
+        assert_eq!(plan.options.retention, Retention::Remove);
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        drop(plan);
+        let disposed = runtime::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                runtime::yield_now().await;
+            }
+        })
+        .await;
+        assert!(matches!(disposed, Timeout::Completed(())));
+    }
 }

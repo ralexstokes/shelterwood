@@ -19,10 +19,13 @@ use crate::{
     task::{OnceTask, TaskDef},
 };
 
-/// A declaration-time reservation error.
+/// A child reservation or dynamic admission error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ReserveError {
+    /// No ambient supported async runtime exists.
+    #[error("no ambient Tokio runtime is available")]
+    NoRuntime,
     /// The child id was empty.
     #[error("child id must not be empty")]
     EmptyId,

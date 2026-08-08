@@ -664,27 +664,94 @@ impl<H> AdmissionReceipt<H> {
     }
 }
 
-/// An admission future. Fused additions abort on drop; split definitions
-/// detach after their first poll.
+/// An admission future.
+///
+/// Fused additions abort on drop; split definitions detach after their first
+/// poll starts admission. Reservation and that first poll require an ambient
+/// Tokio runtime. A first poll outside one returns [`ReserveError::NoRuntime`]
+/// and releases the reservation. Like a fused future, it remains pending if
+/// polled again after completion.
 #[must_use]
 pub struct Admission<H> {
-    reservation: Option<DynamicReservation>,
-    receipt: Option<AdmissionReceipt<H>>,
-    fused_cancel: Option<Latch>,
-    inner: Option<AdmissionWait>,
-    immediate: Option<ReserveError>,
-    polled: bool,
-    done: bool,
+    state: AdmissionState<H>,
 }
 
 type AdmissionWait = Pin<Box<dyn Future<Output = Result<(), ReserveError>> + Send + 'static>>;
+
+struct PendingAdmission<H> {
+    reservation: DynamicReservation,
+    receipt: AdmissionReceipt<H>,
+    fused_cancel: Option<Latch>,
+}
+
+impl<H> PendingAdmission<H> {
+    fn start(&self) -> Result<AdmissionWait, ReserveError> {
+        let response = crate::driver::start_admission(
+            Arc::clone(&self.reservation.control),
+            Arc::clone(&self.reservation.slot),
+            self.fused_cancel.clone(),
+        )?;
+        Ok(Box::pin(async move {
+            response
+                .receive()
+                .await
+                .unwrap_or(Err(ReserveError::NotAdmitting(
+                    crate::NotAdmittingCause::Terminal,
+                )))
+        }))
+    }
+
+    fn cancel_reservation(&self) {
+        crate::driver::cancel_dynamic_reservation(
+            &self.reservation.control,
+            &self.reservation.slot,
+        );
+    }
+}
+
+enum AdmissionState<H> {
+    Immediate(ReserveError),
+    Unpolled(PendingAdmission<H>),
+    InFlight {
+        pending: PendingAdmission<H>,
+        wait: AdmissionWait,
+    },
+    Done,
+}
+
+impl<H> AdmissionState<H> {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Immediate(_) => "Immediate",
+            Self::Unpolled(_) => "Unpolled",
+            Self::InFlight { .. } => "InFlight",
+            Self::Done => "Done",
+        }
+    }
+
+    fn begin(self, wait: AdmissionWait) -> Self {
+        match self {
+            Self::Unpolled(pending) => Self::InFlight { pending, wait },
+            other => other,
+        }
+    }
+
+    fn complete(
+        self,
+        result: Result<(), ReserveError>,
+    ) -> (Self, Option<Result<AdmissionReceipt<H>, ReserveError>>) {
+        match self {
+            Self::InFlight { pending, .. } => (Self::Done, Some(result.map(|()| pending.receipt))),
+            other => (other, None),
+        }
+    }
+}
 
 impl<H> fmt::Debug for Admission<H> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Admission")
-            .field("polled", &self.polled)
-            .field("done", &self.done)
+            .field("state", &self.state.name())
             .finish_non_exhaustive()
     }
 }
@@ -692,29 +759,21 @@ impl<H> fmt::Debug for Admission<H> {
 impl<H> Admission<H> {
     fn error(error: ReserveError) -> Self {
         Self {
-            reservation: None,
-            receipt: None,
-            fused_cancel: None,
-            inner: None,
-            immediate: Some(error),
-            polled: false,
-            done: false,
+            state: AdmissionState::Immediate(error),
         }
     }
 
     fn new(reservation: DynamicReservation, handles: H, fused: bool) -> Self {
         let membership = reservation.slot.member.membership();
         Self {
-            reservation: Some(reservation),
-            receipt: Some(AdmissionReceipt {
-                membership,
-                handles,
+            state: AdmissionState::Unpolled(PendingAdmission {
+                reservation,
+                receipt: AdmissionReceipt {
+                    membership,
+                    handles,
+                },
+                fused_cancel: fused.then(Latch::default),
             }),
-            fused_cancel: fused.then(Latch::default),
-            inner: None,
-            immediate: None,
-            polled: false,
-            done: false,
         }
     }
 }
@@ -723,64 +782,54 @@ impl<H: Unpin> Future for Admission<H> {
     type Output = Result<AdmissionReceipt<H>, ReserveError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(error) = self.immediate.take() {
-            self.done = true;
-            return Poll::Ready(Err(error));
-        }
-        if !self.polled {
-            self.polled = true;
-            let reservation = self
-                .reservation
-                .as_ref()
-                .expect("pending admission must carry its reservation");
-            let response = crate::driver::start_admission(
-                Arc::clone(&reservation.control),
-                Arc::clone(&reservation.slot),
-                self.fused_cancel.clone(),
-            );
-            self.inner = Some(Box::pin(async move {
-                response
-                    .receive()
-                    .await
-                    .expect("admission response obligation must complete")
-            }));
-        }
-        let poll = self
-            .inner
-            .as_mut()
-            .expect("polled admission must carry its response future")
-            .as_mut()
-            .poll(context);
-        match poll {
-            Poll::Ready(Ok(())) => {
-                self.done = true;
-                Poll::Ready(Ok(self
-                    .receipt
-                    .take()
-                    .expect("successful admission must carry a receipt")))
+        let this = self.as_mut().get_mut();
+        loop {
+            match &mut this.state {
+                AdmissionState::Immediate(error) => {
+                    let error = error.clone();
+                    this.state = AdmissionState::Done;
+                    return Poll::Ready(Err(error));
+                }
+                AdmissionState::Unpolled(pending) => {
+                    let wait = match pending.start() {
+                        Ok(wait) => wait,
+                        Err(error) => {
+                            pending.cancel_reservation();
+                            this.state = AdmissionState::Done;
+                            return Poll::Ready(Err(error));
+                        }
+                    };
+                    let previous = std::mem::replace(&mut this.state, AdmissionState::Done);
+                    this.state = previous.begin(wait);
+                }
+                AdmissionState::InFlight { wait, .. } => match wait.as_mut().poll(context) {
+                    Poll::Ready(result) => {
+                        let previous = std::mem::replace(&mut this.state, AdmissionState::Done);
+                        let (state, output) = previous.complete(result);
+                        this.state = state;
+                        if let Some(output) = output {
+                            return Poll::Ready(output);
+                        }
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                AdmissionState::Done => return Poll::Pending,
             }
-            Poll::Ready(Err(error)) => {
-                self.done = true;
-                Poll::Ready(Err(error))
-            }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl<H> Drop for Admission<H> {
     fn drop(&mut self) {
-        if self.done {
-            return;
-        }
-        let Some(reservation) = &self.reservation else {
-            return;
-        };
-        if let Some(cancel) = &self.fused_cancel {
-            crate::driver::signal_fused_cancel(&reservation.control, cancel);
-            crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
-        } else if !self.polled {
-            crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
+        match &self.state {
+            AdmissionState::Unpolled(pending) => pending.cancel_reservation(),
+            AdmissionState::InFlight { pending, .. } => {
+                if let Some(cancel) = &pending.fused_cancel {
+                    crate::driver::signal_fused_cancel(&pending.reservation.control, cancel);
+                    pending.cancel_reservation();
+                }
+            }
+            AdmissionState::Immediate(_) | AdmissionState::Done => {}
         }
     }
 }
@@ -1364,6 +1413,8 @@ impl DynamicScopeRef {
     }
 
     /// Reserves an actor id synchronously and exposes its exact handle.
+    ///
+    /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
     pub fn reserve_actor<M: Send + 'static>(
         &self,
         id: impl Into<ChildId>,
@@ -1432,6 +1483,8 @@ impl DynamicScopeRef {
     }
 
     /// Reserves a task id synchronously and exposes its exact handle.
+    ///
+    /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
     pub fn reserve_task(&self, id: impl Into<ChildId>) -> Result<DynamicTaskSlot, ReserveError> {
         crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
             DynamicTaskSlot {
@@ -1461,6 +1514,8 @@ impl DynamicScopeRef {
     }
 
     /// Reserves a typed subtree id synchronously.
+    ///
+    /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
     pub fn reserve_subtree<T: Subtree>(
         &self,
         id: impl Into<ChildId>,

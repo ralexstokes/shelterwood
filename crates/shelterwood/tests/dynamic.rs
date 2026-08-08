@@ -588,6 +588,140 @@ async fn reserved_cell_removal_wins_a_queued_split_definition() {
         .expect("root stops");
 }
 
+#[test]
+fn admission_runtime_guards_leave_reservation_ids_reusable() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let (system, scope, task, mut admission) = runtime.block_on(async {
+        let system = DynamicTree::new().spawn().expect("runtime is available");
+        system.wait_started().await.expect("root starts");
+        let scope = system.scope();
+        let slot = scope
+            .reserve_task("poll-outside")
+            .expect("reservation starts inside the runtime");
+        let task = slot.task_ref();
+        let admission = Box::pin(slot.define(waiting_task()));
+        (system, scope, task, admission)
+    });
+
+    assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
+    assert!(matches!(
+        scope.reserve_task("poll-outside"),
+        Err(ReserveError::NoRuntime)
+    ));
+    assert!(matches!(
+        scope.reserve_task("reserve-outside"),
+        Err(ReserveError::NoRuntime)
+    ));
+    let mut immediate = Box::pin(scope.add_task("add-outside", waiting_task()));
+    assert!(matches!(
+        poll_once(immediate.as_mut()),
+        std::task::Poll::Ready(Err(ReserveError::NoRuntime))
+    ));
+    assert!(matches!(
+        poll_once(admission.as_mut()),
+        std::task::Poll::Ready(Err(ReserveError::NoRuntime))
+    ));
+    assert!(poll_once(admission.as_mut()).is_pending());
+
+    runtime.block_on(async {
+        assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
+        for id in ["reserve-outside", "add-outside", "poll-outside"] {
+            let task = scope
+                .add_task(id, waiting_task())
+                .await
+                .unwrap_or_else(|error| panic!("id `{id}` remains reusable: {error:?}"))
+                .into_handles();
+            assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+        }
+        system
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("root stops");
+    });
+    assert!(matches!(
+        scope.reserve_task("stopped-outside"),
+        Err(ReserveError::NoRuntime)
+    ));
+}
+
+#[tokio::test]
+async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+
+    let mut fused = Box::pin(scope.add_task("fused-select", waiting_task()));
+    assert!(poll_once(fused.as_mut()).is_pending());
+    tokio::select! {
+        biased;
+        () = std::future::ready(()) => {}
+        result = fused => panic!("ready branch must win over admission: {result:?}"),
+    }
+    let reused = scope
+        .add_task("fused-select", waiting_task())
+        .await
+        .expect("select dropping a fused admission frees its id")
+        .into_handles();
+    assert_eq!(scope.remove_task(&reused).await, RemoveOutcome::Removed);
+
+    let split_started = Arc::new(AtomicBool::new(false));
+    let split_cancelled = Arc::new(AtomicBool::new(false));
+    let slot = scope
+        .reserve_task("split-timeout")
+        .expect("split reservation");
+    let task = slot.task_ref();
+    let mut split = Box::pin(slot.define(TaskDef::new({
+        let split_started = Arc::clone(&split_started);
+        let split_cancelled = Arc::clone(&split_cancelled);
+        move |context| {
+            let split_started = Arc::clone(&split_started);
+            let split_cancelled = Arc::clone(&split_cancelled);
+            async move {
+                split_started.store(true, Ordering::SeqCst);
+                context.shutdown_token().cancelled().await;
+                split_cancelled.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    })));
+    assert!(poll_once(split.as_mut()).is_pending());
+    let timed_admission = async move {
+        let _split = split;
+        std::future::pending::<()>().await;
+    };
+    assert!(
+        tokio::time::timeout(Duration::ZERO, timed_admission)
+            .await
+            .is_err()
+    );
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            split_started.load(Ordering::SeqCst)
+        })
+        .await,
+        "timing out a polled split admission detaches the running child"
+    );
+    assert!(matches!(
+        scope.reserve_task("split-timeout"),
+        Err(ReserveError::DuplicateId(_))
+    ));
+    assert_quiet(Duration::from_millis(20), || {
+        split_cancelled.load(Ordering::SeqCst)
+    })
+    .await;
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert!(split_cancelled.load(Ordering::SeqCst));
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
 #[tokio::test]
 async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     let system = DynamicTree::new().spawn().expect("runtime is available");

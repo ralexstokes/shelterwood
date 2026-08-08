@@ -263,6 +263,9 @@ pub(crate) fn reserve_dynamic(
     child_scope: Option<ScopeFlavor>,
 ) -> Result<DynamicReservation, ReserveError> {
     let id = checked_id(id)?;
+    if !runtime::is_available() {
+        return Err(ReserveError::NoRuntime);
+    }
     if matches!(scope.member.record().stage, MemberStage::Terminal(_)) {
         return Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal));
     }
@@ -314,7 +317,10 @@ pub(crate) fn start_admission(
     control: Arc<DynamicControl>,
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
-) -> runtime::OneShotReceiver<Result<(), ReserveError>> {
+) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
+    if !runtime::is_available() {
+        return Err(ReserveError::NoRuntime);
+    }
     let (sender, response) = runtime::oneshot();
     let request = AdmissionRequest {
         control: Arc::downgrade(&control),
@@ -327,7 +333,7 @@ pub(crate) fn start_admission(
     runtime::spawn(async move {
         let _ = runtime::mpsc_send(&control.events, DriverEvent::Admission(request)).await;
     });
-    response
+    Ok(response)
 }
 
 fn cancel_dynamic_reservation_parts(

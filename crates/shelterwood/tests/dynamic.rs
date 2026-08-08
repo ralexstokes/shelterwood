@@ -78,6 +78,39 @@ impl RawActor for WaitingRaw {
     }
 }
 
+struct SignalledWaitingRaw {
+    started: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RawActor for SignalledWaitingRaw {
+    type Msg = ();
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        self.started.store(true, Ordering::SeqCst);
+        context.shutdown_token().cancelled().await;
+        self.cancelled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn signalled_waiting_tree(started: Arc<AtomicBool>, cancelled: Arc<AtomicBool>) -> Tree {
+    let mut tree = Tree::new();
+    let (_, completion) = tree
+        .add_task_once(
+            "worker",
+            TaskOnceDef::new(move |context| async move {
+                started.store(true, Ordering::SeqCst);
+                context.shutdown_token().cancelled().await;
+                cancelled.store(true, Ordering::SeqCst);
+                Ok::<_, ExitError>(())
+            }),
+        )
+        .expect("valid signalled task");
+    drop(completion);
+    tree
+}
+
 #[tokio::test]
 async fn restartable_dynamic_surfaces_are_parallel_across_all_three_child_kinds() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
@@ -661,6 +694,131 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
 }
 
 #[tokio::test]
+async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+
+    let actor_started = Arc::new(AtomicBool::new(false));
+    let actor_cancelled = Arc::new(AtomicBool::new(false));
+    let mut fused_actor = Box::pin(scope.add_raw(
+        "fused-actor",
+        RawDef::factory({
+            let actor_started = Arc::clone(&actor_started);
+            let actor_cancelled = Arc::clone(&actor_cancelled);
+            move || SignalledWaitingRaw {
+                started: Arc::clone(&actor_started),
+                cancelled: Arc::clone(&actor_cancelled),
+            }
+        }),
+    ));
+    assert!(poll_once(fused_actor.as_mut()).is_pending());
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            actor_started.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    drop(fused_actor);
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            actor_cancelled.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    let actor = scope
+        .add_raw("fused-actor", RawDef::factory(|| WaitingRaw))
+        .await
+        .expect("fused actor drop frees its id")
+        .into_handles();
+    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
+
+    let subtree_started = Arc::new(AtomicBool::new(false));
+    let subtree_cancelled = Arc::new(AtomicBool::new(false));
+    let mut fused_subtree = Box::pin(scope.add_subtree_once(
+        "fused-subtree",
+        SubtreeOnceDef::new(signalled_waiting_tree(
+            Arc::clone(&subtree_started),
+            Arc::clone(&subtree_cancelled),
+        )),
+    ));
+    assert!(poll_once(fused_subtree.as_mut()).is_pending());
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            subtree_started.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    drop(fused_subtree);
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            subtree_cancelled.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    let subtree = scope
+        .add_subtree_once("fused-subtree", SubtreeOnceDef::new(waiting_tree()))
+        .await
+        .expect("fused subtree drop frees its id")
+        .into_handles();
+    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+
+    let actor_started = Arc::new(AtomicBool::new(false));
+    let actor_cancelled = Arc::new(AtomicBool::new(false));
+    let slot = scope
+        .reserve_actor("split-actor")
+        .expect("actor reservation succeeds");
+    let actor = slot.actor_ref();
+    let mut split_actor = Box::pin(slot.define_once_raw(RawOnceDef::new(SignalledWaitingRaw {
+        started: Arc::clone(&actor_started),
+        cancelled: Arc::clone(&actor_cancelled),
+    })));
+    assert!(poll_once(split_actor.as_mut()).is_pending());
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            actor_started.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    drop(split_actor);
+    assert_quiet(Duration::from_millis(20), || {
+        actor_cancelled.load(Ordering::SeqCst)
+    })
+    .await;
+    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
+    assert!(actor_cancelled.load(Ordering::SeqCst));
+
+    let subtree_started = Arc::new(AtomicBool::new(false));
+    let subtree_cancelled = Arc::new(AtomicBool::new(false));
+    let slot = scope
+        .reserve_subtree::<Tree>("split-subtree")
+        .expect("subtree reservation succeeds");
+    let subtree = slot.scope_ref();
+    let mut split_subtree = Box::pin(slot.define_once(SubtreeOnceDef::new(
+        signalled_waiting_tree(Arc::clone(&subtree_started), Arc::clone(&subtree_cancelled)),
+    )));
+    assert!(poll_once(split_subtree.as_mut()).is_pending());
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            subtree_started.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    drop(split_subtree);
+    assert_quiet(Duration::from_millis(20), || {
+        subtree_cancelled.load(Ordering::SeqCst)
+    })
+    .await;
+    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    assert!(subtree_cancelled.load(Ordering::SeqCst));
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
 async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
     let started = Arc::new(AtomicBool::new(false));
     let factory_dropped = Arc::new(AtomicBool::new(false));
@@ -788,6 +946,20 @@ async fn dropping_undefined_dynamic_slots_terminalizes_cells_and_frees_ids() {
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
 
+    let actor_slot = scope
+        .reserve_actor::<()>("actor")
+        .expect("actor reservation");
+    let abandoned_actor = actor_slot.actor_ref();
+    drop(actor_slot);
+    assert_eq!(
+        abandoned_actor
+            .send(())
+            .await
+            .expect_err("abandoned actor is terminal")
+            .kind,
+        SendErrorKind::Terminated
+    );
+
     let task_slot = scope.reserve_task("worker").expect("task reservation");
     let abandoned_task = task_slot.task_ref();
     drop(task_slot);
@@ -812,6 +984,12 @@ async fn dropping_undefined_dynamic_slots_terminalizes_cells_and_frees_ids() {
         .expect("task id was released")
         .into_handles();
     assert_eq!(scope.remove_task(&worker).await, RemoveOutcome::Removed);
+    let actor = scope
+        .add_raw("actor", RawDef::factory(|| WaitingRaw))
+        .await
+        .expect("actor id was released")
+        .into_handles();
+    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
     let nested = scope
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await

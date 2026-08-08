@@ -151,6 +151,53 @@ fn actor_types_obey_resource_and_payload_trait_contracts() {
     let _ = SubtreeOnceDef::new(Tree::new());
 }
 
+#[test]
+#[allow(clippy::type_complexity)]
+fn slot_method_signatures_remain_nominal_and_parallel() {
+    let _: fn(&ActorSlot<Cell<()>>) -> ActorRef<Cell<()>> = ActorSlot::actor_ref;
+    let _: fn(ActorSlot<Cell<()>>, ActorDef<OpaqueActor>) -> ActorRef<Cell<()>> = ActorSlot::define;
+    let _: fn(ActorSlot<Cell<()>>, ActorOnceDef<OpaqueActor>) -> ActorRef<Cell<()>> =
+        ActorSlot::define_once;
+    let _: fn(ActorSlot<Cell<()>>, RawDef<OpaqueRaw>) -> ActorRef<Cell<()>> = ActorSlot::define_raw;
+    let _: fn(ActorSlot<Cell<()>>, RawOnceDef<OpaqueRaw>) -> ActorRef<Cell<()>> =
+        ActorSlot::define_once_raw;
+
+    let _: fn(&TaskSlot) -> TaskRef = TaskSlot::task_ref;
+    let _: fn(TaskSlot, TaskDef) -> TaskRef = TaskSlot::define;
+    let _: fn(TaskSlot, TaskOnceDef<Cell<()>>) -> (TaskRef, OneShotTaskRef<Cell<()>>) =
+        TaskSlot::define_once;
+
+    let _: fn(&SubtreeSlot<Tree>) -> ScopeRef = SubtreeSlot::<Tree>::scope_ref;
+    let _: fn(SubtreeSlot<Tree>, SubtreeDef<Tree>) -> ScopeRef = SubtreeSlot::<Tree>::define;
+    let _: fn(SubtreeSlot<Tree>, SubtreeOnceDef<Tree>) -> ScopeRef =
+        SubtreeSlot::<Tree>::define_once;
+
+    let _: fn(&DynamicActorSlot<Cell<()>>) -> ActorRef<Cell<()>> = DynamicActorSlot::actor_ref;
+    let _: fn(DynamicActorSlot<Cell<()>>, ActorDef<OpaqueActor>) -> Admission<ActorRef<Cell<()>>> =
+        DynamicActorSlot::define;
+    let _: fn(
+        DynamicActorSlot<Cell<()>>,
+        ActorOnceDef<OpaqueActor>,
+    ) -> Admission<ActorRef<Cell<()>>> = DynamicActorSlot::define_once;
+    let _: fn(DynamicActorSlot<Cell<()>>, RawDef<OpaqueRaw>) -> Admission<ActorRef<Cell<()>>> =
+        DynamicActorSlot::define_raw;
+    let _: fn(DynamicActorSlot<Cell<()>>, RawOnceDef<OpaqueRaw>) -> Admission<ActorRef<Cell<()>>> =
+        DynamicActorSlot::define_once_raw;
+
+    let _: fn(&DynamicTaskSlot) -> TaskRef = DynamicTaskSlot::task_ref;
+    let _: fn(DynamicTaskSlot, TaskDef) -> Admission<TaskRef> = DynamicTaskSlot::define;
+    let _: fn(
+        DynamicTaskSlot,
+        TaskOnceDef<Cell<()>>,
+    ) -> Admission<(TaskRef, OneShotTaskRef<Cell<()>>)> = DynamicTaskSlot::define_once;
+
+    let _: fn(&DynamicSubtreeSlot<Tree>) -> ScopeRef = DynamicSubtreeSlot::<Tree>::scope_ref;
+    let _: fn(DynamicSubtreeSlot<Tree>, SubtreeDef<Tree>) -> Admission<ScopeRef> =
+        DynamicSubtreeSlot::<Tree>::define;
+    let _: fn(DynamicSubtreeSlot<Tree>, SubtreeOnceDef<Tree>) -> Admission<ScopeRef> =
+        DynamicSubtreeSlot::<Tree>::define_once;
+}
+
 struct OpaqueRaw {
     _not_sync: Cell<()>,
 }

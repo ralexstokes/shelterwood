@@ -81,6 +81,54 @@ async fn ordered_startup_waits_for_manual_readiness() {
         .expect("clean shutdown");
 }
 
+#[tokio::test]
+async fn shutdown_racing_startup_reports_shutdown_requested() {
+    let entered = ReleaseGate::default();
+    let cancellation_seen = ReleaseGate::default();
+    let release_ready = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "gated",
+        TaskDef::new({
+            let entered = entered.clone();
+            let cancellation_seen = cancellation_seen.clone();
+            let release_ready = release_ready.clone();
+            move |context| {
+                let entered = entered.clone();
+                let cancellation_seen = cancellation_seen.clone();
+                let release_ready = release_ready.clone();
+                async move {
+                    entered.release();
+                    context.shutdown_token().cancelled().await;
+                    cancellation_seen.release();
+                    release_ready.wait().await;
+                    context.mark_ready();
+                    Ok(())
+                }
+            }
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid task");
+
+    let system = tree.spawn().expect("runtime is available");
+    entered.wait().await;
+    system.scope().request_shutdown();
+    cancellation_seen.wait().await;
+    release_ready.release();
+
+    assert_eq!(
+        system.wait_started().await,
+        Err(StartupError::ShutdownRequested)
+    );
+    assert_eq!(
+        system.wait().await,
+        shelterwood::StopReason::ShutdownRequested
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn readiness_deadline_is_typed_and_absolute() {
     let deadline_width = Duration::from_secs(10);

@@ -57,7 +57,7 @@ pub(crate) fn sleep_until(deadline: std::time::Instant) -> BoxedSleep {
 }
 
 pub(crate) struct ActorWork {
-    handle: Option<JoinHandle<(), ()>>,
+    handle: Option<JoinHandle<()>>,
     abort: AbortHandle,
 }
 
@@ -81,7 +81,7 @@ impl Drop for ActorWork {
 }
 
 pub(crate) fn spawn_actor_work(future: impl Future<Output = ()> + Send + 'static) -> ActorWork {
-    let handle = spawn((), future);
+    let handle = spawn(future);
     let abort = handle.abort_handle();
     ActorWork {
         handle: Some(handle),
@@ -90,7 +90,7 @@ pub(crate) fn spawn_actor_work(future: impl Future<Output = ()> + Send + 'static
 }
 
 pub(crate) struct BlockingWork<T> {
-    handle: Option<JoinHandle<(), T>>,
+    handle: Option<JoinHandle<T>>,
 }
 
 impl<T: Send + 'static> BlockingWork<T> {
@@ -99,7 +99,7 @@ impl<T: Send + 'static> BlockingWork<T> {
             .handle
             .take()
             .expect("blocking operation was joined more than once");
-        join_resuming(handle).await.1
+        join_resuming(handle).await
     }
 }
 
@@ -107,7 +107,7 @@ pub(crate) fn spawn_blocking_work<T: Send + 'static>(
     operation: impl FnOnce() -> T + Send + 'static,
 ) -> BlockingWork<T> {
     BlockingWork {
-        handle: Some(spawn_blocking((), operation)),
+        handle: Some(spawn_blocking(operation)),
     }
 }
 
@@ -718,9 +718,8 @@ impl<T> fmt::Debug for BroadcastReceiver<T> {
     }
 }
 
-/// A spawned operation whose identity is retained through joining.
-pub(crate) struct JoinHandle<I, T> {
-    id: I,
+/// A spawned operation owned by the library.
+pub(crate) struct JoinHandle<T> {
     inner: task::JoinHandle<T>,
 }
 
@@ -733,7 +732,7 @@ impl AbortHandle {
     }
 }
 
-impl<I, T> JoinHandle<I, T> {
+impl<T> JoinHandle<T> {
     pub(crate) fn abort_handle(&self) -> AbortHandle {
         AbortHandle(self.inner.abort_handle())
     }
@@ -765,30 +764,28 @@ pub(crate) enum JoinOutcome<T> {
     Cancelled,
 }
 
-pub(crate) fn spawn<I, F>(id: I, future: F) -> JoinHandle<I, F::Output>
+pub(crate) fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     JoinHandle {
-        id,
         inner: task::spawn(future),
     }
 }
 
-pub(crate) fn spawn_blocking<I, F, T>(id: I, operation: F) -> JoinHandle<I, T>
+pub(crate) fn spawn_blocking<F, T>(operation: F) -> JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     JoinHandle {
-        id,
         inner: task::spawn_blocking(operation),
     }
 }
 
-pub(crate) async fn join<I, T>(handle: JoinHandle<I, T>) -> JoinOutcome<T> {
-    let JoinHandle { inner, .. } = handle;
+pub(crate) async fn join<T>(handle: JoinHandle<T>) -> JoinOutcome<T> {
+    let JoinHandle { inner } = handle;
     match inner.await {
         Ok(value) => JoinOutcome::Ok { value },
         Err(error) if error.is_panic() => JoinOutcome::Panic {
@@ -801,10 +798,10 @@ pub(crate) async fn join<I, T>(handle: JoinHandle<I, T>) -> JoinOutcome<T> {
     }
 }
 
-pub(crate) async fn join_resuming<I, T>(handle: JoinHandle<I, T>) -> (I, T) {
-    let JoinHandle { id, inner } = handle;
+pub(crate) async fn join_resuming<T>(handle: JoinHandle<T>) -> T {
+    let JoinHandle { inner } = handle;
     match inner.await {
-        Ok(value) => (id, value),
+        Ok(value) => value,
         Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
         Err(error) => {
             debug_assert!(error.is_cancelled());
@@ -1018,7 +1015,7 @@ mod tests {
         for _ in 0..FIRERS {
             let latch = latch.clone();
             let ready = Arc::clone(&ready);
-            firers.push(spawn((), async move {
+            firers.push(spawn(async move {
                 ready.fetch_add(1, Ordering::AcqRel);
                 while ready.load(Ordering::Acquire) != FIRERS {
                     yield_now().await;
@@ -1050,7 +1047,7 @@ mod tests {
         for _ in 0..WAITERS {
             let latch = latch.clone();
             let parked = Arc::clone(&parked);
-            waiters.push(spawn((), async move {
+            waiters.push(spawn(async move {
                 let mut fired = Box::pin(latch.fired());
                 let first_poll =
                     std::future::poll_fn(|context| Poll::Ready(fired.as_mut().poll(context))).await;

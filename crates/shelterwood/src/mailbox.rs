@@ -1812,7 +1812,7 @@ mod tests {
     }
 
     fn actor() -> (Arc<MailboxCell<u8>>, ActorRef<u8>) {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("actor");
         let member = MemberCell::new(
             id.clone(),
@@ -1833,7 +1833,7 @@ mod tests {
     #[should_panic(expected = "mailbox must be configured before its first bind")]
     fn binding_before_configuration_trips_the_driver_contract() {
         let (mailbox, _) = actor();
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let membership = identity
             .mint_membership(&ChildId::from("actor"))
             .expect("membership available");
@@ -1903,7 +1903,7 @@ mod tests {
         park_with(&mut third, &counting);
         MailboxControl::configure(&*mailbox, Mailbox::default());
         let mut generations = {
-            let mut identity = ScopeIdentity::new().expect("scope identity available");
+            let mut identity = ScopeIdentity::new();
             let membership = identity
                 .mint_membership(&ChildId::from("actor"))
                 .expect("membership available");

@@ -360,7 +360,7 @@ mod tests {
 
     fn task_context() -> (TaskContext, Latch, Latch, Latch) {
         let id = ChildId::from("task");
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let membership = identity.mint_membership(&id).expect("membership available");
         let mut incarnations = identity.incarnation_counter(membership);
         let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
@@ -419,7 +419,7 @@ mod tests {
         OneShotTaskRef<T>,
         std::sync::Arc<MemberCell>,
     ) {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("task");
         let membership = identity.mint_membership(&id).expect("membership available");
         let member = MemberCell::new(id, membership);
@@ -503,15 +503,15 @@ mod tests {
             let primary = Latch::default();
             let local = Latch::default();
             let operation = CancellationToken::from_latch(primary.clone()).child(local.clone());
-            let waiter = runtime::spawn((), async move {
+            let waiter = runtime::spawn(async move {
                 operation.cancelled().await;
             });
 
-            let primary_firer = runtime::spawn((), async move {
+            let primary_firer = runtime::spawn(async move {
                 runtime::yield_now().await;
                 primary.fire()
             });
-            let local_firer = runtime::spawn((), async move {
+            let local_firer = runtime::spawn(async move {
                 runtime::yield_now().await;
                 local.fire()
             });

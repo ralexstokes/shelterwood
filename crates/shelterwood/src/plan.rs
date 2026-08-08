@@ -92,7 +92,7 @@ pub(crate) fn mint_reserved_slot(
         .ok_or(ReserveError::IdentityExhausted)?;
     let member = MemberCell::new(id.clone(), membership);
     let scope = child_scope.map(|flavor| {
-        let identity = ScopeIdentity::new().expect("global scope identity space exhausted");
+        let identity = ScopeIdentity::new();
         ScopeCell::new(Arc::clone(&member), flavor, identity)
     });
     Ok(SlotCell::new(member, scope))
@@ -205,13 +205,12 @@ impl BuilderCore {
 
     pub(crate) fn new(flavor: ScopeFlavor) -> Self {
         let root_id = ChildId::from("$root");
-        let mut root_identity =
-            ScopeIdentity::new().expect("global scope identity space exhausted");
+        let mut root_identity = ScopeIdentity::new();
         let membership = root_identity
             .mint_membership(&root_id)
             .expect("fresh scope identity must mint its root membership");
         let member = MemberCell::new(root_id, membership);
-        let child_identity = ScopeIdentity::new().expect("global scope identity space exhausted");
+        let child_identity = ScopeIdentity::new();
         let root = ScopeCell::new(member, flavor, child_identity);
         Self {
             root,

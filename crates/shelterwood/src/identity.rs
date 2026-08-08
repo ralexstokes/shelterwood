@@ -41,7 +41,7 @@ impl Membership {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Incarnation {
     membership: Membership,
-    generation: Fence,
+    generation: Generation,
 }
 
 impl Incarnation {
@@ -61,19 +61,41 @@ impl Incarnation {
     }
 }
 
-/// The one ordered fencing value used for membership and incarnation checks.
+/// An ordered generation within one identity lineage.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct Generation(u64);
+
+impl Generation {
+    const POISON: Self = Self(u64::MAX);
+
+    fn new(value: u64) -> Option<Self> {
+        (value != Self::POISON.0).then_some(Self(value))
+    }
+
+    fn get(self) -> u64 {
+        self.0
+    }
+
+    fn supersedes(self, other: Self) -> bool {
+        self != Self::POISON && other != Self::POISON && self.0 > other.0
+    }
+
+    #[cfg(test)]
+    fn fixture(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// A complete membership fence: its lineage and ordered generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct Fence {
     lineage: u64,
-    generation: u64,
+    generation: Generation,
 }
 
 impl Fence {
     fn supersedes(self, other: Self) -> bool {
-        self.lineage == other.lineage
-            && self.generation != u64::MAX
-            && other.generation != u64::MAX
-            && self.generation > other.generation
+        self.lineage == other.lineage && self.generation.supersedes(other.generation)
     }
 }
 
@@ -105,14 +127,14 @@ impl FenceCounter {
 
     fn mint(&mut self) -> Option<Fence> {
         let next = self.current.checked_add(1)?;
-        if next == u64::MAX {
+        let Some(generation) = Generation::new(next) else {
             self.current = u64::MAX;
             return None;
-        }
+        };
         self.current = next;
         Some(Fence {
             lineage: self.lineage,
-            generation: next,
+            generation,
         })
     }
 
@@ -121,7 +143,7 @@ impl FenceCounter {
     /// Observation uses the same saturating, poison-never-minted primitive as
     /// membership and incarnation fencing.
     pub(crate) fn mint_sequence(&mut self) -> Option<u64> {
-        self.mint().map(|fence| fence.generation)
+        self.mint().map(|fence| fence.generation.get())
     }
 }
 
@@ -132,14 +154,14 @@ pub(crate) struct ScopeIdentity {
 }
 
 impl ScopeIdentity {
-    pub(crate) fn new() -> Option<Self> {
+    pub(crate) fn new() -> Self {
         #[cfg(test)]
         CURRENT_THREAD_SCOPE_CREATIONS.with(|creations| {
             creations.set(creations.get().saturating_add(1));
         });
-        Some(Self {
+        Self {
             memberships: HashMap::new(),
-        })
+        }
     }
 
     fn fresh_counter() -> Option<FenceCounter> {
@@ -191,35 +213,29 @@ impl ScopeIdentity {
         match self.memberships.entry(id.clone()) {
             Entry::Occupied(mut entry) => entry.get_mut().mint().map(Membership),
             Entry::Vacant(entry) => {
-                debug_assert_ne!(provisional.0.generation, u64::MAX);
+                debug_assert_ne!(provisional.0.generation, Generation::POISON);
                 entry.insert(FenceCounter {
                     lineage: provisional.0.lineage,
-                    current: provisional.0.generation,
+                    current: provisional.0.generation.get(),
                 });
                 Some(provisional)
             }
         }
     }
 
-    pub(crate) fn incarnation_counter(&self, membership: Membership) -> FenceCounter {
-        // The membership's complete fence is compressed into a unique local
-        // lineage. The membership scope lineage remains part of the mixing, so
-        // matching child ids in different scopes cannot compare equal.
-        //
-        // A nested builder mints its public handles before it is attached to
-        // the parent scope. Deriving from the membership itself keeps those
-        // handles valid after lowering under the parent's runtime cell.
-        let lineage = membership.0.lineage.rotate_left(17) ^ membership.0.generation;
-        FenceCounter::new(lineage)
+    pub(crate) fn incarnation_counter(&self, _membership: Membership) -> FenceCounter {
+        // Membership already supplies the complete incarnation lineage. The
+        // per-membership counter therefore needs only an ordered generation.
+        FenceCounter::new(0)
     }
 
     pub(crate) fn mint_incarnation(
         membership: Membership,
         counter: &mut FenceCounter,
     ) -> Option<Incarnation> {
-        counter.mint().map(|generation| Incarnation {
+        counter.mint().map(|fence| Incarnation {
             membership,
-            generation,
+            generation: fence.generation,
         })
     }
 }
@@ -228,12 +244,12 @@ impl ScopeIdentity {
 mod tests {
     use crate::ChildId;
 
-    use super::{FenceCounter, ScopeIdentity};
+    use super::{FenceCounter, Generation, ScopeIdentity};
 
     #[test]
     fn cross_scope_tokens_fail_closed() {
-        let mut left = ScopeIdentity::new().expect("scope identity available");
-        let mut right = ScopeIdentity::new().expect("scope identity available");
+        let mut left = ScopeIdentity::new();
+        let mut right = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let left_member = left.mint_membership(&id).expect("membership available");
         let right_member = right.mint_membership(&id).expect("membership available");
@@ -245,7 +261,7 @@ mod tests {
 
     #[test]
     fn membership_and_incarnation_order_is_scoped_by_owner_and_id() {
-        let mut scope = ScopeIdentity::new().expect("scope identity available");
+        let mut scope = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let first = scope.mint_membership(&id).expect("membership available");
         let second = scope.mint_membership(&id).expect("membership available");
@@ -277,19 +293,19 @@ mod tests {
     fn stable_scope_adopts_the_first_declaration_then_orders_rebuilds() {
         let id = ChildId::from("worker");
         let other_id = ChildId::from("other");
-        let mut first_builder = ScopeIdentity::new().expect("builder identity available");
+        let mut first_builder = ScopeIdentity::new();
         let first = first_builder
             .mint_membership(&id)
             .expect("first provisional membership available");
         let other = first_builder
             .mint_membership(&other_id)
             .expect("other provisional membership available");
-        let mut rebuilt_builder = ScopeIdentity::new().expect("builder identity available");
+        let mut rebuilt_builder = ScopeIdentity::new();
         let rebuilt = rebuilt_builder
             .mint_membership(&id)
             .expect("rebuilt provisional membership available");
 
-        let mut stable = ScopeIdentity::new().expect("stable identity available");
+        let mut stable = ScopeIdentity::new();
         assert_eq!(
             stable.adopt_or_mint_membership(&id, first),
             Some(first),
@@ -314,8 +330,11 @@ mod tests {
 
     #[test]
     fn exhaustion_never_mints_the_poison_value_or_a_duplicate() {
+        const TEST_LINEAGE: u64 = u64::MAX;
         let id = ChildId::from("worker");
-        let counter = FenceCounter::near_exhaustion(7);
+        // The production allocator never mints the poison lineage, so this
+        // fixture cannot collide with an unrelated identity created below.
+        let counter = FenceCounter::near_exhaustion(TEST_LINEAGE);
         let mut scope = ScopeIdentity::with_counter(id.clone(), counter);
         let last = scope
             .mint_membership(&id)
@@ -323,7 +342,7 @@ mod tests {
         assert!(scope.mint_membership(&id).is_none());
         assert!(scope.mint_membership(&id).is_none());
 
-        let other = MembershipFixture::at(7, u64::MAX);
+        let other = MembershipFixture::at(TEST_LINEAGE, u64::MAX);
         assert_ne!(last, other);
         assert!(!last.supersedes(other));
         assert!(!other.supersedes(last));
@@ -342,7 +361,7 @@ mod tests {
         stable
             .mint_membership(&id)
             .expect("last usable stable membership is minted");
-        let mut builder = ScopeIdentity::new().expect("builder identity available");
+        let mut builder = ScopeIdentity::new();
         let provisional = builder
             .mint_membership(&id)
             .expect("provisional membership available");
@@ -357,7 +376,7 @@ mod tests {
 
     #[test]
     fn incarnation_exhaustion_also_mints_nothing() {
-        let mut scope = ScopeIdentity::new().expect("scope identity available");
+        let mut scope = ScopeIdentity::new();
         let membership = scope
             .mint_membership(&ChildId::from("worker"))
             .expect("membership available");
@@ -369,13 +388,27 @@ mod tests {
         assert_eq!(last.membership(), membership);
     }
 
+    #[test]
+    fn generation_ordering_is_typed_and_poison_fails_closed() {
+        let first = Generation::fixture(1);
+        let second = Generation::fixture(2);
+
+        assert!(second.supersedes(first));
+        assert!(!first.supersedes(second));
+        assert!(!Generation::POISON.supersedes(second));
+        assert!(!second.supersedes(Generation::POISON));
+
+        let mut sequence = FenceCounter::new(0);
+        assert_eq!(sequence.mint_sequence(), Some(1));
+    }
+
     struct MembershipFixture;
 
     impl MembershipFixture {
         fn at(lineage: u64, generation: u64) -> super::Membership {
             super::Membership(super::Fence {
                 lineage,
-                generation,
+                generation: super::Generation::fixture(generation),
             })
         }
     }

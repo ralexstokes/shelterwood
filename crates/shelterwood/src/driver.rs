@@ -2332,14 +2332,18 @@ impl ScopeRuntime {
             .keys()
             .filter(|key| {
                 let child = &self.children[*key];
+                // Only a nested scope can hold a pending-incarnation stop, and
+                // only its own control plane can answer whether one exists.
+                // Both are cheap, so they gate the suppression sweep, which
+                // takes the dynamic-state lock and scans every entry.
                 child.active.is_none()
                     && matches!(child.slot.member.record().stage, MemberStage::Restarting)
-                    && !self.restart_is_suppressed(*key)
                     && child
                         .slot
                         .scope
                         .as_ref()
                         .is_some_and(|scope| scope.has_pending_incarnation_shutdown())
+                    && !self.restart_is_suppressed(*key)
             })
             .collect()
     }

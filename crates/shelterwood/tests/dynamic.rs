@@ -13,12 +13,35 @@ use crate::common::{
     waiting::{task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
-    Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicTree, ExitError,
-    ExitKind, ExitResult, NotAdmittingCause, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
-    RemoveOutcome, ReserveError, RestartCondition, RestartPolicy, Retention, ScopeRef,
-    SendErrorKind, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, System, TaskDef, TaskOnceDef,
-    Tree,
+    Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicScopeRef,
+    DynamicTree, ExitError, ExitKind, ExitResult, NotAdmittingCause, RawActor, RawContext, RawDef,
+    RawOnceDef, Readiness, RemoveOutcome, ReserveError, RestartCondition, RestartPolicy, Retention,
+    ScopeRef, SendErrorKind, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, System, TaskDef,
+    TaskOnceDef, Tree,
 };
+
+/// Waits until a fused drop has finished releasing its id.
+///
+/// Dropping a polled fused `Admission` only fires the fused-cancel latch.
+/// The driver then marks the membership `removing` and runs the stop ladder,
+/// so a flag stored from inside the child's own shutdown handler is raised
+/// *within* the removal window, while the dynamic entry is still held.
+/// Reusing the id off that flag alone therefore races the only producer of
+/// `ReserveError::RemovalInProgress`: a surviving entry whose member is
+/// already `removing`.
+///
+/// Removal completion releases the entry before it withdraws residency, so
+/// an absent resident is a sound — slightly conservative — signal that the
+/// id is free again.
+async fn wait_for_id_release(scope: &DynamicScopeRef, id: &str) {
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            scope.child(id).is_none()
+        })
+        .await,
+        "removal of {id} did not release its id"
+    );
+}
 
 struct DropProbe(Arc<AtomicBool>);
 
@@ -612,6 +635,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         })
         .await
     );
+    wait_for_id_release(&scope, "fused-after-admission").await;
     let reused = scope
         .add_task("fused-after-admission", waiting_task())
         .await
@@ -726,6 +750,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
         })
         .await
     );
+    wait_for_id_release(&scope, "fused-actor").await;
     let actor = scope
         .add_raw("fused-actor", RawDef::factory(|| WaitingRaw))
         .await
@@ -756,6 +781,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
         })
         .await
     );
+    wait_for_id_release(&scope, "fused-subtree").await;
     let subtree = scope
         .add_subtree_once("fused-subtree", SubtreeOnceDef::new(waiting_tree()))
         .await

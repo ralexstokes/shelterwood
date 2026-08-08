@@ -521,16 +521,23 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
         "leaf starts polling"
     );
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(5)));
-    assert_quiet(Duration::from_millis(50), || shutdown.is_finished()).await;
+    let returned_before_leaf_released =
+        poll_until(Duration::from_millis(50), Duration::from_millis(1), || {
+            shutdown.is_finished()
+        })
+        .await;
     {
         let (released, wake) = &*release;
         *released.lock().expect("release mutex poisoned") = true;
         wake.notify_all();
     }
-    shutdown
-        .await
-        .expect("shutdown task does not panic")
-        .expect("root shuts down");
+    let shutdown_result = shutdown.await.expect("shutdown task does not panic");
+
+    assert!(
+        !returned_before_leaf_released,
+        "shutdown must not return while a recursively aborted child future is still polling"
+    );
+    shutdown_result.expect("root shuts down");
 
     assert!(
         weak.upgrade().is_none(),

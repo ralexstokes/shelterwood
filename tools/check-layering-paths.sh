@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly lower_layers=(
+readonly below_driver_layers=(
+  crates/shelterwood/src/actor.rs
+  crates/shelterwood/src/cells.rs
+  crates/shelterwood/src/deadline.rs
+  crates/shelterwood/src/engine.rs
+  crates/shelterwood/src/exit.rs
+  crates/shelterwood/src/identity.rs
   crates/shelterwood/src/mailbox.rs
+  crates/shelterwood/src/observe.rs
+  crates/shelterwood/src/plan.rs
+  crates/shelterwood/src/policy.rs
   crates/shelterwood/src/raw.rs
+  crates/shelterwood/src/runtime.rs
   crates/shelterwood/src/task.rs
 )
-readonly cells_path="crates/shelterwood/src/cells.rs"
 readonly driver_path="crates/shelterwood/src/driver.rs"
 
 check_forbidden() {
@@ -36,18 +45,13 @@ check_forbidden() {
 }
 
 check_forbidden \
-  "upward driver references found below the driver layer:" \
-  '\bdriver::' \
-  "${lower_layers[@]}"
-
-check_forbidden \
-  "upward driver or tree references found in the shared cells layer:" \
+  "upward driver or tree references found below the driver layer:" \
   '\b(driver|tree)::' \
-  "$cells_path"
+  "${below_driver_layers[@]}"
 
 check_forbidden \
   "upward tree references found in the driver layer:" \
   '\btree::' \
   "$driver_path"
 
-echo "shared-cell layering restrictions: clean"
+echo "supervision layering restrictions: clean"

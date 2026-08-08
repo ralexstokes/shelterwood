@@ -332,8 +332,8 @@ mod tests {
     fn exhaustion_never_mints_the_poison_value_or_a_duplicate() {
         const TEST_LINEAGE: u64 = u64::MAX;
         let id = ChildId::from("worker");
-        // The production allocator never mints the poison lineage, so this
-        // fixture cannot collide with an unrelated identity created below.
+        // A fixture lineage this test does not otherwise allocate, so it
+        // cannot collide with an unrelated identity created below.
         let counter = FenceCounter::near_exhaustion(TEST_LINEAGE);
         let mut scope = ScopeIdentity::with_counter(id.clone(), counter);
         let last = scope

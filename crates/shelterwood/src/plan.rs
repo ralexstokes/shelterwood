@@ -355,7 +355,13 @@ impl BuilderCore {
         }
         root.set_observation_config(self.config.strategy, self.config.intensity);
         let mut children = Vec::with_capacity(self.slots.len());
+        debug_assert_eq!(
+            self.slots.len(),
+            resolved.len(),
+            "policy resolution is one entry per slot, in slot order"
+        );
         for (slot, resolved) in self.slots.iter().zip(resolved) {
+            let resolved = resolved.expect("validated slot must have resolved options");
             let definition = slot
                 .take_definition()
                 .expect("validated slot must have a definition");
@@ -378,17 +384,18 @@ impl BuilderCore {
     fn validate_policies(
         &self,
         inherited: &ResolvedDefaults,
-    ) -> Result<(ResolvedDefaults, Vec<ResolvedCommonOptions>), InvalidPolicy> {
+    ) -> Result<(ResolvedDefaults, Vec<Option<ResolvedCommonOptions>>), InvalidPolicy> {
         self.config
             .intensity
             .validate()
             .map_err(|error| InvalidPolicy::new(PolicyField::Intensity, error))?;
         let defaults = inherited.overlay(&self.config.defaults)?;
+        // One entry per slot, in slot order. An undefined slot resolves to
+        // `None` rather than being skipped, so this vector can never shift a
+        // later child onto another child's options.
         let mut resolved = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
-            if let Some(options) = slot.resolve_policy(&defaults)? {
-                resolved.push(options);
-            }
+            resolved.push(slot.resolve_policy(&defaults)?);
         }
         Ok((defaults, resolved))
     }

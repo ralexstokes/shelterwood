@@ -114,6 +114,10 @@ impl TaskContext {
     }
 
     /// Releases manual readiness. Repeated calls are no-ops.
+    ///
+    /// Once cooperative shutdown or escalation has begun this incarnation is
+    /// already stopping, so readiness can no longer be published and the call
+    /// is a no-op as well.
     pub fn mark_ready(&self) {
         if !self.is_stopping() {
             self.ready.fire();

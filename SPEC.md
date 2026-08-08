@@ -2926,7 +2926,10 @@ outcome during the beat classifies by that outcome, while a future
 destroyed by the ensuing hard abort records `Aborted { after_grace }`),
 `mark_ready()` (one-shot by construction; no-op only where declared
 readiness makes it meaningless, and that is a documented no-op, not a silent
-state change).
+state change — the same rule covers a stopping incarnation: once either
+cooperative shutdown or escalation has begun, readiness can no longer be
+published and the call is likewise a documented no-op, matching B.1's
+during-drain rule for the actor contexts).
 
 ### B.3 Send/call errors
 

@@ -326,7 +326,14 @@ impl<T> OneShotTaskRef<T> {
         if !matches!(exit.kind(), crate::ExitKind::Completed) {
             return Err(exit);
         }
-        completion.receive().await.ok_or(exit)
+        // The erased one-shot body sends before returning success, and this
+        // receiver is the sole completion claim. A published Completed verdict
+        // with a closed, empty channel is therefore a framework invariant
+        // violation, not an application exit that can be reported as `Err`.
+        Ok(completion
+            .receive()
+            .await
+            .expect("completed one-shot task must publish its typed value"))
     }
 }
 
@@ -440,6 +447,16 @@ mod tests {
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
         member.terminalize(exit.clone());
         assert_eq!(waiting.await, Err(exit));
+    }
+
+    #[crate::runtime::test]
+    #[should_panic(expected = "completed one-shot task must publish its typed value")]
+    async fn completed_terminal_publication_requires_a_typed_value() {
+        let (sender, claim, member) = one_shot_claim::<u8>();
+        drop(sender);
+        member.terminalize(Exit::new(ExitKind::Completed, false));
+
+        let _ = claim.wait().await;
     }
 
     #[crate::runtime::test]

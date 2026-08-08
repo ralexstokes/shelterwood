@@ -17,7 +17,10 @@ use crate::{
         MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode,
         StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
     },
-    exit::{JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit},
+    exit::{
+        JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit,
+        reconcile_recorded_outcomes,
+    },
     identity::{FenceCounter, ScopeIdentity},
     observe::LifecycleEventKind,
     plan::{
@@ -1825,7 +1828,7 @@ impl ScopeRuntime {
         {
             join = JoinVerdict::Cancelled { after_grace };
         }
-        let recorded = active.forced_outcome.or(recorded);
+        let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
         let exit = classify_exit(recorded, join, cancelled);
         let ran_for = runtime::now().saturating_duration_since(active.started_at);
         if ran_for >= self.intensity_policy.within {

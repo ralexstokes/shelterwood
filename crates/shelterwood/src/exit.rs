@@ -336,7 +336,36 @@ pub(crate) enum JoinVerdict {
     Cancelled { after_grace: bool },
 }
 
+/// Reconciles task-produced evidence with a later supervisor-forced outcome.
+///
+/// The same diagnostic precedence used for the final join applies here, and
+/// equal-ranked evidence keeps the task-produced value because it was
+/// recorded first. This prevents a forced abort from erasing a structured
+/// application failure while still allowing readiness timeout or panic to
+/// supersede ordinary completion.
+pub(crate) fn reconcile_recorded_outcomes(
+    recorded: Option<RecordedOutcome>,
+    forced: Option<RecordedOutcome>,
+) -> Option<RecordedOutcome> {
+    match (recorded, forced) {
+        (Some(recorded), Some(forced)) if recorded_rank(&recorded) >= recorded_rank(&forced) => {
+            Some(recorded)
+        }
+        (_, Some(forced)) => Some(forced),
+        (Some(recorded), None) => Some(recorded),
+        (None, None) => None,
+    }
+}
+
 /// Purely folds the provisional run outcome and post-destruction join verdict.
+///
+/// Precedence follows the amount of diagnostic evidence retained by each
+/// outcome: a panic is strongest, followed by a readiness timeout, an
+/// application failure, an abort, and successful completion. In particular,
+/// cancellation reported while joining only proves that destruction ended the
+/// task; it must not erase an application error recorded before destruction.
+/// Equal-ranked outcomes keep the earlier recorded evidence, including its
+/// panic payload or abort provenance.
 pub(crate) fn classify_exit(
     recorded: Option<RecordedOutcome>,
     join: JoinVerdict,
@@ -368,14 +397,38 @@ fn recorded_kind(recorded: RecordedOutcome) -> ExitKind {
     }
 }
 
-fn rank(kind: &ExitKind) -> u8 {
+/// Diagnostic precedence shared by provisional and final exit evidence.
+///
+/// Variant order is weakest to strongest so derived ordering selects the
+/// outcome that preserves the most useful evidence.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum OutcomeRank {
+    NeverStarted,
+    Completed,
+    Aborted,
+    Failed,
+    ReadinessTimedOut,
+    Panicked,
+}
+
+fn recorded_rank(recorded: &RecordedOutcome) -> OutcomeRank {
+    match recorded {
+        RecordedOutcome::Panicked { .. } => OutcomeRank::Panicked,
+        RecordedOutcome::ReadinessTimedOut { .. } => OutcomeRank::ReadinessTimedOut,
+        RecordedOutcome::Returned(Err(_)) => OutcomeRank::Failed,
+        RecordedOutcome::Aborted { .. } => OutcomeRank::Aborted,
+        RecordedOutcome::Returned(Ok(())) => OutcomeRank::Completed,
+    }
+}
+
+fn rank(kind: &ExitKind) -> OutcomeRank {
     match kind {
-        ExitKind::Panicked { .. } => 5,
-        ExitKind::ReadinessTimedOut { .. } => 4,
-        ExitKind::Aborted { .. } => 3,
-        ExitKind::Failed(_) => 2,
-        ExitKind::Completed => 1,
-        ExitKind::NeverStarted => 0,
+        ExitKind::Panicked { .. } => OutcomeRank::Panicked,
+        ExitKind::ReadinessTimedOut { .. } => OutcomeRank::ReadinessTimedOut,
+        ExitKind::Failed(_) => OutcomeRank::Failed,
+        ExitKind::Aborted { .. } => OutcomeRank::Aborted,
+        ExitKind::Completed => OutcomeRank::Completed,
+        ExitKind::NeverStarted => OutcomeRank::NeverStarted,
     }
 }
 
@@ -400,72 +453,164 @@ pub struct ShutdownTimeout {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{ExitError, ExitKind, JoinVerdict, RecordedOutcome, classify_exit};
+    use super::{
+        ChildId, Exit, ExitError, ExitKind, JoinVerdict, RecordedOutcome, StartupFailure,
+        StartupFailureCause, classify_exit, reconcile_recorded_outcomes,
+    };
 
     #[test]
     fn classification_precedence_is_table_driven() {
         let deadline = Instant::now() + Duration::from_secs(1);
+        let failure = ExitError::message("failed");
         let cases = [
             (
-                RecordedOutcome::Returned(Ok(())),
+                "recorded completion",
+                Some(RecordedOutcome::Returned(Ok(()))),
                 JoinVerdict::Completed,
-                "completed",
+                false,
+                Exit::new(ExitKind::Completed, false),
             ),
             (
-                RecordedOutcome::Returned(Err(ExitError::message("failed"))),
-                JoinVerdict::Completed,
-                "failed",
-            ),
-            (
-                RecordedOutcome::ReadinessTimedOut { deadline },
+                "cancellation overrides recorded completion",
+                Some(RecordedOutcome::Returned(Ok(()))),
                 JoinVerdict::Cancelled { after_grace: true },
-                "readiness",
+                true,
+                Exit::new(ExitKind::Aborted { after_grace: true }, true),
             ),
             (
-                RecordedOutcome::Returned(Ok(())),
+                "recorded failure",
+                Some(RecordedOutcome::Returned(Err(failure.clone()))),
+                JoinVerdict::Completed,
+                false,
+                Exit::new(ExitKind::Failed(failure.clone()), false),
+            ),
+            (
+                "late cancellation preserves recorded failure",
+                Some(RecordedOutcome::Returned(Err(failure.clone()))),
+                JoinVerdict::Cancelled { after_grace: true },
+                true,
+                Exit::new(ExitKind::Failed(failure.clone()), true),
+            ),
+            (
+                "join panic overrides recorded failure",
+                Some(RecordedOutcome::Returned(Err(failure.clone()))),
                 JoinVerdict::Panicked {
                     message: Some("drop panic".to_owned()),
                 },
-                "panic",
+                false,
+                Exit::new(
+                    ExitKind::Panicked {
+                        message: Some("drop panic".to_owned()),
+                    },
+                    false,
+                ),
             ),
             (
-                RecordedOutcome::Panicked {
+                "readiness timeout overrides cancellation",
+                Some(RecordedOutcome::ReadinessTimedOut { deadline }),
+                JoinVerdict::Cancelled { after_grace: true },
+                true,
+                Exit::new(ExitKind::ReadinessTimedOut { deadline }, true),
+            ),
+            (
+                "join panic overrides recorded completion",
+                Some(RecordedOutcome::Returned(Ok(()))),
+                JoinVerdict::Panicked {
+                    message: Some("drop panic".to_owned()),
+                },
+                false,
+                Exit::new(
+                    ExitKind::Panicked {
+                        message: Some("drop panic".to_owned()),
+                    },
+                    false,
+                ),
+            ),
+            (
+                "earlier recorded panic wins a tie",
+                Some(RecordedOutcome::Panicked {
                     message: Some("callback panic".to_owned()),
-                },
+                }),
                 JoinVerdict::Panicked {
                     message: Some("drop panic".to_owned()),
                 },
-                "callback panic",
+                true,
+                Exit::new(
+                    ExitKind::Panicked {
+                        message: Some("callback panic".to_owned()),
+                    },
+                    true,
+                ),
+            ),
+            (
+                "earlier recorded abort wins a tie",
+                Some(RecordedOutcome::Aborted { after_grace: false }),
+                JoinVerdict::Cancelled { after_grace: true },
+                true,
+                Exit::new(ExitKind::Aborted { after_grace: false }, true),
+            ),
+            (
+                "join cancellation supplies a missing outcome",
+                None,
+                JoinVerdict::Cancelled { after_grace: true },
+                true,
+                Exit::new(ExitKind::Aborted { after_grace: true }, true),
+            ),
+            (
+                "missing outcome fails closed",
+                None,
+                JoinVerdict::Completed,
+                false,
+                Exit::new(ExitKind::Aborted { after_grace: false }, false),
             ),
         ];
 
-        for (recorded, join, expected) in cases {
-            let exit = classify_exit(Some(recorded), join, true);
-            assert!(exit.cancelled());
-            match (expected, exit.kind()) {
-                ("completed", ExitKind::Completed)
-                | ("failed", ExitKind::Failed(_))
-                | ("readiness", ExitKind::ReadinessTimedOut { .. }) => {}
-                ("panic", ExitKind::Panicked { message }) => {
-                    assert_eq!(message.as_deref(), Some("drop panic"));
-                }
-                ("callback panic", ExitKind::Panicked { message }) => {
-                    assert_eq!(message.as_deref(), Some("callback panic"));
-                }
-                _ => panic!("unexpected classification: {:?}", exit.kind()),
-            }
+        for (case, recorded, join, cancelled, expected) in cases {
+            assert_eq!(classify_exit(recorded, join, cancelled), expected, "{case}");
         }
+    }
 
-        let aborted = classify_exit(None, JoinVerdict::Cancelled { after_grace: true }, true);
-        assert!(matches!(
-            aborted.kind(),
-            ExitKind::Aborted { after_grace: true }
-        ));
-        let missing_report = classify_exit(None, JoinVerdict::Completed, false);
-        assert!(matches!(
-            missing_report.kind(),
-            ExitKind::Aborted { after_grace: false }
-        ));
+    #[test]
+    fn forced_outcomes_do_not_erase_stronger_recorded_evidence() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let failure = ExitError::from_startup_failure(StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: ChildId::from("nested"),
+            },
+        });
+        let cases = [
+            (
+                "application failure survives forced abort",
+                Some(RecordedOutcome::Returned(Err(failure.clone()))),
+                Some(RecordedOutcome::Aborted { after_grace: true }),
+                Exit::new(ExitKind::Failed(failure), true),
+            ),
+            (
+                "forced readiness timeout overrides completion",
+                Some(RecordedOutcome::Returned(Ok(()))),
+                Some(RecordedOutcome::ReadinessTimedOut { deadline }),
+                Exit::new(ExitKind::ReadinessTimedOut { deadline }, true),
+            ),
+            (
+                "earlier abort evidence wins a tie",
+                Some(RecordedOutcome::Aborted { after_grace: false }),
+                Some(RecordedOutcome::Aborted { after_grace: true }),
+                Exit::new(ExitKind::Aborted { after_grace: false }, true),
+            ),
+        ];
+
+        for (case, recorded, forced, expected) in cases {
+            let reconciled = reconcile_recorded_outcomes(recorded, forced);
+            assert_eq!(
+                classify_exit(
+                    reconciled,
+                    JoinVerdict::Cancelled { after_grace: true },
+                    true
+                ),
+                expected,
+                "{case}"
+            );
+        }
     }
 
     #[derive(Debug, thiserror::Error)]

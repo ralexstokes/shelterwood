@@ -147,7 +147,6 @@ impl SlotCell {
 /// Erased declaration storage before inherited defaults and identities are lowered.
 pub(crate) struct BuilderCore {
     pub(crate) root: Arc<ScopeCell>,
-    pub(crate) flavor: ScopeFlavor,
     pub(crate) config: ScopeConfig,
     pub(crate) slots: Vec<Arc<SlotCell>>,
     ids: HashMap<ChildId, Arc<SlotCell>>,
@@ -177,7 +176,6 @@ impl BuilderCore {
         let root = ScopeCell::new(member, flavor, child_identity);
         Self {
             root,
-            flavor,
             config: ScopeConfig::default(),
             slots: Vec::new(),
             ids: HashMap::new(),
@@ -276,7 +274,6 @@ impl BuilderCore {
         self.armed = false;
         Ok(ScopePlan {
             root,
-            flavor: self.flavor,
             config: self.config.clone(),
             defaults,
             children,
@@ -306,7 +303,6 @@ impl Drop for BuilderCore {
 /// Fully lowered scope plan whose construction payloads still have one owner.
 pub(crate) struct ScopePlan {
     pub(crate) root: Arc<ScopeCell>,
-    pub(crate) flavor: ScopeFlavor,
     pub(crate) config: ScopeConfig,
     pub(crate) defaults: ResolvedDefaults,
     pub(crate) children: Vec<ChildPlan>,

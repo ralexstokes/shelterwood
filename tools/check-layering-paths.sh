@@ -7,6 +7,7 @@ readonly lower_layers=(
   crates/shelterwood/src/task.rs
 )
 readonly cells_path="crates/shelterwood/src/cells.rs"
+readonly driver_path="crates/shelterwood/src/driver.rs"
 
 check_forbidden() {
   local message="$1"
@@ -43,5 +44,10 @@ check_forbidden \
   "upward driver or tree references found in the shared cells layer:" \
   '\b(driver|tree)::' \
   "$cells_path"
+
+check_forbidden \
+  "upward tree references found in the driver layer:" \
+  '\btree::' \
+  "$driver_path"
 
 echo "shared-cell layering restrictions: clean"

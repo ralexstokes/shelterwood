@@ -396,15 +396,16 @@ fn spawn_builder<R>(
 }
 
 #[cfg(test)]
-pub(crate) fn lower_tree_for_test(tree: Tree) -> crate::plan::ScopePlan {
-    tree.core
-        .lower(ResolvedDefaults::default(), None)
-        .expect("test tree must be fully defined")
-}
+impl Tree {
+    pub(crate) fn lower_for_test(self) -> crate::plan::ScopePlan {
+        self.core
+            .lower(ResolvedDefaults::default(), None)
+            .expect("test tree must be fully defined")
+    }
 
-#[cfg(test)]
-pub(crate) fn into_core_for_test(tree: Tree) -> BuilderCore {
-    tree.core
+    pub(crate) fn into_core_for_test(self) -> BuilderCore {
+        self.core
+    }
 }
 
 /// An owned pre-spawn actor slot with a stable mailbox binding.

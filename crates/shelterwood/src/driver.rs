@@ -940,7 +940,6 @@ impl IndexMut<ChildKey> for ChildArena {
 
 struct ScopeRuntime {
     root: Arc<ScopeCell>,
-    flavor: ScopeFlavor,
     defaults: ResolvedDefaults,
     intensity_policy: crate::Intensity,
     intensity: IntensityState,
@@ -1499,7 +1498,7 @@ impl ScopeRuntime {
         if self.phase != ScopePhase::Starting {
             return;
         }
-        match self.flavor {
+        match self.root.flavor {
             ScopeFlavor::Ordered => {
                 while let Some(key) = self.next_ordered_start {
                     if !self.children[key].spawned_once {
@@ -1675,7 +1674,7 @@ impl ScopeRuntime {
             self.root.set_startup(Err(StartupError::ShutdownRequested));
         }
         self.root.set_state(ScopeState::Draining);
-        match self.flavor {
+        match self.root.flavor {
             ScopeFlavor::Ordered => self.stop_next_ordered(),
             ScopeFlavor::Dynamic => {
                 let children: Vec<_> = self.children.keys().collect();
@@ -1687,7 +1686,7 @@ impl ScopeRuntime {
     }
 
     fn stop_next_ordered(&mut self) {
-        if self.flavor != ScopeFlavor::Ordered || !self.phase.is_draining() {
+        if self.root.flavor != ScopeFlavor::Ordered || !self.phase.is_draining() {
             return;
         }
         loop {
@@ -2074,7 +2073,7 @@ impl ScopeRuntime {
         self.phase = ScopePhase::StartupFailed;
         self.root
             .set_startup(Err(StartupError::StartupFailed(failure.clone())));
-        if self.flavor == ScopeFlavor::Ordered {
+        if self.root.flavor == ScopeFlavor::Ordered {
             let later_children: Vec<_> = self.children.keys_after(key).collect();
             for later in later_children {
                 if !self.children[later].spawned_once
@@ -2161,7 +2160,7 @@ impl ScopeRuntime {
             return None;
         }
         if !self.phase.startup_failed()
-            && self.flavor == ScopeFlavor::Ordered
+            && self.root.flavor == ScopeFlavor::Ordered
             && !self.children.is_empty()
             && self
                 .children
@@ -2402,7 +2401,7 @@ impl ScopeRuntime {
             }
         }
         self.root.prune_child(&member);
-        if self.flavor == ScopeFlavor::Dynamic {
+        if self.root.flavor == ScopeFlavor::Dynamic {
             self.reclaim_child(key);
         }
         // The entry's drop completes any in-flight removal response; it must
@@ -2522,8 +2521,8 @@ async fn run_scope_incarnation(
     }
     let capacity = plan.children.len().saturating_mul(3).max(64);
     let (events, mut event_receiver) = runtime::bounded_mpsc(capacity);
-    let dynamic =
-        (plan.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(&root, events.clone()));
+    let dynamic = (plan.root.flavor == ScopeFlavor::Dynamic)
+        .then(|| DynamicControl::new(&root, events.clone()));
     if let Some(control) = &dynamic {
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
         for child in &plan.children {
@@ -2562,7 +2561,6 @@ async fn run_scope_incarnation(
     let next_ordered_start = children.keys().next();
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
-        flavor: plan.flavor,
         defaults: plan.defaults.clone(),
         intensity_policy: plan.config.intensity,
         intensity: IntensityState::default(),
@@ -2589,7 +2587,7 @@ async fn run_scope_incarnation(
     plan.armed = false;
     drop(plan);
 
-    match scope.flavor {
+    match scope.root.flavor {
         ScopeFlavor::Ordered => scope.progress_startup(),
         ScopeFlavor::Dynamic => {
             let children: Vec<_> = scope.children.keys().collect();
@@ -2836,7 +2834,6 @@ mod tests {
         mailbox::MailboxCell,
         plan::SlotCell,
         runtime::Latch,
-        tree::{into_core_for_test, lower_tree_for_test},
     };
 
     use super::{
@@ -2995,7 +2992,7 @@ mod tests {
         tree.add_task("trip", TaskDef::new(|_| future::pending()))
             .expect("valid task");
 
-        let mut plan = lower_tree_for_test(tree);
+        let mut plan = tree.lower_for_test();
         let root = Arc::clone(&plan.root);
         let epoch = root.begin_incarnation();
         root.set_admitted_children(
@@ -3023,7 +3020,6 @@ mod tests {
         let next_ordered_start = children.keys().next();
         let mut scope = ScopeRuntime {
             root: Arc::clone(&root),
-            flavor: plan.flavor,
             defaults: plan.defaults.clone(),
             intensity_policy: plan.config.intensity,
             intensity: super::IntensityState::default(),
@@ -3181,7 +3177,7 @@ mod tests {
         let mut tree = Tree::new();
         tree.add_task("worker", TaskDef::new(|_| future::pending()))
             .expect("valid task");
-        let mut plan = lower_tree_for_test(tree);
+        let mut plan = tree.lower_for_test();
         let child =
             ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &plan.root);
         let mut arena = ChildArena::default();
@@ -3200,7 +3196,7 @@ mod tests {
         let mut tree = Tree::new();
         tree.add_task("worker", TaskDef::new(|_| future::pending()))
             .expect("valid task");
-        let mut plan = lower_tree_for_test(tree);
+        let mut plan = tree.lower_for_test();
         let child =
             ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &plan.root);
         let mut arena = ChildArena {
@@ -3419,7 +3415,7 @@ mod tests {
                 .expect("manual readiness is valid"),
         )
         .expect("valid task");
-        let plan = lower_tree_for_test(tree);
+        let plan = tree.lower_for_test();
         let scope = Arc::clone(&plan.root);
         let epoch = scope.begin_incarnation();
         let driver = crate::runtime::spawn(
@@ -3459,7 +3455,7 @@ mod tests {
 
     #[crate::runtime::test]
     async fn dropped_unpolled_scope_plan_terminalizes_its_root() {
-        let plan = lower_tree_for_test(Tree::new());
+        let plan = Tree::new().lower_for_test();
         let root = Arc::clone(&plan.root);
 
         drop(plan);
@@ -3483,7 +3479,7 @@ mod tests {
             .expect("valid nested scope");
         let mut snapshots = nested.subscribe_snapshots();
         let mut events = nested.subscribe_lifecycle();
-        let plan = lower_tree_for_test(outer);
+        let plan = outer.lower_for_test();
 
         drop(plan);
 
@@ -3527,7 +3523,7 @@ mod tests {
             tree.add_task(id, TaskDef::new(|_| future::pending()))
                 .expect("valid task");
         }
-        let plan = lower_tree_for_test(tree);
+        let plan = tree.lower_for_test();
         let root = Arc::clone(&plan.root);
         let mut events = root.subscribe_lifecycle();
         let children: Vec<_> = plan
@@ -4057,7 +4053,7 @@ mod tests {
             .expect("provisional declaration succeeds");
         let ready = Latch::default();
         let error = run_nested_tree(
-            into_core_for_test(tree),
+            tree.into_core_for_test(),
             Arc::clone(&scope),
             crate::policy::ResolvedDefaults::default(),
             ready.clone(),

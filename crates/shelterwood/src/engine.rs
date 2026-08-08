@@ -31,6 +31,7 @@ pub(crate) fn arbitrate<T>(events: &mut [(ArbitrationClass, T)]) {
 pub(crate) enum StopAction {
     Cancel,
     Escalate,
+    AbortFramework { after_grace: bool },
     HardAbort { after_grace: bool },
 }
 
@@ -39,6 +40,7 @@ enum StopPhase {
     Idle,
     Cooperative,
     Escalated,
+    AbortingFramework,
     Finished,
 }
 
@@ -49,15 +51,29 @@ pub(crate) struct StopLadder {
     phase: StopPhase,
     deadline: Option<Instant>,
     after_grace: bool,
+    force_requested: bool,
+    framework_driver: bool,
+    framework_abort_acked: bool,
 }
 
 impl StopLadder {
     pub(crate) fn new(policy: Shutdown) -> Self {
+        Self::with_framework_driver(policy, false)
+    }
+
+    pub(crate) fn for_framework_driver(policy: Shutdown) -> Self {
+        Self::with_framework_driver(policy, true)
+    }
+
+    fn with_framework_driver(policy: Shutdown, framework_driver: bool) -> Self {
         Self {
             policy,
             phase: StopPhase::Idle,
             deadline: None,
             after_grace: false,
+            force_requested: false,
+            framework_driver,
+            framework_abort_acked: false,
         }
     }
 
@@ -65,16 +81,43 @@ impl StopLadder {
         self.deadline
     }
 
+    /// Expedites this ladder without replacing or rewinding it.
+    pub(crate) fn force(&mut self, now: Instant) {
+        if self.phase == StopPhase::Finished {
+            return;
+        }
+        if self.phase == StopPhase::Cooperative {
+            if !self.force_requested
+                && matches!(self.policy, Shutdown::Graceful { .. })
+                && self.deadline.is_some_and(|deadline| now >= deadline)
+            {
+                self.after_grace = true;
+            }
+            self.deadline = Some(now);
+        }
+        self.force_requested = true;
+    }
+
+    pub(crate) fn acknowledge_framework_abort(&mut self) {
+        if self.phase == StopPhase::AbortingFramework {
+            self.framework_abort_acked = true;
+        }
+    }
+
     pub(crate) fn advance(&mut self, now: Instant) -> Option<StopAction> {
         match self.phase {
             StopPhase::Idle => {
                 self.phase = StopPhase::Cooperative;
-                match self.policy {
-                    Shutdown::Graceful { grace } => {
-                        self.deadline = Deadline::after(now, grace).instant();
-                    }
-                    Shutdown::Abort => {
-                        self.deadline = Some(now);
+                if self.force_requested {
+                    self.deadline = Some(now);
+                } else {
+                    match self.policy {
+                        Shutdown::Graceful { grace } => {
+                            self.deadline = Deadline::after(now, grace).instant();
+                        }
+                        Shutdown::Abort => {
+                            self.deadline = Some(now);
+                        }
                     }
                 }
                 Some(StopAction::Cancel)
@@ -82,7 +125,9 @@ impl StopLadder {
             StopPhase::Cooperative if self.deadline.is_some_and(|deadline| now >= deadline) => {
                 let grace = match self.policy {
                     Shutdown::Graceful { grace } => {
-                        self.after_grace = true;
+                        if !self.force_requested {
+                            self.after_grace = true;
+                        }
                         grace
                     }
                     Shutdown::Abort => Duration::ZERO,
@@ -92,13 +137,33 @@ impl StopLadder {
                 Some(StopAction::Escalate)
             }
             StopPhase::Escalated if self.deadline.is_some_and(|deadline| now >= deadline) => {
+                if self.framework_driver {
+                    self.phase = StopPhase::AbortingFramework;
+                    self.deadline = Deadline::after(now, tidy_abort_beat(Duration::ZERO)).instant();
+                    Some(StopAction::AbortFramework {
+                        after_grace: self.after_grace,
+                    })
+                } else {
+                    self.phase = StopPhase::Finished;
+                    self.deadline = None;
+                    Some(StopAction::HardAbort {
+                        after_grace: self.after_grace,
+                    })
+                }
+            }
+            StopPhase::AbortingFramework
+                if self.deadline.is_some_and(|deadline| now >= deadline) =>
+            {
                 self.phase = StopPhase::Finished;
                 self.deadline = None;
-                Some(StopAction::HardAbort {
+                (!self.framework_abort_acked).then_some(StopAction::HardAbort {
                     after_grace: self.after_grace,
                 })
             }
-            StopPhase::Cooperative | StopPhase::Escalated | StopPhase::Finished => None,
+            StopPhase::Cooperative
+            | StopPhase::Escalated
+            | StopPhase::AbortingFramework
+            | StopPhase::Finished => None,
         }
     }
 }
@@ -528,6 +593,74 @@ mod tests {
         assert_eq!(abort.advance(start), Some(StopAction::Escalate));
         assert_eq!(
             abort.advance(abort.deadline().expect("tidy deadline")),
+            Some(StopAction::HardAbort { after_grace: false })
+        );
+    }
+
+    #[test]
+    fn repeated_force_expedites_without_rewinding_the_ladder() {
+        let start = Instant::now();
+        let grace = Duration::from_secs(30);
+        let mut ladder = StopLadder::new(Shutdown::Graceful { grace });
+
+        assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
+        ladder.force(start);
+        ladder.force(start);
+        assert_eq!(ladder.advance(start), Some(StopAction::Escalate));
+
+        let tidy = ladder
+            .deadline()
+            .expect("forced ladder keeps its tidy beat");
+        ladder.force(start);
+        assert_eq!(
+            ladder.advance(start),
+            None,
+            "force does not skip the tidy beat"
+        );
+        assert_eq!(
+            ladder.advance(tidy),
+            Some(StopAction::HardAbort { after_grace: false })
+        );
+        ladder.force(tidy);
+        assert_eq!(
+            ladder.advance(tidy),
+            None,
+            "a finished ladder stays finished"
+        );
+    }
+
+    #[test]
+    fn framework_abort_and_ack_are_owned_by_the_same_stop_ladder() {
+        let start = Instant::now();
+        let mut ladder = StopLadder::for_framework_driver(Shutdown::Abort);
+
+        assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
+        assert_eq!(ladder.advance(start), Some(StopAction::Escalate));
+        let tidy = ladder
+            .deadline()
+            .expect("abort policy keeps the first tidy beat");
+        assert_eq!(
+            ladder.advance(tidy),
+            Some(StopAction::AbortFramework { after_grace: false })
+        );
+        ladder.acknowledge_framework_abort();
+        let framework_tidy = ladder
+            .deadline()
+            .expect("framework acknowledgment has a bounded tidy beat");
+        assert_eq!(ladder.advance(framework_tidy), None);
+        assert_eq!(ladder.deadline(), None);
+
+        let mut unacked = StopLadder::for_framework_driver(Shutdown::Abort);
+        assert_eq!(unacked.advance(start), Some(StopAction::Cancel));
+        assert_eq!(unacked.advance(start), Some(StopAction::Escalate));
+        let tidy = unacked.deadline().expect("abort tidy beat");
+        assert_eq!(
+            unacked.advance(tidy),
+            Some(StopAction::AbortFramework { after_grace: false })
+        );
+        let framework_tidy = unacked.deadline().expect("framework tidy beat");
+        assert_eq!(
+            unacked.advance(framework_tidy),
             Some(StopAction::HardAbort { after_grace: false })
         );
     }

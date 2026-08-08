@@ -647,7 +647,6 @@ struct ActiveChild {
     construction_release: Latch,
     framework_abort: Option<Latch>,
     framework_abort_ack: Option<Latch>,
-    framework_abort_deadline: Option<Instant>,
     stop_deadline: Option<DeadlineHandle>,
 }
 
@@ -1446,7 +1445,6 @@ impl ScopeRuntime {
             construction_release,
             framework_abort: scope_child.then_some(framework_abort),
             framework_abort_ack: scope_child.then_some(framework_abort_ack),
-            framework_abort_deadline: None,
             stop_deadline: None,
         });
         #[cfg(test)]
@@ -1529,7 +1527,11 @@ impl ScopeRuntime {
             if active.forced_outcome.is_none() {
                 active.readiness.step(ReadinessEvent::Shutdown);
             }
-            active.ladder = Some(StopLadder::new(child.options.shutdown));
+            active.ladder = Some(if active.framework_abort.is_some() {
+                StopLadder::for_framework_driver(child.options.shutdown)
+            } else {
+                StopLadder::new(child.options.shutdown)
+            });
             self.advance_ladder(key, runtime::now());
         } else {
             if let Some(deadline) = child.restart_deadline.take() {
@@ -1557,6 +1559,13 @@ impl ScopeRuntime {
         let Some(ladder) = &mut active.ladder else {
             return;
         };
+        if active
+            .framework_abort_ack
+            .as_ref()
+            .is_some_and(Latch::is_fired)
+        {
+            ladder.acknowledge_framework_abort();
+        }
         while let Some(action) = ladder.advance(now) {
             match action {
                 StopAction::Cancel => {
@@ -1565,37 +1574,25 @@ impl ScopeRuntime {
                 StopAction::Escalate => {
                     active.abort.fire();
                 }
+                StopAction::AbortFramework { after_grace } => {
+                    active.hard_abort_after_grace = Some(after_grace);
+                    if active.forced_outcome.is_none() {
+                        active.forced_outcome = Some(RecordedOutcome::Aborted { after_grace });
+                    }
+                    active
+                        .framework_abort
+                        .as_ref()
+                        .expect("framework action belongs only to a framework driver")
+                        .fire();
+                }
                 StopAction::HardAbort { after_grace } => {
                     active.hard_abort_after_grace = Some(after_grace);
-                    if let Some(abort) = &active.framework_abort {
-                        if active.forced_outcome.is_none() {
-                            active.forced_outcome = Some(RecordedOutcome::Aborted { after_grace });
-                        }
-                        abort.fire();
-                        active.framework_abort_deadline =
-                            Deadline::after(now, crate::policy::tidy_abort_beat(Duration::ZERO))
-                                .instant();
-                    } else {
-                        active.abort_handle.abort();
-                    }
+                    active.abort_handle.abort();
                 }
             }
         }
         let ladder_deadline = ladder.deadline();
-        if active
-            .framework_abort_deadline
-            .is_some_and(|deadline| now >= deadline)
-        {
-            active.framework_abort_deadline = None;
-            if active
-                .framework_abort_ack
-                .as_ref()
-                .is_none_or(|ack| !ack.is_fired())
-            {
-                active.abort_handle.abort();
-            }
-        }
-        if let Some(deadline) = ladder_deadline.or(active.framework_abort_deadline) {
+        if let Some(deadline) = ladder_deadline {
             active.stop_deadline = Some(self.deadlines.push(
                 deadline,
                 DeadlineKind::Stop {
@@ -1651,16 +1648,18 @@ impl ScopeRuntime {
         let now = runtime::now();
         let children: Vec<_> = self.children.keys().collect();
         for key in children {
-            let child = &mut self.children[key];
-            let Some(active) = &mut child.active else {
-                continue;
-            };
-            let mut ladder = StopLadder::new(crate::Shutdown::Abort);
-            let _ = ladder.advance(now);
-            let _ = ladder.advance(now);
-            active.shutdown.fire();
-            active.abort.fire();
-            active.ladder = Some(ladder);
+            // Every live membership enters the same stop funnel first. That
+            // owns mailbox freeze, readiness disarm, ordered-child handling,
+            // and the initial cooperative action.
+            self.begin_stop_child(key, None);
+            if let Some(ladder) = self
+                .children
+                .get_mut(key)
+                .and_then(|child| child.active.as_mut())
+                .and_then(|active| active.ladder.as_mut())
+            {
+                ladder.force(now);
+            }
             self.advance_ladder(key, now);
         }
         let disposing = self
@@ -2534,7 +2533,9 @@ async fn run_scope_incarnation(
             pending.push((ArbitrationClass::ScopeShutdown, Pending::AncestorAbort));
         }
         if root.take_force_request(epoch) {
-            pending.push((ArbitrationClass::StopDeadline, Pending::Force));
+            // Force owns shutdown arbitration: readiness from the same wake
+            // cannot publish Running after the stop boundary.
+            pending.push((ArbitrationClass::ScopeShutdown, Pending::Force));
         }
         for membership in scope.pending_removals() {
             pending.push((
@@ -2740,7 +2741,7 @@ mod tests {
         LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline,
         RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause,
         StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
-        engine::arbitrate,
+        engine::{StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
@@ -2764,6 +2765,20 @@ mod tests {
             identity.mint_membership(&id).expect("membership available"),
         );
         ScopeCell::new(member, flavor, ScopeIdentity::new())
+    }
+
+    struct PendingRaw;
+
+    impl crate::RawActor for PendingRaw {
+        type Msg = u8;
+
+        fn readiness(&self) -> Readiness {
+            Readiness::Manual
+        }
+
+        async fn run(&mut self, _: &mut crate::RawContext<Self::Msg>) -> crate::ExitResult {
+            future::pending().await
+        }
     }
 
     #[test]
@@ -2878,6 +2893,128 @@ mod tests {
                 }
             );
             assert!(!phase.begin_drain(StopReason::Finished));
+        }
+    }
+
+    #[crate::runtime::test]
+    async fn force_uses_the_stop_funnel_for_every_ordered_child() {
+        let mut tree = Tree::new();
+        let first = tree
+            .add_raw("first", crate::RawDef::factory(|| PendingRaw))
+            .expect("valid first actor");
+        let second = tree
+            .add_raw("second", crate::RawDef::factory(|| PendingRaw))
+            .expect("valid second actor");
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root.begin_incarnation();
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let mut children = ChildArena::default();
+        plan.children.reverse();
+        while let Some(child) = plan.children.pop() {
+            children
+                .insert(ChildRuntime::from_plan(child, &root))
+                .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
+        }
+        let keys = children.keys().collect::<Vec<_>>();
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            phase: ScopePhase::Running,
+            next_ordered_start: None,
+            is_root: true,
+            parent_ready: None,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown: None,
+            ancestor_shutdown_seen: false,
+            ancestor_abort: None,
+            ancestor_abort_ack: None,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        for key in &keys {
+            scope.spawn_child(*key);
+        }
+        let incarnations = keys
+            .iter()
+            .map(|key| {
+                scope.children[*key]
+                    .active
+                    .as_ref()
+                    .expect("child is active")
+                    .incarnation
+            })
+            .collect::<Vec<_>>();
+
+        scope.force_all();
+
+        for key in &keys {
+            let active = scope.children[*key]
+                .active
+                .as_ref()
+                .expect("forced child remains active through the tidy beat");
+            assert!(active.shutdown.is_fired(), "force sends cancellation");
+            assert!(active.abort.is_fired(), "force immediately escalates");
+        }
+        assert_eq!(
+            first.try_send(1).expect_err("first mailbox freezes").kind,
+            SendErrorKind::NotRunning
+        );
+        assert_eq!(
+            second.try_send(2).expect_err("second mailbox freezes").kind,
+            SendErrorKind::NotRunning
+        );
+
+        // Model readiness messages that shared the driver's wake with force.
+        // The force boundary disarmed both gates before either can publish a
+        // late Running transition.
+        for (key, incarnation) in keys.iter().zip(incarnations) {
+            scope.handle_ready(*key, incarnation);
+            assert!(matches!(
+                scope.children[*key].slot.member.record().stage,
+                MemberStage::Stopping
+            ));
+        }
+
+        let deadlines = keys
+            .iter()
+            .map(|key| {
+                scope.children[*key]
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.ladder)
+                    .and_then(StopLadder::deadline)
+                    .expect("each ladder retains its tidy deadline")
+            })
+            .collect::<Vec<_>>();
+        scope.force_all();
+        for (key, deadline) in keys.iter().zip(deadlines) {
+            assert_eq!(
+                scope.children[*key]
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.ladder)
+                    .and_then(StopLadder::deadline),
+                Some(deadline),
+                "repeated force cannot rewind or skip the ladder"
+            );
         }
     }
 

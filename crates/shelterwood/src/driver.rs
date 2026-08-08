@@ -1,9 +1,9 @@
 //! Mutable runtime shell and shared handle state.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt,
-    ops::{Index, IndexMut},
+    ops::{Bound, Index, IndexMut},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -1903,130 +1903,81 @@ impl ScopePhase {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ChildKey {
-    index: usize,
-    generation: u64,
-}
-
-struct ChildArenaSlot {
-    generation: u64,
-    child: Option<ChildRuntime>,
-}
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct ChildKey(u64);
 
 #[derive(Default)]
 struct ChildArena {
-    // Vacancies are reused, but every reuse advances the generation carried
-    // by driver events and deadlines. A late event can therefore miss; it
-    // can never address the new resident of the same physical slot.
-    slots: Vec<ChildArenaSlot>,
-    free: Vec<usize>,
-    len: usize,
+    // Keys are insertion-order ids and are never reused. A late event can
+    // therefore miss; it can never address a subsequently inserted child.
+    children: BTreeMap<ChildKey, ChildRuntime>,
+    // `u64::MAX` is poison and is never minted. Once exhausted, every later
+    // insertion fails closed instead of wrapping into the live key domain.
+    next_key: u64,
 }
 
 impl ChildArena {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            slots: Vec::with_capacity(capacity),
-            free: Vec::new(),
-            len: 0,
+    fn insert(&mut self, child: ChildRuntime) -> Result<ChildKey, Box<ChildRuntime>> {
+        let Some(next) = self.next_key.checked_add(1) else {
+            return Err(Box::new(child));
+        };
+        if next == u64::MAX {
+            self.next_key = u64::MAX;
+            return Err(Box::new(child));
         }
-    }
-
-    fn insert(&mut self, child: ChildRuntime) -> ChildKey {
-        self.len += 1;
-        if let Some(index) = self.free.pop() {
-            let slot = &mut self.slots[index];
-            debug_assert!(slot.child.is_none());
-            slot.child = Some(child);
-            ChildKey {
-                index,
-                generation: slot.generation,
-            }
-        } else {
-            let index = self.slots.len();
-            self.slots.push(ChildArenaSlot {
-                generation: 0,
-                child: Some(child),
-            });
-            ChildKey {
-                index,
-                generation: 0,
-            }
-        }
+        self.next_key = next;
+        let key = ChildKey(next);
+        let replaced = self.children.insert(key, child);
+        debug_assert!(replaced.is_none(), "monotonic child keys are never reused");
+        Ok(key)
     }
 
     fn get(&self, key: ChildKey) -> Option<&ChildRuntime> {
-        self.slots
-            .get(key.index)
-            .filter(|slot| slot.generation == key.generation)
-            .and_then(|slot| slot.child.as_ref())
+        self.children.get(&key)
     }
 
     fn get_mut(&mut self, key: ChildKey) -> Option<&mut ChildRuntime> {
-        self.slots
-            .get_mut(key.index)
-            .filter(|slot| slot.generation == key.generation)
-            .and_then(|slot| slot.child.as_mut())
+        self.children.get_mut(&key)
     }
 
     fn remove(&mut self, key: ChildKey) -> Option<ChildRuntime> {
-        let slot = self.slots.get_mut(key.index)?;
-        if slot.generation != key.generation {
-            return None;
-        }
-        let child = slot.child.take()?;
-        self.len -= 1;
-        if let Some(next) = slot.generation.checked_add(1) {
-            slot.generation = next;
-            self.free.push(key.index);
-        }
-        Some(child)
-    }
-
-    fn key_at(&self, index: usize) -> Option<ChildKey> {
-        self.slots.get(index).and_then(|slot| {
-            slot.child.as_ref().map(|_| ChildKey {
-                index,
-                generation: slot.generation,
-            })
-        })
+        self.children.remove(&key)
     }
 
     fn keys(&self) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
-        self.slots.iter().enumerate().filter_map(|(index, slot)| {
-            slot.child.as_ref().map(|_| ChildKey {
-                index,
-                generation: slot.generation,
-            })
-        })
+        self.children.keys().copied()
+    }
+
+    fn keys_after(&self, key: ChildKey) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
+        self.children
+            .range((Bound::Excluded(key), Bound::Unbounded))
+            .map(|(key, _)| *key)
     }
 
     fn values(&self) -> impl Iterator<Item = &ChildRuntime> {
-        self.slots.iter().filter_map(|slot| slot.child.as_ref())
+        self.children.values()
     }
 
     fn values_mut(&mut self) -> impl Iterator<Item = &mut ChildRuntime> {
-        self.slots.iter_mut().filter_map(|slot| slot.child.as_mut())
+        self.children.values_mut()
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
-        self.len
+        self.children.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.len == 0
+        self.children.is_empty()
     }
 
     fn clear(&mut self) {
-        self.slots.clear();
-        self.free.clear();
-        self.len = 0;
+        self.children.clear();
     }
 
     #[cfg(test)]
     fn storage_len(&self) -> usize {
-        self.slots.len()
+        self.children.len()
     }
 }
 
@@ -2055,7 +2006,7 @@ struct ScopeRuntime {
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
     phase: ScopePhase,
-    next_ordered_start: usize,
+    next_ordered_start: Option<ChildKey>,
     is_root: bool,
     parent_ready: Option<Latch>,
     dynamic: Option<Arc<DynamicControl>>,
@@ -2611,16 +2562,12 @@ impl ScopeRuntime {
         }
         match self.flavor {
             ScopeFlavor::Ordered => {
-                while self.next_ordered_start < self.children.len() {
-                    let key = self
-                        .children
-                        .key_at(self.next_ordered_start)
-                        .expect("ordered children are never reclaimed during startup");
+                while let Some(key) = self.next_ordered_start {
                     if !self.children[key].spawned_once {
                         self.spawn_child(key);
                     }
                     if self.children[key].initial_ready {
-                        self.next_ordered_start += 1;
+                        self.next_ordered_start = self.children.keys_after(key).next();
                     } else {
                         return;
                     }
@@ -3189,11 +3136,8 @@ impl ScopeRuntime {
         self.root
             .set_startup(Err(StartupError::StartupFailed(failure.clone())));
         if self.flavor == ScopeFlavor::Ordered {
-            for later_index in key.index + 1..self.children.len() {
-                let later = self
-                    .children
-                    .key_at(later_index)
-                    .expect("ordered children are never reclaimed during startup");
+            let later_children: Vec<_> = self.children.keys_after(key).collect();
+            for later in later_children {
                 if !self.children[later].spawned_once
                     && !self.children[later].is_disposing()
                     && !self.children[later].is_terminal()
@@ -3391,8 +3335,37 @@ impl ScopeRuntime {
         }
         let mut child = ChildRuntime::from_plan(plan, &self.root);
         child.initial = false;
+        let key = match self.children.insert(child) {
+            Ok(key) => key,
+            Err(child) => {
+                let mut child = *child;
+                let removed = {
+                    let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
+                    let id = request.slot.member.id();
+                    let matches_admission = state.entries.get(id).is_some_and(|entry| {
+                        entry.slot.member.membership() == request.slot.member.membership()
+                            && entry.admitted
+                    });
+                    matches_admission
+                        .then(|| state.entries.remove(id))
+                        .flatten()
+                };
+                request.slot.member.terminalize(Exit::never_started());
+                if let Some(scope) = &request.slot.scope {
+                    scope.terminalize_never_started();
+                }
+                child.complete_terminality();
+                let ChildRuntime { construction, .. } = child;
+                reject_admission_after_disposal(
+                    request,
+                    Some(construction),
+                    removed,
+                    ReserveError::IdentityExhausted,
+                );
+                return;
+            }
+        };
         self.root.admit_child(&request.slot);
-        let key = self.children.insert(child);
         #[cfg(test)]
         self.record_storage();
         request.complete(Ok(()));
@@ -3639,11 +3612,15 @@ async fn run_scope_incarnation(
     // owned by ScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
     // exactly one terminality owner for every child.
-    let mut children = ChildArena::with_capacity(plan.children.len());
+    let mut children = ChildArena::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
-        children.insert(ChildRuntime::from_plan(child, &root));
+        let child = ChildRuntime::from_plan(child, &root);
+        if children.insert(child).is_err() {
+            unreachable!("a fresh child-key domain accommodates an in-memory child collection");
+        }
     }
+    let next_ordered_start = children.keys().next();
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
         flavor: plan.flavor,
@@ -3655,7 +3632,7 @@ async fn run_scope_incarnation(
         deadlines: DeadlineQueue::default(),
         jitter: runtime::JitterRng::from_system_entropy(),
         phase: ScopePhase::Starting,
-        next_ordered_start: 0,
+        next_ordered_start,
         is_root,
         parent_ready,
         dynamic,
@@ -3923,11 +3900,11 @@ mod tests {
     };
 
     use super::{
-        ChildArena, ChildEvent, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
+        ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
         MemberCell, MemberStage, Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell,
-        ScopeFlavor, ScopePhase, ScopeRuntime, StartupPhase, complete_removals,
-        driver_event_class, mint_child_incarnation, report_channel, restart_shutdown_work,
-        run_nested_tree, run_scope_incarnation,
+        ScopeFlavor, ScopePhase, ScopeRuntime, StartupPhase, complete_removals, driver_event_class,
+        mint_child_incarnation, report_channel, restart_shutdown_work, run_nested_tree,
+        run_scope_incarnation,
     };
 
     fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
@@ -4091,10 +4068,12 @@ mod tests {
                 .collect(),
         );
         let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
-        let mut children = ChildArena::with_capacity(plan.children.len());
+        let mut children = ChildArena::default();
         plan.children.reverse();
         while let Some(child) = plan.children.pop() {
-            children.insert(ChildRuntime::from_plan(child, &root));
+            children
+                .insert(ChildRuntime::from_plan(child, &root))
+                .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
         }
         let nested = children
             .keys()
@@ -4104,6 +4083,7 @@ mod tests {
             .keys()
             .find(|key| children[*key].slot.member.id().as_str() == "trip")
             .expect("tripping child key");
+        let next_ordered_start = children.keys().next();
         let mut scope = ScopeRuntime {
             root: Arc::clone(&root),
             flavor: plan.flavor,
@@ -4115,7 +4095,7 @@ mod tests {
             deadlines: super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::from_system_entropy(),
             phase: ScopePhase::Running,
-            next_ordered_start: 0,
+            next_ordered_start,
             is_root: true,
             parent_ready: None,
             dynamic: None,
@@ -4260,7 +4240,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_child_keys_cannot_target_reused_slots() {
+    fn removed_child_keys_are_never_reused() {
         let mut tree = Tree::new();
         tree.add_task("worker", TaskDef::new(|_| future::pending()))
             .expect("valid task");
@@ -4268,44 +4248,47 @@ mod tests {
         let child =
             ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &plan.root);
         let mut arena = ChildArena::default();
-        let stale = arena.insert(child);
+        let stale = arena.insert(child).unwrap_or_else(|_| panic!("key mints"));
         let child = arena.remove(stale).expect("live key removes its child");
-        let current = arena.insert(child);
+        let current = arena.insert(child).unwrap_or_else(|_| panic!("key mints"));
 
-        assert_eq!(stale.index, current.index, "the vacant slot is reused");
-        assert_ne!(stale.generation, current.generation);
+        assert!(current > stale, "keys advance monotonically across removal");
         assert!(arena.get(stale).is_none());
         assert!(arena.remove(stale).is_none());
         assert!(arena.get(current).is_some());
     }
 
     #[test]
-    fn exhausted_child_generation_retires_the_slot() {
+    fn child_key_exhaustion_poison_is_never_minted() {
         let mut tree = Tree::new();
         tree.add_task("worker", TaskDef::new(|_| future::pending()))
             .expect("valid task");
         let mut plan = lower_tree_for_test(tree);
         let child =
             ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &plan.root);
-        let mut arena = ChildArena::default();
-        let original = arena.insert(child);
-        arena.slots[original.index].generation = u64::MAX;
-        let exhausted = super::ChildKey {
-            index: original.index,
-            generation: u64::MAX,
+        let mut arena = ChildArena {
+            next_key: u64::MAX - 2,
+            ..ChildArena::default()
         };
+        let last = arena
+            .insert(child)
+            .unwrap_or_else(|_| panic!("the last usable key mints"));
+        assert_eq!(last, ChildKey(u64::MAX - 1));
+        let child = arena.remove(last).expect("the last usable key is live");
 
-        let child = arena
-            .remove(exhausted)
-            .expect("the forced exhausted generation is live");
-        let current = arena.insert(child);
-        assert_ne!(exhausted.index, current.index);
-        assert!(arena.get(exhausted).is_none());
-        assert!(arena.get(current).is_some());
+        let child = *arena
+            .insert(child)
+            .expect_err("the poison key is never minted");
+        assert_eq!(arena.next_key, u64::MAX);
+        assert!(arena.get(ChildKey(u64::MAX)).is_none());
+        assert!(
+            arena.insert(child).is_err(),
+            "the exhausted domain stays poisoned"
+        );
     }
 
     #[crate::runtime::test]
-    async fn dynamic_high_cycle_add_remove_reuses_runtime_storage() {
+    async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
         const CYCLES: usize = 1_000;
 
         let system = DynamicTree::new().spawn().expect("runtime is available");
@@ -4337,7 +4320,7 @@ mod tests {
                     deadlines: 1,
                     deadline_slots: 1,
                 },
-                "cycle {cycle} must reuse the sole runtime slot"
+                "cycle {cycle} stores only the live child"
             );
 
             assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
@@ -4345,11 +4328,11 @@ mod tests {
                 cell.runtime_storage(),
                 RuntimeStorage {
                     children: 0,
-                    child_slots: 1,
+                    child_slots: 0,
                     deadlines: 0,
                     deadline_slots: 0,
                 },
-                "cycle {cycle} must reclaim the removed child"
+                "cycle {cycle} must release removed-child storage"
             );
 
             let automatic = scope
@@ -4365,11 +4348,11 @@ mod tests {
                 cell.runtime_storage(),
                 RuntimeStorage {
                     children: 0,
-                    child_slots: 1,
+                    child_slots: 0,
                     deadlines: 0,
                     deadline_slots: 0,
                 },
-                "cycle {cycle} must reclaim Retention::Remove registration"
+                "cycle {cycle} must release Retention::Remove storage"
             );
         }
 

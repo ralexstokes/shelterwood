@@ -1980,11 +1980,19 @@ impl ScopeRuntime {
         }
 
         let exit = terminal.exit;
+        // §6's `StartupAborted` is a startup-sequence property of a
+        // membership that *ran* and failed before its initial readiness
+        // edge. A terminal without an exited incarnation never ran, so it
+        // publishes the plain `Stopped { NeverStarted }` verdict (B.6) even
+        // when its pre-readiness position still routes the scope's startup
+        // failure below. Incarnation exhaustion is the reachable case:
+        // it terminalizes an unspawned membership while `pre_ready` holds.
+        let startup_aborted = terminal.exited_incarnation.is_some() && terminal.startup_aborted;
         self.children[key].terminalize(
             &self.root,
             exit.clone(),
             terminal.exited_incarnation,
-            terminal.startup_aborted,
+            startup_aborted,
         );
         let removing = self.children[key].slot.member.record().removing;
         if removing {
@@ -4021,6 +4029,116 @@ mod tests {
         assert!(
             root.snapshot().children.is_empty(),
             "retention pruning follows joined disposal"
+        );
+    }
+
+    /// Exhaustion terminalizes a membership that never spawned. B.6 makes
+    /// that the plain `Stopped { NeverStarted }` verdict; §6's
+    /// `StartupAborted` stays reserved for a membership that ran and failed
+    /// before its initial readiness edge. The pre-readiness position still
+    /// has to route the scope's startup failure.
+    #[crate::runtime::test]
+    async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "worker",
+            TaskDef::new(|_| future::pending::<crate::ExitResult>()),
+        )
+        .expect("valid task");
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root.begin_incarnation();
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(64);
+        let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+        let mut children = ChildArena::default();
+        let key = children
+            .insert(child)
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            phase: ScopePhase::Starting,
+            next_ordered_start: Some(key),
+            is_root: true,
+            parent_ready: None,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown: None,
+            ancestor_shutdown_seen: false,
+            ancestor_abort: None,
+            ancestor_abort_ack: None,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        // Burn the counter's last usable generation without touching the
+        // member record: the child is still an unspawned initial member, so
+        // its very first `spawn_child` exhausts before any incarnation runs.
+        scope.children[key].incarnations = FenceCounter::near_exhaustion(73);
+        {
+            let child = &mut scope.children[key];
+            assert!(mint_child_incarnation(&child.slot, &mut child.incarnations).is_some());
+        }
+        assert!(scope.children[key].initial);
+        assert!(!scope.children[key].initial_ready);
+        assert_eq!(
+            scope.children[key].slot.member.record().last_incarnation,
+            None
+        );
+
+        scope.spawn_child(key);
+        assert!(scope.children[key].is_disposing());
+
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = event_receiver
+            .recv()
+            .await
+            .expect("disposal reports completion")
+        else {
+            panic!("only construction disposal was armed")
+        };
+        scope.handle_construction_disposed(child, panic);
+
+        assert!(matches!(
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        let snapshot = root.snapshot();
+        let published = snapshot
+            .child("worker")
+            .expect("a retained exhausted child stays resident");
+        assert!(
+            matches!(
+                published.state,
+                ChildState::Stopped { ref exit } if matches!(exit.kind(), ExitKind::NeverStarted)
+            ),
+            "an unspawned exhausted membership is Stopped, not StartupAborted: {:?}",
+            published.state
+        );
+        assert!(
+            !scope.children[key].slot.member.record().startup_aborted,
+            "§6's startup-abort flag belongs to a membership that ran"
+        );
+        assert!(
+            matches!(
+                root.record().startup,
+                Some(Err(StartupError::StartupFailed(_)))
+            ),
+            "the pre-readiness position still routes the scope's startup failure"
         );
     }
 

@@ -690,6 +690,15 @@ impl ScopeCell {
             if matches!(record.stage, MemberStage::Terminal(_)) {
                 return false;
             }
+            // Nested publication and closure are reached only through this
+            // residency lookup, so a supervised child must still be resident
+            // here when it is terminalized. That holds because residency is
+            // installed before the child can be spawned (`set_admitted_children`
+            // for a planned incarnation, `admit_child` before dynamic
+            // `spawn_child`) and is only withdrawn by pruning, which always
+            // follows terminality. A child that has already left residency
+            // owns its nested scope through `SlotCell::terminalize_never_started`
+            // instead.
             let nested = self.current_children.read_with(|children| {
                 children
                     .iter()

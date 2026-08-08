@@ -1180,6 +1180,14 @@ impl ScopeCell {
             })
     }
 
+    fn has_stop_request(&self, epoch: u64) -> bool {
+        let control = self.control.lock().expect("scope control mutex poisoned");
+        control
+            .shutdown
+            .is_some_and(|request| request.epoch == epoch)
+            || control.force.is_some_and(|request| request.epoch == epoch)
+    }
+
     fn take_shutdown_request(&self, epoch: u64) -> bool {
         let mut control = self.control.lock().expect("scope control mutex poisoned");
         match control.shutdown.as_mut() {
@@ -2288,6 +2296,37 @@ enum SpawnBody {
 }
 
 impl ScopeRuntime {
+    fn restart_is_suppressed(&self, key: ChildKey) -> bool {
+        if self.phase.is_draining()
+            || self.hard_forced
+            || self.root.has_stop_request(self.epoch)
+            || self.ancestor_shutdown.as_ref().is_some_and(Latch::is_fired)
+            || self.ancestor_abort.as_ref().is_some_and(Latch::is_fired)
+        {
+            return true;
+        }
+        let Some(child) = self.children.get(key) else {
+            return true;
+        };
+        let record = child.slot.member.record();
+        if record.removing || child.slot.member.removal.is_fired() {
+            return true;
+        }
+        self.dynamic.as_ref().is_some_and(|control| {
+            control
+                .state
+                .lock()
+                .expect("dynamic-state mutex poisoned")
+                .entries
+                .values()
+                .find(|entry| entry.slot.member.membership() == child.slot.member.membership())
+                .is_some_and(|entry| {
+                    entry.removal_started
+                        || entry.fused_cancel.as_ref().is_some_and(Latch::is_fired)
+                })
+        })
+    }
+
     fn pending_restart_shutdowns(&self) -> Vec<ChildKey> {
         self.children
             .keys()
@@ -2295,6 +2334,7 @@ impl ScopeRuntime {
                 let child = &self.children[*key];
                 child.active.is_none()
                     && matches!(child.slot.member.record().stage, MemberStage::Restarting)
+                    && !self.restart_is_suppressed(*key)
                     && child
                         .slot
                         .scope
@@ -2302,6 +2342,15 @@ impl ScopeRuntime {
                         .is_some_and(|scope| scope.has_pending_incarnation_shutdown())
             })
             .collect()
+    }
+
+    fn expedite_restart_shutdown(&mut self, key: ChildKey) {
+        // Collection and execution are separated by arbitration. Recheck
+        // every level-triggered stop source so teardown/removal latched in the
+        // same batch suppresses user construction immediately.
+        if !self.restart_is_suppressed(key) {
+            self.spawn_child(key);
+        }
     }
 
     #[cfg(test)]
@@ -3914,7 +3963,7 @@ async fn run_scope_incarnation(
                     }
                     scope.begin_drain(StopReason::ShutdownRequested);
                 }
-                Pending::RestartShutdown(child) => scope.spawn_child(child),
+                Pending::RestartShutdown(child) => scope.expedite_restart_shutdown(child),
                 Pending::AncestorShutdown => {
                     scope.begin_drain(StopReason::ShutdownRequested);
                 }

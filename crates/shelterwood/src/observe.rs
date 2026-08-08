@@ -14,6 +14,11 @@ use crate::{
 /// Number of lifecycle events retained independently for each subscriber.
 pub const LIFECYCLE_EVENT_CAPACITY: usize = 128;
 
+// Tokio rounds broadcast capacity up to a power of two. `try_recv` compares
+// receiver length with this requested capacity and therefore requires the
+// requested and effective capacities to remain equal.
+const _: () = assert!(LIFECYCLE_EVENT_CAPACITY.is_power_of_two());
+
 /// One item read from a lifecycle subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]

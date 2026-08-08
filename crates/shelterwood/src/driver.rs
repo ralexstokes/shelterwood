@@ -405,9 +405,13 @@ pub(crate) fn remove_dynamic(
     // through the normal removal path, like live residents, so that
     // registration is reclaimed before the removal response completes.
     let member = Arc::clone(&entry.slot.member);
-    scope.transition_child(&member, |record| record.removing = true, None);
-    entry.slot.member.removal.fire();
+    // Dynamic-state protects admission/removal bookkeeping; the observation
+    // gate protects the public projection. Never nest the former around the
+    // latter: shutdown takes the same resources in the opposite order while
+    // clearing residents and closing dynamic state.
     drop(state);
+    scope.transition_child(&member, |record| record.removing = true, None);
+    member.removal.fire();
     scope.signal().pulse();
     response
 }
@@ -877,6 +881,7 @@ struct ScopeRuntime {
     intensity: IntensityState,
     children: ChildArena,
     events: runtime::MpscSender<DriverEvent>,
+    disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
     lifecycle: ScopeLifecycle,
@@ -1998,12 +2003,17 @@ impl ScopeRuntime {
         // The retained factory is user-owned. Destroy it on the blocking
         // pool. The disposal job itself owns completion, so cancellation or
         // failure to spawn an auxiliary async joiner cannot strand the child.
-        let sender = self.events.clone();
+        let sender = self.disposal_events.clone();
+        let signal = self.root.signal().clone();
         runtime::dispose_then(construction, move |panic| {
-            let _ = sender.blocking_send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
-                child: key,
-                panic,
-            }));
+            if runtime::unbounded_mpsc_send(
+                &sender,
+                DriverEvent::Child(ChildEvent::ConstructionDisposed { child: key, panic }),
+            )
+            .is_ok()
+            {
+                signal.pulse();
+            }
         });
     }
 
@@ -2060,6 +2070,10 @@ impl ScopeRuntime {
     }
 
     fn fail_startup(&mut self, key: ChildKey, exit: Exit) {
+        // Several initial children can fail in one arbitration batch. The
+        // first failure owns the startup verdict and its sole lifecycle edge;
+        // later exits are still terminalized, but cannot republish the scope
+        // transition or replace the authoritative cause.
         let child = &self.children[key];
         let failure = StartupFailure {
             cause: StartupFailureCause::Child {
@@ -2542,6 +2556,7 @@ async fn run_scope_incarnation(
     }
     let capacity = plan.children.len().saturating_mul(3).max(64);
     let (events, mut event_receiver) = runtime::bounded_mpsc(capacity);
+    let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
     let dynamic = (plan.root.flavor == ScopeFlavor::Dynamic)
         .then(|| DynamicControl::new(&root, events.clone()));
     if let Some(control) = &dynamic {
@@ -2587,6 +2602,7 @@ async fn run_scope_incarnation(
         intensity: IntensityState::default(),
         children,
         events,
+        disposal_events,
         deadlines: DeadlineQueue::default(),
         jitter: runtime::JitterRng::from_system_entropy(),
         lifecycle: ScopeLifecycle::starting(),
@@ -2657,6 +2673,10 @@ async fn run_scope_incarnation(
             ));
         }
         while let Some(event) = runtime::mpsc_try_recv(&mut event_receiver) {
+            let class = driver_event_class(&event);
+            pending.push((class, Pending::Driver(event)));
+        }
+        while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut disposal_event_receiver) {
             let class = driver_event_class(&event);
             pending.push((class, Pending::Driver(event)));
         }
@@ -3099,6 +3119,7 @@ mod tests {
                 .collect(),
         );
         let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
         let mut children = ChildArena::default();
         plan.children.reverse();
         while let Some(child) = plan.children.pop() {
@@ -3114,6 +3135,7 @@ mod tests {
             intensity: super::IntensityState::default(),
             children,
             events,
+            disposal_events,
             deadlines: super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::from_system_entropy(),
             lifecycle: ScopeLifecycle::running(),
@@ -3233,6 +3255,7 @@ mod tests {
                 .collect(),
         );
         let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
         let mut children = ChildArena::default();
         plan.children.reverse();
         while let Some(child) = plan.children.pop() {
@@ -3256,6 +3279,7 @@ mod tests {
             intensity: super::IntensityState::default(),
             children,
             events,
+            disposal_events,
             deadlines: super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::from_system_entropy(),
             lifecycle: ScopeLifecycle::running(),
@@ -4206,6 +4230,89 @@ mod tests {
         assert_eq!(response.try_receive(), Some(RemoveOutcome::Removed));
     }
 
+    #[test]
+    fn reserve_dynamic_rejects_an_empty_id_at_the_driver_boundary() {
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
+
+        assert!(matches!(
+            super::reserve_dynamic(&root, ChildId::from(""), None),
+            Err(crate::ReserveError::EmptyId)
+        ));
+    }
+
+    #[test]
+    fn dynamic_removal_releases_state_before_waiting_for_the_observation_gate() {
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
+        let child_id = ChildId::from("worker");
+        let member = MemberCell::new(
+            child_id.clone(),
+            root.child_identity
+                .lock()
+                .expect("scope identity mutex poisoned")
+                .mint_membership(&child_id)
+                .expect("child membership available"),
+        );
+        let slot = SlotCell::new(Arc::clone(&member), None);
+        root.set_admitted_children(vec![resident_projection(&slot)]);
+        let (events, _receiver) = crate::runtime::bounded_mpsc(1);
+        let control = DynamicControl::new(&root, events);
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entries
+            .insert(
+                child_id.clone(),
+                DynamicEntry {
+                    slot,
+                    admitted: true,
+                    fused_cancel: None,
+                    removal: Obligation::new(RemovalResponses::default(), complete_removals),
+                    removal_started: false,
+                },
+            );
+        root.set_dynamic_route(Some(super::DynamicRoute::new(Arc::clone(&control))));
+
+        let gate = root.observation_gate();
+        let held_gate = gate.lock().expect("observation gate starts healthy");
+        let baseline_member_owners = Arc::strong_count(&member);
+        let removal_root = Arc::clone(&root);
+        let removal_id = child_id.clone();
+        let worker =
+            std::thread::spawn(move || super::remove_dynamic(&removal_root, &removal_id, None));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&member) == baseline_member_owners {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "removal reaches its observation transition"
+            );
+            std::thread::yield_now();
+        }
+        loop {
+            match control.state.try_lock() {
+                Ok(state) => {
+                    drop(state);
+                    break;
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a removal blocked on observation must release dynamic state"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("dynamic-state mutex poisoned")
+                }
+            }
+        }
+
+        drop(held_gate);
+        let response = worker.join().expect("removal transition completes");
+        drop(response);
+    }
+
     #[crate::runtime::test]
     async fn system_shutdown_joins_root_driver_teardown() {
         let system = DynamicTree::new().spawn().expect("runtime is available");
@@ -4270,7 +4377,8 @@ mod tests {
                 .map(|child| resident_projection(&child.slot))
                 .collect(),
         );
-        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+        let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
         let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
         let mut children = ChildArena::default();
         let key = children
@@ -4283,6 +4391,7 @@ mod tests {
             intensity: super::IntensityState::default(),
             children,
             events,
+            disposal_events,
             deadlines: super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::from_system_entropy(),
             lifecycle: ScopeLifecycle::running(),
@@ -4323,6 +4432,17 @@ mod tests {
             None,
         );
 
+        assert!(
+            scope
+                .events
+                .try_send(DriverEvent::Child(ChildEvent::Ready {
+                    child: key,
+                    incarnation: first,
+                }))
+                .is_ok(),
+            "the bounded driver queue is deliberately saturated"
+        );
+
         scope.spawn_child(key);
         assert!(scope.children[key].is_disposing());
         assert!(matches!(
@@ -4331,13 +4451,18 @@ mod tests {
         ));
         assert_eq!(root.snapshot().children.len(), 1);
 
-        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = event_receiver
-            .recv()
-            .await
-            .expect("disposal reports completion")
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
+            disposal_event_receiver
+                .recv()
+                .await
+                .expect("disposal reports completion")
         else {
             panic!("only construction disposal was armed")
         };
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(DriverEvent::Child(ChildEvent::Ready { .. }))
+        ));
         scope.handle_construction_disposed(child, panic);
 
         assert!(!scope.children[key].is_disposing());
@@ -4375,7 +4500,8 @@ mod tests {
                 .map(|child| resident_projection(&child.slot))
                 .collect(),
         );
-        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
         let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
         let mut children = ChildArena::default();
         let key = children
@@ -4388,6 +4514,7 @@ mod tests {
             intensity: super::IntensityState::default(),
             children,
             events,
+            disposal_events,
             deadlines: super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::from_system_entropy(),
             lifecycle: ScopeLifecycle::starting(),
@@ -4425,10 +4552,11 @@ mod tests {
         scope.spawn_child(key);
         assert!(scope.children[key].is_disposing());
 
-        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = event_receiver
-            .recv()
-            .await
-            .expect("disposal reports completion")
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
+            disposal_event_receiver
+                .recv()
+                .await
+                .expect("disposal reports completion")
         else {
             panic!("only construction disposal was armed")
         };

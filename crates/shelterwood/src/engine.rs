@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BinaryHeap, VecDeque},
+    collections::{BTreeMap, BinaryHeap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -352,7 +352,7 @@ impl ReadinessGate {
 
 impl PartialEq for DeadlineEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.at == other.at && self.order == other.order
+        self.at == other.at && self.handle == other.handle
     }
 }
 
@@ -369,76 +369,49 @@ impl Ord for DeadlineEntry {
         other
             .at
             .cmp(&self.at)
-            .then_with(|| other.order.cmp(&self.order))
+            .then_with(|| other.handle.cmp(&self.handle))
     }
 }
 
 /// The engine's single deadline priority queue.
 #[derive(Debug)]
 pub(crate) struct DeadlineQueue<K> {
-    next_order: u64,
+    // Keys are both registration identity and equal-deadline arming order.
+    // They are never reused, so a stale handle can only miss.
+    next_key: u64,
     entries: BinaryHeap<DeadlineEntry>,
-    slots: Vec<DeadlineSlot<K>>,
-    free: Vec<usize>,
-    len: usize,
+    registrations: BTreeMap<DeadlineHandle, K>,
 }
 
-/// A generation-checked registration for one armed deadline.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct DeadlineHandle {
-    index: usize,
-    generation: u64,
-}
-
-#[derive(Debug)]
-struct DeadlineSlot<K> {
-    generation: u64,
-    key: Option<K>,
-}
+/// A never-reused registration for one armed deadline.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct DeadlineHandle(u64);
 
 #[derive(Debug)]
 struct DeadlineEntry {
     at: Instant,
-    order: u64,
     handle: DeadlineHandle,
 }
 
 impl<K> Default for DeadlineQueue<K> {
     fn default() -> Self {
         Self {
-            next_order: 0,
+            next_key: 0,
             entries: BinaryHeap::new(),
-            slots: Vec::new(),
-            free: Vec::new(),
-            len: 0,
+            registrations: BTreeMap::new(),
         }
     }
 }
 
 impl<K> DeadlineQueue<K> {
     pub(crate) fn push(&mut self, at: Instant, key: K) -> DeadlineHandle {
-        let order = self.next_arming_order();
-        let handle = if let Some(index) = self.free.pop() {
-            let slot = &mut self.slots[index];
-            debug_assert!(slot.key.is_none());
-            slot.key = Some(key);
-            DeadlineHandle {
-                index,
-                generation: slot.generation,
-            }
-        } else {
-            let index = self.slots.len();
-            self.slots.push(DeadlineSlot {
-                generation: 0,
-                key: Some(key),
-            });
-            DeadlineHandle {
-                index,
-                generation: 0,
-            }
-        };
-        self.len += 1;
-        self.entries.push(DeadlineEntry { at, order, handle });
+        let handle = self.next_handle();
+        let replaced = self.registrations.insert(handle, key);
+        debug_assert!(
+            replaced.is_none(),
+            "monotonic deadline keys are never reused"
+        );
+        self.entries.push(DeadlineEntry { at, handle });
         handle
     }
 
@@ -465,51 +438,26 @@ impl<K> DeadlineQueue<K> {
         }
     }
 
-    fn next_arming_order(&mut self) -> u64 {
-        if self.next_order == u64::MAX {
-            // Preserve the relative arming order of every live registration,
-            // while dropping tombstones, before the sequence space wraps.
-            // Handles address the separate generational arena and remain
-            // valid across this rebuild.
-            let slots = &self.slots;
-            let mut entries = std::mem::take(&mut self.entries).into_vec();
-            entries.retain(|entry| Self::is_active_in(slots, entry.handle));
-            entries.sort_unstable_by_key(|entry| entry.order);
-            for (order, entry) in entries.iter_mut().enumerate() {
-                entry.order = u64::try_from(order)
-                    .expect("live deadline count cannot exceed the arming sequence space");
-            }
-            self.next_order = u64::try_from(entries.len())
-                .expect("live deadline count cannot exceed the arming sequence space");
-            self.entries = BinaryHeap::from(entries);
+    fn next_handle(&mut self) -> DeadlineHandle {
+        let Some(next) = self.next_key.checked_add(1) else {
+            panic!("deadline key space exhausted");
+        };
+        // Reserve the maximum value as poison. Once reached, the counter stays
+        // poisoned and every later push fails instead of wrapping or reusing.
+        if next == u64::MAX {
+            self.next_key = u64::MAX;
+            panic!("deadline key space exhausted");
         }
-        let order = self.next_order;
-        self.next_order += 1;
-        order
+        self.next_key = next;
+        DeadlineHandle(next)
     }
 
     fn take(&mut self, handle: DeadlineHandle) -> Option<K> {
-        let slot = self.slots.get_mut(handle.index)?;
-        if slot.generation != handle.generation {
-            return None;
-        }
-        let key = slot.key.take()?;
-        self.len -= 1;
-        if let Some(next) = slot.generation.checked_add(1) {
-            slot.generation = next;
-            self.free.push(handle.index);
-        }
-        Some(key)
+        self.registrations.remove(&handle)
     }
 
     fn is_active(&self, handle: DeadlineHandle) -> bool {
-        Self::is_active_in(&self.slots, handle)
-    }
-
-    fn is_active_in(slots: &[DeadlineSlot<K>], handle: DeadlineHandle) -> bool {
-        slots
-            .get(handle.index)
-            .is_some_and(|slot| slot.generation == handle.generation && slot.key.is_some())
+        self.registrations.contains_key(&handle)
     }
 
     fn prune_stale_head(&mut self) {
@@ -523,16 +471,16 @@ impl<K> DeadlineQueue<K> {
     }
 
     fn compact_if_sparse(&mut self) {
-        if self.entries.len() > self.len.saturating_mul(2) {
-            let slots = &self.slots;
+        if self.entries.len() > self.registrations.len().saturating_mul(2) {
+            let registrations = &self.registrations;
             self.entries
-                .retain(|entry| Self::is_active_in(slots, entry.handle));
+                .retain(|entry| registrations.contains_key(&entry.handle));
         }
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.registrations.len()
     }
 
     #[cfg(test)]
@@ -541,14 +489,15 @@ impl<K> DeadlineQueue<K> {
     }
 
     #[cfg(test)]
-    fn registration_slots_len(&self) -> usize {
-        self.slots.len()
+    fn registration_storage_len(&self) -> usize {
+        self.registrations.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -823,14 +772,22 @@ mod tests {
     }
 
     #[test]
-    fn one_priority_queue_orders_equal_deadlines_by_arming_order() {
+    fn one_priority_queue_orders_deadlines_then_equal_deadline_fifo() {
         let now = Instant::now();
+        let later = now + Duration::from_secs(1);
         let mut deadlines = DeadlineQueue::default();
-        deadlines.push(now, "first");
-        deadlines.push(now, "second");
+        deadlines.push(later, "later-first");
+        deadlines.push(now, "now-first");
+        deadlines.push(later, "later-second");
+        deadlines.push(now, "now-second");
+
         assert_eq!(deadlines.next(), Some(now));
-        assert_eq!(deadlines.pop_due(now), Some("first"));
-        assert_eq!(deadlines.pop_due(now), Some("second"));
+        assert_eq!(deadlines.pop_due(now), Some("now-first"));
+        assert_eq!(deadlines.pop_due(now), Some("now-second"));
+        assert_eq!(deadlines.pop_due(now), None);
+        assert_eq!(deadlines.next(), Some(later));
+        assert_eq!(deadlines.pop_due(later), Some("later-first"));
+        assert_eq!(deadlines.pop_due(later), Some("later-second"));
     }
 
     #[test]
@@ -848,9 +805,9 @@ mod tests {
                 "heap tombstones must stay proportional to live deadlines"
             );
             assert_eq!(
-                deadlines.registration_slots_len(),
-                2,
-                "registration slots must be reused"
+                deadlines.registration_storage_len(),
+                deadlines.len(),
+                "the registration map stores only live payloads"
             );
         }
 
@@ -860,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_deadline_drops_payload_and_stale_handle_misses_reused_slot() {
+    fn cancellation_and_queue_drop_own_payloads_while_stale_handles_stay_absent() {
         struct DropProbe(Arc<AtomicUsize>);
 
         impl Drop for DropProbe {
@@ -880,45 +837,47 @@ mod tests {
         );
 
         let current = deadlines.push(Instant::now(), DropProbe(Arc::clone(&drops)));
-        assert_eq!(stale.index, current.index, "the vacant slot is reused");
-        assert_ne!(stale.generation, current.generation);
         assert!(
-            !deadlines.cancel(stale),
-            "a stale handle misses the replacement"
+            current > stale,
+            "deadline keys are monotonic and never reused"
         );
-        assert!(deadlines.cancel(current));
+        assert!(!deadlines.cancel(stale), "a stale handle remains absent");
+        assert_eq!(
+            deadlines.len(),
+            1,
+            "stale cancellation preserves the live key"
+        );
+        drop(deadlines);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]
-    fn deadline_generation_exhaustion_retires_the_slot() {
-        let mut deadlines = DeadlineQueue::default();
-        let original = deadlines.push(Instant::now(), "retired");
-        deadlines.slots[original.index].generation = u64::MAX;
-        let exhausted = DeadlineHandle {
-            index: original.index,
-            generation: u64::MAX,
-        };
-
-        assert!(deadlines.cancel(exhausted));
-        let current = deadlines.push(Instant::now(), "current");
-        assert_ne!(exhausted.index, current.index);
-        assert!(!deadlines.cancel(exhausted));
-        assert_eq!(deadlines.pop_due(Instant::now()), Some("current"));
-    }
-
-    #[test]
-    fn arming_order_exhaustion_rebases_without_changing_equal_deadline_order() {
+    fn deadline_key_exhaustion_never_mints_poison_or_reuses_a_key() {
         let now = Instant::now();
-        let mut deadlines = DeadlineQueue::default();
-        deadlines.push(now, "first");
-        deadlines.push(now, "second");
-        deadlines.next_order = u64::MAX;
-        deadlines.push(now, "third");
+        let mut deadlines = DeadlineQueue {
+            next_key: u64::MAX - 2,
+            ..DeadlineQueue::default()
+        };
+        let last = deadlines.push(now, "last usable");
+        assert_eq!(last, DeadlineHandle(u64::MAX - 1));
+        assert!(deadlines.cancel(last));
 
-        assert_eq!(deadlines.pop_due(now), Some("first"));
-        assert_eq!(deadlines.pop_due(now), Some("second"));
-        assert_eq!(deadlines.pop_due(now), Some("third"));
+        let first_exhausted = catch_unwind(AssertUnwindSafe(|| deadlines.push(now, "poison")));
+        assert!(first_exhausted.is_err(), "the poison key is never minted");
+        assert_eq!(deadlines.next_key, u64::MAX);
+        assert!(
+            !deadlines
+                .registrations
+                .contains_key(&DeadlineHandle(u64::MAX))
+        );
+
+        let still_exhausted = catch_unwind(AssertUnwindSafe(|| deadlines.push(now, "wrapped")));
+        assert!(
+            still_exhausted.is_err(),
+            "the exhausted domain stays poisoned"
+        );
+        assert!(deadlines.registrations.is_empty());
+        assert!(deadlines.entries.is_empty());
     }
 
     #[test]

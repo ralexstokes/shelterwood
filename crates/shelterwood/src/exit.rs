@@ -145,6 +145,37 @@ pub struct StartupFailure {
     pub cause: StartupFailureCause,
 }
 
+/// The terminal reason for a scope incarnation or root system.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum StopReason {
+    /// A non-empty ordered workload completed naturally.
+    Finished,
+    /// Shutdown was explicitly requested.
+    ShutdownRequested,
+    /// The scope exceeded its restart budget.
+    IntensityTripped(IntensityTrip),
+    /// A nested scope could not complete startup.
+    StartupFailed(StartupFailure),
+    /// The membership terminalized without an incarnation.
+    NeverStarted,
+}
+
+/// Failure of the root startup barrier.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum StartupError {
+    /// A child or nested lowering failed terminally during startup.
+    #[error("tree startup failed")]
+    StartupFailed(StartupFailure),
+    /// Restart intensity tripped during startup.
+    #[error("restart intensity tripped during startup")]
+    IntensityTripped(IntensityTrip),
+    /// Shutdown began before startup completed.
+    #[error("shutdown was requested during startup")]
+    ShutdownRequested,
+}
+
 /// The cause of a nested-scope startup failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]

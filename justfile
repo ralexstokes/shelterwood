@@ -34,6 +34,9 @@ runtime-path-check:
 exit-path-check:
     ./tools/check-exit-paths.sh
 
+layering-path-check:
+    ./tools/check-layering-paths.sh
+
 packaged-docs-sync:
     ./tools/sync-packaged-docs.sh --write
 
@@ -48,7 +51,7 @@ nixfmt-check:
 
 # Fast local CI mirror — reuses the local cargo cache and incremental builds.
 # The clean Nix lane retains the explicit all-target build for non-test codegen coverage.
-ci: fmt lint test doc-check runtime-api-check runtime-path-check exit-path-check packaged-docs-check package-check nixfmt-check
+ci: fmt lint test doc-check runtime-api-check runtime-path-check exit-path-check layering-path-check packaged-docs-check package-check nixfmt-check
 
 # Full clean Nix CI lane; use before pushing or when touching Nix files.
 ci-nix:

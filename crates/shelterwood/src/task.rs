@@ -11,7 +11,7 @@ use std::{
 use crate::{
     ChildId, Exit, ExitError, ExitResult, Incarnation, Membership, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
-    driver::MemberCell,
+    cells::MemberCell,
     policy::CommonOptions,
     runtime::{self, Latch},
 };
@@ -380,7 +380,7 @@ mod tests {
 
     use crate::{
         ChildId, Exit, ExitKind,
-        driver::MemberCell,
+        cells::MemberCell,
         identity::ScopeIdentity,
         runtime::{self, JoinOutcome, Latch, Timeout},
     };

@@ -13,56 +13,22 @@ use std::{
 };
 
 use crate::{
-    ActorDef, ActorOnceDef, ActorRef, ChildId, DefaultsInheritance, Exit, Intensity, IntensityTrip,
+    ActorDef, ActorOnceDef, ActorRef, ChildId, DefaultsInheritance, Exit, Intensity,
     LifecycleEvents, Membership, ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults,
-    ScopeSnapshot, Shutdown, ShutdownTimeout, SnapshotReceiver, StartupFailure, Strategy,
-    WaitError,
-    driver::{DynamicReservation, MemberCell, ScopeCell},
+    ScopeSnapshot, Shutdown, ShutdownTimeout, SnapshotReceiver, Strategy, WaitError,
+    cells::{MemberCell, MemberStage, ScopeCell},
+    driver::DynamicReservation,
+    exit::{StartupError, StopReason},
     identity::ScopeIdentity,
     mailbox::MailboxCell,
-    policy::{CommonOptions, IdError, ResolvedCommonOptions, ResolvedDefaults, resolve_common},
+    policy::{
+        CommonOptions, IdError, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor,
+        resolve_common,
+    },
     raw::{RawConstruction, RawDef, RawOnceDef},
     runtime::{self, Latch},
     task::{OnceTask, OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
-
-/// Whether a scope has fixed ordered membership or runtime-dynamic membership.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ScopeFlavor {
-    Ordered,
-    Dynamic,
-}
-
-/// The terminal reason for a scope incarnation or root system.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum StopReason {
-    /// A non-empty ordered workload completed naturally.
-    Finished,
-    /// Shutdown was explicitly requested.
-    ShutdownRequested,
-    /// The scope exceeded its restart budget.
-    IntensityTripped(IntensityTrip),
-    /// A nested scope could not complete startup.
-    StartupFailed(StartupFailure),
-    /// The membership terminalized without an incarnation.
-    NeverStarted,
-}
-
-/// Failure of the root startup barrier.
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
-pub enum StartupError {
-    /// A child or nested lowering failed terminally during startup.
-    #[error("tree startup failed")]
-    StartupFailed(StartupFailure),
-    /// Restart intensity tripped during startup.
-    #[error("restart intensity tripped during startup")]
-    IntensityTripped(IntensityTrip),
-    /// Shutdown began before startup completed.
-    #[error("shutdown was requested during startup")]
-    ShutdownRequested,
-}
 
 /// Startup failure paired with any rollback timeout report.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -331,7 +297,7 @@ impl BuilderCore {
                 }
             }
         }
-        root.set_config(self.config.clone());
+        root.set_observation_config(self.config.strategy, self.config.intensity);
         let defaults = inherited.overlay(&self.config.defaults);
         let mut children = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
@@ -1742,10 +1708,7 @@ impl ScopeRef {
             if expires.is_due(crate::runtime::now()) {
                 return Err(WaitError::TimedOut);
             }
-            if matches!(
-                self.cell.member.record().stage,
-                crate::driver::MemberStage::Terminal(_)
-            ) {
+            if matches!(self.cell.member.record().stage, MemberStage::Terminal(_)) {
                 return Err(WaitError::ScopeTerminated {
                     state: snapshot.state.clone(),
                 });

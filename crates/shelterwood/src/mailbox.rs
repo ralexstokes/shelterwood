@@ -15,7 +15,7 @@ use std::{
 
 use crate::{
     ChildId, Incarnation, Mailbox, Membership,
-    driver::MemberCell,
+    cells::{MailboxControl, MailboxDisposal, MailboxStats, MailboxTermination, MemberCell},
     runtime::{Signal, SignalWatcher},
 };
 
@@ -639,16 +639,6 @@ impl<M> WaiterQueue<M> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct MailboxStats {
-    pub(crate) accepted: u64,
-    pub(crate) delivered: u64,
-    pub(crate) conflated: u64,
-    pub(crate) sends_rejected: u64,
-    pub(crate) depth: usize,
-    pub(crate) capacity: usize,
-}
-
 struct Promotion<M: Send + 'static> {
     displaced: Vec<Envelope<M>>,
     wakers: Vec<Waker>,
@@ -731,8 +721,6 @@ impl<M> Termination<M> {
     }
 }
 
-pub(crate) trait MailboxDisposal: Send {}
-
 struct MailboxPayload<M> {
     queue: Option<VecDeque<Envelope<M>>>,
     latest: Option<Envelope<M>>,
@@ -772,10 +760,6 @@ impl<M> Drop for MailboxPayload<M> {
 }
 
 impl<M: Send> MailboxDisposal for MailboxPayload<M> {}
-
-pub(crate) trait MailboxTermination: Send {
-    fn finish(self: Box<Self>) -> Option<Box<dyn MailboxDisposal>>;
-}
 
 struct MailboxTeardown<M: Send + 'static> {
     changed: Option<Signal>,
@@ -829,16 +813,6 @@ impl<M: Send + 'static> Drop for MailboxTeardown<M> {
             resume_unwind(panic);
         }
     }
-}
-
-/// Type-erased control used by the supervision driver.
-pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
-    fn configure(&self, mailbox: Mailbox);
-    fn bind(&self, incarnation: Incarnation);
-    fn freeze(&self, incarnation: Incarnation);
-    fn close(&self, incarnation: Incarnation) -> Option<Box<dyn MailboxDisposal>>;
-    fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>>;
-    fn stats(&self) -> MailboxStats;
 }
 
 pub(crate) struct MailboxCell<M> {
@@ -1854,7 +1828,7 @@ mod tests {
         task::{Context, Poll, Wake, Waker},
     };
 
-    use crate::{ChildId, Mailbox, SendErrorKind, driver::MemberCell, identity::ScopeIdentity};
+    use crate::{ChildId, Mailbox, SendErrorKind, cells::MemberCell, identity::ScopeIdentity};
 
     use super::{ActorRef, MailboxCell, MailboxControl};
 

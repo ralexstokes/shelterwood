@@ -3,6 +3,7 @@
 //! Structured supervision and actors for asynchronous Rust systems.
 
 mod actor;
+mod cells;
 mod deadline;
 mod driver;
 mod engine;
@@ -19,7 +20,7 @@ mod tree;
 pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use exit::{
     Exit, ExitError, ExitKind, ExitResult, IntensityTrip, ShutdownStraggler, ShutdownTimeout,
-    StartupFailure, StartupFailureCause,
+    StartupError, StartupFailure, StartupFailureCause, StopReason,
 };
 pub use identity::{Incarnation, Membership};
 pub use mailbox::{
@@ -43,8 +44,8 @@ pub use task::{CancellationToken, OneShotTaskRef, TaskContext, TaskDef, TaskOnce
 pub use tree::{
     ActorSlot, Admission, AdmissionReceipt, BuildError, DynamicActorSlot, DynamicScopeRef,
     DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, NotAdmittingCause, Removal, RemoveOutcome,
-    ReserveError, ScopeRef, StartOrShutdownError, StartupError, StopReason, Subtree, SubtreeDef,
-    SubtreeOnceDef, SubtreeSlot, System, TaskSlot, Tree,
+    ReserveError, ScopeRef, StartOrShutdownError, Subtree, SubtreeDef, SubtreeOnceDef, SubtreeSlot,
+    System, TaskSlot, Tree,
 };
 
 // Keep the repository-facing examples in the same rustdoc compilation lane as

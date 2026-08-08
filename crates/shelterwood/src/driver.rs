@@ -2,42 +2,36 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    fmt,
     ops::{Bound, Index, IndexMut},
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Mutex, Weak, mpsc},
     time::{Duration, Instant},
 };
 
 use crate::{
     ChildId, Exit, ExitKind, Incarnation, IntensityTrip, Membership, Readiness, ReadinessDeadline,
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    cells::{DynamicRoute, MemberCell, MemberStage, ResidentProjection, ScopeCell},
     deadline::Deadline,
     engine::{
         ArbitrationClass, DeadlineHandle, DeadlineQueue, ExitDispatch, IntensityState,
         MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode,
         StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
     },
-    exit::{JoinVerdict, RecordedOutcome, classify_exit},
+    exit::{JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit},
     identity::{FenceCounter, ScopeIdentity},
-    mailbox::{MailboxControl, MailboxTermination},
-    observe::{
-        ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-        LifecycleHub, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
-    },
-    policy::{DefaultsInheritance, ResolvedDefaults},
+    observe::LifecycleEventKind,
+    policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
     runtime::{self, Latch},
     task::{OnceTaskBody, TaskContext, TaskFactory},
     tree::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, NotAdmittingCause, RemoveOutcome,
-        ReserveError, ScopeFactory, ScopeFlavor, ScopePlan, ScopeSource, SlotCell, StartupError,
-        StopReason,
+        ReserveError, ScopeFactory, ScopePlan, ScopeSource, SlotCell,
     },
 };
+
+#[cfg(test)]
+use crate::cells::RuntimeStorage;
 
 /// An exactly-once synchronous completion.
 ///
@@ -80,235 +74,6 @@ impl<T> Obligation<T> {
 impl<T> Drop for Obligation<T> {
     fn drop(&mut self) {
         self.discharge();
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MemberStage {
-    Reserved,
-    Admitted,
-    Starting,
-    Running,
-    Restarting,
-    Stopping,
-    Terminal(Exit),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MemberRecord {
-    pub(crate) stage: MemberStage,
-    pub(crate) incarnation: Option<Incarnation>,
-    pub(crate) last_incarnation: Option<Incarnation>,
-    pub(crate) last_exit: Option<Exit>,
-    pub(crate) restart_count: u64,
-    pub(crate) restart_at: Option<Instant>,
-    pub(crate) removing: bool,
-    pub(crate) startup_aborted: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct MemberCell {
-    id: ChildId,
-    membership: Mutex<Membership>,
-    record: runtime::WatchSender<MemberRecord>,
-    terminal_disposal_pending: AtomicBool,
-    mailbox: Mutex<MemberMailbox>,
-    options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
-    pub(crate) removal: Latch,
-}
-
-#[derive(Default)]
-struct MemberMailbox {
-    control: Option<Arc<dyn MailboxControl>>,
-    terminal: Option<Exit>,
-    teardown: Option<Box<dyn MailboxTermination>>,
-}
-
-impl fmt::Debug for MemberMailbox {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("MemberMailbox")
-            .field("control", &self.control)
-            .field("terminal", &self.terminal)
-            .field("teardown_pending", &self.teardown.is_some())
-            .finish()
-    }
-}
-
-impl MemberCell {
-    pub(crate) fn new(id: ChildId, membership: Membership) -> Arc<Self> {
-        let (record, _) = runtime::watch(MemberRecord {
-            stage: MemberStage::Reserved,
-            incarnation: None,
-            last_incarnation: None,
-            last_exit: None,
-            restart_count: 0,
-            restart_at: None,
-            removing: false,
-            startup_aborted: false,
-        });
-        Arc::new(Self {
-            id,
-            membership: Mutex::new(membership),
-            record,
-            terminal_disposal_pending: AtomicBool::new(false),
-            mailbox: Mutex::new(MemberMailbox::default()),
-            options: Mutex::new(None),
-            removal: Latch::default(),
-        })
-    }
-
-    pub(crate) fn id(&self) -> &ChildId {
-        &self.id
-    }
-
-    pub(crate) fn membership(&self) -> Membership {
-        *self
-            .membership
-            .lock()
-            .expect("member identity mutex poisoned")
-    }
-
-    pub(crate) fn rebase_membership(&self, membership: Membership) {
-        let record = self.record();
-        assert!(
-            matches!(record.stage, MemberStage::Reserved)
-                && record.incarnation.is_none()
-                && record.last_incarnation.is_none(),
-            "only an unstarted reservation can be rebased"
-        );
-        *self
-            .membership
-            .lock()
-            .expect("member identity mutex poisoned") = membership;
-    }
-
-    pub(crate) fn record(&self) -> MemberRecord {
-        self.record.read_cloned()
-    }
-
-    fn terminal_disposal_pending(&self) -> bool {
-        self.terminal_disposal_pending.load(Ordering::Acquire)
-    }
-
-    fn set_terminal_disposal_pending(&self, pending: bool) {
-        self.terminal_disposal_pending
-            .store(pending, Ordering::Release);
-    }
-
-    pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
-        self.record.send_modify(update);
-    }
-
-    fn update_locked(&self, update: impl FnOnce(&mut MemberRecord)) {
-        self.record.send_modify(update);
-    }
-
-    pub(crate) fn set_options(&self, options: crate::policy::ResolvedCommonOptions) {
-        *self.options.lock().expect("member options mutex poisoned") = Some(options);
-    }
-
-    fn options(&self) -> crate::policy::ResolvedCommonOptions {
-        self.options
-            .lock()
-            .expect("member options mutex poisoned")
-            .clone()
-            .unwrap_or_else(|| {
-                crate::policy::resolve_common(
-                    &crate::policy::CommonOptions::default(),
-                    &crate::policy::ResolvedDefaults::default(),
-                    false,
-                    Readiness::Immediate,
-                )
-            })
-    }
-
-    pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
-        let terminal_exit = {
-            let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            assert!(state.control.is_none(), "a member can own only one mailbox");
-            state.control = Some(Arc::clone(&mailbox));
-            let terminal_exit = state.terminal.clone();
-            if terminal_exit.is_some() {
-                debug_assert!(state.teardown.is_none());
-                state.teardown = mailbox.prepare_termination();
-            }
-            terminal_exit
-        };
-        if let Some(terminal_exit) = terminal_exit {
-            self.publish_terminal(terminal_exit);
-        }
-    }
-
-    pub(crate) fn mailbox(&self) -> Option<Arc<dyn MailboxControl>> {
-        self.mailbox
-            .lock()
-            .expect("member mailbox mutex poisoned")
-            .control
-            .clone()
-    }
-
-    pub(crate) fn terminalize(&self, exit: Exit) {
-        let (terminal_exit, mailbox) = {
-            let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            let terminal_exit = if let Some(terminal_exit) = &state.terminal {
-                terminal_exit.clone()
-            } else {
-                let teardown = state
-                    .control
-                    .as_ref()
-                    .and_then(|mailbox| mailbox.prepare_termination());
-                state.terminal = Some(exit.clone());
-                state.teardown = teardown;
-                exit
-            };
-            (terminal_exit, state.control.clone())
-        };
-        self.publish_terminal(terminal_exit);
-        if let Some(mailbox) = mailbox {
-            let stats = mailbox.stats();
-            debug_assert!(stats.delivered <= stats.accepted);
-            debug_assert!(stats.conflated <= stats.accepted);
-            debug_assert!(stats.depth <= stats.capacity);
-            let _ = stats.sends_rejected;
-        }
-    }
-
-    fn publish_terminal(&self, terminal_exit: Exit) {
-        let mut published = false;
-        self.record.modify_silently(|record| {
-            if !matches!(record.stage, MemberStage::Terminal(_)) {
-                record.incarnation = None;
-                record.restart_at = None;
-                record.last_exit = Some(terminal_exit.clone());
-                record.stage = MemberStage::Terminal(terminal_exit);
-                published = true;
-            }
-        });
-        let teardown = self
-            .mailbox
-            .lock()
-            .expect("member mailbox mutex poisoned")
-            .teardown
-            .take();
-        if let Some(teardown) = teardown
-            && let Some(payload) = teardown.finish()
-        {
-            runtime::dispose_detached(payload);
-        }
-        if published {
-            self.record.pulse();
-        }
-    }
-
-    pub(crate) async fn wait_terminal(&self) -> Exit {
-        let mut watcher = self.record.watcher();
-        loop {
-            if let MemberStage::Terminal(exit) = watcher.borrow_cloned().stage {
-                return exit;
-            }
-            watcher.changed().await;
-        }
     }
 }
 
@@ -371,831 +136,6 @@ impl ReportReceiver {
         self.0
             .recv()
             .expect("owned report token must record or fall back")
-    }
-}
-
-struct ResidencyCompletion {
-    parent: Weak<ScopeCell>,
-    slot: Arc<SlotCell>,
-}
-
-fn discharge_residency(completion: ResidencyCompletion) {
-    let Some(parent) = completion.parent.upgrade() else {
-        return;
-    };
-    parent.emit_locked(LifecycleEventKind::Removed {
-        id: completion.slot.member.id().clone(),
-        membership: completion.slot.member.membership(),
-        last_incarnation: completion.slot.member.record().last_incarnation,
-    });
-}
-
-struct ResidentChild {
-    slot: Arc<SlotCell>,
-    _removal: Obligation<ResidencyCompletion>,
-}
-
-impl ResidentChild {
-    fn new(parent: &Arc<ScopeCell>, slot: Arc<SlotCell>) -> Self {
-        Self {
-            _removal: Obligation::new(
-                ResidencyCompletion {
-                    parent: Arc::downgrade(parent),
-                    slot: Arc::clone(&slot),
-                },
-                discharge_residency,
-            ),
-            slot,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ScopeRecord {
-    pub(crate) state: ScopeState,
-    pub(crate) startup: Option<Result<(), StartupError>>,
-    pub(crate) total_restarts: u64,
-}
-
-/// Shared scope state follows two distinct synchronization regimes.
-///
-/// One gate per running tree serializes compound, observation-visible
-/// transitions across `config`, `record`, `current_children`, and `parent`,
-/// including recursive snapshot projection and lifecycle-event staging. Their
-/// watch channels retain the latest independently readable value; they do not
-/// make that compound transition atomic, so every multi-field observation path
-/// must continue to hold the gate.
-///
-/// The remaining mutexes are deliberately not collapsed into one state lock.
-/// `control` is an epoch-tagged request plane with concurrent callers,
-/// `child_identity` and `lifecycle_sequence` mint monotonic identities, and
-/// `current_dynamic` owns the independently published dynamic request route.
-/// Scope state therefore has multiple writers and no single-writer invariant.
-pub(crate) struct ScopeCell {
-    pub(crate) member: Arc<MemberCell>,
-    pub(crate) flavor: ScopeFlavor,
-    pub(crate) child_identity: Mutex<ScopeIdentity>,
-    config: runtime::WatchSender<crate::tree::ScopeConfig>,
-    record: runtime::WatchSender<ScopeRecord>,
-    control: Mutex<ScopeControl>,
-    current_dynamic: Mutex<Option<Arc<DynamicControl>>>,
-    current_children: runtime::WatchSender<Vec<ResidentChild>>,
-    parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
-    observation_gate: Mutex<Arc<Mutex<()>>>,
-    lifecycle_sequence: Mutex<FenceCounter>,
-    lifecycle_seq: AtomicU64,
-    lifecycle: LifecycleHub,
-    snapshots: SnapshotHub,
-    observation_closed: AtomicBool,
-    #[cfg(test)]
-    runtime_storage: Mutex<RuntimeStorage>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct RuntimeStorage {
-    children: usize,
-    child_slots: usize,
-    deadlines: usize,
-    deadline_slots: usize,
-}
-
-#[derive(Debug, Default)]
-struct ScopeControl {
-    current_epoch: u64,
-    live: bool,
-    last_stopped_epoch: u64,
-    shutdown: Option<ScopeRequest>,
-    force: Option<ScopeRequest>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ScopeRequest {
-    epoch: u64,
-    consumed: bool,
-}
-
-impl ScopeCell {
-    pub(crate) fn new(
-        member: Arc<MemberCell>,
-        flavor: ScopeFlavor,
-        child_identity: ScopeIdentity,
-    ) -> Arc<Self> {
-        let (config, _) = runtime::watch(crate::tree::ScopeConfig::default());
-        let (record, _) = runtime::watch(ScopeRecord {
-            state: ScopeState::Unstarted,
-            startup: None,
-            total_restarts: 0,
-        });
-        let (current_children, _) = runtime::watch(Vec::new());
-        let (parent, _) = runtime::watch(None);
-        Arc::new(Self {
-            member,
-            flavor,
-            child_identity: Mutex::new(child_identity),
-            config,
-            record,
-            control: Mutex::new(ScopeControl::default()),
-            current_dynamic: Mutex::new(None),
-            current_children,
-            parent,
-            observation_gate: Mutex::new(Arc::new(Mutex::new(()))),
-            lifecycle_sequence: Mutex::new(FenceCounter::new(0)),
-            lifecycle_seq: AtomicU64::new(0),
-            lifecycle: LifecycleHub::default(),
-            snapshots: SnapshotHub::default(),
-            observation_closed: AtomicBool::new(false),
-            #[cfg(test)]
-            runtime_storage: Mutex::new(RuntimeStorage::default()),
-        })
-    }
-
-    pub(crate) fn record(&self) -> ScopeRecord {
-        self.record.read_cloned()
-    }
-
-    #[cfg(test)]
-    fn runtime_storage(&self) -> RuntimeStorage {
-        *self
-            .runtime_storage
-            .lock()
-            .expect("runtime-storage mutex poisoned")
-    }
-
-    fn observation_gate(&self) -> Arc<Mutex<()>> {
-        Arc::clone(
-            &self
-                .observation_gate
-                .lock()
-                .expect("observation gate handoff mutex poisoned"),
-        )
-    }
-
-    fn adopt_observation_gate(&self, gate: &Arc<Mutex<()>>) {
-        loop {
-            let current = self.observation_gate();
-            if Arc::ptr_eq(&current, gate) {
-                return;
-            }
-
-            // An operation that passed `with_observation_gate`'s pointer
-            // check is allowed to finish its complete observation edge before
-            // the handoff. Conversely, an operation that only captured this
-            // gate will see the replacement after acquiring it and retry.
-            let current_guard = current
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut installed = self
-                .observation_gate
-                .lock()
-                .expect("observation gate handoff mutex poisoned");
-            if Arc::ptr_eq(&current, &installed) {
-                *installed = Arc::clone(gate);
-                drop(installed);
-                self.adopt_descendant_observation_gates_locked(&current, gate);
-                drop(current_guard);
-                return;
-            }
-            drop(installed);
-            drop(current_guard);
-        }
-    }
-
-    /// Re-homes a resident subtree while its former tree gate is held. The
-    /// caller also holds the destination gate, so observers cannot enter
-    /// either half of the tree while the handoff is being installed.
-    fn adopt_descendant_observation_gates_locked(
-        &self,
-        previous: &Arc<Mutex<()>>,
-        gate: &Arc<Mutex<()>>,
-    ) {
-        let descendants = self.current_children.read_with(|children| {
-            children
-                .iter()
-                .filter_map(|resident| resident.slot.scope.as_ref().cloned())
-                .collect::<Vec<_>>()
-        });
-        for descendant in descendants {
-            let mut installed = descendant
-                .observation_gate
-                .lock()
-                .expect("observation gate handoff mutex poisoned");
-            if Arc::ptr_eq(&installed, previous) {
-                *installed = Arc::clone(gate);
-            } else {
-                assert!(
-                    Arc::ptr_eq(&installed, gate),
-                    "one resident tree must share one observation gate"
-                );
-            }
-            drop(installed);
-            descendant.adopt_descendant_observation_gates_locked(previous, gate);
-        }
-    }
-
-    /// Runs against the cell's current tree gate. Adoption can race an early
-    /// pre-start observer, so a waiter that acquired an obsolete gate retries
-    /// before entering the observation critical section.
-    fn with_observation_gate<R>(&self, operation: impl FnOnce() -> R) -> R {
-        let mut operation = Some(operation);
-        loop {
-            let gate = self.observation_gate();
-            let guard = gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if Arc::ptr_eq(&gate, &self.observation_gate()) {
-                let operation = operation
-                    .take()
-                    .expect("observation operation runs exactly once");
-                let result = operation();
-                drop(guard);
-                return result;
-            }
-            drop(guard);
-        }
-    }
-
-    pub(crate) fn set_state(&self, state: ScopeState) {
-        self.with_observation_gate(|| {
-            self.record.send_modify(|record| {
-                if state == ScopeState::Starting {
-                    record.total_restarts = 0;
-                }
-                record.state = state.clone();
-            });
-            self.member.record.pulse();
-            self.emit_locked(LifecycleEventKind::ScopeState { state });
-        });
-    }
-
-    pub(crate) fn set_config(&self, config: crate::tree::ScopeConfig) {
-        self.with_observation_gate(|| {
-            self.config.replace(config);
-            self.publish_snapshot_chain_locked();
-        });
-    }
-
-    pub(crate) fn transition_child(
-        &self,
-        member: &MemberCell,
-        update: impl FnOnce(&mut MemberRecord),
-        event: Option<LifecycleEventKind>,
-    ) {
-        self.with_observation_gate(|| {
-            member.update_locked(update);
-            if let Some(event) = event {
-                self.emit_locked(event);
-            } else {
-                self.publish_snapshot_chain_locked();
-            }
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn emit(&self, event: LifecycleEventKind) {
-        self.with_observation_gate(|| self.emit_locked(event));
-    }
-
-    pub(crate) fn publish_child_restart(
-        &self,
-        member: &MemberCell,
-        total_restarts: u64,
-        update: impl FnOnce(&mut MemberRecord),
-        exited: LifecycleEventKind,
-        scheduled: LifecycleEventKind,
-    ) {
-        self.with_observation_gate(|| {
-            self.record.send_modify(|scope| {
-                scope.total_restarts = total_restarts;
-            });
-            member.update_locked(update);
-            self.emit_locked(exited);
-            self.emit_locked(scheduled);
-        });
-    }
-
-    pub(crate) fn terminalize_child(
-        &self,
-        member: &MemberCell,
-        exit: Exit,
-        exited_incarnation: Option<Incarnation>,
-        startup_aborted: bool,
-    ) -> bool {
-        self.with_observation_gate(|| {
-            if matches!(member.record().stage, MemberStage::Terminal(_)) {
-                return false;
-            }
-            member.update_locked(|record| record.startup_aborted = startup_aborted);
-            member.terminalize(exit.clone());
-            if let Some(incarnation) = exited_incarnation {
-                self.emit_locked(LifecycleEventKind::Exited {
-                    id: member.id().clone(),
-                    membership: member.membership(),
-                    incarnation,
-                    exit: exit.clone(),
-                });
-            }
-            let nested = self.current_children.read_with(|children| {
-                children
-                    .iter()
-                    .find(|resident| resident.slot.member.membership() == member.membership())
-                    .and_then(|resident| resident.slot.scope.as_ref())
-                    .cloned()
-            });
-            if let Some(scope) = nested {
-                scope.close_observation_locked();
-            }
-            true
-        })
-    }
-
-    pub(crate) fn prune_child(&self, member: &MemberCell) -> bool {
-        self.with_observation_gate(|| {
-            let membership = member.membership();
-            let mut resident = None;
-            let removed = self.current_children.send_if_modified(|children| {
-                let Some(index) = children
-                    .iter()
-                    .position(|child| child.slot.member.membership() == membership)
-                else {
-                    return false;
-                };
-                resident = Some(children.remove(index));
-                true
-            });
-            if !removed {
-                return false;
-            }
-            let resident = resident.expect("a reported removal owns its resident entry");
-            debug_assert_eq!(resident.slot.member.membership(), membership);
-            // Dropping residency while the observation gate is held emits the
-            // matching Removed edge through its owned completion.
-            drop(resident);
-            true
-        })
-    }
-
-    pub(crate) fn snapshot(&self) -> Arc<ScopeSnapshot> {
-        self.with_observation_gate(|| self.snapshot_locked())
-    }
-
-    pub(crate) fn subscribe_snapshots(&self) -> SnapshotReceiver {
-        self.with_observation_gate(|| {
-            let receiver = self.snapshots.subscribe(self.snapshot_locked());
-            if self.observation_closed.load(Ordering::Acquire) {
-                self.snapshots.close();
-            }
-            receiver
-        })
-    }
-
-    pub(crate) fn subscribe_lifecycle(&self) -> LifecycleEvents {
-        self.with_observation_gate(|| {
-            let events = self.lifecycle.subscribe();
-            if self.observation_closed.load(Ordering::Acquire) {
-                self.lifecycle.close();
-            }
-            events
-        })
-    }
-
-    fn snapshot_locked(&self) -> Arc<ScopeSnapshot> {
-        let record = self.record();
-        let config = self.config.read_cloned();
-        let children = self
-            .current_children
-            .read_with(|children| {
-                children
-                    .iter()
-                    .map(|resident| Arc::clone(&resident.slot))
-                    .collect::<Vec<_>>()
-            })
-            .into_iter()
-            .map(|slot| self.child_snapshot_locked(&slot))
-            .collect::<Vec<_>>();
-        Arc::new(ScopeSnapshot {
-            state: record.state,
-            kind: match self.flavor {
-                ScopeFlavor::Ordered => ScopeKind::Ordered,
-                ScopeFlavor::Dynamic => ScopeKind::Dynamic,
-            },
-            strategy: (self.flavor == ScopeFlavor::Ordered).then_some(config.strategy),
-            intensity: config.intensity,
-            total_restarts: record.total_restarts,
-            lifecycle_seq: self.lifecycle_seq.load(Ordering::Acquire),
-            children: children.into(),
-        })
-    }
-
-    fn child_snapshot_locked(&self, slot: &SlotCell) -> ChildSnapshot {
-        let record = slot.member.record();
-        let options = slot.member.options();
-        let terminal = matches!(record.stage, MemberStage::Terminal(_));
-        let nested = slot.scope.as_ref().and_then(|scope| {
-            (record.incarnation.is_some() || terminal).then(|| scope.snapshot_locked())
-        });
-        ChildSnapshot {
-            id: slot.member.id().clone(),
-            membership: slot.member.membership(),
-            incarnation: record.incarnation,
-            state: match record.stage {
-                MemberStage::Reserved | MemberStage::Admitted => ChildState::Admitted,
-                MemberStage::Starting => ChildState::Starting,
-                MemberStage::Running => ChildState::Running,
-                MemberStage::Restarting => ChildState::Restarting,
-                MemberStage::Stopping => ChildState::Stopping,
-                MemberStage::Terminal(exit) if record.startup_aborted => {
-                    ChildState::StartupAborted { exit }
-                }
-                MemberStage::Terminal(exit) => ChildState::Stopped { exit },
-            },
-            last_exit: record.last_exit,
-            membership_status: if record.removing {
-                MembershipStatus::Removing
-            } else {
-                MembershipStatus::Active
-            },
-            restart_count: record.restart_count,
-            restart_policy: options.restart,
-            retention: options.retention,
-            restart_at: record.restart_at,
-            nested,
-            scope_seq: slot
-                .scope
-                .as_ref()
-                .map(|scope| scope.lifecycle_seq.load(Ordering::Acquire)),
-        }
-    }
-
-    fn ancestors_locked(&self) -> Vec<Arc<ScopeCell>> {
-        let mut ancestors = Vec::new();
-        let mut current = self.parent.read_cloned().as_ref().and_then(Weak::upgrade);
-        while let Some(scope) = current {
-            current = scope.parent.read_cloned().as_ref().and_then(Weak::upgrade);
-            ancestors.push(scope);
-        }
-        ancestors
-    }
-
-    fn publish_snapshot_chain_locked(&self) {
-        self.snapshots.publish(|| self.snapshot_locked());
-        for ancestor in self.ancestors_locked() {
-            ancestor.snapshots.publish(|| ancestor.snapshot_locked());
-        }
-    }
-
-    fn emit_locked(&self, kind: LifecycleEventKind) {
-        let seq = self
-            .lifecycle_sequence
-            .lock()
-            .expect("lifecycle sequence mutex poisoned")
-            .mint_sequence();
-        let Some(seq) = seq else {
-            self.lifecycle_seq.store(u64::MAX, Ordering::Release);
-            self.publish_snapshot_chain_locked();
-            self.lifecycle.publish_lagged(1);
-            for ancestor in self.ancestors_locked() {
-                ancestor.lifecycle.publish_lagged(1);
-            }
-            return;
-        };
-        self.lifecycle_seq.store(seq, Ordering::Release);
-        self.publish_snapshot_chain_locked();
-
-        let scope = self.member.membership();
-        let mut event = LifecycleEvent {
-            scope_path: Vec::new(),
-            scope,
-            seq,
-            kind,
-        };
-        self.lifecycle.publish(event.clone());
-        let mut child_id = self.member.id().clone();
-        for ancestor in self.ancestors_locked() {
-            event.scope_path.insert(0, child_id);
-            child_id = ancestor.member.id().clone();
-            ancestor.lifecycle.publish(event.clone());
-        }
-    }
-
-    fn close_observation_locked(&self) {
-        if self.observation_closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.snapshots.close();
-        self.lifecycle.close();
-    }
-
-    pub(crate) fn set_startup(&self, startup: Result<(), StartupError>) {
-        let mut published = false;
-        self.record.modify_silently(|record| {
-            if record.startup.is_none() {
-                record.startup = Some(startup);
-                published = true;
-            }
-        });
-        if published {
-            // Before the record became watch-backed, startup waiters shared
-            // the member signal. Preserve that ordering boundary: publish the
-            // member-plane wake before releasing the startup result itself.
-            self.member.record.pulse();
-            self.record.pulse();
-        }
-    }
-
-    fn begin_incarnation(&self) -> u64 {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        control.current_epoch = control.current_epoch.saturating_add(1);
-        control.live = true;
-        let epoch = control.current_epoch;
-        drop(control);
-        self.member.record.pulse();
-        epoch
-    }
-
-    fn finish_incarnation(&self, epoch: u64, reason: StopReason) {
-        self.finish_incarnation_with_terminal(epoch, reason, None);
-    }
-
-    fn finish_root_incarnation(&self, epoch: u64, reason: StopReason, exit: Exit) {
-        self.finish_incarnation_with_terminal(epoch, reason, Some(exit));
-    }
-
-    fn finish_incarnation_with_terminal(
-        &self,
-        epoch: u64,
-        reason: StopReason,
-        terminal_exit: Option<Exit>,
-    ) {
-        self.with_observation_gate(|| {
-            let state = ScopeState::Stopped {
-                reason: reason.clone(),
-            };
-            self.record.modify_silently(|record| {
-                if record.startup.is_none() {
-                    record.startup = Some(Err(StartupError::ShutdownRequested));
-                }
-                record.state = state.clone();
-            });
-            let terminal = terminal_exit.is_some();
-            if let Some(exit) = terminal_exit {
-                self.member.terminalize(exit);
-            }
-            let mut control = self.control.lock().expect("scope control mutex poisoned");
-            if control.current_epoch == epoch {
-                control.live = false;
-                control.last_stopped_epoch = control.last_stopped_epoch.max(epoch);
-                if control
-                    .shutdown
-                    .is_some_and(|request| request.epoch <= epoch)
-                {
-                    control.shutdown = None;
-                }
-                if control.force.is_some_and(|request| request.epoch <= epoch) {
-                    control.force = None;
-                }
-            }
-            drop(control);
-            self.member.record.pulse();
-            // `wait_started` must not observe terminal startup until the member
-            // and incarnation-control planes above are consistent.
-            self.record.pulse();
-            self.emit_locked(LifecycleEventKind::ScopeState { state });
-            if terminal {
-                self.close_observation_locked();
-            }
-        });
-    }
-
-    fn finish_live_root_incarnation(&self, reason: StopReason, exit: Exit) {
-        let epoch = {
-            let control = self.control.lock().expect("scope control mutex poisoned");
-            control.live.then_some(control.current_epoch)
-        };
-        if let Some(epoch) = epoch {
-            self.finish_root_incarnation(epoch, reason, exit);
-        } else {
-            self.with_observation_gate(|| {
-                let state = ScopeState::Stopped { reason };
-                self.record.modify_silently(|record| {
-                    if record.startup.is_none() {
-                        record.startup = Some(Err(StartupError::ShutdownRequested));
-                    }
-                    record.state = state.clone();
-                });
-                self.member.terminalize(exit);
-                self.member.record.pulse();
-                self.record.pulse();
-                self.emit_locked(LifecycleEventKind::ScopeState { state });
-                self.close_observation_locked();
-            });
-        }
-    }
-
-    pub(crate) fn request_shutdown(&self) -> u64 {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        let pending_incarnation = !control.live;
-        let target = if control.live {
-            control.current_epoch
-        } else {
-            control.current_epoch.saturating_add(1)
-        };
-        if control
-            .shutdown
-            .is_none_or(|request| request.epoch < target)
-        {
-            control.shutdown = Some(ScopeRequest {
-                epoch: target,
-                consumed: false,
-            });
-        }
-        drop(control);
-        self.member.record.pulse();
-        // A nested scope has no live driver while its parent is retaining it
-        // in restart backoff. Wake that parent as well so it can start the
-        // pending incarnation immediately; that incarnation consumes the
-        // stop and begins the timeout-bounded teardown required by B.9.
-        if pending_incarnation
-            && let Some(parent) = self.parent.read_cloned().as_ref().and_then(Weak::upgrade)
-        {
-            parent.member.record.pulse();
-        }
-        target
-    }
-
-    fn has_pending_incarnation_shutdown(&self) -> bool {
-        let control = self.control.lock().expect("scope control mutex poisoned");
-        !control.live
-            && control.shutdown.is_some_and(|request| {
-                !request.consumed && request.epoch > control.last_stopped_epoch
-            })
-    }
-
-    fn has_stop_request(&self, epoch: u64) -> bool {
-        let control = self.control.lock().expect("scope control mutex poisoned");
-        control
-            .shutdown
-            .is_some_and(|request| request.epoch == epoch)
-            || control.force.is_some_and(|request| request.epoch == epoch)
-    }
-
-    fn take_shutdown_request(&self, epoch: u64) -> bool {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        match control.shutdown.as_mut() {
-            Some(request) if request.epoch == epoch && !request.consumed => {
-                request.consumed = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn force_shutdown(&self, epoch: u64) {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        if control.live && control.current_epoch == epoch {
-            control.force = Some(ScopeRequest {
-                epoch,
-                consumed: false,
-            });
-        }
-        drop(control);
-        self.member.record.pulse();
-    }
-
-    fn take_force_request(&self, epoch: u64) -> bool {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        match control.force.as_mut() {
-            Some(request) if request.epoch == epoch && !request.consumed => {
-                request.consumed = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn incarnation_finished(&self, epoch: u64) -> bool {
-        let control = self.control.lock().expect("scope control mutex poisoned");
-        control.last_stopped_epoch >= epoch
-    }
-
-    fn set_admitted_children(self: &Arc<Self>, children: Vec<Arc<SlotCell>>) {
-        self.with_observation_gate(|| {
-            let gate = self.observation_gate();
-            self.clear_residents_locked();
-            for child in children {
-                if let Some(scope) = &child.scope {
-                    scope.adopt_observation_gate(&gate);
-                    scope.parent.replace(Some(Arc::downgrade(self)));
-                }
-                child
-                    .member
-                    .update_locked(|record| record.stage = MemberStage::Admitted);
-                self.current_children.send_modify(|children| {
-                    children.push(ResidentChild::new(self, Arc::clone(&child)))
-                });
-                self.emit_locked(LifecycleEventKind::Added {
-                    id: child.member.id().clone(),
-                    membership: child.member.membership(),
-                });
-            }
-        });
-    }
-
-    fn admit_child(self: &Arc<Self>, child: &Arc<SlotCell>) {
-        self.with_observation_gate(|| {
-            let gate = self.observation_gate();
-            if let Some(scope) = &child.scope {
-                scope.adopt_observation_gate(&gate);
-                scope.parent.replace(Some(Arc::downgrade(self)));
-            }
-            self.current_children
-                .send_modify(|children| children.push(ResidentChild::new(self, Arc::clone(child))));
-            child
-                .member
-                .update_locked(|record| record.stage = MemberStage::Admitted);
-            self.emit_locked(LifecycleEventKind::Added {
-                id: child.member.id().clone(),
-                membership: child.member.membership(),
-            });
-        });
-    }
-
-    pub(crate) fn clear_residents(&self) {
-        self.with_observation_gate(|| self.clear_residents_locked());
-    }
-
-    fn clear_residents_locked(&self) {
-        let residents = self.current_children.take();
-        // Each entry's owned completion emits Removed. Drop the vector only
-        // after releasing the child-set watch value guard so snapshot publication can
-        // project the now-empty set while this observation gate stays held.
-        drop(residents);
-    }
-
-    fn set_dynamic(&self, control: Option<Arc<DynamicControl>>) {
-        *self
-            .current_dynamic
-            .lock()
-            .expect("scope dynamic-control mutex poisoned") = control;
-        self.member.record.pulse();
-    }
-
-    fn dynamic(&self) -> Option<Arc<DynamicControl>> {
-        self.current_dynamic
-            .lock()
-            .expect("scope dynamic-control mutex poisoned")
-            .clone()
-    }
-
-    pub(crate) fn signal(&self) -> &runtime::WatchSender<MemberRecord> {
-        &self.member.record
-    }
-
-    pub(crate) async fn wait_started(&self) -> Result<(), StartupError> {
-        let mut watcher = self.record.watcher();
-        loop {
-            if let Some(result) = watcher.borrow_and_update_cloned().startup {
-                return result;
-            }
-            watcher.changed().await;
-        }
-    }
-
-    pub(crate) async fn wait_stopped(&self) -> StopReason {
-        self.member.wait_terminal().await;
-        match self.record().state {
-            ScopeState::Stopped { reason } => reason,
-            ScopeState::Unstarted
-            | ScopeState::Starting
-            | ScopeState::Running
-            | ScopeState::StartupFailed
-            | ScopeState::Draining => StopReason::NeverStarted,
-        }
-    }
-
-    pub(crate) fn terminalize_never_started(&self) {
-        self.with_observation_gate(|| {
-            if self.observation_closed.load(Ordering::Acquire) {
-                return;
-            }
-            self.member.terminalize(Exit::never_started());
-            self.record.modify_silently(|record| {
-                if record.startup.is_none() {
-                    record.startup = Some(Err(StartupError::ShutdownRequested));
-                }
-                record.state = ScopeState::Stopped {
-                    reason: StopReason::NeverStarted,
-                };
-            });
-            self.member.record.pulse();
-            self.record.pulse();
-            self.emit_locked(LifecycleEventKind::ScopeState {
-                state: ScopeState::Stopped {
-                    reason: StopReason::NeverStarted,
-                },
-            });
-            self.close_observation_locked();
-        });
     }
 }
 
@@ -1295,6 +235,14 @@ impl DynamicControl {
     }
 }
 
+fn dynamic_control(scope: &ScopeCell) -> Option<Arc<DynamicControl>> {
+    scope.dynamic_route()?.resolve().ok()
+}
+
+fn resident_projection(slot: &SlotCell) -> ResidentProjection {
+    ResidentProjection::new(Arc::clone(&slot.member), slot.scope.clone())
+}
+
 pub(crate) struct DynamicReservation {
     pub(crate) slot: Arc<SlotCell>,
     pub(crate) control: Arc<DynamicControl>,
@@ -1308,7 +256,7 @@ pub(crate) fn reserve_dynamic(
     if matches!(scope.member.record().stage, MemberStage::Terminal(_)) {
         return Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal));
     }
-    let control = scope.dynamic().ok_or(ReserveError::NotAdmitting(
+    let control = dynamic_control(scope).ok_or(ReserveError::NotAdmitting(
         NotAdmittingCause::NoLiveIncarnation,
     ))?;
     match scope.record().state {
@@ -1435,7 +383,7 @@ pub(crate) fn remove_dynamic(
     ) {
         return completed_removal(RemoveOutcome::AlreadyAbsent);
     }
-    let Some(control) = scope.dynamic() else {
+    let Some(control) = dynamic_control(scope) else {
         return completed_removal(RemoveOutcome::AlreadyAbsent);
     };
     let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
@@ -1556,12 +504,7 @@ impl SystemRun {
 }
 
 fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<ShutdownStraggler>) {
-    let children = scope.current_children.read_with(|children| {
-        children
-            .iter()
-            .map(|resident| Arc::clone(&resident.slot))
-            .collect::<Vec<_>>()
-    });
+    let children = scope.resident_projections();
     for child in children {
         if matches!(child.member.record().stage, MemberStage::Terminal(_))
             || child.member.terminal_disposal_pending()
@@ -2029,7 +972,7 @@ impl Drop for ScopeRuntime {
     fn drop(&mut self) {
         let dynamic_entries = if let Some(dynamic) = &self.dynamic {
             let entries = dynamic.close();
-            self.root.set_dynamic(None);
+            self.root.set_dynamic_route(None);
             Some(entries)
         } else {
             None
@@ -2157,16 +1100,12 @@ impl ScopeRuntime {
 
     #[cfg(test)]
     fn record_storage(&self) {
-        *self
-            .root
-            .runtime_storage
-            .lock()
-            .expect("runtime-storage mutex poisoned") = RuntimeStorage {
+        self.root.record_runtime_storage(RuntimeStorage {
             children: self.children.len(),
             child_slots: self.children.storage_len(),
             deadlines: self.deadlines.len(),
             deadline_slots: self.deadlines.storage_len(),
-        };
+        });
     }
 
     fn spawn_child(&mut self, key: ChildKey) {
@@ -3365,7 +2304,7 @@ impl ScopeRuntime {
                 return;
             }
         };
-        self.root.admit_child(&request.slot);
+        self.root.admit_child(resident_projection(&request.slot));
         #[cfg(test)]
         self.record_storage();
         request.complete(Ok(()));
@@ -3503,7 +2442,7 @@ fn mint_child_incarnation(slot: &Arc<SlotCell>, counter: &mut FenceCounter) -> O
             if record.last_incarnation.is_none() {
                 scope.terminalize_never_started();
             } else {
-                scope.with_observation_gate(|| scope.close_observation_locked());
+                scope.close_observation();
             }
         }
     }
@@ -3600,12 +2539,12 @@ async fn run_scope_incarnation(
             );
         }
         drop(state);
-        root.set_dynamic(Some(Arc::clone(control)));
+        root.set_dynamic_route(Some(DynamicRoute::new(Arc::clone(control))));
     }
     root.set_admitted_children(
         plan.children
             .iter()
-            .map(|child| Arc::clone(&child.slot))
+            .map(|child| resident_projection(&child.slot))
             .collect(),
     );
     // Transfer children one at a time. The not-yet-converted suffix remains
@@ -3903,8 +2842,8 @@ mod tests {
         ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
         MemberCell, MemberStage, Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell,
         ScopeFlavor, ScopePhase, ScopeRuntime, StartupPhase, complete_removals, driver_event_class,
-        mint_child_incarnation, report_channel, restart_shutdown_work, run_nested_tree,
-        run_scope_incarnation,
+        dynamic_control, mint_child_incarnation, report_channel, resident_projection,
+        restart_shutdown_work, run_nested_tree, run_scope_incarnation,
     };
 
     fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
@@ -3953,7 +2892,7 @@ mod tests {
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
         let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
 
-        root.set_admitted_children(vec![slot]);
+        root.set_admitted_children(vec![resident_projection(&slot)]);
 
         assert!(Arc::ptr_eq(
             &root.observation_gate(),
@@ -3967,14 +2906,14 @@ mod tests {
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
         let leaf = isolated_scope("leaf", ScopeFlavor::Ordered);
         let leaf_slot = SlotCell::new(Arc::clone(&leaf.member), Some(Arc::clone(&leaf)));
-        nested.set_admitted_children(vec![leaf_slot]);
+        nested.set_admitted_children(vec![resident_projection(&leaf_slot)]);
         assert!(Arc::ptr_eq(
             &nested.observation_gate(),
             &leaf.observation_gate()
         ));
 
         let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-        root.set_admitted_children(vec![nested_slot]);
+        root.set_admitted_children(vec![resident_projection(&nested_slot)]);
 
         let root_gate = root.observation_gate();
         assert!(Arc::ptr_eq(&root_gate, &nested.observation_gate()));
@@ -4006,10 +2945,7 @@ mod tests {
         // Model the instant at which adoption owns the old gate and publishes
         // the replacement. The waiting observer must acquire the old gate,
         // detect this handoff, and retry on the root gate.
-        *nested
-            .observation_gate
-            .lock()
-            .expect("observation gate handoff mutex remains healthy") = root.observation_gate();
+        nested.replace_observation_gate(root.observation_gate());
         drop(held);
         worker.join().expect("observer follows the gate handoff");
 
@@ -4064,7 +3000,7 @@ mod tests {
         root.set_admitted_children(
             plan.children
                 .iter()
-                .map(|child| Arc::clone(&child.slot))
+                .map(|child| resident_projection(&child.slot))
                 .collect(),
         );
         let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
@@ -4202,7 +3138,7 @@ mod tests {
         let adopting_root = Arc::clone(&root);
         let (adopted, adopted_receiver) = std::sync::mpsc::sync_channel(0);
         let adoption = std::thread::spawn(move || {
-            adopting_root.set_admitted_children(vec![slot]);
+            adopting_root.set_admitted_children(vec![resident_projection(&slot)]);
             adopted.send(()).expect("test receiver remains available");
         });
 
@@ -4748,7 +3684,7 @@ mod tests {
         });
         let waker = Waker::from(Arc::clone(&probe));
         let mut context = Context::from_waker(&waker);
-        let mut watcher = member.record.watcher();
+        let mut watcher = member.record_watcher();
         let mut changed = Box::pin(watcher.changed());
         assert!(changed.as_mut().poll(&mut context).is_pending());
 
@@ -4813,11 +3749,7 @@ mod tests {
         let mailbox = MailboxCell::new(member.id().clone());
         let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
         let first_exit = Exit::never_started();
-        member
-            .mailbox
-            .lock()
-            .expect("member mailbox mutex poisoned")
-            .terminal = Some(first_exit.clone());
+        member.stage_terminal_before_mailbox(first_exit.clone());
         let probe = Arc::new(ObserveMemberOnMailboxWake {
             member: Arc::clone(&member),
             competing_exit: Exit::new(ExitKind::Completed, false),
@@ -4900,7 +3832,7 @@ mod tests {
             observed: Mutex::new(None),
         });
         let waker = Waker::from(Arc::clone(&probe));
-        let mut watcher = scope.record.watcher();
+        let mut watcher = scope.record_watcher();
         let mut changed = Box::pin(watcher.changed());
         assert!(
             changed
@@ -4946,7 +3878,7 @@ mod tests {
             observed: Mutex::new(None),
         });
         let waker = Waker::from(Arc::clone(&probe));
-        let mut watcher = scope.record.watcher();
+        let mut watcher = scope.record_watcher();
         let mut changed = Box::pin(watcher.changed());
         assert!(
             changed
@@ -5014,7 +3946,7 @@ mod tests {
                 .expect("child membership available"),
         );
         let slot = SlotCell::new(Arc::clone(&member), None);
-        root.set_admitted_children(vec![Arc::clone(&slot)]);
+        root.set_admitted_children(vec![resident_projection(&slot)]);
         let (events, _receiver) = crate::runtime::bounded_mpsc(1);
         let control = DynamicControl::new(&root, events);
         let (sender, mut response) = crate::runtime::oneshot();
@@ -5056,11 +3988,8 @@ mod tests {
         let system = DynamicTree::new().spawn().expect("runtime is available");
         let root = system.scope();
         system.wait_started().await.expect("dynamic root starts");
-        let control = root
-            .as_scope()
-            .cell
-            .dynamic()
-            .expect("running dynamic root has a control");
+        let control =
+            dynamic_control(&root.as_scope().cell).expect("running dynamic root has a control");
         let weak = Arc::downgrade(&control);
         drop(control);
 
@@ -5222,10 +4151,7 @@ mod tests {
             ScopeFlavor::Ordered,
             ScopeIdentity::new().expect("child identity available"),
         );
-        *scope
-            .lifecycle_sequence
-            .lock()
-            .expect("lifecycle sequence mutex poisoned") = FenceCounter::near_exhaustion(0);
+        scope.set_lifecycle_sequence(FenceCounter::near_exhaustion(0));
         let mut events = scope.subscribe_lifecycle();
 
         scope.emit(LifecycleEventKind::ScopeState {

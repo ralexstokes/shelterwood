@@ -16,7 +16,8 @@ use std::{
 use crate::{
     ActorRef, CancellationToken, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown,
     PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef, Shutdown,
-    mailbox::{MailboxCell, MailboxControl, MailboxReceiver},
+    cells::{MailboxControl, MemberCell},
+    mailbox::{MailboxCell, MailboxReceiver},
     policy::CommonOptions,
     runtime::{self, ActorWork, Latch, Signal, SignalWatcher},
 };
@@ -1746,7 +1747,7 @@ pub(crate) enum RawSource {
 pub(crate) struct RawRunContext {
     pub(crate) id: ChildId,
     pub(crate) incarnation: Incarnation,
-    pub(crate) member: Arc<crate::driver::MemberCell>,
+    pub(crate) member: Arc<MemberCell>,
     pub(crate) scope: ScopeRef,
     pub(crate) shutdown: Latch,
     pub(crate) abort: Latch,

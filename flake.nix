@@ -62,6 +62,7 @@
                   target/doc/shelterwood.json
                 ${pkgs.bash}/bin/bash ./tools/check-runtime-paths.sh
                 ${pkgs.bash}/bin/bash ./tools/check-exit-paths.sh
+                ${pkgs.bash}/bin/bash ./tools/check-layering-paths.sh
                 ${pkgs.bash}/bin/bash ./tools/sync-packaged-docs.sh --check
                 ${pkgs.bash}/bin/bash ./tools/check-packaged-crate.sh
               '';

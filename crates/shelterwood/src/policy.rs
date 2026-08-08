@@ -2,6 +2,13 @@
 
 use std::{fmt, num::NonZeroUsize, time::Duration};
 
+/// Whether a scope has fixed ordered membership or runtime-dynamic membership.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScopeFlavor {
+    Ordered,
+    Dynamic,
+}
+
 /// The default bounded FIFO mailbox capacity.
 pub const DEFAULT_MAILBOX_CAPACITY: usize = 64;
 /// The default child shutdown grace.

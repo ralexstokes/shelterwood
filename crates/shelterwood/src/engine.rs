@@ -133,7 +133,18 @@ impl StopLadder {
                     Shutdown::Abort => Duration::ZERO,
                 };
                 self.phase = StopPhase::Escalated;
-                self.deadline = Deadline::after(now, tidy_abort_beat(grace)).instant();
+                // A forced ladder is the `Abort` policy's zero-grace point on
+                // this same ladder (§10), so it takes the zero-grace tidy beat
+                // rather than one scaled to the grace force just skipped. The
+                // `after_grace` provenance above is unaffected: whether grace
+                // actually expired is a separate fact from how long the beat
+                // between escalation and hard abort runs.
+                let beat = if self.force_requested {
+                    Duration::ZERO
+                } else {
+                    grace
+                };
+                self.deadline = Deadline::after(now, tidy_abort_beat(beat)).instant();
                 Some(StopAction::Escalate)
             }
             StopPhase::Escalated if self.deadline.is_some_and(|deadline| now >= deadline) => {
@@ -552,7 +563,7 @@ mod tests {
     use super::{
         ArbitrationClass, DeadlineHandle, DeadlineQueue, ExitDispatch, IntensityState,
         MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode,
-        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
+        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
     };
 
     #[test]
@@ -611,6 +622,22 @@ mod tests {
         let tidy = ladder
             .deadline()
             .expect("forced ladder keeps its tidy beat");
+        assert_eq!(
+            tidy,
+            start + tidy_abort_beat(Duration::ZERO),
+            "a forced ladder takes the zero-grace tidy beat, not one scaled \
+             to the grace it skipped"
+        );
+
+        let mut unforced = StopLadder::new(Shutdown::Graceful { grace });
+        assert_eq!(unforced.advance(start), Some(StopAction::Cancel));
+        assert_eq!(unforced.advance(start + grace), Some(StopAction::Escalate));
+        assert_eq!(
+            unforced.deadline(),
+            Some(start + grace + tidy_abort_beat(grace)),
+            "an unforced ladder still scales its tidy beat to its grace"
+        );
+
         ladder.force(start);
         assert_eq!(
             ladder.advance(start),

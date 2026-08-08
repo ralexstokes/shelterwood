@@ -16,7 +16,7 @@ use std::{
 use crate::{
     ChildId, Incarnation, Mailbox, Membership,
     cells::{MailboxControl, MailboxDisposal, MailboxStats, MailboxTermination, MemberCell},
-    runtime::{OneShotReceiver, OneShotSender, Signal, SignalWatcher},
+    runtime::{OneShotClose, OneShotReceiver, OneShotSender, Signal, SignalWatcher},
 };
 
 /// The kind of a failed actor send.
@@ -173,9 +173,11 @@ trait DeadlineOperation {
 
     /// Polls the operation before or after the shared deadline transition.
     ///
-    /// An elapsed poll must resolve. It is a second operation poll after the
-    /// timer becomes ready so completion or acceptance at the exact boundary
-    /// wins before operation-specific timeout cleanup runs.
+    /// This is a second operation poll after the timer becomes ready so
+    /// completion or acceptance at the exact boundary wins before
+    /// operation-specific timeout cleanup runs. It may remain pending only
+    /// when an atomic completion transition won but has not published its
+    /// payload yet; that transition must wake the registered operation waker.
     fn poll_deadlined(
         &mut self,
         context: &mut Context<'_>,
@@ -225,7 +227,6 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             .expect("a started deadline future retains its captured budget");
         if this.duration.is_zero() {
             let result = this.operation.poll_deadlined(context, budget, true);
-            debug_assert!(result.is_ready(), "an elapsed operation must resolve");
             this.done = result.is_ready();
             return result;
         }
@@ -244,7 +245,6 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             return Poll::Pending;
         }
         let result = this.operation.poll_deadlined(context, budget, true);
-        debug_assert!(result.is_ready(), "an elapsed operation must resolve");
         this.done = result.is_ready();
         result
     }
@@ -339,11 +339,12 @@ impl<T> DeadlineOperation for ReplyOperation<T> {
         match self.receiver.poll_receive(context) {
             Poll::Ready(Some(value)) => Poll::Ready(Ok(value)),
             Poll::Ready(None) => Poll::Ready(Err(ReplyError::Dropped)),
-            Poll::Pending if elapsed => Poll::Ready(
-                self.receiver
-                    .close_and_try_receive()
-                    .ok_or(ReplyError::Timeout),
-            ),
+            Poll::Pending if elapsed => match self.receiver.close_and_poll_receive(context) {
+                OneShotClose::Value(value) => Poll::Ready(Ok(value)),
+                OneShotClose::SenderClosed => Poll::Ready(Err(ReplyError::Dropped)),
+                OneShotClose::Empty => Poll::Ready(Err(ReplyError::Timeout)),
+                OneShotClose::Pending => Poll::Pending,
+            },
             Poll::Pending => Poll::Pending,
         }
     }
@@ -1570,24 +1571,27 @@ impl<M, T> CallOperation<M, T> {
                 incarnation_observed: Some(incarnation),
                 kind: CallErrorKind::ReplyDropped,
             })),
-            Poll::Pending if deadline_elapsed => {
-                if let Some(value) = reply.close_and_try_receive() {
-                    Poll::Ready(Ok(Replied { value, incarnation }))
-                } else {
-                    Poll::Ready(Err(CallError {
-                        actor_id: self.actor.id().clone(),
-                        incarnation_observed: Some(incarnation),
-                        kind: CallErrorKind::ResponseTimedOut,
-                    }))
-                }
-            }
+            Poll::Pending if deadline_elapsed => match reply.close_and_poll_receive(context) {
+                OneShotClose::Value(value) => Poll::Ready(Ok(Replied { value, incarnation })),
+                OneShotClose::SenderClosed => Poll::Ready(Err(CallError {
+                    actor_id: self.actor.id().clone(),
+                    incarnation_observed: Some(incarnation),
+                    kind: CallErrorKind::ReplyDropped,
+                })),
+                OneShotClose::Empty => Poll::Ready(Err(CallError {
+                    actor_id: self.actor.id().clone(),
+                    incarnation_observed: Some(incarnation),
+                    kind: CallErrorKind::ResponseTimedOut,
+                })),
+                OneShotClose::Pending => Poll::Pending,
+            },
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn close_reply(&mut self) {
         if let Some(reply) = &mut self.reply {
-            let _ = reply.close_and_try_receive();
+            reply.close();
         }
     }
 }

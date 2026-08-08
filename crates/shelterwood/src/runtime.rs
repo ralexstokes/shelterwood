@@ -8,7 +8,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -373,24 +373,96 @@ impl Latch {
     }
 }
 
+const ONESHOT_OPEN: u8 = 0;
+const ONESHOT_SENDING: u8 = 1;
+const ONESHOT_SENT: u8 = 2;
+const ONESHOT_SENDER_CLOSED: u8 = 3;
+const ONESHOT_RECEIVER_CLOSED: u8 = 4;
+
 /// Sending half of a runtime-backed single-delivery channel.
-pub(crate) struct OneShotSender<T>(oneshot::Sender<T>);
+pub(crate) struct OneShotSender<T> {
+    channel: Option<oneshot::Sender<T>>,
+    state: Arc<AtomicU8>,
+}
 
 /// Receiving half of a runtime-backed single-delivery channel.
-pub(crate) struct OneShotReceiver<T>(oneshot::Receiver<T>);
+pub(crate) struct OneShotReceiver<T> {
+    channel: oneshot::Receiver<T>,
+    state: Arc<AtomicU8>,
+}
+
+/// Outcome after atomically closing a single-delivery receive side.
+pub(crate) enum OneShotClose<T> {
+    /// A value was sent before the receiver closed.
+    Value(T),
+    /// The sender was dropped before the receiver closed.
+    SenderClosed,
+    /// The receiver closed while the sender was still live and empty.
+    Empty,
+    /// The send transition won but has not published its value yet.
+    Pending,
+}
 
 pub(crate) fn oneshot<T>() -> (OneShotSender<T>, OneShotReceiver<T>) {
-    let (sender, receiver) = oneshot::channel();
-    (OneShotSender(sender), OneShotReceiver(receiver))
+    let (channel_sender, channel_receiver) = oneshot::channel();
+    let state = Arc::new(AtomicU8::new(ONESHOT_OPEN));
+    (
+        OneShotSender {
+            channel: Some(channel_sender),
+            state: Arc::clone(&state),
+        },
+        OneShotReceiver {
+            channel: channel_receiver,
+            state,
+        },
+    )
 }
 
 impl<T> OneShotSender<T> {
-    pub(crate) fn send(self, value: T) -> Result<(), T> {
-        self.0.send(value)
+    pub(crate) fn send(mut self, value: T) -> Result<(), T> {
+        if self
+            .state
+            .compare_exchange(
+                ONESHOT_OPEN,
+                ONESHOT_SENDING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(value);
+        }
+        let sender = self
+            .channel
+            .take()
+            .expect("a live one-shot sender retains its channel");
+        match sender.send(value) {
+            Ok(()) => {
+                self.state.store(ONESHOT_SENT, Ordering::Release);
+                Ok(())
+            }
+            Err(value) => {
+                self.state.store(ONESHOT_RECEIVER_CLOSED, Ordering::Release);
+                Err(value)
+            }
+        }
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.0.is_closed()
+        self.channel.as_ref().is_none_or(oneshot::Sender::is_closed)
+    }
+}
+
+impl<T> Drop for OneShotSender<T> {
+    fn drop(&mut self) {
+        if self.channel.is_some() {
+            let _ = self.state.compare_exchange(
+                ONESHOT_OPEN,
+                ONESHOT_SENDER_CLOSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
     }
 }
 
@@ -399,26 +471,59 @@ impl<T> OneShotReceiver<T> {
         &mut self,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<T>> {
-        Pin::new(&mut self.0).poll(context).map(Result::ok)
+        Pin::new(&mut self.channel).poll(context).map(Result::ok)
     }
 
-    /// Closes the receive side and returns a value whose send won the race.
+    /// Closes the receive side unless send or sender-drop won first.
     ///
-    /// `tokio::sync::oneshot` makes `close` atomic with `send`; checking the
-    /// slot after closing therefore gives deadline users one transition point
-    /// at which an already-completed delivery wins and every later send loses.
-    pub(crate) fn close_and_try_receive(&mut self) -> Option<T> {
-        self.0.close();
-        self.0.try_recv().ok()
+    /// The shared transition word distinguishes sender-drop from receiver
+    /// close, which Tokio's post-close `try_recv` result alone cannot do. A
+    /// send that wins but is preempted before publishing returns `Pending`;
+    /// the preceding channel poll registered the wake for its completion.
+    pub(crate) fn close_and_poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> OneShotClose<T> {
+        match self.state.compare_exchange(
+            ONESHOT_OPEN,
+            ONESHOT_RECEIVER_CLOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.channel.close();
+                OneShotClose::Empty
+            }
+            Err(ONESHOT_SENDER_CLOSED) => OneShotClose::SenderClosed,
+            Err(ONESHOT_SENDING) | Err(ONESHOT_SENT) => {
+                match Pin::new(&mut self.channel).poll(context) {
+                    std::task::Poll::Ready(Ok(value)) => OneShotClose::Value(value),
+                    std::task::Poll::Ready(Err(_)) => OneShotClose::SenderClosed,
+                    std::task::Poll::Pending => OneShotClose::Pending,
+                }
+            }
+            Err(ONESHOT_RECEIVER_CLOSED) => OneShotClose::Empty,
+            Err(other) => unreachable!("unknown one-shot transition state {other}"),
+        }
+    }
+
+    pub(crate) fn close(&mut self) {
+        let _ = self.state.compare_exchange(
+            ONESHOT_OPEN,
+            ONESHOT_RECEIVER_CLOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.channel.close();
     }
 
     pub(crate) async fn receive(self) -> Option<T> {
-        self.0.await.ok()
+        self.channel.await.ok()
     }
 
     #[cfg(test)]
     pub(crate) fn try_receive(&mut self) -> Option<T> {
-        self.0.try_recv().ok()
+        self.channel.try_recv().ok()
     }
 }
 
@@ -823,7 +928,8 @@ mod tests {
     };
 
     use super::{
-        DisposalJob, JoinOutcome, Latch, Signal, Timeout, join, spawn, timeout, yield_now,
+        DisposalJob, JoinOutcome, Latch, OneShotClose, Signal, Timeout, join, oneshot, spawn,
+        timeout, yield_now,
     };
 
     struct PanickingDrop(Arc<AtomicUsize>);
@@ -854,6 +960,31 @@ mod tests {
             diagnostic.as_ref(),
             Some(Some(Some(message))) if message == "cancelled disposal job payload"
         ));
+    }
+
+    #[test]
+    fn closing_oneshot_distinguishes_value_sender_drop_and_receiver_win() {
+        let mut context = Context::from_waker(Waker::noop());
+        let (sender, mut receiver) = oneshot();
+        sender.send(1_u8).expect("receiver is live");
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::Value(1)
+        ));
+
+        let (sender, mut receiver) = oneshot::<u8>();
+        drop(sender);
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::SenderClosed
+        ));
+
+        let (sender, mut receiver) = oneshot::<u8>();
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::Empty
+        ));
+        assert_eq!(sender.send(1), Err(1));
     }
 
     #[test]

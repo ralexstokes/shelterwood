@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::{
-    Exit, Intensity, RestartPolicy, Shutdown, deadline::Deadline, policy::tidy_abort_beat,
+    Exit, Intensity, Readiness, RestartPolicy, Shutdown, deadline::Deadline, exit::StopReason,
+    policy::tidy_abort_beat,
 };
 
 /// Deterministic priority when one driver wake exposes several events.
@@ -268,6 +269,23 @@ impl RestartState {
     pub(crate) fn settled(&mut self) {
         self.attempt = 0;
     }
+
+    /// Resets the consecutive-attempt counter after one stable incarnation.
+    ///
+    /// Saturating elapsed time deliberately treats a clock regression as a
+    /// zero-length run, so it cannot accidentally forgive restart pressure.
+    pub(crate) fn settle_if_stable(
+        &mut self,
+        started_at: Instant,
+        stopped_at: Instant,
+        stable_for: Duration,
+    ) -> bool {
+        if stopped_at.saturating_duration_since(started_at) < stable_for {
+            return false;
+        }
+        self.settled();
+        true
+    }
 }
 
 /// Complete restart verdict consumed verbatim by the scope driver.
@@ -302,17 +320,34 @@ pub(crate) fn schedule_restart(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReadinessGate {
+enum ReadinessState {
+    Unconfigured,
     Immediate,
     Waiting { deadline: Option<Instant> },
     Ready,
     Disarmed,
 }
 
+/// The authoritative per-incarnation readiness state machine.
+///
+/// The shell only applies returned effects (publish ready, arm/cancel a
+/// deadline, or begin timeout shutdown); it never assigns readiness state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadinessGate {
+    state: ReadinessState,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadinessEvent {
+    Configure {
+        readiness: Readiness,
+        deadline: Option<Instant>,
+    },
     Signal,
-    Deadline(Instant),
+    Deadline {
+        now: Instant,
+        signal_seen: bool,
+    },
     Shutdown,
     Exit,
 }
@@ -320,33 +355,308 @@ pub(crate) enum ReadinessEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadinessEffect {
     BecameReady,
+    ArmDeadline { deadline: Instant },
     TimedOut { deadline: Instant },
     Disarmed,
 }
 
 impl ReadinessGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: ReadinessState::Unconfigured,
+        }
+    }
+
+    /// Whether a retained signal watcher is needed for this incarnation.
+    pub(crate) fn needs_signal_watch(self) -> bool {
+        matches!(
+            self.state,
+            ReadinessState::Unconfigured | ReadinessState::Waiting { .. }
+        )
+    }
+
     pub(crate) fn step(&mut self, event: ReadinessEvent) -> Option<ReadinessEffect> {
-        match (*self, event) {
-            (Self::Immediate, _) | (Self::Ready, _) | (Self::Disarmed, _) => None,
-            (Self::Waiting { .. }, ReadinessEvent::Signal) => {
-                *self = Self::Ready;
+        match (self.state, event) {
+            (
+                ReadinessState::Unconfigured,
+                ReadinessEvent::Configure {
+                    readiness: Readiness::Immediate,
+                    ..
+                },
+            ) => {
+                self.state = ReadinessState::Immediate;
                 Some(ReadinessEffect::BecameReady)
             }
             (
-                Self::Waiting {
+                ReadinessState::Unconfigured,
+                ReadinessEvent::Configure {
+                    readiness: Readiness::Manual | Readiness::AfterInit,
+                    deadline,
+                },
+            ) => {
+                self.state = ReadinessState::Waiting { deadline };
+                deadline.map(|deadline| ReadinessEffect::ArmDeadline { deadline })
+            }
+            (ReadinessState::Waiting { .. }, ReadinessEvent::Signal)
+            | (
+                ReadinessState::Waiting { .. },
+                ReadinessEvent::Deadline {
+                    signal_seen: true, ..
+                },
+            ) => {
+                self.state = ReadinessState::Ready;
+                Some(ReadinessEffect::BecameReady)
+            }
+            (
+                ReadinessState::Waiting {
                     deadline: Some(deadline),
                 },
-                ReadinessEvent::Deadline(now),
+                ReadinessEvent::Deadline {
+                    now,
+                    signal_seen: false,
+                },
             ) if now >= deadline => {
-                *self = Self::Disarmed;
+                self.state = ReadinessState::Disarmed;
                 Some(ReadinessEffect::TimedOut { deadline })
             }
-            (Self::Waiting { .. }, ReadinessEvent::Shutdown | ReadinessEvent::Exit) => {
-                *self = Self::Disarmed;
+            (
+                ReadinessState::Unconfigured | ReadinessState::Waiting { .. },
+                ReadinessEvent::Shutdown | ReadinessEvent::Exit,
+            ) => {
+                self.state = ReadinessState::Disarmed;
                 Some(ReadinessEffect::Disarmed)
             }
-            (Self::Waiting { .. }, ReadinessEvent::Deadline(_)) => None,
+            (
+                ReadinessState::Waiting { .. },
+                ReadinessEvent::Deadline {
+                    signal_seen: false, ..
+                },
+            )
+            | (ReadinessState::Immediate | ReadinessState::Ready | ReadinessState::Disarmed, _)
+            | (
+                ReadinessState::Unconfigured,
+                ReadinessEvent::Signal | ReadinessEvent::Deadline { .. },
+            )
+            | (ReadinessState::Waiting { .. }, ReadinessEvent::Configure { .. }) => None,
         }
+    }
+}
+
+/// Cross-incarnation liveness encoded once as an epoch state, rather than an
+/// epoch pair plus an independently mutable `live` bit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScopeEpochs {
+    Idle { last_stopped: u64 },
+    Live { current: u64, last_stopped: u64 },
+    Exhausted { last_stopped: u64 },
+}
+
+impl Default for ScopeEpochs {
+    fn default() -> Self {
+        Self::Idle { last_stopped: 0 }
+    }
+}
+
+impl ScopeEpochs {
+    pub(crate) fn begin(&mut self) -> Option<u64> {
+        let last_stopped = match *self {
+            Self::Idle { last_stopped } => last_stopped,
+            // One scope cell cannot own two simultaneous drivers. Rejecting
+            // a second begin also prevents it from invalidating the live
+            // driver's epoch while trying to advance the counter.
+            Self::Live { .. } | Self::Exhausted { .. } => return None,
+        };
+        let Some(current) = last_stopped.checked_add(1) else {
+            *self = Self::Exhausted { last_stopped };
+            return None;
+        };
+        // Reserve MAX as poison so no observable epoch can alias the
+        // permanently exhausted state.
+        if current == u64::MAX {
+            *self = Self::Exhausted { last_stopped };
+            return None;
+        }
+        *self = Self::Live {
+            current,
+            last_stopped,
+        };
+        Some(current)
+    }
+
+    pub(crate) fn live_epoch(self) -> Option<u64> {
+        match self {
+            Self::Idle { .. } | Self::Exhausted { .. } => None,
+            Self::Live { current, .. } => Some(current),
+        }
+    }
+
+    pub(crate) fn request_target(self) -> Option<(u64, bool)> {
+        match self {
+            Self::Live { current, .. } => Some((current, false)),
+            Self::Idle { last_stopped } => last_stopped
+                .checked_add(1)
+                .filter(|target| *target != u64::MAX)
+                .map(|target| (target, true)),
+            Self::Exhausted { .. } => None,
+        }
+    }
+
+    pub(crate) fn finish(&mut self, epoch: u64) -> bool {
+        match *self {
+            Self::Live {
+                current,
+                last_stopped,
+            } if current == epoch => {
+                *self = Self::Idle {
+                    last_stopped: last_stopped.max(epoch),
+                };
+                true
+            }
+            Self::Idle { .. } | Self::Live { .. } | Self::Exhausted { .. } => false,
+        }
+    }
+
+    pub(crate) fn is_current(self, epoch: u64) -> bool {
+        self.live_epoch() == Some(epoch)
+    }
+
+    pub(crate) fn request_is_pending(self, epoch: u64) -> bool {
+        matches!(self, Self::Idle { last_stopped } if epoch > last_stopped)
+    }
+
+    pub(crate) fn finished(self, epoch: u64) -> bool {
+        match self {
+            Self::Idle { last_stopped }
+            | Self::Live { last_stopped, .. }
+            | Self::Exhausted { last_stopped } => last_stopped >= epoch,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupPhase {
+    Pending,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ScopePhase {
+    Starting,
+    Running,
+    StartupFailed,
+    Draining {
+        reason: StopReason,
+        startup: StartupPhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DrainEffect {
+    pub(crate) startup_pending: bool,
+}
+
+/// Authoritative lifecycle and finish policy for one scope incarnation.
+///
+/// `ScopeRecord` is only this machine's observation projection; epoch-tagged
+/// requests use [`ScopeEpochs`] and do not encode this phase a second time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScopeLifecycle {
+    phase: ScopePhase,
+}
+
+impl ScopeLifecycle {
+    pub(crate) fn starting() -> Self {
+        Self {
+            phase: ScopePhase::Starting,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running() -> Self {
+        Self {
+            phase: ScopePhase::Running,
+        }
+    }
+
+    pub(crate) fn is_starting(&self) -> bool {
+        self.phase == ScopePhase::Starting
+    }
+
+    pub(crate) fn startup_complete(&self) -> bool {
+        matches!(
+            self.phase,
+            ScopePhase::Running
+                | ScopePhase::Draining {
+                    startup: StartupPhase::Complete,
+                    ..
+                }
+        )
+    }
+
+    pub(crate) fn startup_failed(&self) -> bool {
+        matches!(
+            self.phase,
+            ScopePhase::StartupFailed
+                | ScopePhase::Draining {
+                    startup: StartupPhase::Failed,
+                    ..
+                }
+        )
+    }
+
+    pub(crate) fn is_draining(&self) -> bool {
+        matches!(self.phase, ScopePhase::Draining { .. })
+    }
+
+    pub(crate) fn draining_reason(&self) -> Option<&StopReason> {
+        match &self.phase {
+            ScopePhase::Draining { reason, .. } => Some(reason),
+            ScopePhase::Starting | ScopePhase::Running | ScopePhase::StartupFailed => None,
+        }
+    }
+
+    pub(crate) fn complete_startup(&mut self) -> bool {
+        if self.phase != ScopePhase::Starting {
+            return false;
+        }
+        self.phase = ScopePhase::Running;
+        true
+    }
+
+    /// Records only the first startup failure, so simultaneous failing
+    /// initial children cannot publish the transition twice.
+    pub(crate) fn fail_startup(&mut self) -> bool {
+        if self.phase != ScopePhase::Starting {
+            return false;
+        }
+        self.phase = ScopePhase::StartupFailed;
+        true
+    }
+
+    pub(crate) fn begin_drain(&mut self, reason: StopReason) -> Option<DrainEffect> {
+        let startup = match self.phase {
+            ScopePhase::Starting => StartupPhase::Pending,
+            ScopePhase::Running => StartupPhase::Complete,
+            ScopePhase::StartupFailed => StartupPhase::Failed,
+            ScopePhase::Draining { .. } => return None,
+        };
+        let startup_pending = startup == StartupPhase::Pending;
+        self.phase = ScopePhase::Draining { reason, startup };
+        Some(DrainEffect { startup_pending })
+    }
+
+    pub(crate) fn finish_if_ready(
+        &self,
+        ordered: bool,
+        has_children: bool,
+        all_terminal: bool,
+    ) -> Option<StopReason> {
+        if let Some(reason) = self.draining_reason() {
+            return all_terminal.then(|| reason.clone());
+        }
+        (!self.startup_failed() && ordered && has_children && all_terminal)
+            .then_some(StopReason::Finished)
     }
 }
 
@@ -506,8 +816,9 @@ mod tests {
 
     use super::{
         ArbitrationClass, DeadlineHandle, DeadlineQueue, ExitDispatch, IntensityState,
-        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode,
-        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
+        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeEpochs,
+        ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
+        schedule_restart, tidy_abort_beat,
     };
 
     #[test]
@@ -745,25 +1056,142 @@ mod tests {
     }
 
     #[test]
-    fn readiness_signal_wins_at_its_deadline_and_shutdown_disarms() {
+    fn stable_run_settles_restart_attempt_at_the_exact_boundary() {
+        let start = Instant::now();
+        let stable_for = Duration::from_secs(10);
+        let mut restarts = RestartState::new();
+        assert_eq!(restarts.schedule(), (1, 1));
+        assert!(!restarts.settle_if_stable(
+            start,
+            start + stable_for - Duration::from_nanos(1),
+            stable_for,
+        ));
+        assert_eq!(restarts.schedule(), (2, 2));
+        assert!(restarts.settle_if_stable(start, start + stable_for, stable_for));
+        assert_eq!(restarts.schedule(), (1, 3));
+
+        assert!(
+            !restarts.settle_if_stable(start, start - Duration::from_nanos(1), stable_for),
+            "a regressed clock cannot forgive restart pressure"
+        );
+    }
+
+    #[test]
+    fn readiness_configuration_and_signal_deadline_race_are_engine_owned() {
         let deadline = Instant::now();
-        let mut ready = ReadinessGate::Waiting {
-            deadline: Some(deadline),
-        };
+        let mut ready = ReadinessGate::new();
         assert_eq!(
-            ready.step(ReadinessEvent::Signal),
+            ready.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::Manual,
+                deadline: Some(deadline),
+            }),
+            Some(ReadinessEffect::ArmDeadline { deadline })
+        );
+        assert_eq!(
+            ready.step(ReadinessEvent::Deadline {
+                now: deadline,
+                signal_seen: true,
+            }),
             Some(ReadinessEffect::BecameReady)
         );
-        assert_eq!(ready.step(ReadinessEvent::Deadline(deadline)), None);
+        assert_eq!(
+            ready.step(ReadinessEvent::Deadline {
+                now: deadline,
+                signal_seen: false,
+            }),
+            None
+        );
 
-        let mut shutdown = ReadinessGate::Waiting {
-            deadline: Some(deadline),
-        };
+        let mut timed_out = ReadinessGate::new();
+        assert_eq!(
+            timed_out.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::AfterInit,
+                deadline: Some(deadline),
+            }),
+            Some(ReadinessEffect::ArmDeadline { deadline })
+        );
+        assert_eq!(
+            timed_out.step(ReadinessEvent::Deadline {
+                now: deadline,
+                signal_seen: false,
+            }),
+            Some(ReadinessEffect::TimedOut { deadline })
+        );
+
+        let mut shutdown = ReadinessGate::new();
+        assert_eq!(
+            shutdown.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::Manual,
+                deadline: None,
+            }),
+            None
+        );
         assert_eq!(
             shutdown.step(ReadinessEvent::Shutdown),
             Some(ReadinessEffect::Disarmed)
         );
-        assert_eq!(shutdown.step(ReadinessEvent::Deadline(deadline)), None);
+    }
+
+    #[test]
+    fn scope_lifecycle_owns_first_failure_drain_status_and_finish_policy() {
+        let mut lifecycle = ScopeLifecycle::starting();
+        assert!(lifecycle.fail_startup());
+        assert!(
+            !lifecycle.fail_startup(),
+            "simultaneous initial failures publish one transition"
+        );
+        assert_eq!(lifecycle.finish_if_ready(true, true, true), None);
+        let drain = lifecycle
+            .begin_drain(crate::exit::StopReason::ShutdownRequested)
+            .expect("a failed startup can begin draining");
+        assert!(!drain.startup_pending);
+        assert_eq!(
+            lifecycle.finish_if_ready(false, true, true),
+            Some(crate::exit::StopReason::ShutdownRequested)
+        );
+
+        let mut running = ScopeLifecycle::starting();
+        assert!(running.complete_startup());
+        assert_eq!(running.finish_if_ready(true, false, true), None);
+        assert_eq!(
+            running.finish_if_ready(true, true, true),
+            Some(crate::exit::StopReason::Finished)
+        );
+
+        let mut starting = ScopeLifecycle::starting();
+        let drain = starting
+            .begin_drain(crate::exit::StopReason::ShutdownRequested)
+            .expect("starting can begin draining");
+        assert!(drain.startup_pending);
+    }
+
+    #[test]
+    fn scope_epoch_exhaustion_is_poisoned_without_minting_or_reuse() {
+        let mut epochs = ScopeEpochs::default();
+        assert_eq!(epochs.request_target(), Some((1, true)));
+        let first = epochs.begin().expect("first epoch is available");
+        assert_eq!(epochs.live_epoch(), Some(first));
+        assert_eq!(epochs.request_target(), Some((first, false)));
+        assert_eq!(epochs.begin(), None, "a live epoch cannot be replaced");
+        assert!(!epochs.finish(first + 1));
+        assert_eq!(epochs.live_epoch(), Some(first));
+        assert!(epochs.finish(first));
+        assert!(!epochs.finish(first), "a stopped epoch cannot finish twice");
+        assert_eq!(epochs.live_epoch(), None);
+        assert!(epochs.finished(first));
+        assert!(epochs.request_is_pending(first + 1));
+
+        let mut exhausted = ScopeEpochs::Idle {
+            last_stopped: u64::MAX - 2,
+        };
+        let last = exhausted.begin().expect("last non-poison epoch");
+        assert_eq!(last, u64::MAX - 1);
+        assert!(exhausted.finish(last));
+        assert_eq!(exhausted.begin(), None, "MAX is reserved as poison");
+        assert_eq!(exhausted.live_epoch(), None);
+        assert_eq!(exhausted.request_target(), None);
+        assert_eq!(exhausted.begin(), None, "poisoning is permanent");
+        assert!(!exhausted.finish(u64::MAX));
     }
 
     #[test]

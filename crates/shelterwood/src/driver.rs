@@ -14,8 +14,9 @@ use crate::{
     deadline::Deadline,
     engine::{
         ArbitrationClass, DeadlineHandle, DeadlineQueue, ExitDispatch, IntensityState,
-        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode,
-        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
+        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState,
+        ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
+        schedule_restart,
     },
     exit::{
         JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit,
@@ -456,7 +457,7 @@ enum DriverEvent {
 
 impl SystemRun {
     pub(crate) fn request_shutdown(&self) {
-        self.root.request_shutdown();
+        let _ = self.root.request_shutdown();
     }
 
     pub(crate) async fn shutdown(&mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
@@ -534,7 +535,10 @@ pub(crate) async fn shutdown_scope(
     if matches!(scope.member.record().stage, MemberStage::Terminal(_)) {
         return Ok(());
     }
-    let epoch = scope.request_shutdown();
+    let Some(epoch) = scope.request_shutdown() else {
+        // An exhausted idle scope has no incarnation that can remain live.
+        return Ok(());
+    };
     let mut watcher = scope.signal().watcher();
     loop {
         if scope.incarnation_finished(epoch)
@@ -768,72 +772,6 @@ impl ChildRuntime {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StartupPhase {
-    Pending,
-    Complete,
-    Failed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Driver-loop lifecycle state. `ScopeRecord` remains the observation projection and
-/// `ScopeControl` remains the epoch-tagged request plane; neither duplicates these phases.
-enum ScopePhase {
-    Starting,
-    Running,
-    StartupFailed,
-    Draining {
-        reason: StopReason,
-        startup: StartupPhase,
-    },
-}
-
-impl ScopePhase {
-    fn startup_complete(&self) -> bool {
-        matches!(
-            self,
-            Self::Running
-                | Self::Draining {
-                    startup: StartupPhase::Complete,
-                    ..
-                }
-        )
-    }
-
-    fn startup_failed(&self) -> bool {
-        matches!(
-            self,
-            Self::StartupFailed
-                | Self::Draining {
-                    startup: StartupPhase::Failed,
-                    ..
-                }
-        )
-    }
-
-    fn is_draining(&self) -> bool {
-        matches!(self, Self::Draining { .. })
-    }
-
-    fn draining_reason(&self) -> Option<&StopReason> {
-        match self {
-            Self::Draining { reason, .. } => Some(reason),
-            Self::Starting | Self::Running | Self::StartupFailed => None,
-        }
-    }
-
-    fn begin_drain(&mut self, reason: StopReason) -> bool {
-        let startup = match self {
-            Self::Starting => StartupPhase::Pending,
-            Self::Running => StartupPhase::Complete,
-            Self::StartupFailed => StartupPhase::Failed,
-            Self::Draining { .. } => return false,
-        };
-        *self = Self::Draining { reason, startup };
-        true
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ChildKey(u64);
 
@@ -935,7 +873,7 @@ struct ScopeRuntime {
     events: runtime::MpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
-    phase: ScopePhase,
+    lifecycle: ScopeLifecycle,
     next_ordered_start: Option<ChildKey>,
     is_root: bool,
     parent_ready: Option<Latch>,
@@ -993,7 +931,7 @@ impl Drop for ScopeRuntime {
             let reason = completion
                 .as_ref()
                 .map(|completion| completion.reason.clone())
-                .or_else(|| self.phase.draining_reason().cloned())
+                .or_else(|| self.lifecycle.draining_reason().cloned())
                 .unwrap_or(StopReason::ShutdownRequested);
             if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
                 self.root.finish_root_incarnation(self.epoch, reason, exit);
@@ -1009,23 +947,327 @@ enum SpawnBody {
         spawn: RawSpawn,
         context: RawRunContext,
     },
-    TaskRestartable(TaskFactory),
-    TaskOnce(Box<dyn FnOnce(TaskContext) -> crate::task::TaskFuture + Send + 'static>),
+    TaskRestartable {
+        factory: TaskFactory,
+        context: TaskContext,
+    },
+    TaskOnce {
+        body: Box<dyn FnOnce(TaskContext) -> crate::task::TaskFuture + Send + 'static>,
+        context: TaskContext,
+    },
     ScopeRestartable {
         factory: ScopeFactory,
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
+        ready: Latch,
+        cancel: Latch,
+        abort: Latch,
+        abort_ack: Latch,
     },
     ScopeOnce {
         tree: Box<BuilderCore>,
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
+        ready: Latch,
+        cancel: Latch,
+        abort: Latch,
+        abort_ack: Latch,
     },
+}
+
+struct SpawnDispatch {
+    body: SpawnBody,
+    declared_readiness: Option<Readiness>,
+    construction_spent: bool,
+    scope_child: bool,
+}
+
+/// Latches have deliberately separate ownership:
+///
+/// - `shutdown`/`abort` are the child-facing cooperative ladder;
+/// - `framework_abort`/`framework_abort_ack` bound a nested scope driver's
+///   recursive drain before its task is aborted;
+/// - `construction_release` prevents a raw actor from running before the
+///   driver has installed the readiness mode reported by construction;
+/// - `ended` makes readiness and self-stop watcher tasks finite.
+struct SpawnLatches {
+    shutdown: Latch,
+    abort: Latch,
+    ready: Latch,
+    ended: Latch,
+    construction_release: Latch,
+    local_stop: Latch,
+    framework_abort: Latch,
+    framework_abort_ack: Latch,
+}
+
+struct ChildTaskLaunch {
+    events: runtime::MpscSender<DriverEvent>,
+    key: ChildKey,
+    incarnation: Incarnation,
+    body: SpawnBody,
+    readiness_override: Option<Readiness>,
+    watch_readiness: bool,
+    shutdown: Latch,
+    ready: Latch,
+    ended: Latch,
+    construction_release: Latch,
+    local_stop: Latch,
+}
+
+fn dispatch_child_construction(
+    child: &mut ChildRuntime,
+    root: &Arc<ScopeCell>,
+    defaults: &ResolvedDefaults,
+    incarnation: Incarnation,
+    latches: &SpawnLatches,
+) -> SpawnDispatch {
+    let id = child.slot.member.id().clone();
+    let construction = child.construction.get_mut();
+    match construction {
+        ChildConstruction::Raw(definition) => {
+            let construction_spent = definition.one_shot();
+            SpawnDispatch {
+                body: SpawnBody::Raw {
+                    spawn: definition.take_spawn(),
+                    context: RawRunContext {
+                        id,
+                        incarnation,
+                        member: Arc::clone(&child.slot.member),
+                        scope: crate::ScopeRef {
+                            cell: Arc::clone(root),
+                        },
+                        shutdown: latches.shutdown.clone(),
+                        abort: latches.abort.clone(),
+                        ready: latches.ready.clone(),
+                        local_stop: latches.local_stop.clone(),
+                        mailbox_shutdown: child.options.mailbox_shutdown,
+                    },
+                },
+                declared_readiness: None,
+                construction_spent,
+                scope_child: false,
+            }
+        }
+        ChildConstruction::Task(definition) => SpawnDispatch {
+            body: SpawnBody::TaskRestartable {
+                factory: Arc::clone(&definition.factory),
+                context: TaskContext::new(
+                    id,
+                    incarnation,
+                    latches.shutdown.clone(),
+                    latches.abort.clone(),
+                    latches.ready.clone(),
+                ),
+            },
+            declared_readiness: Some(child.options.readiness),
+            construction_spent: false,
+            scope_child: false,
+        },
+        ChildConstruction::TaskOnce(definition) => SpawnDispatch {
+            body: SpawnBody::TaskOnce {
+                body: definition.take_body(),
+                context: TaskContext::new(
+                    id,
+                    incarnation,
+                    latches.shutdown.clone(),
+                    latches.abort.clone(),
+                    latches.ready.clone(),
+                ),
+            },
+            declared_readiness: Some(child.options.readiness),
+            construction_spent: true,
+            scope_child: false,
+        },
+        ChildConstruction::Scope(definition) => {
+            let inherited = match definition.defaults {
+                DefaultsInheritance::Inherit => defaults.clone(),
+                DefaultsInheritance::Reset => ResolvedDefaults::default(),
+            };
+            let scope = Arc::clone(
+                child
+                    .slot
+                    .scope
+                    .as_ref()
+                    .expect("scope construction needs a scope cell"),
+            );
+            let (body, construction_spent) = if let Some(factory) = definition.restartable() {
+                (
+                    SpawnBody::ScopeRestartable {
+                        factory: Arc::clone(factory),
+                        scope,
+                        inherited,
+                        ready: latches.ready.clone(),
+                        cancel: latches.shutdown.clone(),
+                        abort: latches.framework_abort.clone(),
+                        abort_ack: latches.framework_abort_ack.clone(),
+                    },
+                    false,
+                )
+            } else {
+                (
+                    SpawnBody::ScopeOnce {
+                        tree: definition
+                            .take_one_shot()
+                            .expect("one-shot subtree construction invoked more than once"),
+                        scope,
+                        inherited,
+                        ready: latches.ready.clone(),
+                        cancel: latches.shutdown.clone(),
+                        abort: latches.framework_abort.clone(),
+                        abort_ack: latches.framework_abort_ack.clone(),
+                    },
+                    true,
+                )
+            };
+            SpawnDispatch {
+                body,
+                declared_readiness: Some(Readiness::Manual),
+                construction_spent,
+                scope_child: true,
+            }
+        }
+    }
+}
+
+fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
+    let ChildTaskLaunch {
+        events,
+        key,
+        incarnation,
+        body,
+        readiness_override,
+        watch_readiness,
+        shutdown,
+        ready,
+        ended,
+        construction_release,
+        local_stop,
+    } = launch;
+    let (report, report_receiver) = report_channel(shutdown, Some(local_stop.clone()));
+    let constructed_sender = events.clone();
+    let handle = runtime::spawn(async move {
+        let body = async move {
+            match body {
+                SpawnBody::Raw { spawn, context } => {
+                    let instance = spawn.construct();
+                    let readiness = readiness_override.unwrap_or_else(|| instance.readiness());
+                    let _ = runtime::mpsc_send(
+                        &constructed_sender,
+                        DriverEvent::Child(ChildEvent::Constructed {
+                            child: key,
+                            incarnation,
+                            readiness,
+                        }),
+                    )
+                    .await;
+                    construction_release.fired().await;
+                    instance.run(context, readiness).await
+                }
+                SpawnBody::TaskRestartable { factory, context } => factory(context).await,
+                SpawnBody::TaskOnce { body, context } => body(context).await,
+                SpawnBody::ScopeRestartable {
+                    factory,
+                    scope,
+                    inherited,
+                    ready,
+                    cancel,
+                    abort,
+                    abort_ack,
+                } => {
+                    run_nested_tree(factory(), scope, inherited, ready, cancel, abort, abort_ack)
+                        .await
+                }
+                SpawnBody::ScopeOnce {
+                    tree,
+                    scope,
+                    inherited,
+                    ready,
+                    cancel,
+                    abort,
+                    abort_ack,
+                } => {
+                    run_nested_tree(*tree, scope, inherited, ready, cancel, abort, abort_ack).await
+                }
+            }
+        };
+        let outcome = CatchUnwindFuture::new(body).await;
+        let result = match outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        report.record(RecordedOutcome::Returned(result));
+    });
+    let abort_handle = handle.abort_handle();
+
+    let exit_sender = events.clone();
+    let exit_ended = ended.clone();
+    runtime::spawn(async move {
+        let join = match runtime::join(handle).await {
+            runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
+            runtime::JoinOutcome::Panic { message, .. } => JoinVerdict::Panicked { message },
+            runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled { after_grace: false },
+        };
+        exit_ended.fire();
+        // The task owns `report`, whose explicit record or Drop fallback runs
+        // before the join completes. Therefore this blocking receive cannot
+        // wait on a producer that is still schedulable on this worker.
+        let report = report_receiver.receive();
+        let _ = runtime::mpsc_send(
+            &exit_sender,
+            DriverEvent::Child(ChildEvent::Exited {
+                child: key,
+                incarnation,
+                recorded: report.outcome,
+                join,
+                cancelled: report.cancelled,
+            }),
+        )
+        .await;
+    });
+
+    if watch_readiness {
+        let ready_sender = events.clone();
+        let ready_ended = ended.clone();
+        runtime::spawn(async move {
+            if matches!(
+                runtime::select_two(ready.fired(), ready_ended.fired()).await,
+                runtime::Either::Left(())
+            ) {
+                let _ = runtime::mpsc_send(
+                    &ready_sender,
+                    DriverEvent::Child(ChildEvent::Ready {
+                        child: key,
+                        incarnation,
+                    }),
+                )
+                .await;
+            }
+        });
+    }
+
+    runtime::spawn(async move {
+        if matches!(
+            runtime::select_two(local_stop.fired(), ended.fired()).await,
+            runtime::Either::Left(())
+        ) {
+            let _ = runtime::mpsc_send(
+                &events,
+                DriverEvent::Child(ChildEvent::SelfStop {
+                    child: key,
+                    incarnation,
+                }),
+            )
+            .await;
+        }
+    });
+
+    abort_handle
 }
 
 impl ScopeRuntime {
     fn restart_is_suppressed(&self, key: ChildKey) -> bool {
-        if self.phase.is_draining()
+        if self.lifecycle.is_draining()
             || self.hard_forced
             || self.root.has_stop_request(self.epoch)
             || self.ancestor_shutdown.as_ref().is_some_and(Latch::is_fired)
@@ -1099,7 +1341,7 @@ impl ScopeRuntime {
         let Some(child) = self.children.get(key) else {
             return;
         };
-        if self.phase.is_draining()
+        if self.lifecycle.is_draining()
             || child.active.is_some()
             || child.is_terminal()
             || child.is_disposing()
@@ -1117,7 +1359,8 @@ impl ScopeRuntime {
                 .record()
                 .last_exit
                 .unwrap_or_else(Exit::never_started);
-            let pre_ready = child.initial && !self.phase.startup_complete() && !child.initial_ready;
+            let pre_ready =
+                child.initial && !self.lifecycle.startup_complete() && !child.initial_ready;
             // Exhaustion is a terminal outcome, not an exceptional cleanup
             // path. Join retained-definition disposal before terminality,
             // retention, removal completion, or ordered-scope progression.
@@ -1125,110 +1368,22 @@ impl ScopeRuntime {
             return;
         };
 
-        let shutdown = Latch::default();
-        let abort = Latch::default();
-        let ready = Latch::default();
-        let ended = Latch::default();
-        let construction_release = Latch::default();
-        let local_stop = Latch::default();
-        let id = child.slot.member.id().clone();
-        let task_context = TaskContext::new(
-            id.clone(),
-            incarnation,
-            shutdown.clone(),
-            abort.clone(),
-            ready.clone(),
-        );
-        let construction = child.construction.get_mut();
-        let scope_child = matches!(construction, ChildConstruction::Scope(_));
-        let (body, declared_readiness, construction_spent) = match construction {
-            ChildConstruction::Raw(definition) => {
-                let one_shot = definition.one_shot();
-                let spawn = definition.take_spawn();
-                (
-                    SpawnBody::Raw {
-                        spawn,
-                        context: RawRunContext {
-                            id,
-                            incarnation,
-                            member: Arc::clone(&child.slot.member),
-                            scope: crate::ScopeRef {
-                                cell: Arc::clone(&self.root),
-                            },
-                            shutdown: shutdown.clone(),
-                            abort: abort.clone(),
-                            ready: ready.clone(),
-                            local_stop: local_stop.clone(),
-                            mailbox_shutdown: child.options.mailbox_shutdown,
-                        },
-                    },
-                    None,
-                    one_shot,
-                )
-            }
-            ChildConstruction::Task(definition) => {
-                let factory = Arc::clone(&definition.factory);
-                (
-                    SpawnBody::TaskRestartable(factory),
-                    Some(child.options.readiness),
-                    false,
-                )
-            }
-            ChildConstruction::TaskOnce(definition) => {
-                let body = definition.take_body();
-                (
-                    SpawnBody::TaskOnce(body),
-                    Some(child.options.readiness),
-                    true,
-                )
-            }
-            ChildConstruction::Scope(definition) => {
-                let inherited = match definition.defaults {
-                    DefaultsInheritance::Inherit => self.defaults.clone(),
-                    DefaultsInheritance::Reset => ResolvedDefaults::default(),
-                };
-                if let Some(factory) = definition.restartable() {
-                    (
-                        SpawnBody::ScopeRestartable {
-                            factory: Arc::clone(factory),
-                            scope: Arc::clone(
-                                child
-                                    .slot
-                                    .scope
-                                    .as_ref()
-                                    .expect("scope construction needs a scope cell"),
-                            ),
-                            inherited,
-                        },
-                        Some(Readiness::Manual),
-                        false,
-                    )
-                } else {
-                    let tree = definition
-                        .take_one_shot()
-                        .expect("one-shot subtree construction invoked more than once");
-                    (
-                        SpawnBody::ScopeOnce {
-                            tree,
-                            scope: Arc::clone(
-                                child
-                                    .slot
-                                    .scope
-                                    .as_ref()
-                                    .expect("scope construction needs a scope cell"),
-                            ),
-                            inherited,
-                        },
-                        Some(Readiness::Manual),
-                        true,
-                    )
-                }
-            }
+        let latches = SpawnLatches {
+            shutdown: Latch::default(),
+            abort: Latch::default(),
+            ready: Latch::default(),
+            ended: Latch::default(),
+            construction_release: Latch::default(),
+            local_stop: Latch::default(),
+            framework_abort: Latch::default(),
+            framework_abort_ack: Latch::default(),
         };
-        let construction_pending = declared_readiness.is_none();
-        let gated = scope_child
-            || declared_readiness.is_none_or(|readiness| readiness != Readiness::Immediate);
-
+        let SpawnDispatch {
+            body,
+            declared_readiness,
+            construction_spent,
+            scope_child,
+        } = dispatch_child_construction(child, &self.root, &self.defaults, incarnation, &latches);
         let now = runtime::now();
         child.spawned_once = true;
         if let Some(mailbox) = child.slot.member.mailbox() {
@@ -1249,50 +1404,19 @@ impl ScopeRuntime {
             }),
         );
 
-        let (readiness, readiness_deadline) = if construction_pending {
-            (ReadinessGate::Waiting { deadline: None }, None)
-        } else if !gated {
-            ready.fire();
-            child.initial_ready = true;
-            self.root.transition_child(
-                &child.slot.member,
-                |record| record.stage = MemberStage::Running,
-                Some(LifecycleEventKind::Ready {
-                    id: child.slot.member.id().clone(),
-                    membership: child.slot.member.membership(),
-                    incarnation,
-                }),
-            );
-            (ReadinessGate::Immediate, None)
-        } else {
-            let (deadline, handle) = match child.options.readiness_deadline {
-                ReadinessDeadline::Bounded(duration) => {
-                    let deadline = Deadline::after(now, duration).instant();
-                    let handle = deadline.map(|deadline| {
-                        self.deadlines.push(
-                            deadline,
-                            DeadlineKind::Readiness {
-                                child: key,
-                                incarnation,
-                            },
-                        )
-                    });
-                    (deadline, handle)
-                }
-                ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => (None, None),
+        let mut readiness = ReadinessGate::new();
+        let readiness_effect = declared_readiness.and_then(|readiness_mode| {
+            let deadline = match child.options.readiness_deadline {
+                ReadinessDeadline::Bounded(duration) => Deadline::after(now, duration).instant(),
+                ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
             };
-            (ReadinessGate::Waiting { deadline }, handle)
-        };
+            readiness.step(ReadinessEvent::Configure {
+                readiness: readiness_mode,
+                deadline,
+            })
+        });
+        let gated = readiness.needs_signal_watch();
 
-        let (report, report_receiver) = report_channel(shutdown.clone(), Some(local_stop.clone()));
-        let nested_ready = ready.clone();
-        let nested_cancel = shutdown.clone();
-        let framework_abort = Latch::default();
-        let nested_abort = framework_abort.clone();
-        let framework_abort_ack = Latch::default();
-        let nested_abort_ack = framework_abort_ack.clone();
-        let constructed_sender = self.events.clone();
-        let run_release = construction_release.clone();
         let child_readiness_override = child.options.readiness_override;
         if construction_spent {
             // One-shot actor/task/subtree state has moved into `body`; the
@@ -1301,158 +1425,111 @@ impl ScopeRuntime {
             // terminal publication or restart-window arbitration.
             drop(child.construction.take());
         }
-        let handle = runtime::spawn(async move {
-            let body = async move {
-                match body {
-                    SpawnBody::Raw { spawn, context } => {
-                        let instance = spawn.construct();
-                        let readiness = match child_readiness_override {
-                            Some(readiness) => readiness,
-                            None => instance.readiness(),
-                        };
-                        let _ = runtime::mpsc_send(
-                            &constructed_sender,
-                            DriverEvent::Child(ChildEvent::Constructed {
-                                child: key,
-                                incarnation,
-                                readiness,
-                            }),
-                        )
-                        .await;
-                        run_release.fired().await;
-                        instance.run(context, readiness).await
-                    }
-                    SpawnBody::TaskRestartable(factory) => {
-                        let future = factory(task_context);
-                        future.await
-                    }
-                    SpawnBody::TaskOnce(body) => body(task_context).await,
-                    SpawnBody::ScopeRestartable {
-                        factory,
-                        scope,
-                        inherited,
-                    } => {
-                        let tree = factory();
-                        run_nested_tree(
-                            tree,
-                            scope,
-                            inherited,
-                            nested_ready,
-                            nested_cancel,
-                            nested_abort,
-                            nested_abort_ack,
-                        )
-                        .await
-                    }
-                    SpawnBody::ScopeOnce {
-                        tree,
-                        scope,
-                        inherited,
-                    } => {
-                        run_nested_tree(
-                            *tree,
-                            scope,
-                            inherited,
-                            nested_ready,
-                            nested_cancel,
-                            nested_abort,
-                            nested_abort_ack,
-                        )
-                        .await
-                    }
-                }
-            };
-            let outcome = CatchUnwindFuture::new(body).await;
-            let result = match outcome {
-                Ok(result) => result,
-                Err(payload) => std::panic::resume_unwind(payload),
-            };
-            report.record(RecordedOutcome::Returned(result));
-        });
-        let abort_handle = handle.abort_handle();
-        let exit_sender = self.events.clone();
-        let exit_ended = ended.clone();
-        runtime::spawn(async move {
-            let join = match runtime::join(handle).await {
-                runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
-                runtime::JoinOutcome::Panic { message, .. } => JoinVerdict::Panicked { message },
-                runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled { after_grace: false },
-            };
-            exit_ended.fire();
-            let report = report_receiver.receive();
-            let _ = runtime::mpsc_send(
-                &exit_sender,
-                DriverEvent::Child(ChildEvent::Exited {
-                    child: key,
-                    incarnation,
-                    recorded: report.outcome,
-                    join,
-                    cancelled: report.cancelled,
-                }),
-            )
-            .await;
-        });
-
-        let readiness_signal = ready.clone();
-        let self_stop_ended = ended.clone();
-        if gated {
-            let ready_sender = self.events.clone();
-            runtime::spawn(async move {
-                if matches!(
-                    runtime::select_two(ready.fired(), ended.fired()).await,
-                    runtime::Either::Left(())
-                ) {
-                    let _ = runtime::mpsc_send(
-                        &ready_sender,
-                        DriverEvent::Child(ChildEvent::Ready {
-                            child: key,
-                            incarnation,
-                        }),
-                    )
-                    .await;
-                }
-            });
-        }
-        let self_stop_sender = self.events.clone();
-        runtime::spawn(async move {
-            if matches!(
-                runtime::select_two(local_stop.fired(), self_stop_ended.fired()).await,
-                runtime::Either::Left(())
-            ) {
-                let _ = runtime::mpsc_send(
-                    &self_stop_sender,
-                    DriverEvent::Child(ChildEvent::SelfStop {
-                        child: key,
-                        incarnation,
-                    }),
-                )
-                .await;
-            }
+        let abort_handle = spawn_child_tasks(ChildTaskLaunch {
+            events: self.events.clone(),
+            key,
+            incarnation,
+            body,
+            readiness_override: child_readiness_override,
+            watch_readiness: gated,
+            shutdown: latches.shutdown.clone(),
+            ready: latches.ready.clone(),
+            ended: latches.ended.clone(),
+            construction_release: latches.construction_release.clone(),
+            local_stop: latches.local_stop.clone(),
         });
 
         child.active = Some(ActiveChild {
             incarnation,
             started_at: now,
-            shutdown,
-            abort,
+            shutdown: latches.shutdown,
+            abort: latches.abort,
             abort_handle,
             ladder: None,
             forced_outcome: None,
             hard_abort_after_grace: None,
             readiness,
-            readiness_deadline,
-            ready_signal: readiness_signal,
-            construction_release,
-            framework_abort: scope_child.then_some(framework_abort),
-            framework_abort_ack: scope_child.then_some(framework_abort_ack),
+            readiness_deadline: None,
+            ready_signal: latches.ready,
+            construction_release: latches.construction_release,
+            framework_abort: scope_child.then_some(latches.framework_abort),
+            framework_abort_ack: scope_child.then_some(latches.framework_abort_ack),
             stop_deadline: None,
         });
+        if let Some(effect) = readiness_effect {
+            // `progress_startup` already owns this ordered-startup loop. Do
+            // not re-enter it synchronously for an immediate child.
+            let _ = self.apply_readiness_effect(key, incarnation, effect);
+        }
         #[cfg(test)]
         self.record_storage();
     }
 
+    fn apply_readiness_effect(
+        &mut self,
+        key: ChildKey,
+        incarnation: Incarnation,
+        effect: ReadinessEffect,
+    ) -> bool {
+        match effect {
+            ReadinessEffect::ArmDeadline { deadline } => {
+                let handle = self.deadlines.push(
+                    deadline,
+                    DeadlineKind::Readiness {
+                        child: key,
+                        incarnation,
+                    },
+                );
+                if let Some(active) = self
+                    .children
+                    .get_mut(key)
+                    .and_then(|child| child.active.as_mut())
+                    && active.incarnation == incarnation
+                {
+                    active.readiness_deadline = Some(handle);
+                } else {
+                    self.deadlines.cancel(handle);
+                }
+                false
+            }
+            ReadinessEffect::BecameReady => {
+                let Some(child) = self.children.get_mut(key) else {
+                    return false;
+                };
+                let Some(active) = child.active.as_mut() else {
+                    return false;
+                };
+                if active.incarnation != incarnation {
+                    return false;
+                }
+                if let Some(deadline) = active.readiness_deadline.take() {
+                    self.deadlines.cancel(deadline);
+                }
+                active.ready_signal.fire();
+                if !self.lifecycle.startup_complete() {
+                    child.initial_ready = true;
+                }
+                self.root.transition_child(
+                    &child.slot.member,
+                    |record| record.stage = MemberStage::Running,
+                    Some(LifecycleEventKind::Ready {
+                        id: child.slot.member.id().clone(),
+                        membership: child.slot.member.membership(),
+                        incarnation,
+                    }),
+                );
+                true
+            }
+            ReadinessEffect::TimedOut { deadline } => {
+                self.begin_stop_child(key, Some(RecordedOutcome::ReadinessTimedOut { deadline }));
+                false
+            }
+            ReadinessEffect::Disarmed => false,
+        }
+    }
+
     fn progress_startup(&mut self) {
-        if self.phase != ScopePhase::Starting {
+        if !self.lifecycle.is_starting() {
             return;
         }
         match self.root.flavor {
@@ -1490,7 +1567,9 @@ impl ScopeRuntime {
     }
 
     fn complete_startup(&mut self) {
-        self.phase = ScopePhase::Running;
+        if !self.lifecycle.complete_startup() {
+            return;
+        }
         self.root.set_state(ScopeState::Running);
         self.root.set_startup(Ok(()));
         if let Some(parent_ready) = &self.parent_ready {
@@ -1604,11 +1683,10 @@ impl ScopeRuntime {
     }
 
     fn begin_drain(&mut self, reason: StopReason) {
-        let startup_pending = self.phase == ScopePhase::Starting;
-        if !self.phase.begin_drain(reason) {
+        let Some(effect) = self.lifecycle.begin_drain(reason) else {
             return;
-        }
-        if startup_pending {
+        };
+        if effect.startup_pending {
             self.root.set_startup(Err(StartupError::ShutdownRequested));
         }
         self.root.set_state(ScopeState::Draining);
@@ -1624,7 +1702,7 @@ impl ScopeRuntime {
     }
 
     fn stop_next_ordered(&mut self) {
-        if self.root.flavor != ScopeFlavor::Ordered || !self.phase.is_draining() {
+        if self.root.flavor != ScopeFlavor::Ordered || !self.lifecycle.is_draining() {
             return;
         }
         loop {
@@ -1642,7 +1720,7 @@ impl ScopeRuntime {
 
     fn force_all(&mut self) {
         self.hard_forced = true;
-        if !self.phase.is_draining() {
+        if !self.lifecycle.is_draining() {
             self.begin_drain(StopReason::ShutdownRequested);
         }
         let now = runtime::now();
@@ -1681,9 +1759,7 @@ impl ScopeRuntime {
         incarnation: Incarnation,
         readiness: Readiness,
     ) {
-        let mut became_ready = false;
-        let mut deadline_to_arm = None;
-        {
+        let effect = {
             let Some(child) = self.children.get_mut(key) else {
                 return;
             };
@@ -1697,49 +1773,29 @@ impl ScopeRuntime {
                 active.construction_release.fire();
                 return;
             }
-            if readiness == Readiness::Immediate {
-                active.readiness = ReadinessGate::Immediate;
-                active.ready_signal.fire();
-                if !self.phase.startup_complete() {
-                    child.initial_ready = true;
+            let deadline = match child.options.readiness_deadline {
+                ReadinessDeadline::Bounded(duration) => {
+                    Deadline::after(active.started_at, duration).instant()
                 }
-                self.root.transition_child(
-                    &child.slot.member,
-                    |record| record.stage = MemberStage::Running,
-                    Some(LifecycleEventKind::Ready {
-                        id: child.slot.member.id().clone(),
-                        membership: child.slot.member.membership(),
-                        incarnation,
-                    }),
-                );
-                became_ready = true;
-            } else {
-                let deadline = match child.options.readiness_deadline {
-                    ReadinessDeadline::Bounded(duration) => {
-                        Deadline::after(active.started_at, duration).instant()
-                    }
-                    ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
-                };
-                active.readiness = ReadinessGate::Waiting { deadline };
-                deadline_to_arm = deadline;
-            }
-            active.construction_release.fire();
-        }
-        if let Some(deadline) = deadline_to_arm {
-            let handle = self.deadlines.push(
+                ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
+            };
+            active.readiness.step(ReadinessEvent::Configure {
+                readiness,
                 deadline,
-                DeadlineKind::Readiness {
-                    child: key,
-                    incarnation,
-                },
-            );
-            if let Some(active) = self.children[key].active.as_mut()
-                && active.incarnation == incarnation
-            {
-                active.readiness_deadline = Some(handle);
-            } else {
-                self.deadlines.cancel(handle);
-            }
+            })
+        };
+        let became_ready = effect
+            .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
+            .unwrap_or(false);
+        if let Some(active) = self
+            .children
+            .get(key)
+            .and_then(|child| child.active.as_ref())
+            .filter(|active| active.incarnation == incarnation)
+        {
+            // Readiness state and all shell effects are installed before raw
+            // actor execution is released.
+            active.construction_release.fire();
         }
         if became_ready {
             self.progress_startup();
@@ -1747,38 +1803,20 @@ impl ScopeRuntime {
     }
 
     fn handle_ready(&mut self, key: ChildKey, incarnation: Incarnation) {
-        let Some(child) = self.children.get_mut(key) else {
-            return;
-        };
-        let Some(active) = child.active.as_mut() else {
-            return;
-        };
-        if active.incarnation != incarnation
-            || !matches!(
-                active.readiness.step(ReadinessEvent::Signal),
-                Some(ReadinessEffect::BecameReady)
-            )
-        {
-            return;
+        let effect = self
+            .children
+            .get_mut(key)
+            .and_then(|child| child.active.as_mut())
+            .filter(|active| active.incarnation == incarnation)
+            .and_then(|active| active.readiness.step(ReadinessEvent::Signal));
+        let became_ready = effect
+            .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
+            .unwrap_or(false);
+        if became_ready {
+            self.progress_startup();
         }
-        if let Some(deadline) = active.readiness_deadline.take() {
-            self.deadlines.cancel(deadline);
-        }
-        if !self.phase.startup_complete() {
-            child.initial_ready = true;
-        }
-        self.root.transition_child(
-            &child.slot.member,
-            |record| record.stage = MemberStage::Running,
-            Some(LifecycleEventKind::Ready {
-                id: child.slot.member.id().clone(),
-                membership: child.slot.member.membership(),
-                incarnation,
-            }),
-        );
         #[cfg(test)]
         self.record_storage();
-        self.progress_startup();
     }
 
     fn handle_self_stop(&mut self, key: ChildKey, incarnation: Incarnation) {
@@ -1829,12 +1867,13 @@ impl ScopeRuntime {
         }
         let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
         let exit = classify_exit(recorded, join, cancelled);
-        let ran_for = runtime::now().saturating_duration_since(active.started_at);
-        if ran_for >= self.intensity_policy.within {
-            child.restarts.settled();
-        }
+        child.restarts.settle_if_stable(
+            active.started_at,
+            runtime::now(),
+            self.intensity_policy.within,
+        );
 
-        let mode = if self.phase.is_draining() {
+        let mode = if self.lifecycle.is_draining() {
             ScopeMode::Draining
         } else {
             ScopeMode::Running
@@ -1851,11 +1890,11 @@ impl ScopeRuntime {
                 // later incarnation stopped pre-ready (e.g. during drain)
                 // does not rewind it.
                 let pre_ready =
-                    child.initial && !self.phase.startup_complete() && !child.initial_ready;
+                    child.initial && !self.lifecycle.startup_complete() && !child.initial_ready;
                 self.begin_terminal_disposal(key, exit, Some(incarnation), pre_ready);
             }
             ExitDispatch::ScheduleRestart => {
-                if !self.phase.startup_complete() {
+                if !self.lifecycle.startup_complete() {
                     child.initial_ready = false;
                 }
                 let sample = self.jitter.sample(0..u64::MAX) as f64 / u64::MAX as f64;
@@ -1900,7 +1939,7 @@ impl ScopeRuntime {
                         observed_restarts: decision.charge.in_window,
                         within: self.intensity_policy.within,
                     };
-                    if self.phase == ScopePhase::Starting {
+                    if self.lifecycle.is_starting() {
                         self.root
                             .set_startup(Err(StartupError::IntensityTripped(trip.clone())));
                     }
@@ -1999,7 +2038,7 @@ impl ScopeRuntime {
         let removing = self.children[key].slot.member.record().removing;
         if removing {
             self.finalize_removal(key);
-        } else if terminal.startup_aborted && !self.phase.is_draining() {
+        } else if terminal.startup_aborted && !self.lifecycle.is_draining() {
             self.fail_startup(key, exit);
             if self.children[key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
@@ -2008,7 +2047,7 @@ impl ScopeRuntime {
             if self.children[key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
             }
-            if self.phase.is_draining() {
+            if self.lifecycle.is_draining() {
                 self.stop_next_ordered();
             }
         }
@@ -2023,7 +2062,10 @@ impl ScopeRuntime {
                 exit,
             },
         };
-        self.phase = ScopePhase::StartupFailed;
+        let first_failure = self.lifecycle.fail_startup();
+        if !first_failure {
+            return;
+        }
         self.root
             .set_startup(Err(StartupError::StartupFailed(failure.clone())));
         if self.root.flavor == ScopeFlavor::Ordered {
@@ -2050,17 +2092,6 @@ impl ScopeRuntime {
                 child: key,
                 incarnation,
             } => {
-                if self
-                    .children
-                    .get(key)
-                    .and_then(|child| child.active.as_ref())
-                    .is_some_and(|active| {
-                        active.incarnation == incarnation && active.ready_signal.is_fired()
-                    })
-                {
-                    self.handle_ready(key, incarnation);
-                    return;
-                }
                 let Some(child) = self.children.get_mut(key) else {
                     return;
                 };
@@ -2070,13 +2101,20 @@ impl ScopeRuntime {
                 if active.incarnation != incarnation {
                     return;
                 }
-                let Some(ReadinessEffect::TimedOut { deadline }) = active
-                    .readiness
-                    .step(ReadinessEvent::Deadline(runtime::now()))
-                else {
-                    return;
-                };
-                self.begin_stop_child(key, Some(RecordedOutcome::ReadinessTimedOut { deadline }));
+                // The queue already consumed this registration. Feed the
+                // retained latch into the engine so signal-at-deadline policy
+                // is decided in exactly one place.
+                active.readiness_deadline.take();
+                let effect = active.readiness.step(ReadinessEvent::Deadline {
+                    now: runtime::now(),
+                    signal_seen: active.ready_signal.is_fired(),
+                });
+                if effect
+                    .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
+                    .unwrap_or(false)
+                {
+                    self.progress_startup();
+                }
             }
             DeadlineKind::Restart { child } => self.spawn_child(child),
             DeadlineKind::Stop { child, incarnation } => {
@@ -2093,27 +2131,15 @@ impl ScopeRuntime {
     }
 
     fn finish_if_ready(&mut self) -> Option<StopReason> {
-        if let Some(reason) = self.phase.draining_reason() {
-            if self
-                .children
-                .values()
-                .all(|child| child.is_terminal() && !child.is_disposing())
-            {
-                return Some(reason.clone());
-            }
-            return None;
-        }
-        if !self.phase.startup_failed()
-            && self.root.flavor == ScopeFlavor::Ordered
-            && !self.children.is_empty()
-            && self
-                .children
-                .values()
-                .all(|child| child.is_terminal() && !child.is_disposing())
-        {
-            return Some(StopReason::Finished);
-        }
-        None
+        let all_terminal = self
+            .children
+            .values()
+            .all(|child| child.is_terminal() && !child.is_disposing());
+        self.lifecycle.finish_if_ready(
+            self.root.flavor == ScopeFlavor::Ordered,
+            !self.children.is_empty(),
+            all_terminal,
+        )
     }
 
     fn handle_admission(&mut self, mut request: AdmissionRequest) {
@@ -2125,12 +2151,12 @@ impl ScopeRuntime {
             .dynamic
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &control))
-            || self.phase.is_draining()
-            || self.phase.startup_failed()
+            || self.lifecycle.is_draining()
+            || self.lifecycle.startup_failed()
         {
-            let cause = if self.phase.is_draining() {
+            let cause = if self.lifecycle.is_draining() {
                 NotAdmittingCause::Draining
-            } else if self.phase.startup_failed() {
+            } else if self.lifecycle.startup_failed() {
                 NotAdmittingCause::StartupFailed
             } else {
                 NotAdmittingCause::NoLiveIncarnation
@@ -2359,6 +2385,50 @@ fn mint_child_incarnation(slot: &Arc<SlotCell>, counter: &mut FenceCounter) -> O
     ScopeIdentity::mint_incarnation(slot.member.membership(), counter)
 }
 
+/// Owns a scope epoch until a `ScopeRuntime` has taken over its teardown.
+///
+/// Nested lowering can await isolated disposal before a driver exists. If
+/// that setup future is cancelled or unwinds, dropping this guard retires the
+/// epoch so a later restart cannot mistake the still-live reservation for
+/// identity exhaustion.
+struct ScopeEpochGuard {
+    scope: Arc<ScopeCell>,
+    epoch: Option<u64>,
+}
+
+impl ScopeEpochGuard {
+    fn begin(scope: &Arc<ScopeCell>) -> Option<Self> {
+        let epoch = scope.begin_incarnation()?;
+        Some(Self {
+            scope: Arc::clone(scope),
+            epoch: Some(epoch),
+        })
+    }
+
+    fn finish(mut self, reason: StopReason) {
+        let epoch = self
+            .epoch
+            .take()
+            .expect("an owned scope epoch finishes at most once");
+        self.scope.finish_incarnation(epoch, reason);
+    }
+
+    fn transfer(mut self) -> u64 {
+        self.epoch
+            .take()
+            .expect("an owned scope epoch transfers at most once")
+    }
+}
+
+impl Drop for ScopeEpochGuard {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.epoch.take() {
+            self.scope
+                .finish_incarnation(epoch, StopReason::ShutdownRequested);
+        }
+    }
+}
+
 async fn run_nested_tree(
     tree: BuilderCore,
     scope: Arc<ScopeCell>,
@@ -2368,7 +2438,15 @@ async fn run_nested_tree(
     abort: Latch,
     abort_ack: Latch,
 ) -> crate::ExitResult {
-    let epoch = scope.begin_incarnation();
+    let Some(epoch) = ScopeEpochGuard::begin(&scope) else {
+        let failure = StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: scope.member.id().clone(),
+            },
+        };
+        scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
+        return Err(crate::ExitError::from_startup_failure(failure));
+    };
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
         Err(error) => {
@@ -2387,7 +2465,7 @@ async fn run_nested_tree(
             disposal.fired().await;
             let failure = StartupFailure { cause };
             scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
-            scope.finish_incarnation(epoch, StopReason::StartupFailed(failure.clone()));
+            epoch.finish(StopReason::StartupFailed(failure.clone()));
             return Err(crate::ExitError::from_startup_failure(failure));
         }
     };
@@ -2411,7 +2489,12 @@ async fn run_nested_tree(
 
 async fn run_scope(plan: ScopePlan, is_root: bool, parent_ready: Option<Latch>) -> StopReason {
     let root = Arc::clone(&plan.root);
-    let epoch = root.begin_incarnation();
+    let Some(epoch) = ScopeEpochGuard::begin(&root) else {
+        // Dropping the still-armed plan terminalizes every never-started
+        // declaration and the root; no aliased driver epoch is created.
+        drop(plan);
+        return StopReason::NeverStarted;
+    };
     run_scope_incarnation(plan, is_root, parent_ready, None, None, None, epoch).await
 }
 
@@ -2422,10 +2505,9 @@ async fn run_scope_incarnation(
     incarnation_cancel: Option<Latch>,
     incarnation_abort: Option<Latch>,
     incarnation_abort_ack: Option<Latch>,
-    epoch: u64,
+    epoch: ScopeEpochGuard,
 ) -> StopReason {
     let root = Arc::clone(&plan.root);
-    root.set_state(ScopeState::Starting);
     if is_root {
         root.member
             .update(|record| record.stage = MemberStage::Running);
@@ -2479,12 +2561,11 @@ async fn run_scope_incarnation(
         events,
         deadlines: DeadlineQueue::default(),
         jitter: runtime::JitterRng::from_system_entropy(),
-        phase: ScopePhase::Starting,
+        lifecycle: ScopeLifecycle::starting(),
         next_ordered_start,
         is_root,
         parent_ready,
         dynamic,
-        epoch,
         ancestor_shutdown: incarnation_cancel,
         ancestor_shutdown_seen: false,
         ancestor_abort: incarnation_abort,
@@ -2492,6 +2573,10 @@ async fn run_scope_incarnation(
         ancestor_abort_seen: false,
         hard_forced: false,
         completion: None,
+        // Transfer last: every fallible setup expression above remains
+        // covered by the pre-driver guard, and completed construction moves
+        // the raw epoch directly into ScopeRuntime's synchronous epilogue.
+        epoch: epoch.transfer(),
     };
     #[cfg(test)]
     scope.record_storage();
@@ -2512,7 +2597,7 @@ async fn run_scope_incarnation(
     let mut signal = root.signal().watcher();
     loop {
         let mut pending = Vec::new();
-        if root.take_shutdown_request(epoch) {
+        if root.take_shutdown_request(scope.epoch) {
             pending.push((ArbitrationClass::ScopeShutdown, Pending::Shutdown));
         }
         for child in scope.pending_restart_shutdowns() {
@@ -2532,7 +2617,7 @@ async fn run_scope_incarnation(
             scope.ancestor_abort_seen = true;
             pending.push((ArbitrationClass::ScopeShutdown, Pending::AncestorAbort));
         }
-        if root.take_force_request(epoch) {
+        if root.take_force_request(scope.epoch) {
             // Force owns shutdown arbitration: readiness from the same wake
             // cannot publish Running after the stop boundary.
             pending.push((ArbitrationClass::ScopeShutdown, Pending::Force));
@@ -2741,7 +2826,7 @@ mod tests {
         LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline,
         RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause,
         StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
-        engine::{StopLadder, arbitrate},
+        engine::{ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
@@ -2752,7 +2837,7 @@ mod tests {
     use super::{
         ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
         MemberCell, MemberStage, Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell,
-        ScopeFlavor, ScopePhase, ScopeRuntime, StartupPhase, complete_removals, driver_event_class,
+        ScopeEpochGuard, ScopeFlavor, ScopeRuntime, complete_removals, driver_event_class,
         dynamic_control, mint_child_incarnation, report_channel, resident_projection,
         restart_shutdown_work, run_nested_tree, run_scope_incarnation,
     };
@@ -2805,6 +2890,64 @@ mod tests {
             Ok(()),
             "holding one system's gate must not stall another system"
         );
+    }
+
+    #[test]
+    fn stale_scope_driver_cannot_stop_a_newer_live_incarnation_projection() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let first = scope
+            .begin_incarnation()
+            .expect("first scope epoch is available");
+        scope.finish_incarnation(first, StopReason::Finished);
+        let second = scope
+            .begin_incarnation()
+            .expect("second scope epoch is available");
+        scope.set_state(ScopeState::Running);
+
+        scope.finish_incarnation(first, StopReason::Finished);
+        assert_eq!(scope.record().state, ScopeState::Running);
+        assert!(!scope.incarnation_finished(second));
+
+        scope.finish_incarnation(second, StopReason::Finished);
+        assert_eq!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::Finished,
+            }
+        );
+        assert!(scope.incarnation_finished(second));
+    }
+
+    #[test]
+    fn pre_driver_epoch_guard_releases_on_cancellation_and_unwind() {
+        let cancelled = isolated_scope("cancelled", ScopeFlavor::Ordered);
+        let guard = ScopeEpochGuard::begin(&cancelled).expect("first epoch is available");
+        let mut setup = Box::pin(async move {
+            let _guard = guard;
+            future::pending::<()>().await;
+        });
+        assert!(
+            setup
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(setup);
+        let successor = ScopeEpochGuard::begin(&cancelled)
+            .expect("cancelling pre-driver setup retires its epoch");
+        successor.finish(StopReason::NeverStarted);
+
+        let unwound = isolated_scope("unwound", ScopeFlavor::Ordered);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _guard = ScopeEpochGuard::begin(&unwound).expect("unwind epoch is available");
+                panic!("injected pre-driver unwind");
+            }))
+            .is_err()
+        );
+        let successor =
+            ScopeEpochGuard::begin(&unwound).expect("unwinding pre-driver setup retires its epoch");
+        successor.finish(StopReason::NeverStarted);
     }
 
     #[test]
@@ -2877,25 +3020,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn scope_phase_preserves_startup_status_while_draining() {
-        for (mut phase, startup) in [
-            (ScopePhase::Starting, StartupPhase::Pending),
-            (ScopePhase::Running, StartupPhase::Complete),
-            (ScopePhase::StartupFailed, StartupPhase::Failed),
-        ] {
-            assert!(phase.begin_drain(StopReason::ShutdownRequested));
-            assert_eq!(
-                phase,
-                ScopePhase::Draining {
-                    reason: StopReason::ShutdownRequested,
-                    startup,
-                }
-            );
-            assert!(!phase.begin_drain(StopReason::Finished));
-        }
-    }
-
     #[crate::runtime::test]
     async fn force_uses_the_stop_funnel_for_every_ordered_child() {
         let mut tree = Tree::new();
@@ -2907,7 +3031,9 @@ mod tests {
             .expect("valid second actor");
         let mut plan = tree.lower_for_test();
         let root = Arc::clone(&plan.root);
-        let epoch = root.begin_incarnation();
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
         root.set_admitted_children(
             plan.children
                 .iter()
@@ -2932,7 +3058,7 @@ mod tests {
             events,
             deadlines: super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::from_system_entropy(),
-            phase: ScopePhase::Running,
+            lifecycle: ScopeLifecycle::running(),
             next_ordered_start: None,
             is_root: true,
             parent_ready: None,
@@ -3039,7 +3165,9 @@ mod tests {
 
         let mut plan = tree.lower_for_test();
         let root = Arc::clone(&plan.root);
-        let epoch = root.begin_incarnation();
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
         root.set_admitted_children(
             plan.children
                 .iter()
@@ -3072,7 +3200,7 @@ mod tests {
             events,
             deadlines: super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::from_system_entropy(),
-            phase: ScopePhase::Running,
+            lifecycle: ScopeLifecycle::running(),
             next_ordered_start,
             is_root: true,
             parent_ready: None,
@@ -3097,7 +3225,7 @@ mod tests {
             },
             None,
         );
-        scope.children[nested]
+        let _ = scope.children[nested]
             .slot
             .scope
             .as_ref()
@@ -3148,7 +3276,7 @@ mod tests {
         crate::runtime::yield_now().await;
         crate::runtime::yield_now().await;
 
-        assert!(scope.phase.is_draining());
+        assert!(scope.lifecycle.is_draining());
         assert_eq!(
             factories.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -3462,7 +3590,7 @@ mod tests {
         .expect("valid task");
         let plan = tree.lower_for_test();
         let scope = Arc::clone(&plan.root);
-        let epoch = scope.begin_incarnation();
+        let epoch = ScopeEpochGuard::begin(&scope).expect("test scope epoch is available");
         let driver = crate::runtime::spawn(run_scope_incarnation(
             plan,
             false,
@@ -3581,7 +3709,7 @@ mod tests {
             .iter()
             .map(|child| Arc::clone(&child.slot.member))
             .collect();
-        let epoch = root.begin_incarnation();
+        let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
 
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -3868,7 +3996,9 @@ mod tests {
             identity.mint_membership(&id).expect("membership available"),
         );
         let scope = ScopeCell::new(member, ScopeFlavor::Ordered, ScopeIdentity::new());
-        let epoch = scope.begin_incarnation();
+        let epoch = scope
+            .begin_incarnation()
+            .expect("test scope epoch is available");
         let probe = Arc::new(ObserveScopeOnStartupWake {
             scope: Arc::clone(&scope),
             epoch: Some(epoch),
@@ -4073,7 +4203,9 @@ mod tests {
         .expect("valid task");
         let mut plan = tree.lower_for_test();
         let root = Arc::clone(&plan.root);
-        let epoch = root.begin_incarnation();
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
         root.set_admitted_children(
             plan.children
                 .iter()
@@ -4095,7 +4227,7 @@ mod tests {
             events,
             deadlines: super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::from_system_entropy(),
-            phase: ScopePhase::Running,
+            lifecycle: ScopeLifecycle::running(),
             next_ordered_start: Some(key),
             is_root: true,
             parent_ready: None,
@@ -4176,7 +4308,9 @@ mod tests {
         .expect("valid task");
         let mut plan = tree.lower_for_test();
         let root = Arc::clone(&plan.root);
-        let epoch = root.begin_incarnation();
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
         root.set_admitted_children(
             plan.children
                 .iter()
@@ -4198,7 +4332,7 @@ mod tests {
             events,
             deadlines: super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::from_system_entropy(),
-            phase: ScopePhase::Starting,
+            lifecycle: ScopeLifecycle::starting(),
             next_ordered_start: Some(key),
             is_root: true,
             parent_ready: None,

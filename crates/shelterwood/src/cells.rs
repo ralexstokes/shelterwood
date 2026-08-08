@@ -17,6 +17,7 @@ use std::{
 
 use crate::{
     ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, ScopeState, Strategy,
+    engine::ScopeEpochs,
     exit::{StartupError, StopReason},
     identity::{FenceCounter, ScopeIdentity},
     observe::{
@@ -310,6 +311,8 @@ impl MemberCell {
     }
 }
 
+/// Observation-only projection of the authoritative engine lifecycle.
+/// Driver decisions never read this record back as liveness policy.
 #[derive(Clone, Debug)]
 pub(crate) struct ScopeRecord {
     pub(crate) state: ScopeState,
@@ -396,9 +399,7 @@ struct ObservationConfig {
 
 #[derive(Debug, Default)]
 struct ScopeControl {
-    current_epoch: u64,
-    live: bool,
-    last_stopped_epoch: u64,
+    epochs: ScopeEpochs,
     shutdown: Option<ScopeRequest>,
     force: Option<ScopeRequest>,
 }
@@ -944,14 +945,23 @@ impl ScopeCell {
         }
     }
 
-    pub(crate) fn begin_incarnation(&self) -> u64 {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        control.current_epoch = control.current_epoch.saturating_add(1);
-        control.live = true;
-        let epoch = control.current_epoch;
-        drop(control);
-        self.member.record.pulse();
-        epoch
+    pub(crate) fn begin_incarnation(&self) -> Option<u64> {
+        self.with_observation_gate(|| {
+            let mut control = self.control.lock().expect("scope control mutex poisoned");
+            let epoch = control.epochs.begin()?;
+            let state = ScopeState::Starting;
+            self.record.send_modify(|record| {
+                record.total_restarts = 0;
+                record.state = state.clone();
+            });
+            // Hold epoch ownership through its observation projection. A
+            // stale finish and a newer begin can no longer cross these two
+            // state planes in opposite orders.
+            drop(control);
+            self.member.record.pulse();
+            self.emit_locked(LifecycleEventKind::ScopeState { state });
+            Some(epoch)
+        })
     }
 
     pub(crate) fn finish_incarnation(&self, epoch: u64, reason: StopReason) {
@@ -969,6 +979,21 @@ impl ScopeCell {
         terminal_exit: Option<Exit>,
     ) {
         self.with_observation_gate(|| {
+            let mut control = self.control.lock().expect("scope control mutex poisoned");
+            if !control.epochs.finish(epoch) {
+                // A stale driver must not overwrite the observation
+                // projection of a newer live incarnation.
+                return;
+            }
+            if control
+                .shutdown
+                .is_some_and(|request| request.epoch <= epoch)
+            {
+                control.shutdown = None;
+            }
+            if control.force.is_some_and(|request| request.epoch <= epoch) {
+                control.force = None;
+            }
             let state = ScopeState::Stopped {
                 reason: reason.clone(),
             };
@@ -982,20 +1007,8 @@ impl ScopeCell {
             if let Some(exit) = terminal_exit {
                 self.member.terminalize(exit);
             }
-            let mut control = self.control.lock().expect("scope control mutex poisoned");
-            if control.current_epoch == epoch {
-                control.live = false;
-                control.last_stopped_epoch = control.last_stopped_epoch.max(epoch);
-                if control
-                    .shutdown
-                    .is_some_and(|request| request.epoch <= epoch)
-                {
-                    control.shutdown = None;
-                }
-                if control.force.is_some_and(|request| request.epoch <= epoch) {
-                    control.force = None;
-                }
-            }
+            // Keep epoch ownership through the final record mutation so a
+            // newer begin cannot race an old driver into publishing Stopped.
             drop(control);
             self.member.record.pulse();
             // `wait_started` must not observe terminal startup until the member
@@ -1011,7 +1024,7 @@ impl ScopeCell {
     pub(crate) fn finish_live_root_incarnation(&self, reason: StopReason, exit: Exit) {
         let epoch = {
             let control = self.control.lock().expect("scope control mutex poisoned");
-            control.live.then_some(control.current_epoch)
+            control.epochs.live_epoch()
         };
         if let Some(epoch) = epoch {
             self.finish_root_incarnation(epoch, reason, exit);
@@ -1033,14 +1046,9 @@ impl ScopeCell {
         }
     }
 
-    pub(crate) fn request_shutdown(&self) -> u64 {
+    pub(crate) fn request_shutdown(&self) -> Option<u64> {
         let mut control = self.control.lock().expect("scope control mutex poisoned");
-        let pending_incarnation = !control.live;
-        let target = if control.live {
-            control.current_epoch
-        } else {
-            control.current_epoch.saturating_add(1)
-        };
+        let (target, pending_incarnation) = control.epochs.request_target()?;
         if control
             .shutdown
             .is_none_or(|request| request.epoch < target)
@@ -1057,15 +1065,14 @@ impl ScopeCell {
         {
             parent.member.record.pulse();
         }
-        target
+        Some(target)
     }
 
     pub(crate) fn has_pending_incarnation_shutdown(&self) -> bool {
         let control = self.control.lock().expect("scope control mutex poisoned");
-        !control.live
-            && control.shutdown.is_some_and(|request| {
-                !request.consumed && request.epoch > control.last_stopped_epoch
-            })
+        control.shutdown.is_some_and(|request| {
+            !request.consumed && control.epochs.request_is_pending(request.epoch)
+        })
     }
 
     pub(crate) fn has_stop_request(&self, epoch: u64) -> bool {
@@ -1089,7 +1096,7 @@ impl ScopeCell {
 
     pub(crate) fn force_shutdown(&self, epoch: u64) {
         let mut control = self.control.lock().expect("scope control mutex poisoned");
-        if control.live && control.current_epoch == epoch {
+        if control.epochs.is_current(epoch) {
             control.force = Some(ScopeRequest {
                 epoch,
                 consumed: false,
@@ -1112,7 +1119,7 @@ impl ScopeCell {
 
     pub(crate) fn incarnation_finished(&self, epoch: u64) -> bool {
         let control = self.control.lock().expect("scope control mutex poisoned");
-        control.last_stopped_epoch >= epoch
+        control.epochs.finished(epoch)
     }
 
     pub(crate) fn set_admitted_children(self: &Arc<Self>, children: Vec<ResidentProjection>) {

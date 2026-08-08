@@ -136,6 +136,30 @@ async fn one_shot_completion_finishes_an_ordered_root() {
 }
 
 #[tokio::test]
+async fn large_ordered_immediate_startup_is_iterative() {
+    const CHILDREN: usize = 4_096;
+
+    let mut tree = Tree::new();
+    for index in 0..CHILDREN {
+        let (_task, _completion) = tree
+            .add_task_once(
+                format!("immediate-{index}"),
+                TaskOnceDef::new(|_| async { Ok::<(), ExitError>(()) })
+                    .readiness(Readiness::Immediate)
+                    .expect("immediate task readiness is valid"),
+            )
+            .expect("unique child declaration");
+    }
+
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("all immediate children start without recursive re-entry");
+    assert_eq!(system.wait().await, StopReason::Finished);
+}
+
+#[tokio::test]
 async fn one_shot_completion_reports_failure_and_panic_verdicts() {
     let mut failed_tree = Tree::new();
     let (_task, failed) = failed_tree

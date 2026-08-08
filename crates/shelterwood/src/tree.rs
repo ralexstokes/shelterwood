@@ -1232,7 +1232,7 @@ impl ScopeRef {
 
     /// Requests shutdown without waiting.
     pub fn request_shutdown(&self) {
-        self.cell.request_shutdown();
+        let _ = self.cell.request_shutdown();
     }
 
     /// Waits for terminal membership state.

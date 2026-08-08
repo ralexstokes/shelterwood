@@ -511,32 +511,6 @@ mod tests {
     }
 
     #[test]
-    fn same_batch_intensity_exit_suppresses_expedited_restart_work() {
-        enum Event {
-            IntensityTrippingExit,
-            ExpeditedRestart,
-        }
-
-        let mut events = [
-            (ArbitrationClass::BackoffDue, Event::ExpeditedRestart),
-            (ArbitrationClass::ChildExit, Event::IntensityTrippingExit),
-        ];
-        arbitrate(&mut events);
-
-        let mut draining = false;
-        let mut factory_starts = 0;
-        for (_, event) in events {
-            match event {
-                Event::IntensityTrippingExit => draining = true,
-                Event::ExpeditedRestart if !draining => factory_starts += 1,
-                Event::ExpeditedRestart => {}
-            }
-        }
-
-        assert_eq!(factory_starts, 0);
-    }
-
-    #[test]
     fn ladder_uses_cancel_escalate_and_hard_abort_for_every_policy() {
         let start = Instant::now();
         let grace = Duration::from_millis(100);

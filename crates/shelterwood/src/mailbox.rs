@@ -1,7 +1,7 @@
 //! Membership-owned actor mailboxes and request/reply capabilities.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     fmt,
     future::Future,
     hash::{Hash, Hasher},
@@ -16,7 +16,7 @@ use std::{
 use crate::{
     ChildId, Incarnation, Mailbox, Membership,
     cells::{MailboxControl, MailboxDisposal, MailboxStats, MailboxTermination, MemberCell},
-    runtime::{Signal, SignalWatcher},
+    runtime::{OneShotReceiver, OneShotSender, Signal, SignalWatcher},
 };
 
 /// The kind of a failed actor send.
@@ -168,54 +168,95 @@ impl fmt::Display for ReplyError {
 
 impl std::error::Error for ReplyError {}
 
-enum ReplyOutcome<T> {
-    Pending,
-    Value(T),
-    Dropped,
+trait DeadlineOperation {
+    type Output;
+
+    /// Polls the operation before or after the shared deadline transition.
+    ///
+    /// An elapsed poll must resolve. It is a second operation poll after the
+    /// timer becomes ready so completion or acceptance at the exact boundary
+    /// wins before operation-specific timeout cleanup runs.
+    fn poll_deadlined(
+        &mut self,
+        context: &mut Context<'_>,
+        budget: crate::deadline::Deadline,
+        elapsed: bool,
+    ) -> Poll<Self::Output>;
 }
 
-struct ReplyState<T> {
-    outcome: ReplyOutcome<T>,
-    receiver_alive: bool,
-    waker: Option<Waker>,
+/// First-poll deadline capture shared by every public mailbox deadline future.
+struct Deadlined<F> {
+    operation: F,
+    duration: Duration,
+    budget: Option<crate::deadline::Deadline>,
+    timer: Option<crate::runtime::BoxedSleep>,
+    started: bool,
+    done: bool,
 }
 
-struct ReplyShared<T> {
-    state: Mutex<ReplyState<T>>,
-}
-
-impl<T> ReplyShared<T> {
-    fn poll(&self, context: &mut Context<'_>) -> Poll<Result<T, ReplyError>> {
-        let mut state = self.state.lock().expect("reply mutex poisoned");
-        match std::mem::replace(&mut state.outcome, ReplyOutcome::Pending) {
-            ReplyOutcome::Value(value) => {
-                state.receiver_alive = false;
-                Poll::Ready(Ok(value))
-            }
-            ReplyOutcome::Dropped => {
-                state.receiver_alive = false;
-                Poll::Ready(Err(ReplyError::Dropped))
-            }
-            ReplyOutcome::Pending => {
-                state.waker = Some(context.waker().clone());
-                Poll::Pending
-            }
+impl<F> Deadlined<F> {
+    fn new(operation: F, duration: Duration) -> Self {
+        Self {
+            operation,
+            duration,
+            budget: None,
+            timer: None,
+            started: false,
+            done: false,
         }
     }
+}
 
-    fn close_receiver(&self) {
-        let mut state = self.state.lock().expect("reply mutex poisoned");
-        state.receiver_alive = false;
-        state.waker = None;
-        if matches!(state.outcome, ReplyOutcome::Value(_)) {
-            state.outcome = ReplyOutcome::Pending;
+impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        if !this.started {
+            this.started = true;
+            let budget = crate::runtime::deadline(this.duration);
+            this.budget = Some(budget);
+            if !this.duration.is_zero() {
+                this.timer = Some(crate::runtime::sleep_deadline(budget));
+            }
         }
+        let budget = this
+            .budget
+            .expect("a started deadline future retains its captured budget");
+        if this.duration.is_zero() {
+            let result = this.operation.poll_deadlined(context, budget, true);
+            debug_assert!(result.is_ready(), "an elapsed operation must resolve");
+            this.done = result.is_ready();
+            return result;
+        }
+        if let Poll::Ready(result) = this.operation.poll_deadlined(context, budget, false) {
+            this.done = true;
+            return Poll::Ready(result);
+        }
+        if this
+            .timer
+            .as_mut()
+            .expect("a non-zero deadline future retains its timer")
+            .as_mut()
+            .poll(context)
+            .is_pending()
+        {
+            return Poll::Pending;
+        }
+        let result = this.operation.poll_deadlined(context, budget, true);
+        debug_assert!(result.is_ready(), "an elapsed operation must resolve");
+        this.done = result.is_ready();
+        result
     }
 }
 
 /// A consuming, infallible reply capability.
+///
+/// Dropping an unanswered capability is completion: its receiver observes
+/// [`ReplyError::Dropped`]. Dropping or timing out the receiver instead closes
+/// the channel, so a late [`Reply::send`] safely discards its value.
 pub struct Reply<T> {
-    shared: Arc<ReplyShared<T>>,
+    sender: Option<OneShotSender<T>>,
     answered: bool,
 }
 
@@ -232,20 +273,14 @@ impl<T: Send + 'static> Reply<T> {
     /// Creates a reply capability and its single owned receiver.
     #[must_use]
     pub fn channel() -> (Self, ReplyReceiver<T>) {
-        let shared = Arc::new(ReplyShared {
-            state: Mutex::new(ReplyState {
-                outcome: ReplyOutcome::Pending,
-                receiver_alive: true,
-                waker: None,
-            }),
-        });
+        let (sender, receiver) = crate::runtime::oneshot();
         (
             Self {
-                shared: Arc::clone(&shared),
+                sender: Some(sender),
                 answered: false,
             },
             ReplyReceiver {
-                shared: Some(shared),
+                receiver: Some(receiver),
             },
         )
     }
@@ -253,44 +288,17 @@ impl<T: Send + 'static> Reply<T> {
     /// Consumes the capability and delivers or discards the reply.
     pub fn send(mut self, value: T) {
         self.answered = true;
-        let wake = {
-            let mut state = self.shared.state.lock().expect("reply mutex poisoned");
-            if state.receiver_alive && matches!(state.outcome, ReplyOutcome::Pending) {
-                state.outcome = ReplyOutcome::Value(value);
-                state.waker.take()
-            } else {
-                None
-            }
-        };
-        if let Some(waker) = wake {
-            waker.wake();
-        }
-    }
-}
-
-impl<T> Drop for Reply<T> {
-    fn drop(&mut self) {
-        if self.answered {
-            return;
-        }
-        let wake = {
-            let mut state = self.shared.state.lock().expect("reply mutex poisoned");
-            if matches!(state.outcome, ReplyOutcome::Pending) {
-                state.outcome = ReplyOutcome::Dropped;
-                state.waker.take()
-            } else {
-                None
-            }
-        };
-        if let Some(waker) = wake {
-            waker.wake();
-        }
+        let sender = self
+            .sender
+            .take()
+            .expect("an unanswered reply retains its sender");
+        let _ = sender.send(value);
     }
 }
 
 /// The owned, non-cloneable receive half of [`Reply::channel`].
 pub struct ReplyReceiver<T> {
-    shared: Option<Arc<ReplyShared<T>>>,
+    receiver: Option<OneShotReceiver<T>>,
 }
 
 impl<T> fmt::Debug for ReplyReceiver<T> {
@@ -305,19 +313,38 @@ impl<T: Send + 'static> ReplyReceiver<T> {
     /// Consumes the receiver and waits within one response-only budget.
     pub fn recv(mut self, deadline: Duration) -> ReplyReceive<T> {
         ReplyReceive {
-            shared: self.shared.take(),
-            deadline,
-            timer: None,
-            started: false,
-            done: false,
+            deadlined: Deadlined::new(
+                ReplyOperation {
+                    receiver: self.receiver.take().expect("unused reply receiver is live"),
+                },
+                deadline,
+            ),
         }
     }
 }
 
-impl<T> Drop for ReplyReceiver<T> {
-    fn drop(&mut self) {
-        if let Some(shared) = &self.shared {
-            shared.close_receiver();
+struct ReplyOperation<T> {
+    receiver: OneShotReceiver<T>,
+}
+
+impl<T> DeadlineOperation for ReplyOperation<T> {
+    type Output = Result<T, ReplyError>;
+
+    fn poll_deadlined(
+        &mut self,
+        context: &mut Context<'_>,
+        _budget: crate::deadline::Deadline,
+        elapsed: bool,
+    ) -> Poll<Self::Output> {
+        match self.receiver.poll_receive(context) {
+            Poll::Ready(Some(value)) => Poll::Ready(Ok(value)),
+            Poll::Ready(None) => Poll::Ready(Err(ReplyError::Dropped)),
+            Poll::Pending if elapsed => Poll::Ready(
+                self.receiver
+                    .close_and_try_receive()
+                    .ok_or(ReplyError::Timeout),
+            ),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -325,19 +352,15 @@ impl<T> Drop for ReplyReceiver<T> {
 /// Future returned by [`ReplyReceiver::recv`].
 #[must_use]
 pub struct ReplyReceive<T> {
-    shared: Option<Arc<ReplyShared<T>>>,
-    deadline: Duration,
-    timer: Option<crate::runtime::BoxedSleep>,
-    started: bool,
-    done: bool,
+    deadlined: Deadlined<ReplyOperation<T>>,
 }
 
 impl<T> fmt::Debug for ReplyReceive<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ReplyReceive")
-            .field("started", &self.started)
-            .field("done", &self.done)
+            .field("started", &self.deadlined.started)
+            .field("done", &self.deadlined.done)
             .finish_non_exhaustive()
     }
 }
@@ -346,50 +369,7 @@ impl<T: Send + 'static> Future for ReplyReceive<T> {
     type Output = Result<T, ReplyError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.started {
-            self.started = true;
-            let budget = crate::runtime::deadline(self.deadline);
-            if self.deadline.is_zero() {
-                self.done = true;
-                if let Some(shared) = &self.shared {
-                    shared.close_receiver();
-                }
-                return Poll::Ready(Err(ReplyError::Timeout));
-            }
-            self.timer = Some(crate::runtime::sleep_deadline(budget));
-        }
-        let shared = Arc::clone(
-            self.shared
-                .as_ref()
-                .expect("pending reply receive must retain its shared state"),
-        );
-        if let Poll::Ready(result) = shared.poll(context) {
-            self.done = true;
-            return Poll::Ready(result);
-        }
-        if self
-            .timer
-            .as_mut()
-            .expect("started reply receive must have a timer")
-            .as_mut()
-            .poll(context)
-            .is_ready()
-        {
-            shared.close_receiver();
-            self.done = true;
-            return Poll::Ready(Err(ReplyError::Timeout));
-        }
-        Poll::Pending
-    }
-}
-
-impl<T> Drop for ReplyReceive<T> {
-    fn drop(&mut self) {
-        if !self.done
-            && let Some(shared) = &self.shared
-        {
-            shared.close_receiver();
-        }
+        Pin::new(&mut self.deadlined).poll(context)
     }
 }
 
@@ -434,6 +414,12 @@ struct OperationState<M> {
 struct SendOperation<M> {
     state: Mutex<OperationState<M>>,
 }
+
+// Lock order is mailbox state, then send-operation state. Code that starts
+// from an operation lock must release it before entering the mailbox. Paths
+// that take only the operation lock (polling, detached teardown) never reach
+// back into mailbox state. This keeps acceptance, withdrawal, and waiter
+// registration on one acyclic ordering.
 
 impl<M> SendOperation<M> {
     fn new(message: M) -> Arc<Self> {
@@ -522,25 +508,17 @@ struct MailboxState<M> {
     sends_rejected: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct WaiterId(u64);
 
-struct WaiterEntry<M> {
-    operation: Arc<SendOperation<M>>,
-    previous: Option<WaiterId>,
-    next: Option<WaiterId>,
-}
-
-/// FIFO registrations with constant-time removal by a send operation.
+/// FIFO registrations with direct removal by a send operation.
 ///
-/// The mailbox mutex serializes every mutation, so a compact intrusive list
-/// can use monotonic local ids without another synchronization layer. The ids
-/// are never reused, which also prevents a stale cancellation from unlinking
-/// a later operation.
+/// Monotonic keys are insertion order, so the first map entry is the oldest
+/// waiter. Keys are never reused, making stale cancellation ids harmless.
+/// `u64::MAX` is a poison key and is never minted; exhaustion remains poisoned
+/// instead of wrapping back into the live id domain.
 struct WaiterQueue<M> {
-    entries: HashMap<WaiterId, WaiterEntry<M>>,
-    head: Option<WaiterId>,
-    tail: Option<WaiterId>,
+    entries: BTreeMap<WaiterId, Arc<SendOperation<M>>>,
     next_id: u64,
     #[cfg(test)]
     direct_removals: usize,
@@ -549,9 +527,7 @@ struct WaiterQueue<M> {
 impl<M> Default for WaiterQueue<M> {
     fn default() -> Self {
         Self {
-            entries: HashMap::new(),
-            head: None,
-            tail: None,
+            entries: BTreeMap::new(),
             next_id: 0,
             #[cfg(test)]
             direct_removals: 0,
@@ -570,30 +546,17 @@ impl<M> WaiterQueue<M> {
     }
 
     fn push_back(&mut self, operation: Arc<SendOperation<M>>) -> WaiterId {
-        let id = WaiterId(self.next_id);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("mailbox waiter identity space exhausted");
-        let previous = self.tail;
-        let replaced = self.entries.insert(
-            id,
-            WaiterEntry {
-                operation,
-                previous,
-                next: None,
-            },
-        );
-        debug_assert!(replaced.is_none());
-        if let Some(previous) = previous {
-            self.entries
-                .get_mut(&previous)
-                .expect("tail registration must be live")
-                .next = Some(id);
-        } else {
-            self.head = Some(id);
+        let Some(next) = self.next_id.checked_add(1) else {
+            panic!("mailbox waiter identity space exhausted");
+        };
+        if next == u64::MAX {
+            self.next_id = u64::MAX;
+            panic!("mailbox waiter identity space exhausted");
         }
-        self.tail = Some(id);
+        self.next_id = next;
+        let id = WaiterId(next);
+        let replaced = self.entries.insert(id, operation);
+        debug_assert!(replaced.is_none());
         id
     }
 
@@ -603,39 +566,27 @@ impl<M> WaiterQueue<M> {
     }
 
     fn observe_all(&self, incarnation: Incarnation) {
-        for entry in self.entries.values() {
-            entry.operation.observe(incarnation);
+        for operation in self.entries.values() {
+            operation.observe(incarnation);
         }
     }
 
     fn pop_front(&mut self) -> Option<(WaiterId, Arc<SendOperation<M>>)> {
-        let id = self.head?;
-        self.remove(id).map(|operation| (id, operation))
+        let entry = self.entries.pop_first();
+        #[cfg(test)]
+        if entry.is_some() {
+            self.direct_removals = self.direct_removals.saturating_add(1);
+        }
+        entry
     }
 
     fn remove(&mut self, id: WaiterId) -> Option<Arc<SendOperation<M>>> {
-        let entry = self.entries.remove(&id)?;
+        let operation = self.entries.remove(&id)?;
         #[cfg(test)]
         {
             self.direct_removals = self.direct_removals.saturating_add(1);
         }
-        if let Some(previous) = entry.previous {
-            self.entries
-                .get_mut(&previous)
-                .expect("previous registration must be live")
-                .next = entry.next;
-        } else {
-            self.head = entry.next;
-        }
-        if let Some(next) = entry.next {
-            self.entries
-                .get_mut(&next)
-                .expect("next registration must be live")
-                .previous = entry.previous;
-        } else {
-            self.tail = entry.previous;
-        }
-        Some(entry.operation)
+        Some(operation)
     }
 }
 
@@ -1075,6 +1026,12 @@ impl<M: Send + 'static> MailboxCell<M> {
 impl<M> MailboxCell<M> {
     fn withdraw(&self, operation: &Arc<SendOperation<M>>) -> Withdrawal<M> {
         let mut mailbox = self.state.lock().expect("mailbox mutex poisoned");
+        let current_observation = match mailbox.status {
+            BindingStatus::Bound(incarnation) | BindingStatus::Frozen(incarnation) => {
+                Some(incarnation)
+            }
+            BindingStatus::Unbound | BindingStatus::Terminal(_) => None,
+        };
         let (result, registration) = {
             let mut state = operation
                 .state
@@ -1088,7 +1045,12 @@ impl<M> MailboxCell<M> {
                     let message = message
                         .take()
                         .expect("a waiting operation must retain its message");
-                    let observed = *newest_observed;
+                    // The mailbox lock makes this one evidence snapshot: a
+                    // binding either precedes withdrawal and contributes its
+                    // incarnation, or follows the completed withdrawal. This
+                    // also covers an operation first submitted by an elapsed
+                    // (including zero-duration) deadline poll.
+                    let observed = (*newest_observed).or(current_observation);
                     state.outcome = OperationOutcome::Withdrawn;
                     state.waker = None;
                     (
@@ -1330,11 +1292,12 @@ impl<M: Send + 'static> ActorRef<M> {
     /// Sends within one acceptance budget, recovering an unaccepted message.
     pub fn send_timeout(&self, message: M, deadline: Duration) -> SendTimeout<M> {
         SendTimeout {
-            send: Some(self.send(message)),
-            deadline,
-            timer: None,
-            started: false,
-            done: false,
+            deadlined: Deadlined::new(
+                TimedSend {
+                    send: self.send(message),
+                },
+                deadline,
+            ),
         }
     }
 
@@ -1359,15 +1322,16 @@ impl<M: Send + 'static> ActorRef<M> {
         deadline: Duration,
     ) -> CallFuture<M, T> {
         CallFuture {
-            actor: self.clone(),
-            make_msg: Some(Box::new(make_msg)),
-            deadline,
-            timer: None,
-            send: None,
-            reply: None,
-            accepted: None,
-            started: false,
-            done: false,
+            deadlined: Deadlined::new(
+                CallOperation {
+                    actor: self.clone(),
+                    make_msg: Some(Box::new(make_msg)),
+                    send: None,
+                    reply: None,
+                    accepted: None,
+                },
+                deadline,
+            ),
         }
     }
 }
@@ -1499,20 +1463,59 @@ impl<M> Drop for SendFuture<M> {
 /// Cancellation-safe future returned by [`ActorRef::send_timeout`].
 #[must_use]
 pub struct SendTimeout<M> {
-    send: Option<SendFuture<M>>,
-    deadline: Duration,
-    timer: Option<crate::runtime::BoxedSleep>,
-    started: bool,
-    done: bool,
+    deadlined: Deadlined<TimedSend<M>>,
+}
+
+struct TimedSend<M> {
+    send: SendFuture<M>,
 }
 
 impl<M> fmt::Debug for SendTimeout<M> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SendTimeout")
-            .field("started", &self.started)
-            .field("done", &self.done)
+            .field("started", &self.deadlined.started)
+            .field("done", &self.deadlined.done)
             .finish_non_exhaustive()
+    }
+}
+
+fn withdraw_send<M: Send + 'static>(send: &mut SendFuture<M>) -> Result<Incarnation, SendError<M>> {
+    let actor_id = send.actor.id().clone();
+    match send.withdraw() {
+        Withdrawal::Withdrawn { message, observed } => Err(SendError {
+            actor_id,
+            incarnation_observed: observed,
+            message,
+            kind: SendErrorKind::TimedOut,
+        }),
+        Withdrawal::Accepted(incarnation) => Ok(incarnation),
+        Withdrawal::Terminated { message, observed } => Err(SendError {
+            actor_id,
+            incarnation_observed: observed,
+            message,
+            kind: SendErrorKind::Terminated,
+        }),
+    }
+}
+
+impl<M: Send + 'static> DeadlineOperation for TimedSend<M> {
+    type Output = Result<Incarnation, SendError<M>>;
+
+    fn poll_deadlined(
+        &mut self,
+        context: &mut Context<'_>,
+        _budget: crate::deadline::Deadline,
+        elapsed: bool,
+    ) -> Poll<Self::Output> {
+        if let Poll::Ready(result) = Pin::new(&mut self.send).poll(context) {
+            return Poll::Ready(result);
+        }
+        if !elapsed {
+            Poll::Pending
+        } else {
+            Poll::Ready(withdraw_send(&mut self.send))
+        }
     }
 }
 
@@ -1520,161 +1523,95 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
     type Output = Result<Incarnation, SendError<M>>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.started {
-            self.started = true;
-            let budget = crate::runtime::deadline(self.deadline);
-            if self.deadline.is_zero() {
-                let actor_id = self
-                    .send
-                    .as_ref()
-                    .expect("pending timed send retains send")
-                    .actor
-                    .id()
-                    .clone();
-                let current = self
-                    .send
-                    .as_ref()
-                    .expect("pending timed send retains send")
-                    .actor
-                    .mailbox
-                    .current_observation();
-                let withdrawal = self
-                    .send
-                    .as_mut()
-                    .expect("pending timed send retains send")
-                    .withdraw();
-                let Withdrawal::Withdrawn { message, observed } = withdrawal else {
-                    unreachable!("an unpolled send cannot already be accepted")
-                };
-                self.done = true;
-                return Poll::Ready(Err(SendError {
-                    actor_id,
-                    incarnation_observed: observed.or(current),
-                    message,
-                    kind: SendErrorKind::TimedOut,
-                }));
-            }
-            self.timer = Some(crate::runtime::sleep_deadline(budget));
-        }
-        let send = self.send.as_mut().expect("pending timed send retains send");
-        if let Poll::Ready(result) = Pin::new(send).poll(context) {
-            self.done = true;
-            return Poll::Ready(result);
-        }
-        if self
-            .timer
-            .as_mut()
-            .expect("started timed send has a timer")
-            .as_mut()
-            .poll(context)
-            .is_ready()
-        {
-            let send = self.send.as_mut().expect("pending timed send retains send");
-            let actor_id = send.actor.id().clone();
-            match send.withdraw() {
-                Withdrawal::Withdrawn { message, observed } => {
-                    self.done = true;
-                    Poll::Ready(Err(SendError {
-                        actor_id,
-                        incarnation_observed: observed,
-                        message,
-                        kind: SendErrorKind::TimedOut,
-                    }))
-                }
-                Withdrawal::Accepted(incarnation) => {
-                    self.done = true;
-                    Poll::Ready(Ok(incarnation))
-                }
-                Withdrawal::Terminated { message, observed } => {
-                    self.done = true;
-                    Poll::Ready(Err(SendError {
-                        actor_id,
-                        incarnation_observed: observed,
-                        message,
-                        kind: SendErrorKind::Terminated,
-                    }))
-                }
-            }
-        } else {
-            Poll::Pending
-        }
+        Pin::new(&mut self.deadlined).poll(context)
     }
 }
 
 /// Cancellation-safe future returned by [`ActorRef::call`].
 #[must_use]
 pub struct CallFuture<M, T> {
+    deadlined: Deadlined<CallOperation<M, T>>,
+}
+
+struct CallOperation<M, T> {
     actor: ActorRef<M>,
     make_msg: Option<Box<dyn FnOnce(Reply<T>) -> M + Send + 'static>>,
-    deadline: Duration,
-    timer: Option<crate::runtime::BoxedSleep>,
     send: Option<SendFuture<M>>,
-    reply: Option<Arc<ReplyShared<T>>>,
+    reply: Option<OneShotReceiver<T>>,
     accepted: Option<Incarnation>,
-    started: bool,
-    done: bool,
 }
 
 impl<M, T> fmt::Debug for CallFuture<M, T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CallFuture")
-            .field("started", &self.started)
-            .field("accepted", &self.accepted)
-            .field("done", &self.done)
+            .field("started", &self.deadlined.started)
+            .field("accepted", &self.deadlined.operation.accepted)
+            .field("done", &self.deadlined.done)
             .finish_non_exhaustive()
     }
 }
 
-impl<M, T> CallFuture<M, T> {
+impl<M, T> CallOperation<M, T> {
     fn poll_reply(
-        &self,
+        &mut self,
         context: &mut Context<'_>,
         incarnation: Incarnation,
         deadline_elapsed: bool,
     ) -> Poll<Result<Replied<T>, CallError>> {
         let reply = self
             .reply
-            .as_ref()
+            .as_mut()
             .expect("accepted call retains reply state");
-        match reply.poll(context) {
-            Poll::Ready(Ok(value)) => Poll::Ready(Ok(Replied { value, incarnation })),
-            Poll::Ready(Err(ReplyError::Dropped)) => Poll::Ready(Err(CallError {
+        match reply.poll_receive(context) {
+            Poll::Ready(Some(value)) => Poll::Ready(Ok(Replied { value, incarnation })),
+            Poll::Ready(None) => Poll::Ready(Err(CallError {
                 actor_id: self.actor.id().clone(),
                 incarnation_observed: Some(incarnation),
                 kind: CallErrorKind::ReplyDropped,
             })),
-            Poll::Ready(Err(ReplyError::Timeout)) => unreachable!(),
             Poll::Pending if deadline_elapsed => {
-                reply.close_receiver();
-                Poll::Ready(Err(CallError {
-                    actor_id: self.actor.id().clone(),
-                    incarnation_observed: Some(incarnation),
-                    kind: CallErrorKind::ResponseTimedOut,
-                }))
+                if let Some(value) = reply.close_and_try_receive() {
+                    Poll::Ready(Ok(Replied { value, incarnation }))
+                } else {
+                    Poll::Ready(Err(CallError {
+                        actor_id: self.actor.id().clone(),
+                        incarnation_observed: Some(incarnation),
+                        kind: CallErrorKind::ResponseTimedOut,
+                    }))
+                }
             }
             Poll::Pending => Poll::Pending,
         }
     }
+
+    fn close_reply(&mut self) {
+        if let Some(reply) = &mut self.reply {
+            let _ = reply.close_and_try_receive();
+        }
+    }
 }
 
-impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
+impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M, T> {
     type Output = Result<Replied<T>, CallError>;
 
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.started {
-            self.started = true;
-            // Capture the one overall budget before invoking user code. A
-            // slow message constructor consumes acceptance/response time.
-            let budget = crate::runtime::deadline(self.deadline);
-            if self.deadline.is_zero() {
-                self.done = true;
+    fn poll_deadlined(
+        &mut self,
+        context: &mut Context<'_>,
+        budget: crate::deadline::Deadline,
+        elapsed: bool,
+    ) -> Poll<Self::Output> {
+        if self.make_msg.is_some() {
+            if elapsed {
                 return Poll::Ready(Err(CallError {
                     actor_id: self.actor.id().clone(),
                     incarnation_observed: self.actor.mailbox.current_observation(),
                     kind: CallErrorKind::AcceptanceTimedOut,
                 }));
             }
+            // Capture the one overall budget before invoking user code. A
+            // slow message constructor consumes acceptance/response time. The
+            // shared scaffold captured `budget` before this callback runs.
             let (reply, mut receiver) = Reply::channel();
             let message =
                 self.make_msg
@@ -1685,16 +1622,14 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
             // existed before it completed, so do not start one after the
             // captured budget is strictly in the past.
             if budget.is_overdue(crate::runtime::now()) {
-                self.done = true;
                 return Poll::Ready(Err(CallError {
                     actor_id: self.actor.id().clone(),
                     incarnation_observed: self.actor.mailbox.current_observation(),
                     kind: CallErrorKind::AcceptanceTimedOut,
                 }));
             }
-            self.reply = receiver.shared.take();
+            self.reply = receiver.receiver.take();
             self.send = Some(self.actor.send(message));
-            self.timer = Some(crate::runtime::sleep_deadline(budget));
         }
 
         if self.accepted.is_none() {
@@ -1708,10 +1643,7 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
                     self.send = None;
                 }
                 Poll::Ready(Err(error)) => {
-                    if let Some(reply) = &self.reply {
-                        reply.close_receiver();
-                    }
-                    self.done = true;
+                    self.close_reply();
                     return Poll::Ready(Err(CallError {
                         actor_id: error.actor_id,
                         incarnation_observed: error.incarnation_observed,
@@ -1723,66 +1655,49 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
         }
 
         if let Some(accepted) = self.accepted
-            && let Poll::Ready(result) = self.poll_reply(context, accepted, false)
+            && let Poll::Ready(result) = self.poll_reply(context, accepted, elapsed)
         {
-            self.done = true;
             return Poll::Ready(result);
         }
 
-        if self
-            .timer
-            .as_mut()
-            .expect("started call has a timer")
-            .as_mut()
-            .poll(context)
-            .is_pending()
-        {
+        if !elapsed {
             return Poll::Pending;
         }
 
-        if let Some(accepted) = self.accepted {
-            let result = self.poll_reply(context, accepted, true);
-            self.done = true;
-            result
-        } else {
-            let actor_id = self.actor.id().clone();
-            let send = self
-                .send
+        let result = withdraw_send(
+            self.send
                 .as_mut()
-                .expect("unaccepted call retains send future");
-            let result = match send.withdraw() {
-                Withdrawal::Withdrawn { observed, .. } => CallError {
-                    actor_id,
-                    incarnation_observed: observed,
-                    kind: CallErrorKind::AcceptanceTimedOut,
-                },
-                Withdrawal::Accepted(incarnation) => {
-                    let result = self.poll_reply(context, incarnation, true);
-                    self.done = true;
-                    return result;
-                }
-                Withdrawal::Terminated { observed, .. } => CallError {
-                    actor_id,
-                    incarnation_observed: observed,
-                    kind: CallErrorKind::Terminated,
-                },
-            };
-            if let Some(reply) = &self.reply {
-                reply.close_receiver();
+                .expect("an unaccepted call retains its send future"),
+        );
+        self.send = None;
+        match result {
+            Ok(incarnation) => {
+                self.accepted = Some(incarnation);
+                self.poll_reply(context, incarnation, true)
             }
-            self.done = true;
-            Poll::Ready(Err(result))
+            Err(error) => {
+                self.close_reply();
+                Poll::Ready(Err(CallError {
+                    actor_id: error.actor_id,
+                    incarnation_observed: error.incarnation_observed,
+                    kind: match error.kind {
+                        SendErrorKind::TimedOut => CallErrorKind::AcceptanceTimedOut,
+                        SendErrorKind::Terminated => CallErrorKind::Terminated,
+                        SendErrorKind::NotRunning | SendErrorKind::Full => {
+                            unreachable!("withdrawal returns only timed-out or terminal errors")
+                        }
+                    },
+                }))
+            }
         }
     }
 }
 
-impl<M, T> Drop for CallFuture<M, T> {
-    fn drop(&mut self) {
-        if !self.done
-            && let Some(reply) = &self.reply
-        {
-            reply.close_receiver();
-        }
+impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
+    type Output = Result<Replied<T>, CallError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.deadlined).poll(context)
     }
 }
 
@@ -2058,5 +1973,55 @@ mod tests {
         assert!(Arc::ptr_eq(&removed, &second));
         removed.clear_registration(second_id);
         assert!(waiters.is_empty());
+    }
+
+    #[test]
+    fn waiter_queue_preserves_fifo_across_removal() {
+        let mut waiters = super::WaiterQueue::default();
+        let first = super::SendOperation::new(1_u8);
+        let second = super::SendOperation::new(2_u8);
+        let third = super::SendOperation::new(3_u8);
+        let first_id = waiters.push_back(Arc::clone(&first));
+        let second_id = waiters.push_back(Arc::clone(&second));
+        let third_id = waiters.push_back(Arc::clone(&third));
+
+        assert!(Arc::ptr_eq(
+            &waiters.remove(second_id).expect("middle waiter is live"),
+            &second
+        ));
+        let (popped_first, operation) = waiters.pop_front().expect("head remains live");
+        assert_eq!(popped_first, first_id);
+        assert!(Arc::ptr_eq(&operation, &first));
+        let (popped_third, operation) = waiters.pop_front().expect("tail remains live");
+        assert_eq!(popped_third, third_id);
+        assert!(Arc::ptr_eq(&operation, &third));
+        assert!(waiters.is_empty());
+    }
+
+    #[test]
+    fn waiter_identity_exhaustion_poison_is_never_minted() {
+        let mut waiters = super::WaiterQueue {
+            next_id: u64::MAX - 2,
+            ..super::WaiterQueue::default()
+        };
+        let last = waiters.push_back(super::SendOperation::new(1_u8));
+        assert_eq!(last, super::WaiterId(u64::MAX - 1));
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                waiters.push_back(super::SendOperation::new(2_u8));
+            }))
+            .is_err(),
+            "the poison key is never minted"
+        );
+        assert_eq!(waiters.next_id, u64::MAX);
+        assert!(!waiters.entries.contains_key(&super::WaiterId(u64::MAX)));
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                waiters.push_back(super::SendOperation::new(3_u8));
+            }))
+            .is_err(),
+            "the exhausted domain stays poisoned"
+        );
     }
 }

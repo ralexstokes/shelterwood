@@ -216,7 +216,7 @@ async fn call_promotion_winning_the_deadline_race_reports_response_timeout() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn zero_deadlines_short_circuit_without_acceptance_or_message_construction() {
+async fn zero_deadline_accepts_ready_send_but_does_not_construct_a_call() {
     let gate = ReleaseGate::default();
     let values = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -235,10 +235,15 @@ async fn zero_deadlines_short_circuit_without_acceptance_or_message_construction
         .try_send(Message::Value(1))
         .expect("identity probe accepts");
 
-    let timed = actor
+    let accepted_at_zero = actor
         .send_timeout(Message::Value(2), Duration::ZERO)
         .await
-        .expect_err("zero send deadline short-circuits");
+        .expect("immediate acceptance wins a zero send deadline");
+    assert_eq!(accepted_at_zero, accepting);
+    let timed = actor
+        .send_timeout(Message::Value(3), Duration::ZERO)
+        .await
+        .expect_err("a full mailbox cannot accept at the zero deadline");
     assert_eq!(timed.kind, SendErrorKind::TimedOut);
     assert_eq!(timed.incarnation_observed, Some(accepting));
     let constructed_in_call = Arc::clone(&constructed);
@@ -251,7 +256,7 @@ async fn zero_deadlines_short_circuit_without_acceptance_or_message_construction
             Duration::ZERO,
         )
         .await
-        .expect_err("zero call deadline short-circuits");
+        .expect_err("a zero call deadline short-circuits user construction");
     assert_eq!(call.kind, CallErrorKind::AcceptanceTimedOut);
     assert_eq!(call.incarnation_observed, Some(accepting));
     assert!(!constructed.load(Ordering::SeqCst));
@@ -259,16 +264,16 @@ async fn zero_deadlines_short_circuit_without_acceptance_or_message_construction
     gate.release();
     assert!(
         poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
-            values.lock().expect("values mutex poisoned").as_slice() == [1]
+            values.lock().expect("values mutex poisoned").as_slice() == [1, 2]
         })
         .await
     );
     assert_quiet(Duration::from_millis(20), || {
-        values.lock().expect("values mutex poisoned").contains(&2)
+        values.lock().expect("values mutex poisoned").contains(&3)
             || calls.load(Ordering::SeqCst) != 0
     })
     .await;
-    assert!(matches!(timed.message, Message::Value(2)));
+    assert!(matches!(timed.message, Message::Value(3)));
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -578,4 +583,24 @@ async fn reply_receiver_reports_drop_and_is_safe_to_abandon() {
     let (reply, receiver) = Reply::<usize>::channel();
     drop(receiver);
     reply.send(1);
+
+    let (reply, receiver) = Reply::channel();
+    reply.send(2);
+    assert_eq!(
+        receiver.recv(Duration::ZERO).await,
+        Ok(2),
+        "a completed reply wins at a zero-width boundary"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reply_completion_wins_at_the_exact_deadline() {
+    let width = Duration::from_secs(10);
+    let (reply, receiver) = Reply::channel();
+    let mut receive = Box::pin(receiver.recv(width));
+    assert!(poll_once(receive.as_mut()).is_pending());
+
+    advance_time(width).await;
+    reply.send(7);
+    assert_eq!(receive.await, Ok(7));
 }

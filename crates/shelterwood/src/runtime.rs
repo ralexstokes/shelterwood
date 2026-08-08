@@ -395,6 +395,23 @@ impl<T> OneShotSender<T> {
 }
 
 impl<T> OneShotReceiver<T> {
+    pub(crate) fn poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<T>> {
+        Pin::new(&mut self.0).poll(context).map(Result::ok)
+    }
+
+    /// Closes the receive side and returns a value whose send won the race.
+    ///
+    /// `tokio::sync::oneshot` makes `close` atomic with `send`; checking the
+    /// slot after closing therefore gives deadline users one transition point
+    /// at which an already-completed delivery wins and every later send loses.
+    pub(crate) fn close_and_try_receive(&mut self) -> Option<T> {
+        self.0.close();
+        self.0.try_recv().ok()
+    }
+
     pub(crate) async fn receive(self) -> Option<T> {
         self.0.await.ok()
     }

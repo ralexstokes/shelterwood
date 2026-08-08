@@ -692,12 +692,17 @@ impl<H> PendingAdmission<H> {
             self.fused_cancel.clone(),
         )?;
         Ok(Box::pin(async move {
-            response
-                .receive()
-                .await
-                .unwrap_or(Err(ReserveError::NotAdmitting(
+            response.receive().await.unwrap_or_else(|| {
+                // The driver's admission `Obligation` publishes an outcome on
+                // every path, including its drop fallback. Treat a missing
+                // response as the scope having gone terminal so a caller is
+                // never stranded, but fail loudly in debug builds: silence
+                // here would mask an obligation regression.
+                debug_assert!(false, "admission response obligation must complete");
+                Err(ReserveError::NotAdmitting(
                     crate::NotAdmittingCause::Terminal,
-                )))
+                ))
+            })
         }))
     }
 
@@ -822,7 +827,16 @@ impl<H: Unpin> Future for Admission<H> {
 impl<H> Drop for Admission<H> {
     fn drop(&mut self) {
         match &self.state {
-            AdmissionState::Unpolled(pending) => pending.cancel_reservation(),
+            AdmissionState::Unpolled(pending) => {
+                // A fused admission annuls its reservation on every drop edge,
+                // polled or not. Firing the latch before cancelling keeps the
+                // scope's control-plane wake and the cancellation evidence in
+                // the same order the in-flight path uses.
+                if let Some(cancel) = &pending.fused_cancel {
+                    crate::driver::signal_fused_cancel(&pending.reservation.control, cancel);
+                }
+                pending.cancel_reservation();
+            }
             AdmissionState::InFlight { pending, .. } => {
                 if let Some(cancel) = &pending.fused_cancel {
                     crate::driver::signal_fused_cancel(&pending.reservation.control, cancel);

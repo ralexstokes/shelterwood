@@ -2187,17 +2187,31 @@ impl ScopeRuntime {
             return;
         }
 
-        let Some(definition) = request.slot.take_defined() else {
-            let (_, removed) = cancel_dynamic_reservation_parts(&control, &request.slot);
-            reject_admission_after_disposal(
-                request,
-                None,
-                removed,
-                ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
-            );
-            return;
+        let (definition, resolved) = match request.slot.resolve_and_take_defined(&self.defaults) {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => {
+                let (_, removed) = cancel_dynamic_reservation_parts(&control, &request.slot);
+                reject_admission_after_disposal(
+                    request,
+                    None,
+                    removed,
+                    ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
+                );
+                return;
+            }
+            Err(invalid) => {
+                let (definition, removed) =
+                    cancel_dynamic_reservation_parts(&control, &request.slot);
+                reject_admission_after_disposal(
+                    request,
+                    definition,
+                    removed,
+                    ReserveError::InvalidPolicy(invalid),
+                );
+                return;
+            }
         };
-        let plan = ChildPlan::resolve(Arc::clone(&request.slot), definition, &self.defaults);
+        let plan = ChildPlan::with_options(Arc::clone(&request.slot), definition, resolved);
         {
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
             let id = request.slot.member.id();
@@ -2462,6 +2476,9 @@ async fn run_nested_tree(
                 }
                 LowerError::IdentityExhausted { id, disposal } => {
                     (StartupFailureCause::IdentityExhausted { id }, disposal)
+                }
+                LowerError::InvalidPolicy { invalid, disposal } => {
+                    (StartupFailureCause::InvalidPolicy(invalid), disposal)
                 }
             };
             // Lowering never created a nested driver to own teardown. Keep

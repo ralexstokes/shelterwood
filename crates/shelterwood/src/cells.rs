@@ -215,6 +215,7 @@ impl MemberCell {
                     false,
                     Readiness::Immediate,
                 )
+                .expect("library defaults must be valid")
             })
     }
 

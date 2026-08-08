@@ -199,6 +199,8 @@ pub enum StartupFailureCause {
         /// Child whose stable membership could not be minted.
         id: ChildId,
     },
+    /// A produced subtree contained an invalid public policy literal.
+    InvalidPolicy(crate::policy::InvalidPolicy),
 }
 
 #[derive(Debug)]
@@ -219,6 +221,7 @@ impl fmt::Display for StructuredStartupFailure {
                     "membership identity space is exhausted for child `{id}`"
                 )
             }
+            StartupFailureCause::InvalidPolicy(invalid) => invalid.fmt(formatter),
         }
     }
 }

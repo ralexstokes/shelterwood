@@ -37,9 +37,9 @@ pub use observe::{
 };
 pub use plan::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use policy::{
-    Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, Jitter, Mailbox,
-    MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, RestartCondition, RestartPolicy,
-    Retention, ScopeDefaults, Shutdown, Strategy,
+    Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, InvalidPolicy, Jitter,
+    Mailbox, MailboxShutdown, PolicyError, PolicyField, Readiness, ReadinessDeadline,
+    RestartCondition, RestartPolicy, Retention, ScopeDefaults, Shutdown, Strategy,
 };
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,

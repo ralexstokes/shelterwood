@@ -11,8 +11,8 @@ use crate::{
     definition::DefinitionSource,
     identity::ScopeIdentity,
     policy::{
-        CommonOptions, IdError, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor,
-        resolve_common,
+        CommonOptions, IdError, InvalidPolicy, PolicyField, ResolvedCommonOptions,
+        ResolvedDefaults, ScopeFlavor, resolve_common,
     },
     raw::RawConstruction,
     runtime::{self, Isolated, Latch},
@@ -41,6 +41,9 @@ pub enum ReserveError {
     /// The scope can mint no further membership identities.
     #[error("membership identity space is exhausted")]
     IdentityExhausted,
+    /// A public policy representation contained an invalid literal value.
+    #[error(transparent)]
+    InvalidPolicy(InvalidPolicy),
 }
 
 /// Exact reason an admission operation could not proceed.
@@ -184,6 +187,72 @@ impl SlotCell {
         self.terminalize_never_started();
         definition
     }
+
+    pub(crate) fn resolve_policy(
+        &self,
+        defaults: &ResolvedDefaults,
+    ) -> Result<Option<ResolvedCommonOptions>, InvalidPolicy> {
+        let state = self.definition.lock().expect("definition mutex poisoned");
+        let DefinitionState::Defined(definition) = &*state else {
+            return Ok(None);
+        };
+        self.resolve_defined_policy(definition, defaults).map(Some)
+    }
+
+    /// Resolves policy and claims the matching construction under one
+    /// definition lock. Dynamic removal can therefore observe either the
+    /// unclaimed definition or the completed claim, never the gap between
+    /// those operations.
+    pub(crate) fn resolve_and_take_defined(
+        &self,
+        defaults: &ResolvedDefaults,
+    ) -> Result<Option<(Isolated<ChildConstruction>, ResolvedCommonOptions)>, InvalidPolicy> {
+        self.resolve_and_take_defined_with(defaults, || {})
+    }
+
+    fn resolve_and_take_defined_with(
+        &self,
+        defaults: &ResolvedDefaults,
+        before_claim: impl FnOnce(),
+    ) -> Result<Option<(Isolated<ChildConstruction>, ResolvedCommonOptions)>, InvalidPolicy> {
+        let mut state = self.definition.lock().expect("definition mutex poisoned");
+        let DefinitionState::Defined(definition) = &*state else {
+            return Ok(None);
+        };
+        let resolved = self.resolve_defined_policy(definition, defaults)?;
+        before_claim();
+        let DefinitionState::Defined(definition) =
+            std::mem::replace(&mut *state, DefinitionState::Lowered)
+        else {
+            unreachable!("the definition lock keeps resolution and claim atomic")
+        };
+        Ok(Some((definition, resolved)))
+    }
+
+    fn resolve_defined_policy(
+        &self,
+        definition: &Isolated<ChildConstruction>,
+        defaults: &ResolvedDefaults,
+    ) -> Result<ResolvedCommonOptions, InvalidPolicy> {
+        let (options, one_shot) = match definition.get() {
+            ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
+            ChildConstruction::Task(definition) => (&definition.options, false),
+            ChildConstruction::TaskOnce(definition) => (&definition.options, true),
+            ChildConstruction::Scope(definition) => {
+                if let DefinitionSource::OneShot(tree) = &definition.source {
+                    let inherited = match definition.defaults {
+                        DefaultsInheritance::Inherit => defaults.clone(),
+                        DefaultsInheritance::Reset => ResolvedDefaults::default(),
+                    };
+                    tree.validate_policies(&inherited)
+                        .map_err(|invalid| invalid.prepend(self.member.id()))?;
+                }
+                (&definition.options, definition.one_shot())
+            }
+        };
+        resolve_common(options, defaults, one_shot, Readiness::Immediate)
+            .map_err(|invalid| invalid.prepend(self.member.id()))
+    }
 }
 
 /// Erased declaration storage before inherited defaults and identities are lowered.
@@ -258,6 +327,13 @@ impl BuilderCore {
                 disposal,
             });
         }
+        let (defaults, resolved) = match self.validate_policies(&inherited) {
+            Ok(resolved) => resolved,
+            Err(invalid) => {
+                let disposal = self.begin_failed_disposal();
+                return Err(LowerError::InvalidPolicy { invalid, disposal });
+            }
+        };
         if !Arc::ptr_eq(&root, &self.root) {
             let mut identity = root
                 .child_identity
@@ -278,13 +354,16 @@ impl BuilderCore {
             }
         }
         root.set_observation_config(self.config.strategy, self.config.intensity);
-        let defaults = inherited.overlay(&self.config.defaults);
         let mut children = Vec::with_capacity(self.slots.len());
-        for slot in &self.slots {
+        for (slot, resolved) in self.slots.iter().zip(resolved) {
             let definition = slot
                 .take_definition()
                 .expect("validated slot must have a definition");
-            children.push(ChildPlan::resolve(Arc::clone(slot), definition, &defaults));
+            children.push(ChildPlan::with_options(
+                Arc::clone(slot),
+                definition,
+                resolved,
+            ));
         }
         self.armed = false;
         Ok(ScopePlan {
@@ -294,6 +373,24 @@ impl BuilderCore {
             children,
             armed: true,
         })
+    }
+
+    fn validate_policies(
+        &self,
+        inherited: &ResolvedDefaults,
+    ) -> Result<(ResolvedDefaults, Vec<ResolvedCommonOptions>), InvalidPolicy> {
+        self.config
+            .intensity
+            .validate()
+            .map_err(|error| InvalidPolicy::new(PolicyField::Intensity, error))?;
+        let defaults = inherited.overlay(&self.config.defaults)?;
+        let mut resolved = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            if let Some(options) = slot.resolve_policy(&defaults)? {
+                resolved.push(options);
+            }
+        }
+        Ok((defaults, resolved))
     }
 
     fn terminalize(&self) {
@@ -344,18 +441,11 @@ pub(crate) struct ChildPlan {
 }
 
 impl ChildPlan {
-    pub(crate) fn resolve(
+    pub(crate) fn with_options(
         slot: Arc<SlotCell>,
         construction: Isolated<ChildConstruction>,
-        defaults: &ResolvedDefaults,
+        options: ResolvedCommonOptions,
     ) -> Self {
-        let (options, one_shot) = match construction.get() {
-            ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
-            ChildConstruction::Task(definition) => (&definition.options, false),
-            ChildConstruction::TaskOnce(definition) => (&definition.options, true),
-            ChildConstruction::Scope(definition) => (&definition.options, definition.one_shot()),
-        };
-        let options = resolve_common(options, defaults, one_shot, Readiness::Immediate);
         slot.member.set_options(options.clone());
         Self {
             slot,
@@ -373,6 +463,10 @@ pub(crate) enum LowerError {
     },
     IdentityExhausted {
         id: ChildId,
+        disposal: Latch,
+    },
+    InvalidPolicy {
+        invalid: InvalidPolicy,
         disposal: Latch,
     },
 }
@@ -410,7 +504,7 @@ pub(crate) fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError
 mod tests {
     use std::{
         sync::{
-            Arc,
+            Arc, Barrier,
             atomic::{AtomicBool, Ordering},
         },
         time::Duration,
@@ -420,7 +514,7 @@ mod tests {
         Backoff, ExitError, Readiness, RestartCondition, RestartPolicy, Retention, Shutdown,
         TaskOnceDef,
         policy::{ResolvedDefaults, ScopeFlavor},
-        runtime::{self, Isolated, Timeout},
+        runtime::{self, Timeout},
         task::TaskDef,
     };
 
@@ -454,13 +548,54 @@ mod tests {
         let dynamic_slot = admission
             .reserve("dynamic", None)
             .expect("dynamic reservation succeeds");
-        let dynamic_plan = ChildPlan::resolve(
-            dynamic_slot,
-            Isolated::new(ChildConstruction::Task(configured_task())),
-            &defaults,
-        );
+        dynamic_slot.define(ChildConstruction::Task(configured_task()));
+        let dynamic_options = dynamic_slot
+            .resolve_policy(&defaults)
+            .expect("dynamic policy is valid")
+            .expect("dynamic slot is defined");
+        let dynamic_definition = dynamic_slot
+            .take_definition()
+            .expect("dynamic slot remains claimable");
+        let dynamic_plan =
+            ChildPlan::with_options(dynamic_slot, dynamic_definition, dynamic_options);
 
         assert_eq!(static_plan.children[0].options, dynamic_plan.options);
+    }
+
+    #[test]
+    fn dynamic_policy_resolution_and_definition_claim_are_atomic() {
+        let defaults = ResolvedDefaults::default();
+        let mut declaration = BuilderCore::new(ScopeFlavor::Dynamic);
+        let slot = declaration
+            .reserve("dynamic", None)
+            .expect("dynamic reservation succeeds");
+        slot.define(ChildConstruction::Task(configured_task()));
+
+        let race = Arc::new(Barrier::new(2));
+        let competing_slot = Arc::clone(&slot);
+        let competing_race = Arc::clone(&race);
+        let competing_claim = std::thread::spawn(move || {
+            competing_race.wait();
+            competing_slot.take_defined()
+        });
+
+        let claim = slot
+            .resolve_and_take_defined_with(&defaults, || {
+                // The competing remover is released only after resolution,
+                // while this method still owns the definition lock.
+                race.wait();
+                std::thread::yield_now();
+            })
+            .expect("dynamic policy is valid")
+            .expect("admission claims the defined construction");
+        assert!(
+            competing_claim
+                .join()
+                .expect("competing claim thread does not panic")
+                .is_none(),
+            "removal cannot claim between policy resolution and admission"
+        );
+        drop(claim);
     }
 
     struct DropFlag(Arc<AtomicBool>);
@@ -485,12 +620,16 @@ mod tests {
         let slot = declaration
             .reserve("one-shot", None)
             .expect("reservation succeeds");
-
-        let plan = ChildPlan::resolve(
-            slot,
-            Isolated::new(ChildConstruction::TaskOnce(construction)),
-            &ResolvedDefaults::default(),
-        );
+        slot.define(ChildConstruction::TaskOnce(construction));
+        let defaults = ResolvedDefaults::default();
+        let options = slot
+            .resolve_policy(&defaults)
+            .expect("one-shot policy is valid")
+            .expect("one-shot slot is defined");
+        let construction = slot
+            .take_definition()
+            .expect("one-shot slot remains claimable");
+        let plan = ChildPlan::with_options(slot, construction, options);
         assert!(plan.options.restart.is_never());
         assert_eq!(plan.options.retention, Retention::Remove);
         assert!(!dropped.load(Ordering::SeqCst));

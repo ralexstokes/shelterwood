@@ -24,7 +24,7 @@ use crate::{
         BuilderCore, ChildConstruction, LowerError, RemoveOutcome, ReserveError, ScopeConstruction,
         SlotCell,
     },
-    policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
+    policy::{CommonOptions, InvalidPolicy, ResolvedDefaults, ScopeFlavor},
     raw::{RawDef, RawOnceDef},
     runtime::{self, Latch},
     task::{OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
@@ -53,6 +53,9 @@ pub enum BuildError {
         /// Child-id paths of every undefined reservation.
         paths: Vec<Vec<ChildId>>,
     },
+    /// A public policy representation contained an invalid literal value.
+    #[error(transparent)]
+    InvalidPolicy(InvalidPolicy),
 }
 
 #[derive(Clone, Copy)]
@@ -533,6 +536,7 @@ fn spawn_builder<R>(
             LowerError::IdentityExhausted { .. } => {
                 unreachable!("root lowering does not mint memberships")
             }
+            LowerError::InvalidPolicy { invalid, .. } => BuildError::InvalidPolicy(invalid),
         })?;
     let scope_ref = ScopeRef { cell: root };
     let run = crate::driver::spawn_system(plan);

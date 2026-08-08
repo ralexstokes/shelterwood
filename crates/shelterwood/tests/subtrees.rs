@@ -472,27 +472,25 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
     let started = Arc::new(AtomicBool::new(false));
     let release = Arc::new((Mutex::new(false), Condvar::new()));
     let mut inner = Tree::new();
-    inner
-        .add_task(
+    // Keep the probe exclusively in the live future. Restartable factories
+    // are retained definitions whose cleanup is intentionally detached after
+    // hard escalation, so they cannot witness the recursive driver join.
+    let (_leaf, _completion) = inner
+        .add_task_once(
             "leaf",
-            TaskDef::new({
+            TaskOnceDef::new({
                 let held = Arc::clone(&held);
                 let started = Arc::clone(&started);
                 let release = Arc::clone(&release);
-                move |_| {
-                    let held = Arc::clone(&held);
-                    let started = Arc::clone(&started);
-                    let release = Arc::clone(&release);
-                    async move {
-                        let _held = held;
-                        started.store(true, Ordering::Release);
-                        let (released, wake) = &*release;
-                        let mut released = released.lock().expect("release mutex poisoned");
-                        while !*released {
-                            released = wake.wait(released).expect("release mutex poisoned");
-                        }
-                        Ok(())
+                move |_| async move {
+                    let _held = held;
+                    started.store(true, Ordering::Release);
+                    let (released, wake) = &*release;
+                    let mut released = released.lock().expect("release mutex poisoned");
+                    while !*released {
+                        released = wake.wait(released).expect("release mutex poisoned");
                     }
+                    Ok(())
                 }
             })
             .shutdown(Shutdown::Graceful {
@@ -523,20 +521,27 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
         "leaf starts polling"
     );
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(5)));
-    assert_quiet(Duration::from_millis(50), || shutdown.is_finished()).await;
+    let returned_before_leaf_released =
+        poll_until(Duration::from_millis(50), Duration::from_millis(1), || {
+            shutdown.is_finished()
+        })
+        .await;
     {
         let (released, wake) = &*release;
         *released.lock().expect("release mutex poisoned") = true;
         wake.notify_all();
     }
-    shutdown
-        .await
-        .expect("shutdown task does not panic")
-        .expect("root shuts down");
+    let shutdown_result = shutdown.await.expect("shutdown task does not panic");
+
+    assert!(
+        !returned_before_leaf_released,
+        "shutdown must not return while a recursively aborted child future is still polling"
+    );
+    shutdown_result.expect("root shuts down");
 
     assert!(
         weak.upgrade().is_none(),
-        "shutdown returns only after every nested driver and construction drops"
+        "shutdown returns only after every nested driver and active future drops"
     );
 }
 

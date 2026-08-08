@@ -3841,7 +3841,12 @@ async fn run_scope_incarnation(
         }
         for child in scope.pending_restart_shutdowns() {
             pending.push((
-                ArbitrationClass::ScopeShutdown,
+                // This starts a pending incarnation, so it is restart work,
+                // not a scope-shutdown transition. In particular, a child
+                // exit collected in the same wake must first get the chance
+                // to trip intensity or fail startup; the execution-time
+                // suppression check then observes that drain.
+                ArbitrationClass::BackoffDue,
                 Pending::RestartShutdown(child),
             ));
         }

@@ -2478,6 +2478,11 @@ async fn run_nested_tree(
                     (StartupFailureCause::IdentityExhausted { id }, disposal)
                 }
                 LowerError::InvalidPolicy { invalid, disposal } => {
+                    // `InvalidPolicy::path` is relative to the scope being
+                    // lowered, which here is this nested scope itself. The
+                    // owning child id is already carried by the enclosing
+                    // `StartupFailureCause::Child`, so prepending it here
+                    // would double-count this frame.
                     (StartupFailureCause::InvalidPolicy(invalid), disposal)
                 }
             };

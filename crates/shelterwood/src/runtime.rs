@@ -5,6 +5,7 @@ use std::{
     future::Future,
     ops::RangeBounds,
     panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -17,6 +18,8 @@ use tokio::{
     task, time,
 };
 
+use crate::deadline::Deadline;
+
 #[cfg(test)]
 pub(crate) use tokio::test;
 
@@ -26,6 +29,130 @@ pub(crate) fn now() -> std::time::Instant {
 
 pub(crate) fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
+}
+
+pub(crate) type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+pub(crate) fn deadline(duration: Duration) -> Deadline {
+    Deadline::after(now(), duration)
+}
+
+pub(crate) fn sleep_deadline(deadline: Deadline) -> BoxedSleep {
+    Box::pin(async move {
+        match deadline.instant() {
+            Some(deadline) => sleep_until_std(deadline).await,
+            None => std::future::pending().await,
+        }
+    })
+}
+
+pub(crate) fn sleep_until(deadline: std::time::Instant) -> BoxedSleep {
+    Box::pin(sleep_until_std(deadline))
+}
+
+pub(crate) struct ActorWork {
+    handle: Option<JoinHandle<(), ()>>,
+    abort: AbortHandle,
+}
+
+impl ActorWork {
+    pub(crate) fn abort(&self) {
+        self.abort.abort();
+    }
+
+    pub(crate) async fn join(mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let _ = join(handle).await;
+    }
+}
+
+impl Drop for ActorWork {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+pub(crate) fn spawn_actor_work(future: impl Future<Output = ()> + Send + 'static) -> ActorWork {
+    let handle = spawn((), future);
+    let abort = handle.abort_handle();
+    ActorWork {
+        handle: Some(handle),
+        abort,
+    }
+}
+
+pub(crate) struct BlockingWork<T> {
+    handle: Option<JoinHandle<(), T>>,
+}
+
+impl<T: Send + 'static> BlockingWork<T> {
+    pub(crate) async fn join(mut self) -> T {
+        let handle = self
+            .handle
+            .take()
+            .expect("blocking operation was joined more than once");
+        join_resuming(handle).await.1
+    }
+}
+
+pub(crate) fn spawn_blocking_work<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> BlockingWork<T> {
+    BlockingWork {
+        handle: Some(spawn_blocking((), operation)),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Signal {
+    inner: WatchSender<()>,
+}
+
+impl Default for Signal {
+    fn default() -> Self {
+        Self { inner: watch(()).0 }
+    }
+}
+
+impl Clone for Signal {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Signal {
+    pub(crate) fn pulse(&self) {
+        self.inner.pulse();
+    }
+
+    pub(crate) fn watcher(&self) -> SignalWatcher {
+        SignalWatcher {
+            inner: self.inner.watcher(),
+            _signal: self.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn watcher_count(&self) -> usize {
+        self.inner.receiver_count()
+    }
+}
+
+pub(crate) struct SignalWatcher {
+    inner: WatchReceiver<()>,
+    // Retain the source through every watcher so channel closure cannot turn
+    // into a spurious pulse.
+    _signal: Signal,
+}
+
+impl SignalWatcher {
+    pub(crate) async fn changed(&mut self) {
+        self.inner.changed().await;
+    }
 }
 
 /// Ownership wrapper for user values retained by framework state.
@@ -674,11 +801,13 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
-        task::Poll,
+        task::{Context, Poll, Waker},
         time::Duration,
     };
 
-    use super::{DisposalJob, JoinOutcome, Latch, Timeout, join, spawn, timeout, yield_now};
+    use super::{
+        DisposalJob, JoinOutcome, Latch, Signal, Timeout, join, spawn, timeout, yield_now,
+    };
 
     struct PanickingDrop(Arc<AtomicUsize>);
 
@@ -708,6 +837,21 @@ mod tests {
             diagnostic.as_ref(),
             Some(Some(Some(message))) if message == "cancelled disposal job payload"
         ));
+    }
+
+    #[test]
+    fn quiet_signal_wait_cancellation_keeps_one_watch_registration() {
+        let signal = Signal::default();
+        let mut watcher = signal.watcher();
+        assert_eq!(signal.watcher_count(), 1);
+
+        for _ in 0..10_000 {
+            let mut changed = Box::pin(watcher.changed());
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(changed.as_mut().poll(&mut context).is_pending());
+            drop(changed);
+            assert_eq!(signal.watcher_count(), 1);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -746,7 +746,7 @@ fn spawn_builder<R>(
     core: BuilderCore,
     make_ref: impl FnOnce(ScopeRef) -> R,
 ) -> Result<System<R>, BuildError> {
-    if !crate::driver::runtime_available() {
+    if !runtime::is_available() {
         return Err(BuildError::NoRuntime);
     }
     let root = Arc::clone(&core.root);

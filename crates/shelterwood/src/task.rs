@@ -55,7 +55,7 @@ impl CancellationToken {
     /// Waits until cancellation is requested.
     pub async fn cancelled(&self) {
         if let Some(secondary) = &self.secondary {
-            let _ = crate::driver::select(self.primary.fired(), secondary.fired()).await;
+            let _ = runtime::select_two(self.primary.fired(), secondary.fired()).await;
         } else {
             self.primary.fired().await;
         }

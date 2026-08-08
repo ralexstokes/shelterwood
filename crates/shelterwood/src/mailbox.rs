@@ -15,7 +15,8 @@ use std::{
 
 use crate::{
     ChildId, Incarnation, Mailbox, Membership,
-    driver::{MemberCell, Signal, SignalWatcher},
+    driver::MemberCell,
+    runtime::{Signal, SignalWatcher},
 };
 
 /// The kind of a failed actor send.
@@ -326,7 +327,7 @@ impl<T> Drop for ReplyReceiver<T> {
 pub struct ReplyReceive<T> {
     shared: Option<Arc<ReplyShared<T>>>,
     deadline: Duration,
-    timer: Option<crate::driver::DriverSleep>,
+    timer: Option<crate::runtime::BoxedSleep>,
     started: bool,
     done: bool,
 }
@@ -347,7 +348,7 @@ impl<T: Send + 'static> Future for ReplyReceive<T> {
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.started {
             self.started = true;
-            let budget = crate::driver::deadline(self.deadline);
+            let budget = crate::runtime::deadline(self.deadline);
             if self.deadline.is_zero() {
                 self.done = true;
                 if let Some(shared) = &self.shared {
@@ -355,7 +356,7 @@ impl<T: Send + 'static> Future for ReplyReceive<T> {
                 }
                 return Poll::Ready(Err(ReplyError::Timeout));
             }
-            self.timer = Some(crate::driver::sleep_deadline(budget));
+            self.timer = Some(crate::runtime::sleep_deadline(budget));
         }
         let shared = Arc::clone(
             self.shared
@@ -1518,7 +1519,7 @@ impl<M> Drop for SendFuture<M> {
 pub struct SendTimeout<M> {
     send: Option<SendFuture<M>>,
     deadline: Duration,
-    timer: Option<crate::driver::DriverSleep>,
+    timer: Option<crate::runtime::BoxedSleep>,
     started: bool,
     done: bool,
 }
@@ -1539,7 +1540,7 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.started {
             self.started = true;
-            let budget = crate::driver::deadline(self.deadline);
+            let budget = crate::runtime::deadline(self.deadline);
             if self.deadline.is_zero() {
                 let actor_id = self
                     .send
@@ -1571,7 +1572,7 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
                     kind: SendErrorKind::TimedOut,
                 }));
             }
-            self.timer = Some(crate::driver::sleep_deadline(budget));
+            self.timer = Some(crate::runtime::sleep_deadline(budget));
         }
         let send = self.send.as_mut().expect("pending timed send retains send");
         if let Poll::Ready(result) = Pin::new(send).poll(context) {
@@ -1624,7 +1625,7 @@ pub struct CallFuture<M, T> {
     actor: ActorRef<M>,
     make_msg: Option<Box<dyn FnOnce(Reply<T>) -> M + Send + 'static>>,
     deadline: Duration,
-    timer: Option<crate::driver::DriverSleep>,
+    timer: Option<crate::runtime::BoxedSleep>,
     send: Option<SendFuture<M>>,
     reply: Option<Arc<ReplyShared<T>>>,
     accepted: Option<Incarnation>,
@@ -1683,7 +1684,7 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
             self.started = true;
             // Capture the one overall budget before invoking user code. A
             // slow message constructor consumes acceptance/response time.
-            let budget = crate::driver::deadline(self.deadline);
+            let budget = crate::runtime::deadline(self.deadline);
             if self.deadline.is_zero() {
                 self.done = true;
                 return Poll::Ready(Err(CallError {
@@ -1701,7 +1702,7 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
             // at the exact deadline win. Construction is different: no send
             // existed before it completed, so do not start one after the
             // captured budget is strictly in the past.
-            if budget.is_overdue(crate::driver::now()) {
+            if budget.is_overdue(crate::runtime::now()) {
                 self.done = true;
                 return Poll::Ready(Err(CallError {
                     actor_id: self.actor.id().clone(),
@@ -1711,7 +1712,7 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
             }
             self.reply = receiver.shared.take();
             self.send = Some(self.actor.send(message));
-            self.timer = Some(crate::driver::sleep_deadline(budget));
+            self.timer = Some(crate::runtime::sleep_deadline(budget));
         }
 
         if self.accepted.is_none() {

@@ -16,10 +16,9 @@ use std::{
 use crate::{
     ActorRef, CancellationToken, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown,
     PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef, Shutdown,
-    driver::{ActorWork, Signal, SignalWatcher},
     mailbox::{MailboxCell, MailboxControl, MailboxReceiver},
     policy::CommonOptions,
-    runtime::Latch,
+    runtime::{self, ActorWork, Latch, Signal, SignalWatcher},
 };
 
 type PanicPayload = Box<dyn Any + Send + 'static>;
@@ -1048,7 +1047,7 @@ impl<M: Send + 'static> RawContext<M> {
     {
         let cancellation = Latch::default();
         let token = self.shutdown.child(cancellation.clone());
-        let work = crate::driver::spawn_blocking_work(move || operation(token));
+        let work = runtime::spawn_blocking_work(move || operation(token));
         Blocking {
             future: Box::pin(async move { work.join().await }),
             cancellation,
@@ -1095,7 +1094,7 @@ impl<M: Send + 'static> RawContext<M> {
         K: Hash + Eq + Send + 'static,
     {
         self.resources.next_timer_order = self.resources.next_timer_order.saturating_add(1);
-        let now = crate::driver::now();
+        let now = runtime::now();
         let deadline = crate::deadline::Deadline::after(now, after).instant();
         self.resources.timers.replace(
             key,
@@ -1154,31 +1153,30 @@ impl<M: Send + 'static> RawContext<M> {
         }
 
         let token = self.shutdown.child(cancellation.clone());
-        let started_at = crate::driver::now();
+        let started_at = runtime::now();
         let expires_at = crate::deadline::Deadline::after(started_at, deadline).instant();
         let event_cancellation = cancellation.clone();
         let operation = async move {
             let completion = async move {
                 let work = CatchUnwindFuture::new(work);
                 if let Some(expires_at) = expires_at {
-                    match crate::driver::select(work, crate::driver::sleep_until(expires_at)).await
-                    {
-                        crate::driver::Selected::First(result) => result.map(Ok),
-                        crate::driver::Selected::Second(()) => Ok(Err(DeadlineElapsed)),
+                    match runtime::select_two(work, runtime::sleep_until(expires_at)).await {
+                        runtime::Either::Left(result) => result.map(Ok),
+                        runtime::Either::Right(()) => Ok(Err(DeadlineElapsed)),
                     }
                 } else {
                     work.await.map(Ok)
                 }
             };
-            match crate::driver::select(token.cancelled(), completion).await {
-                crate::driver::Selected::First(()) => {}
-                crate::driver::Selected::Second(Ok(result)) => {
+            match runtime::select_two(token.cancelled(), completion).await {
+                runtime::Either::Left(()) => {}
+                runtime::Either::Right(Ok(result)) => {
                     events.push(QueuedEvent::Deliver {
                         cancellation: event_cancellation,
                         make_message: Box::new(move || continuation(result)),
                     });
                 }
-                crate::driver::Selected::Second(Err(payload)) => {
+                runtime::Either::Right(Err(payload)) => {
                     panic.record(payload);
                     events.signal.pulse();
                 }
@@ -1190,7 +1188,7 @@ impl<M: Send + 'static> RawContext<M> {
             self.resources.events.signal.clone(),
             finished.clone(),
         );
-        let task = crate::driver::spawn_actor_work(SharedOffloadFuture(Arc::clone(&state)));
+        let task = runtime::spawn_actor_work(SharedOffloadFuture(Arc::clone(&state)));
         self.resources.offloads.push(OffloadResource {
             cancellation,
             finished,
@@ -1310,7 +1308,7 @@ impl<M: Send + 'static> RawContext<M> {
         if self.resources.fired_batch.is_some() || self.resources.timers.is_empty() {
             return;
         }
-        let now = crate::driver::now();
+        let now = runtime::now();
         let armings = self.resources.timers.take_due(now);
         if armings.is_empty() {
             return;
@@ -1328,7 +1326,7 @@ impl<M: Send + 'static> RawContext<M> {
     fn deliver_timer(&mut self, arming: u64) -> Option<M> {
         let entry = self.resources.timers.entry_mut(arming)?;
         if let Some(period) = entry.period {
-            let deadline = crate::deadline::Deadline::after(crate::driver::now(), period).instant();
+            let deadline = crate::deadline::Deadline::after(runtime::now(), period).instant();
             entry.deadline = deadline;
             let TimerMessage::Interval(make_message) = &entry.message else {
                 unreachable!("an interval timer must own a message factory")
@@ -1355,23 +1353,23 @@ impl<M: Send + 'static> RawContext<M> {
 
     async fn wait_for_event(&mut self) {
         let sleep = self.next_timer_deadline().map_or_else(
-            || Box::pin(std::future::pending()) as crate::driver::DriverSleep,
-            crate::driver::sleep_until,
+            || Box::pin(std::future::pending()) as runtime::BoxedSleep,
+            runtime::sleep_until,
         );
         let shutdown = self.shutdown.clone();
         let local_stop = self.local_stop.clone();
         let mailbox = &mut self.receiver;
         let event_watcher = &mut self.resources.event_watcher;
         let delivery = async move {
-            let _ = crate::driver::select(
+            let _ = runtime::select_two(
                 mailbox.changed(),
-                crate::driver::select(event_watcher.changed(), sleep),
+                runtime::select_two(event_watcher.changed(), sleep),
             )
             .await;
         };
-        let _ = crate::driver::select(
+        let _ = runtime::select_two(
             shutdown.cancelled(),
-            crate::driver::select(local_stop.fired(), delivery),
+            runtime::select_two(local_stop.fired(), delivery),
         )
         .await;
     }
@@ -1776,7 +1774,7 @@ mod tests {
         EventQueue, OffloadResource, PanicPayload, PanicSlot, QueuedEvent, RawResources,
         SharedOffloadFuture, SharedOffloadState, resume_preferred_panic,
     };
-    use crate::{driver::Signal, runtime::Latch};
+    use crate::runtime::{Latch, Signal};
 
     fn marker(value: usize) -> QueuedEvent<usize> {
         QueuedEvent::Deliver {

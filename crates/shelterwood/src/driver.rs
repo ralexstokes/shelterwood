@@ -3,9 +3,7 @@
 use std::{
     collections::HashMap,
     fmt,
-    future::Future,
     ops::{Index, IndexMut},
-    pin::Pin,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -40,29 +38,6 @@ use crate::{
         StopReason,
     },
 };
-
-pub(crate) type DriverSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-
-pub(crate) fn deadline(duration: Duration) -> Deadline {
-    Deadline::after(runtime::now(), duration)
-}
-
-pub(crate) fn sleep_deadline(deadline: Deadline) -> DriverSleep {
-    Box::pin(async move {
-        match deadline.instant() {
-            Some(deadline) => runtime::sleep_until_std(deadline).await,
-            None => std::future::pending().await,
-        }
-    })
-}
-
-pub(crate) fn sleep_until(deadline: Instant) -> DriverSleep {
-    Box::pin(runtime::sleep_until_std(deadline))
-}
-
-pub(crate) fn now() -> Instant {
-    runtime::now()
-}
 
 /// An exactly-once synchronous completion.
 ///
@@ -105,130 +80,6 @@ impl<T> Obligation<T> {
 impl<T> Drop for Obligation<T> {
     fn drop(&mut self) {
         self.discharge();
-    }
-}
-
-pub(crate) struct ActorWork {
-    handle: Option<runtime::JoinHandle<(), ()>>,
-    abort: runtime::AbortHandle,
-}
-
-impl ActorWork {
-    pub(crate) fn abort(&self) {
-        self.abort.abort();
-    }
-
-    pub(crate) async fn join(mut self) {
-        let Some(handle) = self.handle.take() else {
-            return;
-        };
-        let _ = runtime::join(handle).await;
-    }
-}
-
-impl Drop for ActorWork {
-    fn drop(&mut self) {
-        self.abort.abort();
-    }
-}
-
-pub(crate) fn spawn_actor_work(future: impl Future<Output = ()> + Send + 'static) -> ActorWork {
-    let handle = runtime::spawn((), future);
-    let abort = handle.abort_handle();
-    ActorWork {
-        handle: Some(handle),
-        abort,
-    }
-}
-
-pub(crate) struct BlockingWork<T> {
-    handle: Option<runtime::JoinHandle<(), T>>,
-}
-
-impl<T: Send + 'static> BlockingWork<T> {
-    pub(crate) async fn join(mut self) -> T {
-        let handle = self
-            .handle
-            .take()
-            .expect("blocking operation was joined more than once");
-        runtime::join_resuming(handle).await.1
-    }
-}
-
-pub(crate) fn spawn_blocking_work<T: Send + 'static>(
-    operation: impl FnOnce() -> T + Send + 'static,
-) -> BlockingWork<T> {
-    BlockingWork {
-        handle: Some(runtime::spawn_blocking((), operation)),
-    }
-}
-
-pub(crate) enum Selected<A, B> {
-    First(A),
-    Second(B),
-}
-
-pub(crate) async fn select<A, B>(first: A, second: B) -> Selected<A::Output, B::Output>
-where
-    A: Future + Send,
-    B: Future + Send,
-{
-    match runtime::select_two(first, second).await {
-        runtime::Either::Left(value) => Selected::First(value),
-        runtime::Either::Right(value) => Selected::Second(value),
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct Signal {
-    inner: runtime::WatchSender<()>,
-}
-
-impl Default for Signal {
-    fn default() -> Self {
-        Self {
-            inner: runtime::watch(()).0,
-        }
-    }
-}
-
-impl Clone for Signal {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl Signal {
-    pub(crate) fn pulse(&self) {
-        self.inner.pulse();
-    }
-
-    pub(crate) fn watcher(&self) -> SignalWatcher {
-        SignalWatcher {
-            inner: self.inner.watcher(),
-            _signal: self.clone(),
-        }
-    }
-
-    #[cfg(test)]
-    fn watcher_count(&self) -> usize {
-        self.inner.receiver_count()
-    }
-}
-
-pub(crate) struct SignalWatcher {
-    inner: runtime::WatchReceiver<()>,
-    // The previous signal implementation kept the source alive through each
-    // watcher. Preserve that ownership so `changed` cannot turn channel
-    // closure into a spurious pulse.
-    _signal: Signal,
-}
-
-impl SignalWatcher {
-    pub(crate) async fn changed(&mut self) {
-        self.inner.changed().await;
     }
 }
 
@@ -1702,10 +1553,6 @@ impl SystemRun {
             }
         }
     }
-}
-
-pub(crate) fn runtime_available() -> bool {
-    runtime::is_available()
 }
 
 fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<ShutdownStraggler>) {
@@ -4078,7 +3925,7 @@ mod tests {
     use super::{
         ChildArena, ChildEvent, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
         MemberCell, MemberStage, Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell,
-        ScopeFlavor, ScopePhase, ScopeRuntime, Signal, StartupPhase, complete_removals,
+        ScopeFlavor, ScopePhase, ScopeRuntime, StartupPhase, complete_removals,
         driver_event_class, mint_child_incarnation, report_channel, restart_shutdown_work,
         run_nested_tree, run_scope_incarnation,
     };
@@ -4410,21 +4257,6 @@ mod tests {
             &root.observation_gate(),
             &nested.observation_gate()
         ));
-    }
-
-    #[test]
-    fn quiet_signal_wait_cancellation_keeps_one_watch_registration() {
-        let signal = Signal::default();
-        let mut watcher = signal.watcher();
-        assert_eq!(signal.watcher_count(), 1);
-
-        for _ in 0..10_000 {
-            let mut changed = Box::pin(watcher.changed());
-            let mut context = Context::from_waker(Waker::noop());
-            assert!(changed.as_mut().poll(&mut context).is_pending());
-            drop(changed);
-            assert_eq!(signal.watcher_count(), 1);
-        }
     }
 
     #[test]

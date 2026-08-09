@@ -139,6 +139,60 @@ async fn one_shot_subtree_lowering_failure_retains_structured_provenance() {
 }
 
 #[tokio::test]
+async fn subtree_intensity_trip_retains_structured_provenance() {
+    // The nested scope's zero budget trips on the first failure, before its
+    // manually gated task ever becomes ready, so the parent deterministically
+    // observes the subtree child terminalize during startup.
+    let mut nested = Tree::new();
+    nested.intensity(Intensity::new(0, Duration::from_secs(10)).expect("valid intensity"));
+    nested
+        .add_task(
+            "failing",
+            TaskDef::new(|_| async { Err(ExitError::message("retry")) })
+                .readiness(Readiness::Manual)
+                .expect("manual readiness"),
+        )
+        .expect("valid task");
+    let mut root = Tree::new();
+    root.add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree edge");
+    let system = root.spawn().expect("runtime is available");
+    let StartupError::StartupFailed(failure) = system
+        .wait_started()
+        .await
+        .expect_err("nested budget trips during startup")
+    else {
+        panic!("expected structured startup failure");
+    };
+    let StartupFailureCause::Child { id, exit, .. } = failure.cause else {
+        panic!("root failure must name its nested child");
+    };
+    assert_eq!(id.as_str(), "nested");
+    let ExitKind::Failed(error) = exit.kind() else {
+        panic!("a tripped subtree is a child failure");
+    };
+    let trip = error
+        .intensity_trip()
+        .expect("framework provenance is retained");
+    assert_eq!(trip.max_restarts, 0);
+    assert_eq!(trip.observed_restarts, 1);
+    assert_eq!(trip.within, Duration::from_secs(10));
+    assert!(
+        error.startup_failure().is_none(),
+        "an intensity trip is not a startup failure"
+    );
+    assert_eq!(
+        error.as_error().to_string(),
+        error.to_string(),
+        "as_error exposes the same erased failure that Display renders"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root rolls back");
+}
+
+#[tokio::test]
 async fn over_budget_restart_is_charged_but_never_spawned() {
     let starts = Arc::new(AtomicUsize::new(0));
     let releases = Arc::new([

@@ -449,6 +449,10 @@ async fn cancelling_inflight_one_shot_adds_drops_every_kind_resource_once() {
     let task_count = ConsumeCount::default();
     let task_started = Arc::new(AtomicBool::new(false));
     let task_guard = task_count.guard();
+    // The `!started` assertions below are deterministic only on the
+    // current_thread runtime: no await separates each enqueueing poll from its
+    // fused drop, so the driver cannot process the admission first (under
+    // multi_thread this would race).
     let mut task = Box::pin(scope.add_task_once(
         "task",
         TaskOnceDef::new({

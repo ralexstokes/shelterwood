@@ -196,6 +196,7 @@ struct DetachedBlockingActor {
     result_disposed: ReleaseGate,
     fresh_seen: ReleaseGate,
     stale_seen: Arc<AtomicBool>,
+    map_ran: Arc<AtomicBool>,
 }
 
 impl Actor for DetachedBlockingActor {
@@ -207,6 +208,7 @@ impl Actor for DetachedBlockingActor {
         ReleaseGate,
         ReleaseGate,
         Arc<AtomicBool>,
+        Arc<AtomicBool>,
     );
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
@@ -217,6 +219,7 @@ impl Actor for DetachedBlockingActor {
             result_disposed: args.3,
             fresh_seen: args.4,
             stale_seen: args.5,
+            map_ran: args.6,
         })
     }
 
@@ -246,7 +249,13 @@ impl Actor for DetachedBlockingActor {
                 context
                     .offload(
                         work,
-                        |_| DetachedBlockingMessage::StaleCompletion,
+                        {
+                            let map_ran = Arc::clone(&self.map_ran);
+                            move |_| {
+                                map_ran.store(true, Ordering::SeqCst);
+                                DetachedBlockingMessage::StaleCompletion
+                            }
+                        },
                         Duration::MAX,
                     )
                     .expect("blocking future is accepted before failure");
@@ -280,6 +289,7 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
     let result_disposed = ReleaseGate::default();
     let fresh_seen = ReleaseGate::default();
     let stale_seen = Arc::new(AtomicBool::new(false));
+    let map_ran = Arc::new(AtomicBool::new(false));
     let mut tree = Tree::new();
     let actor = tree
         .add_actor(
@@ -291,6 +301,7 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
                 let result_disposed = result_disposed.clone();
                 let fresh_seen = fresh_seen.clone();
                 let stale_seen = Arc::clone(&stale_seen);
+                let map_ran = Arc::clone(&map_ran);
                 move || {
                     (
                         generations.fetch_add(1, Ordering::SeqCst) + 1,
@@ -299,6 +310,7 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
                         result_disposed.clone(),
                         fresh_seen.clone(),
                         Arc::clone(&stale_seen),
+                        Arc::clone(&map_ran),
                     )
                 }
             }),
@@ -319,9 +331,16 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
     );
 
     thread_release.release();
+    // The gate only witnesses that the result's destructor ran somewhere; the
+    // `map_ran` assertions below pin down that disposal, not the map closure,
+    // consumed it.
     tokio::time::timeout(POLL_TIMEOUT, result_disposed.wait())
         .await
-        .expect("the detached blocking result is disposed");
+        .expect("the detached blocking result's destructor runs");
+    assert!(
+        !map_ran.load(Ordering::SeqCst),
+        "the detached completion is disposed without running the map closure"
+    );
 
     actor
         .send(DetachedBlockingMessage::Fresh)
@@ -340,6 +359,10 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
         .expect("replacement accepts the final stop");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert!(!stale_seen.load(Ordering::SeqCst));
+    assert!(
+        !map_ran.load(Ordering::SeqCst),
+        "the stale completion was never mapped"
+    );
 }
 
 enum DeadlineMessage {

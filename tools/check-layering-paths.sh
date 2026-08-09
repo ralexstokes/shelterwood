@@ -25,7 +25,19 @@ readonly below_driver_layers=(
   crates/shelterwood/src/task.rs
 )
 readonly driver_path="crates/shelterwood/src/driver.rs"
+readonly scope_path="crates/shelterwood/src/scope.rs"
 readonly tree_path="crates/shelterwood/src/tree.rs"
+
+# A direct `tree::`/`driver::` reference is the usual spelling, while the
+# longer alternatives cover aliases imported from either the crate root or a
+# grouped root import. `--multiline` below lets the grouped form span the
+# rustfmt-normalized lines of a `use crate::{ ... };` statement.
+readonly upward_module_pattern='\b(driver|tree)::|\b(crate|super)::(driver|tree)\b|\b(crate|super)::\{[^;]*\b(driver|tree)\b[[:space:]]*(,|}|as\b)'
+
+# `lib.rs` re-exports these tree-layer types at the crate root. Naming one via
+# `crate::System`, for example, is still an upward dependency even though the
+# source contains no `tree::` token.
+readonly tree_root_export_pattern='ActorSlot|Admission|AdmissionReceipt|BuildError|DynamicActorSlot|DynamicSubtreeSlot|DynamicTaskSlot|DynamicTree|Removal|StartOrShutdownError|Subtree|SubtreeDef|SubtreeOnceDef|SubtreeSlot|System|TaskSlot|Tree'
 
 check_forbidden() {
   local message="$1"
@@ -35,7 +47,7 @@ check_forbidden() {
   local matches
   local status
   set +e
-  matches="$({ rg --line-number "$forbidden" "$@"; } 2>&1)"
+  matches="$({ rg --multiline --line-number "$forbidden" "$@"; } 2>&1)"
   status=$?
   set -e
 
@@ -55,8 +67,13 @@ check_forbidden() {
 
 check_forbidden \
   "upward driver or tree references found below the driver layer:" \
-  '\b(driver|tree)::' \
+  "$upward_module_pattern" \
   "${below_driver_layers[@]}"
+
+check_forbidden \
+  "upward tree root re-exports found in the scope layer:" \
+  "\\b(crate|super)::($tree_root_export_pattern)\\b|\\buse[[:space:]]+(crate|super)::\\{[^;]*\\b($tree_root_export_pattern)\\b" \
+  "$scope_path"
 
 check_forbidden \
   "upward tree references found in the driver layer:" \

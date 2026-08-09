@@ -672,6 +672,11 @@ impl OffloadResource {
             state.cancel();
         }
         if let Some(task) = &self.task {
+            // These are complementary: `state.cancel()` synchronously
+            // disposes idle work (capturing destructor panic) or marks an
+            // in-progress poll to dispose on return, while abort independently
+            // requests cancellation of the runtime task driving that poll.
+            // Neither substitutes for the other.
             task.abort();
         }
         self.finished.fire();

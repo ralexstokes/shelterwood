@@ -439,6 +439,12 @@ pub(crate) struct ScopeCell {
     record: runtime::WatchSender<ScopeRecord>,
     control: Mutex<ScopeControl>,
     dynamic_route: Mutex<Option<Arc<dyn DynamicRoute>>>,
+    // Dropping a resident emits `Removed` and recursively reads this watch.
+    // Every removal path must therefore release the watch guard first:
+    // mutation callbacks move removed residents into outer storage, while a
+    // wholesale clear uses `take`/replacement, whose old collection emerges
+    // only after the channel's internal guard is released. Dropping a resident
+    // inside a mutation callback would self-deadlock; adding one there is safe.
     current_children: runtime::WatchSender<Vec<ResidentChild>>,
     parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
     observation_gate: RwLock<Arc<Mutex<()>>>,
@@ -585,7 +591,18 @@ impl ScopeCell {
         )
     }
 
-    fn adopt_observation_gate(&self, gate: &Arc<Mutex<()>>) {
+    fn adopt_observation_gate(&self, parent: &ScopeCell, gate: &Arc<Mutex<()>>) {
+        debug_assert!(
+            !std::ptr::eq(self, parent),
+            "a scope cannot adopt from itself"
+        );
+        // The caller holds `gate` through `parent.with_observation_gate`.
+        // Re-homing the parent would first have to acquire that same gate, so
+        // rereading its installed pointer here cannot race a parent handoff.
+        debug_assert!(
+            Arc::ptr_eq(gate, &parent.current_observation_gate()),
+            "observation gates are adopted only in the parent-to-child direction"
+        );
         loop {
             let current = self.current_observation_gate();
             if Arc::ptr_eq(&current, gate) {
@@ -1201,7 +1218,7 @@ impl ScopeCell {
             self.clear_residents_locked();
             for child in children {
                 if let Some(scope) = &child.scope {
-                    scope.adopt_observation_gate(&gate);
+                    scope.adopt_observation_gate(self, &gate);
                     scope.parent.replace(Some(Arc::downgrade(self)));
                 }
                 child
@@ -1220,7 +1237,7 @@ impl ScopeCell {
         self.with_observation_gate(|| {
             let gate = self.current_observation_gate();
             if let Some(scope) = &child.scope {
-                scope.adopt_observation_gate(&gate);
+                scope.adopt_observation_gate(self, &gate);
                 scope.parent.replace(Some(Arc::downgrade(self)));
             }
             let id = child.member.id().clone();

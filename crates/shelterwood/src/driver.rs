@@ -1,11 +1,14 @@
 //! Mutable runtime shell and shared handle state.
 
 use std::{
-    collections::{BTreeMap, HashMap},
-    ops::{Bound, Index, IndexMut},
+    collections::HashMap,
     sync::{Arc, Mutex, Weak, mpsc},
     time::{Duration, Instant},
 };
+
+mod storage;
+
+use storage::{ChildArena, ChildKey, Obligation};
 
 use crate::{
     Cancellation, ChildId, Exit, ExitKind, GracePhase, Incarnation, IntensityTrip, JitterSample,
@@ -41,50 +44,6 @@ use crate::{
 
 #[cfg(test)]
 use crate::cells::{GateCapture, MemberCell, RuntimeStorage};
-
-/// An exactly-once synchronous completion.
-///
-/// The orderly path consumes the payload with [`Self::complete`]. If that
-/// path is destroyed before doing so, dropping the obligation executes the
-/// fail-closed fallback instead. Fallbacks must never await or join.
-#[must_use = "dropping an obligation executes its fallback completion"]
-struct Obligation<T> {
-    payload: Option<T>,
-    fallback: fn(T),
-}
-
-impl<T> Obligation<T> {
-    fn new(payload: T, fallback: fn(T)) -> Self {
-        Self {
-            payload: Some(payload),
-            fallback,
-        }
-    }
-
-    fn payload_mut(&mut self) -> &mut T {
-        self.payload
-            .as_mut()
-            .expect("a completed obligation has no payload")
-    }
-
-    fn complete(&mut self, completion: impl FnOnce(T)) {
-        if let Some(payload) = self.payload.take() {
-            completion(payload);
-        }
-    }
-
-    fn discharge(&mut self) {
-        if let Some(payload) = self.payload.take() {
-            (self.fallback)(payload);
-        }
-    }
-}
-
-impl<T> Drop for Obligation<T> {
-    fn drop(&mut self) {
-        self.discharge();
-    }
-}
 
 struct RecordedReport {
     outcome: Option<RecordedOutcome>,
@@ -964,98 +923,6 @@ impl ChildRuntime {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct ChildKey(u64);
-
-#[derive(Default)]
-struct ChildArena {
-    // Keys are insertion-order ids and are never reused. A late event can
-    // therefore miss; it can never address a subsequently inserted child.
-    children: BTreeMap<ChildKey, ChildRuntime>,
-    // `u64::MAX` is poison and is never minted. Once exhausted, every later
-    // insertion fails closed instead of wrapping into the live key domain.
-    next_key: u64,
-}
-
-impl ChildArena {
-    fn insert(&mut self, child: ChildRuntime) -> Result<ChildKey, Box<ChildRuntime>> {
-        let Some(next) = self.next_key.checked_add(1) else {
-            return Err(Box::new(child));
-        };
-        if next == u64::MAX {
-            self.next_key = u64::MAX;
-            return Err(Box::new(child));
-        }
-        self.next_key = next;
-        let key = ChildKey(next);
-        let replaced = self.children.insert(key, child);
-        debug_assert!(replaced.is_none(), "monotonic child keys are never reused");
-        Ok(key)
-    }
-
-    fn get(&self, key: ChildKey) -> Option<&ChildRuntime> {
-        self.children.get(&key)
-    }
-
-    fn get_mut(&mut self, key: ChildKey) -> Option<&mut ChildRuntime> {
-        self.children.get_mut(&key)
-    }
-
-    fn remove(&mut self, key: ChildKey) -> Option<ChildRuntime> {
-        self.children.remove(&key)
-    }
-
-    fn keys(&self) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
-        self.children.keys().copied()
-    }
-
-    fn keys_after(&self, key: ChildKey) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
-        self.children
-            .range((Bound::Excluded(key), Bound::Unbounded))
-            .map(|(key, _)| *key)
-    }
-
-    fn values(&self) -> impl Iterator<Item = &ChildRuntime> {
-        self.children.values()
-    }
-
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut ChildRuntime> {
-        self.children.values_mut()
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.children.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.children.is_empty()
-    }
-
-    fn clear(&mut self) {
-        self.children.clear();
-    }
-
-    #[cfg(test)]
-    fn storage_len(&self) -> usize {
-        self.children.len()
-    }
-}
-
-impl Index<ChildKey> for ChildArena {
-    type Output = ChildRuntime;
-
-    fn index(&self, key: ChildKey) -> &Self::Output {
-        self.get(key).expect("live child key")
-    }
-}
-
-impl IndexMut<ChildKey> for ChildArena {
-    fn index_mut(&mut self, key: ChildKey) -> &mut Self::Output {
-        self.get_mut(key).expect("live child key")
-    }
-}
-
 struct AncestorCommandLatches {
     shutdown: Latch,
     abort: Latch,
@@ -1097,7 +964,7 @@ struct ScopeRuntime {
     defaults: ResolvedDefaults,
     intensity_policy: crate::Intensity,
     intensity: IntensityState,
-    children: ChildArena,
+    children: ChildArena<ChildRuntime>,
     events: runtime::MpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
@@ -3105,12 +2972,11 @@ mod tests {
     };
 
     use super::{
-        AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
-        DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
-        Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
-        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, complete_removals,
-        report_channel, resident_projection, restart_shutdown_work, run_nested_tree,
-        run_scope_incarnation,
+        AncestorCommandLatches, ChildArena, ChildEvent, ChildRuntime, DriverEvent, DynamicControl,
+        DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches, Obligation,
+        Pending, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard, ScopeFlavor,
+        ScopeRole, ScopeRuntime, StartupDisposition, complete_removals, report_channel,
+        resident_projection, restart_shutdown_work, run_nested_tree, run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -3670,54 +3536,6 @@ mod tests {
         assert!(
             root.observation_gate()
                 .same_gate(&nested.observation_gate())
-        );
-    }
-
-    #[test]
-    fn removed_child_keys_are_never_reused() {
-        let mut tree = Tree::new();
-        tree.add_task("worker", TaskDef::new(|_| future::pending()))
-            .expect("valid task");
-        let mut plan = tree.lower_for_test();
-        let child =
-            ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &plan.root);
-        let mut arena = ChildArena::default();
-        let stale = arena.insert(child).unwrap_or_else(|_| panic!("key mints"));
-        let child = arena.remove(stale).expect("live key removes its child");
-        let current = arena.insert(child).unwrap_or_else(|_| panic!("key mints"));
-
-        assert!(current > stale, "keys advance monotonically across removal");
-        assert!(arena.get(stale).is_none());
-        assert!(arena.remove(stale).is_none());
-        assert!(arena.get(current).is_some());
-    }
-
-    #[test]
-    fn child_key_exhaustion_poison_is_never_minted() {
-        let mut tree = Tree::new();
-        tree.add_task("worker", TaskDef::new(|_| future::pending()))
-            .expect("valid task");
-        let mut plan = tree.lower_for_test();
-        let child =
-            ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &plan.root);
-        let mut arena = ChildArena {
-            next_key: u64::MAX - 2,
-            ..ChildArena::default()
-        };
-        let last = arena
-            .insert(child)
-            .unwrap_or_else(|_| panic!("the last usable key mints"));
-        assert_eq!(last, ChildKey(u64::MAX - 1));
-        let child = arena.remove(last).expect("the last usable key is live");
-
-        let child = *arena
-            .insert(child)
-            .expect_err("the poison key is never minted");
-        assert_eq!(arena.next_key, u64::MAX);
-        assert!(arena.get(ChildKey(u64::MAX)).is_none());
-        assert!(
-            arena.insert(child).is_err(),
-            "the exhausted domain stays poisoned"
         );
     }
 

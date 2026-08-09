@@ -11,8 +11,19 @@ pub(crate) struct Deadline(Option<Instant>);
 
 impl Deadline {
     /// Captures a duration budget relative to `started_at`.
+    ///
+    /// A deadline the timer could not arm — one within
+    /// [`Self::ARMING_HEADROOM`] of the clock limit — is treated exactly
+    /// like one the clock cannot represent: it never arrives. Filtering
+    /// here keeps every stored deadline identical to the instant that
+    /// would be armed for it, so due-ness checks and timer wakes can
+    /// never disagree at the clock boundary.
     pub(crate) fn after(started_at: Instant, duration: Duration) -> Self {
-        Self(started_at.checked_add(duration))
+        Self(
+            started_at
+                .checked_add(duration)
+                .filter(|deadline| deadline.checked_add(Self::ARMING_HEADROOM).is_some()),
+        )
     }
 
     /// Returns the representable absolute deadline, if there is one.
@@ -24,10 +35,11 @@ impl Deadline {
     ///
     /// Arming a deadline is itself clock arithmetic — tokio rounds a
     /// sleep deadline up to the next whole millisecond by adding to it
-    /// before tick conversion — so a clamp flush against `Instant`'s
-    /// limit would panic at arming time. One second comfortably covers
-    /// that sub-millisecond round-up without measurably loosening the
-    /// clamp.
+    /// before tick conversion, and a paused test clock advances its base
+    /// past the armed tick by another whole millisecond — so a deadline
+    /// flush against `Instant`'s limit would panic at arming or advance
+    /// time. One second comfortably covers both additions without
+    /// measurably loosening the clamp.
     pub(crate) const ARMING_HEADROOM: Duration = Duration::from_secs(1);
 
     /// Captures a duration budget as an absolute instant, saturating to
@@ -72,7 +84,10 @@ impl Deadline {
     /// clock limit would still panic inside the timer's millisecond
     /// round-up, so the arming boundary pulls it back just far enough to
     /// fit. Deadlines that already leave the headroom pass through
-    /// unchanged.
+    /// unchanged — including everything [`Deadline::after`] produces,
+    /// which withholds unarmable deadlines at computation time; this
+    /// clamp is the last line of defense for instants that reach the
+    /// runtime boundary by any other route.
     pub(crate) fn clamp_armable(deadline: Instant) -> Instant {
         if deadline.checked_add(Self::ARMING_HEADROOM).is_some() {
             return deadline;
@@ -140,6 +155,31 @@ mod tests {
     }
 
     #[test]
+    fn unarmable_but_representable_budgets_never_arrive() {
+        let now = Instant::now();
+        // The largest armable budget: its deadline sits exactly one
+        // headroom below the clock limit, so one more headroom on top of
+        // it lands flush against the limit — representable, but a panic
+        // to arm.
+        let armable = Deadline::saturating_after(now, Duration::MAX) - now;
+        let unarmable = armable + Deadline::ARMING_HEADROOM;
+
+        assert_eq!(
+            Deadline::after(now, armable).instant(),
+            Some(now + armable),
+            "a budget that leaves the arming headroom is a real deadline"
+        );
+        let flush = Deadline::after(now, unarmable);
+        assert_eq!(
+            flush.instant(),
+            None,
+            "a budget the timer could not arm never arrives"
+        );
+        assert!(!flush.is_due(now + armable));
+        assert!(!flush.is_overdue(now + armable));
+    }
+
+    #[test]
     fn clamp_armable_passes_ordinary_deadlines_through_unchanged() {
         let now = Instant::now();
         let deadline = now + Duration::from_secs(1);
@@ -154,7 +194,7 @@ mod tests {
         // limit: representable, but a panic to arm.
         let flush = Deadline::saturating_after(now, Duration::MAX) + Deadline::ARMING_HEADROOM;
         let clamped = Deadline::clamp_armable(flush);
-        assert!(clamped <= flush, "the clamp never arms later than asked");
+        assert!(clamped < flush, "the clamp never arms later than asked");
         assert!(
             clamped.checked_add(Deadline::ARMING_HEADROOM).is_some(),
             "the clamp leaves the timer's arming headroom below the clock limit"

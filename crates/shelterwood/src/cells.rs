@@ -277,7 +277,7 @@ impl MemberCell {
             }
         };
         if let Some(terminal_exit) = terminal_exit {
-            self.publish_terminal(terminal_exit);
+            runtime::resume_preferred_panic(self.publish_terminal(terminal_exit));
         }
     }
 
@@ -290,37 +290,10 @@ impl MemberCell {
     }
 
     pub(crate) fn terminalize(&self, exit: Exit) {
-        let terminal_exit = {
-            let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            match &*state {
-                MemberMailbox::Terminal {
-                    exit: terminal_exit,
-                    ..
-                } => terminal_exit.clone(),
-                MemberMailbox::Unattached => {
-                    *state = MemberMailbox::Terminal {
-                        control: None,
-                        exit: exit.clone(),
-                        teardown: None,
-                    };
-                    exit
-                }
-                MemberMailbox::Attached(control) => {
-                    let control = Arc::clone(control);
-                    let teardown = control.prepare_termination();
-                    *state = MemberMailbox::Terminal {
-                        control: Some(control),
-                        exit: exit.clone(),
-                        teardown,
-                    };
-                    exit
-                }
-            }
-        };
-        self.publish_terminal(terminal_exit);
+        runtime::resume_preferred_panic(self.terminalize_for_scope(exit));
     }
 
-    fn publish_terminal(&self, terminal_exit: Exit) {
+    fn publish_terminal(&self, terminal_exit: Exit) -> runtime::UnwindPanics {
         let mut published = false;
         self.record.modify_silently(|record| {
             if !matches!(record.stage, MemberStage::Terminal(_)) {
@@ -355,10 +328,41 @@ impl MemberCell {
         let pulse_panic = published
             .then(|| runtime::catch_panic(|| self.record.pulse()).err())
             .flatten();
-        runtime::resume_preferred_panic(runtime::UnwindPanics {
+        runtime::UnwindPanics {
             primary: teardown_panic,
             cleanup: pulse_panic,
-        });
+        }
+    }
+
+    fn terminalize_for_scope(&self, exit: Exit) -> runtime::UnwindPanics {
+        let terminal_exit = {
+            let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
+            match &*state {
+                MemberMailbox::Terminal {
+                    exit: terminal_exit,
+                    ..
+                } => terminal_exit.clone(),
+                MemberMailbox::Unattached => {
+                    *state = MemberMailbox::Terminal {
+                        control: None,
+                        exit: exit.clone(),
+                        teardown: None,
+                    };
+                    exit
+                }
+                MemberMailbox::Attached(control) => {
+                    let control = Arc::clone(control);
+                    let teardown = control.prepare_termination();
+                    *state = MemberMailbox::Terminal {
+                        control: Some(control),
+                        exit: exit.clone(),
+                        teardown,
+                    };
+                    exit
+                }
+            }
+        };
+        self.publish_terminal(terminal_exit)
     }
 
     pub(crate) async fn wait_terminal(&self) -> Exit {
@@ -863,7 +867,7 @@ impl ScopeCell {
             member.update_locked(|record| {
                 record.startup_aborted = startup == StartupDisposition::Aborted;
             });
-            member.terminalize(exit.clone());
+            let terminal_panics = member.terminalize_for_scope(exit.clone());
             if record.last_incarnation.is_none()
                 && let Some(scope) = &nested
             {
@@ -886,6 +890,11 @@ impl ScopeCell {
             if let Some(scope) = nested {
                 scope.close_observation_locked();
             }
+            // A hostile mailbox waker may panic while discharge makes this
+            // terminal record observable. Keep that panic authoritative, but
+            // defer it until the parent snapshot/lifecycle transaction and
+            // nested observation closure are complete.
+            runtime::resume_preferred_panic(terminal_panics);
             true
         })
     }

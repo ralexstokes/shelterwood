@@ -952,11 +952,16 @@ impl ChildRuntime {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
-        let changed = root.terminalize_child(&self.slot.member, exit, exited_incarnation, startup);
+        let terminalized = runtime::catch_panic(|| {
+            root.terminalize_child(&self.slot.member, exit, exited_incarnation, startup)
+        });
         if matches!(self.slot.member.record().stage, MemberStage::Terminal(_)) {
             self.terminality.complete(drop);
         }
-        changed
+        match terminalized {
+            Ok(changed) => changed,
+            Err(payload) => runtime::resume_panic(payload),
+        }
     }
 
     fn complete_terminality(&mut self) {
@@ -3147,15 +3152,35 @@ mod tests {
         }
     }
 
-    struct PanicWake;
+    struct PanicWake(&'static str);
 
     impl Wake for PanicWake {
         fn wake(self: Arc<Self>) {
-            panic!("injected mailbox waker panic");
+            std::panic::panic_any(self.0);
         }
 
         fn wake_by_ref(self: &Arc<Self>) {
-            panic!("injected mailbox waker panic");
+            std::panic::panic_any(self.0);
+        }
+    }
+
+    struct PanicDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for PanicDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct CountedPanicWake(Arc<AtomicUsize>);
+
+    impl Wake for CountedPanicWake {
+        fn wake(self: Arc<Self>) {
+            std::panic::panic_any(PanicDropProbe(Arc::clone(&self.0)));
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            std::panic::panic_any(PanicDropProbe(Arc::clone(&self.0)));
         }
     }
 
@@ -4235,7 +4260,7 @@ mod tests {
         member.attach_mailbox(mailbox);
 
         let mut parked_send = Box::pin(actor.send(1));
-        let panicking_waker = Waker::from(Arc::new(PanicWake));
+        let panicking_waker = Waker::from(Arc::new(PanicWake("injected mailbox waker panic")));
         assert!(
             parked_send
                 .as_mut()
@@ -4276,6 +4301,72 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn mailbox_teardown_panic_precedes_a_terminal_pulse_panic() {
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+
+        let mut parked_send = Box::pin(actor.send(1));
+        let mailbox_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let mailbox_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &mailbox_payload_dropped,
+        ))));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&mailbox_waker))
+                .is_pending()
+        );
+
+        let mut terminal = Box::pin(member.wait_terminal());
+        let pulse_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let terminal_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &pulse_payload_dropped,
+        ))));
+        assert!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&terminal_waker))
+                .is_pending()
+        );
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            member.terminalize(Exit::never_started());
+        }))
+        .expect_err("the primary mailbox panic still surfaces");
+        assert_eq!(
+            mailbox_payload_dropped.load(Ordering::SeqCst),
+            0,
+            "the primary mailbox payload is retained for the caller"
+        );
+        assert_eq!(
+            pulse_payload_dropped.load(Ordering::SeqCst),
+            1,
+            "the membership-pulse panic is cleanup and is contained"
+        );
+        drop(payload);
+        assert_eq!(mailbox_payload_dropped.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(error)) if error.kind == SendErrorKind::Terminated
+        ));
+    }
+
     #[crate::runtime::test]
     async fn mailbox_waker_panic_is_contained_without_wedging_system_completion() {
         let exit = Latch::default();
@@ -4290,6 +4381,7 @@ mod tests {
         let plan = tree.lower_for_test();
         let member = Arc::clone(&plan.children[0].slot.member);
         let root = Arc::clone(&plan.root);
+        let mut events = root.subscribe_lifecycle();
         let mut system = super::spawn_system(plan);
         root.wait_started().await.expect("actor starts");
         actor
@@ -4297,7 +4389,7 @@ mod tests {
             .expect("the first message fills the queue");
 
         let mut parked_send = Box::pin(actor.send(2));
-        let panicking_waker = Waker::from(Arc::new(PanicWake));
+        let panicking_waker = Waker::from(Arc::new(PanicWake("injected mailbox waker panic")));
         assert!(
             parked_send
                 .as_mut()
@@ -4349,6 +4441,22 @@ mod tests {
             ExitKind::Panicked { message }
                 if message.as_deref() == Some("injected mailbox waker panic")
         ));
+        let mut terminal_trace = Vec::new();
+        while let Some(item) = events.recv().await {
+            let LifecycleItem::Event(event) = item else {
+                panic!("the single-child terminal trace cannot lag");
+            };
+            match event.kind {
+                LifecycleEventKind::Exited { .. } => terminal_trace.push("exited"),
+                LifecycleEventKind::Removed { .. } => terminal_trace.push("removed"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            terminal_trace,
+            ["exited", "removed"],
+            "mailbox panic resumes only after the terminal event, pruning edge, and stream closure"
+        );
     }
 
     #[test]

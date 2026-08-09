@@ -1375,8 +1375,8 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         };
         exit_ended.fire();
         // The task owns `report`, whose explicit record or Drop fallback runs
-        // before the join completes. Therefore this blocking receive cannot
-        // wait on a producer that is still schedulable on this worker.
+        // before the join completes. `receive` therefore asserts immediate
+        // post-join availability without ever blocking this runtime worker.
         let report = report_receiver.receive();
         let _ = runtime::mpsc_send(
             &exit_sender,

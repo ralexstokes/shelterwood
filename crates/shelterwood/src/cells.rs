@@ -440,9 +440,11 @@ pub(crate) struct ScopeCell {
     control: Mutex<ScopeControl>,
     dynamic_route: Mutex<Option<Arc<dyn DynamicRoute>>>,
     // Dropping a resident emits `Removed` and recursively reads this watch.
-    // Mutation callbacks must therefore move removed residents out and drop
-    // them only after the watch guard has been released; dropping one from
-    // inside `send_modify`/`send_if_modified` would self-deadlock.
+    // Every removal path must therefore release the watch guard first:
+    // mutation callbacks move removed residents into outer storage, while a
+    // wholesale clear uses `take`/replacement, whose old collection emerges
+    // only after the channel's internal guard is released. Dropping a resident
+    // inside a mutation callback would self-deadlock; adding one there is safe.
     current_children: runtime::WatchSender<Vec<ResidentChild>>,
     parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
     observation_gate: RwLock<Arc<Mutex<()>>>,
@@ -594,6 +596,9 @@ impl ScopeCell {
             !std::ptr::eq(self, parent),
             "a scope cannot adopt from itself"
         );
+        // The caller holds `gate` through `parent.with_observation_gate`.
+        // Re-homing the parent would first have to acquire that same gate, so
+        // rereading its installed pointer here cannot race a parent handoff.
         debug_assert!(
             Arc::ptr_eq(gate, &parent.current_observation_gate()),
             "observation gates are adopted only in the parent-to-child direction"

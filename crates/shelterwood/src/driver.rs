@@ -2867,8 +2867,10 @@ async fn run_scope_incarnation(
                 let _ = runtime::select_two(shutdown, abort).await;
             };
             match runtime::wait_scope(
-                signal.changed(),
-                ancestor_command,
+                runtime::ScopeWait {
+                    signal: signal.changed(),
+                    parent_shutdown: ancestor_command,
+                },
                 &mut event_receiver,
                 scope.deadlines.next(),
             )

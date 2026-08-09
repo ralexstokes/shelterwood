@@ -3521,7 +3521,7 @@ fn wait_for_child(
     &self,
     id: impl Into<ChildId>,
     pred: impl FnMut(&ChildSnapshot) -> bool + Send,
-    deadline: Duration,                       // trailing, per Appendix B
+    timeout: Duration,                        // trailing, per Appendix B
 ) -> impl Future<Output = Result<ChildSnapshot, WaitError>> + Send;
 // WaitError { TimedOut, ScopeTerminated { state } } — non-exhaustive;
 // ScopeTerminated carries the scope's terminal B.6 state

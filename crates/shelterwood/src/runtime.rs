@@ -43,6 +43,12 @@ pub(crate) fn alive_task_count() -> usize {
 /// Runtime-owned spelling for an unwind payload crossing a framework boundary.
 pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
 
+/// Panic payloads crossing an unwind boundary, named by precedence.
+pub(crate) struct UnwindPanics {
+    pub(crate) primary: Option<PanicPayload>,
+    pub(crate) cleanup: Option<PanicPayload>,
+}
+
 /// Catches application code without requiring every caller to repeat the
 /// `AssertUnwindSafe` boundary vocabulary.
 pub(crate) fn catch_panic<T>(operation: impl FnOnce() -> T) -> Result<T, PanicPayload> {
@@ -82,7 +88,8 @@ pub(crate) fn keep_first_panic(first: &mut Option<PanicPayload>, candidate: Opti
 /// outcome, which is true in a destructor and false on a normal return path.
 /// Callers that own the sole surviving copy of an authoritative panic must use
 /// [`resume_preferred_panic_outside_unwind`] instead.
-pub(crate) fn resume_preferred_panic(primary: Option<PanicPayload>, cleanup: Option<PanicPayload>) {
+pub(crate) fn resume_preferred_panic(panics: UnwindPanics) {
+    let UnwindPanics { primary, cleanup } = panics;
     if std::thread::panicking() {
         discard_panic(primary);
         discard_panic(cleanup);
@@ -102,10 +109,8 @@ pub(crate) fn resume_preferred_panic(primary: Option<PanicPayload>, cleanup: Opt
 /// erase the authoritative diagnostic and let the caller continue past a
 /// failure it believes it re-raised, so the caller's non-unwinding precondition
 /// is asserted rather than absorbed.
-pub(crate) fn resume_preferred_panic_outside_unwind(
-    primary: Option<PanicPayload>,
-    cleanup: Option<PanicPayload>,
-) {
+pub(crate) fn resume_preferred_panic_outside_unwind(panics: UnwindPanics) {
+    let UnwindPanics { primary, cleanup } = panics;
     debug_assert!(
         !std::thread::panicking(),
         "an unwinding caller must contain its payloads with resume_preferred_panic"
@@ -143,7 +148,10 @@ impl PanicAccumulator {
 
 impl Drop for PanicAccumulator {
     fn drop(&mut self) {
-        resume_preferred_panic(None, self.first.take());
+        resume_preferred_panic(UnwindPanics {
+            primary: None,
+            cleanup: self.first.take(),
+        });
     }
 }
 
@@ -1161,9 +1169,13 @@ pub(crate) enum ScopeWake<T> {
     Deadline,
 }
 
+pub(crate) struct ScopeWait<S, C> {
+    pub(crate) signal: S,
+    pub(crate) parent_shutdown: C,
+}
+
 pub(crate) async fn wait_scope<S, C, T>(
-    signal: S,
-    parent_shutdown: C,
+    wait: ScopeWait<S, C>,
     receiver: &mut MpscReceiver<T>,
     deadline: Option<std::time::Instant>,
 ) -> ScopeWake<T>
@@ -1171,6 +1183,10 @@ where
     S: Future<Output = ()> + Send,
     C: Future<Output = ()> + Send,
 {
+    let ScopeWait {
+        signal,
+        parent_shutdown,
+    } = wait;
     tokio::pin!(signal);
     tokio::pin!(parent_shutdown);
     let deadline = async move {

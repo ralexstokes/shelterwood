@@ -192,14 +192,17 @@ async fn latest_mailbox_keeps_only_the_newest_accepted_value() {
         })
         .await
     );
-    assert_quiet(Duration::from_millis(20), || {
-        values.lock().expect("values mutex poisoned").len() > 1
-    })
-    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
+    // The complete post-shutdown history proves conflation destroyed the
+    // replaced values rather than merely delaying them.
+    assert_eq!(
+        *values.lock().expect("values mutex poisoned"),
+        [3],
+        "only the newest accepted value survives conflation"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -252,14 +255,17 @@ async fn timed_send_withdraws_and_recovers_the_message() {
         })
         .await
     );
-    assert_quiet(Duration::from_millis(20), || {
-        values.lock().expect("values mutex poisoned").contains(&3)
-    })
-    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
+    // The complete post-shutdown history proves the cancelled send was
+    // withdrawn before acceptance while the recovered message arrived.
+    assert_eq!(
+        *values.lock().expect("values mutex poisoned"),
+        [1, 2],
+        "a send cancelled before acceptance must never be delivered"
+    );
 }
 
 #[tokio::test(start_paused = true)]

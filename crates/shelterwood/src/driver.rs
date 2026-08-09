@@ -35,7 +35,7 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::cells::{MemberCell, RuntimeStorage};
+use crate::cells::{GateCapture, MemberCell, RuntimeStorage};
 
 /// An exactly-once synchronous completion.
 ///
@@ -2967,11 +2967,17 @@ mod tests {
 
     use super::{
         ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
-        MemberCell, MemberStage, Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell,
-        ScopeEpochGuard, ScopeFlavor, ScopeRuntime, complete_removals, driver_event_class,
-        dynamic_control, mint_child_incarnation, report_channel, resident_projection,
-        restart_shutdown_work, run_nested_tree, run_scope_incarnation,
+        GateCapture, MemberCell, MemberStage, Obligation, Pending, RemovalResponses,
+        RuntimeStorage, ScopeCell, ScopeEpochGuard, ScopeFlavor, ScopeRuntime, complete_removals,
+        driver_event_class, dynamic_control, mint_child_incarnation, report_channel,
+        resident_projection, restart_shutdown_work, run_nested_tree, run_scope_incarnation,
     };
+
+    /// Bounds every gate-capture probe wait. The probe sender lives inside
+    /// the scope cell for the whole test, so the channel can never
+    /// disconnect: a regression that keeps a thread from reaching its gate
+    /// must time out with a diagnostic rather than hang the test on `recv`.
+    const CAPTURE_PROBE_WAIT: Duration = Duration::from_secs(10);
 
     fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
         let mut identity = ScopeIdentity::new();
@@ -3149,6 +3155,7 @@ mod tests {
     fn pre_admission_observer_retries_after_gate_handoff() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        let captures = nested.probe_gate_captures();
         let prior_gate = nested.observation_gate();
         let held = prior_gate
             .lock()
@@ -3156,15 +3163,13 @@ mod tests {
         let observer = Arc::clone(&nested);
         let worker = std::thread::spawn(move || observer.set_state(ScopeState::Starting));
 
-        for _ in 0..100_000 {
-            if Arc::strong_count(&prior_gate) >= 3 {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert!(
-            Arc::strong_count(&prior_gate) >= 3,
-            "observer must be waiting on the pre-admission gate"
+        // The capture report proves the observer committed to the
+        // pre-admission gate, which the held guard keeps it from acquiring.
+        assert_eq!(
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("the observer reports its capture within the bound"),
+            GateCapture::Observation
         );
 
         // Model the instant at which adoption owns the old gate and publishes
@@ -3174,6 +3179,13 @@ mod tests {
         drop(held);
         worker.join().expect("observer follows the gate handoff");
 
+        assert_eq!(
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("the observer reports its retry within the bound"),
+            GateCapture::Observation,
+            "the handoff forces one retry capture on the root gate"
+        );
         assert_eq!(nested.record().state, ScopeState::Starting);
         assert!(Arc::ptr_eq(
             &root.observation_gate(),
@@ -3453,7 +3465,7 @@ mod tests {
     fn gate_handoff_waits_for_an_in_flight_observation_edge() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
-        let prior_gate = nested.observation_gate();
+        let captures = nested.probe_gate_captures();
         let (entered, entered_receiver) = std::sync::mpsc::sync_channel(0);
         let (release, release_receiver) = std::sync::mpsc::sync_channel(0);
         let observer = Arc::clone(&nested);
@@ -3468,6 +3480,12 @@ mod tests {
         entered_receiver
             .recv()
             .expect("observer enters the pre-admission edge");
+        assert_eq!(
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("the observation edge reports its capture within the bound"),
+            GateCapture::Observation
+        );
 
         let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
         let adopting_root = Arc::clone(&root);
@@ -3477,19 +3495,14 @@ mod tests {
             adopted.send(()).expect("test receiver remains available");
         });
 
-        // The field, this test, and the active observation own three gate
-        // references. A fourth proves adoption reached the old gate and is
-        // blocked behind the complete observation edge rather than replacing
-        // it concurrently.
-        for _ in 0..100_000 {
-            if Arc::strong_count(&prior_gate) >= 4 {
-                break;
-            }
-            std::thread::yield_now();
-        }
-        assert!(
-            Arc::strong_count(&prior_gate) >= 4,
-            "adoption must synchronize through the prior observation gate"
+        // The adoption capture proves handoff committed to the prior gate and
+        // is blocked behind the complete observation edge rather than
+        // replacing it concurrently, so adoption cannot yet have completed.
+        assert_eq!(
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("adoption reports its capture within the bound"),
+            GateCapture::Adoption
         );
         assert!(matches!(
             adopted_receiver.try_recv(),
@@ -4356,40 +4369,30 @@ mod tests {
             );
         root.set_dynamic_route(Some(super::DynamicRoute::new(Arc::clone(&control))));
 
+        let captures = root.probe_gate_captures();
         let gate = root.observation_gate();
         let held_gate = gate.lock().expect("observation gate starts healthy");
-        let baseline_member_owners = Arc::strong_count(&member);
         let removal_root = Arc::clone(&root);
         let removal_id = child_id.clone();
         let worker =
             std::thread::spawn(move || super::remove_dynamic(&removal_root, &removal_id, None));
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while Arc::strong_count(&member) == baseline_member_owners {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "removal reaches its observation transition"
-            );
-            std::thread::yield_now();
-        }
-        loop {
-            match control.state.try_lock() {
-                Ok(state) => {
-                    drop(state);
-                    break;
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "a removal blocked on observation must release dynamic state"
-                    );
-                    std::thread::yield_now();
-                }
-                Err(std::sync::TryLockError::Poisoned(_)) => {
-                    panic!("dynamic-state mutex poisoned")
-                }
-            }
-        }
+        // The capture report proves removal committed to the held observation
+        // gate for its removing transition. Dynamic state cannot change again
+        // until that gate is released, so a single acquisition attempt decides
+        // whether removal reached the gate while still holding the state.
+        assert_eq!(
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("removal reports its gate capture within the bound"),
+            GateCapture::Observation
+        );
+        drop(
+            control
+                .state
+                .try_lock()
+                .expect("a removal waiting on observation must release dynamic state"),
+        );
 
         drop(held_gate);
         let response = worker.join().expect("removal transition completes");

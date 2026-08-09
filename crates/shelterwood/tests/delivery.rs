@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_once, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, poll_once, poll_until};
 use shelterwood::{
     CallErrorKind, ExitError, ExitResult, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Reply,
     SendErrorKind, Shutdown, SubtreeOnceDef, Tree,
@@ -86,17 +86,19 @@ async fn accepted_but_undelivered_prefix_never_crosses_an_incarnation() {
         })
         .await
     );
-    assert_quiet(Duration::from_millis(20), || {
-        log.lock()
-            .expect("prefix log mutex poisoned")
-            .iter()
-            .any(|(_, value)| *value == 2 || *value == 3)
-    })
-    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
+    // The final history is authoritative: after synchronized shutdown no
+    // later delivery can occur, so the accepted-but-undelivered prefix
+    // (2 and 3) is proven absent rather than merely unseen for a quiet
+    // window.
+    assert_eq!(
+        *log.lock().expect("prefix log mutex poisoned"),
+        [(1, 1), (2, 4)],
+        "the undelivered prefix must never reach any incarnation"
+    );
 }
 
 #[derive(Debug)]
@@ -321,14 +323,17 @@ async fn latest_conflation_drops_replaced_call_and_keeps_newest_value() {
     assert_eq!(error.kind, CallErrorKind::ReplyDropped);
     assert_eq!(error.incarnation_observed, Some(accepting));
     gate.release();
-    assert_quiet(Duration::from_millis(20), || {
-        calls.load(Ordering::SeqCst) != 0
-    })
-    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
+    // The replaced call envelope was destroyed at conflation time — the
+    // complete post-shutdown history proves the handler never saw it.
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a conflated-away call must never be delivered"
+    );
 }
 
 #[tokio::test]
@@ -370,17 +375,17 @@ async fn send_cancellation_withdraws_before_acceptance_but_not_after() {
         })
         .await
     );
-    assert_quiet(Duration::from_millis(20), || {
-        log.lock()
-            .expect("send log mutex poisoned")
-            .iter()
-            .any(|(_, value)| *value == 2)
-    })
-    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
+    // The complete post-shutdown history proves the pre-acceptance
+    // cancellation withdrew message 2 outright.
+    assert_eq!(
+        *log.lock().expect("send log mutex poisoned"),
+        [(2, 1), (2, 3)],
+        "a send cancelled before acceptance must never be delivered"
+    );
 }
 
 #[tokio::test]
@@ -422,16 +427,18 @@ async fn call_cancellation_withdraws_before_acceptance_but_processes_after() {
                 })
                 .await
             );
-        } else {
-            assert_quiet(Duration::from_millis(20), || {
-                calls.load(Ordering::SeqCst) != expected
-            })
-            .await;
         }
         system
             .shutdown(Duration::from_secs(1))
             .await
             .expect("actor stops");
+        // The complete post-shutdown history is exact in both directions:
+        // an accepted call is processed once, a withdrawn call never.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            expected,
+            "cancellation before acceptance withdraws the call outright"
+        );
     }
 }
 

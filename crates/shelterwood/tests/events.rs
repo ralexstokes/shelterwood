@@ -212,6 +212,169 @@ async fn due_timer_promotes_the_steady_batch_without_changing_source_priority() 
 }
 
 #[derive(Clone, Copy, Debug)]
+enum LiveContinuationMessage {
+    Start,
+    FirstOffload,
+    SecondOffload,
+    Continuation,
+}
+
+struct LiveContinuationActor {
+    handled: usize,
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Actor for LiveContinuationActor {
+    type Msg = LiveContinuationMessage;
+    type Args = Arc<Mutex<Vec<&'static str>>>;
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            handled: 0,
+            log: args,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        let entry = match message {
+            LiveContinuationMessage::Start => {
+                context
+                    .offload(
+                        async {},
+                        |_| LiveContinuationMessage::FirstOffload,
+                        Duration::ZERO,
+                    )
+                    .expect("first completion accepted");
+                context
+                    .offload(
+                        async {},
+                        |_| LiveContinuationMessage::SecondOffload,
+                        Duration::ZERO,
+                    )
+                    .expect("second completion accepted");
+                "start"
+            }
+            LiveContinuationMessage::FirstOffload => {
+                context
+                    .continue_with(LiveContinuationMessage::Continuation)
+                    .expect("continuation accepted");
+                "offload-1"
+            }
+            LiveContinuationMessage::SecondOffload => "offload-2",
+            LiveContinuationMessage::Continuation => "continuation",
+        };
+        self.handled += 1;
+        if self.handled == 4 {
+            context.stop();
+        }
+        self.log.lock().expect("log mutex poisoned").push(entry);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn continuation_queued_by_external_handler_leads_remaining_steady_batch_work() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "live-continuation",
+            ActorOnceDef::<LiveContinuationActor>::new(Arc::clone(&log)),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor
+        .send(LiveContinuationMessage::Start)
+        .await
+        .expect("actor accepts start");
+
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(
+        *log.lock().expect("log mutex poisoned"),
+        ["start", "offload-1", "continuation", "offload-2"]
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MidContinuationExternalMessage {
+    Start,
+    FirstContinuation,
+    SecondContinuation,
+    External,
+}
+
+struct MidContinuationExternalActor {
+    handled: usize,
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Actor for MidContinuationExternalActor {
+    type Msg = MidContinuationExternalMessage;
+    type Args = Arc<Mutex<Vec<&'static str>>>;
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            handled: 0,
+            log: args,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        let entry = match message {
+            MidContinuationExternalMessage::Start => {
+                context
+                    .continue_with(MidContinuationExternalMessage::FirstContinuation)
+                    .expect("first continuation accepted");
+                context
+                    .continue_with(MidContinuationExternalMessage::SecondContinuation)
+                    .expect("second continuation accepted");
+                "start"
+            }
+            MidContinuationExternalMessage::FirstContinuation => {
+                context
+                    .myself()
+                    .try_send(MidContinuationExternalMessage::External)
+                    .expect("external message accepted during continuation");
+                "continuation-1"
+            }
+            MidContinuationExternalMessage::SecondContinuation => "continuation-2",
+            MidContinuationExternalMessage::External => "external",
+        };
+        self.handled += 1;
+        if self.handled == 4 {
+            context.stop();
+        }
+        self.log.lock().expect("log mutex poisoned").push(entry);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn external_work_added_during_a_continuation_gets_the_fairness_turn() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "mid-continuation-external",
+            ActorOnceDef::<MidContinuationExternalActor>::new(Arc::clone(&log)),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor
+        .send(MidContinuationExternalMessage::Start)
+        .await
+        .expect("actor accepts start");
+
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(
+        *log.lock().expect("log mutex poisoned"),
+        ["start", "continuation-1", "external", "continuation-2"]
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
 enum NestedTimerMessage {
     Start,
     First,

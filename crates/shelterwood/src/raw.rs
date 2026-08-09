@@ -251,15 +251,16 @@ impl PanicSlot {
 /// The queue is deliberately unbounded, but sustained traffic cannot grow it
 /// without bound. Every entry is produced by work this incarnation itself
 /// started — exactly one completion per offload, no external sender can
-/// reach it — and `next_ready` snapshots the queued completions into each
-/// arbitration batch and drains that prefix
-/// ahead of later mailbox input, so the population stays bounded by the
-/// actor's own in-flight offload count plus the completions arriving within
-/// one such window. Bounded-mailbox policy governs external input only (SPEC §5.5:
-/// offload completions do not consume mailbox capacity), and imposing a
-/// bound here would either block the offload task or drop a completion the
-/// total-continuation contract promises to deliver. Freezing at stop clears
-/// the queue, and dropped `RawResources` clear it on every exit path.
+/// reach it — and `next_ready` snapshots queued completions into bounded
+/// arbitration turns. A turn admits at most one mailbox delivery before its
+/// captured completion prefix, with continuation fairness interleaved, so the
+/// population stays bounded by the actor's own in-flight offload count plus
+/// the completions arriving within one such window. Bounded-mailbox policy
+/// governs external input only (SPEC §5.5: offload completions do not consume
+/// mailbox capacity), and imposing a bound here would either block the offload
+/// task or drop a completion the total-continuation contract promises to
+/// deliver. Freezing at stop clears the queue, and dropped `RawResources`
+/// clear it on every exit path.
 struct EventQueue<M> {
     // Arbitration batches snapshot the number of currently queued events.
     // Insertion and the snapshot share this lock, so FIFO order itself is the
@@ -541,6 +542,9 @@ impl<M> TimerStore<M> {
 
 struct ReadyBatch {
     armings: VecDeque<ArmingOrder>,
+    // Only fired batches constrain continuations to a captured prefix.
+    // Steady-state continuations stay live so one queued by an external
+    // handler retains `continue_with`'s next-message priority.
     continuations_remaining: usize,
     mailbox_through: AcceptedSequence,
     // Steady state takes one mailbox delivery before its captured offload
@@ -553,14 +557,10 @@ struct ReadyBatch {
 }
 
 impl ReadyBatch {
-    fn steady(
-        continuations_remaining: usize,
-        mailbox_through: AcceptedSequence,
-        offloads_remaining: usize,
-    ) -> Self {
+    fn steady(mailbox_through: AcceptedSequence, offloads_remaining: usize) -> Self {
         Self {
             armings: VecDeque::new(),
-            continuations_remaining,
+            continuations_remaining: 0,
             mailbox_through,
             mailbox_remaining: Some(1),
             mailbox_complete: false,
@@ -593,6 +593,17 @@ impl ReadyBatch {
 
     fn is_fired(&self) -> bool {
         self.mailbox_remaining.is_none()
+    }
+
+    fn continuation_is_eligible(&self) -> bool {
+        !self.is_fired() || self.continuations_remaining > 0
+    }
+
+    fn record_continuation_delivery(&mut self) {
+        if self.is_fired() {
+            debug_assert!(self.continuations_remaining > 0);
+            self.continuations_remaining -= 1;
+        }
     }
 
     fn record_mailbox_delivery(&mut self) {
@@ -1093,9 +1104,9 @@ impl<M: Send + 'static> RawContext<M> {
     /// Completions re-enter the loop through incarnation-internal storage
     /// that does not consume mailbox capacity (SPEC §5.5). That storage is
     /// unbounded but cannot accumulate a backlog: it holds at most one entry
-    /// per offload the actor itself started, and completions already queued
-    /// when a mailbox message is delivered are consumed ahead of later
-    /// mailbox input, so its population stays proportional to the caller's
+    /// per offload the actor itself started, and each bounded arbitration turn
+    /// admits at most one mailbox delivery before its captured completion
+    /// prefix. Its population therefore stays proportional to the caller's
     /// in-flight count even under sustained mailbox traffic. Bookkeeping for
     /// finished offloads is reclaimed when a new offload starts and when the
     /// loop goes idle.
@@ -1117,8 +1128,8 @@ impl<M: Send + 'static> RawContext<M> {
     /// Starts guarded incarnation-owned async work with one deadline budget.
     ///
     /// Completion storage follows [`offload`](Self::offload): unbounded, but
-    /// one entry per offload the actor itself started, drained ahead of
-    /// later mailbox input so no backlog accumulates.
+    /// one entry per offload the actor itself started and drained in bounded
+    /// arbitration turns alongside mailbox input so no backlog accumulates.
     pub fn offload_scoped<F, T, C>(
         &mut self,
         work: F,
@@ -1296,9 +1307,10 @@ impl<M: Send + 'static> RawContext<M> {
     ///
     /// Every selection runs through one bounded arbitration batch. Steady
     /// state captures at most one mailbox delivery together with the queued
-    /// offload and continuation prefixes. If a timer is due, that same batch
-    /// is promoted by widening the mailbox cutoff to everything accepted at
-    /// the fire observation and refreshing the other source cutoffs.
+    /// offload prefix, while continuations remain live across handler calls.
+    /// If a timer is due, that same batch is promoted by widening the mailbox
+    /// cutoff to everything accepted at the fire observation and capturing
+    /// the continuation and offload prefixes at that point.
     ///
     /// Stage priority is: at most one fairness continuation, mailbox prefix,
     /// offload prefix, remaining snapshotted continuations, then timer
@@ -1324,10 +1336,10 @@ impl<M: Send + 'static> RawContext<M> {
                 .take()
                 .expect("ready selection always owns an arbitration batch");
             if !self.resources.continuation_needs_external
-                && batch.continuations_remaining > 0
+                && batch.continuation_is_eligible()
                 && let Some(message) = self.resources.continuations.pop_front()
             {
-                batch.continuations_remaining -= 1;
+                batch.record_continuation_delivery();
                 self.resources.continuation_needs_external = true;
                 self.resources.ready_batch = Some(batch);
                 return Some(message);
@@ -1359,10 +1371,26 @@ impl<M: Send + 'static> RawContext<M> {
                 batch.offloads_complete = true;
             }
 
-            if batch.continuations_remaining > 0
+            // A steady batch may have exhausted its captured external turn
+            // while a continuation handler made later external work ready.
+            // Start a fresh bounded turn before allowing another continuation
+            // so that work receives §5.2's mandatory fairness opportunity.
+            // Fired batches deliberately retain their immutable cutoffs:
+            // post-fire arrivals must not jump the already-fired timers.
+            if !batch.is_fired()
+                && self.resources.continuation_needs_external
+                && (batch.mailbox_budget_exhausted()
+                    || self.receiver.accepted_sequence() > batch.mailbox_through
+                    || self.resources.events.watermark() > 0)
+            {
+                self.resources.ready_batch = None;
+                continue;
+            }
+
+            if batch.continuation_is_eligible()
                 && let Some(message) = self.resources.continuations.pop_front()
             {
-                batch.continuations_remaining -= 1;
+                batch.record_continuation_delivery();
                 self.resources.continuation_needs_external = true;
                 self.resources.ready_batch = Some(batch);
                 return Some(message);
@@ -1402,7 +1430,6 @@ impl<M: Send + 'static> RawContext<M> {
     fn begin_ready_batch(&mut self) {
         if self.resources.ready_batch.is_none() {
             self.resources.ready_batch = Some(ReadyBatch::steady(
-                self.resources.continuations.len(),
                 self.receiver.accepted_sequence(),
                 self.resources.events.watermark(),
             ));

@@ -8,8 +8,8 @@ use crate::common::{POLL_TIMEOUT, ReleaseGate, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DeadlineElapsed, DynamicScopeRef,
     DynamicTree, ExitError, ExitResult, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-    LifecycleItem, Mailbox, Membership, RemoveOutcome, Reply, ReserveError, RestartPolicy,
-    ScopeState, StopContext, SubtreeOnceDef, Tree,
+    LifecycleItem, Mailbox, Membership, RemoveOutcome, Reply, ReserveError, RestartCount,
+    RestartPolicy, ScopeState, StopContext, SubtreeOnceDef, Tree,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -518,7 +518,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             session.snapshot().child("control").is_some_and(|child| {
                 matches!(child.state, ChildState::Running)
-                    && child.restart_count == 1
+                    && child.restart_count == RestartCount::ZERO.bump()
                     && child.incarnation.is_some_and(|incarnation| {
                         incarnation.supersedes(first_control_incarnation)
                     })
@@ -556,7 +556,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                 .child("temporary-tool")
                 .is_some_and(|child| {
                     matches!(child.state, ChildState::Running)
-                        && child.restart_count == 1
+                        && child.restart_count == RestartCount::ZERO.bump()
                         && child.incarnation.is_some_and(|incarnation| {
                             incarnation.supersedes(first_tool_incarnation)
                         })
@@ -664,7 +664,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .expect("replacement is resident")
         .clone();
     assert_eq!(replacement_snapshot.membership, replacement.membership());
-    assert_eq!(replacement_snapshot.restart_count, 0);
+    assert_eq!(replacement_snapshot.restart_count, RestartCount::ZERO);
     replacement_stop.release();
 
     assert_eq!(

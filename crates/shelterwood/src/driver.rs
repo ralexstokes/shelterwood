@@ -2115,11 +2115,7 @@ impl ScopeRuntime {
                     },
                 );
                 if decision.charge.tripped {
-                    let trip = IntensityTrip {
-                        max_restarts: self.intensity_policy.max_restarts,
-                        observed_restarts: decision.charge.in_window,
-                        within: self.intensity_policy.within,
-                    };
+                    let trip = IntensityTrip::new(self.intensity_policy, decision.charge);
                     if self.lifecycle.is_starting() {
                         self.root
                             .set_startup(Err(StartupError::IntensityTripped(trip.clone())));

@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    Exit, Intensity, Readiness, RestartPolicy, Shutdown, deadline::Deadline, exit::StopReason,
-    policy::tidy_abort_beat,
+    Exit, Intensity, IntensityTrip, Readiness, RestartAttempt, RestartCount, RestartPolicy,
+    Shutdown, TotalRestarts, deadline::Deadline, exit::StopReason, policy::tidy_abort_beat,
 };
 
 /// Deterministic priority when one driver wake exposes several events.
@@ -214,17 +214,37 @@ pub(crate) fn dispatch_exit(
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct IntensityState {
     charges: VecDeque<Instant>,
-    total_restarts: u64,
+    total_restarts: TotalRestarts,
+}
+
+impl Default for IntensityState {
+    fn default() -> Self {
+        Self {
+            charges: VecDeque::new(),
+            total_restarts: TotalRestarts::ZERO,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IntensityCharge {
     pub(crate) in_window: u64,
-    pub(crate) total_restarts: u64,
+    pub(crate) total_restarts: TotalRestarts,
     pub(crate) tripped: bool,
+}
+
+impl IntensityTrip {
+    pub(crate) fn new(policy: Intensity, charge: IntensityCharge) -> Self {
+        debug_assert_eq!(charge.tripped, charge.in_window > policy.max_restarts);
+        Self {
+            max_restarts: policy.max_restarts,
+            observed_restarts: charge.in_window,
+            within: policy.within,
+        }
+    }
 }
 
 impl IntensityState {
@@ -236,7 +256,7 @@ impl IntensityState {
             self.charges.pop_front();
         }
         self.charges.push_back(now);
-        self.total_restarts = self.total_restarts.saturating_add(1);
+        self.total_restarts = self.total_restarts.bump();
         let in_window = u64::try_from(self.charges.len()).unwrap_or(u64::MAX);
         IntensityCharge {
             in_window,
@@ -248,26 +268,26 @@ impl IntensityState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RestartState {
-    attempt: u64,
-    cumulative: u64,
+    attempt: RestartAttempt,
+    cumulative: RestartCount,
 }
 
 impl RestartState {
     pub(crate) fn new() -> Self {
         Self {
-            attempt: 0,
-            cumulative: 0,
+            attempt: RestartAttempt::ZERO,
+            cumulative: RestartCount::ZERO,
         }
     }
 
-    pub(crate) fn schedule(&mut self) -> (u64, u64) {
-        self.attempt = self.attempt.saturating_add(1);
-        self.cumulative = self.cumulative.saturating_add(1);
+    pub(crate) fn schedule(&mut self) -> (RestartAttempt, RestartCount) {
+        self.attempt = self.attempt.bump();
+        self.cumulative = self.cumulative.bump();
         (self.attempt, self.cumulative)
     }
 
     pub(crate) fn settled(&mut self) {
-        self.attempt = 0;
+        self.attempt = RestartAttempt::ZERO;
     }
 
     /// Resets the consecutive-attempt counter after one stable incarnation.
@@ -291,8 +311,8 @@ impl RestartState {
 /// Complete restart verdict consumed verbatim by the scope driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RestartDecision {
-    pub(crate) attempt: u64,
-    pub(crate) restart_count: u64,
+    pub(crate) attempt: RestartAttempt,
+    pub(crate) restart_count: RestartCount,
     pub(crate) delay: Duration,
     /// Absolute backoff deadline; unrepresentable far-future points are
     /// clamped (B.6: `restart_at` is present exactly in `Restarting`).
@@ -862,7 +882,8 @@ mod tests {
     };
 
     use crate::{
-        Exit, ExitKind, Intensity, RestartCondition, RestartPolicy, Shutdown, policy::Backoff,
+        Exit, ExitKind, Intensity, RestartAttempt, RestartCondition, RestartCount, RestartPolicy,
+        Shutdown, TotalRestarts, policy::Backoff,
     };
 
     use super::{
@@ -1052,12 +1073,19 @@ mod tests {
         let trip = state.charge(policy, start + Duration::from_secs(10));
         assert!(trip.tripped);
         assert_eq!(trip.in_window, 2);
-        assert_eq!(trip.total_restarts, 2);
+        assert_eq!(trip.total_restarts, TotalRestarts::ZERO.bump().bump());
+        let trip_payload = crate::IntensityTrip::new(policy, trip);
+        assert_eq!(trip_payload.max_restarts, policy.max_restarts);
+        assert_eq!(trip_payload.observed_restarts, trip.in_window);
+        assert_eq!(trip_payload.within, policy.within);
 
         let aged = state.charge(policy, start + Duration::from_secs(21));
         assert!(!aged.tripped);
         assert_eq!(aged.in_window, 1);
-        assert_eq!(aged.total_restarts, 3);
+        assert_eq!(
+            aged.total_restarts,
+            TotalRestarts::ZERO.bump().bump().bump()
+        );
     }
 
     #[test]
@@ -1076,11 +1104,11 @@ mod tests {
             0.5,
         );
 
-        assert_eq!(decision.attempt, 1);
-        assert_eq!(decision.restart_count, 1);
+        assert_eq!(decision.attempt, RestartAttempt::ZERO.bump());
+        assert_eq!(decision.restart_count, RestartCount::ZERO.bump());
         assert_eq!(decision.delay, Duration::ZERO);
         assert_eq!(decision.restart_at, now);
-        assert_eq!(decision.charge.total_restarts, 1);
+        assert_eq!(decision.charge.total_restarts, TotalRestarts::ZERO.bump());
         assert!(decision.charge.tripped);
     }
 
@@ -1116,15 +1144,20 @@ mod tests {
         let start = Instant::now();
         let stable_for = Duration::from_secs(10);
         let mut restarts = RestartState::new();
-        assert_eq!(restarts.schedule(), (1, 1));
+        let attempt_one = RestartAttempt::ZERO.bump();
+        let attempt_two = attempt_one.bump();
+        let count_one = RestartCount::ZERO.bump();
+        let count_two = count_one.bump();
+        let count_three = count_two.bump();
+        assert_eq!(restarts.schedule(), (attempt_one, count_one));
         assert!(!restarts.settle_if_stable(
             start,
             start + stable_for - Duration::from_nanos(1),
             stable_for,
         ));
-        assert_eq!(restarts.schedule(), (2, 2));
+        assert_eq!(restarts.schedule(), (attempt_two, count_two));
         assert!(restarts.settle_if_stable(start, start + stable_for, stable_for));
-        assert_eq!(restarts.schedule(), (1, 3));
+        assert_eq!(restarts.schedule(), (attempt_one, count_three));
 
         assert!(
             !restarts.settle_if_stable(start, start - Duration::from_nanos(1), stable_for),

@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::{
-    ChildId, Exit, Incarnation, Intensity, Membership, RestartPolicy, Retention, Strategy,
-    exit::StopReason, runtime,
+    ChildId, Exit, Incarnation, Intensity, Membership, RestartAttempt, RestartCount, RestartPolicy,
+    Retention, Strategy, TotalRestarts, exit::StopReason, runtime,
 };
 
 /// Number of lifecycle events retained independently for each subscriber.
@@ -95,7 +95,7 @@ pub enum LifecycleEventKind {
         /// Child membership identity.
         membership: Membership,
         /// Resettable backoff attempt number.
-        attempt: u64,
+        attempt: RestartAttempt,
         /// Sampled restart delay.
         delay: Duration,
     },
@@ -216,7 +216,7 @@ pub struct ChildSnapshot {
     /// Planned-removal status.
     pub membership_status: MembershipStatus,
     /// Cumulative scheduled-restart charges for this membership.
-    pub restart_count: u64,
+    pub restart_count: RestartCount,
     /// Resolved restart policy.
     pub restart_policy: RestartPolicy,
     /// Resolved terminal-retention policy.
@@ -243,7 +243,7 @@ pub struct ScopeSnapshot {
     /// Scope-wide restart budget.
     pub intensity: Intensity,
     /// Cumulative restart charges across children in this incarnation.
-    pub total_restarts: u64,
+    pub total_restarts: TotalRestarts,
     /// This scope membership's lifecycle watermark.
     pub lifecycle_seq: u64,
     /// Children in declaration or admission order.
@@ -671,7 +671,7 @@ mod tests {
             kind: ScopeKind::Dynamic,
             strategy: None,
             intensity: Intensity::default(),
-            total_restarts: 0,
+            total_restarts: crate::TotalRestarts::ZERO,
             lifecycle_seq: 0,
             children: Arc::from([]),
         })

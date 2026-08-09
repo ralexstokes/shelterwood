@@ -800,10 +800,13 @@ the survivor is the newest accepted value.
 payload inline on the displacing task, after acceptance of its replacement
 is visible. This is the deliberate hot-path exception: a panicking foreign
 payload destructor surfaces on that task even though the replacement remains
-accepted. Every framework-initiated discard — including teardown,
-timeout/withdrawal cleanup, and batch disposal — runs detached from the
-initiating task with per-element panic containment. No single disposal-thread
-identity is promised.
+accepted. Framework-initiated disposal of externally submitted mailbox or
+reply-bearing payloads — including mailbox teardown, timeout/withdrawal
+cleanup, and accepted-prefix batch disposal — runs detached from the
+initiating task with per-element panic containment. Incarnation-owned
+continuations, timer messages, and offload state instead follow §5.5 and §7's
+incarnation teardown and verdict rules. No single disposal-thread identity is
+promised.
 
 Request/reply on a conflating mailbox is a correctness trap (a barrier can
 be conflated away). A static fence is not possible — mailbox kind is
@@ -873,13 +876,14 @@ skip-missed-ticks posture already accepts bounded lateness as the timer
 contract.
 
 On stop (supervisor shutdown, removal, readiness-timeout teardown, or
-local `ctx.stop()`): close
-external intake to freeze the accepted prefix; drain or drop that prefix
-per the mailbox shutdown policy (`Drain` delivers it, `Discard` drops
-it — §10; handlers observe draining state); then `on_stop`.
-For `Discard`, the actor loop returns without draining and the framework
-disposes the frozen prefix under §5.1's detached, per-element containment
-rule. A payload-destructor panic there is a disposal fault: it MUST NOT
+local `ctx.stop()`), close external intake to freeze the accepted prefix; then
+follow the mailbox shutdown policy (§10; handlers observe draining state).
+For `Drain`, the actor loop delivers the frozen prefix before `on_stop`. For
+`Discard`, freezing makes the prefix permanently undeliverable and the actor
+loop returns without draining, then runs `on_stop`; the framework extracts and
+schedules the prefix for §5.1's detached, per-element disposal after the actor
+run returns. Physical destruction is not ordered before `on_stop` or exit
+publication. A payload-destructor panic there is a disposal fault: it MUST NOT
 reclassify the actor's exit or skip `on_stop`.
 The stop boundary is exact about what drains: **only the frozen accepted
 mailbox prefix** — under `queue`, every accepted-but-undelivered message

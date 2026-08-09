@@ -2,7 +2,10 @@
 
 use std::{
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -303,22 +306,32 @@ pub struct SnapshotClosed;
 /// Conflating receiver for recursive scope snapshots.
 #[derive(Clone)]
 pub struct SnapshotReceiver {
-    inner: runtime::WatchReceiver<Arc<ScopeSnapshot>>,
+    inner: runtime::WatchReceiver<SnapshotHubState>,
+    seen_generation: u64,
 }
 
 impl SnapshotReceiver {
     /// Borrows the newest snapshot without marking it observed.
     #[must_use]
     pub fn borrow_latest(&self) -> Arc<ScopeSnapshot> {
-        self.inner.borrow_cloned()
+        self.inner.borrow_cloned().snapshot
     }
 
     /// Waits for and returns a newer snapshot.
     pub async fn changed(&mut self) -> Result<Arc<ScopeSnapshot>, SnapshotClosed> {
-        if self.inner.changed_or_closed().await {
-            Ok(self.inner.borrow_and_update_cloned())
-        } else {
-            Err(SnapshotClosed)
+        loop {
+            let state = self.inner.borrow_cloned();
+            if state.generation != self.seen_generation {
+                let state = self.inner.borrow_and_update_cloned();
+                self.seen_generation = state.generation;
+                return Ok(state.snapshot);
+            }
+            if state.closed {
+                return Err(SnapshotClosed);
+            }
+            if !self.inner.changed_or_closed().await {
+                return Err(SnapshotClosed);
+            }
         }
     }
 }
@@ -334,67 +347,104 @@ impl fmt::Debug for SnapshotReceiver {
 
 #[derive(Default)]
 pub(crate) struct SnapshotHub {
-    state: Mutex<SnapshotHubState>,
+    sender: OnceLock<runtime::WatchSender<SnapshotHubState>>,
+    closed: AtomicBool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug)]
 struct SnapshotHubState {
-    sender: Option<runtime::WatchSender<Arc<ScopeSnapshot>>>,
+    snapshot: Arc<ScopeSnapshot>,
+    generation: u64,
     closed: bool,
 }
 
 impl SnapshotHub {
     pub(crate) fn subscribe(&self, initial: Arc<ScopeSnapshot>) -> SnapshotReceiver {
-        let mut state = self.state.lock().expect("snapshot hub mutex poisoned");
-        if state.closed {
-            let (sender, inner) = runtime::watch(initial);
+        if self.closed.load(Ordering::Acquire) {
+            let (sender, inner) = runtime::watch(SnapshotHubState {
+                snapshot: initial,
+                generation: 0,
+                closed: true,
+            });
             drop(sender);
-            return SnapshotReceiver { inner };
-        }
-        if let Some(sender) = &state.sender
-            && sender.receiver_count() > 0
-        {
             return SnapshotReceiver {
-                inner: sender.watcher(),
+                inner,
+                seen_generation: 0,
             };
         }
-        let (sender, inner) = runtime::watch(initial);
-        state.sender = Some(sender);
-        SnapshotReceiver { inner }
+        let sender = self.sender.get_or_init(|| {
+            runtime::watch(SnapshotHubState {
+                snapshot: Arc::clone(&initial),
+                generation: 0,
+                closed: false,
+            })
+            .0
+        });
+        // `close` may win between the first atomic check and lazy sender
+        // initialization. Reconcile the channel state after initialization so
+        // that first subscriber still observes closure; once installed,
+        // `close` itself performs this publication and wakeup.
+        if self.closed.load(Ordering::Acquire) {
+            sender.send_modify(|state| state.closed = true);
+        } else if sender.receiver_count() == 0 {
+            sender.send_modify(|state| {
+                state.snapshot = initial;
+                state.generation = state.generation.saturating_add(1);
+            });
+        }
+        let inner = sender.watcher();
+        let seen_generation = inner.borrow_cloned().generation;
+        SnapshotReceiver {
+            inner,
+            seen_generation,
+        }
     }
 
     pub(crate) fn publish(&self, snapshot: impl FnOnce() -> Arc<ScopeSnapshot>) {
-        let mut state = self.state.lock().expect("snapshot hub mutex poisoned");
-        let Some(sender) = &state.sender else {
-            return;
-        };
-        if sender.receiver_count() == 0 {
-            state.sender = None;
+        if self.closed.load(Ordering::Acquire) {
             return;
         }
-        sender.replace(snapshot());
+        let Some(sender) = self.sender.get() else {
+            return;
+        };
+        if sender.receiver_count() > 0 {
+            sender.send_if_modified(|state| {
+                // `close` and publication serialize on the retained watch
+                // state. The atomic is the fast path; this check prevents a
+                // publisher that passed it just before closure from mutating
+                // the terminal value afterward.
+                if state.closed {
+                    return false;
+                }
+                state.snapshot = snapshot();
+                state.generation = state.generation.saturating_add(1);
+                true
+            });
+        }
     }
 
     pub(crate) fn close(&self) {
-        let mut state = self.state.lock().expect("snapshot hub mutex poisoned");
-        state.closed = true;
-        state.sender = None;
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(sender) = self.sender.get() {
+            sender.send_modify(|state| state.closed = true);
+        }
     }
 }
 
 impl fmt::Debug for SnapshotHub {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.state.lock().expect("snapshot hub mutex poisoned");
         formatter
             .debug_struct("SnapshotHub")
             .field(
                 "receivers",
-                &state
+                &self
                     .sender
-                    .as_ref()
+                    .get()
                     .map_or(0, |sender| sender.receiver_count()),
             )
-            .field("closed", &state.closed)
+            .field("closed", &self.closed.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -414,7 +464,7 @@ pub enum LifecycleTryRecvError {
 /// One membership-owned lifecycle subscription.
 pub struct LifecycleEvents {
     events: runtime::BroadcastReceiver<LifecycleEvent>,
-    explicit_lag: runtime::WatchReceiver<u64>,
+    signal: runtime::WatchReceiver<LifecycleSignal>,
     seen_explicit_lag: u64,
 }
 
@@ -427,7 +477,7 @@ impl LifecycleEvents {
                 Err(LifecycleTryRecvError::Closed) => return None,
                 Err(LifecycleTryRecvError::Empty) => {}
             }
-            let _ = self.explicit_lag.changed_or_closed().await;
+            let _ = self.signal.changed_or_closed().await;
         }
     }
 
@@ -436,7 +486,8 @@ impl LifecycleEvents {
         // The marker leads the overflow episode deliberately. A consumer
         // snapshots here, then discards retained events at or below that
         // watermark before applying the newer suffix.
-        let current_explicit_lag = self.explicit_lag.borrow_cloned();
+        let signal = self.signal.borrow_cloned();
+        let current_explicit_lag = signal.explicit_lag;
         if current_explicit_lag != self.seen_explicit_lag {
             let mut dropped = current_explicit_lag.saturating_sub(self.seen_explicit_lag);
             self.seen_explicit_lag = current_explicit_lag;
@@ -462,6 +513,7 @@ impl LifecycleEvents {
         match self.events.try_receive() {
             runtime::BroadcastReceive::Item(event) => Ok(LifecycleItem::Event(event)),
             runtime::BroadcastReceive::Lagged(dropped) => Ok(LifecycleItem::Lagged { dropped }),
+            runtime::BroadcastReceive::Empty if signal.closed => Err(LifecycleTryRecvError::Closed),
             runtime::BroadcastReceive::Empty => Err(LifecycleTryRecvError::Empty),
             runtime::BroadcastReceive::Closed => Err(LifecycleTryRecvError::Closed),
         }
@@ -478,47 +530,40 @@ impl fmt::Debug for LifecycleEvents {
 }
 
 pub(crate) struct LifecycleHub {
-    channels: Mutex<Option<LifecycleChannels>>,
+    channels: LifecycleChannels,
+    closed: AtomicBool,
 }
 
 struct LifecycleChannels {
     events: runtime::BroadcastSender<LifecycleEvent>,
-    explicit_lag: runtime::WatchSender<u64>,
+    signal: runtime::WatchSender<LifecycleSignal>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LifecycleSignal {
+    explicit_lag: u64,
+    closed: bool,
 }
 
 impl Default for LifecycleHub {
     fn default() -> Self {
         let (events, _) = runtime::broadcast(LIFECYCLE_EVENT_CAPACITY);
-        let (explicit_lag, _) = runtime::watch(0);
+        let (signal, _) = runtime::watch(LifecycleSignal::default());
         Self {
-            channels: Mutex::new(Some(LifecycleChannels {
-                events,
-                explicit_lag,
-            })),
+            channels: LifecycleChannels { events, signal },
+            closed: AtomicBool::new(false),
         }
     }
 }
 
 impl LifecycleHub {
     pub(crate) fn subscribe(&self) -> LifecycleEvents {
-        let channels = self.channels.lock().expect("lifecycle hub mutex poisoned");
-        if let Some(channels) = channels.as_ref() {
-            let explicit_lag = channels.explicit_lag.watcher();
-            let seen_explicit_lag = explicit_lag.borrow_cloned();
-            return LifecycleEvents {
-                events: channels.events.subscribe(),
-                explicit_lag,
-                seen_explicit_lag,
-            };
-        }
-        let (events_sender, events) = runtime::broadcast(LIFECYCLE_EVENT_CAPACITY);
-        let (lag_sender, explicit_lag) = runtime::watch(0);
-        drop(events_sender);
-        drop(lag_sender);
+        let signal = self.channels.signal.watcher();
+        let seen_explicit_lag = signal.borrow_cloned().explicit_lag;
         LifecycleEvents {
-            events,
-            explicit_lag,
-            seen_explicit_lag: 0,
+            events: self.channels.events.subscribe(),
+            signal,
+            seen_explicit_lag,
         }
     }
 
@@ -530,52 +575,59 @@ impl LifecycleHub {
             kind = ?event.kind,
             "scope lifecycle event"
         );
-        if let Some(channels) = self
-            .channels
-            .lock()
-            .expect("lifecycle hub mutex poisoned")
-            .as_ref()
-        {
-            let _ = channels.events.send(event);
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        self.publish_past_fast_path(event);
+    }
+
+    /// The enqueue half of [`publish`](Self::publish), after the atomic
+    /// fast-path check. Split out so tests can pin the close race: calling
+    /// this on a closed hub is exactly a publisher that read `closed ==
+    /// false` and then lost the linearization race to `close`.
+    fn publish_past_fast_path(&self, event: LifecycleEvent) {
+        self.channels.signal.send_if_modified(|signal| {
+            // Enqueue and activity notification share the same linearization
+            // point as closure. A publisher that passed the atomic fast-path
+            // check cannot append after receivers have observed `closed`.
+            if signal.closed {
+                return false;
+            }
+            let _ = self.channels.events.send(event);
             // The watch version is also the no-loss activity notification for
             // async receivers. Its value changes only for explicit lag.
-            channels.explicit_lag.pulse();
-        }
+            true
+        });
     }
 
     pub(crate) fn publish_lagged(&self, dropped: u64) {
-        if let Some(channels) = self
-            .channels
-            .lock()
-            .expect("lifecycle hub mutex poisoned")
-            .as_ref()
-        {
-            channels
-                .explicit_lag
-                .send_modify(|total| *total = total.saturating_add(dropped));
+        if self.closed.load(Ordering::Acquire) {
+            return;
         }
+        self.channels.signal.send_if_modified(|signal| {
+            if signal.closed {
+                return false;
+            }
+            signal.explicit_lag = signal.explicit_lag.saturating_add(dropped);
+            true
+        });
     }
 
     pub(crate) fn close(&self) {
-        self.channels
-            .lock()
-            .expect("lifecycle hub mutex poisoned")
-            .take();
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.channels
+                .signal
+                .send_modify(|signal| signal.closed = true);
+        }
     }
 }
 
 impl fmt::Debug for LifecycleHub {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let channels = self.channels.lock().expect("lifecycle hub mutex poisoned");
         formatter
             .debug_struct("LifecycleHub")
-            .field(
-                "receivers",
-                &channels
-                    .as_ref()
-                    .map_or(0, |channels| channels.events.receiver_count()),
-            )
-            .field("closed", &channels.is_none())
+            .field("receivers", &self.channels.events.receiver_count())
+            .field("closed", &self.closed.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -597,18 +649,131 @@ pub enum WaitError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        thread,
+    };
+
     use crate::{
-        ScopeState,
+        Intensity, ScopeState,
         identity::ScopeIdentity,
-        observe::{LifecycleEvent, LifecycleEventKind, LifecycleItem},
+        observe::{
+            LifecycleEvent, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, ScopeKind,
+            ScopeSnapshot,
+        },
     };
 
     use super::{LIFECYCLE_EVENT_CAPACITY, LifecycleHub, SnapshotHub};
+
+    fn snapshot(state: ScopeState) -> Arc<ScopeSnapshot> {
+        Arc::new(ScopeSnapshot {
+            state,
+            kind: ScopeKind::Dynamic,
+            strategy: None,
+            intensity: Intensity::default(),
+            total_restarts: 0,
+            lifecycle_seq: 0,
+            children: Arc::from([]),
+        })
+    }
 
     #[test]
     fn snapshot_projection_is_skipped_without_subscribers() {
         let hub = SnapshotHub::default();
         hub.publish(|| panic!("projection must be lazy when no receiver exists"));
+    }
+
+    #[crate::runtime::test]
+    async fn snapshot_publication_that_linearizes_before_close_is_drained() {
+        let hub = Arc::new(SnapshotHub::default());
+        let mut snapshots = hub.subscribe(snapshot(ScopeState::Unstarted));
+        let (entered, wait_for_release) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+
+        let publisher = {
+            let hub = Arc::clone(&hub);
+            thread::spawn(move || {
+                hub.publish(|| {
+                    entered.send(()).expect("test remains active");
+                    released.recv().expect("publisher is released");
+                    snapshot(ScopeState::Running)
+                });
+            })
+        };
+        wait_for_release
+            .recv()
+            .expect("publisher reaches the serialized channel update");
+        let closer = {
+            let hub = Arc::clone(&hub);
+            thread::spawn(move || hub.close())
+        };
+        while !hub.closed.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        release.send(()).expect("publisher is still waiting");
+        publisher.join().expect("publisher does not panic");
+        closer.join().expect("closer does not panic");
+
+        assert_eq!(
+            snapshots
+                .changed()
+                .await
+                .expect("publication precedes close")
+                .state,
+            ScopeState::Running
+        );
+        assert!(snapshots.changed().await.is_err());
+        hub.publish(|| panic!("publication after close must remain lazy"));
+
+        let mut after_close = hub.subscribe(snapshot(ScopeState::Stopped {
+            reason: crate::StopReason::Finished,
+        }));
+        assert!(matches!(
+            after_close.borrow_latest().state,
+            ScopeState::Stopped {
+                reason: crate::StopReason::Finished
+            }
+        ));
+        assert!(after_close.changed().await.is_err());
+    }
+
+    #[crate::runtime::test]
+    async fn lifecycle_close_wakes_parked_receivers() {
+        let hub = Arc::new(LifecycleHub::default());
+        let mut events = hub.subscribe();
+        let waiter = crate::runtime::spawn(async move { events.recv().await });
+        crate::runtime::yield_now().await;
+
+        hub.close();
+
+        assert_eq!(crate::runtime::join_resuming(waiter).await, None);
+    }
+
+    #[test]
+    fn lifecycle_publication_that_lost_the_close_race_appends_nothing() {
+        let mut identity = ScopeIdentity::new();
+        let membership = identity
+            .mint_membership(&crate::ChildId::from("scope"))
+            .expect("membership available");
+        let hub = LifecycleHub::default();
+        let mut events = hub.subscribe();
+        hub.close();
+
+        // A publisher that read `closed == false` and then lost the
+        // linearization race to `close` must append nothing.
+        hub.publish_past_fast_path(LifecycleEvent {
+            scope_path: Vec::new(),
+            scope: membership,
+            seq: 1,
+            kind: LifecycleEventKind::ScopeState {
+                state: ScopeState::Running,
+            },
+        });
+
+        assert!(matches!(
+            events.try_recv(),
+            Err(LifecycleTryRecvError::Closed)
+        ));
     }
 
     #[test]
@@ -646,5 +811,38 @@ mod tests {
             panic!("expected the retained suffix");
         };
         assert_eq!(first_retained.seq, 3);
+    }
+
+    #[test]
+    fn lifecycle_close_drains_the_queued_prefix_and_rejects_late_publication() {
+        let mut identity = ScopeIdentity::new();
+        let membership = identity
+            .mint_membership(&crate::ChildId::from("scope"))
+            .expect("membership available");
+        let event = |seq| LifecycleEvent {
+            scope_path: Vec::new(),
+            scope: membership,
+            seq,
+            kind: LifecycleEventKind::ScopeState {
+                state: ScopeState::Running,
+            },
+        };
+        let hub = LifecycleHub::default();
+        let mut events = hub.subscribe();
+
+        hub.publish_lagged(2);
+        hub.publish(event(1));
+        hub.close();
+        hub.publish_lagged(3);
+        hub.publish(event(2));
+
+        assert_eq!(events.try_recv(), Ok(LifecycleItem::Lagged { dropped: 2 }));
+        assert_eq!(events.try_recv(), Ok(LifecycleItem::Event(event(1))));
+        assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+        assert_eq!(
+            hub.subscribe().try_recv(),
+            Err(LifecycleTryRecvError::Closed),
+            "post-close subscribers start at the drained terminal edge"
+        );
     }
 }

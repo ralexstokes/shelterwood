@@ -1,7 +1,7 @@
 //! Mutable runtime shell and shared handle state.
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap},
     ops::{Bound, Index, IndexMut},
     sync::{Arc, Mutex, Weak, mpsc},
     time::{Duration, Instant},
@@ -11,7 +11,7 @@ use crate::{
     ChildId, Exit, ExitKind, Incarnation, IntensityTrip, Membership, Readiness, ReadinessDeadline,
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
-    cells::{DynamicRoute, MemberStage, ResidentProjection, ScopeCell},
+    cells::{DynamicRoute, MailboxControl, MemberStage, ResidentProjection, ScopeCell},
     deadline::Deadline,
     engine::{
         ArbitrationClass, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch, IntensityState,
@@ -206,36 +206,71 @@ struct DynamicState {
     entries: HashMap<ChildId, DynamicEntry>,
 }
 
-/// Admission requests awaiting the scope's single forwarder task.
-///
-/// `forwarding` is only cleared by the forwarder after observing an empty
-/// queue under this lock, and submitters push and consult it under the same
-/// lock, so a queued request always has a live forwarder destined to drain
-/// it.
-#[derive(Default)]
-struct AdmissionQueue {
-    pending: VecDeque<AdmissionRequest>,
-    forwarding: bool,
-}
-
 pub(crate) struct DynamicControl {
-    scope: Weak<ScopeCell>,
     events: runtime::MpscSender<DriverEvent>,
     state: Mutex<DynamicState>,
-    admissions: Mutex<AdmissionQueue>,
+    requests: runtime::UnboundedMpscSender<DriverEvent>,
+    request_forwarder_close: Latch,
+    #[cfg(test)]
+    request_forwarder_ended: Latch,
 }
 
 impl DynamicControl {
-    fn new(scope: &Arc<ScopeCell>, events: runtime::MpscSender<DriverEvent>) -> Arc<Self> {
-        Arc::new(Self {
-            scope: Arc::downgrade(scope),
+    fn new(events: runtime::MpscSender<DriverEvent>) -> Arc<Self> {
+        let (requests, mut request_receiver) = runtime::unbounded_mpsc();
+        let forward_events = events.clone();
+        let request_forwarder_close = Latch::default();
+        let close_forwarder = request_forwarder_close.clone();
+        #[cfg(test)]
+        let request_forwarder_ended = Latch::default();
+        #[cfg(test)]
+        let forwarder_ended = request_forwarder_ended.clone();
+        let control = Arc::new(Self {
             events,
             state: Mutex::new(DynamicState {
                 accepting: true,
                 entries: HashMap::new(),
             }),
-            admissions: Mutex::default(),
-        })
+            requests,
+            request_forwarder_close,
+            #[cfg(test)]
+            request_forwarder_ended,
+        });
+        // Off-runtime construction (unit tests only) safely skips the
+        // forwarder: `reserve_dynamic`/`start_admission` fail closed with
+        // `NoRuntime` before anything can enqueue, and a live driver — the
+        // only other producer — exists only inside the runtime.
+        if runtime::is_available() {
+            runtime::spawn(async move {
+                loop {
+                    let request = match runtime::select_two(
+                        close_forwarder.fired(),
+                        runtime::unbounded_mpsc_recv(&mut request_receiver),
+                    )
+                    .await
+                    {
+                        runtime::Either::Left(()) | runtime::Either::Right(None) => break,
+                        runtime::Either::Right(Some(request)) => request,
+                    };
+                    // A failed admission send drops its response obligation,
+                    // completing it with `Terminal`. Explicit closure drops
+                    // this request and the queued suffix for the same result.
+                    if matches!(
+                        runtime::select_two(
+                            close_forwarder.fired(),
+                            runtime::mpsc_send(&forward_events, request),
+                        )
+                        .await,
+                        runtime::Either::Left(())
+                    ) {
+                        break;
+                    }
+                }
+                #[cfg(test)]
+                forwarder_ended.fire();
+            });
+        }
+        control
     }
 
     fn close(&self) -> HashMap<ChildId, DynamicEntry> {
@@ -243,6 +278,10 @@ impl DynamicControl {
         state.accepting = false;
         let entries = std::mem::take(&mut state.entries);
         drop(state);
+        // Reservation handles may retain this control after scope teardown.
+        // Stop the sole per-scope forwarder explicitly instead of waiting for
+        // every clone of its unbounded sender to disappear.
+        self.request_forwarder_close.fire();
         let mut retained = HashMap::new();
         for (id, entry) in entries {
             if !entry.admitted {
@@ -356,43 +395,11 @@ pub(crate) fn start_admission(
     };
     // The driver channel is bounded and a split admission may be dropped
     // right after this first poll (drop detaches), so the send cannot live in
-    // the caller-held future. Spawning one detached sender task per admission
-    // would let a saturated driver channel accumulate one live task per
-    // pending admission; instead requests queue here and at most one
-    // forwarder task per scope drains them in FIFO order, keeping
-    // pending-admission memory proportional to the requests themselves.
-    let start_forwarder = {
-        let mut admissions = control
-            .admissions
-            .lock()
-            .expect("admission queue mutex poisoned");
-        admissions.pending.push_back(request);
-        !std::mem::replace(&mut admissions.forwarding, true)
-    };
-    if start_forwarder {
-        runtime::spawn(forward_admissions(control));
-    }
+    // the caller-held future. One persistent forwarder per scope drains this
+    // unbounded FIFO, keeping pending-admission memory proportional to the
+    // requests without a second mutex-protected channel implementation.
+    let _ = runtime::unbounded_mpsc_send(&control.requests, DriverEvent::Admission(request));
     Ok(response)
-}
-
-async fn forward_admissions(control: Arc<DynamicControl>) {
-    loop {
-        let request = {
-            let mut admissions = control
-                .admissions
-                .lock()
-                .expect("admission queue mutex poisoned");
-            let Some(request) = admissions.pending.pop_front() else {
-                admissions.forwarding = false;
-                return;
-            };
-            request
-        };
-        // A failed send returns and drops the request, whose response
-        // obligation then completes with `Terminal`. Keep draining so every
-        // queued admission is answered even after the driver stops.
-        let _ = runtime::mpsc_send(&control.events, DriverEvent::Admission(request)).await;
-    }
 }
 
 fn cancel_dynamic_reservation_parts(
@@ -424,10 +431,13 @@ pub(crate) fn cancel_dynamic_reservation(control: &Arc<DynamicControl>, slot: &A
     dispose_definition_then(definition, move || drop(removed));
 }
 
-pub(crate) fn signal_fused_cancel(control: &Arc<DynamicControl>, latch: &Latch) {
-    latch.fire();
-    if let Some(scope) = control.scope.upgrade() {
-        scope.signal().pulse();
+pub(crate) fn signal_fused_cancel(
+    control: &Arc<DynamicControl>,
+    membership: Membership,
+    latch: &Latch,
+) {
+    if latch.fire() {
+        queue_driver_event(control, DriverEvent::Removal(membership));
     }
 }
 
@@ -464,6 +474,7 @@ pub(crate) fn remove_dynamic(
     // through the normal removal path, like live residents, so that
     // registration is reclaimed before the removal response completes.
     let member = Arc::clone(&entry.slot.member);
+    let membership = member.membership();
     // Dynamic-state protects admission/removal bookkeeping; the observation
     // gate protects the public projection. Release the former before entering
     // the latter. No path takes the two in the opposite order, so this is not
@@ -473,9 +484,21 @@ pub(crate) fn remove_dynamic(
     // stall every concurrent reservation, removal, and driver admission.
     drop(state);
     scope.transition_child(&member, |record| record.removing = true, None);
-    member.removal.fire();
-    scope.signal().pulse();
+    if member.removal.fire() {
+        queue_driver_event(&control, DriverEvent::Removal(membership));
+    }
     response
+}
+
+fn queue_driver_event(control: &DynamicControl, event: DriverEvent) {
+    let Err(event) = runtime::mpsc_try_send(&control.events, event) else {
+        return;
+    };
+    // The unbounded send is synchronous and runtime-independent, so a drop or
+    // removal from a foreign thread cannot lose the edge when the bounded
+    // driver lane is full. The per-scope forwarder applies backpressure only
+    // on that saturated fallback; the normal removal path stays allocation-free.
+    let _ = runtime::unbounded_mpsc_send(&control.requests, event);
 }
 
 struct AdmissionRequest {
@@ -525,6 +548,7 @@ fn dispose_definition_then(
 enum DriverEvent {
     Child(ChildEvent),
     Admission(AdmissionRequest),
+    Removal(Membership),
 }
 
 impl SystemRun {
@@ -756,6 +780,7 @@ fn discharge_child_terminality(completion: ChildTerminality) {
 
 struct ChildRuntime {
     slot: Arc<SlotCell>,
+    mailbox: Option<Arc<dyn MailboxControl>>,
     terminality: Obligation<ChildTerminality>,
     construction: runtime::Isolated<ChildConstruction>,
     pending_terminal: Option<PendingTerminal>,
@@ -797,12 +822,14 @@ impl ChildRuntime {
             .lock()
             .expect("scope identity mutex poisoned")
             .incarnation_counter(slot.member.membership());
-        if let Some(mailbox) = slot.member.mailbox() {
+        let mailbox = slot.member.mailbox();
+        if let Some(mailbox) = &mailbox {
             mailbox.configure(options.mailbox);
         }
         Self {
             terminality,
             slot,
+            mailbox,
             construction,
             pending_terminal: None,
             options,
@@ -977,7 +1004,7 @@ impl Drop for ScopeRuntime {
         };
         for child in self.children.values_mut() {
             if let Some(active) = child.active.take() {
-                if let Some(mailbox) = child.slot.member.mailbox() {
+                if let Some(mailbox) = &child.mailbox {
                     mailbox.freeze(active.incarnation);
                     if let Some(teardown) = mailbox.close(active.incarnation) {
                         runtime::dispose_detached(teardown);
@@ -1467,7 +1494,7 @@ impl ScopeRuntime {
         } = dispatch_child_construction(child, &self.root, &self.defaults, incarnation, &latches);
         let now = runtime::now();
         child.spawned_once = true;
-        if let Some(mailbox) = child.slot.member.mailbox() {
+        if let Some(mailbox) = &child.mailbox {
             #[cfg(debug_assertions)]
             debug_assert!(
                 mailbox.bind_order_valid(),
@@ -1682,7 +1709,7 @@ impl ScopeRuntime {
                 |record| record.stage = MemberStage::Stopping,
                 None,
             );
-            if let Some(mailbox) = child.slot.member.mailbox() {
+            if let Some(mailbox) = &child.mailbox {
                 mailbox.freeze(active.incarnation);
             }
             active.forced_outcome = forced;
@@ -1940,7 +1967,7 @@ impl ScopeRuntime {
         if let Some(deadline) = active.stop_deadline.take() {
             self.deadlines.cancel(deadline);
         }
-        if let Some(mailbox) = child.slot.member.mailbox()
+        if let Some(mailbox) = &child.mailbox
             && let Some(teardown) = mailbox.close(incarnation)
         {
             runtime::dispose_detached(teardown);
@@ -2369,26 +2396,6 @@ impl ScopeRuntime {
         self.spawn_child(key);
     }
 
-    fn pending_removals(&self) -> Vec<Membership> {
-        let Some(control) = &self.dynamic else {
-            return Vec::new();
-        };
-        control
-            .state
-            .lock()
-            .expect("dynamic-state mutex poisoned")
-            .entries
-            .values()
-            .filter(|entry| {
-                entry.admitted
-                    && !entry.removal_started
-                    && (entry.slot.member.removal.is_fired()
-                        || entry.fused_cancel.as_ref().is_some_and(Latch::is_fired))
-            })
-            .map(|entry| entry.slot.member.membership())
-            .collect()
-    }
-
     fn handle_removal(&mut self, membership: Membership) {
         if let Some(control) = &self.dynamic {
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
@@ -2631,8 +2638,8 @@ async fn run_scope_incarnation(
     let capacity = plan.children.len().saturating_mul(3).max(64);
     let (events, mut event_receiver) = runtime::bounded_mpsc(capacity);
     let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
-    let dynamic = (plan.root.flavor == ScopeFlavor::Dynamic)
-        .then(|| DynamicControl::new(&root, events.clone()));
+    let dynamic =
+        (plan.root.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(events.clone()));
     if let Some(control) = &dynamic {
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
         for child in &plan.children {
@@ -2740,12 +2747,6 @@ async fn run_scope_incarnation(
             // cannot publish Running after the stop boundary.
             pending.push((ArbitrationClass::ScopeShutdown, Pending::Force));
         }
-        for membership in scope.pending_removals() {
-            pending.push((
-                ArbitrationClass::MembershipRemoval,
-                Pending::Removal(membership),
-            ));
-        }
         while let Some(event) = runtime::mpsc_try_recv(&mut event_receiver) {
             let class = driver_event_class(&event);
             pending.push((class, Pending::Driver(event)));
@@ -2850,7 +2851,9 @@ async fn run_scope_incarnation(
                 Pending::Force => {
                     scope.force_all();
                 }
-                Pending::Removal(membership) => scope.handle_removal(membership),
+                Pending::Driver(DriverEvent::Removal(membership)) => {
+                    scope.handle_removal(membership)
+                }
                 Pending::Driver(DriverEvent::Admission(request)) => {
                     scope.handle_admission(request);
                 }
@@ -2914,7 +2917,6 @@ enum Pending {
     AncestorShutdown,
     AncestorAbort,
     Force,
-    Removal(Membership),
     Driver(DriverEvent),
     Deadline(DeadlineKind),
 }
@@ -2933,6 +2935,7 @@ fn restart_shutdown_work(child: ChildKey) -> (ArbitrationClass, Pending) {
 fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
     match event {
         DriverEvent::Child(ChildEvent::SelfStop { .. }) => ArbitrationClass::MembershipRemoval,
+        DriverEvent::Removal(_) => ArbitrationClass::MembershipRemoval,
         DriverEvent::Child(ChildEvent::Constructed { .. } | ChildEvent::Ready { .. }) => {
             ArbitrationClass::ReadinessSignal
         }
@@ -4292,7 +4295,7 @@ mod tests {
         let slot = SlotCell::new(Arc::clone(&member), None);
         root.set_admitted_children(vec![resident_projection(&slot)]);
         let (events, _receiver) = crate::runtime::bounded_mpsc(1);
-        let control = DynamicControl::new(&root, events);
+        let control = DynamicControl::new(events);
         let (sender, mut response) = crate::runtime::oneshot();
         let mut responses = RemovalResponses::default();
         responses.0.push(sender);
@@ -4327,6 +4330,32 @@ mod tests {
         assert_eq!(response.try_receive(), Some(RemoveOutcome::Removed));
     }
 
+    #[crate::runtime::test]
+    async fn retained_unadmitted_slot_does_not_retain_the_request_forwarder() {
+        let system = DynamicTree::new().spawn().expect("runtime is available");
+        system.wait_started().await.expect("root starts");
+        let scope = system.scope();
+        let slot = scope
+            .reserve_task("retained")
+            .expect("unadmitted reservation is retained");
+        let control = dynamic_control(&scope.as_scope().cell)
+            .expect("the live dynamic scope exposes its control");
+        let forwarder_ended = control.request_forwarder_ended.clone();
+
+        system
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("driver teardown completes");
+
+        assert!(control.request_forwarder_close.is_fired());
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(1), forwarder_ended.fired()).await,
+            crate::runtime::Timeout::Completed(())
+        ));
+        drop(slot);
+        drop(control);
+    }
+
     #[test]
     fn reserve_dynamic_rejects_an_empty_id_at_the_driver_boundary() {
         let root = isolated_scope("root", ScopeFlavor::Dynamic);
@@ -4352,7 +4381,7 @@ mod tests {
         let slot = SlotCell::new(Arc::clone(&member), None);
         root.set_admitted_children(vec![resident_projection(&slot)]);
         let (events, _receiver) = crate::runtime::bounded_mpsc(1);
-        let control = DynamicControl::new(&root, events);
+        let control = DynamicControl::new(events);
         control
             .state
             .lock()
@@ -4401,12 +4430,59 @@ mod tests {
     }
 
     #[crate::runtime::test]
+    async fn saturated_removal_from_a_foreign_thread_reaches_the_driver() {
+        let mut identity = ScopeIdentity::new();
+        let first_id = ChildId::from("first");
+        let second_id = ChildId::from("second");
+        let first = identity
+            .mint_membership(&first_id)
+            .expect("first membership available");
+        let second = identity
+            .mint_membership(&second_id)
+            .expect("second membership available");
+        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+        assert!(
+            events.try_send(DriverEvent::Removal(first)).is_ok(),
+            "the fixture saturates the bounded driver lane"
+        );
+        let control = DynamicControl::new(events);
+        let foreign_control = Arc::clone(&control);
+        std::thread::spawn(move || {
+            assert!(
+                !crate::runtime::is_available(),
+                "Tokio context is not inherited by a foreign thread"
+            );
+            super::signal_fused_cancel(&foreign_control, second, &Latch::default());
+        })
+        .join()
+        .expect("foreign-thread removal signaling succeeds");
+
+        let Some(DriverEvent::Removal(observed_first)) = event_receiver.recv().await else {
+            panic!("the saturated event remains first");
+        };
+        assert_eq!(observed_first, first);
+        let second_event =
+            match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+                crate::runtime::Timeout::Completed(event) => {
+                    event.expect("the control forwarder remains open")
+                }
+                crate::runtime::Timeout::Elapsed => {
+                    panic!("the off-runtime removal edge must not be lost")
+                }
+            };
+        let DriverEvent::Removal(observed_second) = second_event else {
+            panic!("the forwarded event is the requested removal");
+        };
+        assert_eq!(observed_second, second);
+    }
+
+    #[crate::runtime::test]
     async fn saturated_admissions_share_one_forwarder_task_and_all_resolve() {
         const ADMISSIONS: usize = 64;
 
         let root = isolated_scope("root", ScopeFlavor::Dynamic);
         let (events, event_receiver) = crate::runtime::bounded_mpsc(1);
-        let control = DynamicControl::new(&root, events);
+        let control = DynamicControl::new(events);
         let child_id = ChildId::from("worker");
         let member = MemberCell::new(
             child_id.clone(),
@@ -4895,7 +4971,7 @@ mod tests {
         let membership = identity.mint_membership(&id).expect("membership available");
         let member = MemberCell::new(id, membership);
         let scope = ScopeCell::new(member, ScopeFlavor::Ordered, ScopeIdentity::new());
-        scope.set_lifecycle_sequence(FenceCounter::near_exhaustion(0));
+        scope.set_lifecycle_sequence(u64::MAX - 2);
         let mut events = scope.subscribe_lifecycle();
 
         scope.emit(LifecycleEventKind::ScopeState {

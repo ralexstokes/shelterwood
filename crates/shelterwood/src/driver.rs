@@ -3102,7 +3102,7 @@ mod tests {
     use crate::{
         ActorRef, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
         GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox,
-        RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, Retention, ScopeState,
+        RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, Retention, ScopeRef, ScopeState,
         SendErrorKind, StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef,
         TaskDef, Tree,
         engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
@@ -3136,6 +3136,36 @@ mod tests {
             identity.mint_membership(&id).expect("membership available"),
         );
         ScopeCell::new(member, flavor, ScopeIdentity::new())
+    }
+
+    struct SnapshotReentryWake {
+        scope: ScopeRef,
+        observed: std::sync::mpsc::Sender<ScopeState>,
+    }
+
+    impl Wake for SnapshotReentryWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.observed.send(self.scope.snapshot().state.clone());
+        }
+    }
+
+    fn snapshot_reentry_waker(
+        scope: &Arc<ScopeCell>,
+    ) -> (Waker, std::sync::mpsc::Receiver<ScopeState>) {
+        let (observed, receiver) = std::sync::mpsc::channel();
+        (
+            Waker::from(Arc::new(SnapshotReentryWake {
+                scope: ScopeRef {
+                    cell: Arc::clone(scope),
+                },
+                observed,
+            })),
+            receiver,
+        )
     }
 
     struct PendingRaw;
@@ -3231,6 +3261,91 @@ mod tests {
             Ok(()),
             "holding one system's gate must not stall another system"
         );
+    }
+
+    #[test]
+    fn snapshot_subscription_waker_can_reenter_snapshot() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let handle = ScopeRef {
+            cell: Arc::clone(&scope),
+        };
+        let mut snapshots = handle.subscribe_snapshots();
+        let (waker, observed) = snapshot_reentry_waker(&scope);
+        let mut changed = Box::pin(snapshots.changed());
+        assert!(matches!(
+            changed.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+
+        let publisher = std::thread::spawn(move || scope.set_state(ScopeState::Starting));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)),
+            Ok(ScopeState::Starting),
+            "the watch waker must run only after snapshot can reacquire the gate"
+        );
+        publisher.join().expect("snapshot publication completes");
+        assert!(matches!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(_))
+        ));
+    }
+
+    #[test]
+    fn lifecycle_subscription_waker_can_reenter_snapshot() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let handle = ScopeRef {
+            cell: Arc::clone(&scope),
+        };
+        let mut events = handle.subscribe_lifecycle();
+        let (waker, observed) = snapshot_reentry_waker(&scope);
+        let mut next = Box::pin(events.recv());
+        assert!(matches!(
+            next.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+
+        let publisher = std::thread::spawn(move || scope.set_state(ScopeState::Starting));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)),
+            Ok(ScopeState::Starting),
+            "the lifecycle waker must run only after snapshot can reacquire the gate"
+        );
+        publisher.join().expect("lifecycle publication completes");
+        assert!(matches!(
+            next.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Some(_))
+        ));
+    }
+
+    #[test]
+    fn scope_wait_waker_can_reenter_snapshot_at_terminality() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let handle = ScopeRef {
+            cell: Arc::clone(&scope),
+        };
+        let mut stopped = Box::pin(handle.wait_stopped());
+        let (stopped_waker, stopped_observed) = snapshot_reentry_waker(&scope);
+        assert!(matches!(
+            stopped
+                .as_mut()
+                .poll(&mut Context::from_waker(&stopped_waker)),
+            Poll::Pending
+        ));
+
+        let terminalizer = std::thread::spawn(move || scope.terminalize_never_started());
+        assert!(matches!(
+            stopped_observed.recv_timeout(Duration::from_secs(2)),
+            Ok(ScopeState::Stopped { .. })
+        ));
+        terminalizer.join().expect("terminal publication completes");
+        assert!(matches!(
+            stopped
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(_)
+        ));
     }
 
     #[test]
@@ -3686,7 +3801,7 @@ mod tests {
         let (release, release_receiver) = std::sync::mpsc::sync_channel(0);
         let observer = Arc::clone(&nested);
         let observation = std::thread::spawn(move || {
-            observer.with_observation_gate(|| {
+            observer.with_observation_gate(|_| {
                 entered.send(()).expect("test receiver remains available");
                 release_receiver
                     .recv()

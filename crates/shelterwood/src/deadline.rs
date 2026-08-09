@@ -66,6 +66,21 @@ impl Deadline {
         started_at + low
     }
 
+    /// Clamps an absolute deadline to the largest armable instant.
+    ///
+    /// A representable deadline within [`Self::ARMING_HEADROOM`] of the
+    /// clock limit would still panic inside the timer's millisecond
+    /// round-up, so the arming boundary pulls it back just far enough to
+    /// fit. Deadlines that already leave the headroom pass through
+    /// unchanged.
+    pub(crate) fn clamp_armable(deadline: Instant) -> Instant {
+        if deadline.checked_add(Self::ARMING_HEADROOM).is_some() {
+            return deadline;
+        }
+        let now = Instant::now();
+        Self::saturating_after(now, deadline.saturating_duration_since(now))
+    }
+
     /// Reports whether a representable deadline has elapsed.
     pub(crate) fn is_due(self, now: Instant) -> bool {
         self.0.is_some_and(|deadline| now >= deadline)
@@ -122,6 +137,30 @@ mod tests {
             "the clamp saturates to the clock limit less the arming headroom, \
              not to a halved budget"
         );
+    }
+
+    #[test]
+    fn clamp_armable_passes_ordinary_deadlines_through_unchanged() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        assert_eq!(Deadline::clamp_armable(deadline), deadline);
+    }
+
+    #[test]
+    fn clamp_armable_pulls_a_near_limit_deadline_below_the_headroom() {
+        let now = Instant::now();
+        // The far-future clamp saturates to the clock limit less the
+        // headroom, so adding the headroom back lands flush against the
+        // limit: representable, but a panic to arm.
+        let flush = Deadline::saturating_after(now, Duration::MAX) + Deadline::ARMING_HEADROOM;
+        let clamped = Deadline::clamp_armable(flush);
+        assert!(clamped <= flush, "the clamp never arms later than asked");
+        assert!(
+            clamped.checked_add(Deadline::ARMING_HEADROOM).is_some(),
+            "the clamp leaves the timer's arming headroom below the clock limit"
+        );
+        let century = Duration::from_secs(60 * 60 * 24 * 365 * 100);
+        assert!(clamped > now + century, "the clamp stays far future");
     }
 
     #[test]

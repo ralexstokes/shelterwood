@@ -1083,6 +1083,12 @@ pub(crate) async fn yield_now() {
 }
 
 pub(crate) async fn sleep_until_std(deadline: std::time::Instant) {
+    // Every absolute-deadline arming funnels through here, so this is the
+    // one place the arming clamp has to hold: tokio rounds the deadline up
+    // to the next whole millisecond with a panicking add before tick
+    // conversion, and a deadline flush against the clock limit would
+    // panic at arming time rather than when it was computed.
+    let deadline = Deadline::clamp_armable(deadline);
     time::sleep_until(time::Instant::from_std(deadline)).await;
 }
 
@@ -1195,9 +1201,20 @@ mod tests {
     };
 
     use super::{
-        DisposalJob, JoinOutcome, Latch, OneShotClose, Signal, Timeout, discard_panic, join,
-        oneshot, spawn, timeout, yield_now,
+        Deadline, DisposalJob, JoinOutcome, Latch, OneShotClose, Signal, Timeout, discard_panic,
+        join, oneshot, spawn, timeout, yield_now,
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn arming_a_deadline_flush_against_the_clock_limit_stays_pending() {
+        let now = std::time::Instant::now();
+        let flush = Deadline::saturating_after(now, Duration::MAX) + Deadline::ARMING_HEADROOM;
+        let mut sleep = std::pin::pin!(super::sleep_until_std(flush));
+        let mut context = Context::from_waker(Waker::noop());
+        // The timer registers on first poll: without the arming clamp this
+        // panicked inside tokio's millisecond round-up rather than parking.
+        assert!(sleep.as_mut().poll(&mut context).is_pending());
+    }
 
     struct RecursivelyPanickingPayload;
 

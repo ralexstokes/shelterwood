@@ -8,25 +8,32 @@ cd "${SHELTERWOOD_ENFORCEMENT_ROOT:-.}"
 readonly source_root="crates/shelterwood/src"
 readonly driver_path="$source_root/driver.rs"
 readonly tree_path="$source_root/tree.rs"
+readonly cells_path="$source_root/cells.rs"
 
 # Every Rust source except the two orchestration modules and their submodules
-# belongs below the driver. Derive all three sets recursively so either a flat
+# belongs below the driver. Derive all four sets recursively so either a flat
 # module or the conventional `module/mod.rs` layout cannot silently bypass the
 # check; lib.rs is the crate root and may wire every layer together.
 below_driver_layers=()
 driver_layers=()
 tree_layers=()
+cells_layers=()
 while IFS= read -r -d '' path; do
   case "$path" in
     "$source_root/lib.rs") ;;
     "$driver_path"|"$source_root/driver/"*) driver_layers+=("$path") ;;
     "$tree_path"|"$source_root/tree/"*) tree_layers+=("$path") ;;
+    "$cells_path"|"$source_root/cells/"*)
+      cells_layers+=("$path")
+      below_driver_layers+=("$path")
+      ;;
     *) below_driver_layers+=("$path") ;;
   esac
 done < <(find "$source_root" -type f -name '*.rs' -print0)
 readonly -a below_driver_layers
 readonly -a driver_layers
 readonly -a tree_layers
+readonly -a cells_layers
 
 check_forbidden() {
   local message="$1"
@@ -67,7 +74,7 @@ check_forbidden \
 check_forbidden \
   "plan references found in the restart-stable cell layer:" \
   '\bplan::' \
-  crates/shelterwood/src/cells.rs
+  "${cells_layers[@]}"
 
 check_forbidden \
   "child option resolution escaped the shared plan funnel:" \

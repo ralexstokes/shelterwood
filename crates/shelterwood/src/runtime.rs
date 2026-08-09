@@ -630,6 +630,16 @@ impl<T> OneShotReceiver<T> {
         self.channel.close();
     }
 
+    /// Closes the receive side and recovers a value stored before the close.
+    ///
+    /// Tokio retains a value sent before `close`, so this is the cancellation
+    /// hook that lets callers route an unclaimed stored value through isolated
+    /// disposal instead of destroying it in their own drop glue.
+    pub(crate) fn close_and_take(&mut self) -> Option<T> {
+        self.close();
+        self.channel.try_recv().ok()
+    }
+
     pub(crate) async fn receive(self) -> Option<T> {
         self.channel.await.ok()
     }
@@ -637,6 +647,36 @@ impl<T> OneShotReceiver<T> {
     #[cfg(test)]
     pub(crate) fn try_receive(&mut self) -> Option<T> {
         self.channel.try_recv().ok()
+    }
+}
+
+/// One-shot receive state that keeps user value destruction off framework and
+/// holder drop glue.
+///
+/// A value stored before the receive side is cancelled is user-owned:
+/// destroying it inline could block or panic whoever dropped the holder. The
+/// disposal function is captured at construction, where the value type's
+/// `Send + 'static` bounds hold, so unbounded holders can still route an
+/// unclaimed stored value through isolated disposal on drop.
+pub(crate) struct DisposingReceiver<T> {
+    pub(crate) inner: OneShotReceiver<T>,
+    dispose: fn(T),
+}
+
+impl<T: Send + 'static> DisposingReceiver<T> {
+    pub(crate) fn new(inner: OneShotReceiver<T>) -> Self {
+        Self {
+            inner,
+            dispose: dispose_detached::<T>,
+        }
+    }
+}
+
+impl<T> Drop for DisposingReceiver<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.inner.close_and_take() {
+            (self.dispose)(value);
+        }
     }
 }
 

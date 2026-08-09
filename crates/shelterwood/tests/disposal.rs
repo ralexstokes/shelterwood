@@ -15,9 +15,10 @@ use crate::common::{
     poll_until,
 };
 use shelterwood::{
-    Backoff, ChildState, DynamicTree, ExitError, ExitKind, ExitResult, Jitter, LifecycleEventKind,
-    LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline,
-    RemoveOutcome, RestartCondition, RestartPolicy, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    Backoff, CallErrorKind, ChildState, DynamicTree, ExitError, ExitKind, ExitResult, Jitter,
+    LifecycleEventKind, LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef,
+    Readiness, ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition,
+    RestartPolicy, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe {
@@ -898,6 +899,465 @@ async fn restart_window_cleanup_is_isolated_without_reclassifying_the_recorded_e
         task.wait().await.kind(),
         ExitKind::Failed(error) if error.to_string() == "restart me"
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_one_shot_completion_disposes_blocking_value_off_the_task() {
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let probe = BlockingDropProbe::new(&gate, dropped);
+    let (task, completion) = tree
+        .add_task_once(
+            "abandoned",
+            TaskOnceDef::new(move |_| async move { Ok::<_, ExitError>(probe) }),
+        )
+        .expect("valid task");
+    drop(completion);
+
+    let system = tree.spawn().expect("runtime is available");
+    wait_for_destructor(&gate).await;
+    let bounded = tokio::time::timeout(Duration::from_secs(1), task.wait()).await;
+    gate.release();
+    let exit = bounded.expect("a blocked abandoned-claim disposal must not hang the task");
+    assert!(matches!(exit.kind(), ExitKind::Completed));
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("abandoned result reports its disposal thread"),
+        thread::current().id()
+    );
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abandoned_one_shot_completion_keeps_completed_verdict_through_destructor_panic() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let probe = DropProbe::panicking(dropped, "abandoned completion destructor");
+    let (task, completion) = tree
+        .add_task_once(
+            "abandoned",
+            TaskOnceDef::new(move |_| async move { Ok::<_, ExitError>(probe) }),
+        )
+        .expect("valid task");
+    drop(completion);
+
+    let system = tree.spawn().expect("runtime is available");
+    let exit = task.wait().await;
+    assert!(
+        matches!(exit.kind(), ExitKind::Completed),
+        "an abandoned claim's destructor panic must not reclassify the task: {exit:?}"
+    );
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("abandoned result reports its disposal thread"),
+        thread::current().id()
+    );
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_id_rejection_disposes_blocking_definition_off_the_caller() {
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    tree.add_task("dup", TaskDef::new(|_| async { Ok(()) }).restart(never()))
+        .expect("first definition");
+    let error = tree
+        .add_task(
+            "dup",
+            TaskDef::new({
+                let capture = BlockingDropProbe::new(&gate, dropped);
+                move |_| {
+                    let _ = &capture;
+                    async { Ok(()) }
+                }
+            }),
+        )
+        .expect_err("duplicate id is rejected");
+    assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
+
+    wait_for_destructor(&gate).await;
+    let disposal_thread = drops
+        .recv()
+        .await
+        .expect("rejected definition reports its disposal thread");
+    gate.release();
+    assert_ne!(disposal_thread, thread::current().id());
+}
+
+struct HostileCapture {
+    _probe: DropProbe,
+}
+
+impl RawActor for HostileCapture {
+    type Msg = ();
+
+    async fn run(&mut self, _context: &mut RawContext<Self::Msg>) -> ExitResult {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn duplicate_id_rejection_contains_definition_destructor_panic() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    tree.add_raw_once("dup", RawOnceDef::new(Unread::<()>::default()))
+        .expect("first definition");
+    let error = tree
+        .add_raw_once(
+            "dup",
+            RawOnceDef::new(HostileCapture {
+                _probe: DropProbe::panicking(dropped, "rejected definition destructor"),
+            }),
+        )
+        .expect_err("duplicate id is rejected without unwinding the caller");
+    assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("rejected definition reports its disposal thread"),
+        thread::current().id()
+    );
+}
+
+#[tokio::test]
+async fn dynamic_duplicate_rejection_disposes_definition_before_admission() {
+    let tree = DynamicTree::new();
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+    let _held = scope.reserve_task("dup").expect("task reservation");
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let admission = scope.add_task(
+        "dup",
+        TaskDef::new({
+            let capture = DropProbe::panicking(dropped, "rejected dynamic definition destructor");
+            move |_| {
+                let _ = &capture;
+                async { Ok(()) }
+            }
+        }),
+    );
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("rejected definition reports its disposal thread"),
+        thread::current().id()
+    );
+    let error = admission.await.expect_err("duplicate id is rejected");
+    assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root shuts down");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_send_disposes_blocking_message_off_the_caller() {
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let tree = {
+        let mut tree = Tree::new();
+        let actor = tree
+            .add_raw_once(
+                "unread",
+                RawOnceDef::new(Unread::<BlockingDropProbe>::default()),
+            )
+            .expect("valid actor");
+        let mut pending = Box::pin(actor.send(BlockingDropProbe::new(&gate, dropped)));
+        poll_pending(&mut pending).await;
+        drop(pending);
+        tree
+    };
+
+    wait_for_destructor(&gate).await;
+    let disposal_thread = drops
+        .recv()
+        .await
+        .expect("withdrawn message reports its disposal thread");
+    gate.release();
+    assert_ne!(disposal_thread, thread::current().id());
+    drop(tree);
+}
+
+#[tokio::test]
+async fn cancelled_send_contains_message_destructor_panic() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once("unread", RawOnceDef::new(Unread::<DropProbe>::default()))
+        .expect("valid actor");
+    let mut pending =
+        Box::pin(actor.send(DropProbe::panicking(dropped, "cancelled send destructor")));
+    poll_pending(&mut pending).await;
+    drop(pending);
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("withdrawn message reports its disposal thread"),
+        thread::current().id()
+    );
+}
+
+struct ReplyThenPark {
+    gate: DestructorGate,
+    dropped: tokio::sync::mpsc::UnboundedSender<ThreadId>,
+    replied: ReleaseGate,
+}
+
+impl RawActor for ReplyThenPark {
+    type Msg = Reply<BlockingDropProbe>;
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        if let Some(reply) = context.recv().await {
+            reply.send(BlockingDropProbe::new(&self.gate, self.dropped.clone()));
+            self.replied.release();
+        }
+        context.shutdown_token().cancelled().await;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_call_disposes_stored_reply_off_the_caller() {
+    let gate = DestructorGate::default();
+    let replied = ReleaseGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "replier",
+            RawOnceDef::new(ReplyThenPark {
+                gate: gate.clone(),
+                dropped,
+                replied: replied.clone(),
+            }),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+
+    let mut call = Box::pin(actor.call(|reply| reply, Duration::from_secs(5)));
+    poll_pending(&mut call).await;
+    replied.wait().await;
+    drop(call);
+    wait_for_destructor(&gate).await;
+    let disposal_thread = drops
+        .recv()
+        .await
+        .expect("stored reply reports its disposal thread");
+    gate.release();
+    assert_ne!(disposal_thread, thread::current().id());
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("replier shuts down");
+}
+
+#[tokio::test]
+async fn dropped_reply_receiver_disposes_stored_value_through_isolated_disposal() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, receiver) = Reply::<DropProbe>::channel();
+    reply.send(DropProbe::panicking(dropped, "unclaimed reply destructor"));
+    drop(receiver);
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("stored reply reports its disposal thread"),
+        thread::current().id()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unclaimed_completion_value_disposes_blocking_destructor_off_the_claim_holder() {
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let probe = BlockingDropProbe::new(&gate, dropped);
+    let (task, completion) = tree
+        .add_task_once(
+            "unclaimed",
+            TaskOnceDef::new(move |_| async move { Ok::<_, ExitError>(probe) }),
+        )
+        .expect("valid task");
+
+    let system = tree.spawn().expect("runtime is available");
+    let exit = task.wait().await;
+    assert!(matches!(exit.kind(), ExitKind::Completed));
+    drop(completion);
+    wait_for_destructor(&gate).await;
+    let disposal_thread = drops
+        .recv()
+        .await
+        .expect("unclaimed completion reports its disposal thread");
+    gate.release();
+    assert_ne!(disposal_thread, thread::current().id());
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+#[tokio::test]
+async fn unclaimed_completion_value_contains_destructor_panic() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let probe = DropProbe::panicking(dropped, "unclaimed completion destructor");
+    let (task, completion) = tree
+        .add_task_once(
+            "unclaimed",
+            TaskOnceDef::new(move |_| async move { Ok::<_, ExitError>(probe) }),
+        )
+        .expect("valid task");
+
+    let system = tree.spawn().expect("runtime is available");
+    let exit = task.wait().await;
+    assert!(matches!(exit.kind(), ExitKind::Completed));
+    drop(completion);
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("unclaimed completion reports its disposal thread"),
+        thread::current().id()
+    );
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+struct CompleteNow<M>(PhantomData<M>);
+
+impl<M> Default for CompleteNow<M> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<M: Send + 'static> RawActor for CompleteNow<M> {
+    type Msg = M;
+
+    async fn run(&mut self, _context: &mut RawContext<Self::Msg>) -> ExitResult {
+        Ok(())
+    }
+}
+
+struct ProbedCall<P> {
+    _reply: Reply<()>,
+    _probe: P,
+}
+
+#[tokio::test]
+async fn terminated_call_disposes_recovered_message_off_the_caller() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "done",
+            RawOnceDef::new(CompleteNow::<ProbedCall<DropProbe>>::default()),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+
+    let probe = DropProbe::panicking(dropped, "terminated call message destructor");
+    let error = actor
+        .call(
+            move |reply| ProbedCall {
+                _reply: reply,
+                _probe: probe,
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("terminated actor rejects the call");
+    assert!(matches!(error.kind, CallErrorKind::Terminated));
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("recovered message reports its disposal thread"),
+        thread::current().id()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acceptance_timed_out_call_disposes_recovered_message_off_the_caller() {
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "unread",
+            RawOnceDef::new(Unread::<ProbedCall<BlockingDropProbe>>::default()),
+        )
+        .expect("valid actor");
+
+    let probe = BlockingDropProbe::new(&gate, dropped);
+    let error = actor
+        .call(
+            move |reply| ProbedCall {
+                _reply: reply,
+                _probe: probe,
+            },
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("unbound mailbox never accepts within the deadline");
+    assert!(matches!(error.kind, CallErrorKind::AcceptanceTimedOut));
+    wait_for_destructor(&gate).await;
+    let disposal_thread = drops
+        .recv()
+        .await
+        .expect("recovered message reports its disposal thread");
+    gate.release();
+    assert_ne!(disposal_thread, thread::current().id());
+    drop(tree);
+}
+
+#[tokio::test]
+async fn dropped_unstarted_call_disposes_constructor_off_the_caller() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once("unread", RawOnceDef::new(Unread::<()>::default()))
+        .expect("valid actor");
+
+    let capture = DropProbe::panicking(dropped, "unstarted call constructor destructor");
+    let call = actor.call(
+        move |_reply: Reply<()>| {
+            let _ = &capture;
+        },
+        Duration::from_secs(1),
+    );
+    drop(call);
+    assert_ne!(
+        drops
+            .recv()
+            .await
+            .expect("unstarted constructor reports its disposal thread"),
+        thread::current().id()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_reply_send_disposes_unclaimed_value_off_the_sender() {
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, receiver) = Reply::<BlockingDropProbe>::channel();
+    drop(receiver);
+    reply.send(BlockingDropProbe::new(&gate, dropped));
+    wait_for_destructor(&gate).await;
+    let disposal_thread = drops
+        .recv()
+        .await
+        .expect("late reply reports its disposal thread");
+    gate.release();
+    assert_ne!(disposal_thread, thread::current().id());
 }
 
 struct OffloadPanic {

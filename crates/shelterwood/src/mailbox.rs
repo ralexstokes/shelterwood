@@ -16,8 +16,8 @@ use crate::{
     ChildId, Incarnation, Mailbox, Membership,
     cells::{MailboxControl, MailboxDisposal, MailboxTermination, MemberCell},
     runtime::{
-        OneShotClose, OneShotReceiver, OneShotSender, PanicAccumulator, PanicPayload, Signal,
-        SignalWatcher, resume_panic,
+        DisposingReceiver, OneShotClose, OneShotSender, PanicAccumulator, PanicPayload, Signal,
+        SignalWatcher, dispose_detached, resume_panic,
     },
 };
 
@@ -275,7 +275,8 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
 ///
 /// Dropping an unanswered capability is completion: its receiver observes
 /// [`ReplyError::Dropped`]. Dropping or timing out the receiver instead closes
-/// the channel, so a late [`Reply::send`] safely discards its value.
+/// the channel, so a late [`Reply::send`] safely discards its value through
+/// isolated disposal.
 pub struct Reply<T> {
     sender: Option<OneShotSender<T>>,
     answered: bool,
@@ -301,7 +302,7 @@ impl<T: Send + 'static> Reply<T> {
                 answered: false,
             },
             ReplyReceiver {
-                receiver: Some(receiver),
+                receiver: Some(DisposingReceiver::new(receiver)),
             },
         )
     }
@@ -313,13 +314,18 @@ impl<T: Send + 'static> Reply<T> {
             .sender
             .take()
             .expect("an unanswered reply retains its sender");
-        let _ = sender.send(value);
+        // A cancelled receiver rejects the value. Destroying it inline would
+        // run a possibly blocking or panicking user destructor on the replying
+        // actor; route the discard through isolated disposal instead.
+        if let Err(unclaimed) = sender.send(value) {
+            dispose_detached(unclaimed);
+        }
     }
 }
 
 /// The owned, non-cloneable receive half of [`Reply::channel`].
 pub struct ReplyReceiver<T> {
-    receiver: Option<OneShotReceiver<T>>,
+    receiver: Option<DisposingReceiver<T>>,
 }
 
 impl<T> fmt::Debug for ReplyReceiver<T> {
@@ -345,7 +351,7 @@ impl<T: Send + 'static> ReplyReceiver<T> {
 }
 
 struct ReplyOperation<T> {
-    receiver: OneShotReceiver<T>,
+    receiver: DisposingReceiver<T>,
 }
 
 impl<T> DeadlineOperation for ReplyOperation<T> {
@@ -357,10 +363,10 @@ impl<T> DeadlineOperation for ReplyOperation<T> {
         _budget: crate::deadline::Deadline,
         elapsed: bool,
     ) -> Poll<Self::Output> {
-        match self.receiver.poll_receive(context) {
+        match self.receiver.inner.poll_receive(context) {
             Poll::Ready(Some(value)) => Poll::Ready(Ok(value)),
             Poll::Ready(None) => Poll::Ready(Err(ReplyError::Dropped)),
-            Poll::Pending if elapsed => match self.receiver.close_and_poll_receive(context) {
+            Poll::Pending if elapsed => match self.receiver.inner.close_and_poll_receive(context) {
                 OneShotClose::Value(value) => Poll::Ready(Ok(value)),
                 OneShotClose::SenderClosed => Poll::Ready(Err(ReplyError::Dropped)),
                 OneShotClose::Empty => Poll::Ready(Err(ReplyError::Timeout)),
@@ -371,7 +377,7 @@ impl<T> DeadlineOperation for ReplyOperation<T> {
     }
 
     fn short_circuit(&mut self) -> Self::Output {
-        self.receiver.close();
+        self.receiver.inner.close();
         Err(ReplyError::Timeout)
     }
 }
@@ -1279,6 +1285,7 @@ impl<M: Send + 'static> ActorRef<M> {
                     send: None,
                     reply: None,
                     accepted: None,
+                    dispose_constructor: dispose_detached::<MessageConstructor<M, T>>,
                 },
                 deadline,
             ),
@@ -1326,6 +1333,9 @@ impl<M> Hash for ActorRef<M> {
 pub struct SendFuture<M> {
     actor: ActorRef<M>,
     operation: Arc<SendOperation<M>>,
+    // Captured where `M: Send + 'static` holds so the unbounded `Drop` impl
+    // can route a withdrawn message through isolated disposal.
+    dispose: fn(M),
     submitted: bool,
     done: bool,
 }
@@ -1335,6 +1345,7 @@ impl<M: Send + 'static> SendFuture<M> {
         Self {
             actor,
             operation: SendOperation::new(message),
+            dispose: dispose_detached::<M>,
             submitted: false,
             done: false,
         }
@@ -1405,7 +1416,16 @@ impl<M: Send + 'static> Future for SendFuture<M> {
 impl<M> Drop for SendFuture<M> {
     fn drop(&mut self) {
         if !self.done {
-            let _ = self.actor.mailbox.withdraw(&self.operation);
+            // Cancellation recovers the unaccepted message with no caller
+            // left to hand it to. Destroying it inline would run a possibly
+            // blocking or panicking user destructor in this drop glue, so
+            // route the payload through isolated disposal.
+            match self.actor.mailbox.withdraw(&self.operation) {
+                Withdrawal::Withdrawn { message, .. } | Withdrawal::Terminated { message, .. } => {
+                    (self.dispose)(message);
+                }
+                Withdrawal::Accepted(_) => {}
+            }
         }
     }
 }
@@ -1490,12 +1510,30 @@ pub struct CallFuture<M, T> {
     deadlined: Deadlined<CallOperation<M, T>>,
 }
 
+type MessageConstructor<M, T> = Box<dyn FnOnce(Reply<T>) -> M + Send + 'static>;
+
 struct CallOperation<M, T> {
     actor: ActorRef<M>,
-    make_msg: Option<Box<dyn FnOnce(Reply<T>) -> M + Send + 'static>>,
+    make_msg: Option<MessageConstructor<M, T>>,
     send: Option<SendFuture<M>>,
-    reply: Option<OneShotReceiver<T>>,
+    reply: Option<DisposingReceiver<T>>,
     accepted: Option<Incarnation>,
+    // Captured where `M: Send + 'static` holds so the unbounded `Drop` impl
+    // can route an unused constructor and its captures through isolated
+    // disposal.
+    dispose_constructor: fn(MessageConstructor<M, T>),
+}
+
+impl<M, T> Drop for CallOperation<M, T> {
+    fn drop(&mut self) {
+        if let Some(make_msg) = self.make_msg.take() {
+            // An unstarted or short-circuited call discards its constructor
+            // without ever building a message. Destroying the captures inline
+            // would run possibly blocking or panicking user destructors in
+            // this drop glue, so route them through isolated disposal.
+            (self.dispose_constructor)(make_msg);
+        }
+    }
 }
 
 impl<M, T> fmt::Debug for CallFuture<M, T> {
@@ -1520,34 +1558,36 @@ impl<M, T> CallOperation<M, T> {
             .reply
             .as_mut()
             .expect("accepted call retains reply state");
-        match reply.poll_receive(context) {
+        match reply.inner.poll_receive(context) {
             Poll::Ready(Some(value)) => Poll::Ready(Ok(Replied { value, incarnation })),
             Poll::Ready(None) => Poll::Ready(Err(CallError {
                 actor_id: self.actor.id().clone(),
                 incarnation_observed: Some(incarnation),
                 kind: CallErrorKind::ReplyDropped,
             })),
-            Poll::Pending if deadline_elapsed => match reply.close_and_poll_receive(context) {
-                OneShotClose::Value(value) => Poll::Ready(Ok(Replied { value, incarnation })),
-                OneShotClose::SenderClosed => Poll::Ready(Err(CallError {
-                    actor_id: self.actor.id().clone(),
-                    incarnation_observed: Some(incarnation),
-                    kind: CallErrorKind::ReplyDropped,
-                })),
-                OneShotClose::Empty => Poll::Ready(Err(CallError {
-                    actor_id: self.actor.id().clone(),
-                    incarnation_observed: Some(incarnation),
-                    kind: CallErrorKind::ResponseTimedOut,
-                })),
-                OneShotClose::Pending => Poll::Pending,
-            },
+            Poll::Pending if deadline_elapsed => {
+                match reply.inner.close_and_poll_receive(context) {
+                    OneShotClose::Value(value) => Poll::Ready(Ok(Replied { value, incarnation })),
+                    OneShotClose::SenderClosed => Poll::Ready(Err(CallError {
+                        actor_id: self.actor.id().clone(),
+                        incarnation_observed: Some(incarnation),
+                        kind: CallErrorKind::ReplyDropped,
+                    })),
+                    OneShotClose::Empty => Poll::Ready(Err(CallError {
+                        actor_id: self.actor.id().clone(),
+                        incarnation_observed: Some(incarnation),
+                        kind: CallErrorKind::ResponseTimedOut,
+                    })),
+                    OneShotClose::Pending => Poll::Pending,
+                }
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn close_reply(&mut self) {
         if let Some(reply) = &mut self.reply {
-            reply.close();
+            reply.inner.close();
         }
     }
 }
@@ -1596,6 +1636,10 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
                 }
                 Poll::Ready(Err(error)) => {
                     self.close_reply();
+                    // The call surface has no way to hand the recovered
+                    // message back; route the discard through isolated
+                    // disposal.
+                    dispose_detached(error.message);
                     return Poll::Ready(Err(CallError {
                         actor_id: error.actor_id,
                         incarnation_observed: error.incarnation_observed,
@@ -1632,6 +1676,9 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             }
             Err(error) => {
                 self.close_reply();
+                // The call surface has no way to hand the recovered message
+                // back; route the discard through isolated disposal.
+                dispose_detached(error.message);
                 Poll::Ready(Err(CallError {
                     actor_id: error.actor_id,
                     incarnation_observed: error.incarnation_observed,

@@ -7,12 +7,17 @@ use std::{
 };
 
 use crate::{
-    ChildId, Exit, Incarnation, Intensity, Membership, RestartPolicy, Retention, StopReason,
-    Strategy, runtime,
+    ChildId, Exit, Incarnation, Intensity, Membership, RestartPolicy, Retention, Strategy,
+    exit::StopReason, runtime,
 };
 
 /// Number of lifecycle events retained independently for each subscriber.
 pub const LIFECYCLE_EVENT_CAPACITY: usize = 128;
+
+// Tokio rounds broadcast capacity up to a power of two. `try_recv` compares
+// receiver length with this requested capacity and therefore requires the
+// requested and effective capacities to remain equal.
+const _: () = assert!(LIFECYCLE_EVENT_CAPACITY.is_power_of_two());
 
 /// One item read from a lifecycle subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -607,7 +612,7 @@ mod tests {
 
     #[test]
     fn a_retained_event_after_explicit_lag_remains_subject_to_later_overflow() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let membership = identity
             .mint_membership(&crate::ChildId::from("scope"))
             .expect("membership available");

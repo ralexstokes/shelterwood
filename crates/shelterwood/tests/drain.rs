@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, assert_quiet, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
 use shelterwood::{
     Actor, ActorOnceDef, Context, Exit, ExitError, ExitKind, ExitResult, LifecycleEventKind,
     LifecycleEvents, LifecycleItem, Mailbox, MailboxShutdown, SendErrorKind, Shutdown, StopContext,
@@ -114,7 +114,7 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
 
     actor.send(Message::Stop).await.expect("stop accepted");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             stop_entered.load(Ordering::SeqCst)
         })
         .await
@@ -130,7 +130,7 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
     allow_stop.release();
 
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             drain_entered.load(Ordering::SeqCst)
         })
         .await

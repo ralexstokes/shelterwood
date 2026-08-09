@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, advance_time, assert_quiet, policy::never, poll_until};
+use crate::common::{
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, policy::never, poll_until,
+};
 use shelterwood::{
     ChildState, DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, ScopeState,
     Shutdown, StartupError, StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
@@ -57,7 +59,7 @@ async fn ordered_startup_waits_for_manual_readiness() {
 
     let system = tree.spawn().expect("runtime is available");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             order.lock().expect("order mutex poisoned").as_slice() == ["gated"]
         })
         .await
@@ -198,7 +200,7 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
         .expect("valid task");
     let ready_system = ready_tree.spawn().expect("runtime is available");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             ready_started.load(Ordering::SeqCst)
         })
         .await
@@ -302,14 +304,14 @@ async fn restart_before_aggregate_readiness_rearms_the_gate() {
     .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             later_started.load(Ordering::SeqCst)
         })
         .await
     );
     fail_first.release();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             incarnation.load(Ordering::SeqCst) == 2
         })
         .await
@@ -474,7 +476,7 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             initial_started.load(Ordering::SeqCst)
         })
         .await

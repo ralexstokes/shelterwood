@@ -1,68 +1,34 @@
 //! Tree declarations, scope handles, and the owning system façade.
 
 use std::{
-    collections::HashMap,
     fmt,
     future::Future,
     hash::{Hash, Hasher},
     marker::PhantomData,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 
 use crate::{
-    ActorDef, ActorOnceDef, ActorRef, ChildId, DefaultsInheritance, Exit, Intensity, IntensityTrip,
-    LifecycleEvents, Membership, ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults,
-    ScopeSnapshot, Shutdown, ShutdownTimeout, SnapshotReceiver, StartupFailure, Strategy,
-    WaitError,
-    driver::{DynamicReservation, MemberCell, ScopeCell},
-    identity::ScopeIdentity,
+    ActorDef, ActorOnceDef, ActorRef, ChildId, DefaultsInheritance, Intensity, LifecycleEvents,
+    Membership, ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults, ScopeSnapshot,
+    Shutdown, ShutdownTimeout, SnapshotReceiver, Strategy, WaitError,
+    cells::{MemberStage, ScopeCell},
+    definition::DefinitionSource,
+    driver::DynamicReservation,
+    exit::{StartupError, StopReason},
     mailbox::MailboxCell,
-    policy::{CommonOptions, IdError, ResolvedCommonOptions, ResolvedDefaults, resolve_common},
-    raw::{RawConstruction, RawDef, RawOnceDef},
+    plan::{
+        BuilderCore, ChildConstruction, LowerError, RemoveOutcome, ReserveError, ScopeConstruction,
+        SlotCell,
+    },
+    policy::{CommonOptions, InvalidPolicy, ResolvedDefaults, ScopeFlavor},
+    raw::{RawDef, RawOnceDef},
     runtime::{self, Latch},
-    task::{OnceTask, OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
+    task::{OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
-
-/// Whether a scope has fixed ordered membership or runtime-dynamic membership.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ScopeFlavor {
-    Ordered,
-    Dynamic,
-}
-
-/// The terminal reason for a scope incarnation or root system.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum StopReason {
-    /// A non-empty ordered workload completed naturally.
-    Finished,
-    /// Shutdown was explicitly requested.
-    ShutdownRequested,
-    /// The scope exceeded its restart budget.
-    IntensityTripped(IntensityTrip),
-    /// A nested scope could not complete startup.
-    StartupFailed(StartupFailure),
-    /// The membership terminalized without an incarnation.
-    NeverStarted,
-}
-
-/// Failure of the root startup barrier.
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
-pub enum StartupError {
-    /// A child or nested lowering failed terminally during startup.
-    #[error("tree startup failed")]
-    StartupFailed(StartupFailure),
-    /// Restart intensity tripped during startup.
-    #[error("restart intensity tripped during startup")]
-    IntensityTripped(IntensityTrip),
-    /// Shutdown began before startup completed.
-    #[error("shutdown was requested during startup")]
-    ShutdownRequested,
-}
 
 /// Startup failure paired with any rollback timeout report.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -72,43 +38,6 @@ pub struct StartOrShutdownError {
     pub startup: StartupError,
     /// Stragglers forced down after the rollback bound, if any.
     pub rollback_timeout: Option<ShutdownTimeout>,
-}
-
-/// A declaration-time reservation error.
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
-pub enum ReserveError {
-    /// The child id was empty.
-    #[error("child id must not be empty")]
-    EmptyId,
-    /// A resident membership already occupies the id.
-    #[error("child id `{0}` is already resident")]
-    DuplicateId(ChildId),
-    /// A same-id membership is currently being removed.
-    #[error("child id `{0}` is being removed")]
-    RemovalInProgress(ChildId),
-    /// The target dynamic scope is not admitting.
-    #[error("scope is not admitting: {0:?}")]
-    NotAdmitting(NotAdmittingCause),
-    /// The scope can mint no further membership identities.
-    #[error("membership identity space is exhausted")]
-    IdentityExhausted,
-}
-
-/// Exact reason an admission operation could not proceed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum NotAdmittingCause {
-    /// The scope membership is terminal.
-    Terminal,
-    /// The live scope incarnation is draining.
-    Draining,
-    /// The dynamic root is parked after startup failure.
-    StartupFailed,
-    /// No scope incarnation is currently live.
-    NoLiveIncarnation,
-    /// This operation's reservation ended before admission.
-    ReservationEnded,
 }
 
 /// A root lowering error.
@@ -124,312 +53,366 @@ pub enum BuildError {
         /// Child-id paths of every undefined reservation.
         paths: Vec<Vec<ChildId>>,
     },
+    /// A public policy representation contained an invalid literal value.
+    #[error(transparent)]
+    InvalidPolicy(InvalidPolicy),
 }
 
-#[derive(Debug)]
-pub(crate) enum LowerError {
-    Undefined {
-        paths: Vec<Vec<ChildId>>,
-        disposal: crate::runtime::Latch,
-    },
-    IdentityExhausted {
-        id: ChildId,
-        disposal: crate::runtime::Latch,
-    },
+#[derive(Clone, Copy)]
+enum AdmissionOwnership {
+    Split,
+    Fused,
 }
 
-/// Outcome of an idempotent dynamic removal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RemoveOutcome {
-    /// A reservation or resident membership was removed.
-    Removed,
-    /// No matching membership remained to remove.
-    AlreadyAbsent,
+impl AdmissionOwnership {
+    fn is_fused(self) -> bool {
+        matches!(self, Self::Fused)
+    }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ScopeConfig {
-    pub(crate) strategy: Strategy,
-    pub(crate) intensity: Intensity,
-    pub(crate) defaults: ScopeDefaults,
+trait SlotEndpoint: Sized {
+    type Output<H>;
+
+    fn slot(&self) -> &SlotCell;
+
+    fn define<H>(
+        self,
+        handles: H,
+        construction: ChildConstruction,
+        ownership: AdmissionOwnership,
+    ) -> Self::Output<H>;
 }
 
-pub(crate) enum ChildConstruction {
-    Raw(RawConstruction),
-    Task(TaskDef),
-    TaskOnce(OnceTask),
-    Scope(Box<ScopeConstruction>),
-}
+struct StaticSlotEndpoint(Arc<SlotCell>);
 
-enum DefinitionState {
-    Undefined,
-    Defined(crate::runtime::Isolated<ChildConstruction>),
-    Lowered,
-}
+impl SlotEndpoint for StaticSlotEndpoint {
+    type Output<H> = H;
 
-pub(crate) struct SlotCell {
-    pub(crate) member: Arc<MemberCell>,
-    pub(crate) scope: Option<Arc<ScopeCell>>,
-    definition: Mutex<DefinitionState>,
-}
-
-impl SlotCell {
-    pub(crate) fn new(member: Arc<MemberCell>, scope: Option<Arc<ScopeCell>>) -> Arc<Self> {
-        Arc::new(Self {
-            member,
-            scope,
-            definition: Mutex::new(DefinitionState::Undefined),
-        })
+    fn slot(&self) -> &SlotCell {
+        &self.0
     }
 
-    pub(crate) fn define(&self, definition: ChildConstruction) {
-        let mut state = self.definition.lock().expect("definition mutex poisoned");
-        match *state {
-            DefinitionState::Undefined => {
-                *state = DefinitionState::Defined(crate::runtime::Isolated::new(definition));
-            }
-            DefinitionState::Defined(_) | DefinitionState::Lowered => {
-                panic!("a child slot was defined more than once")
-            }
+    fn define<H>(self, handles: H, construction: ChildConstruction, _: AdmissionOwnership) -> H {
+        self.0.define(construction);
+        handles
+    }
+}
+
+struct DynamicSlotEndpoint(Option<DynamicReservation>);
+
+impl DynamicSlotEndpoint {
+    fn reservation(&self) -> &DynamicReservation {
+        self.0
+            .as_ref()
+            .expect("dynamic slot reservation was already consumed")
+    }
+}
+
+impl SlotEndpoint for DynamicSlotEndpoint {
+    type Output<H> = Admission<H>;
+
+    fn slot(&self) -> &SlotCell {
+        &self.reservation().slot
+    }
+
+    fn define<H>(
+        mut self,
+        handles: H,
+        construction: ChildConstruction,
+        ownership: AdmissionOwnership,
+    ) -> Admission<H> {
+        let reservation = self
+            .0
+            .take()
+            .expect("dynamic slot reservation was already consumed");
+        reservation.slot.define(construction);
+        Admission::new(reservation, handles, ownership.is_fused())
+    }
+}
+
+impl Drop for DynamicSlotEndpoint {
+    fn drop(&mut self) {
+        if let Some(reservation) = &self.0 {
+            crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
         }
     }
+}
 
-    pub(crate) fn is_undefined(&self) -> bool {
-        matches!(
-            *self.definition.lock().expect("definition mutex poisoned"),
-            DefinitionState::Undefined
+struct ActorSlotCore<E, M> {
+    endpoint: E,
+    mailbox: Arc<MailboxCell<M>>,
+}
+
+macro_rules! impl_actor_core_definition {
+    ($method:ident, $definition:ident) => {
+        fn $method<R>(
+            self,
+            definition: $definition<R>,
+            ownership: AdmissionOwnership,
+        ) -> E::Output<ActorRef<M>>
+        where
+            R: crate::RawActor<Msg = M>,
+        {
+            let actor = self.actor_ref();
+            let Self { endpoint, mailbox } = self;
+            endpoint.define(
+                actor,
+                ChildConstruction::Raw(definition.erase(mailbox)),
+                ownership,
+            )
+        }
+    };
+}
+
+impl<E: SlotEndpoint, M: Send + 'static> ActorSlotCore<E, M> {
+    fn new(endpoint: E, mailbox: Arc<MailboxCell<M>>) -> Self {
+        Self { endpoint, mailbox }
+    }
+
+    fn actor_ref(&self) -> ActorRef<M> {
+        ActorRef::new(
+            Arc::clone(&self.endpoint.slot().member),
+            Arc::clone(&self.mailbox),
         )
     }
 
-    pub(crate) fn take_definition(&self) -> Option<crate::runtime::Isolated<ChildConstruction>> {
-        let mut state = self.definition.lock().expect("definition mutex poisoned");
-        match std::mem::replace(&mut *state, DefinitionState::Lowered) {
-            DefinitionState::Defined(definition) => Some(definition),
-            DefinitionState::Undefined => {
-                *state = DefinitionState::Undefined;
-                None
-            }
-            DefinitionState::Lowered => panic!("a tree was lowered more than once"),
-        }
+    impl_actor_core_definition!(define_raw, RawDef);
+    impl_actor_core_definition!(define_once_raw, RawOnceDef);
+}
+
+struct TaskSlotCore<E> {
+    endpoint: E,
+}
+
+impl<E: SlotEndpoint> TaskSlotCore<E> {
+    fn new(endpoint: E) -> Self {
+        Self { endpoint }
     }
 
-    pub(crate) fn take_defined(&self) -> Option<crate::runtime::Isolated<ChildConstruction>> {
-        let mut state = self.definition.lock().expect("definition mutex poisoned");
-        match std::mem::replace(&mut *state, DefinitionState::Lowered) {
-            DefinitionState::Defined(definition) => Some(definition),
-            DefinitionState::Undefined => {
-                *state = DefinitionState::Undefined;
-                None
-            }
-            DefinitionState::Lowered => None,
-        }
+    fn task_ref(&self) -> TaskRef {
+        TaskRef::new(Arc::clone(&self.endpoint.slot().member))
+    }
+
+    fn define(self, definition: TaskDef, ownership: AdmissionOwnership) -> E::Output<TaskRef> {
+        let task = self.task_ref();
+        self.endpoint
+            .define(task, ChildConstruction::Task(definition), ownership)
+    }
+
+    fn define_once<T: Send + 'static>(
+        self,
+        definition: TaskOnceDef<T>,
+        ownership: AdmissionOwnership,
+    ) -> E::Output<(TaskRef, OneShotTaskRef<T>)> {
+        let task = self.task_ref();
+        let (completion, receiver) = runtime::oneshot();
+        let claim = OneShotTaskRef::new(receiver, task.clone());
+        self.endpoint.define(
+            (task, claim),
+            ChildConstruction::TaskOnce(definition.erase(completion)),
+            ownership,
+        )
     }
 }
 
-pub(crate) struct BuilderCore {
-    root: Arc<ScopeCell>,
-    flavor: ScopeFlavor,
-    config: ScopeConfig,
-    slots: Vec<Arc<SlotCell>>,
-    ids: HashMap<ChildId, Arc<SlotCell>>,
-    armed: bool,
+struct SubtreeSlotCore<E, T: Subtree> {
+    endpoint: E,
+    marker: PhantomData<fn() -> T>,
 }
 
-impl BuilderCore {
-    fn begin_failed_disposal(&self) -> crate::runtime::Latch {
-        let definitions = self
-            .slots
-            .iter()
-            .filter_map(|slot| slot.take_defined())
-            .filter_map(|mut definition| definition.take())
-            .collect();
-        crate::runtime::dispose_all(definitions)
-    }
+macro_rules! impl_subtree_core_definition {
+    ($method:ident, $definition:ident) => {
+        fn $method(
+            self,
+            definition: $definition<T>,
+            ownership: AdmissionOwnership,
+        ) -> E::Output<T::Ref> {
+            let scope = self.scope_ref();
+            self.endpoint.define(
+                scope,
+                ChildConstruction::Scope(Box::new(definition.erase())),
+                ownership,
+            )
+        }
+    };
+}
 
-    fn new(flavor: ScopeFlavor) -> Self {
-        let root_id = ChildId::from("$root");
-        let mut root_identity =
-            ScopeIdentity::new().expect("global scope identity space exhausted");
-        let membership = root_identity
-            .mint_membership(&root_id)
-            .expect("fresh scope identity must mint its root membership");
-        let member = MemberCell::new(root_id, membership);
-        let child_identity = ScopeIdentity::new().expect("global scope identity space exhausted");
-        let root = ScopeCell::new(member, flavor, child_identity);
+impl<E: SlotEndpoint, T: Subtree> SubtreeSlotCore<E, T> {
+    fn new(endpoint: E) -> Self {
         Self {
-            root,
-            flavor,
-            config: ScopeConfig::default(),
-            slots: Vec::new(),
-            ids: HashMap::new(),
-            armed: true,
+            endpoint,
+            marker: PhantomData,
         }
     }
 
-    fn reserve(
-        &mut self,
-        id: impl Into<ChildId>,
-        scope: Option<ScopeFlavor>,
-    ) -> Result<Arc<SlotCell>, ReserveError> {
-        let id = checked_id(id)?;
-        if self.ids.contains_key(&id) {
-            return Err(ReserveError::DuplicateId(id));
-        }
-        let membership = self
-            .root
-            .child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .mint_membership(&id)
-            .ok_or(ReserveError::IdentityExhausted)?;
-        let member = MemberCell::new(id.clone(), membership);
-        let scope = scope.map(|flavor| {
-            let identity = ScopeIdentity::new().expect("global scope identity space exhausted");
-            ScopeCell::new(Arc::clone(&member), flavor, identity)
-        });
-        let slot = SlotCell::new(member, scope);
-        self.ids.insert(id, Arc::clone(&slot));
-        self.slots.push(Arc::clone(&slot));
-        Ok(slot)
-    }
-
-    pub(crate) fn lower(
-        mut self,
-        inherited: ResolvedDefaults,
-        root_override: Option<Arc<ScopeCell>>,
-    ) -> Result<ScopePlan, LowerError> {
-        let root = root_override.unwrap_or_else(|| Arc::clone(&self.root));
-        let undefined: Vec<_> = self
-            .slots
-            .iter()
-            .filter(|slot| slot.is_undefined())
-            .map(|slot| vec![slot.member.id().clone()])
-            .collect();
-        if !undefined.is_empty() {
-            let disposal = self.begin_failed_disposal();
-            return Err(LowerError::Undefined {
-                paths: undefined,
-                disposal,
-            });
-        }
-        if !Arc::ptr_eq(&root, &self.root) {
-            let mut identity = root
-                .child_identity
-                .lock()
-                .expect("scope identity mutex poisoned");
-            for slot in &self.slots {
-                let Some(membership) =
-                    identity.adopt_or_mint_membership(slot.member.id(), slot.member.membership())
-                else {
-                    let id = slot.member.id().clone();
-                    drop(identity);
-                    let disposal = self.begin_failed_disposal();
-                    return Err(LowerError::IdentityExhausted { id, disposal });
-                };
-                if membership != slot.member.membership() {
-                    slot.member.rebase_membership(membership);
-                }
-            }
-        }
-        root.set_config(self.config.clone());
-        let defaults = inherited.overlay(&self.config.defaults);
-        let mut children = Vec::with_capacity(self.slots.len());
-        for slot in &self.slots {
-            let definition = slot
-                .take_definition()
-                .expect("validated slot must have a definition");
-            let (options, one_shot) = match definition.get() {
-                ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
-                ChildConstruction::Task(definition) => (&definition.options, false),
-                ChildConstruction::TaskOnce(definition) => (&definition.options, true),
-                ChildConstruction::Scope(definition) => {
-                    (&definition.options, definition.one_shot())
-                }
-            };
-            let resolved =
-                resolve_common(options, &defaults, one_shot, crate::Readiness::Immediate);
-            slot.member.set_options(resolved.clone());
-            children.push(ChildPlan {
-                slot: Arc::clone(slot),
-                construction: definition,
-                options: resolved,
-            });
-        }
-        self.armed = false;
-        Ok(ScopePlan {
-            root,
-            flavor: self.flavor,
-            config: self.config.clone(),
-            defaults,
-            children,
-            armed: true,
+    fn scope_ref(&self) -> T::Ref {
+        <T as sealed::Sealed>::make_ref(ScopeRef {
+            cell: Arc::clone(
+                self.endpoint
+                    .slot()
+                    .scope
+                    .as_ref()
+                    .expect("subtree slot must carry a scope cell"),
+            ),
         })
     }
 
-    fn terminalize(&self) {
-        for slot in &self.slots {
-            slot.member.terminalize(Exit::never_started());
-            if let Some(scope) = &slot.scope {
-                scope.terminalize_never_started();
+    impl_subtree_core_definition!(define, SubtreeDef);
+    impl_subtree_core_definition!(define_once, SubtreeOnceDef);
+}
+
+macro_rules! impl_slot_debug {
+    ($slot:ident $(<$generic:ident $(: $bound:path)?>)?, $label:literal) => {
+        impl$(<$generic $(: $bound)?>)? fmt::Debug for $slot$(<$generic>)? {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_struct($label)
+                    .field("id", self.core.endpoint.slot().member.id())
+                    .finish_non_exhaustive()
             }
         }
-        self.root.terminalize_never_started();
-    }
-}
-
-impl Drop for BuilderCore {
-    fn drop(&mut self) {
-        if self.armed {
-            self.terminalize();
-        }
-    }
-}
-
-pub(crate) struct ScopePlan {
-    pub(crate) root: Arc<ScopeCell>,
-    pub(crate) flavor: ScopeFlavor,
-    pub(crate) config: ScopeConfig,
-    pub(crate) defaults: ResolvedDefaults,
-    pub(crate) children: Vec<ChildPlan>,
-    pub(crate) armed: bool,
-}
-
-impl Drop for ScopePlan {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        for child in &self.children {
-            child.slot.member.terminalize(Exit::never_started());
-            if let Some(scope) = &child.slot.scope {
-                scope.terminalize_never_started();
-            }
-        }
-        // Lowering can publish the planned children before ScopeRuntime takes
-        // ownership. If construction then unwinds, the plan fallback also
-        // owns those residencies and their matching Removed edges.
-        self.root.clear_residents();
-        self.root.terminalize_never_started();
-    }
-}
-
-pub(crate) struct ChildPlan {
-    pub(crate) slot: Arc<SlotCell>,
-    pub(crate) construction: crate::runtime::Isolated<ChildConstruction>,
-    pub(crate) options: ResolvedCommonOptions,
-}
-
-fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError> {
-    let id = id.into();
-    ChildId::validate(id.as_str().to_owned()).map_err(|error| match error {
-        IdError::Empty => ReserveError::EmptyId,
-    })
+    };
 }
 
 fn attach_actor_slot<M: Send + 'static>(slot: Arc<SlotCell>) -> ActorSlot<M> {
     let mailbox = MailboxCell::new(slot.member.id().clone());
     slot.member.attach_mailbox(mailbox.clone());
-    ActorSlot { slot, mailbox }
+    ActorSlot {
+        core: ActorSlotCore::new(StaticSlotEndpoint(slot), mailbox),
+    }
+}
+
+macro_rules! impl_common_builder_surface {
+    (
+        reserve_actor: $reserve_actor_doc:literal,
+        add_actor: $add_actor_doc:literal,
+        add_actor_once: $add_actor_once_doc:literal,
+        add_raw: $add_raw_doc:literal,
+        add_raw_once: $add_raw_once_doc:literal,
+        reserve_task: $reserve_task_doc:literal,
+        add_task: $add_task_doc:literal,
+        add_task_once: $add_task_once_doc:literal,
+        reserve_subtree: $reserve_subtree_doc:literal,
+        add_subtree: $add_subtree_doc:literal,
+        add_subtree_once: $add_subtree_once_doc:literal $(,)?
+    ) => {
+        /// Sets the scope restart-intensity budget.
+        pub fn intensity(&mut self, intensity: Intensity) -> &mut Self {
+            self.core.config.intensity = intensity;
+            self
+        }
+
+        /// Sets child policy defaults for this scope.
+        pub fn defaults(&mut self, defaults: ScopeDefaults) -> &mut Self {
+            self.core.config.defaults = defaults;
+            self
+        }
+
+        #[doc = $reserve_actor_doc]
+        pub fn reserve_actor<M: Send + 'static>(
+            &mut self,
+            id: impl Into<ChildId>,
+        ) -> Result<ActorSlot<M>, ReserveError> {
+            self.core.reserve(id, None).map(attach_actor_slot)
+        }
+
+        #[doc = $add_actor_doc]
+        pub fn add_actor<A: crate::Actor>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: ActorDef<A>,
+        ) -> Result<ActorRef<A::Msg>, ReserveError> {
+            self.reserve_actor(id).map(|slot| slot.define(definition))
+        }
+
+        #[doc = $add_actor_once_doc]
+        pub fn add_actor_once<A: crate::Actor>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: ActorOnceDef<A>,
+        ) -> Result<ActorRef<A::Msg>, ReserveError> {
+            self.reserve_actor(id)
+                .map(|slot| slot.define_once(definition))
+        }
+
+        #[doc = $add_raw_doc]
+        pub fn add_raw<R: crate::RawActor>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: RawDef<R>,
+        ) -> Result<ActorRef<R::Msg>, ReserveError> {
+            self.reserve_actor(id)
+                .map(|slot| slot.define_raw(definition))
+        }
+
+        #[doc = $add_raw_once_doc]
+        pub fn add_raw_once<R: crate::RawActor>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: RawOnceDef<R>,
+        ) -> Result<ActorRef<R::Msg>, ReserveError> {
+            self.reserve_actor(id)
+                .map(|slot| slot.define_once_raw(definition))
+        }
+
+        #[doc = $reserve_task_doc]
+        pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
+            self.core.reserve(id, None).map(|slot| TaskSlot {
+                core: TaskSlotCore::new(StaticSlotEndpoint(slot)),
+            })
+        }
+
+        #[doc = $add_task_doc]
+        pub fn add_task(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: TaskDef,
+        ) -> Result<TaskRef, ReserveError> {
+            self.reserve_task(id).map(|slot| slot.define(definition))
+        }
+
+        #[doc = $add_task_once_doc]
+        pub fn add_task_once<T: Send + 'static>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: TaskOnceDef<T>,
+        ) -> Result<(TaskRef, OneShotTaskRef<T>), ReserveError> {
+            self.reserve_task(id)
+                .map(|slot| slot.define_once(definition))
+        }
+
+        #[doc = $reserve_subtree_doc]
+        pub fn reserve_subtree<T: Subtree>(
+            &mut self,
+            id: impl Into<ChildId>,
+        ) -> Result<SubtreeSlot<T>, ReserveError> {
+            self.core
+                .reserve(id, Some(<T as sealed::Sealed>::FLAVOR))
+                .map(|slot| SubtreeSlot {
+                    core: SubtreeSlotCore::new(StaticSlotEndpoint(slot)),
+                })
+        }
+
+        #[doc = $add_subtree_doc]
+        pub fn add_subtree<T: Subtree>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: SubtreeDef<T>,
+        ) -> Result<T::Ref, ReserveError> {
+            self.reserve_subtree::<T>(id)
+                .map(|slot| slot.define(definition))
+        }
+
+        #[doc = $add_subtree_once_doc]
+        pub fn add_subtree_once<T: Subtree>(
+            &mut self,
+            id: impl Into<ChildId>,
+            definition: SubtreeOnceDef<T>,
+        ) -> Result<T::Ref, ReserveError> {
+            self.reserve_subtree::<T>(id)
+                .map(|slot| slot.define_once(definition))
+        }
+    };
 }
 
 /// A fixed-membership, readiness-ordered tree declaration.
@@ -468,120 +451,18 @@ impl Tree {
         self
     }
 
-    /// Sets the scope restart-intensity budget.
-    pub fn intensity(&mut self, intensity: Intensity) -> &mut Self {
-        self.core.config.intensity = intensity;
-        self
-    }
-
-    /// Sets child policy defaults for this scope.
-    pub fn defaults(&mut self, defaults: ScopeDefaults) -> &mut Self {
-        self.core.config.defaults = defaults;
-        self
-    }
-
-    /// Reserves an actor membership and returns its pre-spawn handle slot.
-    pub fn reserve_actor<M: Send + 'static>(
-        &mut self,
-        id: impl Into<ChildId>,
-    ) -> Result<ActorSlot<M>, ReserveError> {
-        self.core.reserve(id, None).map(attach_actor_slot)
-    }
-
-    /// Adds a restartable callback-oriented actor.
-    pub fn add_actor<A: crate::Actor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: ActorDef<A>,
-    ) -> Result<ActorRef<A::Msg>, ReserveError> {
-        self.reserve_actor(id).map(|slot| slot.define(definition))
-    }
-
-    /// Adds a consuming one-shot callback-oriented actor.
-    pub fn add_actor_once<A: crate::Actor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: ActorOnceDef<A>,
-    ) -> Result<ActorRef<A::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_once(definition))
-    }
-
-    /// Adds a restartable raw actor.
-    pub fn add_raw<R: crate::RawActor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: RawDef<R>,
-    ) -> Result<ActorRef<R::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_raw(definition))
-    }
-
-    /// Adds a consuming one-shot raw actor.
-    pub fn add_raw_once<R: crate::RawActor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: RawOnceDef<R>,
-    ) -> Result<ActorRef<R::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_once_raw(definition))
-    }
-
-    /// Reserves a task membership and returns its pre-spawn handle slot.
-    pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
-        self.core.reserve(id, None).map(|slot| TaskSlot { slot })
-    }
-
-    /// Adds a restartable task.
-    pub fn add_task(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: TaskDef,
-    ) -> Result<TaskRef, ReserveError> {
-        self.reserve_task(id).map(|slot| slot.define(definition))
-    }
-
-    /// Adds a consuming one-shot task and its typed completion claim.
-    pub fn add_task_once<T: Send + 'static>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: TaskOnceDef<T>,
-    ) -> Result<(TaskRef, OneShotTaskRef<T>), ReserveError> {
-        self.reserve_task(id)
-            .map(|slot| slot.define_once(definition))
-    }
-
-    /// Reserves a typed subtree membership.
-    pub fn reserve_subtree<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-    ) -> Result<SubtreeSlot<T>, ReserveError> {
-        self.core
-            .reserve(id, Some(<T as sealed::Sealed>::FLAVOR))
-            .map(|slot| SubtreeSlot {
-                slot,
-                marker: PhantomData,
-            })
-    }
-
-    /// Adds a restartable subtree.
-    pub fn add_subtree<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: SubtreeDef<T>,
-    ) -> Result<T::Ref, ReserveError> {
-        self.reserve_subtree::<T>(id)
-            .map(|slot| slot.define(definition))
-    }
-
-    /// Adds a consuming one-shot subtree.
-    pub fn add_subtree_once<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: SubtreeOnceDef<T>,
-    ) -> Result<T::Ref, ReserveError> {
-        self.reserve_subtree::<T>(id)
-            .map(|slot| slot.define_once(definition))
+    impl_common_builder_surface! {
+        reserve_actor: "Reserves an actor membership and returns its pre-spawn handle slot.",
+        add_actor: "Adds a restartable callback-oriented actor.",
+        add_actor_once: "Adds a consuming one-shot callback-oriented actor.",
+        add_raw: "Adds a restartable raw actor.",
+        add_raw_once: "Adds a consuming one-shot raw actor.",
+        reserve_task: "Reserves a task membership and returns its pre-spawn handle slot.",
+        add_task: "Adds a restartable task.",
+        add_task_once: "Adds a consuming one-shot task and its typed completion claim.",
+        reserve_subtree: "Reserves a typed subtree membership.",
+        add_subtree: "Adds a restartable subtree.",
+        add_subtree_once: "Adds a consuming one-shot subtree.",
     }
 
     /// Lowers and starts this tree synchronously.
@@ -620,120 +501,18 @@ impl DynamicTree {
         }
     }
 
-    /// Sets the scope restart-intensity budget.
-    pub fn intensity(&mut self, intensity: Intensity) -> &mut Self {
-        self.core.config.intensity = intensity;
-        self
-    }
-
-    /// Sets child policy defaults for this scope.
-    pub fn defaults(&mut self, defaults: ScopeDefaults) -> &mut Self {
-        self.core.config.defaults = defaults;
-        self
-    }
-
-    /// Reserves an initial actor membership.
-    pub fn reserve_actor<M: Send + 'static>(
-        &mut self,
-        id: impl Into<ChildId>,
-    ) -> Result<ActorSlot<M>, ReserveError> {
-        self.core.reserve(id, None).map(attach_actor_slot)
-    }
-
-    /// Adds an initial restartable callback-oriented actor.
-    pub fn add_actor<A: crate::Actor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: ActorDef<A>,
-    ) -> Result<ActorRef<A::Msg>, ReserveError> {
-        self.reserve_actor(id).map(|slot| slot.define(definition))
-    }
-
-    /// Adds an initial consuming one-shot callback-oriented actor.
-    pub fn add_actor_once<A: crate::Actor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: ActorOnceDef<A>,
-    ) -> Result<ActorRef<A::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_once(definition))
-    }
-
-    /// Adds an initial restartable raw actor.
-    pub fn add_raw<R: crate::RawActor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: RawDef<R>,
-    ) -> Result<ActorRef<R::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_raw(definition))
-    }
-
-    /// Adds an initial consuming one-shot raw actor.
-    pub fn add_raw_once<R: crate::RawActor>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: RawOnceDef<R>,
-    ) -> Result<ActorRef<R::Msg>, ReserveError> {
-        self.reserve_actor(id)
-            .map(|slot| slot.define_once_raw(definition))
-    }
-
-    /// Reserves an initial task membership.
-    pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
-        self.core.reserve(id, None).map(|slot| TaskSlot { slot })
-    }
-
-    /// Adds an initial restartable task.
-    pub fn add_task(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: TaskDef,
-    ) -> Result<TaskRef, ReserveError> {
-        self.reserve_task(id).map(|slot| slot.define(definition))
-    }
-
-    /// Adds an initial one-shot task.
-    pub fn add_task_once<T: Send + 'static>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: TaskOnceDef<T>,
-    ) -> Result<(TaskRef, OneShotTaskRef<T>), ReserveError> {
-        self.reserve_task(id)
-            .map(|slot| slot.define_once(definition))
-    }
-
-    /// Reserves an initial typed subtree membership.
-    pub fn reserve_subtree<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-    ) -> Result<SubtreeSlot<T>, ReserveError> {
-        self.core
-            .reserve(id, Some(<T as sealed::Sealed>::FLAVOR))
-            .map(|slot| SubtreeSlot {
-                slot,
-                marker: PhantomData,
-            })
-    }
-
-    /// Adds an initial restartable subtree.
-    pub fn add_subtree<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: SubtreeDef<T>,
-    ) -> Result<T::Ref, ReserveError> {
-        self.reserve_subtree::<T>(id)
-            .map(|slot| slot.define(definition))
-    }
-
-    /// Adds an initial one-shot subtree.
-    pub fn add_subtree_once<T: Subtree>(
-        &mut self,
-        id: impl Into<ChildId>,
-        definition: SubtreeOnceDef<T>,
-    ) -> Result<T::Ref, ReserveError> {
-        self.reserve_subtree::<T>(id)
-            .map(|slot| slot.define_once(definition))
+    impl_common_builder_surface! {
+        reserve_actor: "Reserves an initial actor membership.",
+        add_actor: "Adds an initial restartable callback-oriented actor.",
+        add_actor_once: "Adds an initial consuming one-shot callback-oriented actor.",
+        add_raw: "Adds an initial restartable raw actor.",
+        add_raw_once: "Adds an initial consuming one-shot raw actor.",
+        reserve_task: "Reserves an initial task membership.",
+        add_task: "Adds an initial restartable task.",
+        add_task_once: "Adds an initial one-shot task.",
+        reserve_subtree: "Reserves an initial typed subtree membership.",
+        add_subtree: "Adds an initial restartable subtree.",
+        add_subtree_once: "Adds an initial one-shot subtree.",
     }
 
     /// Lowers and starts this tree synchronously.
@@ -746,7 +525,7 @@ fn spawn_builder<R>(
     core: BuilderCore,
     make_ref: impl FnOnce(ScopeRef) -> R,
 ) -> Result<System<R>, BuildError> {
-    if !crate::driver::runtime_available() {
+    if !runtime::is_available() {
         return Err(BuildError::NoRuntime);
     }
     let root = Arc::clone(&core.root);
@@ -757,6 +536,7 @@ fn spawn_builder<R>(
             LowerError::IdentityExhausted { .. } => {
                 unreachable!("root lowering does not mint memberships")
             }
+            LowerError::InvalidPolicy { invalid, .. } => BuildError::InvalidPolicy(invalid),
         })?;
     let scope_ref = ScopeRef { cell: root };
     let run = crate::driver::spawn_system(plan);
@@ -768,37 +548,30 @@ fn spawn_builder<R>(
 }
 
 #[cfg(test)]
-pub(crate) fn lower_tree_for_test(tree: Tree) -> ScopePlan {
-    tree.core
-        .lower(ResolvedDefaults::default(), None)
-        .expect("test tree must be fully defined")
-}
+impl Tree {
+    pub(crate) fn lower_for_test(self) -> crate::plan::ScopePlan {
+        self.core
+            .lower(ResolvedDefaults::default(), None)
+            .expect("test tree must be fully defined")
+    }
 
-#[cfg(test)]
-pub(crate) fn into_core_for_test(tree: Tree) -> BuilderCore {
-    tree.core
+    pub(crate) fn into_core_for_test(self) -> BuilderCore {
+        self.core
+    }
 }
 
 /// An owned pre-spawn actor slot with a stable mailbox binding.
 pub struct ActorSlot<M> {
-    slot: Arc<SlotCell>,
-    mailbox: Arc<MailboxCell<M>>,
+    core: ActorSlotCore<StaticSlotEndpoint, M>,
 }
 
-impl<M> fmt::Debug for ActorSlot<M> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ActorSlot")
-            .field("id", self.slot.member.id())
-            .finish_non_exhaustive()
-    }
-}
+impl_slot_debug!(ActorSlot<M>, "ActorSlot");
 
 impl<M: Send + 'static> ActorSlot<M> {
     /// Returns the membership-addressed handle before definition or spawn.
     #[must_use]
     pub fn actor_ref(&self) -> ActorRef<M> {
-        ActorRef::new(Arc::clone(&self.slot.member), Arc::clone(&self.mailbox))
+        self.core.actor_ref()
     }
 
     /// Defines a restartable callback-oriented actor and consumes the slot.
@@ -825,10 +598,7 @@ impl<M: Send + 'static> ActorSlot<M> {
     where
         R: crate::RawActor<Msg = M>,
     {
-        let actor = self.actor_ref();
-        self.slot
-            .define(ChildConstruction::Raw(definition.erase(self.mailbox)));
-        actor
+        self.core.define_raw(definition, AdmissionOwnership::Split)
     }
 
     /// Defines a consuming one-shot raw actor and consumes the slot.
@@ -837,40 +607,29 @@ impl<M: Send + 'static> ActorSlot<M> {
     where
         R: crate::RawActor<Msg = M>,
     {
-        let actor = self.actor_ref();
-        self.slot
-            .define(ChildConstruction::Raw(definition.erase(self.mailbox)));
-        actor
+        self.core
+            .define_once_raw(definition, AdmissionOwnership::Split)
     }
 }
 
 /// An owned pre-spawn task slot.
 pub struct TaskSlot {
-    slot: Arc<SlotCell>,
+    core: TaskSlotCore<StaticSlotEndpoint>,
 }
 
-impl fmt::Debug for TaskSlot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TaskSlot")
-            .field("id", self.slot.member.id())
-            .finish_non_exhaustive()
-    }
-}
+impl_slot_debug!(TaskSlot, "TaskSlot");
 
 impl TaskSlot {
     /// Returns the membership handle before definition or spawn.
     #[must_use]
     pub fn task_ref(&self) -> TaskRef {
-        TaskRef::new(Arc::clone(&self.slot.member))
+        self.core.task_ref()
     }
 
     /// Defines a restartable task and consumes the slot.
     #[must_use]
     pub fn define(self, definition: TaskDef) -> TaskRef {
-        let task = self.task_ref();
-        self.slot.define(ChildConstruction::Task(definition));
-        task
+        self.core.define(definition, AdmissionOwnership::Split)
     }
 
     /// Defines a one-shot task and consumes the slot.
@@ -878,12 +637,7 @@ impl TaskSlot {
         self,
         definition: TaskOnceDef<T>,
     ) -> (TaskRef, OneShotTaskRef<T>) {
-        let task = self.task_ref();
-        let (completion, receiver) = runtime::oneshot();
-        let claim = OneShotTaskRef::new(receiver, task.clone());
-        self.slot
-            .define(ChildConstruction::TaskOnce(definition.erase(completion)));
-        (task, claim)
+        self.core.define_once(definition, AdmissionOwnership::Split)
     }
 }
 
@@ -914,27 +668,99 @@ impl<H> AdmissionReceipt<H> {
     }
 }
 
-/// An admission future. Fused additions abort on drop; split definitions
-/// detach after their first poll.
+/// An admission future.
+///
+/// Fused additions abort on drop; split definitions detach after their first
+/// poll starts admission. Reservation and that first poll require an ambient
+/// Tokio runtime. A first poll outside one returns [`ReserveError::NoRuntime`]
+/// and releases the reservation. Like a fused future, it remains pending if
+/// polled again after completion.
 #[must_use]
 pub struct Admission<H> {
-    reservation: Option<DynamicReservation>,
-    receipt: Option<AdmissionReceipt<H>>,
-    fused_cancel: Option<Latch>,
-    inner: Option<AdmissionWait>,
-    immediate: Option<ReserveError>,
-    polled: bool,
-    done: bool,
+    state: AdmissionState<H>,
 }
 
 type AdmissionWait = Pin<Box<dyn Future<Output = Result<(), ReserveError>> + Send + 'static>>;
+
+struct PendingAdmission<H> {
+    reservation: DynamicReservation,
+    receipt: AdmissionReceipt<H>,
+    fused_cancel: Option<Latch>,
+}
+
+impl<H> PendingAdmission<H> {
+    fn start(&self) -> Result<AdmissionWait, ReserveError> {
+        let response = crate::driver::start_admission(
+            Arc::clone(&self.reservation.control),
+            Arc::clone(&self.reservation.slot),
+            self.fused_cancel.clone(),
+        )?;
+        Ok(Box::pin(async move {
+            response.receive().await.unwrap_or_else(|| {
+                // The driver's admission `Obligation` publishes an outcome on
+                // every path, including its drop fallback. Treat a missing
+                // response as the scope having gone terminal so a caller is
+                // never stranded, but fail loudly in debug builds: silence
+                // here would mask an obligation regression.
+                debug_assert!(false, "admission response obligation must complete");
+                Err(ReserveError::NotAdmitting(
+                    crate::NotAdmittingCause::Terminal,
+                ))
+            })
+        }))
+    }
+
+    fn cancel_reservation(&self) {
+        crate::driver::cancel_dynamic_reservation(
+            &self.reservation.control,
+            &self.reservation.slot,
+        );
+    }
+}
+
+enum AdmissionState<H> {
+    Immediate(ReserveError),
+    Unpolled(PendingAdmission<H>),
+    InFlight {
+        pending: PendingAdmission<H>,
+        wait: AdmissionWait,
+    },
+    Done,
+}
+
+impl<H> AdmissionState<H> {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Immediate(_) => "Immediate",
+            Self::Unpolled(_) => "Unpolled",
+            Self::InFlight { .. } => "InFlight",
+            Self::Done => "Done",
+        }
+    }
+
+    fn begin(self, wait: AdmissionWait) -> Self {
+        match self {
+            Self::Unpolled(pending) => Self::InFlight { pending, wait },
+            other => other,
+        }
+    }
+
+    fn complete(
+        self,
+        result: Result<(), ReserveError>,
+    ) -> (Self, Option<Result<AdmissionReceipt<H>, ReserveError>>) {
+        match self {
+            Self::InFlight { pending, .. } => (Self::Done, Some(result.map(|()| pending.receipt))),
+            other => (other, None),
+        }
+    }
+}
 
 impl<H> fmt::Debug for Admission<H> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Admission")
-            .field("polled", &self.polled)
-            .field("done", &self.done)
+            .field("state", &self.state.name())
             .finish_non_exhaustive()
     }
 }
@@ -942,29 +768,21 @@ impl<H> fmt::Debug for Admission<H> {
 impl<H> Admission<H> {
     fn error(error: ReserveError) -> Self {
         Self {
-            reservation: None,
-            receipt: None,
-            fused_cancel: None,
-            inner: None,
-            immediate: Some(error),
-            polled: false,
-            done: false,
+            state: AdmissionState::Immediate(error),
         }
     }
 
     fn new(reservation: DynamicReservation, handles: H, fused: bool) -> Self {
         let membership = reservation.slot.member.membership();
         Self {
-            reservation: Some(reservation),
-            receipt: Some(AdmissionReceipt {
-                membership,
-                handles,
+            state: AdmissionState::Unpolled(PendingAdmission {
+                reservation,
+                receipt: AdmissionReceipt {
+                    membership,
+                    handles,
+                },
+                fused_cancel: fused.then(Latch::default),
             }),
-            fused_cancel: fused.then(Latch::default),
-            inner: None,
-            immediate: None,
-            polled: false,
-            done: false,
         }
     }
 }
@@ -973,111 +791,79 @@ impl<H: Unpin> Future for Admission<H> {
     type Output = Result<AdmissionReceipt<H>, ReserveError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(error) = self.immediate.take() {
-            self.done = true;
-            return Poll::Ready(Err(error));
-        }
-        if !self.polled {
-            self.polled = true;
-            let reservation = self
-                .reservation
-                .as_ref()
-                .expect("pending admission must carry its reservation");
-            let response = crate::driver::start_admission(
-                Arc::clone(&reservation.control),
-                Arc::clone(&reservation.slot),
-                self.fused_cancel.clone(),
-            );
-            self.inner = Some(Box::pin(async move {
-                response
-                    .receive()
-                    .await
-                    .expect("admission response obligation must complete")
-            }));
-        }
-        let poll = self
-            .inner
-            .as_mut()
-            .expect("polled admission must carry its response future")
-            .as_mut()
-            .poll(context);
-        match poll {
-            Poll::Ready(Ok(())) => {
-                self.done = true;
-                Poll::Ready(Ok(self
-                    .receipt
-                    .take()
-                    .expect("successful admission must carry a receipt")))
+        let this = self.as_mut().get_mut();
+        loop {
+            match &mut this.state {
+                AdmissionState::Immediate(error) => {
+                    let error = error.clone();
+                    this.state = AdmissionState::Done;
+                    return Poll::Ready(Err(error));
+                }
+                AdmissionState::Unpolled(pending) => {
+                    let wait = match pending.start() {
+                        Ok(wait) => wait,
+                        Err(error) => {
+                            pending.cancel_reservation();
+                            this.state = AdmissionState::Done;
+                            return Poll::Ready(Err(error));
+                        }
+                    };
+                    let previous = std::mem::replace(&mut this.state, AdmissionState::Done);
+                    this.state = previous.begin(wait);
+                }
+                AdmissionState::InFlight { wait, .. } => match wait.as_mut().poll(context) {
+                    Poll::Ready(result) => {
+                        let previous = std::mem::replace(&mut this.state, AdmissionState::Done);
+                        let (state, output) = previous.complete(result);
+                        this.state = state;
+                        if let Some(output) = output {
+                            return Poll::Ready(output);
+                        }
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                AdmissionState::Done => return Poll::Pending,
             }
-            Poll::Ready(Err(error)) => {
-                self.done = true;
-                Poll::Ready(Err(error))
-            }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl<H> Drop for Admission<H> {
     fn drop(&mut self) {
-        if self.done {
-            return;
-        }
-        let Some(reservation) = &self.reservation else {
-            return;
-        };
-        if let Some(cancel) = &self.fused_cancel {
-            crate::driver::signal_fused_cancel(&reservation.control, cancel);
-            crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
-        } else if !self.polled {
-            crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
+        match &self.state {
+            AdmissionState::Unpolled(pending) => {
+                // A fused admission annuls its reservation on every drop edge,
+                // polled or not. Firing the latch before cancelling keeps the
+                // scope's control-plane wake and the cancellation evidence in
+                // the same order the in-flight path uses.
+                if let Some(cancel) = &pending.fused_cancel {
+                    crate::driver::signal_fused_cancel(&pending.reservation.control, cancel);
+                }
+                pending.cancel_reservation();
+            }
+            AdmissionState::InFlight { pending, .. } => {
+                if let Some(cancel) = &pending.fused_cancel {
+                    crate::driver::signal_fused_cancel(&pending.reservation.control, cancel);
+                    pending.cancel_reservation();
+                }
+            }
+            AdmissionState::Immediate(_) | AdmissionState::Done => {}
         }
     }
 }
 
 /// A split dynamic actor reservation with a stable mailbox binding.
 pub struct DynamicActorSlot<M> {
-    reservation: Option<DynamicReservation>,
-    mailbox: Arc<MailboxCell<M>>,
+    core: ActorSlotCore<DynamicSlotEndpoint, M>,
 }
 
-impl<M> fmt::Debug for DynamicActorSlot<M> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DynamicActorSlot")
-            .field(
-                "id",
-                self.reservation
-                    .as_ref()
-                    .expect("dynamic actor slot reservation was already consumed")
-                    .slot
-                    .member
-                    .id(),
-            )
-            .finish_non_exhaustive()
-    }
-}
+impl_slot_debug!(DynamicActorSlot<M>, "DynamicActorSlot");
 
 impl<M: Send + 'static> DynamicActorSlot<M> {
-    fn reservation(&self) -> &DynamicReservation {
-        self.reservation
-            .as_ref()
-            .expect("dynamic actor slot reservation was already consumed")
-    }
-
-    fn take_reservation(&mut self) -> DynamicReservation {
-        self.reservation
-            .take()
-            .expect("dynamic actor slot reservation was already consumed")
-    }
-
     /// Returns the exact actor handle before admission.
     #[must_use]
     pub fn actor_ref(&self) -> ActorRef<M> {
-        ActorRef::new(
-            Arc::clone(&self.reservation().slot.member),
-            Arc::clone(&self.mailbox),
-        )
+        self.core.actor_ref()
     }
 
     /// Defines a restartable callback-oriented actor; dropping after first poll detaches.
@@ -1088,13 +874,6 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
         self.define_raw(definition.into_raw())
     }
 
-    fn define_fused<A>(self, definition: ActorDef<A>) -> Admission<ActorRef<M>>
-    where
-        A: crate::Actor<Msg = M>,
-    {
-        self.define_raw_fused(definition.into_raw())
-    }
-
     /// Defines a one-shot callback-oriented actor; dropping after first poll detaches.
     pub fn define_once<A>(self, definition: ActorOnceDef<A>) -> Admission<ActorRef<M>>
     where
@@ -1103,252 +882,74 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
         self.define_once_raw(definition.into_raw())
     }
 
-    fn define_once_fused<A>(self, definition: ActorOnceDef<A>) -> Admission<ActorRef<M>>
-    where
-        A: crate::Actor<Msg = M>,
-    {
-        self.define_once_raw_fused(definition.into_raw())
-    }
-
     /// Defines a restartable raw actor; dropping after first poll detaches.
-    pub fn define_raw<R>(mut self, definition: RawDef<R>) -> Admission<ActorRef<M>>
+    pub fn define_raw<R>(self, definition: RawDef<R>) -> Admission<ActorRef<M>>
     where
         R: crate::RawActor<Msg = M>,
     {
-        self.define_raw_with(definition, false)
-    }
-
-    fn define_raw_fused<R>(mut self, definition: RawDef<R>) -> Admission<ActorRef<M>>
-    where
-        R: crate::RawActor<Msg = M>,
-    {
-        self.define_raw_with(definition, true)
-    }
-
-    fn define_raw_with<R>(&mut self, definition: RawDef<R>, fused: bool) -> Admission<ActorRef<M>>
-    where
-        R: crate::RawActor<Msg = M>,
-    {
-        let actor = self.actor_ref();
-        let reservation = self.take_reservation();
-        reservation.slot.define(ChildConstruction::Raw(
-            definition.erase(Arc::clone(&self.mailbox)),
-        ));
-        Admission::new(reservation, actor, fused)
+        self.core.define_raw(definition, AdmissionOwnership::Split)
     }
 
     /// Defines a one-shot raw actor; dropping after first poll detaches.
-    pub fn define_once_raw<R>(mut self, definition: RawOnceDef<R>) -> Admission<ActorRef<M>>
+    pub fn define_once_raw<R>(self, definition: RawOnceDef<R>) -> Admission<ActorRef<M>>
     where
         R: crate::RawActor<Msg = M>,
     {
-        self.define_once_raw_with(definition, false)
-    }
-
-    fn define_once_raw_fused<R>(mut self, definition: RawOnceDef<R>) -> Admission<ActorRef<M>>
-    where
-        R: crate::RawActor<Msg = M>,
-    {
-        self.define_once_raw_with(definition, true)
-    }
-
-    fn define_once_raw_with<R>(
-        &mut self,
-        definition: RawOnceDef<R>,
-        fused: bool,
-    ) -> Admission<ActorRef<M>>
-    where
-        R: crate::RawActor<Msg = M>,
-    {
-        let actor = self.actor_ref();
-        let reservation = self.take_reservation();
-        reservation.slot.define(ChildConstruction::Raw(
-            definition.erase(Arc::clone(&self.mailbox)),
-        ));
-        Admission::new(reservation, actor, fused)
-    }
-}
-
-impl<M> Drop for DynamicActorSlot<M> {
-    fn drop(&mut self) {
-        if let Some(reservation) = &self.reservation {
-            crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
-        }
+        self.core
+            .define_once_raw(definition, AdmissionOwnership::Split)
     }
 }
 
 /// A split dynamic task reservation.
 pub struct DynamicTaskSlot {
-    reservation: Option<DynamicReservation>,
+    core: TaskSlotCore<DynamicSlotEndpoint>,
 }
 
-impl fmt::Debug for DynamicTaskSlot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DynamicTaskSlot")
-            .field("id", self.reservation().slot.member.id())
-            .finish_non_exhaustive()
-    }
-}
+impl_slot_debug!(DynamicTaskSlot, "DynamicTaskSlot");
 
 impl DynamicTaskSlot {
-    fn reservation(&self) -> &DynamicReservation {
-        self.reservation
-            .as_ref()
-            .expect("dynamic task slot reservation was already consumed")
-    }
-
-    fn take_reservation(&mut self) -> DynamicReservation {
-        self.reservation
-            .take()
-            .expect("dynamic task slot reservation was already consumed")
-    }
-
     /// Returns the exact task handle before admission.
     #[must_use]
     pub fn task_ref(&self) -> TaskRef {
-        TaskRef::new(Arc::clone(&self.reservation().slot.member))
+        self.core.task_ref()
     }
 
     /// Defines a restartable task; dropping after first poll detaches admission.
-    pub fn define(mut self, definition: TaskDef) -> Admission<TaskRef> {
-        let task = self.task_ref();
-        let reservation = self.take_reservation();
-        reservation.slot.define(ChildConstruction::Task(definition));
-        Admission::new(reservation, task, false)
-    }
-
-    fn define_fused(mut self, definition: TaskDef) -> Admission<TaskRef> {
-        let task = self.task_ref();
-        let reservation = self.take_reservation();
-        reservation.slot.define(ChildConstruction::Task(definition));
-        Admission::new(reservation, task, true)
+    pub fn define(self, definition: TaskDef) -> Admission<TaskRef> {
+        self.core.define(definition, AdmissionOwnership::Split)
     }
 
     /// Defines a one-shot task; dropping after first poll detaches admission.
     pub fn define_once<T: Send + 'static>(
-        mut self,
+        self,
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
-        let task = self.task_ref();
-        let (completion, receiver) = runtime::oneshot();
-        let reservation = self.take_reservation();
-        let claim = OneShotTaskRef::new(receiver, task.clone());
-        reservation
-            .slot
-            .define(ChildConstruction::TaskOnce(definition.erase(completion)));
-        Admission::new(reservation, (task, claim), false)
-    }
-
-    fn define_once_fused<T: Send + 'static>(
-        mut self,
-        definition: TaskOnceDef<T>,
-    ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
-        let task = self.task_ref();
-        let (completion, receiver) = runtime::oneshot();
-        let reservation = self.take_reservation();
-        let claim = OneShotTaskRef::new(receiver, task.clone());
-        reservation
-            .slot
-            .define(ChildConstruction::TaskOnce(definition.erase(completion)));
-        Admission::new(reservation, (task, claim), true)
-    }
-}
-
-impl Drop for DynamicTaskSlot {
-    fn drop(&mut self) {
-        if let Some(reservation) = &self.reservation {
-            crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
-        }
+        self.core.define_once(definition, AdmissionOwnership::Split)
     }
 }
 
 /// A split dynamic subtree reservation.
 pub struct DynamicSubtreeSlot<T: Subtree> {
-    reservation: Option<DynamicReservation>,
-    marker: PhantomData<fn() -> T>,
+    core: SubtreeSlotCore<DynamicSlotEndpoint, T>,
 }
 
-impl<T: Subtree> fmt::Debug for DynamicSubtreeSlot<T> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("DynamicSubtreeSlot")
-            .field("id", self.reservation().slot.member.id())
-            .finish_non_exhaustive()
-    }
-}
+impl_slot_debug!(DynamicSubtreeSlot<T: Subtree>, "DynamicSubtreeSlot");
 
 impl<T: Subtree> DynamicSubtreeSlot<T> {
-    fn reservation(&self) -> &DynamicReservation {
-        self.reservation
-            .as_ref()
-            .expect("dynamic subtree slot reservation was already consumed")
-    }
-
-    fn take_reservation(&mut self) -> DynamicReservation {
-        self.reservation
-            .take()
-            .expect("dynamic subtree slot reservation was already consumed")
-    }
-
     /// Returns the typed exact scope handle before admission.
     #[must_use]
     pub fn scope_ref(&self) -> T::Ref {
-        <T as sealed::Sealed>::make_ref(ScopeRef {
-            cell: Arc::clone(
-                self.reservation()
-                    .slot
-                    .scope
-                    .as_ref()
-                    .expect("subtree reservation needs a scope cell"),
-            ),
-        })
+        self.core.scope_ref()
     }
 
     /// Defines a restartable subtree; dropping after first poll detaches.
-    pub fn define(mut self, definition: SubtreeDef<T>) -> Admission<T::Ref> {
-        let scope = self.scope_ref();
-        let reservation = self.take_reservation();
-        reservation
-            .slot
-            .define(ChildConstruction::Scope(Box::new(definition.erase())));
-        Admission::new(reservation, scope, false)
-    }
-
-    fn define_fused(mut self, definition: SubtreeDef<T>) -> Admission<T::Ref> {
-        let scope = self.scope_ref();
-        let reservation = self.take_reservation();
-        reservation
-            .slot
-            .define(ChildConstruction::Scope(Box::new(definition.erase())));
-        Admission::new(reservation, scope, true)
+    pub fn define(self, definition: SubtreeDef<T>) -> Admission<T::Ref> {
+        self.core.define(definition, AdmissionOwnership::Split)
     }
 
     /// Defines a one-shot subtree; dropping after first poll detaches.
-    pub fn define_once(mut self, definition: SubtreeOnceDef<T>) -> Admission<T::Ref> {
-        let scope = self.scope_ref();
-        let reservation = self.take_reservation();
-        reservation
-            .slot
-            .define(ChildConstruction::Scope(Box::new(definition.erase())));
-        Admission::new(reservation, scope, false)
-    }
-
-    fn define_once_fused(mut self, definition: SubtreeOnceDef<T>) -> Admission<T::Ref> {
-        let scope = self.scope_ref();
-        let reservation = self.take_reservation();
-        reservation
-            .slot
-            .define(ChildConstruction::Scope(Box::new(definition.erase())));
-        Admission::new(reservation, scope, true)
-    }
-}
-
-impl<T: Subtree> Drop for DynamicSubtreeSlot<T> {
-    fn drop(&mut self) {
-        if let Some(reservation) = &self.reservation {
-            crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
-        }
+    pub fn define_once(self, definition: SubtreeOnceDef<T>) -> Admission<T::Ref> {
+        self.core.define_once(definition, AdmissionOwnership::Split)
     }
 }
 
@@ -1412,33 +1013,7 @@ impl<T: Subtree> SubtreeDef<T> {
         }
     }
 
-    /// Overrides the restart policy.
-    #[must_use]
-    pub fn restart(mut self, restart: RestartPolicy) -> Self {
-        self.options.restart = Some(restart);
-        self
-    }
-
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(restart, shutdown, structural_readiness_deadline, retention,);
 
     /// Selects inheritance or reset for unset nested defaults.
     #[must_use]
@@ -1450,7 +1025,7 @@ impl<T: Subtree> SubtreeDef<T> {
     fn erase(self) -> ScopeConstruction {
         let factory = self.factory;
         ScopeConstruction {
-            source: ScopeSource::Restartable(Arc::new(move || {
+            source: DefinitionSource::Restartable(Arc::new(move || {
                 <T as sealed::Sealed>::into_core(factory())
             })),
             options: self.options,
@@ -1488,26 +1063,7 @@ impl<T: Subtree> SubtreeOnceDef<T> {
         }
     }
 
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(shutdown, structural_readiness_deadline, retention,);
 
     /// Selects inheritance or reset for unset nested defaults.
     #[must_use]
@@ -1518,78 +1074,39 @@ impl<T: Subtree> SubtreeOnceDef<T> {
 
     fn erase(self) -> ScopeConstruction {
         ScopeConstruction {
-            source: ScopeSource::OneShot(Box::new(<T as sealed::Sealed>::into_core(self.tree))),
+            source: DefinitionSource::OneShot(Box::new(<T as sealed::Sealed>::into_core(
+                self.tree,
+            ))),
             options: self.options,
             defaults: self.defaults,
         }
     }
 }
 
-pub(crate) struct ScopeConstruction {
-    pub(crate) source: ScopeSource,
-    pub(crate) options: CommonOptions,
-    pub(crate) defaults: DefaultsInheritance,
-}
-
-pub(crate) type ScopeFactory = Arc<dyn Fn() -> BuilderCore + Send + Sync + 'static>;
-
-impl ScopeConstruction {
-    pub(crate) fn one_shot(&self) -> bool {
-        matches!(self.source, ScopeSource::OneShot(_) | ScopeSource::Spent)
-    }
-}
-
-pub(crate) enum ScopeSource {
-    Restartable(ScopeFactory),
-    OneShot(Box<BuilderCore>),
-    Spent,
-}
-
 /// A typed pre-spawn subtree slot.
 pub struct SubtreeSlot<T: Subtree> {
-    slot: Arc<SlotCell>,
-    marker: PhantomData<fn() -> T>,
+    core: SubtreeSlotCore<StaticSlotEndpoint, T>,
 }
 
-impl<T: Subtree> fmt::Debug for SubtreeSlot<T> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SubtreeSlot")
-            .field("id", self.slot.member.id())
-            .finish_non_exhaustive()
-    }
-}
+impl_slot_debug!(SubtreeSlot<T: Subtree>, "SubtreeSlot");
 
 impl<T: Subtree> SubtreeSlot<T> {
     /// Returns the typed scope handle before definition or spawn.
     #[must_use]
     pub fn scope_ref(&self) -> T::Ref {
-        <T as sealed::Sealed>::make_ref(ScopeRef {
-            cell: Arc::clone(
-                self.slot
-                    .scope
-                    .as_ref()
-                    .expect("subtree slot must carry a scope cell"),
-            ),
-        })
+        self.core.scope_ref()
     }
 
     /// Defines a restartable subtree and consumes the slot.
     #[must_use]
     pub fn define(self, definition: SubtreeDef<T>) -> T::Ref {
-        let scope = self.scope_ref();
-        self.slot
-            .define(ChildConstruction::Scope(Box::new(definition.erase())));
-        scope
+        self.core.define(definition, AdmissionOwnership::Split)
     }
 
     /// Defines a one-shot subtree and consumes the slot.
     #[must_use]
     pub fn define_once(self, definition: SubtreeOnceDef<T>) -> T::Ref {
-        let scope = self.scope_ref();
-        self.slot
-            .define(ChildConstruction::Scope(Box::new(definition.erase())));
-        scope
+        self.core.define_once(definition, AdmissionOwnership::Split)
     }
 }
 
@@ -1742,10 +1259,7 @@ impl ScopeRef {
             if expires.is_due(crate::runtime::now()) {
                 return Err(WaitError::TimedOut);
             }
-            if matches!(
-                self.cell.member.record().stage,
-                crate::driver::MemberStage::Terminal(_)
-            ) {
+            if matches!(self.cell.member.record().stage, MemberStage::Terminal(_)) {
                 return Err(WaitError::ScopeTerminated {
                     state: snapshot.state.clone(),
                 });
@@ -1785,7 +1299,7 @@ impl ScopeRef {
 
     /// Requests shutdown without waiting.
     pub fn request_shutdown(&self) {
-        self.cell.request_shutdown();
+        let _ = self.cell.request_shutdown();
     }
 
     /// Waits for terminal membership state.
@@ -1917,17 +1431,17 @@ impl DynamicScopeRef {
     }
 
     /// Reserves an actor id synchronously and exposes its exact handle.
+    ///
+    /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
     pub fn reserve_actor<M: Send + 'static>(
         &self,
         id: impl Into<ChildId>,
     ) -> Result<DynamicActorSlot<M>, ReserveError> {
-        let id = checked_id(id)?;
-        crate::driver::reserve_dynamic(&self.0.cell, id, None).map(|reservation| {
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
             let mailbox = MailboxCell::new(reservation.slot.member.id().clone());
             reservation.slot.member.attach_mailbox(mailbox.clone());
             DynamicActorSlot {
-                reservation: Some(reservation),
-                mailbox,
+                core: ActorSlotCore::new(DynamicSlotEndpoint(Some(reservation)), mailbox),
             }
         })
     }
@@ -1939,7 +1453,9 @@ impl DynamicScopeRef {
         definition: ActorDef<A>,
     ) -> Admission<ActorRef<A::Msg>> {
         match self.reserve_actor(id) {
-            Ok(slot) => slot.define_fused(definition),
+            Ok(slot) => slot
+                .core
+                .define_raw(definition.into_raw(), AdmissionOwnership::Fused),
             Err(error) => Admission::error(error),
         }
     }
@@ -1951,7 +1467,9 @@ impl DynamicScopeRef {
         definition: ActorOnceDef<A>,
     ) -> Admission<ActorRef<A::Msg>> {
         match self.reserve_actor(id) {
-            Ok(slot) => slot.define_once_fused(definition),
+            Ok(slot) => slot
+                .core
+                .define_once_raw(definition.into_raw(), AdmissionOwnership::Fused),
             Err(error) => Admission::error(error),
         }
     }
@@ -1963,7 +1481,7 @@ impl DynamicScopeRef {
         definition: RawDef<R>,
     ) -> Admission<ActorRef<R::Msg>> {
         match self.reserve_actor(id) {
-            Ok(slot) => slot.define_raw_fused(definition),
+            Ok(slot) => slot.core.define_raw(definition, AdmissionOwnership::Fused),
             Err(error) => Admission::error(error),
         }
     }
@@ -1975,23 +1493,28 @@ impl DynamicScopeRef {
         definition: RawOnceDef<R>,
     ) -> Admission<ActorRef<R::Msg>> {
         match self.reserve_actor(id) {
-            Ok(slot) => slot.define_once_raw_fused(definition),
+            Ok(slot) => slot
+                .core
+                .define_once_raw(definition, AdmissionOwnership::Fused),
             Err(error) => Admission::error(error),
         }
     }
 
     /// Reserves a task id synchronously and exposes its exact handle.
+    ///
+    /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
     pub fn reserve_task(&self, id: impl Into<ChildId>) -> Result<DynamicTaskSlot, ReserveError> {
-        let id = checked_id(id)?;
-        crate::driver::reserve_dynamic(&self.0.cell, id, None).map(|reservation| DynamicTaskSlot {
-            reservation: Some(reservation),
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
+            DynamicTaskSlot {
+                core: TaskSlotCore::new(DynamicSlotEndpoint(Some(reservation))),
+            }
         })
     }
 
     /// Adds a restartable task, resolving at admission rather than startup.
     pub fn add_task(&self, id: impl Into<ChildId>, definition: TaskDef) -> Admission<TaskRef> {
         match self.reserve_task(id) {
-            Ok(slot) => slot.define_fused(definition),
+            Ok(slot) => slot.core.define(definition, AdmissionOwnership::Fused),
             Err(error) => Admission::error(error),
         }
     }
@@ -2003,23 +1526,22 @@ impl DynamicScopeRef {
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
         match self.reserve_task(id) {
-            Ok(slot) => slot.define_once_fused(definition),
+            Ok(slot) => slot.core.define_once(definition, AdmissionOwnership::Fused),
             Err(error) => Admission::error(error),
         }
     }
 
     /// Reserves a typed subtree id synchronously.
+    ///
+    /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
     pub fn reserve_subtree<T: Subtree>(
         &self,
         id: impl Into<ChildId>,
     ) -> Result<DynamicSubtreeSlot<T>, ReserveError> {
-        let id = checked_id(id)?;
-        crate::driver::reserve_dynamic(&self.0.cell, id, Some(<T as sealed::Sealed>::FLAVOR)).map(
-            |reservation| DynamicSubtreeSlot {
-                reservation: Some(reservation),
-                marker: PhantomData,
-            },
-        )
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), Some(<T as sealed::Sealed>::FLAVOR))
+            .map(|reservation| DynamicSubtreeSlot {
+                core: SubtreeSlotCore::new(DynamicSlotEndpoint(Some(reservation))),
+            })
     }
 
     /// Adds a restartable subtree, resolving at admission.
@@ -2029,7 +1551,7 @@ impl DynamicScopeRef {
         definition: SubtreeDef<T>,
     ) -> Admission<T::Ref> {
         match self.reserve_subtree::<T>(id) {
-            Ok(slot) => slot.define_fused(definition),
+            Ok(slot) => slot.core.define(definition, AdmissionOwnership::Fused),
             Err(error) => Admission::error(error),
         }
     }
@@ -2041,7 +1563,7 @@ impl DynamicScopeRef {
         definition: SubtreeOnceDef<T>,
     ) -> Admission<T::Ref> {
         match self.reserve_subtree::<T>(id) {
-            Ok(slot) => slot.define_once_fused(definition),
+            Ok(slot) => slot.core.define_once(definition, AdmissionOwnership::Fused),
             Err(error) => Admission::error(error),
         }
     }

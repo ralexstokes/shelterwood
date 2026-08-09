@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::common::{
-    DestructorBlocker, DestructorGate, ReleaseGate, policy::never, poll_once, poll_until,
+    DestructorBlocker, DestructorGate, POLL_TIMEOUT, ReleaseGate, policy::never, poll_once,
+    poll_until,
 };
 use shelterwood::{
     Backoff, CallErrorKind, ExitError, ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef,
@@ -151,7 +152,7 @@ async fn rebind_refreshes_all_overflow_waiter_incarnation_evidence() {
     fail_first.release();
     let mut replacement = None;
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             if let std::task::Poll::Ready(result) = poll_once(promoted.as_mut()) {
                 replacement = Some(result.expect("first waiter enters replacement capacity"));
                 true
@@ -225,7 +226,7 @@ async fn send_rides_the_frozen_destructor_and_rebind_window() {
     let accepting = parked.await.expect("send rides into replacement");
     assert!(accepting.supersedes(first));
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             deliveries
                 .lock()
                 .expect("deliveries mutex poisoned")
@@ -314,7 +315,7 @@ async fn timed_send_withdraws_while_replacement_is_in_backoff() {
     fail_first.release();
     let mut observed_rebind = None;
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             match actor.try_send(0) {
                 Err(error) if error.kind == SendErrorKind::NotRunning => {
                     observed_rebind = Some(error.incarnation_observed);
@@ -375,7 +376,7 @@ async fn dropping_a_parked_send_in_the_rebind_window_withdraws_it() {
     parked.await.expect("the retained send rides the window");
     actor.send(44).await.expect("replacement accepts");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             deliveries
                 .lock()
                 .expect("deliveries mutex poisoned")

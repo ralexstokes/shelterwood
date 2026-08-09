@@ -1232,14 +1232,36 @@ One classification, produced at one point, used by every consumer.
   already says nothing ran.
 - **Verdict precedence.** When one incarnation's end admits several
   readings, classification picks the highest of: `Panicked` >
-  `ReadinessTimedOut` > `Aborted` > `Failed` > `Completed`; `cancelled` is
+  `ReadinessTimedOut` > `Failed` > `Aborted` > `Completed`; `cancelled` is
   orthogonal and never competes. Concretely: a panic is never masked,
   wherever it lands (`run`, `on_stop` — superseding the run's outcome,
-  §4.1 — or a destructor, via the fallback report token); a
+  §4.1 — or a destructor, via the fallback report token); and a
   readiness-deadline expiry names the *cause* even when the teardown it
-  triggers ends in a grace-expiry abort (the mechanism); and `Aborted`
-  describes a future destroyed before yielding an outcome, so it cannot
-  genuinely conflict with `Failed`/`Completed`, which require one.
+  triggers ends in a grace-expiry abort (the mechanism).
+- **`Aborted` genuinely competes with a recorded outcome, and the rule is
+  asymmetric.** `Aborted` describes a future destroyed before yielding an
+  outcome, so it reads as if it could never conflict with
+  `Failed`/`Completed`, which require one. It conflicts anyway, by race:
+  the body can record its result and the destruction still land before
+  the join retires, and §10's ladder can arm a supervisor-forced abort
+  verdict against a membership that has already recorded one. Precedence
+  resolves that race in one direction only, and the asymmetry is
+  deliberate rather than an artifact of the ordering:
+  - A recorded `Failed(error)` **survives** a later abort. Destruction
+    proves only that teardown ended the task; it must not erase the
+    structured application error the task already produced, which is the
+    only evidence naming *why* the child was failing.
+  - A recorded `Completed` does **not** survive: cancellation overrides
+    it and the exit reads `Aborted { after_grace }` with
+    `cancelled: true`. A supervisor that destroyed a child before its
+    success was observable did not get a successful child. Concretely, a
+    one-shot task whose body returned `Ok(value)` inside that window
+    exits `Aborted` and `OneShotTaskRef::wait` yields `Err(exit)` — the
+    typed value is dropped rather than released past a stop the
+    supervisor had already committed to.
+
+  Only the recorded-vs-abort pair is asymmetric this way; the ordering
+  above is otherwise a total precedence over the whole variant set.
 - **Failure classification (feeds §9.2):** an exit is a *failure* iff it is
   not `Completed`. So `Failed`, `Panicked`, `ReadinessTimedOut`, and
   `Aborted` all restart under `OnFailure`; `Always` restarts even clean
@@ -1504,8 +1526,9 @@ Rules (normative):
   point for the id errors — `EmptyId` and `DuplicateId` on either flavor
   (a retained tombstone counts as a duplicate — retention semantics
   above); on dynamic scopes additionally `RemovalInProgress` (same id
-  mid-removal, §11) and `NotAdmitting` (stage rule below). From success the slot's
-  handles resolve through the cell like any other handle; the slot is
+  mid-removal, §11), `NoRuntime` (runtime boundary below), and
+  `NotAdmitting` (stage rule below). From success the slot's handles
+  resolve through the cell like any other handle; the slot is
   parameterized by exactly what a handle needs (`M` for the wire type,
   `T` for the subtree's ref dispatch) so refs exist before any actor type
   or factory is named.
@@ -1529,10 +1552,11 @@ Rules (normative):
   and cannot fail — spec-level validation already happened eagerly at
   spec construction (§9.3). On a dynamic scope, `define` *is* the
   admission call: a future resolving at admission to the receipt (B.8).
-  Its only error is `NotAdmitting`: the id errors were already spent at
+  Its operation errors are `NotAdmitting` and the first-poll
+  `NoRuntime` rejection below: the id errors were already spent at
   reserve, and definition validation was spent at spec construction
   (§9.3's eager rule), exactly as on the builder flavor — admission
-  validates nothing. Whether the builder and dynamic flavors
+  validates no definition data. Whether the builder and dynamic flavors
   are one generic slot type or two parallel families is implementation
   latitude; the operation inventory and this error split are not.
 - **Fused admission futures abort on drop; split ones detach.** Dropping
@@ -1577,6 +1601,23 @@ Rules (normative):
   dropped before ever being polled has submitted nothing, and the cell
   terminalizes exactly as if the slot had been dropped undefined
   (§3.2).
+- **Runtime availability is checked before dynamic mutation.** A dynamic
+  `reserve_*` validates the id syntax first, then requires an ambient
+  runtime, and only then reads the scope's admitting state or resident-id
+  table. The error precedence is therefore `EmptyId` before `NoRuntime`,
+  and `NoRuntime` before `NotAdmitting`, `RemovalInProgress`, or
+  `DuplicateId` (and before identity minting can yield
+  `IdentityExhausted`); a no-runtime rejection mints no cell and claims
+  no id.
+  The admission future rechecks runtime availability at its first poll,
+  before spawning or submitting the admission command. If a slot was
+  reserved inside a runtime but its `define` future is first-polled
+  outside one, both fused and split forms return `NoRuntime`, release the
+  reservation, and publish the cell as terminal `NeverStarted`; the id is
+  reusable before that poll returns `Ready`. This failed poll never
+  crosses the split form's in-flight/detach edge. A completed admission
+  future is fuse-like: any later poll remains pending rather than
+  repeating the outcome or panicking.
 - **Stage semantics: dynamic operations are admission-stage-exact.** A
   dynamic scope is *admitting* exactly while its membership is
   non-terminal and it has a live incarnation in `Starting` or `Running`
@@ -1799,7 +1840,11 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   exits `Completed`/`Failed` (with `cancelled: true`), and
   `Aborted { after_grace: false }` records only a hard abort actually
   reached — the future destroyed before yielding — distinguishable from
-  grace-expiry abort (`after_grace: true`). Grace is a supervisor-side
+  grace-expiry abort (`after_grace: true`). The one boundary case, where
+  the beat expires and the hard abort lands *after* the body recorded its
+  outcome but before the join retires, is settled by §7's precedence and
+  not here: a recorded `Failed` survives that abort, a recorded
+  `Completed` does not. Grace is a supervisor-side
   upper bound; child-local time after
   cancellation wakeup is scheduler-dependent — this is documented
   contract. Cancellation-before-escalation ordering is observable to the
@@ -2926,7 +2971,10 @@ outcome during the beat classifies by that outcome, while a future
 destroyed by the ensuing hard abort records `Aborted { after_grace }`),
 `mark_ready()` (one-shot by construction; no-op only where declared
 readiness makes it meaningless, and that is a documented no-op, not a silent
-state change).
+state change — the same rule covers a stopping incarnation: once either
+cooperative shutdown or escalation has begun, readiness can no longer be
+published and the call is likewise a documented no-op, matching B.1's
+during-drain rule for the actor contexts).
 
 ### B.3 Send/call errors
 
@@ -3283,10 +3331,14 @@ it fires no `Removed` event and leaves no tombstone, §3.2's
 minting/admission split) — §11's idempotency, made concrete. `remove`
 futures are observation only: removal latches synchronously at the
 call (§11's remove rule), so dropping the future — polled or not —
-detaches, and a latched removal still completes. Dynamic `add_*`
+detaches, and a latched removal still completes. The public
+`ReserveError` enum is non-exhaustive and includes `NoRuntime`: it names
+the absent ambient runtime at dynamic reservation or first poll, with
+the cleanup and precedence pinned in §8. Dynamic `add_*`
 fails with exactly the union of its two halves (§8): `EmptyId`,
-`DuplicateId` (tombstones included), and `RemovalInProgress` (same id
-mid-removal — await removal and retry) from reserve — plus §3.1's
+`NoRuntime`, `DuplicateId` (tombstones included), and
+`RemovalInProgress` (same id mid-removal — await removal and retry) from
+reserve, with `NoRuntime` also possible at first poll — plus §3.1's
 enumerated identity-exhaustion rejection, unreachable in practice but
 named so fail-closed has a shape; `NotAdmitting`
 from either half. `NotAdmitting` is one outcome with an enumerated,
@@ -3301,10 +3353,12 @@ reached admission (removed by id, §8's orphaned-slot rule; or annulled
 by the fused drop latch). That last cause is cell-level, enumerated
 distinctly so a caller can tell "the scope closed" from "my
 reservation is gone".
-Defines add no errors of their own: definition
-validation is spent eagerly at spec construction (§9.3), on both
-flavors. Declaration builders share the reserve id errors (`EmptyId`,
-`DuplicateId`); their defines cannot fail (§8).
+Defines add no definition-validation errors: validation is spent eagerly
+at spec construction (§9.3), on both flavors. A dynamic define still
+crosses §8's admission boundary, so it can return `NoRuntime` at first
+poll or `NotAdmitting`; declaration builders share the reserve id errors
+(`EmptyId`, `DuplicateId`), require no runtime for reservation or define,
+and their defines cannot fail (§8).
 
 `BuildError` (spawn-time, §11) is enumerated and non-exhaustive:
 `NoRuntime` (no ambient async runtime reachable through D.3's `runtime`

@@ -6,7 +6,6 @@ use std::{
     fmt,
     future::Future,
     hash::{BuildHasher, Hash},
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context as TaskPollContext, Poll},
@@ -16,40 +15,20 @@ use std::{
 use crate::{
     ActorRef, CancellationToken, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown,
     PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef, Shutdown,
-    driver::{ActorWork, Signal, SignalWatcher},
-    mailbox::{MailboxCell, MailboxControl, MailboxReceiver},
+    cells::{MailboxControl, MemberCell},
+    definition::DefinitionSource,
+    mailbox::{MailboxCell, MailboxReceiver},
     policy::CommonOptions,
-    runtime::Latch,
+    runtime::{
+        self, ActorWork, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher, catch_panic,
+        discard_panic, keep_first_panic, resume_preferred_panic,
+        resume_preferred_panic_outside_unwind,
+    },
 };
 
-type PanicPayload = Box<dyn Any + Send + 'static>;
 type DeferredMessage<M> = Box<dyn FnOnce() -> M + Send + 'static>;
 type OffloadFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type SharedWork = Arc<SharedOffloadState>;
-
-fn discard_panic(payload: Option<PanicPayload>) {
-    if let Some(payload) = payload {
-        let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
-    }
-}
-
-fn keep_first_panic(first: &mut Option<PanicPayload>, candidate: Option<PanicPayload>) {
-    if first.is_none() {
-        *first = candidate;
-    } else {
-        discard_panic(candidate);
-    }
-}
-
-fn resume_preferred_panic(primary: Option<PanicPayload>, cleanup: Option<PanicPayload>) {
-    if let Some(payload) = primary {
-        discard_panic(cleanup);
-        resume_unwind(payload);
-    }
-    if let Some(payload) = cleanup {
-        resume_unwind(payload);
-    }
-}
 
 /// Marker returned to an offload continuation when its one deadline expires.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -201,17 +180,17 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
 
     fn poll(self: Pin<&mut Self>, context: &mut TaskPollContext<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let polled = catch_unwind(AssertUnwindSafe(|| {
+        let polled = catch_panic(|| {
             this.future
                 .as_mut()
                 .expect("a completed panic boundary was polled again")
                 .as_mut()
                 .poll(context)
-        }));
+        });
         match polled {
             Ok(Poll::Ready(value)) => {
                 let future = this.future.take();
-                match catch_unwind(AssertUnwindSafe(|| drop(future))) {
+                match catch_panic(|| drop(future)) {
                     Ok(()) => Poll::Ready(Ok(value)),
                     Err(payload) => Poll::Ready(Err(payload)),
                 }
@@ -219,7 +198,7 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
             Ok(Poll::Pending) => Poll::Pending,
             Err(payload) => {
                 let future = this.future.take();
-                let _ = catch_unwind(AssertUnwindSafe(|| drop(future)));
+                discard_panic(catch_panic(|| drop(future)).err());
                 Poll::Ready(Err(payload))
             }
         }
@@ -228,20 +207,15 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
 
 impl<F> Drop for CatchUnwindFuture<F> {
     fn drop(&mut self) {
-        let already_panicking = std::thread::panicking();
         let future = self.future.take();
-        let panic = catch_unwind(AssertUnwindSafe(|| drop(future))).err();
-        if !already_panicking && let Some(payload) = panic {
-            resume_unwind(payload);
-        }
+        let mut panics = PanicAccumulator::default();
+        panics.run(|| drop(future));
     }
 }
 
-enum QueuedEvent<M> {
-    Deliver {
-        cancellation: Latch,
-        make_message: DeferredMessage<M>,
-    },
+struct QueuedEvent<M> {
+    cancellation: Latch,
+    make_message: DeferredMessage<M>,
 }
 
 #[derive(Default)]
@@ -371,7 +345,7 @@ impl<K: Send + 'static> ErasedTimerKey for StoredTimerKey<K> {
 }
 
 enum TimerMessage<M> {
-    Once(Option<M>),
+    Once(M),
     Interval(Box<dyn Fn() -> M + Send + 'static>),
 }
 
@@ -621,7 +595,7 @@ impl SharedOffloadState {
 
     fn dispose(&self, future: Option<OffloadFuture>) {
         if let Some(future) = future {
-            match catch_unwind(AssertUnwindSafe(|| drop(future))) {
+            match catch_panic(|| drop(future)) {
                 Ok(()) => {}
                 Err(payload) => self.record(payload),
             }
@@ -652,7 +626,7 @@ impl Future for SharedOffloadFuture {
         let Some(mut future) = self.0.take_for_poll() else {
             return Poll::Ready(());
         };
-        let polled = catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(context)));
+        let polled = catch_panic(|| future.as_mut().poll(context));
         match polled {
             Ok(Poll::Pending) => {
                 let dispose = self.0.finish_poll(future, true);
@@ -704,6 +678,9 @@ impl OffloadResource {
 struct RawResources<M> {
     accepting: bool,
     continuations: VecDeque<M>,
+    // Set after returning a continuation and cleared after an external
+    // mailbox/offload/timer item. `next_ready` uses it to prohibit two local
+    // continuations from leading while an external source remains eligible.
     continuation_needs_external: bool,
     timers: TimerStore<M>,
     next_timer_order: u64,
@@ -753,9 +730,10 @@ impl<M> RawResources<M> {
     }
 
     fn resume_pending_panic(&self) {
-        if let Some(payload) = self.panic.take() {
-            resume_unwind(payload);
-        }
+        // Reached from the actor's own receive path, never from cleanup. The
+        // take is destructive, so containment here would drop the retained
+        // offload diagnostic and let the loop keep running.
+        resume_preferred_panic_outside_unwind(self.panic.take(), None);
     }
 
     async fn join_offloads(&mut self) {
@@ -771,17 +749,16 @@ impl<M> RawResources<M> {
 
 impl<M> Drop for RawResources<M> {
     fn drop(&mut self) {
-        let freeze_panic = catch_unwind(AssertUnwindSafe(|| {
+        let freeze_panic = catch_panic(|| {
             let _ = self.freeze();
-        }))
+        })
         .err();
-        let mut cleanup_panic = self.panic.take();
-        keep_first_panic(&mut cleanup_panic, freeze_panic);
-        if std::thread::panicking() {
-            discard_panic(cleanup_panic);
-        } else if let Some(payload) = cleanup_panic {
-            resume_unwind(payload);
-        }
+        let mut panics = PanicAccumulator::default();
+        // `freeze` can transfer a destructor panic into the shared slot. Take
+        // that retained application diagnostic after cleanup and preserve it
+        // ahead of a direct framework-cleanup panic.
+        panics.record(self.panic.take());
+        panics.record(freeze_panic);
     }
 }
 
@@ -929,10 +906,12 @@ impl<M: Send + 'static> RawContext<M> {
     ///
     /// External intake freezes at this call — the drained set is exactly the
     /// already-accepted prefix (§5.1's close point) — queued continuations
-    /// and timers are discarded, and `recv` begins yielding the frozen
-    /// prefix followed by `None`. Idempotent. This is the primitive the
-    /// blanket handler loop's `Context::stop` is built on (§1 principle 5);
-    /// the child's configured §10 ladder bounds the stop.
+    /// and timers are discarded, and [`recv`](Self::recv) returns `None`.
+    /// A raw loop honoring [`MailboxShutdown::Drain`] must then consume the
+    /// frozen prefix with [`try_recv`](Self::try_recv); `recv` never drains a
+    /// frozen mailbox. Idempotent. This is the primitive the blanket handler
+    /// loop's `Context::stop` is built on (§1 principle 5); the child's
+    /// configured §10 ladder bounds the stop.
     pub fn stop(&mut self) {
         self.mailbox.freeze(self.incarnation);
         self.freeze_and_report();
@@ -965,7 +944,7 @@ impl<M: Send + 'static> RawContext<M> {
         if self.is_stopping() || !self.resources.accepting {
             return Err(Rejected::new((key, message)));
         }
-        self.replace_timer(key, TimerMessage::Once(Some(message)), after, None);
+        self.replace_timer(key, TimerMessage::Once(message), after, None);
         Ok(())
     }
 
@@ -1048,7 +1027,7 @@ impl<M: Send + 'static> RawContext<M> {
     {
         let cancellation = Latch::default();
         let token = self.shutdown.child(cancellation.clone());
-        let work = crate::driver::spawn_blocking_work(move || operation(token));
+        let work = runtime::spawn_blocking_work(move || operation(token));
         Blocking {
             future: Box::pin(async move { work.join().await }),
             cancellation,
@@ -1068,7 +1047,7 @@ impl<M: Send + 'static> RawContext<M> {
                 self.freeze_and_report();
                 return None;
             }
-            if let Some(message) = self.next_ready(false) {
+            if let Some(message) = self.next_ready() {
                 return Some(message);
             }
             self.wait_for_event().await;
@@ -1081,7 +1060,7 @@ impl<M: Send + 'static> RawContext<M> {
             self.freeze_and_report();
             self.receiver.try_recv()
         } else {
-            self.next_ready(false)
+            self.next_ready()
         }
     }
 
@@ -1095,7 +1074,7 @@ impl<M: Send + 'static> RawContext<M> {
         K: Hash + Eq + Send + 'static,
     {
         self.resources.next_timer_order = self.resources.next_timer_order.saturating_add(1);
-        let now = crate::driver::now();
+        let now = runtime::now();
         let deadline = crate::deadline::Deadline::after(now, after).instant();
         self.resources.timers.replace(
             key,
@@ -1139,7 +1118,7 @@ impl<M: Send + 'static> RawContext<M> {
         let panic = Arc::clone(&self.resources.panic);
         if deadline.is_zero() {
             drop(work);
-            events.push(QueuedEvent::Deliver {
+            events.push(QueuedEvent {
                 cancellation: cancellation.clone(),
                 make_message: Box::new(move || continuation(Err(DeadlineElapsed))),
             });
@@ -1154,31 +1133,30 @@ impl<M: Send + 'static> RawContext<M> {
         }
 
         let token = self.shutdown.child(cancellation.clone());
-        let started_at = crate::driver::now();
+        let started_at = runtime::now();
         let expires_at = crate::deadline::Deadline::after(started_at, deadline).instant();
         let event_cancellation = cancellation.clone();
         let operation = async move {
             let completion = async move {
                 let work = CatchUnwindFuture::new(work);
                 if let Some(expires_at) = expires_at {
-                    match crate::driver::select(work, crate::driver::sleep_until(expires_at)).await
-                    {
-                        crate::driver::Selected::First(result) => result.map(Ok),
-                        crate::driver::Selected::Second(()) => Ok(Err(DeadlineElapsed)),
+                    match runtime::select_two(work, runtime::sleep_until(expires_at)).await {
+                        runtime::Either::Left(result) => result.map(Ok),
+                        runtime::Either::Right(()) => Ok(Err(DeadlineElapsed)),
                     }
                 } else {
                     work.await.map(Ok)
                 }
             };
-            match crate::driver::select(token.cancelled(), completion).await {
-                crate::driver::Selected::First(()) => {}
-                crate::driver::Selected::Second(Ok(result)) => {
-                    events.push(QueuedEvent::Deliver {
+            match runtime::select_two(token.cancelled(), completion).await {
+                runtime::Either::Left(()) => {}
+                runtime::Either::Right(Ok(result)) => {
+                    events.push(QueuedEvent {
                         cancellation: event_cancellation,
                         make_message: Box::new(move || continuation(result)),
                     });
                 }
-                crate::driver::Selected::Second(Err(payload)) => {
+                runtime::Either::Right(Err(payload)) => {
                     panic.record(payload);
                     events.signal.pulse();
                 }
@@ -1190,7 +1168,7 @@ impl<M: Send + 'static> RawContext<M> {
             self.resources.events.signal.clone(),
             finished.clone(),
         );
-        let task = crate::driver::spawn_actor_work(SharedOffloadFuture(Arc::clone(&state)));
+        let task = runtime::spawn_actor_work(SharedOffloadFuture(Arc::clone(&state)));
         self.resources.offloads.push(OffloadResource {
             cancellation,
             finished,
@@ -1200,7 +1178,24 @@ impl<M: Send + 'static> RawContext<M> {
         Ok(guard)
     }
 
-    fn next_ready(&mut self, allow_frozen_mailbox: bool) -> Option<M> {
+    /// Selects one live-incarnation input without awaiting.
+    ///
+    /// A due timer snapshots continuations, accepted live-mailbox messages,
+    /// queued offload completions, and timer armings before any timer message
+    /// is emitted. Stage priority is: at most one fairness continuation,
+    /// mailbox prefix, offload prefix, remaining snapshotted continuations,
+    /// then timer armings. Each external delivery permits one continuation to
+    /// lead the next call, so continuations can interleave with the mailbox and
+    /// offload stages without repeatedly cutting ahead of them. Once those
+    /// external prefixes are exhausted, the captured continuation remainder
+    /// drains before timers; arrivals after any watermark cannot jump the due
+    /// timers. This prevents both an always-readable mailbox and a self-feeding
+    /// continuation queue from starving the other.
+    ///
+    /// Frozen mailbox input is deliberately absent. Once stopping begins,
+    /// [`try_recv`](Self::try_recv) bypasses this selector and drains the
+    /// accepted prefix directly according to the caller's shutdown policy.
+    fn next_ready(&mut self) -> Option<M> {
         loop {
             self.resources.resume_pending_panic();
             self.begin_fired_batch();
@@ -1216,11 +1211,7 @@ impl<M: Send + 'static> RawContext<M> {
                 }
 
                 if !batch.mailbox_complete {
-                    let message = if allow_frozen_mailbox {
-                        self.receiver.try_recv()
-                    } else {
-                        self.receiver.try_recv_live_through(batch.mailbox_through)
-                    };
+                    let message = self.receiver.try_recv_live_through(batch.mailbox_through);
                     if let Some(message) = message {
                         self.resources.continuation_needs_external = false;
                         self.resources.fired_batch = Some(batch);
@@ -1272,11 +1263,7 @@ impl<M: Send + 'static> RawContext<M> {
                 return Some(message);
             }
 
-            let mailbox = if allow_frozen_mailbox {
-                self.receiver.try_recv()
-            } else {
-                self.receiver.try_recv_live()
-            };
+            let mailbox = self.receiver.try_recv_live();
             if let Some(message) = mailbox {
                 self.resources.continuation_needs_external = false;
                 return Some(message);
@@ -1298,19 +1285,14 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     fn materialize_event(event: QueuedEvent<M>) -> Option<M> {
-        match event {
-            QueuedEvent::Deliver {
-                cancellation,
-                make_message,
-            } => (!cancellation.is_fired()).then(make_message),
-        }
+        (!event.cancellation.is_fired()).then(event.make_message)
     }
 
     fn begin_fired_batch(&mut self) {
         if self.resources.fired_batch.is_some() || self.resources.timers.is_empty() {
             return;
         }
-        let now = crate::driver::now();
+        let now = runtime::now();
         let armings = self.resources.timers.take_due(now);
         if armings.is_empty() {
             return;
@@ -1328,7 +1310,7 @@ impl<M: Send + 'static> RawContext<M> {
     fn deliver_timer(&mut self, arming: u64) -> Option<M> {
         let entry = self.resources.timers.entry_mut(arming)?;
         if let Some(period) = entry.period {
-            let deadline = crate::deadline::Deadline::after(crate::driver::now(), period).instant();
+            let deadline = crate::deadline::Deadline::after(runtime::now(), period).instant();
             entry.deadline = deadline;
             let TimerMessage::Interval(make_message) = &entry.message else {
                 unreachable!("an interval timer must own a message factory")
@@ -1346,7 +1328,7 @@ impl<M: Send + 'static> RawContext<M> {
         let TimerMessage::Once(message) = entry.message else {
             unreachable!("a non-interval timer must own a one-shot message")
         };
-        message
+        Some(message)
     }
 
     fn next_timer_deadline(&self) -> Option<Instant> {
@@ -1355,23 +1337,23 @@ impl<M: Send + 'static> RawContext<M> {
 
     async fn wait_for_event(&mut self) {
         let sleep = self.next_timer_deadline().map_or_else(
-            || Box::pin(std::future::pending()) as crate::driver::DriverSleep,
-            crate::driver::sleep_until,
+            || Box::pin(std::future::pending()) as runtime::BoxedSleep,
+            runtime::sleep_until,
         );
         let shutdown = self.shutdown.clone();
         let local_stop = self.local_stop.clone();
         let mailbox = &mut self.receiver;
         let event_watcher = &mut self.resources.event_watcher;
         let delivery = async move {
-            let _ = crate::driver::select(
+            let _ = runtime::select_two(
                 mailbox.changed(),
-                crate::driver::select(event_watcher.changed(), sleep),
+                runtime::select_two(event_watcher.changed(), sleep),
             )
             .await;
         };
-        let _ = crate::driver::select(
+        let _ = runtime::select_two(
             shutdown.cancelled(),
-            crate::driver::select(local_stop.fired(), delivery),
+            runtime::select_two(local_stop.fired(), delivery),
         )
         .await;
     }
@@ -1427,61 +1409,20 @@ impl<R: RawActor> RawDef<R> {
         }
     }
 
-    /// Overrides the restart policy.
-    #[must_use]
-    pub fn restart(mut self, restart: RestartPolicy) -> Self {
-        self.options.restart = Some(restart);
-        self
-    }
-
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor mailbox kind and capacity.
-    #[must_use]
-    pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
-        self.options.mailbox = Some(mailbox);
-        self
-    }
-
-    /// Overrides frozen-prefix drain versus discard behavior.
-    #[must_use]
-    pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
-        self.options.mailbox_shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor's declared readiness mode.
-    pub fn readiness(mut self, readiness: Readiness) -> Result<Self, PolicyError> {
-        if readiness == Readiness::AfterInit {
-            return Err(PolicyError::UnsupportedReadiness);
-        }
-        self.options.readiness = Some(readiness);
-        Ok(self)
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(
+        restart,
+        shutdown,
+        mailbox,
+        mailbox_shutdown,
+        raw_readiness,
+        structural_readiness_deadline,
+        retention,
+    );
 
     pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
         let factory = self.factory;
         RawConstruction {
-            source: RawSource::Restartable(Arc::new(move || {
+            source: DefinitionSource::Restartable(Arc::new(move || {
                 let actor = factory();
                 Box::new(RawInstance {
                     actor,
@@ -1518,56 +1459,21 @@ impl<R: RawActor> RawOnceDef<R> {
         }
     }
 
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor mailbox kind and capacity.
-    #[must_use]
-    pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
-        self.options.mailbox = Some(mailbox);
-        self
-    }
-
-    /// Overrides frozen-prefix drain versus discard behavior.
-    #[must_use]
-    pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
-        self.options.mailbox_shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor's declared readiness mode.
-    pub fn readiness(mut self, readiness: Readiness) -> Result<Self, PolicyError> {
-        if readiness == Readiness::AfterInit {
-            return Err(PolicyError::UnsupportedReadiness);
-        }
-        self.options.readiness = Some(readiness);
-        Ok(self)
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(
+        shutdown,
+        mailbox,
+        mailbox_shutdown,
+        raw_readiness,
+        structural_readiness_deadline,
+        retention,
+    );
 
     pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
         RawConstruction {
-            source: RawSource::OneShot(Some(Box::new(RawInstance {
+            source: DefinitionSource::OneShot(Box::new(RawInstance {
                 actor: self.actor,
                 mailbox,
-            }))),
+            })),
             options: self.options,
         }
     }
@@ -1637,15 +1543,10 @@ impl<R: RawActor> Drop for RawIncarnationOwner<R> {
         // process. The resource panic is primary: it may be an owned offload
         // panic that completed before cancellation was requested.
         let primary_panic = self.take_primary_panic();
-        let mut cleanup_panic = catch_unwind(AssertUnwindSafe(|| self.drop_raw())).err();
-        let actor_panic = catch_unwind(AssertUnwindSafe(|| self.drop_actor())).err();
-        keep_first_panic(&mut cleanup_panic, actor_panic);
-        if std::thread::panicking() {
-            discard_panic(primary_panic);
-            discard_panic(cleanup_panic);
-        } else {
-            resume_preferred_panic(primary_panic, cleanup_panic);
-        }
+        let mut cleanup = PanicAccumulator::default();
+        cleanup.run(|| self.drop_raw());
+        cleanup.run(|| self.drop_actor());
+        resume_preferred_panic(primary_panic, cleanup.take());
     }
 }
 
@@ -1675,10 +1576,10 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
                     None
                 }
             };
-            let freeze_panic = catch_unwind(AssertUnwindSafe(|| {
+            let freeze_panic = catch_panic(|| {
                 mailbox.freeze(incarnation);
                 owner.raw().freeze_resources();
-            }))
+            })
             .err();
             let mut cleanup_panic = owner.raw().take_resource_panic();
             keep_first_panic(&mut cleanup_panic, freeze_panic);
@@ -1687,40 +1588,42 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
             keep_first_panic(&mut cleanup_panic, joined.err());
             let pending = owner.raw().take_resource_panic();
             keep_first_panic(&mut cleanup_panic, pending);
-            let raw_drop = catch_unwind(AssertUnwindSafe(|| owner.drop_raw())).err();
+            let raw_drop = catch_panic(|| owner.drop_raw()).err();
             keep_first_panic(&mut cleanup_panic, raw_drop);
 
-            let actor_drop = catch_unwind(AssertUnwindSafe(|| owner.drop_actor())).err();
+            let actor_drop = catch_panic(|| owner.drop_actor()).err();
             keep_first_panic(&mut cleanup_panic, actor_drop);
             // Once actor execution has panicked, teardown is secondary: never
-            // replace the actor's original diagnostic.
-            resume_preferred_panic(owner.take_primary_panic(), cleanup_panic);
+            // replace the actor's original diagnostic. This is the incarnation
+            // body's normal return path, so the resume must be unconditional:
+            // containing the primary payload here would strand `result` at
+            // `None` and report the actor's panic as the framework expect
+            // below.
+            resume_preferred_panic_outside_unwind(owner.take_primary_panic(), cleanup_panic);
             result.expect("an incarnation without a primary panic returns a result")
         })
     }
 }
 
 pub(crate) struct RawConstruction {
-    pub(crate) source: RawSource,
+    pub(crate) source: DefinitionSource<RawFactory, Box<dyn ErasedRawInstance>>,
     pub(crate) options: CommonOptions,
 }
 
 impl RawConstruction {
     pub(crate) fn one_shot(&self) -> bool {
-        matches!(self.source, RawSource::OneShot(_) | RawSource::Spent)
+        self.source.is_one_shot()
     }
 
     pub(crate) fn take_spawn(&mut self) -> RawSpawn {
-        match &mut self.source {
-            RawSource::Restartable(factory) => RawSpawn::Restartable(Arc::clone(factory)),
-            RawSource::OneShot(instance) => {
-                let instance = instance
-                    .take()
-                    .expect("one-shot raw actor construction invoked more than once");
-                self.source = RawSource::Spent;
-                RawSpawn::OneShot(instance)
-            }
-            RawSource::Spent => panic!("one-shot raw actor construction invoked more than once"),
+        if let Some(factory) = self.source.restartable() {
+            RawSpawn::Restartable(Arc::clone(factory))
+        } else {
+            RawSpawn::OneShot(
+                self.source
+                    .take_one_shot()
+                    .expect("one-shot raw actor construction invoked more than once"),
+            )
         }
     }
 }
@@ -1739,16 +1642,10 @@ impl RawSpawn {
     }
 }
 
-pub(crate) enum RawSource {
-    Restartable(RawFactory),
-    OneShot(Option<Box<dyn ErasedRawInstance>>),
-    Spent,
-}
-
 pub(crate) struct RawRunContext {
     pub(crate) id: ChildId,
     pub(crate) incarnation: Incarnation,
-    pub(crate) member: Arc<crate::driver::MemberCell>,
+    pub(crate) member: Arc<MemberCell>,
     pub(crate) scope: ScopeRef,
     pub(crate) shutdown: Latch,
     pub(crate) abort: Latch,
@@ -1773,22 +1670,22 @@ mod tests {
     };
 
     use super::{
-        EventQueue, OffloadResource, PanicPayload, PanicSlot, QueuedEvent, RawResources,
-        SharedOffloadFuture, SharedOffloadState, resume_preferred_panic,
+        EventQueue, OffloadResource, PanicSlot, QueuedEvent, RawResources, SharedOffloadFuture,
+        SharedOffloadState,
     };
-    use crate::{driver::Signal, runtime::Latch};
+    use crate::runtime::{
+        Latch, PanicPayload, Signal, resume_preferred_panic, resume_preferred_panic_outside_unwind,
+    };
 
     fn marker(value: usize) -> QueuedEvent<usize> {
-        QueuedEvent::Deliver {
+        QueuedEvent {
             cancellation: Latch::default(),
             make_message: Box::new(move || value),
         }
     }
 
     fn value(event: QueuedEvent<usize>) -> usize {
-        match event {
-            QueuedEvent::Deliver { make_message, .. } => make_message(),
-        }
+        (event.make_message)()
     }
 
     fn panic_message(payload: &PanicPayload) -> Option<&str> {
@@ -1808,6 +1705,23 @@ mod tests {
         }))
         .expect_err("the primary panic is resumed");
         assert_eq!(panic_message(&payload), Some("primary actor panic"));
+    }
+
+    #[test]
+    fn the_incarnation_return_path_resumes_a_primary_panic_it_solely_owns() {
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            resume_preferred_panic_outside_unwind(Some(Box::new("primary actor panic")), None);
+        }))
+        .expect_err("a sole-owned primary panic is never contained");
+        assert_eq!(panic_message(&payload), Some("primary actor panic"));
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            resume_preferred_panic_outside_unwind(None, Some(Box::new("cleanup panic")));
+        }))
+        .expect_err("cleanup stands in when there is no primary panic");
+        assert_eq!(panic_message(&payload), Some("cleanup panic"));
+
+        resume_preferred_panic_outside_unwind(None, None);
     }
 
     struct BlockingPollDrop {
@@ -2086,7 +2000,7 @@ mod timer_store_tests {
     }
 
     fn once(entry: super::TimerEntry<&'static str>) -> &'static str {
-        let TimerMessage::Once(Some(message)) = entry.message else {
+        let TimerMessage::Once(message) = entry.message else {
             panic!("expected a live one-shot timer")
         };
         message
@@ -2100,21 +2014,21 @@ mod timer_store_tests {
             7_u8,
             Some(start + Duration::from_secs(3)),
             1,
-            TimerMessage::Once(Some("old-u8")),
+            TimerMessage::Once("old-u8"),
             None,
         );
         timers.replace(
             7_u16,
             Some(start + Duration::from_secs(1)),
             2,
-            TimerMessage::Once(Some("u16")),
+            TimerMessage::Once("u16"),
             None,
         );
         timers.replace(
             7_u8,
             Some(start + Duration::from_secs(2)),
             3,
-            TimerMessage::Once(Some("new-u8")),
+            TimerMessage::Once("new-u8"),
             None,
         );
 
@@ -2138,25 +2052,13 @@ mod timer_store_tests {
     #[test]
     fn hash_collision_uses_exact_erased_key_equality() {
         let mut timers = TimerStore::default();
-        timers.replace(
-            CollidingKey(1),
-            None,
-            1,
-            TimerMessage::Once(Some("first")),
-            None,
-        );
-        timers.replace(
-            CollidingKey(2),
-            None,
-            2,
-            TimerMessage::Once(Some("second")),
-            None,
-        );
+        timers.replace(CollidingKey(1), None, 1, TimerMessage::Once("first"), None);
+        timers.replace(CollidingKey(2), None, 2, TimerMessage::Once("second"), None);
         timers.replace(
             CollidingKey(1),
             None,
             3,
-            TimerMessage::Once(Some("replacement")),
+            TimerMessage::Once("replacement"),
             None,
         );
 
@@ -2201,7 +2103,7 @@ mod timer_store_tests {
                 key,
                 Some(start + Duration::from_secs((TIMERS - index) as u64)),
                 index as u64,
-                TimerMessage::Once(Some(())),
+                TimerMessage::Once(()),
                 None,
             );
         }

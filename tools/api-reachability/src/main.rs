@@ -9,6 +9,7 @@ use std::{
 use serde_json::Value;
 
 const FORBIDDEN_ROOTS: &[&str] = &["tokio", "tokio_util"];
+const SUPPORTED_FORMAT_VERSION: u64 = 61;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args_os()
@@ -31,6 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn find_leaks(document: &Value) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    validate_format_version(document)?;
     let index = object_field(document, "index")?;
     let paths = object_field(document, "paths")?;
 
@@ -81,6 +83,22 @@ fn find_leaks(document: &Value) -> Result<BTreeSet<String>, Box<dyn Error>> {
     }
 
     Ok(leaks)
+}
+
+fn validate_format_version(document: &Value) -> Result<(), Box<dyn Error>> {
+    let version = document
+        .get("format_version")
+        .and_then(Value::as_u64)
+        .ok_or("rustdoc JSON has no integer field `format_version`")?;
+
+    if version == SUPPORTED_FORMAT_VERSION {
+        return Ok(());
+    }
+
+    Err(format!(
+        "unsupported rustdoc JSON format version {version}; expected {SUPPORTED_FORMAT_VERSION}"
+    )
+    .into())
 }
 
 fn is_blanket_impl(item: &Value) -> bool {
@@ -176,6 +194,7 @@ mod tests {
     #[test]
     fn follows_public_type_ids_without_treating_every_number_as_an_id() {
         let document = json!({
+            "format_version": 61,
             "index": {
                 "0": {
                     "id": 0,
@@ -217,6 +236,7 @@ mod tests {
     #[test]
     fn ignores_materialized_blanket_impls_but_follows_explicit_impls() {
         let document = json!({
+            "format_version": 61,
             "index": {
                 "0": {
                     "id": 0,
@@ -267,6 +287,35 @@ mod tests {
                 "shelterwood::Explicit -> tokio_util::future::FutureExt".to_owned(),
                 "shelterwood::impl-explicit -> tokio_util::future::FutureExt".to_owned(),
             ])
+        );
+    }
+
+    #[test]
+    fn accepts_supported_format_version() {
+        let document = json!({
+            "format_version": 61,
+            "index": {},
+            "paths": {}
+        });
+
+        assert_eq!(
+            find_leaks(&document).expect("format version 61 must remain supported"),
+            BTreeSet::new()
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_format_version() {
+        let document = json!({
+            "format_version": 60,
+            "index": {},
+            "paths": {}
+        });
+
+        let error = find_leaks(&document).expect_err("older schemas must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "unsupported rustdoc JSON format version 60; expected 61"
         );
     }
 }

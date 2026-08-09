@@ -1,13 +1,15 @@
 use std::{cell::Cell, error::Error, hash::Hash, time::Duration};
 
 use shelterwood::{
-    Actor, ActorDef, ActorOnceDef, ActorRef, ActorSlot, Admission, Blocking, CallError, CallFuture,
-    CancellationToken, Context, DeadlineElapsed, DynamicActorSlot, DynamicScopeRef,
-    DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError, ExitResult, Guard, Handler,
-    Incarnation, LifecycleEvents, LifecycleTryRecvError, Membership, OneShotTaskRef, RawActor,
-    RawContext, RawDef, RawOnceDef, Removal, Reply, ReplyReceive, ReplyReceiver, ScopeRef,
-    SendError, SendFuture, SendTimeout, SnapshotClosed, SnapshotReceiver, SubtreeDef,
-    SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, Tree, WaitError,
+    Actor, ActorDef, ActorOnceDef, ActorRef, ActorSlot, Admission, Blocking, BuildError, CallError,
+    CallFuture, CancellationToken, Context, DeadlineElapsed, DefaultsInheritance, DynamicActorSlot,
+    DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError, ExitResult,
+    Guard, Handler, Incarnation, Intensity, LifecycleEvents, LifecycleTryRecvError, Mailbox,
+    MailboxShutdown, Membership, OneShotTaskRef, RawActor, RawContext, RawDef, RawOnceDef,
+    Readiness, ReadinessDeadline, Removal, Reply, ReplyReceive, ReplyReceiver, ReserveError,
+    RestartPolicy, Retention, ScopeDefaults, ScopeRef, SendError, SendFuture, SendTimeout,
+    Shutdown, SnapshotClosed, SnapshotReceiver, StopContext, Strategy, SubtreeDef, SubtreeOnceDef,
+    SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, Tree, WaitError,
 };
 
 fn assert_error<T: Error>() {}
@@ -123,6 +125,8 @@ impl Actor for ClonedActor {
 fn actor_types_obey_resource_and_payload_trait_contracts() {
     assert_error::<DeadlineElapsed>();
     assert_raw::<Handler<OpaqueActor>>();
+    assert_send_type::<Context<'static, OpaqueActor>>();
+    assert_send_type::<StopContext<'static, OpaqueActor>>();
     assert_send_type::<Blocking<Cell<()>>>();
     assert_static::<Blocking<Cell<()>>>();
     assert_send_type::<Guard>();
@@ -147,6 +151,53 @@ fn actor_types_obey_resource_and_payload_trait_contracts() {
     let _ = SubtreeOnceDef::new(Tree::new());
 }
 
+#[test]
+#[allow(clippy::type_complexity)]
+fn slot_method_signatures_remain_nominal_and_parallel() {
+    let _: fn(&ActorSlot<Cell<()>>) -> ActorRef<Cell<()>> = ActorSlot::actor_ref;
+    let _: fn(ActorSlot<Cell<()>>, ActorDef<OpaqueActor>) -> ActorRef<Cell<()>> = ActorSlot::define;
+    let _: fn(ActorSlot<Cell<()>>, ActorOnceDef<OpaqueActor>) -> ActorRef<Cell<()>> =
+        ActorSlot::define_once;
+    let _: fn(ActorSlot<Cell<()>>, RawDef<OpaqueRaw>) -> ActorRef<Cell<()>> = ActorSlot::define_raw;
+    let _: fn(ActorSlot<Cell<()>>, RawOnceDef<OpaqueRaw>) -> ActorRef<Cell<()>> =
+        ActorSlot::define_once_raw;
+
+    let _: fn(&TaskSlot) -> TaskRef = TaskSlot::task_ref;
+    let _: fn(TaskSlot, TaskDef) -> TaskRef = TaskSlot::define;
+    let _: fn(TaskSlot, TaskOnceDef<Cell<()>>) -> (TaskRef, OneShotTaskRef<Cell<()>>) =
+        TaskSlot::define_once;
+
+    let _: fn(&SubtreeSlot<Tree>) -> ScopeRef = SubtreeSlot::<Tree>::scope_ref;
+    let _: fn(SubtreeSlot<Tree>, SubtreeDef<Tree>) -> ScopeRef = SubtreeSlot::<Tree>::define;
+    let _: fn(SubtreeSlot<Tree>, SubtreeOnceDef<Tree>) -> ScopeRef =
+        SubtreeSlot::<Tree>::define_once;
+
+    let _: fn(&DynamicActorSlot<Cell<()>>) -> ActorRef<Cell<()>> = DynamicActorSlot::actor_ref;
+    let _: fn(DynamicActorSlot<Cell<()>>, ActorDef<OpaqueActor>) -> Admission<ActorRef<Cell<()>>> =
+        DynamicActorSlot::define;
+    let _: fn(
+        DynamicActorSlot<Cell<()>>,
+        ActorOnceDef<OpaqueActor>,
+    ) -> Admission<ActorRef<Cell<()>>> = DynamicActorSlot::define_once;
+    let _: fn(DynamicActorSlot<Cell<()>>, RawDef<OpaqueRaw>) -> Admission<ActorRef<Cell<()>>> =
+        DynamicActorSlot::define_raw;
+    let _: fn(DynamicActorSlot<Cell<()>>, RawOnceDef<OpaqueRaw>) -> Admission<ActorRef<Cell<()>>> =
+        DynamicActorSlot::define_once_raw;
+
+    let _: fn(&DynamicTaskSlot) -> TaskRef = DynamicTaskSlot::task_ref;
+    let _: fn(DynamicTaskSlot, TaskDef) -> Admission<TaskRef> = DynamicTaskSlot::define;
+    let _: fn(
+        DynamicTaskSlot,
+        TaskOnceDef<Cell<()>>,
+    ) -> Admission<(TaskRef, OneShotTaskRef<Cell<()>>)> = DynamicTaskSlot::define_once;
+
+    let _: fn(&DynamicSubtreeSlot<Tree>) -> ScopeRef = DynamicSubtreeSlot::<Tree>::scope_ref;
+    let _: fn(DynamicSubtreeSlot<Tree>, SubtreeDef<Tree>) -> Admission<ScopeRef> =
+        DynamicSubtreeSlot::<Tree>::define;
+    let _: fn(DynamicSubtreeSlot<Tree>, SubtreeOnceDef<Tree>) -> Admission<ScopeRef> =
+        DynamicSubtreeSlot::<Tree>::define_once;
+}
+
 struct OpaqueRaw {
     _not_sync: Cell<()>,
 }
@@ -157,6 +208,81 @@ impl RawActor for OpaqueRaw {
     async fn run(&mut self, _context: &mut RawContext<Self::Msg>) -> ExitResult {
         Ok(())
     }
+}
+
+#[test]
+fn ordered_and_dynamic_builders_expose_the_parallel_typed_surface() {
+    let mut ordered = Tree::new();
+    let _: &mut Tree = ordered.strategy(Strategy::default());
+    let _: &mut Tree = ordered.intensity(Intensity::default());
+    let _: &mut Tree = ordered.defaults(ScopeDefaults::default());
+    let _: Result<ActorSlot<Cell<()>>, ReserveError> = ordered.reserve_actor("ordered-actor-slot");
+    let _: Result<ActorRef<()>, ReserveError> =
+        ordered.add_actor("ordered-actor", ActorDef::<ClonedActor>::cloned(()));
+    let _: Result<ActorRef<()>, ReserveError> =
+        ordered.add_actor_once("ordered-actor-once", ActorOnceDef::<ClonedActor>::new(()));
+    let _: Result<ActorRef<Cell<()>>, ReserveError> = ordered.add_raw(
+        "ordered-raw",
+        RawDef::<OpaqueRaw>::factory(|| OpaqueRaw {
+            _not_sync: Cell::new(()),
+        }),
+    );
+    let _: Result<ActorRef<Cell<()>>, ReserveError> = ordered.add_raw_once(
+        "ordered-raw-once",
+        RawOnceDef::new(OpaqueRaw {
+            _not_sync: Cell::new(()),
+        }),
+    );
+    let _: Result<TaskSlot, ReserveError> = ordered.reserve_task("ordered-task-slot");
+    let _: Result<TaskRef, ReserveError> =
+        ordered.add_task("ordered-task", TaskDef::new(|_| async { Ok(()) }));
+    let _: Result<(TaskRef, OneShotTaskRef<()>), ReserveError> = ordered.add_task_once(
+        "ordered-task-once",
+        TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }),
+    );
+    let _: Result<SubtreeSlot<Tree>, ReserveError> =
+        ordered.reserve_subtree("ordered-subtree-slot");
+    let _: Result<ScopeRef, ReserveError> =
+        ordered.add_subtree("ordered-subtree", SubtreeDef::factory(Tree::new));
+    let _: Result<ScopeRef, ReserveError> =
+        ordered.add_subtree_once("ordered-subtree-once", SubtreeOnceDef::new(Tree::new()));
+
+    let mut dynamic = DynamicTree::new();
+    let _: &mut DynamicTree = dynamic.intensity(Intensity::default());
+    let _: &mut DynamicTree = dynamic.defaults(ScopeDefaults::default());
+    let _: Result<ActorSlot<Cell<()>>, ReserveError> = dynamic.reserve_actor("dynamic-actor-slot");
+    let _: Result<ActorRef<()>, ReserveError> =
+        dynamic.add_actor("dynamic-actor", ActorDef::<ClonedActor>::cloned(()));
+    let _: Result<ActorRef<()>, ReserveError> =
+        dynamic.add_actor_once("dynamic-actor-once", ActorOnceDef::<ClonedActor>::new(()));
+    let _: Result<ActorRef<Cell<()>>, ReserveError> = dynamic.add_raw(
+        "dynamic-raw",
+        RawDef::<OpaqueRaw>::factory(|| OpaqueRaw {
+            _not_sync: Cell::new(()),
+        }),
+    );
+    let _: Result<ActorRef<Cell<()>>, ReserveError> = dynamic.add_raw_once(
+        "dynamic-raw-once",
+        RawOnceDef::new(OpaqueRaw {
+            _not_sync: Cell::new(()),
+        }),
+    );
+    let _: Result<TaskSlot, ReserveError> = dynamic.reserve_task("dynamic-task-slot");
+    let _: Result<TaskRef, ReserveError> =
+        dynamic.add_task("dynamic-task", TaskDef::new(|_| async { Ok(()) }));
+    let _: Result<(TaskRef, OneShotTaskRef<()>), ReserveError> = dynamic.add_task_once(
+        "dynamic-task-once",
+        TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }),
+    );
+    let _: Result<SubtreeSlot<Tree>, ReserveError> =
+        dynamic.reserve_subtree("dynamic-subtree-slot");
+    let _: Result<ScopeRef, ReserveError> =
+        dynamic.add_subtree("dynamic-subtree", SubtreeDef::factory(Tree::new));
+    let _: Result<ScopeRef, ReserveError> =
+        dynamic.add_subtree_once("dynamic-subtree-once", SubtreeOnceDef::new(Tree::new()));
+
+    let _: fn(Tree) -> Result<System<ScopeRef>, BuildError> = Tree::spawn;
+    let _: fn(DynamicTree) -> Result<System<DynamicScopeRef>, BuildError> = DynamicTree::spawn;
 }
 
 #[test]
@@ -191,6 +317,77 @@ fn raw_types_obey_error_and_future_trait_contracts() {
     let (reply, receiver) = Reply::<Cell<()>>::channel();
     assert_send(reply);
     assert_send(receiver);
+}
+
+#[test]
+fn all_definition_option_setters_compile() {
+    let _ = RawDef::<OpaqueRaw>::factory(|| OpaqueRaw {
+        _not_sync: Cell::new(()),
+    })
+    .restart(RestartPolicy::default())
+    .shutdown(Shutdown::default())
+    .mailbox(Mailbox::default())
+    .mailbox_shutdown(MailboxShutdown::default())
+    .readiness(Readiness::Immediate)
+    .expect("immediate raw readiness is supported")
+    .readiness_deadline(ReadinessDeadline::Inherit)
+    .retention(Retention::Retain);
+
+    let _ = RawOnceDef::new(OpaqueRaw {
+        _not_sync: Cell::new(()),
+    })
+    .shutdown(Shutdown::default())
+    .mailbox(Mailbox::default())
+    .mailbox_shutdown(MailboxShutdown::default())
+    .readiness(Readiness::Manual)
+    .expect("manual raw readiness is supported")
+    .readiness_deadline(ReadinessDeadline::Inherit)
+    .retention(Retention::Retain);
+
+    let _ = ActorDef::<OpaqueActor>::factory(|| Cell::new(()))
+        .restart(RestartPolicy::default())
+        .shutdown(Shutdown::default())
+        .mailbox(Mailbox::default())
+        .mailbox_shutdown(MailboxShutdown::default())
+        .readiness(Readiness::AfterInit)
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain);
+
+    let _ = ActorOnceDef::<OpaqueActor>::new(Cell::new(()))
+        .shutdown(Shutdown::default())
+        .mailbox(Mailbox::default())
+        .mailbox_shutdown(MailboxShutdown::default())
+        .readiness(Readiness::AfterInit)
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain);
+
+    let _ = TaskDef::new(|_| async { Ok(()) })
+        .restart(RestartPolicy::default())
+        .shutdown(Shutdown::default())
+        .readiness(Readiness::Immediate)
+        .expect("immediate task readiness is supported")
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain);
+
+    let _ = TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) })
+        .shutdown(Shutdown::default())
+        .readiness(Readiness::Manual)
+        .expect("manual task readiness is supported")
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain);
+
+    let _ = SubtreeDef::factory(Tree::new)
+        .restart(RestartPolicy::default())
+        .shutdown(Shutdown::default())
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain)
+        .defaults(DefaultsInheritance::Inherit);
+
+    let _ = SubtreeOnceDef::new(Tree::new())
+        .shutdown(Shutdown::default())
+        .readiness_deadline(ReadinessDeadline::Inherit)
+        .retention(Retention::Retain)
+        .defaults(DefaultsInheritance::Reset);
 }
 
 #[test]

@@ -1,68 +1,41 @@
 //! Mutable runtime shell and shared handle state.
 
 use std::{
-    collections::HashMap,
-    fmt,
-    future::Future,
-    ops::{Index, IndexMut},
-    pin::Pin,
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
-    },
+    collections::{BTreeMap, HashMap},
+    ops::{Bound, Index, IndexMut},
+    sync::{Arc, Mutex, Weak, mpsc},
     time::{Duration, Instant},
 };
 
 use crate::{
     ChildId, Exit, ExitKind, Incarnation, IntensityTrip, Membership, Readiness, ReadinessDeadline,
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    cells::{DynamicRoute, MemberStage, ResidentProjection, ScopeCell},
     deadline::Deadline,
     engine::{
         ArbitrationClass, DeadlineHandle, DeadlineQueue, ExitDispatch, IntensityState,
-        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode,
-        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
+        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState,
+        ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
+        schedule_restart,
     },
-    exit::{JoinVerdict, RecordedOutcome, classify_exit},
+    exit::{
+        JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit,
+        reconcile_recorded_outcomes,
+    },
     identity::{FenceCounter, ScopeIdentity},
-    mailbox::{MailboxControl, MailboxTermination},
-    observe::{
-        ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-        LifecycleHub, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
+    observe::LifecycleEventKind,
+    plan::{
+        BuilderCore, ChildConstruction, ChildPlan, LowerError, NotAdmittingCause, RemoveOutcome,
+        ReserveError, ScopeFactory, ScopePlan, SlotCell, checked_id, mint_reserved_slot,
     },
-    policy::{DefaultsInheritance, ResolvedDefaults},
+    policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
     runtime::{self, Latch},
-    task::{OnceTaskBody, TaskContext, TaskFactory},
-    tree::{
-        BuilderCore, ChildConstruction, ChildPlan, LowerError, NotAdmittingCause, RemoveOutcome,
-        ReserveError, ScopeFactory, ScopeFlavor, ScopePlan, ScopeSource, SlotCell, StartupError,
-        StopReason,
-    },
+    task::{TaskContext, TaskFactory},
 };
 
-pub(crate) type DriverSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-
-pub(crate) fn deadline(duration: Duration) -> Deadline {
-    Deadline::after(runtime::now(), duration)
-}
-
-pub(crate) fn sleep_deadline(deadline: Deadline) -> DriverSleep {
-    Box::pin(async move {
-        match deadline.instant() {
-            Some(deadline) => runtime::sleep_until_std(deadline).await,
-            None => std::future::pending().await,
-        }
-    })
-}
-
-pub(crate) fn sleep_until(deadline: Instant) -> DriverSleep {
-    Box::pin(runtime::sleep_until_std(deadline))
-}
-
-pub(crate) fn now() -> Instant {
-    runtime::now()
-}
+#[cfg(test)]
+use crate::cells::{MemberCell, RuntimeStorage};
 
 /// An exactly-once synchronous completion.
 ///
@@ -108,359 +81,6 @@ impl<T> Drop for Obligation<T> {
     }
 }
 
-pub(crate) struct ActorWork {
-    handle: Option<runtime::JoinHandle<(), ()>>,
-    abort: runtime::AbortHandle,
-}
-
-impl ActorWork {
-    pub(crate) fn abort(&self) {
-        self.abort.abort();
-    }
-
-    pub(crate) async fn join(mut self) {
-        let Some(handle) = self.handle.take() else {
-            return;
-        };
-        let _ = runtime::join(handle).await;
-    }
-}
-
-impl Drop for ActorWork {
-    fn drop(&mut self) {
-        self.abort.abort();
-    }
-}
-
-pub(crate) fn spawn_actor_work(future: impl Future<Output = ()> + Send + 'static) -> ActorWork {
-    let handle = runtime::spawn((), future);
-    let abort = handle.abort_handle();
-    ActorWork {
-        handle: Some(handle),
-        abort,
-    }
-}
-
-pub(crate) struct BlockingWork<T> {
-    handle: Option<runtime::JoinHandle<(), T>>,
-}
-
-impl<T: Send + 'static> BlockingWork<T> {
-    pub(crate) async fn join(mut self) -> T {
-        let handle = self
-            .handle
-            .take()
-            .expect("blocking operation was joined more than once");
-        runtime::join_resuming(handle).await.1
-    }
-}
-
-pub(crate) fn spawn_blocking_work<T: Send + 'static>(
-    operation: impl FnOnce() -> T + Send + 'static,
-) -> BlockingWork<T> {
-    BlockingWork {
-        handle: Some(runtime::spawn_blocking((), operation)),
-    }
-}
-
-pub(crate) enum Selected<A, B> {
-    First(A),
-    Second(B),
-}
-
-pub(crate) async fn select<A, B>(first: A, second: B) -> Selected<A::Output, B::Output>
-where
-    A: Future + Send,
-    B: Future + Send,
-{
-    match runtime::select_two(first, second).await {
-        runtime::Either::Left(value) => Selected::First(value),
-        runtime::Either::Right(value) => Selected::Second(value),
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct Signal {
-    inner: runtime::WatchSender<()>,
-}
-
-impl Default for Signal {
-    fn default() -> Self {
-        Self {
-            inner: runtime::watch(()).0,
-        }
-    }
-}
-
-impl Clone for Signal {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl Signal {
-    pub(crate) fn pulse(&self) {
-        self.inner.pulse();
-    }
-
-    pub(crate) fn watcher(&self) -> SignalWatcher {
-        SignalWatcher {
-            inner: self.inner.watcher(),
-            _signal: self.clone(),
-        }
-    }
-
-    #[cfg(test)]
-    fn watcher_count(&self) -> usize {
-        self.inner.receiver_count()
-    }
-}
-
-pub(crate) struct SignalWatcher {
-    inner: runtime::WatchReceiver<()>,
-    // The previous signal implementation kept the source alive through each
-    // watcher. Preserve that ownership so `changed` cannot turn channel
-    // closure into a spurious pulse.
-    _signal: Signal,
-}
-
-impl SignalWatcher {
-    pub(crate) async fn changed(&mut self) {
-        self.inner.changed().await;
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MemberStage {
-    Reserved,
-    Admitted,
-    Starting,
-    Running,
-    Restarting,
-    Stopping,
-    Terminal(Exit),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MemberRecord {
-    pub(crate) stage: MemberStage,
-    pub(crate) incarnation: Option<Incarnation>,
-    pub(crate) last_incarnation: Option<Incarnation>,
-    pub(crate) last_exit: Option<Exit>,
-    pub(crate) restart_count: u64,
-    pub(crate) restart_at: Option<Instant>,
-    pub(crate) removing: bool,
-    pub(crate) startup_aborted: bool,
-}
-
-#[derive(Debug)]
-pub(crate) struct MemberCell {
-    id: ChildId,
-    membership: Mutex<Membership>,
-    record: runtime::WatchSender<MemberRecord>,
-    terminal_disposal_pending: AtomicBool,
-    mailbox: Mutex<MemberMailbox>,
-    options: Mutex<Option<crate::policy::ResolvedCommonOptions>>,
-    pub(crate) removal: Latch,
-}
-
-#[derive(Default)]
-struct MemberMailbox {
-    control: Option<Arc<dyn MailboxControl>>,
-    terminal: Option<Exit>,
-    teardown: Option<Box<dyn MailboxTermination>>,
-}
-
-impl fmt::Debug for MemberMailbox {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("MemberMailbox")
-            .field("control", &self.control)
-            .field("terminal", &self.terminal)
-            .field("teardown_pending", &self.teardown.is_some())
-            .finish()
-    }
-}
-
-impl MemberCell {
-    pub(crate) fn new(id: ChildId, membership: Membership) -> Arc<Self> {
-        let (record, _) = runtime::watch(MemberRecord {
-            stage: MemberStage::Reserved,
-            incarnation: None,
-            last_incarnation: None,
-            last_exit: None,
-            restart_count: 0,
-            restart_at: None,
-            removing: false,
-            startup_aborted: false,
-        });
-        Arc::new(Self {
-            id,
-            membership: Mutex::new(membership),
-            record,
-            terminal_disposal_pending: AtomicBool::new(false),
-            mailbox: Mutex::new(MemberMailbox::default()),
-            options: Mutex::new(None),
-            removal: Latch::default(),
-        })
-    }
-
-    pub(crate) fn id(&self) -> &ChildId {
-        &self.id
-    }
-
-    pub(crate) fn membership(&self) -> Membership {
-        *self
-            .membership
-            .lock()
-            .expect("member identity mutex poisoned")
-    }
-
-    pub(crate) fn rebase_membership(&self, membership: Membership) {
-        let record = self.record();
-        assert!(
-            matches!(record.stage, MemberStage::Reserved)
-                && record.incarnation.is_none()
-                && record.last_incarnation.is_none(),
-            "only an unstarted reservation can be rebased"
-        );
-        *self
-            .membership
-            .lock()
-            .expect("member identity mutex poisoned") = membership;
-    }
-
-    pub(crate) fn record(&self) -> MemberRecord {
-        self.record.read_cloned()
-    }
-
-    fn terminal_disposal_pending(&self) -> bool {
-        self.terminal_disposal_pending.load(Ordering::Acquire)
-    }
-
-    fn set_terminal_disposal_pending(&self, pending: bool) {
-        self.terminal_disposal_pending
-            .store(pending, Ordering::Release);
-    }
-
-    pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
-        self.record.send_modify(update);
-    }
-
-    fn update_locked(&self, update: impl FnOnce(&mut MemberRecord)) {
-        self.record.send_modify(update);
-    }
-
-    pub(crate) fn set_options(&self, options: crate::policy::ResolvedCommonOptions) {
-        *self.options.lock().expect("member options mutex poisoned") = Some(options);
-    }
-
-    fn options(&self) -> crate::policy::ResolvedCommonOptions {
-        self.options
-            .lock()
-            .expect("member options mutex poisoned")
-            .clone()
-            .unwrap_or_else(|| {
-                crate::policy::resolve_common(
-                    &crate::policy::CommonOptions::default(),
-                    &crate::policy::ResolvedDefaults::default(),
-                    false,
-                    Readiness::Immediate,
-                )
-            })
-    }
-
-    pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
-        let terminal_exit = {
-            let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            assert!(state.control.is_none(), "a member can own only one mailbox");
-            state.control = Some(Arc::clone(&mailbox));
-            let terminal_exit = state.terminal.clone();
-            if terminal_exit.is_some() {
-                debug_assert!(state.teardown.is_none());
-                state.teardown = mailbox.prepare_termination();
-            }
-            terminal_exit
-        };
-        if let Some(terminal_exit) = terminal_exit {
-            self.publish_terminal(terminal_exit);
-        }
-    }
-
-    pub(crate) fn mailbox(&self) -> Option<Arc<dyn MailboxControl>> {
-        self.mailbox
-            .lock()
-            .expect("member mailbox mutex poisoned")
-            .control
-            .clone()
-    }
-
-    pub(crate) fn terminalize(&self, exit: Exit) {
-        let (terminal_exit, mailbox) = {
-            let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            let terminal_exit = if let Some(terminal_exit) = &state.terminal {
-                terminal_exit.clone()
-            } else {
-                let teardown = state
-                    .control
-                    .as_ref()
-                    .and_then(|mailbox| mailbox.prepare_termination());
-                state.terminal = Some(exit.clone());
-                state.teardown = teardown;
-                exit
-            };
-            (terminal_exit, state.control.clone())
-        };
-        self.publish_terminal(terminal_exit);
-        if let Some(mailbox) = mailbox {
-            let stats = mailbox.stats();
-            debug_assert!(stats.delivered <= stats.accepted);
-            debug_assert!(stats.conflated <= stats.accepted);
-            debug_assert!(stats.depth <= stats.capacity);
-            let _ = stats.sends_rejected;
-        }
-    }
-
-    fn publish_terminal(&self, terminal_exit: Exit) {
-        let mut published = false;
-        self.record.modify_silently(|record| {
-            if !matches!(record.stage, MemberStage::Terminal(_)) {
-                record.incarnation = None;
-                record.restart_at = None;
-                record.last_exit = Some(terminal_exit.clone());
-                record.stage = MemberStage::Terminal(terminal_exit);
-                published = true;
-            }
-        });
-        let teardown = self
-            .mailbox
-            .lock()
-            .expect("member mailbox mutex poisoned")
-            .teardown
-            .take();
-        if let Some(teardown) = teardown
-            && let Some(payload) = teardown.finish()
-        {
-            runtime::dispose_detached(payload);
-        }
-        if published {
-            self.record.pulse();
-        }
-    }
-
-    pub(crate) async fn wait_terminal(&self) -> Exit {
-        let mut watcher = self.record.watcher();
-        loop {
-            if let MemberStage::Terminal(exit) = watcher.borrow_cloned().stage {
-                return exit;
-            }
-            watcher.changed().await;
-        }
-    }
-}
-
 struct RecordedReport {
     outcome: Option<RecordedOutcome>,
     cancelled: bool,
@@ -478,6 +98,15 @@ pub(crate) struct ReportToken {
 
 pub(crate) struct ReportReceiver(mpsc::Receiver<RecordedReport>);
 
+/// Couples the child task's outcome report to its join verdict without an
+/// asynchronous handoff race.
+///
+/// `ReportToken` is owned by the child task and its fail-closed `Drop` sends a
+/// fallback synchronously. Rust drops those task locals before the join handle
+/// becomes ready, so the exit joiner may safely perform the blocking receive:
+/// a report has already been sent on every return, panic, and cancellation
+/// edge. The shutdown/local-stop latches are sampled by that same send, making
+/// the report and its cancellation evidence one ordered observation.
 pub(crate) fn report_channel(
     shutdown: Latch,
     local_stop: Option<Latch>,
@@ -523,834 +152,9 @@ impl ReportReceiver {
     }
 }
 
-struct ResidencyCompletion {
-    parent: Weak<ScopeCell>,
-    slot: Arc<SlotCell>,
-}
-
-fn discharge_residency(completion: ResidencyCompletion) {
-    let Some(parent) = completion.parent.upgrade() else {
-        return;
-    };
-    parent.emit_locked(LifecycleEventKind::Removed {
-        id: completion.slot.member.id().clone(),
-        membership: completion.slot.member.membership(),
-        last_incarnation: completion.slot.member.record().last_incarnation,
-    });
-}
-
-struct ResidentChild {
-    slot: Arc<SlotCell>,
-    _removal: Obligation<ResidencyCompletion>,
-}
-
-impl ResidentChild {
-    fn new(parent: &Arc<ScopeCell>, slot: Arc<SlotCell>) -> Self {
-        Self {
-            _removal: Obligation::new(
-                ResidencyCompletion {
-                    parent: Arc::downgrade(parent),
-                    slot: Arc::clone(&slot),
-                },
-                discharge_residency,
-            ),
-            slot,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ScopeRecord {
-    pub(crate) state: ScopeState,
-    pub(crate) startup: Option<Result<(), StartupError>>,
-    pub(crate) total_restarts: u64,
-}
-
-/// Shared scope state follows two distinct synchronization regimes.
-///
-/// One gate per running tree serializes compound, observation-visible
-/// transitions across `config`, `record`, `current_children`, and `parent`,
-/// including recursive snapshot projection and lifecycle-event staging. Their
-/// watch channels retain the latest independently readable value; they do not
-/// make that compound transition atomic, so every multi-field observation path
-/// must continue to hold the gate.
-///
-/// The remaining mutexes are deliberately not collapsed into one state lock.
-/// `control` is an epoch-tagged request plane with concurrent callers,
-/// `child_identity` and `lifecycle_sequence` mint monotonic identities, and
-/// `current_dynamic` owns the independently published dynamic request route.
-/// Scope state therefore has multiple writers and no single-writer invariant.
-pub(crate) struct ScopeCell {
-    pub(crate) member: Arc<MemberCell>,
-    pub(crate) flavor: ScopeFlavor,
-    pub(crate) child_identity: Mutex<ScopeIdentity>,
-    config: runtime::WatchSender<crate::tree::ScopeConfig>,
-    record: runtime::WatchSender<ScopeRecord>,
-    control: Mutex<ScopeControl>,
-    current_dynamic: Mutex<Option<Arc<DynamicControl>>>,
-    current_children: runtime::WatchSender<Vec<ResidentChild>>,
-    parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
-    observation_gate: Mutex<Arc<Mutex<()>>>,
-    lifecycle_sequence: Mutex<FenceCounter>,
-    lifecycle_seq: AtomicU64,
-    lifecycle: LifecycleHub,
-    snapshots: SnapshotHub,
-    observation_closed: AtomicBool,
-    #[cfg(test)]
-    runtime_storage: Mutex<RuntimeStorage>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct RuntimeStorage {
-    children: usize,
-    child_slots: usize,
-    deadlines: usize,
-    deadline_slots: usize,
-}
-
-#[derive(Debug, Default)]
-struct ScopeControl {
-    current_epoch: u64,
-    live: bool,
-    last_stopped_epoch: u64,
-    shutdown: Option<ScopeRequest>,
-    force: Option<ScopeRequest>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ScopeRequest {
-    epoch: u64,
-    consumed: bool,
-}
-
-impl ScopeCell {
-    pub(crate) fn new(
-        member: Arc<MemberCell>,
-        flavor: ScopeFlavor,
-        child_identity: ScopeIdentity,
-    ) -> Arc<Self> {
-        let (config, _) = runtime::watch(crate::tree::ScopeConfig::default());
-        let (record, _) = runtime::watch(ScopeRecord {
-            state: ScopeState::Unstarted,
-            startup: None,
-            total_restarts: 0,
-        });
-        let (current_children, _) = runtime::watch(Vec::new());
-        let (parent, _) = runtime::watch(None);
-        Arc::new(Self {
-            member,
-            flavor,
-            child_identity: Mutex::new(child_identity),
-            config,
-            record,
-            control: Mutex::new(ScopeControl::default()),
-            current_dynamic: Mutex::new(None),
-            current_children,
-            parent,
-            observation_gate: Mutex::new(Arc::new(Mutex::new(()))),
-            lifecycle_sequence: Mutex::new(FenceCounter::new(0)),
-            lifecycle_seq: AtomicU64::new(0),
-            lifecycle: LifecycleHub::default(),
-            snapshots: SnapshotHub::default(),
-            observation_closed: AtomicBool::new(false),
-            #[cfg(test)]
-            runtime_storage: Mutex::new(RuntimeStorage::default()),
-        })
-    }
-
-    pub(crate) fn record(&self) -> ScopeRecord {
-        self.record.read_cloned()
-    }
-
-    #[cfg(test)]
-    fn runtime_storage(&self) -> RuntimeStorage {
-        *self
-            .runtime_storage
-            .lock()
-            .expect("runtime-storage mutex poisoned")
-    }
-
-    fn observation_gate(&self) -> Arc<Mutex<()>> {
-        Arc::clone(
-            &self
-                .observation_gate
-                .lock()
-                .expect("observation gate handoff mutex poisoned"),
-        )
-    }
-
-    fn adopt_observation_gate(&self, gate: &Arc<Mutex<()>>) {
-        loop {
-            let current = self.observation_gate();
-            if Arc::ptr_eq(&current, gate) {
-                return;
-            }
-
-            // An operation that passed `with_observation_gate`'s pointer
-            // check is allowed to finish its complete observation edge before
-            // the handoff. Conversely, an operation that only captured this
-            // gate will see the replacement after acquiring it and retry.
-            let current_guard = current
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut installed = self
-                .observation_gate
-                .lock()
-                .expect("observation gate handoff mutex poisoned");
-            if Arc::ptr_eq(&current, &installed) {
-                *installed = Arc::clone(gate);
-                drop(installed);
-                self.adopt_descendant_observation_gates_locked(&current, gate);
-                drop(current_guard);
-                return;
-            }
-            drop(installed);
-            drop(current_guard);
-        }
-    }
-
-    /// Re-homes a resident subtree while its former tree gate is held. The
-    /// caller also holds the destination gate, so observers cannot enter
-    /// either half of the tree while the handoff is being installed.
-    fn adopt_descendant_observation_gates_locked(
-        &self,
-        previous: &Arc<Mutex<()>>,
-        gate: &Arc<Mutex<()>>,
-    ) {
-        let descendants = self.current_children.read_with(|children| {
-            children
-                .iter()
-                .filter_map(|resident| resident.slot.scope.as_ref().cloned())
-                .collect::<Vec<_>>()
-        });
-        for descendant in descendants {
-            let mut installed = descendant
-                .observation_gate
-                .lock()
-                .expect("observation gate handoff mutex poisoned");
-            if Arc::ptr_eq(&installed, previous) {
-                *installed = Arc::clone(gate);
-            } else {
-                assert!(
-                    Arc::ptr_eq(&installed, gate),
-                    "one resident tree must share one observation gate"
-                );
-            }
-            drop(installed);
-            descendant.adopt_descendant_observation_gates_locked(previous, gate);
-        }
-    }
-
-    /// Runs against the cell's current tree gate. Adoption can race an early
-    /// pre-start observer, so a waiter that acquired an obsolete gate retries
-    /// before entering the observation critical section.
-    fn with_observation_gate<R>(&self, operation: impl FnOnce() -> R) -> R {
-        let mut operation = Some(operation);
-        loop {
-            let gate = self.observation_gate();
-            let guard = gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if Arc::ptr_eq(&gate, &self.observation_gate()) {
-                let operation = operation
-                    .take()
-                    .expect("observation operation runs exactly once");
-                let result = operation();
-                drop(guard);
-                return result;
-            }
-            drop(guard);
-        }
-    }
-
-    pub(crate) fn set_state(&self, state: ScopeState) {
-        self.with_observation_gate(|| {
-            self.record.send_modify(|record| {
-                if state == ScopeState::Starting {
-                    record.total_restarts = 0;
-                }
-                record.state = state.clone();
-            });
-            self.member.record.pulse();
-            self.emit_locked(LifecycleEventKind::ScopeState { state });
-        });
-    }
-
-    pub(crate) fn set_config(&self, config: crate::tree::ScopeConfig) {
-        self.with_observation_gate(|| {
-            self.config.replace(config);
-            self.publish_snapshot_chain_locked();
-        });
-    }
-
-    pub(crate) fn transition_child(
-        &self,
-        member: &MemberCell,
-        update: impl FnOnce(&mut MemberRecord),
-        event: Option<LifecycleEventKind>,
-    ) {
-        self.with_observation_gate(|| {
-            member.update_locked(update);
-            if let Some(event) = event {
-                self.emit_locked(event);
-            } else {
-                self.publish_snapshot_chain_locked();
-            }
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn emit(&self, event: LifecycleEventKind) {
-        self.with_observation_gate(|| self.emit_locked(event));
-    }
-
-    pub(crate) fn publish_child_restart(
-        &self,
-        member: &MemberCell,
-        total_restarts: u64,
-        update: impl FnOnce(&mut MemberRecord),
-        exited: LifecycleEventKind,
-        scheduled: LifecycleEventKind,
-    ) {
-        self.with_observation_gate(|| {
-            self.record.send_modify(|scope| {
-                scope.total_restarts = total_restarts;
-            });
-            member.update_locked(update);
-            self.emit_locked(exited);
-            self.emit_locked(scheduled);
-        });
-    }
-
-    pub(crate) fn terminalize_child(
-        &self,
-        member: &MemberCell,
-        exit: Exit,
-        exited_incarnation: Option<Incarnation>,
-        startup_aborted: bool,
-    ) -> bool {
-        self.with_observation_gate(|| {
-            if matches!(member.record().stage, MemberStage::Terminal(_)) {
-                return false;
-            }
-            member.update_locked(|record| record.startup_aborted = startup_aborted);
-            member.terminalize(exit.clone());
-            if let Some(incarnation) = exited_incarnation {
-                self.emit_locked(LifecycleEventKind::Exited {
-                    id: member.id().clone(),
-                    membership: member.membership(),
-                    incarnation,
-                    exit: exit.clone(),
-                });
-            }
-            let nested = self.current_children.read_with(|children| {
-                children
-                    .iter()
-                    .find(|resident| resident.slot.member.membership() == member.membership())
-                    .and_then(|resident| resident.slot.scope.as_ref())
-                    .cloned()
-            });
-            if let Some(scope) = nested {
-                scope.close_observation_locked();
-            }
-            true
-        })
-    }
-
-    pub(crate) fn prune_child(&self, member: &MemberCell) -> bool {
-        self.with_observation_gate(|| {
-            let membership = member.membership();
-            let mut resident = None;
-            let removed = self.current_children.send_if_modified(|children| {
-                let Some(index) = children
-                    .iter()
-                    .position(|child| child.slot.member.membership() == membership)
-                else {
-                    return false;
-                };
-                resident = Some(children.remove(index));
-                true
-            });
-            if !removed {
-                return false;
-            }
-            let resident = resident.expect("a reported removal owns its resident entry");
-            debug_assert_eq!(resident.slot.member.membership(), membership);
-            // Dropping residency while the observation gate is held emits the
-            // matching Removed edge through its owned completion.
-            drop(resident);
-            true
-        })
-    }
-
-    pub(crate) fn snapshot(&self) -> Arc<ScopeSnapshot> {
-        self.with_observation_gate(|| self.snapshot_locked())
-    }
-
-    pub(crate) fn subscribe_snapshots(&self) -> SnapshotReceiver {
-        self.with_observation_gate(|| {
-            let receiver = self.snapshots.subscribe(self.snapshot_locked());
-            if self.observation_closed.load(Ordering::Acquire) {
-                self.snapshots.close();
-            }
-            receiver
-        })
-    }
-
-    pub(crate) fn subscribe_lifecycle(&self) -> LifecycleEvents {
-        self.with_observation_gate(|| {
-            let events = self.lifecycle.subscribe();
-            if self.observation_closed.load(Ordering::Acquire) {
-                self.lifecycle.close();
-            }
-            events
-        })
-    }
-
-    fn snapshot_locked(&self) -> Arc<ScopeSnapshot> {
-        let record = self.record();
-        let config = self.config.read_cloned();
-        let children = self
-            .current_children
-            .read_with(|children| {
-                children
-                    .iter()
-                    .map(|resident| Arc::clone(&resident.slot))
-                    .collect::<Vec<_>>()
-            })
-            .into_iter()
-            .map(|slot| self.child_snapshot_locked(&slot))
-            .collect::<Vec<_>>();
-        Arc::new(ScopeSnapshot {
-            state: record.state,
-            kind: match self.flavor {
-                ScopeFlavor::Ordered => ScopeKind::Ordered,
-                ScopeFlavor::Dynamic => ScopeKind::Dynamic,
-            },
-            strategy: (self.flavor == ScopeFlavor::Ordered).then_some(config.strategy),
-            intensity: config.intensity,
-            total_restarts: record.total_restarts,
-            lifecycle_seq: self.lifecycle_seq.load(Ordering::Acquire),
-            children: children.into(),
-        })
-    }
-
-    fn child_snapshot_locked(&self, slot: &SlotCell) -> ChildSnapshot {
-        let record = slot.member.record();
-        let options = slot.member.options();
-        let terminal = matches!(record.stage, MemberStage::Terminal(_));
-        let nested = slot.scope.as_ref().and_then(|scope| {
-            (record.incarnation.is_some() || terminal).then(|| scope.snapshot_locked())
-        });
-        ChildSnapshot {
-            id: slot.member.id().clone(),
-            membership: slot.member.membership(),
-            incarnation: record.incarnation,
-            state: match record.stage {
-                MemberStage::Reserved | MemberStage::Admitted => ChildState::Admitted,
-                MemberStage::Starting => ChildState::Starting,
-                MemberStage::Running => ChildState::Running,
-                MemberStage::Restarting => ChildState::Restarting,
-                MemberStage::Stopping => ChildState::Stopping,
-                MemberStage::Terminal(exit) if record.startup_aborted => {
-                    ChildState::StartupAborted { exit }
-                }
-                MemberStage::Terminal(exit) => ChildState::Stopped { exit },
-            },
-            last_exit: record.last_exit,
-            membership_status: if record.removing {
-                MembershipStatus::Removing
-            } else {
-                MembershipStatus::Active
-            },
-            restart_count: record.restart_count,
-            restart_policy: options.restart,
-            retention: options.retention,
-            restart_at: record.restart_at,
-            nested,
-            scope_seq: slot
-                .scope
-                .as_ref()
-                .map(|scope| scope.lifecycle_seq.load(Ordering::Acquire)),
-        }
-    }
-
-    fn ancestors_locked(&self) -> Vec<Arc<ScopeCell>> {
-        let mut ancestors = Vec::new();
-        let mut current = self.parent.read_cloned().as_ref().and_then(Weak::upgrade);
-        while let Some(scope) = current {
-            current = scope.parent.read_cloned().as_ref().and_then(Weak::upgrade);
-            ancestors.push(scope);
-        }
-        ancestors
-    }
-
-    fn publish_snapshot_chain_locked(&self) {
-        self.snapshots.publish(|| self.snapshot_locked());
-        for ancestor in self.ancestors_locked() {
-            ancestor.snapshots.publish(|| ancestor.snapshot_locked());
-        }
-    }
-
-    fn emit_locked(&self, kind: LifecycleEventKind) {
-        let seq = self
-            .lifecycle_sequence
-            .lock()
-            .expect("lifecycle sequence mutex poisoned")
-            .mint_sequence();
-        let Some(seq) = seq else {
-            self.lifecycle_seq.store(u64::MAX, Ordering::Release);
-            self.publish_snapshot_chain_locked();
-            self.lifecycle.publish_lagged(1);
-            for ancestor in self.ancestors_locked() {
-                ancestor.lifecycle.publish_lagged(1);
-            }
-            return;
-        };
-        self.lifecycle_seq.store(seq, Ordering::Release);
-        self.publish_snapshot_chain_locked();
-
-        let scope = self.member.membership();
-        let mut event = LifecycleEvent {
-            scope_path: Vec::new(),
-            scope,
-            seq,
-            kind,
-        };
-        self.lifecycle.publish(event.clone());
-        let mut child_id = self.member.id().clone();
-        for ancestor in self.ancestors_locked() {
-            event.scope_path.insert(0, child_id);
-            child_id = ancestor.member.id().clone();
-            ancestor.lifecycle.publish(event.clone());
-        }
-    }
-
-    fn close_observation_locked(&self) {
-        if self.observation_closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.snapshots.close();
-        self.lifecycle.close();
-    }
-
-    pub(crate) fn set_startup(&self, startup: Result<(), StartupError>) {
-        let mut published = false;
-        self.record.modify_silently(|record| {
-            if record.startup.is_none() {
-                record.startup = Some(startup);
-                published = true;
-            }
-        });
-        if published {
-            // Before the record became watch-backed, startup waiters shared
-            // the member signal. Preserve that ordering boundary: publish the
-            // member-plane wake before releasing the startup result itself.
-            self.member.record.pulse();
-            self.record.pulse();
-        }
-    }
-
-    fn begin_incarnation(&self) -> u64 {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        control.current_epoch = control.current_epoch.saturating_add(1);
-        control.live = true;
-        let epoch = control.current_epoch;
-        drop(control);
-        self.member.record.pulse();
-        epoch
-    }
-
-    fn finish_incarnation(&self, epoch: u64, reason: StopReason) {
-        self.finish_incarnation_with_terminal(epoch, reason, None);
-    }
-
-    fn finish_root_incarnation(&self, epoch: u64, reason: StopReason, exit: Exit) {
-        self.finish_incarnation_with_terminal(epoch, reason, Some(exit));
-    }
-
-    fn finish_incarnation_with_terminal(
-        &self,
-        epoch: u64,
-        reason: StopReason,
-        terminal_exit: Option<Exit>,
-    ) {
-        self.with_observation_gate(|| {
-            let state = ScopeState::Stopped {
-                reason: reason.clone(),
-            };
-            self.record.modify_silently(|record| {
-                if record.startup.is_none() {
-                    record.startup = Some(Err(StartupError::ShutdownRequested));
-                }
-                record.state = state.clone();
-            });
-            let terminal = terminal_exit.is_some();
-            if let Some(exit) = terminal_exit {
-                self.member.terminalize(exit);
-            }
-            let mut control = self.control.lock().expect("scope control mutex poisoned");
-            if control.current_epoch == epoch {
-                control.live = false;
-                control.last_stopped_epoch = control.last_stopped_epoch.max(epoch);
-                if control
-                    .shutdown
-                    .is_some_and(|request| request.epoch <= epoch)
-                {
-                    control.shutdown = None;
-                }
-                if control.force.is_some_and(|request| request.epoch <= epoch) {
-                    control.force = None;
-                }
-            }
-            drop(control);
-            self.member.record.pulse();
-            // `wait_started` must not observe terminal startup until the member
-            // and incarnation-control planes above are consistent.
-            self.record.pulse();
-            self.emit_locked(LifecycleEventKind::ScopeState { state });
-            if terminal {
-                self.close_observation_locked();
-            }
-        });
-    }
-
-    fn finish_live_root_incarnation(&self, reason: StopReason, exit: Exit) {
-        let epoch = {
-            let control = self.control.lock().expect("scope control mutex poisoned");
-            control.live.then_some(control.current_epoch)
-        };
-        if let Some(epoch) = epoch {
-            self.finish_root_incarnation(epoch, reason, exit);
-        } else {
-            self.with_observation_gate(|| {
-                let state = ScopeState::Stopped { reason };
-                self.record.modify_silently(|record| {
-                    if record.startup.is_none() {
-                        record.startup = Some(Err(StartupError::ShutdownRequested));
-                    }
-                    record.state = state.clone();
-                });
-                self.member.terminalize(exit);
-                self.member.record.pulse();
-                self.record.pulse();
-                self.emit_locked(LifecycleEventKind::ScopeState { state });
-                self.close_observation_locked();
-            });
-        }
-    }
-
-    pub(crate) fn request_shutdown(&self) -> u64 {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        let pending_incarnation = !control.live;
-        let target = if control.live {
-            control.current_epoch
-        } else {
-            control.current_epoch.saturating_add(1)
-        };
-        if control
-            .shutdown
-            .is_none_or(|request| request.epoch < target)
-        {
-            control.shutdown = Some(ScopeRequest {
-                epoch: target,
-                consumed: false,
-            });
-        }
-        drop(control);
-        self.member.record.pulse();
-        // A nested scope has no live driver while its parent is retaining it
-        // in restart backoff. Wake that parent as well so it can start the
-        // pending incarnation immediately; that incarnation consumes the
-        // stop and begins the timeout-bounded teardown required by B.9.
-        if pending_incarnation
-            && let Some(parent) = self.parent.read_cloned().as_ref().and_then(Weak::upgrade)
-        {
-            parent.member.record.pulse();
-        }
-        target
-    }
-
-    fn has_pending_incarnation_shutdown(&self) -> bool {
-        let control = self.control.lock().expect("scope control mutex poisoned");
-        !control.live
-            && control.shutdown.is_some_and(|request| {
-                !request.consumed && request.epoch > control.last_stopped_epoch
-            })
-    }
-
-    fn has_stop_request(&self, epoch: u64) -> bool {
-        let control = self.control.lock().expect("scope control mutex poisoned");
-        control
-            .shutdown
-            .is_some_and(|request| request.epoch == epoch)
-            || control.force.is_some_and(|request| request.epoch == epoch)
-    }
-
-    fn take_shutdown_request(&self, epoch: u64) -> bool {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        match control.shutdown.as_mut() {
-            Some(request) if request.epoch == epoch && !request.consumed => {
-                request.consumed = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn force_shutdown(&self, epoch: u64) {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        if control.live && control.current_epoch == epoch {
-            control.force = Some(ScopeRequest {
-                epoch,
-                consumed: false,
-            });
-        }
-        drop(control);
-        self.member.record.pulse();
-    }
-
-    fn take_force_request(&self, epoch: u64) -> bool {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
-        match control.force.as_mut() {
-            Some(request) if request.epoch == epoch && !request.consumed => {
-                request.consumed = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn incarnation_finished(&self, epoch: u64) -> bool {
-        let control = self.control.lock().expect("scope control mutex poisoned");
-        control.last_stopped_epoch >= epoch
-    }
-
-    fn set_admitted_children(self: &Arc<Self>, children: Vec<Arc<SlotCell>>) {
-        self.with_observation_gate(|| {
-            let gate = self.observation_gate();
-            self.clear_residents_locked();
-            for child in children {
-                if let Some(scope) = &child.scope {
-                    scope.adopt_observation_gate(&gate);
-                    scope.parent.replace(Some(Arc::downgrade(self)));
-                }
-                child
-                    .member
-                    .update_locked(|record| record.stage = MemberStage::Admitted);
-                self.current_children.send_modify(|children| {
-                    children.push(ResidentChild::new(self, Arc::clone(&child)))
-                });
-                self.emit_locked(LifecycleEventKind::Added {
-                    id: child.member.id().clone(),
-                    membership: child.member.membership(),
-                });
-            }
-        });
-    }
-
-    fn admit_child(self: &Arc<Self>, child: &Arc<SlotCell>) {
-        self.with_observation_gate(|| {
-            let gate = self.observation_gate();
-            if let Some(scope) = &child.scope {
-                scope.adopt_observation_gate(&gate);
-                scope.parent.replace(Some(Arc::downgrade(self)));
-            }
-            self.current_children
-                .send_modify(|children| children.push(ResidentChild::new(self, Arc::clone(child))));
-            child
-                .member
-                .update_locked(|record| record.stage = MemberStage::Admitted);
-            self.emit_locked(LifecycleEventKind::Added {
-                id: child.member.id().clone(),
-                membership: child.member.membership(),
-            });
-        });
-    }
-
-    pub(crate) fn clear_residents(&self) {
-        self.with_observation_gate(|| self.clear_residents_locked());
-    }
-
-    fn clear_residents_locked(&self) {
-        let residents = self.current_children.take();
-        // Each entry's owned completion emits Removed. Drop the vector only
-        // after releasing the child-set watch value guard so snapshot publication can
-        // project the now-empty set while this observation gate stays held.
-        drop(residents);
-    }
-
-    fn set_dynamic(&self, control: Option<Arc<DynamicControl>>) {
-        *self
-            .current_dynamic
-            .lock()
-            .expect("scope dynamic-control mutex poisoned") = control;
-        self.member.record.pulse();
-    }
-
-    fn dynamic(&self) -> Option<Arc<DynamicControl>> {
-        self.current_dynamic
-            .lock()
-            .expect("scope dynamic-control mutex poisoned")
-            .clone()
-    }
-
-    pub(crate) fn signal(&self) -> &runtime::WatchSender<MemberRecord> {
-        &self.member.record
-    }
-
-    pub(crate) async fn wait_started(&self) -> Result<(), StartupError> {
-        let mut watcher = self.record.watcher();
-        loop {
-            if let Some(result) = watcher.borrow_and_update_cloned().startup {
-                return result;
-            }
-            watcher.changed().await;
-        }
-    }
-
-    pub(crate) async fn wait_stopped(&self) -> StopReason {
-        self.member.wait_terminal().await;
-        match self.record().state {
-            ScopeState::Stopped { reason } => reason,
-            ScopeState::Unstarted
-            | ScopeState::Starting
-            | ScopeState::Running
-            | ScopeState::StartupFailed
-            | ScopeState::Draining => StopReason::NeverStarted,
-        }
-    }
-
-    pub(crate) fn terminalize_never_started(&self) {
-        self.with_observation_gate(|| {
-            if self.observation_closed.load(Ordering::Acquire) {
-                return;
-            }
-            self.member.terminalize(Exit::never_started());
-            self.record.modify_silently(|record| {
-                if record.startup.is_none() {
-                    record.startup = Some(Err(StartupError::ShutdownRequested));
-                }
-                record.state = ScopeState::Stopped {
-                    reason: StopReason::NeverStarted,
-                };
-            });
-            self.member.record.pulse();
-            self.record.pulse();
-            self.emit_locked(LifecycleEventKind::ScopeState {
-                state: ScopeState::Stopped {
-                    reason: StopReason::NeverStarted,
-                },
-            });
-            self.close_observation_locked();
-        });
-    }
-}
-
 pub(crate) struct SystemRun {
     pub(crate) root: Arc<ScopeCell>,
-    driver: Option<runtime::JoinHandle<(), StopReason>>,
+    driver: Option<runtime::JoinHandle<StopReason>>,
 }
 
 pub(crate) type RemovalResponse = runtime::OneShotReceiver<RemoveOutcome>;
@@ -1427,11 +231,7 @@ impl DynamicControl {
         let mut retained = HashMap::new();
         for (id, entry) in entries {
             if !entry.admitted {
-                let definition = entry.slot.take_defined();
-                entry.slot.member.terminalize(Exit::never_started());
-                if let Some(scope) = &entry.slot.scope {
-                    scope.terminalize_never_started();
-                }
+                let definition = entry.slot.take_never_started();
                 dispose_definition_then(definition, move || drop(entry));
             } else {
                 retained.insert(id, entry);
@@ -1444,6 +244,23 @@ impl DynamicControl {
     }
 }
 
+fn dynamic_control(scope: &ScopeCell) -> Option<Arc<DynamicControl>> {
+    // The cells layer stores the route erased because it may not name a driver
+    // type. `set_dynamic_route` is the only writer, so a failed downcast is a
+    // driver bug, not an absent route: resolving it to `None` would fail open,
+    // reporting `NoLiveIncarnation` and `AlreadyAbsent` for a live scope.
+    Some(
+        scope
+            .dynamic_route()?
+            .resolve()
+            .unwrap_or_else(|_| panic!("the dynamic route is always a DynamicControl")),
+    )
+}
+
+fn resident_projection(slot: &SlotCell) -> ResidentProjection {
+    ResidentProjection::new(Arc::clone(&slot.member), slot.scope.clone())
+}
+
 pub(crate) struct DynamicReservation {
     pub(crate) slot: Arc<SlotCell>,
     pub(crate) control: Arc<DynamicControl>,
@@ -1454,10 +271,14 @@ pub(crate) fn reserve_dynamic(
     id: ChildId,
     child_scope: Option<ScopeFlavor>,
 ) -> Result<DynamicReservation, ReserveError> {
+    let id = checked_id(id)?;
+    if !runtime::is_available() {
+        return Err(ReserveError::NoRuntime);
+    }
     if matches!(scope.member.record().stage, MemberStage::Terminal(_)) {
         return Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal));
     }
-    let control = scope.dynamic().ok_or(ReserveError::NotAdmitting(
+    let control = dynamic_control(scope).ok_or(ReserveError::NotAdmitting(
         NotAdmittingCause::NoLiveIncarnation,
     ))?;
     match scope.record().state {
@@ -1484,18 +305,7 @@ pub(crate) fn reserve_dynamic(
         }
         return Err(ReserveError::DuplicateId(id));
     }
-    let membership = scope
-        .child_identity
-        .lock()
-        .expect("scope identity mutex poisoned")
-        .mint_membership(&id)
-        .ok_or(ReserveError::IdentityExhausted)?;
-    let member = MemberCell::new(id.clone(), membership);
-    let child_scope = child_scope.map(|flavor| {
-        let identity = ScopeIdentity::new().expect("global scope identity space exhausted");
-        ScopeCell::new(Arc::clone(&member), flavor, identity)
-    });
-    let slot = SlotCell::new(member, child_scope);
+    let slot = mint_reserved_slot(scope, &id, child_scope)?;
     state.entries.insert(
         id,
         DynamicEntry {
@@ -1516,7 +326,10 @@ pub(crate) fn start_admission(
     control: Arc<DynamicControl>,
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
-) -> runtime::OneShotReceiver<Result<(), ReserveError>> {
+) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
+    if !runtime::is_available() {
+        return Err(ReserveError::NoRuntime);
+    }
     let (sender, response) = runtime::oneshot();
     let request = AdmissionRequest {
         control: Arc::downgrade(&control),
@@ -1526,10 +339,10 @@ pub(crate) fn start_admission(
             let _ = sender.send(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
         }),
     };
-    runtime::spawn((), async move {
+    runtime::spawn(async move {
         let _ = runtime::mpsc_send(&control.events, DriverEvent::Admission(request)).await;
     });
-    response
+    Ok(response)
 }
 
 fn cancel_dynamic_reservation_parts(
@@ -1547,12 +360,7 @@ fn cancel_dynamic_reservation_parts(
     let removed = cancelled.then(|| state.entries.remove(&id)).flatten();
     drop(state);
     let definition = if cancelled {
-        let definition = slot.take_defined();
-        slot.member.terminalize(Exit::never_started());
-        if let Some(scope) = &slot.scope {
-            scope.terminalize_never_started();
-        }
-        definition
+        slot.take_never_started()
     } else {
         None
     };
@@ -1584,7 +392,7 @@ pub(crate) fn remove_dynamic(
     ) {
         return completed_removal(RemoveOutcome::AlreadyAbsent);
     }
-    let Some(control) = scope.dynamic() else {
+    let Some(control) = dynamic_control(scope) else {
         return completed_removal(RemoveOutcome::AlreadyAbsent);
     };
     let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
@@ -1598,11 +406,7 @@ pub(crate) fn remove_dynamic(
     if !entry.admitted {
         let entry = state.entries.remove(id).expect("entry was just resolved");
         drop(state);
-        let definition = entry.slot.take_defined();
-        entry.slot.member.terminalize(Exit::never_started());
-        if let Some(scope) = &entry.slot.scope {
-            scope.terminalize_never_started();
-        }
+        let definition = entry.slot.take_never_started();
         dispose_definition_then(definition, move || drop(entry));
         return response;
     }
@@ -1610,9 +414,16 @@ pub(crate) fn remove_dynamic(
     // through the normal removal path, like live residents, so that
     // registration is reclaimed before the removal response completes.
     let member = Arc::clone(&entry.slot.member);
-    scope.transition_child(&member, |record| record.removing = true, None);
-    entry.slot.member.removal.fire();
+    // Dynamic-state protects admission/removal bookkeeping; the observation
+    // gate protects the public projection. Release the former before entering
+    // the latter. No path takes the two in the opposite order, so this is not
+    // breaking an existing cycle; it keeps an unbounded wait out of the
+    // bookkeeping mutex. Any thread may hold the gate across arbitrary
+    // observation work, and blocking there while holding dynamic state would
+    // stall every concurrent reservation, removal, and driver admission.
     drop(state);
+    scope.transition_child(&member, |record| record.removing = true, None);
+    member.removal.fire();
     scope.signal().pulse();
     response
 }
@@ -1668,7 +479,7 @@ enum DriverEvent {
 
 impl SystemRun {
     pub(crate) fn request_shutdown(&self) {
-        self.root.request_shutdown();
+        let _ = self.root.request_shutdown();
     }
 
     pub(crate) async fn shutdown(&mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
@@ -1704,17 +515,8 @@ impl SystemRun {
     }
 }
 
-pub(crate) fn runtime_available() -> bool {
-    runtime::is_available()
-}
-
 fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<ShutdownStraggler>) {
-    let children = scope.current_children.read_with(|children| {
-        children
-            .iter()
-            .map(|resident| Arc::clone(&resident.slot))
-            .collect::<Vec<_>>()
-    });
+    let children = scope.resident_projections();
     for child in children {
         if matches!(child.member.record().stage, MemberStage::Terminal(_))
             || child.member.terminal_disposal_pending()
@@ -1755,7 +557,10 @@ pub(crate) async fn shutdown_scope(
     if matches!(scope.member.record().stage, MemberStage::Terminal(_)) {
         return Ok(());
     }
-    let epoch = scope.request_shutdown();
+    let Some(epoch) = scope.request_shutdown() else {
+        // An exhausted idle scope has no incarnation that can remain live.
+        return Ok(());
+    };
     let mut watcher = scope.signal().watcher();
     loop {
         if scope.incarnation_finished(epoch)
@@ -1788,8 +593,8 @@ pub(crate) async fn shutdown_scope(
 pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
     let root = Arc::clone(&plan.root);
     let monitor_root = Arc::clone(&root);
-    let driver = runtime::spawn((), async move { run_scope(plan, true, None).await });
-    let lifecycle = runtime::spawn((), async move {
+    let driver = runtime::spawn(async move { run_scope(plan, true, None).await });
+    let lifecycle = runtime::spawn(async move {
         match runtime::join(driver).await {
             runtime::JoinOutcome::Ok { value, .. } => value,
             runtime::JoinOutcome::Panic { message, .. } => {
@@ -1868,7 +673,6 @@ struct ActiveChild {
     construction_release: Latch,
     framework_abort: Option<Latch>,
     framework_abort_ack: Option<Latch>,
-    framework_abort_deadline: Option<Instant>,
     stop_deadline: Option<DeadlineHandle>,
 }
 
@@ -1901,7 +705,7 @@ fn discharge_child_terminality(completion: ChildTerminality) {
 }
 
 struct ChildRuntime {
-    slot: Arc<crate::tree::SlotCell>,
+    slot: Arc<SlotCell>,
     terminality: Obligation<ChildTerminality>,
     construction: runtime::Isolated<ChildConstruction>,
     pending_terminal: Option<PendingTerminal>,
@@ -1990,196 +794,81 @@ impl ChildRuntime {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StartupPhase {
-    Pending,
-    Complete,
-    Failed,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Driver-loop lifecycle state. `ScopeRecord` remains the observation projection and
-/// `ScopeControl` remains the epoch-tagged request plane; neither duplicates these phases.
-enum ScopePhase {
-    Starting,
-    Running,
-    StartupFailed,
-    Draining {
-        reason: StopReason,
-        startup: StartupPhase,
-    },
-}
-
-impl ScopePhase {
-    fn startup_complete(&self) -> bool {
-        matches!(
-            self,
-            Self::Running
-                | Self::Draining {
-                    startup: StartupPhase::Complete,
-                    ..
-                }
-        )
-    }
-
-    fn startup_failed(&self) -> bool {
-        matches!(
-            self,
-            Self::StartupFailed
-                | Self::Draining {
-                    startup: StartupPhase::Failed,
-                    ..
-                }
-        )
-    }
-
-    fn is_draining(&self) -> bool {
-        matches!(self, Self::Draining { .. })
-    }
-
-    fn draining_reason(&self) -> Option<&StopReason> {
-        match self {
-            Self::Draining { reason, .. } => Some(reason),
-            Self::Starting | Self::Running | Self::StartupFailed => None,
-        }
-    }
-
-    fn begin_drain(&mut self, reason: StopReason) -> bool {
-        let startup = match self {
-            Self::Starting => StartupPhase::Pending,
-            Self::Running => StartupPhase::Complete,
-            Self::StartupFailed => StartupPhase::Failed,
-            Self::Draining { .. } => return false,
-        };
-        *self = Self::Draining { reason, startup };
-        true
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ChildKey {
-    index: usize,
-    generation: u64,
-}
-
-struct ChildArenaSlot {
-    generation: u64,
-    child: Option<ChildRuntime>,
-}
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct ChildKey(u64);
 
 #[derive(Default)]
 struct ChildArena {
-    // Vacancies are reused, but every reuse advances the generation carried
-    // by driver events and deadlines. A late event can therefore miss; it
-    // can never address the new resident of the same physical slot.
-    slots: Vec<ChildArenaSlot>,
-    free: Vec<usize>,
-    len: usize,
+    // Keys are insertion-order ids and are never reused. A late event can
+    // therefore miss; it can never address a subsequently inserted child.
+    children: BTreeMap<ChildKey, ChildRuntime>,
+    // `u64::MAX` is poison and is never minted. Once exhausted, every later
+    // insertion fails closed instead of wrapping into the live key domain.
+    next_key: u64,
 }
 
 impl ChildArena {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            slots: Vec::with_capacity(capacity),
-            free: Vec::new(),
-            len: 0,
+    fn insert(&mut self, child: ChildRuntime) -> Result<ChildKey, Box<ChildRuntime>> {
+        let Some(next) = self.next_key.checked_add(1) else {
+            return Err(Box::new(child));
+        };
+        if next == u64::MAX {
+            self.next_key = u64::MAX;
+            return Err(Box::new(child));
         }
-    }
-
-    fn insert(&mut self, child: ChildRuntime) -> ChildKey {
-        self.len += 1;
-        if let Some(index) = self.free.pop() {
-            let slot = &mut self.slots[index];
-            debug_assert!(slot.child.is_none());
-            slot.child = Some(child);
-            ChildKey {
-                index,
-                generation: slot.generation,
-            }
-        } else {
-            let index = self.slots.len();
-            self.slots.push(ChildArenaSlot {
-                generation: 0,
-                child: Some(child),
-            });
-            ChildKey {
-                index,
-                generation: 0,
-            }
-        }
+        self.next_key = next;
+        let key = ChildKey(next);
+        let replaced = self.children.insert(key, child);
+        debug_assert!(replaced.is_none(), "monotonic child keys are never reused");
+        Ok(key)
     }
 
     fn get(&self, key: ChildKey) -> Option<&ChildRuntime> {
-        self.slots
-            .get(key.index)
-            .filter(|slot| slot.generation == key.generation)
-            .and_then(|slot| slot.child.as_ref())
+        self.children.get(&key)
     }
 
     fn get_mut(&mut self, key: ChildKey) -> Option<&mut ChildRuntime> {
-        self.slots
-            .get_mut(key.index)
-            .filter(|slot| slot.generation == key.generation)
-            .and_then(|slot| slot.child.as_mut())
+        self.children.get_mut(&key)
     }
 
     fn remove(&mut self, key: ChildKey) -> Option<ChildRuntime> {
-        let slot = self.slots.get_mut(key.index)?;
-        if slot.generation != key.generation {
-            return None;
-        }
-        let child = slot.child.take()?;
-        self.len -= 1;
-        if let Some(next) = slot.generation.checked_add(1) {
-            slot.generation = next;
-            self.free.push(key.index);
-        }
-        Some(child)
-    }
-
-    fn key_at(&self, index: usize) -> Option<ChildKey> {
-        self.slots.get(index).and_then(|slot| {
-            slot.child.as_ref().map(|_| ChildKey {
-                index,
-                generation: slot.generation,
-            })
-        })
+        self.children.remove(&key)
     }
 
     fn keys(&self) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
-        self.slots.iter().enumerate().filter_map(|(index, slot)| {
-            slot.child.as_ref().map(|_| ChildKey {
-                index,
-                generation: slot.generation,
-            })
-        })
+        self.children.keys().copied()
+    }
+
+    fn keys_after(&self, key: ChildKey) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
+        self.children
+            .range((Bound::Excluded(key), Bound::Unbounded))
+            .map(|(key, _)| *key)
     }
 
     fn values(&self) -> impl Iterator<Item = &ChildRuntime> {
-        self.slots.iter().filter_map(|slot| slot.child.as_ref())
+        self.children.values()
     }
 
     fn values_mut(&mut self) -> impl Iterator<Item = &mut ChildRuntime> {
-        self.slots.iter_mut().filter_map(|slot| slot.child.as_mut())
+        self.children.values_mut()
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
-        self.len
+        self.children.len()
     }
 
     fn is_empty(&self) -> bool {
-        self.len == 0
+        self.children.is_empty()
     }
 
     fn clear(&mut self) {
-        self.slots.clear();
-        self.free.clear();
-        self.len = 0;
+        self.children.clear();
     }
 
     #[cfg(test)]
     fn storage_len(&self) -> usize {
-        self.slots.len()
+        self.children.len()
     }
 }
 
@@ -2199,16 +888,16 @@ impl IndexMut<ChildKey> for ChildArena {
 
 struct ScopeRuntime {
     root: Arc<ScopeCell>,
-    flavor: ScopeFlavor,
     defaults: ResolvedDefaults,
     intensity_policy: crate::Intensity,
     intensity: IntensityState,
     children: ChildArena,
     events: runtime::MpscSender<DriverEvent>,
+    disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
-    phase: ScopePhase,
-    next_ordered_start: usize,
+    lifecycle: ScopeLifecycle,
+    next_ordered_start: Option<ChildKey>,
     is_root: bool,
     parent_ready: Option<Latch>,
     dynamic: Option<Arc<DynamicControl>>,
@@ -2231,7 +920,7 @@ impl Drop for ScopeRuntime {
     fn drop(&mut self) {
         let dynamic_entries = if let Some(dynamic) = &self.dynamic {
             let entries = dynamic.close();
-            self.root.set_dynamic(None);
+            self.root.set_dynamic_route(None);
             Some(entries)
         } else {
             None
@@ -2265,7 +954,7 @@ impl Drop for ScopeRuntime {
             let reason = completion
                 .as_ref()
                 .map(|completion| completion.reason.clone())
-                .or_else(|| self.phase.draining_reason().cloned())
+                .or_else(|| self.lifecycle.draining_reason().cloned())
                 .unwrap_or(StopReason::ShutdownRequested);
             if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
                 self.root.finish_root_incarnation(self.epoch, reason, exit);
@@ -2281,23 +970,327 @@ enum SpawnBody {
         spawn: RawSpawn,
         context: RawRunContext,
     },
-    TaskRestartable(TaskFactory),
-    TaskOnce(Box<dyn FnOnce(TaskContext) -> crate::task::TaskFuture + Send + 'static>),
+    TaskRestartable {
+        factory: TaskFactory,
+        context: TaskContext,
+    },
+    TaskOnce {
+        body: Box<dyn FnOnce(TaskContext) -> crate::task::TaskFuture + Send + 'static>,
+        context: TaskContext,
+    },
     ScopeRestartable {
         factory: ScopeFactory,
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
+        ready: Latch,
+        cancel: Latch,
+        abort: Latch,
+        abort_ack: Latch,
     },
     ScopeOnce {
         tree: Box<BuilderCore>,
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
+        ready: Latch,
+        cancel: Latch,
+        abort: Latch,
+        abort_ack: Latch,
     },
+}
+
+struct SpawnDispatch {
+    body: SpawnBody,
+    declared_readiness: Option<Readiness>,
+    construction_spent: bool,
+    scope_child: bool,
+}
+
+/// Latches have deliberately separate ownership:
+///
+/// - `shutdown`/`abort` are the child-facing cooperative ladder;
+/// - `framework_abort`/`framework_abort_ack` bound a nested scope driver's
+///   recursive drain before its task is aborted;
+/// - `construction_release` prevents a raw actor from running before the
+///   driver has installed the readiness mode reported by construction;
+/// - `ended` makes readiness and self-stop watcher tasks finite.
+struct SpawnLatches {
+    shutdown: Latch,
+    abort: Latch,
+    ready: Latch,
+    ended: Latch,
+    construction_release: Latch,
+    local_stop: Latch,
+    framework_abort: Latch,
+    framework_abort_ack: Latch,
+}
+
+struct ChildTaskLaunch {
+    events: runtime::MpscSender<DriverEvent>,
+    key: ChildKey,
+    incarnation: Incarnation,
+    body: SpawnBody,
+    readiness_override: Option<Readiness>,
+    watch_readiness: bool,
+    shutdown: Latch,
+    ready: Latch,
+    ended: Latch,
+    construction_release: Latch,
+    local_stop: Latch,
+}
+
+fn dispatch_child_construction(
+    child: &mut ChildRuntime,
+    root: &Arc<ScopeCell>,
+    defaults: &ResolvedDefaults,
+    incarnation: Incarnation,
+    latches: &SpawnLatches,
+) -> SpawnDispatch {
+    let id = child.slot.member.id().clone();
+    let construction = child.construction.get_mut();
+    match construction {
+        ChildConstruction::Raw(definition) => {
+            let construction_spent = definition.one_shot();
+            SpawnDispatch {
+                body: SpawnBody::Raw {
+                    spawn: definition.take_spawn(),
+                    context: RawRunContext {
+                        id,
+                        incarnation,
+                        member: Arc::clone(&child.slot.member),
+                        scope: crate::ScopeRef {
+                            cell: Arc::clone(root),
+                        },
+                        shutdown: latches.shutdown.clone(),
+                        abort: latches.abort.clone(),
+                        ready: latches.ready.clone(),
+                        local_stop: latches.local_stop.clone(),
+                        mailbox_shutdown: child.options.mailbox_shutdown,
+                    },
+                },
+                declared_readiness: None,
+                construction_spent,
+                scope_child: false,
+            }
+        }
+        ChildConstruction::Task(definition) => SpawnDispatch {
+            body: SpawnBody::TaskRestartable {
+                factory: Arc::clone(&definition.factory),
+                context: TaskContext::new(
+                    id,
+                    incarnation,
+                    latches.shutdown.clone(),
+                    latches.abort.clone(),
+                    latches.ready.clone(),
+                ),
+            },
+            declared_readiness: Some(child.options.readiness),
+            construction_spent: false,
+            scope_child: false,
+        },
+        ChildConstruction::TaskOnce(definition) => SpawnDispatch {
+            body: SpawnBody::TaskOnce {
+                body: definition.take_body(),
+                context: TaskContext::new(
+                    id,
+                    incarnation,
+                    latches.shutdown.clone(),
+                    latches.abort.clone(),
+                    latches.ready.clone(),
+                ),
+            },
+            declared_readiness: Some(child.options.readiness),
+            construction_spent: true,
+            scope_child: false,
+        },
+        ChildConstruction::Scope(definition) => {
+            let inherited = match definition.defaults {
+                DefaultsInheritance::Inherit => defaults.clone(),
+                DefaultsInheritance::Reset => ResolvedDefaults::default(),
+            };
+            let scope = Arc::clone(
+                child
+                    .slot
+                    .scope
+                    .as_ref()
+                    .expect("scope construction needs a scope cell"),
+            );
+            let (body, construction_spent) = if let Some(factory) = definition.restartable() {
+                (
+                    SpawnBody::ScopeRestartable {
+                        factory: Arc::clone(factory),
+                        scope,
+                        inherited,
+                        ready: latches.ready.clone(),
+                        cancel: latches.shutdown.clone(),
+                        abort: latches.framework_abort.clone(),
+                        abort_ack: latches.framework_abort_ack.clone(),
+                    },
+                    false,
+                )
+            } else {
+                (
+                    SpawnBody::ScopeOnce {
+                        tree: definition
+                            .take_one_shot()
+                            .expect("one-shot subtree construction invoked more than once"),
+                        scope,
+                        inherited,
+                        ready: latches.ready.clone(),
+                        cancel: latches.shutdown.clone(),
+                        abort: latches.framework_abort.clone(),
+                        abort_ack: latches.framework_abort_ack.clone(),
+                    },
+                    true,
+                )
+            };
+            SpawnDispatch {
+                body,
+                declared_readiness: Some(Readiness::Manual),
+                construction_spent,
+                scope_child: true,
+            }
+        }
+    }
+}
+
+fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
+    let ChildTaskLaunch {
+        events,
+        key,
+        incarnation,
+        body,
+        readiness_override,
+        watch_readiness,
+        shutdown,
+        ready,
+        ended,
+        construction_release,
+        local_stop,
+    } = launch;
+    let (report, report_receiver) = report_channel(shutdown, Some(local_stop.clone()));
+    let constructed_sender = events.clone();
+    let handle = runtime::spawn(async move {
+        let body = async move {
+            match body {
+                SpawnBody::Raw { spawn, context } => {
+                    let instance = spawn.construct();
+                    let readiness = readiness_override.unwrap_or_else(|| instance.readiness());
+                    let _ = runtime::mpsc_send(
+                        &constructed_sender,
+                        DriverEvent::Child(ChildEvent::Constructed {
+                            child: key,
+                            incarnation,
+                            readiness,
+                        }),
+                    )
+                    .await;
+                    construction_release.fired().await;
+                    instance.run(context, readiness).await
+                }
+                SpawnBody::TaskRestartable { factory, context } => factory(context).await,
+                SpawnBody::TaskOnce { body, context } => body(context).await,
+                SpawnBody::ScopeRestartable {
+                    factory,
+                    scope,
+                    inherited,
+                    ready,
+                    cancel,
+                    abort,
+                    abort_ack,
+                } => {
+                    run_nested_tree(factory(), scope, inherited, ready, cancel, abort, abort_ack)
+                        .await
+                }
+                SpawnBody::ScopeOnce {
+                    tree,
+                    scope,
+                    inherited,
+                    ready,
+                    cancel,
+                    abort,
+                    abort_ack,
+                } => {
+                    run_nested_tree(*tree, scope, inherited, ready, cancel, abort, abort_ack).await
+                }
+            }
+        };
+        let outcome = CatchUnwindFuture::new(body).await;
+        let result = match outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        report.record(RecordedOutcome::Returned(result));
+    });
+    let abort_handle = handle.abort_handle();
+
+    let exit_sender = events.clone();
+    let exit_ended = ended.clone();
+    runtime::spawn(async move {
+        let join = match runtime::join(handle).await {
+            runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
+            runtime::JoinOutcome::Panic { message, .. } => JoinVerdict::Panicked { message },
+            runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled { after_grace: false },
+        };
+        exit_ended.fire();
+        // The task owns `report`, whose explicit record or Drop fallback runs
+        // before the join completes. Therefore this blocking receive cannot
+        // wait on a producer that is still schedulable on this worker.
+        let report = report_receiver.receive();
+        let _ = runtime::mpsc_send(
+            &exit_sender,
+            DriverEvent::Child(ChildEvent::Exited {
+                child: key,
+                incarnation,
+                recorded: report.outcome,
+                join,
+                cancelled: report.cancelled,
+            }),
+        )
+        .await;
+    });
+
+    if watch_readiness {
+        let ready_sender = events.clone();
+        let ready_ended = ended.clone();
+        runtime::spawn(async move {
+            if matches!(
+                runtime::select_two(ready.fired(), ready_ended.fired()).await,
+                runtime::Either::Left(())
+            ) {
+                let _ = runtime::mpsc_send(
+                    &ready_sender,
+                    DriverEvent::Child(ChildEvent::Ready {
+                        child: key,
+                        incarnation,
+                    }),
+                )
+                .await;
+            }
+        });
+    }
+
+    runtime::spawn(async move {
+        if matches!(
+            runtime::select_two(local_stop.fired(), ended.fired()).await,
+            runtime::Either::Left(())
+        ) {
+            let _ = runtime::mpsc_send(
+                &events,
+                DriverEvent::Child(ChildEvent::SelfStop {
+                    child: key,
+                    incarnation,
+                }),
+            )
+            .await;
+        }
+    });
+
+    abort_handle
 }
 
 impl ScopeRuntime {
     fn restart_is_suppressed(&self, key: ChildKey) -> bool {
-        if self.phase.is_draining()
+        if self.lifecycle.is_draining()
             || self.hard_forced
             || self.root.has_stop_request(self.epoch)
             || self.ancestor_shutdown.as_ref().is_some_and(Latch::is_fired)
@@ -2359,23 +1352,19 @@ impl ScopeRuntime {
 
     #[cfg(test)]
     fn record_storage(&self) {
-        *self
-            .root
-            .runtime_storage
-            .lock()
-            .expect("runtime-storage mutex poisoned") = RuntimeStorage {
+        self.root.record_runtime_storage(RuntimeStorage {
             children: self.children.len(),
             child_slots: self.children.storage_len(),
             deadlines: self.deadlines.len(),
             deadline_slots: self.deadlines.storage_len(),
-        };
+        });
     }
 
     fn spawn_child(&mut self, key: ChildKey) {
         let Some(child) = self.children.get(key) else {
             return;
         };
-        if self.phase.is_draining()
+        if self.lifecycle.is_draining()
             || child.active.is_some()
             || child.is_terminal()
             || child.is_disposing()
@@ -2387,157 +1376,53 @@ impl ScopeRuntime {
             self.deadlines.cancel(deadline);
         }
         let Some(incarnation) = mint_child_incarnation(&child.slot, &mut child.incarnations) else {
-            child.complete_terminality();
-            // Incarnation exhaustion terminalized the membership (§3.1):
-            // publish the observation edges, then route the terminal outcome
-            // through the same paths as a terminal exit so ordered startup
-            // fails or draining advances instead of wedging the scope.
-            self.root.transition_child(&child.slot.member, |_| {}, None);
-            if child.options.retention == crate::Retention::Remove {
-                self.root.prune_child(&child.slot.member);
-            }
-            if let Some(construction) = child.construction.take() {
-                runtime::dispose_detached(construction);
-            }
-            let exit = match child.slot.member.record().stage {
-                MemberStage::Terminal(exit) => exit,
-                _ => Exit::never_started(),
-            };
-            let pre_ready = child.initial && !self.phase.startup_complete() && !child.initial_ready;
-            let removing = child.slot.member.record().removing;
-            let retention_remove = child.options.retention == crate::Retention::Remove;
-            if removing {
-                self.finalize_removal(key);
-            } else if pre_ready && !self.phase.is_draining() {
-                self.fail_startup(key, exit);
-            } else {
-                if retention_remove {
-                    self.prune_terminal(key);
-                }
-                if self.phase.is_draining() {
-                    self.stop_next_ordered();
-                }
-            }
+            let exit = child
+                .slot
+                .member
+                .record()
+                .last_exit
+                .unwrap_or_else(Exit::never_started);
+            let pre_ready =
+                child.initial && !self.lifecycle.startup_complete() && !child.initial_ready;
+            // Exhaustion is a terminal outcome, not an exceptional cleanup
+            // path. Join retained-definition disposal before terminality,
+            // retention, removal completion, or ordered-scope progression.
+            self.begin_terminal_disposal(key, exit, None, pre_ready);
             return;
         };
 
-        let shutdown = Latch::default();
-        let abort = Latch::default();
-        let ready = Latch::default();
-        let ended = Latch::default();
-        let construction_release = Latch::default();
-        let local_stop = Latch::default();
-        let id = child.slot.member.id().clone();
-        let task_context = TaskContext::new(
-            id.clone(),
-            incarnation,
-            shutdown.clone(),
-            abort.clone(),
-            ready.clone(),
-        );
-        let construction = child.construction.get_mut();
-        let scope_child = matches!(construction, ChildConstruction::Scope(_));
-        let (body, declared_readiness, construction_spent) = match construction {
-            ChildConstruction::Raw(definition) => {
-                let one_shot = definition.one_shot();
-                let spawn = definition.take_spawn();
-                (
-                    SpawnBody::Raw {
-                        spawn,
-                        context: RawRunContext {
-                            id,
-                            incarnation,
-                            member: Arc::clone(&child.slot.member),
-                            scope: crate::ScopeRef {
-                                cell: Arc::clone(&self.root),
-                            },
-                            shutdown: shutdown.clone(),
-                            abort: abort.clone(),
-                            ready: ready.clone(),
-                            local_stop: local_stop.clone(),
-                            mailbox_shutdown: child.options.mailbox_shutdown,
-                        },
-                    },
-                    None,
-                    one_shot,
-                )
-            }
-            ChildConstruction::Task(definition) => {
-                let factory = Arc::clone(&definition.factory);
-                (
-                    SpawnBody::TaskRestartable(factory),
-                    Some(child.options.readiness),
-                    false,
-                )
-            }
-            ChildConstruction::TaskOnce(definition) => {
-                let body = std::mem::replace(&mut definition.body, OnceTaskBody::Spent);
-                match body {
-                    OnceTaskBody::Available(body) => (
-                        SpawnBody::TaskOnce(body),
-                        Some(child.options.readiness),
-                        true,
-                    ),
-                    OnceTaskBody::Spent => {
-                        panic!("one-shot task construction invoked more than once")
-                    }
-                }
-            }
-            ChildConstruction::Scope(definition) => {
-                let inherited = match definition.defaults {
-                    DefaultsInheritance::Inherit => self.defaults.clone(),
-                    DefaultsInheritance::Reset => ResolvedDefaults::default(),
-                };
-                match &mut definition.source {
-                    ScopeSource::Restartable(factory) => (
-                        SpawnBody::ScopeRestartable {
-                            factory: Arc::clone(factory),
-                            scope: Arc::clone(
-                                child
-                                    .slot
-                                    .scope
-                                    .as_ref()
-                                    .expect("scope construction needs a scope cell"),
-                            ),
-                            inherited,
-                        },
-                        Some(Readiness::Manual),
-                        false,
-                    ),
-                    ScopeSource::OneShot(_) => {
-                        let source = std::mem::replace(&mut definition.source, ScopeSource::Spent);
-                        let ScopeSource::OneShot(tree) = source else {
-                            unreachable!()
-                        };
-                        (
-                            SpawnBody::ScopeOnce {
-                                tree,
-                                scope: Arc::clone(
-                                    child
-                                        .slot
-                                        .scope
-                                        .as_ref()
-                                        .expect("scope construction needs a scope cell"),
-                                ),
-                                inherited,
-                            },
-                            Some(Readiness::Manual),
-                            true,
-                        )
-                    }
-                    ScopeSource::Spent => {
-                        panic!("one-shot subtree construction invoked more than once")
-                    }
-                }
-            }
+        // Per-incarnation latch topology:
+        // - shutdown/abort flow from the ladder into application code;
+        // - ready and local_stop flow from application code back to helpers;
+        // - ended terminates those helpers when the child exits first;
+        // - construction_release keeps a raw actor behind the driver-owned
+        //   readiness transition after its construction report is accepted;
+        // - framework_abort/ack join nested-scope escalation before exit.
+        // Each edge is level-triggered, so helper startup cannot lose a pulse.
+        let latches = SpawnLatches {
+            shutdown: Latch::default(),
+            abort: Latch::default(),
+            ready: Latch::default(),
+            ended: Latch::default(),
+            construction_release: Latch::default(),
+            local_stop: Latch::default(),
+            framework_abort: Latch::default(),
+            framework_abort_ack: Latch::default(),
         };
-        let construction_pending = declared_readiness.is_none();
-        let gated = scope_child
-            || declared_readiness.is_none_or(|readiness| readiness != Readiness::Immediate);
-
+        let SpawnDispatch {
+            body,
+            declared_readiness,
+            construction_spent,
+            scope_child,
+        } = dispatch_child_construction(child, &self.root, &self.defaults, incarnation, &latches);
         let now = runtime::now();
         child.spawned_once = true;
         if let Some(mailbox) = child.slot.member.mailbox() {
+            #[cfg(debug_assertions)]
+            debug_assert!(
+                mailbox.bind_order_valid(),
+                "driver must configure before bind and close before rebind"
+            );
             mailbox.bind(incarnation);
         }
         self.root.transition_child(
@@ -2555,50 +1440,19 @@ impl ScopeRuntime {
             }),
         );
 
-        let (readiness, readiness_deadline) = if construction_pending {
-            (ReadinessGate::Waiting { deadline: None }, None)
-        } else if !gated {
-            ready.fire();
-            child.initial_ready = true;
-            self.root.transition_child(
-                &child.slot.member,
-                |record| record.stage = MemberStage::Running,
-                Some(LifecycleEventKind::Ready {
-                    id: child.slot.member.id().clone(),
-                    membership: child.slot.member.membership(),
-                    incarnation,
-                }),
-            );
-            (ReadinessGate::Immediate, None)
-        } else {
-            let (deadline, handle) = match child.options.readiness_deadline {
-                ReadinessDeadline::Bounded(duration) => {
-                    let deadline = Deadline::after(now, duration).instant();
-                    let handle = deadline.map(|deadline| {
-                        self.deadlines.push(
-                            deadline,
-                            DeadlineKind::Readiness {
-                                child: key,
-                                incarnation,
-                            },
-                        )
-                    });
-                    (deadline, handle)
-                }
-                ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => (None, None),
+        let mut readiness = ReadinessGate::new();
+        let readiness_effect = declared_readiness.and_then(|readiness_mode| {
+            let deadline = match child.options.readiness_deadline {
+                ReadinessDeadline::Bounded(duration) => Deadline::after(now, duration).instant(),
+                ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
             };
-            (ReadinessGate::Waiting { deadline }, handle)
-        };
+            readiness.step(ReadinessEvent::Configure {
+                readiness: readiness_mode,
+                deadline,
+            })
+        });
+        let gated = readiness.needs_signal_watch();
 
-        let (report, report_receiver) = report_channel(shutdown.clone(), Some(local_stop.clone()));
-        let nested_ready = ready.clone();
-        let nested_cancel = shutdown.clone();
-        let framework_abort = Latch::default();
-        let nested_abort = framework_abort.clone();
-        let framework_abort_ack = Latch::default();
-        let nested_abort_ack = framework_abort_ack.clone();
-        let constructed_sender = self.events.clone();
-        let run_release = construction_release.clone();
         let child_readiness_override = child.options.readiness_override;
         if construction_spent {
             // One-shot actor/task/subtree state has moved into `body`; the
@@ -2607,173 +1461,121 @@ impl ScopeRuntime {
             // terminal publication or restart-window arbitration.
             drop(child.construction.take());
         }
-        let handle = runtime::spawn(incarnation, async move {
-            let body = async move {
-                match body {
-                    SpawnBody::Raw { spawn, context } => {
-                        let instance = spawn.construct();
-                        let readiness = match child_readiness_override {
-                            Some(readiness) => readiness,
-                            None => instance.readiness(),
-                        };
-                        let _ = runtime::mpsc_send(
-                            &constructed_sender,
-                            DriverEvent::Child(ChildEvent::Constructed {
-                                child: key,
-                                incarnation,
-                                readiness,
-                            }),
-                        )
-                        .await;
-                        run_release.fired().await;
-                        instance.run(context, readiness).await
-                    }
-                    SpawnBody::TaskRestartable(factory) => {
-                        let future = factory(task_context);
-                        future.await
-                    }
-                    SpawnBody::TaskOnce(body) => body(task_context).await,
-                    SpawnBody::ScopeRestartable {
-                        factory,
-                        scope,
-                        inherited,
-                    } => {
-                        let tree = factory();
-                        run_nested_tree(
-                            tree,
-                            scope,
-                            inherited,
-                            nested_ready,
-                            nested_cancel,
-                            nested_abort,
-                            nested_abort_ack,
-                        )
-                        .await
-                    }
-                    SpawnBody::ScopeOnce {
-                        tree,
-                        scope,
-                        inherited,
-                    } => {
-                        run_nested_tree(
-                            *tree,
-                            scope,
-                            inherited,
-                            nested_ready,
-                            nested_cancel,
-                            nested_abort,
-                            nested_abort_ack,
-                        )
-                        .await
-                    }
-                }
-            };
-            let outcome = CatchUnwindFuture::new(body).await;
-            let result = match outcome {
-                Ok(result) => result,
-                Err(payload) => std::panic::resume_unwind(payload),
-            };
-            report.record(RecordedOutcome::Returned(result));
-        });
-        let abort_handle = handle.abort_handle();
-        let exit_sender = self.events.clone();
-        let exit_ended = ended.clone();
-        runtime::spawn((), async move {
-            let join = match runtime::join(handle).await {
-                runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
-                runtime::JoinOutcome::Panic { message, .. } => JoinVerdict::Panicked { message },
-                runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled { after_grace: false },
-            };
-            exit_ended.fire();
-            let report = report_receiver.receive();
-            let _ = runtime::mpsc_send(
-                &exit_sender,
-                DriverEvent::Child(ChildEvent::Exited {
-                    child: key,
-                    incarnation,
-                    recorded: report.outcome,
-                    join,
-                    cancelled: report.cancelled,
-                }),
-            )
-            .await;
-        });
-
-        let readiness_signal = ready.clone();
-        let self_stop_ended = ended.clone();
-        if gated {
-            let ready_sender = self.events.clone();
-            runtime::spawn((), async move {
-                if matches!(
-                    runtime::select_two(ready.fired(), ended.fired()).await,
-                    runtime::Either::Left(())
-                ) {
-                    let _ = runtime::mpsc_send(
-                        &ready_sender,
-                        DriverEvent::Child(ChildEvent::Ready {
-                            child: key,
-                            incarnation,
-                        }),
-                    )
-                    .await;
-                }
-            });
-        }
-        let self_stop_sender = self.events.clone();
-        runtime::spawn((), async move {
-            if matches!(
-                runtime::select_two(local_stop.fired(), self_stop_ended.fired()).await,
-                runtime::Either::Left(())
-            ) {
-                let _ = runtime::mpsc_send(
-                    &self_stop_sender,
-                    DriverEvent::Child(ChildEvent::SelfStop {
-                        child: key,
-                        incarnation,
-                    }),
-                )
-                .await;
-            }
+        let abort_handle = spawn_child_tasks(ChildTaskLaunch {
+            events: self.events.clone(),
+            key,
+            incarnation,
+            body,
+            readiness_override: child_readiness_override,
+            watch_readiness: gated,
+            shutdown: latches.shutdown.clone(),
+            ready: latches.ready.clone(),
+            ended: latches.ended.clone(),
+            construction_release: latches.construction_release.clone(),
+            local_stop: latches.local_stop.clone(),
         });
 
         child.active = Some(ActiveChild {
             incarnation,
             started_at: now,
-            shutdown,
-            abort,
+            shutdown: latches.shutdown,
+            abort: latches.abort,
             abort_handle,
             ladder: None,
             forced_outcome: None,
             hard_abort_after_grace: None,
             readiness,
-            readiness_deadline,
-            ready_signal: readiness_signal,
-            construction_release,
-            framework_abort: scope_child.then_some(framework_abort),
-            framework_abort_ack: scope_child.then_some(framework_abort_ack),
-            framework_abort_deadline: None,
+            readiness_deadline: None,
+            ready_signal: latches.ready,
+            construction_release: latches.construction_release,
+            framework_abort: scope_child.then_some(latches.framework_abort),
+            framework_abort_ack: scope_child.then_some(latches.framework_abort_ack),
             stop_deadline: None,
         });
+        if let Some(effect) = readiness_effect {
+            // `progress_startup` already owns this ordered-startup loop. Do
+            // not re-enter it synchronously for an immediate child.
+            let _ = self.apply_readiness_effect(key, incarnation, effect);
+        }
         #[cfg(test)]
         self.record_storage();
     }
 
+    fn apply_readiness_effect(
+        &mut self,
+        key: ChildKey,
+        incarnation: Incarnation,
+        effect: ReadinessEffect,
+    ) -> bool {
+        match effect {
+            ReadinessEffect::ArmDeadline { deadline } => {
+                let handle = self.deadlines.push(
+                    deadline,
+                    DeadlineKind::Readiness {
+                        child: key,
+                        incarnation,
+                    },
+                );
+                if let Some(active) = self
+                    .children
+                    .get_mut(key)
+                    .and_then(|child| child.active.as_mut())
+                    && active.incarnation == incarnation
+                {
+                    active.readiness_deadline = Some(handle);
+                } else {
+                    self.deadlines.cancel(handle);
+                }
+                false
+            }
+            ReadinessEffect::BecameReady => {
+                let Some(child) = self.children.get_mut(key) else {
+                    return false;
+                };
+                let Some(active) = child.active.as_mut() else {
+                    return false;
+                };
+                if active.incarnation != incarnation {
+                    return false;
+                }
+                if let Some(deadline) = active.readiness_deadline.take() {
+                    self.deadlines.cancel(deadline);
+                }
+                active.ready_signal.fire();
+                if !self.lifecycle.startup_complete() {
+                    child.initial_ready = true;
+                }
+                self.root.transition_child(
+                    &child.slot.member,
+                    |record| record.stage = MemberStage::Running,
+                    Some(LifecycleEventKind::Ready {
+                        id: child.slot.member.id().clone(),
+                        membership: child.slot.member.membership(),
+                        incarnation,
+                    }),
+                );
+                true
+            }
+            ReadinessEffect::TimedOut { deadline } => {
+                self.begin_stop_child(key, Some(RecordedOutcome::ReadinessTimedOut { deadline }));
+                false
+            }
+            ReadinessEffect::Disarmed => false,
+        }
+    }
+
     fn progress_startup(&mut self) {
-        if self.phase != ScopePhase::Starting {
+        if !self.lifecycle.is_starting() {
             return;
         }
-        match self.flavor {
+        match self.root.flavor {
             ScopeFlavor::Ordered => {
-                while self.next_ordered_start < self.children.len() {
-                    let key = self
-                        .children
-                        .key_at(self.next_ordered_start)
-                        .expect("ordered children are never reclaimed during startup");
+                while let Some(key) = self.next_ordered_start {
                     if !self.children[key].spawned_once {
                         self.spawn_child(key);
                     }
                     if self.children[key].initial_ready {
-                        self.next_ordered_start += 1;
+                        self.next_ordered_start = self.children.keys_after(key).next();
                     } else {
                         return;
                     }
@@ -2801,7 +1603,9 @@ impl ScopeRuntime {
     }
 
     fn complete_startup(&mut self) {
-        self.phase = ScopePhase::Running;
+        if !self.lifecycle.complete_startup() {
+            return;
+        }
         self.root.set_state(ScopeState::Running);
         self.root.set_startup(Ok(()));
         if let Some(parent_ready) = &self.parent_ready {
@@ -2838,7 +1642,11 @@ impl ScopeRuntime {
             if active.forced_outcome.is_none() {
                 active.readiness.step(ReadinessEvent::Shutdown);
             }
-            active.ladder = Some(StopLadder::new(child.options.shutdown));
+            active.ladder = Some(if active.framework_abort.is_some() {
+                StopLadder::for_framework_driver(child.options.shutdown)
+            } else {
+                StopLadder::new(child.options.shutdown)
+            });
             self.advance_ladder(key, runtime::now());
         } else {
             if let Some(deadline) = child.restart_deadline.take() {
@@ -2846,28 +1654,10 @@ impl ScopeRuntime {
             }
             let record = child.slot.member.record();
             let exit = record.last_exit.unwrap_or_else(Exit::never_started);
-            if record.last_incarnation.is_none() {
-                if let Some(scope) = &child.slot.scope {
-                    scope.terminalize_never_started();
-                }
-                // A never-ran terminal is the plain `Stopped { NeverStarted }`
-                // state (B.6), not a §6 startup abort. Its definition still
-                // owns the only user resource, so join disposal before
-                // completing the scope, while publishing the never-started
-                // member state synchronously for startup observation.
-                self.begin_terminal_disposal(key, exit, None, false);
-                self.children[key].terminalize(&self.root, Exit::never_started(), None, false);
-            } else {
-                // Between incarnations, the recorded exit already owns the
-                // child verdict. There is no incarnation left to classify a
-                // later factory destructor, so publish synchronously and
-                // isolate cleanup without turning it into a shutdown
-                // straggler (including for a zero shutdown budget).
-                child.terminalize(&self.root, exit, None, false);
-                if let Some(construction) = child.construction.take() {
-                    runtime::dispose_detached(construction);
-                }
-            }
+            // A never-ran child and a child stopped between restart
+            // incarnations share the same post-disposal terminal route. Hard
+            // shutdown still detaches disposal through `hard_forced` below.
+            self.begin_terminal_disposal(key, exit, None, false);
         }
     }
 
@@ -2884,6 +1674,13 @@ impl ScopeRuntime {
         let Some(ladder) = &mut active.ladder else {
             return;
         };
+        if active
+            .framework_abort_ack
+            .as_ref()
+            .is_some_and(Latch::is_fired)
+        {
+            ladder.acknowledge_framework_abort();
+        }
         while let Some(action) = ladder.advance(now) {
             match action {
                 StopAction::Cancel => {
@@ -2892,37 +1689,25 @@ impl ScopeRuntime {
                 StopAction::Escalate => {
                     active.abort.fire();
                 }
+                StopAction::AbortFramework { after_grace } => {
+                    active.hard_abort_after_grace = Some(after_grace);
+                    if active.forced_outcome.is_none() {
+                        active.forced_outcome = Some(RecordedOutcome::Aborted { after_grace });
+                    }
+                    active
+                        .framework_abort
+                        .as_ref()
+                        .expect("framework action belongs only to a framework driver")
+                        .fire();
+                }
                 StopAction::HardAbort { after_grace } => {
                     active.hard_abort_after_grace = Some(after_grace);
-                    if let Some(abort) = &active.framework_abort {
-                        if active.forced_outcome.is_none() {
-                            active.forced_outcome = Some(RecordedOutcome::Aborted { after_grace });
-                        }
-                        abort.fire();
-                        active.framework_abort_deadline =
-                            Deadline::after(now, crate::policy::tidy_abort_beat(Duration::ZERO))
-                                .instant();
-                    } else {
-                        active.abort_handle.abort();
-                    }
+                    active.abort_handle.abort();
                 }
             }
         }
         let ladder_deadline = ladder.deadline();
-        if active
-            .framework_abort_deadline
-            .is_some_and(|deadline| now >= deadline)
-        {
-            active.framework_abort_deadline = None;
-            if active
-                .framework_abort_ack
-                .as_ref()
-                .is_none_or(|ack| !ack.is_fired())
-            {
-                active.abort_handle.abort();
-            }
-        }
-        if let Some(deadline) = ladder_deadline.or(active.framework_abort_deadline) {
+        if let Some(deadline) = ladder_deadline {
             active.stop_deadline = Some(self.deadlines.push(
                 deadline,
                 DeadlineKind::Stop {
@@ -2934,15 +1719,14 @@ impl ScopeRuntime {
     }
 
     fn begin_drain(&mut self, reason: StopReason) {
-        let startup_pending = self.phase == ScopePhase::Starting;
-        if !self.phase.begin_drain(reason) {
+        let Some(effect) = self.lifecycle.begin_drain(reason) else {
             return;
-        }
-        if startup_pending {
+        };
+        if effect.startup_pending {
             self.root.set_startup(Err(StartupError::ShutdownRequested));
         }
         self.root.set_state(ScopeState::Draining);
-        match self.flavor {
+        match self.root.flavor {
             ScopeFlavor::Ordered => self.stop_next_ordered(),
             ScopeFlavor::Dynamic => {
                 let children: Vec<_> = self.children.keys().collect();
@@ -2954,7 +1738,7 @@ impl ScopeRuntime {
     }
 
     fn stop_next_ordered(&mut self) {
-        if self.flavor != ScopeFlavor::Ordered || !self.phase.is_draining() {
+        if self.root.flavor != ScopeFlavor::Ordered || !self.lifecycle.is_draining() {
             return;
         }
         loop {
@@ -2972,22 +1756,24 @@ impl ScopeRuntime {
 
     fn force_all(&mut self) {
         self.hard_forced = true;
-        if !self.phase.is_draining() {
+        if !self.lifecycle.is_draining() {
             self.begin_drain(StopReason::ShutdownRequested);
         }
         let now = runtime::now();
         let children: Vec<_> = self.children.keys().collect();
         for key in children {
-            let child = &mut self.children[key];
-            let Some(active) = &mut child.active else {
-                continue;
-            };
-            let mut ladder = StopLadder::new(crate::Shutdown::Abort);
-            let _ = ladder.advance(now);
-            let _ = ladder.advance(now);
-            active.shutdown.fire();
-            active.abort.fire();
-            active.ladder = Some(ladder);
+            // Every live membership enters the same stop funnel first. That
+            // owns mailbox freeze, readiness disarm, ordered-child handling,
+            // and the initial cooperative action.
+            self.begin_stop_child(key, None);
+            if let Some(ladder) = self
+                .children
+                .get_mut(key)
+                .and_then(|child| child.active.as_mut())
+                .and_then(|active| active.ladder.as_mut())
+            {
+                ladder.force(now);
+            }
             self.advance_ladder(key, now);
         }
         let disposing = self
@@ -3009,9 +1795,7 @@ impl ScopeRuntime {
         incarnation: Incarnation,
         readiness: Readiness,
     ) {
-        let mut became_ready = false;
-        let mut deadline_to_arm = None;
-        {
+        let effect = {
             let Some(child) = self.children.get_mut(key) else {
                 return;
             };
@@ -3025,49 +1809,29 @@ impl ScopeRuntime {
                 active.construction_release.fire();
                 return;
             }
-            if readiness == Readiness::Immediate {
-                active.readiness = ReadinessGate::Immediate;
-                active.ready_signal.fire();
-                if !self.phase.startup_complete() {
-                    child.initial_ready = true;
+            let deadline = match child.options.readiness_deadline {
+                ReadinessDeadline::Bounded(duration) => {
+                    Deadline::after(active.started_at, duration).instant()
                 }
-                self.root.transition_child(
-                    &child.slot.member,
-                    |record| record.stage = MemberStage::Running,
-                    Some(LifecycleEventKind::Ready {
-                        id: child.slot.member.id().clone(),
-                        membership: child.slot.member.membership(),
-                        incarnation,
-                    }),
-                );
-                became_ready = true;
-            } else {
-                let deadline = match child.options.readiness_deadline {
-                    ReadinessDeadline::Bounded(duration) => {
-                        Deadline::after(active.started_at, duration).instant()
-                    }
-                    ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
-                };
-                active.readiness = ReadinessGate::Waiting { deadline };
-                deadline_to_arm = deadline;
-            }
-            active.construction_release.fire();
-        }
-        if let Some(deadline) = deadline_to_arm {
-            let handle = self.deadlines.push(
+                ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
+            };
+            active.readiness.step(ReadinessEvent::Configure {
+                readiness,
                 deadline,
-                DeadlineKind::Readiness {
-                    child: key,
-                    incarnation,
-                },
-            );
-            if let Some(active) = self.children[key].active.as_mut()
-                && active.incarnation == incarnation
-            {
-                active.readiness_deadline = Some(handle);
-            } else {
-                self.deadlines.cancel(handle);
-            }
+            })
+        };
+        let became_ready = effect
+            .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
+            .unwrap_or(false);
+        if let Some(active) = self
+            .children
+            .get(key)
+            .and_then(|child| child.active.as_ref())
+            .filter(|active| active.incarnation == incarnation)
+        {
+            // Readiness state and all shell effects are installed before raw
+            // actor execution is released.
+            active.construction_release.fire();
         }
         if became_ready {
             self.progress_startup();
@@ -3075,38 +1839,20 @@ impl ScopeRuntime {
     }
 
     fn handle_ready(&mut self, key: ChildKey, incarnation: Incarnation) {
-        let Some(child) = self.children.get_mut(key) else {
-            return;
-        };
-        let Some(active) = child.active.as_mut() else {
-            return;
-        };
-        if active.incarnation != incarnation
-            || !matches!(
-                active.readiness.step(ReadinessEvent::Signal),
-                Some(ReadinessEffect::BecameReady)
-            )
-        {
-            return;
+        let effect = self
+            .children
+            .get_mut(key)
+            .and_then(|child| child.active.as_mut())
+            .filter(|active| active.incarnation == incarnation)
+            .and_then(|active| active.readiness.step(ReadinessEvent::Signal));
+        let became_ready = effect
+            .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
+            .unwrap_or(false);
+        if became_ready {
+            self.progress_startup();
         }
-        if let Some(deadline) = active.readiness_deadline.take() {
-            self.deadlines.cancel(deadline);
-        }
-        if !self.phase.startup_complete() {
-            child.initial_ready = true;
-        }
-        self.root.transition_child(
-            &child.slot.member,
-            |record| record.stage = MemberStage::Running,
-            Some(LifecycleEventKind::Ready {
-                id: child.slot.member.id().clone(),
-                membership: child.slot.member.membership(),
-                incarnation,
-            }),
-        );
         #[cfg(test)]
         self.record_storage();
-        self.progress_startup();
     }
 
     fn handle_self_stop(&mut self, key: ChildKey, incarnation: Incarnation) {
@@ -3155,14 +1901,15 @@ impl ScopeRuntime {
         {
             join = JoinVerdict::Cancelled { after_grace };
         }
-        let recorded = active.forced_outcome.or(recorded);
+        let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
         let exit = classify_exit(recorded, join, cancelled);
-        let ran_for = runtime::now().saturating_duration_since(active.started_at);
-        if ran_for >= self.intensity_policy.within {
-            child.restarts.settled();
-        }
+        child.restarts.settle_if_stable(
+            active.started_at,
+            runtime::now(),
+            self.intensity_policy.within,
+        );
 
-        let mode = if self.phase.is_draining() {
+        let mode = if self.lifecycle.is_draining() {
             ScopeMode::Draining
         } else {
             ScopeMode::Running
@@ -3179,11 +1926,11 @@ impl ScopeRuntime {
                 // later incarnation stopped pre-ready (e.g. during drain)
                 // does not rewind it.
                 let pre_ready =
-                    child.initial && !self.phase.startup_complete() && !child.initial_ready;
+                    child.initial && !self.lifecycle.startup_complete() && !child.initial_ready;
                 self.begin_terminal_disposal(key, exit, Some(incarnation), pre_ready);
             }
             ExitDispatch::ScheduleRestart => {
-                if !self.phase.startup_complete() {
+                if !self.lifecycle.startup_complete() {
                     child.initial_ready = false;
                 }
                 let sample = self.jitter.sample(0..u64::MAX) as f64 / u64::MAX as f64;
@@ -3228,7 +1975,7 @@ impl ScopeRuntime {
                         observed_restarts: decision.charge.in_window,
                         within: self.intensity_policy.within,
                     };
-                    if self.phase == ScopePhase::Starting {
+                    if self.lifecycle.is_starting() {
                         self.root
                             .set_startup(Err(StartupError::IntensityTripped(trip.clone())));
                     }
@@ -3281,12 +2028,17 @@ impl ScopeRuntime {
         // The retained factory is user-owned. Destroy it on the blocking
         // pool. The disposal job itself owns completion, so cancellation or
         // failure to spawn an auxiliary async joiner cannot strand the child.
-        let sender = self.events.clone();
+        let sender = self.disposal_events.clone();
+        let signal = self.root.signal().clone();
         runtime::dispose_then(construction, move |panic| {
-            let _ = sender.blocking_send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
-                child: key,
-                panic,
-            }));
+            if runtime::unbounded_mpsc_send(
+                &sender,
+                DriverEvent::Child(ChildEvent::ConstructionDisposed { child: key, panic }),
+            )
+            .is_ok()
+            {
+                signal.pulse();
+            }
         });
     }
 
@@ -3298,23 +2050,36 @@ impl ScopeRuntime {
             return;
         };
         child.slot.member.set_terminal_disposal_pending(false);
-        if let Some(message) = panic
+        if terminal.exited_incarnation.is_some()
+            && let Some(message) = panic
             && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
         {
+            // Only an exited incarnation can own a destructor failure. A
+            // never-started child or a child between restart incarnations
+            // keeps its already-authoritative verdict while disposal remains
+            // ordered ahead of terminal routing.
             terminal.exit = Exit::new(ExitKind::Panicked { message }, terminal.exit.cancelled());
         }
 
         let exit = terminal.exit;
+        // §6's `StartupAborted` is a startup-sequence property of a
+        // membership that *ran* and failed before its initial readiness
+        // edge. A terminal without an exited incarnation never ran, so it
+        // publishes the plain `Stopped { NeverStarted }` verdict (B.6) even
+        // when its pre-readiness position still routes the scope's startup
+        // failure below. Incarnation exhaustion is the reachable case:
+        // it terminalizes an unspawned membership while `pre_ready` holds.
+        let startup_aborted = terminal.exited_incarnation.is_some() && terminal.startup_aborted;
         self.children[key].terminalize(
             &self.root,
             exit.clone(),
             terminal.exited_incarnation,
-            terminal.startup_aborted,
+            startup_aborted,
         );
         let removing = self.children[key].slot.member.record().removing;
         if removing {
             self.finalize_removal(key);
-        } else if terminal.startup_aborted && !self.phase.is_draining() {
+        } else if terminal.startup_aborted && !self.lifecycle.is_draining() {
             self.fail_startup(key, exit);
             if self.children[key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
@@ -3323,13 +2088,17 @@ impl ScopeRuntime {
             if self.children[key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
             }
-            if self.phase.is_draining() {
+            if self.lifecycle.is_draining() {
                 self.stop_next_ordered();
             }
         }
     }
 
     fn fail_startup(&mut self, key: ChildKey, exit: Exit) {
+        // Several initial children can fail in one arbitration batch. The
+        // first failure owns the startup verdict and its sole lifecycle edge;
+        // later exits are still terminalized, but cannot republish the scope
+        // transition or replace the authoritative cause.
         let child = &self.children[key];
         let failure = StartupFailure {
             cause: StartupFailureCause::Child {
@@ -3338,29 +2107,20 @@ impl ScopeRuntime {
                 exit,
             },
         };
-        self.phase = ScopePhase::StartupFailed;
+        let first_failure = self.lifecycle.fail_startup();
+        if !first_failure {
+            return;
+        }
         self.root
             .set_startup(Err(StartupError::StartupFailed(failure.clone())));
-        if self.flavor == ScopeFlavor::Ordered {
-            for later_index in key.index + 1..self.children.len() {
-                let later = self
-                    .children
-                    .key_at(later_index)
-                    .expect("ordered children are never reclaimed during startup");
+        if self.root.flavor == ScopeFlavor::Ordered {
+            let later_children: Vec<_> = self.children.keys_after(key).collect();
+            for later in later_children {
                 if !self.children[later].spawned_once
                     && !self.children[later].is_disposing()
                     && !self.children[later].is_terminal()
                 {
-                    if let Some(scope) = &self.children[later].slot.scope {
-                        scope.terminalize_never_started();
-                    }
                     self.begin_terminal_disposal(later, Exit::never_started(), None, false);
-                    self.children[later].terminalize(
-                        &self.root,
-                        Exit::never_started(),
-                        None,
-                        false,
-                    );
                 }
             }
         }
@@ -3377,17 +2137,6 @@ impl ScopeRuntime {
                 child: key,
                 incarnation,
             } => {
-                if self
-                    .children
-                    .get(key)
-                    .and_then(|child| child.active.as_ref())
-                    .is_some_and(|active| {
-                        active.incarnation == incarnation && active.ready_signal.is_fired()
-                    })
-                {
-                    self.handle_ready(key, incarnation);
-                    return;
-                }
                 let Some(child) = self.children.get_mut(key) else {
                     return;
                 };
@@ -3397,13 +2146,20 @@ impl ScopeRuntime {
                 if active.incarnation != incarnation {
                     return;
                 }
-                let Some(ReadinessEffect::TimedOut { deadline }) = active
-                    .readiness
-                    .step(ReadinessEvent::Deadline(runtime::now()))
-                else {
-                    return;
-                };
-                self.begin_stop_child(key, Some(RecordedOutcome::ReadinessTimedOut { deadline }));
+                // The queue already consumed this registration. Feed the
+                // retained latch into the engine so signal-at-deadline policy
+                // is decided in exactly one place.
+                active.readiness_deadline.take();
+                let effect = active.readiness.step(ReadinessEvent::Deadline {
+                    now: runtime::now(),
+                    signal_seen: active.ready_signal.is_fired(),
+                });
+                if effect
+                    .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
+                    .unwrap_or(false)
+                {
+                    self.progress_startup();
+                }
             }
             DeadlineKind::Restart { child } => self.spawn_child(child),
             DeadlineKind::Stop { child, incarnation } => {
@@ -3420,27 +2176,15 @@ impl ScopeRuntime {
     }
 
     fn finish_if_ready(&mut self) -> Option<StopReason> {
-        if let Some(reason) = self.phase.draining_reason() {
-            if self
-                .children
-                .values()
-                .all(|child| child.is_terminal() && !child.is_disposing())
-            {
-                return Some(reason.clone());
-            }
-            return None;
-        }
-        if !self.phase.startup_failed()
-            && self.flavor == ScopeFlavor::Ordered
-            && !self.children.is_empty()
-            && self
-                .children
-                .values()
-                .all(|child| child.is_terminal() && !child.is_disposing())
-        {
-            return Some(StopReason::Finished);
-        }
-        None
+        let all_terminal = self
+            .children
+            .values()
+            .all(|child| child.is_terminal() && !child.is_disposing());
+        self.lifecycle.finish_if_ready(
+            self.root.flavor == ScopeFlavor::Ordered,
+            !self.children.is_empty(),
+            all_terminal,
+        )
     }
 
     fn handle_admission(&mut self, mut request: AdmissionRequest) {
@@ -3452,12 +2196,12 @@ impl ScopeRuntime {
             .dynamic
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &control))
-            || self.phase.is_draining()
-            || self.phase.startup_failed()
+            || self.lifecycle.is_draining()
+            || self.lifecycle.startup_failed()
         {
-            let cause = if self.phase.is_draining() {
+            let cause = if self.lifecycle.is_draining() {
                 NotAdmittingCause::Draining
-            } else if self.phase.startup_failed() {
+            } else if self.lifecycle.startup_failed() {
                 NotAdmittingCause::StartupFailed
             } else {
                 NotAdmittingCause::NoLiveIncarnation
@@ -3482,30 +2226,31 @@ impl ScopeRuntime {
             return;
         }
 
-        let Some(definition) = request.slot.take_defined() else {
-            let (_, removed) = cancel_dynamic_reservation_parts(&control, &request.slot);
-            reject_admission_after_disposal(
-                request,
-                None,
-                removed,
-                ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
-            );
-            return;
+        let (definition, resolved) = match request.slot.resolve_and_take_defined(&self.defaults) {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => {
+                let (_, removed) = cancel_dynamic_reservation_parts(&control, &request.slot);
+                reject_admission_after_disposal(
+                    request,
+                    None,
+                    removed,
+                    ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
+                );
+                return;
+            }
+            Err(invalid) => {
+                let (definition, removed) =
+                    cancel_dynamic_reservation_parts(&control, &request.slot);
+                reject_admission_after_disposal(
+                    request,
+                    definition,
+                    removed,
+                    ReserveError::InvalidPolicy(invalid),
+                );
+                return;
+            }
         };
-        let (options, one_shot) = match definition.get() {
-            ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
-            ChildConstruction::Task(definition) => (&definition.options, false),
-            ChildConstruction::TaskOnce(definition) => (&definition.options, true),
-            ChildConstruction::Scope(definition) => (&definition.options, definition.one_shot()),
-        };
-        let resolved =
-            crate::policy::resolve_common(options, &self.defaults, one_shot, Readiness::Immediate);
-        request.slot.member.set_options(resolved.clone());
-        let plan = ChildPlan {
-            slot: Arc::clone(&request.slot),
-            construction: definition,
-            options: resolved,
-        };
+        let plan = ChildPlan::with_options(Arc::clone(&request.slot), definition, resolved);
         {
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
             let id = request.slot.member.id();
@@ -3518,10 +2263,7 @@ impl ScopeRuntime {
                     .then(|| state.entries.remove(id))
                     .flatten();
                 drop(state);
-                request.slot.member.terminalize(Exit::never_started());
-                if let Some(scope) = &request.slot.scope {
-                    scope.terminalize_never_started();
-                }
+                request.slot.terminalize_never_started();
                 // The entry's drop completes its removal response; preserve
                 // the same terminality-before-completion ordering as every
                 // other reservation-cancellation path. Definition disposal
@@ -3544,8 +2286,34 @@ impl ScopeRuntime {
         }
         let mut child = ChildRuntime::from_plan(plan, &self.root);
         child.initial = false;
-        self.root.admit_child(&request.slot);
-        let key = self.children.insert(child);
+        let key = match self.children.insert(child) {
+            Ok(key) => key,
+            Err(child) => {
+                let mut child = *child;
+                let removed = {
+                    let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
+                    let id = request.slot.member.id();
+                    let matches_admission = state.entries.get(id).is_some_and(|entry| {
+                        entry.slot.member.membership() == request.slot.member.membership()
+                            && entry.admitted
+                    });
+                    matches_admission
+                        .then(|| state.entries.remove(id))
+                        .flatten()
+                };
+                request.slot.terminalize_never_started();
+                child.complete_terminality();
+                let ChildRuntime { construction, .. } = child;
+                reject_admission_after_disposal(
+                    request,
+                    Some(construction),
+                    removed,
+                    ReserveError::IdentityExhausted,
+                );
+                return;
+            }
+        };
+        self.root.admit_child(resident_projection(&request.slot));
         #[cfg(test)]
         self.record_storage();
         request.complete(Ok(()));
@@ -3643,7 +2411,7 @@ impl ScopeRuntime {
             }
         }
         self.root.prune_child(&member);
-        if self.flavor == ScopeFlavor::Dynamic {
+        if self.root.flavor == ScopeFlavor::Dynamic {
             self.reclaim_child(key);
         }
         // The entry's drop completes any in-flight removal response; it must
@@ -3673,21 +2441,51 @@ impl ScopeRuntime {
 }
 
 fn mint_child_incarnation(slot: &Arc<SlotCell>, counter: &mut FenceCounter) -> Option<Incarnation> {
-    let member = &slot.member;
-    let incarnation = ScopeIdentity::mint_incarnation(member.membership(), counter);
-    if incarnation.is_none() {
-        let record = member.record();
-        let exit = record.last_exit.unwrap_or_else(Exit::never_started);
-        member.terminalize(exit);
-        if let Some(scope) = &slot.scope {
-            if record.last_incarnation.is_none() {
-                scope.terminalize_never_started();
-            } else {
-                scope.with_observation_gate(|| scope.close_observation_locked());
-            }
+    ScopeIdentity::mint_incarnation(slot.member.membership(), counter)
+}
+
+/// Owns a scope epoch until a `ScopeRuntime` has taken over its teardown.
+///
+/// Nested lowering can await isolated disposal before a driver exists. If
+/// that setup future is cancelled or unwinds, dropping this guard retires the
+/// epoch so a later restart cannot mistake the still-live reservation for
+/// identity exhaustion.
+struct ScopeEpochGuard {
+    scope: Arc<ScopeCell>,
+    epoch: Option<u64>,
+}
+
+impl ScopeEpochGuard {
+    fn begin(scope: &Arc<ScopeCell>) -> Option<Self> {
+        let epoch = scope.begin_incarnation()?;
+        Some(Self {
+            scope: Arc::clone(scope),
+            epoch: Some(epoch),
+        })
+    }
+
+    fn finish(mut self, reason: StopReason) {
+        let epoch = self
+            .epoch
+            .take()
+            .expect("an owned scope epoch finishes at most once");
+        self.scope.finish_incarnation(epoch, reason);
+    }
+
+    fn transfer(mut self) -> u64 {
+        self.epoch
+            .take()
+            .expect("an owned scope epoch transfers at most once")
+    }
+}
+
+impl Drop for ScopeEpochGuard {
+    fn drop(&mut self) {
+        if let Some(epoch) = self.epoch.take() {
+            self.scope
+                .finish_incarnation(epoch, StopReason::ShutdownRequested);
         }
     }
-    incarnation
 }
 
 async fn run_nested_tree(
@@ -3699,7 +2497,15 @@ async fn run_nested_tree(
     abort: Latch,
     abort_ack: Latch,
 ) -> crate::ExitResult {
-    let epoch = scope.begin_incarnation();
+    let Some(epoch) = ScopeEpochGuard::begin(&scope) else {
+        let failure = StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: scope.member.id().clone(),
+            },
+        };
+        scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
+        return Err(crate::ExitError::from_startup_failure(failure));
+    };
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
         Err(error) => {
@@ -3710,6 +2516,14 @@ async fn run_nested_tree(
                 LowerError::IdentityExhausted { id, disposal } => {
                     (StartupFailureCause::IdentityExhausted { id }, disposal)
                 }
+                LowerError::InvalidPolicy { invalid, disposal } => {
+                    // `InvalidPolicy::path` is relative to the scope being
+                    // lowered, which here is this nested scope itself. The
+                    // owning child id is already carried by the enclosing
+                    // `StartupFailureCause::Child`, so prepending it here
+                    // would double-count this frame.
+                    (StartupFailureCause::InvalidPolicy(invalid), disposal)
+                }
             };
             // Lowering never created a nested driver to own teardown. Keep
             // its isolated definitions attached to this incarnation until
@@ -3718,7 +2532,7 @@ async fn run_nested_tree(
             disposal.fired().await;
             let failure = StartupFailure { cause };
             scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
-            scope.finish_incarnation(epoch, StopReason::StartupFailed(failure.clone()));
+            epoch.finish(StopReason::StartupFailed(failure.clone()));
             return Err(crate::ExitError::from_startup_failure(failure));
         }
     };
@@ -3742,7 +2556,12 @@ async fn run_nested_tree(
 
 async fn run_scope(plan: ScopePlan, is_root: bool, parent_ready: Option<Latch>) -> StopReason {
     let root = Arc::clone(&plan.root);
-    let epoch = root.begin_incarnation();
+    let Some(epoch) = ScopeEpochGuard::begin(&root) else {
+        // Dropping the still-armed plan terminalizes every never-started
+        // declaration and the root; no aliased driver epoch is created.
+        drop(plan);
+        return StopReason::NeverStarted;
+    };
     run_scope_incarnation(plan, is_root, parent_ready, None, None, None, epoch).await
 }
 
@@ -3753,18 +2572,18 @@ async fn run_scope_incarnation(
     incarnation_cancel: Option<Latch>,
     incarnation_abort: Option<Latch>,
     incarnation_abort_ack: Option<Latch>,
-    epoch: u64,
+    epoch: ScopeEpochGuard,
 ) -> StopReason {
     let root = Arc::clone(&plan.root);
-    root.set_state(ScopeState::Starting);
     if is_root {
         root.member
             .update(|record| record.stage = MemberStage::Running);
     }
     let capacity = plan.children.len().saturating_mul(3).max(64);
     let (events, mut event_receiver) = runtime::bounded_mpsc(capacity);
-    let dynamic =
-        (plan.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(&root, events.clone()));
+    let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
+    let dynamic = (plan.root.flavor == ScopeFlavor::Dynamic)
+        .then(|| DynamicControl::new(&root, events.clone()));
     if let Some(control) = &dynamic {
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
         for child in &plan.children {
@@ -3780,39 +2599,42 @@ async fn run_scope_incarnation(
             );
         }
         drop(state);
-        root.set_dynamic(Some(Arc::clone(control)));
+        root.set_dynamic_route(Some(DynamicRoute::new(Arc::clone(control))));
     }
     root.set_admitted_children(
         plan.children
             .iter()
-            .map(|child| Arc::clone(&child.slot))
+            .map(|child| resident_projection(&child.slot))
             .collect(),
     );
     // Transfer children one at a time. The not-yet-converted suffix remains
     // owned by ScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
     // exactly one terminality owner for every child.
-    let mut children = ChildArena::with_capacity(plan.children.len());
+    let mut children = ChildArena::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
-        children.insert(ChildRuntime::from_plan(child, &root));
+        let child = ChildRuntime::from_plan(child, &root);
+        if children.insert(child).is_err() {
+            unreachable!("a fresh child-key domain accommodates an in-memory child collection");
+        }
     }
+    let next_ordered_start = children.keys().next();
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
-        flavor: plan.flavor,
         defaults: plan.defaults.clone(),
         intensity_policy: plan.config.intensity,
         intensity: IntensityState::default(),
         children,
         events,
+        disposal_events,
         deadlines: DeadlineQueue::default(),
         jitter: runtime::JitterRng::from_system_entropy(),
-        phase: ScopePhase::Starting,
-        next_ordered_start: 0,
+        lifecycle: ScopeLifecycle::starting(),
+        next_ordered_start,
         is_root,
         parent_ready,
         dynamic,
-        epoch,
         ancestor_shutdown: incarnation_cancel,
         ancestor_shutdown_seen: false,
         ancestor_abort: incarnation_abort,
@@ -3820,13 +2642,17 @@ async fn run_scope_incarnation(
         ancestor_abort_seen: false,
         hard_forced: false,
         completion: None,
+        // Transfer last: every fallible setup expression above remains
+        // covered by the pre-driver guard, and completed construction moves
+        // the raw epoch directly into ScopeRuntime's synchronous epilogue.
+        epoch: epoch.transfer(),
     };
     #[cfg(test)]
     scope.record_storage();
     plan.armed = false;
     drop(plan);
 
-    match scope.flavor {
+    match scope.root.flavor {
         ScopeFlavor::Ordered => scope.progress_startup(),
         ScopeFlavor::Dynamic => {
             let children: Vec<_> = scope.children.keys().collect();
@@ -3840,7 +2666,7 @@ async fn run_scope_incarnation(
     let mut signal = root.signal().watcher();
     loop {
         let mut pending = Vec::new();
-        if root.take_shutdown_request(epoch) {
+        if root.take_shutdown_request(scope.epoch) {
             pending.push((ArbitrationClass::ScopeShutdown, Pending::Shutdown));
         }
         for child in scope.pending_restart_shutdowns() {
@@ -3860,8 +2686,10 @@ async fn run_scope_incarnation(
             scope.ancestor_abort_seen = true;
             pending.push((ArbitrationClass::ScopeShutdown, Pending::AncestorAbort));
         }
-        if root.take_force_request(epoch) {
-            pending.push((ArbitrationClass::StopDeadline, Pending::Force));
+        if root.take_force_request(scope.epoch) {
+            // Force owns shutdown arbitration: readiness from the same wake
+            // cannot publish Running after the stop boundary.
+            pending.push((ArbitrationClass::ScopeShutdown, Pending::Force));
         }
         for membership in scope.pending_removals() {
             pending.push((
@@ -3870,6 +2698,20 @@ async fn run_scope_incarnation(
             ));
         }
         while let Some(event) = runtime::mpsc_try_recv(&mut event_receiver) {
+            let class = driver_event_class(&event);
+            pending.push((class, Pending::Driver(event)));
+        }
+        // Disposal completions drain after the bounded lane, and `arbitrate`
+        // sorts stably, so a `ConstructionDisposed` always trails every
+        // same-class `Exited` collected in the same wake — even one produced
+        // later. A disposal is therefore a batch-tail event: the exit it
+        // trails may begin a drain first, after which
+        // `handle_construction_disposed` sees `is_draining` and routes the
+        // disposed child through stop progression instead of `fail_startup`.
+        // That is a widening of an order that was already reachable, not a new
+        // one: disposal runs on the blocking pool, so its completion never had
+        // a fixed position relative to concurrent exits.
+        while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut disposal_event_receiver) {
             let class = driver_event_class(&event);
             pending.push((class, Pending::Driver(event)));
         }
@@ -4063,38 +2905,48 @@ mod tests {
     };
 
     use crate::{
-        ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, Intensity, LifecycleEventKind,
-        LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline, RemoveOutcome,
-        Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause, StopReason,
-        SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
-        engine::arbitrate,
+        ActorRef, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind, Intensity,
+        LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline,
+        RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause,
+        StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+        engine::{ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
+        plan::SlotCell,
         runtime::Latch,
-        tree::{SlotCell, into_core_for_test, lower_tree_for_test},
     };
 
     use super::{
-        ChildArena, ChildEvent, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
+        ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
         MemberCell, MemberStage, Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell,
-        ScopeFlavor, ScopePhase, ScopeRuntime, Signal, StartupPhase, complete_removals,
-        driver_event_class, mint_child_incarnation, report_channel, restart_shutdown_work,
-        run_nested_tree, run_scope_incarnation,
+        ScopeEpochGuard, ScopeFlavor, ScopeRuntime, complete_removals, driver_event_class,
+        dynamic_control, mint_child_incarnation, report_channel, resident_projection,
+        restart_shutdown_work, run_nested_tree, run_scope_incarnation,
     };
 
     fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from(id);
         let member = MemberCell::new(
             id.clone(),
             identity.mint_membership(&id).expect("membership available"),
         );
-        ScopeCell::new(
-            member,
-            flavor,
-            ScopeIdentity::new().expect("child identity available"),
-        )
+        ScopeCell::new(member, flavor, ScopeIdentity::new())
+    }
+
+    struct PendingRaw;
+
+    impl crate::RawActor for PendingRaw {
+        type Msg = u8;
+
+        fn readiness(&self) -> Readiness {
+            Readiness::Manual
+        }
+
+        async fn run(&mut self, _: &mut crate::RawContext<Self::Msg>) -> crate::ExitResult {
+            future::pending().await
+        }
     }
 
     #[test]
@@ -4124,12 +2976,100 @@ mod tests {
     }
 
     #[test]
+    fn stale_scope_driver_cannot_stop_a_newer_live_incarnation_projection() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let first = scope
+            .begin_incarnation()
+            .expect("first scope epoch is available");
+        scope.finish_incarnation(first, StopReason::Finished);
+        let second = scope
+            .begin_incarnation()
+            .expect("second scope epoch is available");
+        scope.set_state(ScopeState::Running);
+
+        scope.finish_incarnation(first, StopReason::Finished);
+        assert_eq!(scope.record().state, ScopeState::Running);
+        assert!(!scope.incarnation_finished(second));
+
+        scope.finish_incarnation(second, StopReason::Finished);
+        assert_eq!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::Finished,
+            }
+        );
+        assert!(scope.incarnation_finished(second));
+    }
+
+    #[test]
+    fn pre_driver_epoch_guard_releases_on_cancellation_and_unwind() {
+        let cancelled = isolated_scope("cancelled", ScopeFlavor::Ordered);
+        let guard = ScopeEpochGuard::begin(&cancelled).expect("first epoch is available");
+        let mut setup = Box::pin(async move {
+            let _guard = guard;
+            future::pending::<()>().await;
+        });
+        assert!(
+            setup
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        drop(setup);
+        let successor = ScopeEpochGuard::begin(&cancelled)
+            .expect("cancelling pre-driver setup retires its epoch");
+        successor.finish(StopReason::NeverStarted);
+
+        let unwound = isolated_scope("unwound", ScopeFlavor::Ordered);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _guard = ScopeEpochGuard::begin(&unwound).expect("unwind epoch is available");
+                panic!("injected pre-driver unwind");
+            }))
+            .is_err()
+        );
+        let successor =
+            ScopeEpochGuard::begin(&unwound).expect("unwinding pre-driver setup retires its epoch");
+        successor.finish(StopReason::NeverStarted);
+    }
+
+    #[test]
+    fn a_declined_epoch_still_publishes_its_owned_terminal_exit() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let epoch = scope.begin_incarnation().expect("scope epoch is available");
+        // The orderly finisher retires the epoch without a terminal exit, so
+        // a second owner still holds the only membership verdict.
+        scope.finish_incarnation(epoch, StopReason::Finished);
+        assert!(!matches!(
+            scope.member.record().stage,
+            MemberStage::Terminal(_)
+        ));
+
+        scope.finish_root_incarnation(
+            epoch,
+            StopReason::ShutdownRequested,
+            Exit::new(ExitKind::Aborted { after_grace: false }, true),
+        );
+        assert!(matches!(
+            scope.member.record().stage,
+            MemberStage::Terminal(_)
+        ));
+        assert_eq!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::Finished,
+            },
+            "a declined epoch must not rewrite the retired stop reason"
+        );
+    }
+
+    #[test]
     fn admitted_subtrees_share_their_parent_observation_gate() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
         let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
 
-        root.set_admitted_children(vec![slot]);
+        root.set_admitted_children(vec![resident_projection(&slot)]);
 
         assert!(Arc::ptr_eq(
             &root.observation_gate(),
@@ -4143,14 +3083,14 @@ mod tests {
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
         let leaf = isolated_scope("leaf", ScopeFlavor::Ordered);
         let leaf_slot = SlotCell::new(Arc::clone(&leaf.member), Some(Arc::clone(&leaf)));
-        nested.set_admitted_children(vec![leaf_slot]);
+        nested.set_admitted_children(vec![resident_projection(&leaf_slot)]);
         assert!(Arc::ptr_eq(
             &nested.observation_gate(),
             &leaf.observation_gate()
         ));
 
         let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-        root.set_admitted_children(vec![nested_slot]);
+        root.set_admitted_children(vec![resident_projection(&nested_slot)]);
 
         let root_gate = root.observation_gate();
         assert!(Arc::ptr_eq(&root_gate, &nested.observation_gate()));
@@ -4182,10 +3122,7 @@ mod tests {
         // Model the instant at which adoption owns the old gate and publishes
         // the replacement. The waiting observer must acquire the old gate,
         // detect this handoff, and retry on the root gate.
-        *nested
-            .observation_gate
-            .lock()
-            .expect("observation gate handoff mutex remains healthy") = root.observation_gate();
+        nested.replace_observation_gate(root.observation_gate());
         drop(held);
         worker.join().expect("observer follows the gate handoff");
 
@@ -4196,22 +3133,129 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn scope_phase_preserves_startup_status_while_draining() {
-        for (mut phase, startup) in [
-            (ScopePhase::Starting, StartupPhase::Pending),
-            (ScopePhase::Running, StartupPhase::Complete),
-            (ScopePhase::StartupFailed, StartupPhase::Failed),
-        ] {
-            assert!(phase.begin_drain(StopReason::ShutdownRequested));
+    #[crate::runtime::test]
+    async fn force_uses_the_stop_funnel_for_every_ordered_child() {
+        let mut tree = Tree::new();
+        let first = tree
+            .add_raw("first", crate::RawDef::factory(|| PendingRaw))
+            .expect("valid first actor");
+        let second = tree
+            .add_raw("second", crate::RawDef::factory(|| PendingRaw))
+            .expect("valid second actor");
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let mut children = ChildArena::default();
+        plan.children.reverse();
+        while let Some(child) = plan.children.pop() {
+            children
+                .insert(ChildRuntime::from_plan(child, &root))
+                .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
+        }
+        let keys = children.keys().collect::<Vec<_>>();
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::running(),
+            next_ordered_start: None,
+            is_root: true,
+            parent_ready: None,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown: None,
+            ancestor_shutdown_seen: false,
+            ancestor_abort: None,
+            ancestor_abort_ack: None,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        for key in &keys {
+            scope.spawn_child(*key);
+        }
+        let incarnations = keys
+            .iter()
+            .map(|key| {
+                scope.children[*key]
+                    .active
+                    .as_ref()
+                    .expect("child is active")
+                    .incarnation
+            })
+            .collect::<Vec<_>>();
+
+        scope.force_all();
+
+        for key in &keys {
+            let active = scope.children[*key]
+                .active
+                .as_ref()
+                .expect("forced child remains active through the tidy beat");
+            assert!(active.shutdown.is_fired(), "force sends cancellation");
+            assert!(active.abort.is_fired(), "force immediately escalates");
+        }
+        assert_eq!(
+            first.try_send(1).expect_err("first mailbox freezes").kind,
+            SendErrorKind::NotRunning
+        );
+        assert_eq!(
+            second.try_send(2).expect_err("second mailbox freezes").kind,
+            SendErrorKind::NotRunning
+        );
+
+        // Model readiness messages that shared the driver's wake with force.
+        // The force boundary disarmed both gates before either can publish a
+        // late Running transition.
+        for (key, incarnation) in keys.iter().zip(incarnations) {
+            scope.handle_ready(*key, incarnation);
+            assert!(matches!(
+                scope.children[*key].slot.member.record().stage,
+                MemberStage::Stopping
+            ));
+        }
+
+        let deadlines = keys
+            .iter()
+            .map(|key| {
+                scope.children[*key]
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.ladder)
+                    .and_then(StopLadder::deadline)
+                    .expect("each ladder retains its tidy deadline")
+            })
+            .collect::<Vec<_>>();
+        scope.force_all();
+        for (key, deadline) in keys.iter().zip(deadlines) {
             assert_eq!(
-                phase,
-                ScopePhase::Draining {
-                    reason: StopReason::ShutdownRequested,
-                    startup,
-                }
+                scope.children[*key]
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.ladder)
+                    .and_then(StopLadder::deadline),
+                Some(deadline),
+                "repeated force cannot rewind or skip the ladder"
             );
-            assert!(!phase.begin_drain(StopReason::Finished));
         }
     }
 
@@ -4234,20 +3278,25 @@ mod tests {
         tree.add_task("trip", TaskDef::new(|_| future::pending()))
             .expect("valid task");
 
-        let mut plan = lower_tree_for_test(tree);
+        let mut plan = tree.lower_for_test();
         let root = Arc::clone(&plan.root);
-        let epoch = root.begin_incarnation();
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
         root.set_admitted_children(
             plan.children
                 .iter()
-                .map(|child| Arc::clone(&child.slot))
+                .map(|child| resident_projection(&child.slot))
                 .collect(),
         );
         let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
-        let mut children = ChildArena::with_capacity(plan.children.len());
+        let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let mut children = ChildArena::default();
         plan.children.reverse();
         while let Some(child) = plan.children.pop() {
-            children.insert(ChildRuntime::from_plan(child, &root));
+            children
+                .insert(ChildRuntime::from_plan(child, &root))
+                .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
         }
         let nested = children
             .keys()
@@ -4257,18 +3306,19 @@ mod tests {
             .keys()
             .find(|key| children[*key].slot.member.id().as_str() == "trip")
             .expect("tripping child key");
+        let next_ordered_start = children.keys().next();
         let mut scope = ScopeRuntime {
             root: Arc::clone(&root),
-            flavor: plan.flavor,
             defaults: plan.defaults.clone(),
             intensity_policy: plan.config.intensity,
             intensity: super::IntensityState::default(),
             children,
             events,
+            disposal_events,
             deadlines: super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::from_system_entropy(),
-            phase: ScopePhase::Running,
-            next_ordered_start: 0,
+            lifecycle: ScopeLifecycle::running(),
+            next_ordered_start,
             is_root: true,
             parent_ready: None,
             dynamic: None,
@@ -4292,7 +3342,7 @@ mod tests {
             },
             None,
         );
-        scope.children[nested]
+        let _ = scope.children[nested]
             .slot
             .scope
             .as_ref()
@@ -4343,7 +3393,7 @@ mod tests {
         crate::runtime::yield_now().await;
         crate::runtime::yield_now().await;
 
-        assert!(scope.phase.is_draining());
+        assert!(scope.lifecycle.is_draining());
         assert_eq!(
             factories.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -4375,7 +3425,7 @@ mod tests {
         let adopting_root = Arc::clone(&root);
         let (adopted, adopted_receiver) = std::sync::mpsc::sync_channel(0);
         let adoption = std::thread::spawn(move || {
-            adopting_root.set_admitted_children(vec![slot]);
+            adopting_root.set_admitted_children(vec![resident_projection(&slot)]);
             adopted.send(()).expect("test receiver remains available");
         });
 
@@ -4413,67 +3463,55 @@ mod tests {
     }
 
     #[test]
-    fn quiet_signal_wait_cancellation_keeps_one_watch_registration() {
-        let signal = Signal::default();
-        let mut watcher = signal.watcher();
-        assert_eq!(signal.watcher_count(), 1);
-
-        for _ in 0..10_000 {
-            let mut changed = Box::pin(watcher.changed());
-            let mut context = Context::from_waker(Waker::noop());
-            assert!(changed.as_mut().poll(&mut context).is_pending());
-            drop(changed);
-            assert_eq!(signal.watcher_count(), 1);
-        }
-    }
-
-    #[test]
-    fn stale_child_keys_cannot_target_reused_slots() {
+    fn removed_child_keys_are_never_reused() {
         let mut tree = Tree::new();
         tree.add_task("worker", TaskDef::new(|_| future::pending()))
             .expect("valid task");
-        let mut plan = lower_tree_for_test(tree);
+        let mut plan = tree.lower_for_test();
         let child =
             ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &plan.root);
         let mut arena = ChildArena::default();
-        let stale = arena.insert(child);
+        let stale = arena.insert(child).unwrap_or_else(|_| panic!("key mints"));
         let child = arena.remove(stale).expect("live key removes its child");
-        let current = arena.insert(child);
+        let current = arena.insert(child).unwrap_or_else(|_| panic!("key mints"));
 
-        assert_eq!(stale.index, current.index, "the vacant slot is reused");
-        assert_ne!(stale.generation, current.generation);
+        assert!(current > stale, "keys advance monotonically across removal");
         assert!(arena.get(stale).is_none());
         assert!(arena.remove(stale).is_none());
         assert!(arena.get(current).is_some());
     }
 
     #[test]
-    fn exhausted_child_generation_retires_the_slot() {
+    fn child_key_exhaustion_poison_is_never_minted() {
         let mut tree = Tree::new();
         tree.add_task("worker", TaskDef::new(|_| future::pending()))
             .expect("valid task");
-        let mut plan = lower_tree_for_test(tree);
+        let mut plan = tree.lower_for_test();
         let child =
             ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &plan.root);
-        let mut arena = ChildArena::default();
-        let original = arena.insert(child);
-        arena.slots[original.index].generation = u64::MAX;
-        let exhausted = super::ChildKey {
-            index: original.index,
-            generation: u64::MAX,
+        let mut arena = ChildArena {
+            next_key: u64::MAX - 2,
+            ..ChildArena::default()
         };
+        let last = arena
+            .insert(child)
+            .unwrap_or_else(|_| panic!("the last usable key mints"));
+        assert_eq!(last, ChildKey(u64::MAX - 1));
+        let child = arena.remove(last).expect("the last usable key is live");
 
-        let child = arena
-            .remove(exhausted)
-            .expect("the forced exhausted generation is live");
-        let current = arena.insert(child);
-        assert_ne!(exhausted.index, current.index);
-        assert!(arena.get(exhausted).is_none());
-        assert!(arena.get(current).is_some());
+        let child = *arena
+            .insert(child)
+            .expect_err("the poison key is never minted");
+        assert_eq!(arena.next_key, u64::MAX);
+        assert!(arena.get(ChildKey(u64::MAX)).is_none());
+        assert!(
+            arena.insert(child).is_err(),
+            "the exhausted domain stays poisoned"
+        );
     }
 
     #[crate::runtime::test]
-    async fn dynamic_high_cycle_add_remove_reuses_runtime_storage() {
+    async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
         const CYCLES: usize = 1_000;
 
         let system = DynamicTree::new().spawn().expect("runtime is available");
@@ -4505,7 +3543,7 @@ mod tests {
                     deadlines: 1,
                     deadline_slots: 1,
                 },
-                "cycle {cycle} must reuse the sole runtime slot"
+                "cycle {cycle} stores only the live child"
             );
 
             assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
@@ -4513,11 +3551,11 @@ mod tests {
                 cell.runtime_storage(),
                 RuntimeStorage {
                     children: 0,
-                    child_slots: 1,
+                    child_slots: 0,
                     deadlines: 0,
                     deadline_slots: 0,
                 },
-                "cycle {cycle} must reclaim the removed child"
+                "cycle {cycle} must release removed-child storage"
             );
 
             let automatic = scope
@@ -4533,11 +3571,11 @@ mod tests {
                 cell.runtime_storage(),
                 RuntimeStorage {
                     children: 0,
-                    child_slots: 1,
+                    child_slots: 0,
                     deadlines: 0,
                     deadline_slots: 0,
                 },
-                "cycle {cycle} must reclaim Retention::Remove registration"
+                "cycle {cycle} must release Retention::Remove storage"
             );
         }
 
@@ -4602,7 +3640,7 @@ mod tests {
             hasher.finish()
         }
 
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let member = MemberCell::new(
             id.clone(),
@@ -4630,7 +3668,7 @@ mod tests {
 
     #[crate::runtime::test]
     async fn attaching_after_terminality_closes_the_mailbox() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let member = MemberCell::new(
             id.clone(),
@@ -4667,13 +3705,18 @@ mod tests {
                 .expect("manual readiness is valid"),
         )
         .expect("valid task");
-        let plan = lower_tree_for_test(tree);
+        let plan = tree.lower_for_test();
         let scope = Arc::clone(&plan.root);
-        let epoch = scope.begin_incarnation();
-        let driver = crate::runtime::spawn(
-            (),
-            run_scope_incarnation(plan, false, Some(Latch::default()), None, None, None, epoch),
-        );
+        let epoch = ScopeEpochGuard::begin(&scope).expect("test scope epoch is available");
+        let driver = crate::runtime::spawn(run_scope_incarnation(
+            plan,
+            false,
+            Some(Latch::default()),
+            None,
+            None,
+            None,
+            epoch,
+        ));
         let abort = driver.abort_handle();
         let reached_startup = crate::runtime::timeout(Duration::from_secs(1), async {
             while !matches!(scope.record().state, ScopeState::Starting) {
@@ -4707,7 +3750,7 @@ mod tests {
 
     #[crate::runtime::test]
     async fn dropped_unpolled_scope_plan_terminalizes_its_root() {
-        let plan = lower_tree_for_test(Tree::new());
+        let plan = Tree::new().lower_for_test();
         let root = Arc::clone(&plan.root);
 
         drop(plan);
@@ -4731,7 +3774,7 @@ mod tests {
             .expect("valid nested scope");
         let mut snapshots = nested.subscribe_snapshots();
         let mut events = nested.subscribe_lifecycle();
-        let plan = lower_tree_for_test(outer);
+        let plan = outer.lower_for_test();
 
         drop(plan);
 
@@ -4775,7 +3818,7 @@ mod tests {
             tree.add_task(id, TaskDef::new(|_| future::pending()))
                 .expect("valid task");
         }
-        let plan = lower_tree_for_test(tree);
+        let plan = tree.lower_for_test();
         let root = Arc::clone(&plan.root);
         let mut events = root.subscribe_lifecycle();
         let children: Vec<_> = plan
@@ -4783,7 +3826,7 @@ mod tests {
             .iter()
             .map(|child| Arc::clone(&child.slot.member))
             .collect();
-        let epoch = root.begin_incarnation();
+        let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
 
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -4917,7 +3960,7 @@ mod tests {
 
     #[test]
     fn terminality_signal_follows_mailbox_termination() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let member = MemberCell::new(
             id.clone(),
@@ -4933,7 +3976,7 @@ mod tests {
         });
         let waker = Waker::from(Arc::clone(&probe));
         let mut context = Context::from_waker(&waker);
-        let mut watcher = member.record.watcher();
+        let mut watcher = member.record_watcher();
         let mut changed = Box::pin(watcher.changed());
         assert!(changed.as_mut().poll(&mut context).is_pending());
 
@@ -4948,7 +3991,7 @@ mod tests {
 
     #[test]
     fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let member = MemberCell::new(
             id.clone(),
@@ -4989,7 +4032,7 @@ mod tests {
 
     #[test]
     fn attach_during_terminal_publication_finishes_record_before_mailbox_wake() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let member = MemberCell::new(
             id.clone(),
@@ -4998,11 +4041,7 @@ mod tests {
         let mailbox = MailboxCell::new(member.id().clone());
         let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
         let first_exit = Exit::never_started();
-        member
-            .mailbox
-            .lock()
-            .expect("member mailbox mutex poisoned")
-            .terminal = Some(first_exit.clone());
+        member.stage_terminal_before_mailbox(first_exit.clone());
         let probe = Arc::new(ObserveMemberOnMailboxWake {
             member: Arc::clone(&member),
             competing_exit: Exit::new(ExitKind::Completed, false),
@@ -5034,7 +4073,7 @@ mod tests {
 
     #[test]
     fn concurrent_terminalizers_return_after_one_consistent_record_is_visible() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let member = MemberCell::new(
             id.clone(),
@@ -5067,25 +4106,23 @@ mod tests {
 
     #[test]
     fn terminal_startup_wake_follows_member_and_incarnation_publication() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("root");
         let member = MemberCell::new(
             id.clone(),
             identity.mint_membership(&id).expect("membership available"),
         );
-        let scope = ScopeCell::new(
-            member,
-            ScopeFlavor::Ordered,
-            ScopeIdentity::new().expect("child identity available"),
-        );
-        let epoch = scope.begin_incarnation();
+        let scope = ScopeCell::new(member, ScopeFlavor::Ordered, ScopeIdentity::new());
+        let epoch = scope
+            .begin_incarnation()
+            .expect("test scope epoch is available");
         let probe = Arc::new(ObserveScopeOnStartupWake {
             scope: Arc::clone(&scope),
             epoch: Some(epoch),
             observed: Mutex::new(None),
         });
         let waker = Waker::from(Arc::clone(&probe));
-        let mut watcher = scope.record.watcher();
+        let mut watcher = scope.record_watcher();
         let mut changed = Box::pin(watcher.changed());
         assert!(
             changed
@@ -5114,24 +4151,20 @@ mod tests {
 
     #[test]
     fn no_live_root_startup_wake_follows_member_publication() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("root");
         let member = MemberCell::new(
             id.clone(),
             identity.mint_membership(&id).expect("membership available"),
         );
-        let scope = ScopeCell::new(
-            member,
-            ScopeFlavor::Ordered,
-            ScopeIdentity::new().expect("child identity available"),
-        );
+        let scope = ScopeCell::new(member, ScopeFlavor::Ordered, ScopeIdentity::new());
         let probe = Arc::new(ObserveScopeOnStartupWake {
             scope: Arc::clone(&scope),
             epoch: None,
             observed: Mutex::new(None),
         });
         let waker = Waker::from(Arc::clone(&probe));
-        let mut watcher = scope.record.watcher();
+        let mut watcher = scope.record_watcher();
         let mut changed = Box::pin(watcher.changed());
         assert!(
             changed
@@ -5176,7 +4209,7 @@ mod tests {
 
     #[test]
     fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let root_id = ChildId::from("root");
         let root_member = MemberCell::new(
             root_id.clone(),
@@ -5184,11 +4217,7 @@ mod tests {
                 .mint_membership(&root_id)
                 .expect("root membership available"),
         );
-        let root = ScopeCell::new(
-            root_member,
-            ScopeFlavor::Dynamic,
-            ScopeIdentity::new().expect("child identity available"),
-        );
+        let root = ScopeCell::new(root_member, ScopeFlavor::Dynamic, ScopeIdentity::new());
         let child_id = ChildId::from("worker");
         let member = MemberCell::new(
             child_id.clone(),
@@ -5199,7 +4228,7 @@ mod tests {
                 .expect("child membership available"),
         );
         let slot = SlotCell::new(Arc::clone(&member), None);
-        root.set_admitted_children(vec![Arc::clone(&slot)]);
+        root.set_admitted_children(vec![resident_projection(&slot)]);
         let (events, _receiver) = crate::runtime::bounded_mpsc(1);
         let control = DynamicControl::new(&root, events);
         let (sender, mut response) = crate::runtime::oneshot();
@@ -5236,16 +4265,96 @@ mod tests {
         assert_eq!(response.try_receive(), Some(RemoveOutcome::Removed));
     }
 
+    #[test]
+    fn reserve_dynamic_rejects_an_empty_id_at_the_driver_boundary() {
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
+
+        assert!(matches!(
+            super::reserve_dynamic(&root, ChildId::from(""), None),
+            Err(crate::ReserveError::EmptyId)
+        ));
+    }
+
+    #[test]
+    fn dynamic_removal_releases_state_before_waiting_for_the_observation_gate() {
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
+        let child_id = ChildId::from("worker");
+        let member = MemberCell::new(
+            child_id.clone(),
+            root.child_identity
+                .lock()
+                .expect("scope identity mutex poisoned")
+                .mint_membership(&child_id)
+                .expect("child membership available"),
+        );
+        let slot = SlotCell::new(Arc::clone(&member), None);
+        root.set_admitted_children(vec![resident_projection(&slot)]);
+        let (events, _receiver) = crate::runtime::bounded_mpsc(1);
+        let control = DynamicControl::new(&root, events);
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entries
+            .insert(
+                child_id.clone(),
+                DynamicEntry {
+                    slot,
+                    admitted: true,
+                    fused_cancel: None,
+                    removal: Obligation::new(RemovalResponses::default(), complete_removals),
+                    removal_started: false,
+                },
+            );
+        root.set_dynamic_route(Some(super::DynamicRoute::new(Arc::clone(&control))));
+
+        let gate = root.observation_gate();
+        let held_gate = gate.lock().expect("observation gate starts healthy");
+        let baseline_member_owners = Arc::strong_count(&member);
+        let removal_root = Arc::clone(&root);
+        let removal_id = child_id.clone();
+        let worker =
+            std::thread::spawn(move || super::remove_dynamic(&removal_root, &removal_id, None));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while Arc::strong_count(&member) == baseline_member_owners {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "removal reaches its observation transition"
+            );
+            std::thread::yield_now();
+        }
+        loop {
+            match control.state.try_lock() {
+                Ok(state) => {
+                    drop(state);
+                    break;
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a removal blocked on observation must release dynamic state"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("dynamic-state mutex poisoned")
+                }
+            }
+        }
+
+        drop(held_gate);
+        let response = worker.join().expect("removal transition completes");
+        drop(response);
+    }
+
     #[crate::runtime::test]
     async fn system_shutdown_joins_root_driver_teardown() {
         let system = DynamicTree::new().spawn().expect("runtime is available");
         let root = system.scope();
         system.wait_started().await.expect("dynamic root starts");
-        let control = root
-            .as_scope()
-            .cell
-            .dynamic()
-            .expect("running dynamic root has a control");
+        let control =
+            dynamic_control(&root.as_scope().cell).expect("running dynamic root has a control");
         let weak = Arc::downgrade(&control);
         drop(control);
 
@@ -5261,8 +4370,8 @@ mod tests {
     }
 
     #[test]
-    fn incarnation_exhaustion_terminalizes_the_membership_as_never_restart() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+    fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
         let membership = identity.mint_membership(&id).expect("membership available");
         let member = MemberCell::new(id, membership);
@@ -5279,17 +4388,248 @@ mod tests {
 
         assert!(mint_child_incarnation(&slot, &mut counter).is_some());
         assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(matches!(member.record().stage, MemberStage::Restarting));
+        assert_eq!(member.record().last_exit, Some(previous));
+        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+    }
+
+    #[crate::runtime::test]
+    async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "worker",
+            TaskDef::new(|_| future::pending::<crate::ExitResult>()).retention(Retention::Remove),
+        )
+        .expect("valid task");
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+        let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+        let mut children = ChildArena::default();
+        let key = children
+            .insert(child)
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::running(),
+            next_ordered_start: Some(key),
+            is_root: true,
+            parent_ready: None,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown: None,
+            ancestor_shutdown_seen: false,
+            ancestor_abort: None,
+            ancestor_abort_ack: None,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        scope.children[key].incarnations = FenceCounter::near_exhaustion(71);
+        let first = {
+            let child = &mut scope.children[key];
+            mint_child_incarnation(&child.slot, &mut child.incarnations)
+                .expect("the last usable incarnation mints")
+        };
+        let previous = Exit::new(
+            ExitKind::Failed(ExitError::message("last completed incarnation")),
+            false,
+        );
+        root.transition_child(
+            &scope.children[key].slot.member,
+            |record| {
+                record.incarnation = None;
+                record.last_incarnation = Some(first);
+                record.last_exit = Some(previous.clone());
+                record.stage = MemberStage::Restarting;
+            },
+            None,
+        );
+
+        assert!(
+            scope
+                .events
+                .try_send(DriverEvent::Child(ChildEvent::Ready {
+                    child: key,
+                    incarnation: first,
+                }))
+                .is_ok(),
+            "the bounded driver queue is deliberately saturated"
+        );
+
+        scope.spawn_child(key);
+        assert!(scope.children[key].is_disposing());
         assert!(matches!(
-            member.record().stage,
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Restarting
+        ));
+        assert_eq!(root.snapshot().children.len(), 1);
+
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
+            disposal_event_receiver
+                .recv()
+                .await
+                .expect("disposal reports completion")
+        else {
+            panic!("only construction disposal was armed")
+        };
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(DriverEvent::Child(ChildEvent::Ready { .. }))
+        ));
+        scope.handle_construction_disposed(child, panic);
+
+        assert!(!scope.children[key].is_disposing());
+        assert!(matches!(
+            scope.children[key].slot.member.record().stage,
             MemberStage::Terminal(ref exit) if exit == &previous
         ));
-        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(
+            root.snapshot().children.is_empty(),
+            "retention pruning follows joined disposal"
+        );
+    }
+
+    /// Exhaustion terminalizes a membership that never spawned. B.6 makes
+    /// that the plain `Stopped { NeverStarted }` verdict; §6's
+    /// `StartupAborted` stays reserved for a membership that ran and failed
+    /// before its initial readiness edge. The pre-readiness position still
+    /// has to route the scope's startup failure.
+    #[crate::runtime::test]
+    async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "worker",
+            TaskDef::new(|_| future::pending::<crate::ExitResult>()),
+        )
+        .expect("valid task");
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+        let mut children = ChildArena::default();
+        let key = children
+            .insert(child)
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::starting(),
+            next_ordered_start: Some(key),
+            is_root: true,
+            parent_ready: None,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown: None,
+            ancestor_shutdown_seen: false,
+            ancestor_abort: None,
+            ancestor_abort_ack: None,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        // Burn the counter's last usable generation without touching the
+        // member record: the child is still an unspawned initial member, so
+        // its very first `spawn_child` exhausts before any incarnation runs.
+        scope.children[key].incarnations = FenceCounter::near_exhaustion(73);
+        {
+            let child = &mut scope.children[key];
+            assert!(mint_child_incarnation(&child.slot, &mut child.incarnations).is_some());
+        }
+        assert!(scope.children[key].initial);
+        assert!(!scope.children[key].initial_ready);
+        assert_eq!(
+            scope.children[key].slot.member.record().last_incarnation,
+            None
+        );
+
+        scope.spawn_child(key);
+        assert!(scope.children[key].is_disposing());
+
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
+            disposal_event_receiver
+                .recv()
+                .await
+                .expect("disposal reports completion")
+        else {
+            panic!("only construction disposal was armed")
+        };
+        scope.handle_construction_disposed(child, panic);
+
+        assert!(matches!(
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        let snapshot = root.snapshot();
+        let published = snapshot
+            .child("worker")
+            .expect("a retained exhausted child stays resident");
+        assert!(
+            matches!(
+                published.state,
+                ChildState::Stopped { ref exit } if matches!(exit.kind(), ExitKind::NeverStarted)
+            ),
+            "an unspawned exhausted membership is Stopped, not StartupAborted: {:?}",
+            published.state
+        );
+        assert!(
+            !scope.children[key].slot.member.record().startup_aborted,
+            "§6's startup-abort flag belongs to a membership that ran"
+        );
+        assert!(
+            matches!(
+                root.record().startup,
+                Some(Err(StartupError::StartupFailed(_)))
+            ),
+            "the pre-readiness position still routes the scope's startup failure"
+        );
     }
 
     #[crate::runtime::test]
     async fn nested_membership_exhaustion_is_structured_and_fail_closed() {
         let nested_id = ChildId::from("nested");
-        let mut parent_identity = ScopeIdentity::new().expect("parent identity available");
+        let mut parent_identity = ScopeIdentity::new();
         let nested_membership = parent_identity
             .mint_membership(&nested_id)
             .expect("nested membership available");
@@ -5312,7 +4652,7 @@ mod tests {
             .expect("provisional declaration succeeds");
         let ready = Latch::default();
         let error = run_nested_tree(
-            into_core_for_test(tree),
+            tree.into_core_for_test(),
             Arc::clone(&scope),
             crate::policy::ResolvedDefaults::default(),
             ready.clone(),
@@ -5347,16 +4687,18 @@ mod tests {
 
     #[crate::runtime::test]
     async fn scope_incarnation_exhaustion_closes_nested_observation() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let parent = isolated_scope("parent", ScopeFlavor::Ordered);
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("nested");
         let membership = identity.mint_membership(&id).expect("membership available");
         let member = MemberCell::new(id, membership);
         let scope = ScopeCell::new(
             Arc::clone(&member),
             ScopeFlavor::Ordered,
-            ScopeIdentity::new().expect("child identity available"),
+            ScopeIdentity::new(),
         );
         let slot = SlotCell::new(Arc::clone(&member), Some(Arc::clone(&scope)));
+        parent.set_admitted_children(vec![resident_projection(&slot)]);
         let mut snapshots = scope.subscribe_snapshots();
         let mut events = scope.subscribe_lifecycle();
         let mut counter = FenceCounter::near_exhaustion(83);
@@ -5371,6 +4713,7 @@ mod tests {
         });
 
         assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(matches!(member.record().stage, MemberStage::Restarting));
         assert!(matches!(
             events.try_recv(),
             Ok(LifecycleItem::Event(crate::LifecycleEvent {
@@ -5381,6 +4724,13 @@ mod tests {
                 },
                 ..
             }))
+        ));
+        assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
+        assert!(parent.terminalize_child(
+            &member,
+            Exit::new(ExitKind::Completed, false),
+            None,
+            false
         ));
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
         snapshots
@@ -5396,21 +4746,44 @@ mod tests {
         assert!(snapshots.changed().await.is_err());
     }
 
+    #[crate::runtime::test]
+    async fn never_started_nested_terminal_publishes_one_final_parent_snapshot() {
+        let parent = isolated_scope("parent", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+        let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        parent.set_admitted_children(vec![resident_projection(&slot)]);
+        let mut snapshots = parent.subscribe_snapshots();
+
+        assert!(parent.terminalize_child(&nested.member, Exit::never_started(), None, false));
+        snapshots
+            .changed()
+            .await
+            .expect("no-incarnation terminal publishes the parent projection");
+
+        assert!(matches!(
+            snapshots
+                .borrow_latest()
+                .child("nested")
+                .expect("retained nested child remains resident")
+                .state,
+            ChildState::Stopped { ref exit } if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(
+            nested.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::NeverStarted
+            }
+        ));
+    }
+
     #[test]
     fn lifecycle_sequence_exhaustion_poison_is_never_minted_and_becomes_lag() {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("scope");
         let membership = identity.mint_membership(&id).expect("membership available");
         let member = MemberCell::new(id, membership);
-        let scope = ScopeCell::new(
-            member,
-            ScopeFlavor::Ordered,
-            ScopeIdentity::new().expect("child identity available"),
-        );
-        *scope
-            .lifecycle_sequence
-            .lock()
-            .expect("lifecycle sequence mutex poisoned") = FenceCounter::near_exhaustion(0);
+        let scope = ScopeCell::new(member, ScopeFlavor::Ordered, ScopeIdentity::new());
+        scope.set_lifecycle_sequence(FenceCounter::near_exhaustion(0));
         let mut events = scope.subscribe_lifecycle();
 
         scope.emit(LifecycleEventKind::ScopeState {

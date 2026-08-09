@@ -2,7 +2,10 @@
 
 //! Structured supervision and actors for asynchronous Rust systems.
 
+#[macro_use]
+mod definition;
 mod actor;
+mod cells;
 mod deadline;
 mod driver;
 mod engine;
@@ -10,6 +13,7 @@ mod exit;
 mod identity;
 mod mailbox;
 mod observe;
+mod plan;
 mod policy;
 mod raw;
 mod runtime;
@@ -19,7 +23,7 @@ mod tree;
 pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use exit::{
     Exit, ExitError, ExitKind, ExitResult, IntensityTrip, ShutdownStraggler, ShutdownTimeout,
-    StartupFailure, StartupFailureCause,
+    StartupError, StartupFailure, StartupFailureCause, StopReason,
 };
 pub use identity::{Incarnation, Membership};
 pub use mailbox::{
@@ -31,10 +35,11 @@ pub use observe::{
     LifecycleEvents, LifecycleItem, LifecycleTryRecvError, MembershipStatus, ScopeKind,
     ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
 };
+pub use plan::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use policy::{
-    Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, Jitter, Mailbox,
-    MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, RestartCondition, RestartPolicy,
-    Retention, ScopeDefaults, Shutdown, Strategy,
+    Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, InvalidPolicy, Jitter,
+    Mailbox, MailboxShutdown, PolicyError, PolicyField, Readiness, ReadinessDeadline,
+    RestartCondition, RestartPolicy, Retention, ScopeDefaults, Shutdown, Strategy,
 };
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,
@@ -42,9 +47,8 @@ pub use raw::{
 pub use task::{CancellationToken, OneShotTaskRef, TaskContext, TaskDef, TaskOnceDef, TaskRef};
 pub use tree::{
     ActorSlot, Admission, AdmissionReceipt, BuildError, DynamicActorSlot, DynamicScopeRef,
-    DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, NotAdmittingCause, Removal, RemoveOutcome,
-    ReserveError, ScopeRef, StartOrShutdownError, StartupError, StopReason, Subtree, SubtreeDef,
-    SubtreeOnceDef, SubtreeSlot, System, TaskSlot, Tree,
+    DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, Removal, ScopeRef, StartOrShutdownError,
+    Subtree, SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskSlot, Tree,
 };
 
 // Keep the repository-facing examples in the same rustdoc compilation lane as

@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, policy::never, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, policy::never, poll_until};
 use shelterwood::{
     Actor, ActorOnceDef, ChildState, Context, ExitError, ExitKind, ExitResult, Readiness,
     ReadinessDeadline, Shutdown, StartOrShutdownError, StopContext, SubtreeOnceDef, TaskDef,
@@ -209,7 +209,7 @@ async fn sidecar_runs_two_host_owned_cycles_with_readiness_and_policy_exact_shut
         let system = fixture.tree.spawn().expect("runtime is available");
         let scope = system.scope();
         assert!(
-            poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
                 fixture.config_started.load(Ordering::SeqCst)
             })
             .await
@@ -336,7 +336,7 @@ async fn sidecar_startup_failure_leaves_prefix_supervised_until_host_rolls_it_ba
     let system = fixture.tree.spawn().expect("runtime is available");
     let scope = system.scope();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             fixture.prefix_one.load(Ordering::SeqCst)
         })
         .await

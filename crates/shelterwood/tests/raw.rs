@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, assert_quiet, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
 use shelterwood::{
     DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
     RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ScopeDefaults,
@@ -262,7 +262,7 @@ async fn raw_manual_readiness_gates_ordered_startup_but_not_mailbox_acceptance()
         .expect("valid sibling");
     let system = tree.spawn().expect("runtime is available");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             entered.load(Ordering::SeqCst)
         })
         .await
@@ -279,7 +279,7 @@ async fn raw_manual_readiness_gates_ordered_startup_but_not_mailbox_acceptance()
     system.wait_started().await.expect("manual gate releases");
     assert!(sibling_started.load(Ordering::SeqCst));
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             values
                 .lock()
                 .expect("manual values mutex poisoned")
@@ -348,7 +348,7 @@ async fn raw_recv_is_shutdown_biased_and_try_recv_controls_drain_vs_discard() {
         actor.try_send(2).expect("two accepts");
         let shutdown = tokio::spawn(async move { system.shutdown(Duration::from_secs(1)).await });
         assert!(
-            poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
                 matches!(
                     actor.try_send(3),
                     Err(ref error)
@@ -410,7 +410,7 @@ async fn dynamic_scope_admits_uses_and_exactly_removes_a_raw_actor() {
     let actor = receipt.into_handles();
     actor.send(9).await.expect("dynamic actor accepts");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             values
                 .lock()
                 .expect("dynamic values mutex poisoned")
@@ -455,7 +455,7 @@ async fn deferred_queue_capacity_ignores_a_latest_scope_default() {
         .expect("second value proves queue capacity did not become latest");
     gate.release();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             values
                 .lock()
                 .expect("default values mutex poisoned")
@@ -565,7 +565,7 @@ async fn hard_abort_offload_panic_with_panicking_raw_destructor_is_contained() {
     let mut events = system.scope().subscribe_lifecycle();
     system.wait_started().await.expect("actor starts");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             queued.load(Ordering::SeqCst)
         })
         .await,

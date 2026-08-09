@@ -2,9 +2,33 @@ use std::time::Duration;
 
 use crate::common::LiveFlag;
 use shelterwood::{
-    BuildError, DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, RemoveOutcome,
-    Shutdown, StopReason, TaskDef, TaskOnceDef, Tree,
+    BuildError, DynamicTree, Exit, ExitError, ExitKind, Readiness, ReadinessDeadline,
+    RemoveOutcome, ReserveError, Shutdown, StopReason, TaskDef, TaskOnceDef, Tree,
 };
+
+#[test]
+fn public_exit_constructor_preserves_evidence_and_classifies_failures() {
+    let completed = Exit::new(ExitKind::Completed, true);
+    assert!(completed.cancelled());
+    assert!(matches!(completed.kind(), ExitKind::Completed));
+    assert!(!completed.is_failure());
+
+    for kind in [
+        ExitKind::Failed(ExitError::message("failed")),
+        ExitKind::Panicked {
+            message: Some("panicked".to_owned()),
+        },
+        ExitKind::ReadinessTimedOut {
+            deadline: std::time::Instant::now(),
+        },
+        ExitKind::Aborted { after_grace: true },
+        ExitKind::NeverStarted,
+    ] {
+        let exit = Exit::new(kind, false);
+        assert!(!exit.cancelled());
+        assert!(exit.is_failure(), "non-completed exit: {:?}", exit.kind());
+    }
+}
 
 #[test]
 fn spawn_without_runtime_is_a_build_error() {
@@ -36,6 +60,25 @@ fn declaration_errors_are_eager_and_root_lowering_is_the_only_other_build_error(
         ));
         assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     });
+}
+
+#[tokio::test]
+async fn dynamic_reservation_validates_ids_at_the_driver_boundary() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+
+    assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root stops");
+
+    assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
+    assert!(matches!(
+        scope.reserve_task("worker"),
+        Err(ReserveError::NotAdmitting(_))
+    ));
 }
 
 #[tokio::test]
@@ -113,6 +156,30 @@ async fn one_shot_completion_finishes_an_ordered_root() {
     system.wait_started().await.expect("tree starts");
     assert_eq!(completion.wait().await.expect("task completed"), 42);
     assert!(matches!(task.wait().await.kind(), ExitKind::Completed));
+    assert_eq!(system.wait().await, StopReason::Finished);
+}
+
+#[tokio::test]
+async fn large_ordered_immediate_startup_is_iterative() {
+    const CHILDREN: usize = 4_096;
+
+    let mut tree = Tree::new();
+    for index in 0..CHILDREN {
+        let (_task, _completion) = tree
+            .add_task_once(
+                format!("immediate-{index}"),
+                TaskOnceDef::new(|_| async { Ok::<(), ExitError>(()) })
+                    .readiness(Readiness::Immediate)
+                    .expect("immediate task readiness is valid"),
+            )
+            .expect("unique child declaration");
+    }
+
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("all immediate children start without recursive re-entry");
     assert_eq!(system.wait().await, StopReason::Finished);
 }
 

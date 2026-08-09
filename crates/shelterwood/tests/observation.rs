@@ -8,14 +8,14 @@ use std::{
 };
 
 use crate::common::{
-    ReleaseGate, assert_quiet, poll_once, poll_until,
+    POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_once, poll_until,
     waiting::{task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
-    Backoff, ChildState, DynamicScopeRef, DynamicTree, Jitter, LifecycleEvent, LifecycleEventKind,
-    LifecycleEvents, LifecycleItem, LifecycleTryRecvError, RemoveOutcome, RestartCondition,
-    RestartPolicy, Retention, ScopeRef, ScopeState, StopReason, SubtreeDef, SubtreeOnceDef,
-    TaskDef, TaskOnceDef, TaskRef, Tree, WaitError,
+    Backoff, ChildState, DynamicScopeRef, DynamicTree, Jitter, LIFECYCLE_EVENT_CAPACITY,
+    LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleTryRecvError,
+    RemoveOutcome, RestartCondition, RestartPolicy, Retention, ScopeRef, ScopeState, StopReason,
+    SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, Tree, WaitError,
 };
 
 async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
@@ -139,14 +139,20 @@ async fn drain_added_started_ready(events: &mut LifecycleEvents) {
 
 #[tokio::test]
 async fn lifecycle_lag_is_exact_coalesced_per_episode_and_subscribers_are_isolated() {
+    const EVENTS_PER_ADMISSION: usize = 3;
+
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
     let mut slow = scope.subscribe_lifecycle();
     let mut fast = scope.subscribe_lifecycle();
 
+    let admissions_per_episode = LIFECYCLE_EVENT_CAPACITY.div_ceil(EVENTS_PER_ADMISSION) + 1;
+    let emitted_per_episode = admissions_per_episode * EVENTS_PER_ADMISSION;
+    let dropped_per_episode = emitted_per_episode - LIFECYCLE_EVENT_CAPACITY;
+
     for episode in 0..2 {
-        for index in 0..50 {
+        for index in 0..admissions_per_episode {
             admit_waiter(&scope, format!("worker-{episode}-{index}")).await;
             drain_added_started_ready(&mut fast).await;
         }
@@ -154,10 +160,12 @@ async fn lifecycle_lag_is_exact_coalesced_per_episode_and_subscribers_are_isolat
         let watermark = scope.snapshot().lifecycle_seq;
         assert_eq!(
             next_item(&mut slow).await,
-            LifecycleItem::Lagged { dropped: 22 },
-            "150 events in a 128-event queue drop exactly 22"
+            LifecycleItem::Lagged {
+                dropped: dropped_per_episode as u64,
+            },
+            "each overflow episode reports its capacity-derived exact drop count"
         );
-        for _ in 0..128 {
+        for _ in 0..LIFECYCLE_EVENT_CAPACITY {
             let LifecycleItem::Event(event) = next_item(&mut slow).await else {
                 panic!("one coalesced marker must lead each overflow episode");
             };
@@ -190,7 +198,7 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
         .expect("subtree admitted")
         .into_handles();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             root.snapshot()
                 .child("nested")
                 .is_some_and(|child| matches!(child.state, ChildState::Running))
@@ -287,7 +295,7 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     let membership = task.membership();
     task.wait().await;
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             root.snapshot()
                 .child("retained")
                 .is_some_and(|child| child.state.is_terminal())
@@ -358,7 +366,7 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     let teardown_membership = teardown_task.membership();
     teardown_task.wait().await;
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             root.snapshot()
                 .child("teardown-tombstone")
                 .is_some_and(|child| child.state.is_terminal())
@@ -570,7 +578,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     };
 
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             root.snapshot()
                 .child("nested")
                 .is_some_and(|child| matches!(child.state, ChildState::Restarting))
@@ -620,7 +628,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     assert_eq!(nested.snapshot().total_restarts, 0);
     assert!(nested.snapshot().lifecycle_seq >= starting.seq);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             root.snapshot().child("nested").is_some_and(|child| {
                 matches!(child.state, ChildState::Running) && child.restart_at.is_none()
             })
@@ -987,6 +995,14 @@ async fn never_ran_members_stop_rather_than_report_startup_abort() {
         .wait_started()
         .await
         .expect_err("pre-ready terminal exit aborts startup");
+    scope
+        .wait_for_child(
+            "never-ran",
+            |child| matches!(child.state, ChildState::Stopped { .. }),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("joined suffix disposal publishes terminality");
     let snapshot = scope.snapshot();
     assert!(matches!(
         snapshot
@@ -1124,7 +1140,7 @@ async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_va
         .into_handles();
     task.wait().await;
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             scope.child("ephemeral").is_none()
         })
         .await,

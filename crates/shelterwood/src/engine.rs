@@ -2,12 +2,13 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BinaryHeap, VecDeque},
+    collections::{BTreeMap, BinaryHeap, VecDeque},
     time::{Duration, Instant},
 };
 
 use crate::{
-    Exit, Intensity, RestartPolicy, Shutdown, deadline::Deadline, policy::tidy_abort_beat,
+    Exit, Intensity, Readiness, RestartPolicy, Shutdown, deadline::Deadline, exit::StopReason,
+    policy::tidy_abort_beat,
 };
 
 /// Deterministic priority when one driver wake exposes several events.
@@ -31,6 +32,7 @@ pub(crate) fn arbitrate<T>(events: &mut [(ArbitrationClass, T)]) {
 pub(crate) enum StopAction {
     Cancel,
     Escalate,
+    AbortFramework { after_grace: bool },
     HardAbort { after_grace: bool },
 }
 
@@ -39,6 +41,7 @@ enum StopPhase {
     Idle,
     Cooperative,
     Escalated,
+    AbortingFramework,
     Finished,
 }
 
@@ -49,15 +52,29 @@ pub(crate) struct StopLadder {
     phase: StopPhase,
     deadline: Option<Instant>,
     after_grace: bool,
+    force_requested: bool,
+    framework_driver: bool,
+    framework_abort_acked: bool,
 }
 
 impl StopLadder {
     pub(crate) fn new(policy: Shutdown) -> Self {
+        Self::with_framework_driver(policy, false)
+    }
+
+    pub(crate) fn for_framework_driver(policy: Shutdown) -> Self {
+        Self::with_framework_driver(policy, true)
+    }
+
+    fn with_framework_driver(policy: Shutdown, framework_driver: bool) -> Self {
         Self {
             policy,
             phase: StopPhase::Idle,
             deadline: None,
             after_grace: false,
+            force_requested: false,
+            framework_driver,
+            framework_abort_acked: false,
         }
     }
 
@@ -65,16 +82,43 @@ impl StopLadder {
         self.deadline
     }
 
+    /// Expedites this ladder without replacing or rewinding it.
+    pub(crate) fn force(&mut self, now: Instant) {
+        if self.phase == StopPhase::Finished {
+            return;
+        }
+        if self.phase == StopPhase::Cooperative {
+            if !self.force_requested
+                && matches!(self.policy, Shutdown::Graceful { .. })
+                && self.deadline.is_some_and(|deadline| now >= deadline)
+            {
+                self.after_grace = true;
+            }
+            self.deadline = Some(now);
+        }
+        self.force_requested = true;
+    }
+
+    pub(crate) fn acknowledge_framework_abort(&mut self) {
+        if self.phase == StopPhase::AbortingFramework {
+            self.framework_abort_acked = true;
+        }
+    }
+
     pub(crate) fn advance(&mut self, now: Instant) -> Option<StopAction> {
         match self.phase {
             StopPhase::Idle => {
                 self.phase = StopPhase::Cooperative;
-                match self.policy {
-                    Shutdown::Graceful { grace } => {
-                        self.deadline = Deadline::after(now, grace).instant();
-                    }
-                    Shutdown::Abort => {
-                        self.deadline = Some(now);
+                if self.force_requested {
+                    self.deadline = Some(now);
+                } else {
+                    match self.policy {
+                        Shutdown::Graceful { grace } => {
+                            self.deadline = Deadline::after(now, grace).instant();
+                        }
+                        Shutdown::Abort => {
+                            self.deadline = Some(now);
+                        }
                     }
                 }
                 Some(StopAction::Cancel)
@@ -82,23 +126,56 @@ impl StopLadder {
             StopPhase::Cooperative if self.deadline.is_some_and(|deadline| now >= deadline) => {
                 let grace = match self.policy {
                     Shutdown::Graceful { grace } => {
-                        self.after_grace = true;
+                        if !self.force_requested {
+                            self.after_grace = true;
+                        }
                         grace
                     }
                     Shutdown::Abort => Duration::ZERO,
                 };
                 self.phase = StopPhase::Escalated;
-                self.deadline = Deadline::after(now, tidy_abort_beat(grace)).instant();
+                // A forced ladder is the `Abort` policy's zero-grace point on
+                // this same ladder (§10), so it takes the zero-grace tidy beat
+                // rather than one scaled to the grace force just skipped. The
+                // `after_grace` provenance above is unaffected: whether grace
+                // actually expired is a separate fact from how long the beat
+                // between escalation and hard abort runs.
+                let beat = if self.force_requested {
+                    Duration::ZERO
+                } else {
+                    grace
+                };
+                self.deadline = Deadline::after(now, tidy_abort_beat(beat)).instant();
                 Some(StopAction::Escalate)
             }
             StopPhase::Escalated if self.deadline.is_some_and(|deadline| now >= deadline) => {
+                if self.framework_driver {
+                    self.phase = StopPhase::AbortingFramework;
+                    self.deadline = Deadline::after(now, tidy_abort_beat(Duration::ZERO)).instant();
+                    Some(StopAction::AbortFramework {
+                        after_grace: self.after_grace,
+                    })
+                } else {
+                    self.phase = StopPhase::Finished;
+                    self.deadline = None;
+                    Some(StopAction::HardAbort {
+                        after_grace: self.after_grace,
+                    })
+                }
+            }
+            StopPhase::AbortingFramework
+                if self.deadline.is_some_and(|deadline| now >= deadline) =>
+            {
                 self.phase = StopPhase::Finished;
                 self.deadline = None;
-                Some(StopAction::HardAbort {
+                (!self.framework_abort_acked).then_some(StopAction::HardAbort {
                     after_grace: self.after_grace,
                 })
             }
-            StopPhase::Cooperative | StopPhase::Escalated | StopPhase::Finished => None,
+            StopPhase::Cooperative
+            | StopPhase::Escalated
+            | StopPhase::AbortingFramework
+            | StopPhase::Finished => None,
         }
     }
 }
@@ -192,6 +269,23 @@ impl RestartState {
     pub(crate) fn settled(&mut self) {
         self.attempt = 0;
     }
+
+    /// Resets the consecutive-attempt counter after one stable incarnation.
+    ///
+    /// Saturating elapsed time deliberately treats a clock regression as a
+    /// zero-length run, so it cannot accidentally forgive restart pressure.
+    pub(crate) fn settle_if_stable(
+        &mut self,
+        started_at: Instant,
+        stopped_at: Instant,
+        stable_for: Duration,
+    ) -> bool {
+        if stopped_at.saturating_duration_since(started_at) < stable_for {
+            return false;
+        }
+        self.settled();
+        true
+    }
 }
 
 /// Complete restart verdict consumed verbatim by the scope driver.
@@ -226,17 +320,34 @@ pub(crate) fn schedule_restart(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReadinessGate {
+enum ReadinessState {
+    Unconfigured,
     Immediate,
     Waiting { deadline: Option<Instant> },
     Ready,
     Disarmed,
 }
 
+/// The authoritative per-incarnation readiness state machine.
+///
+/// The shell only applies returned effects (publish ready, arm/cancel a
+/// deadline, or begin timeout shutdown); it never assigns readiness state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadinessGate {
+    state: ReadinessState,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadinessEvent {
+    Configure {
+        readiness: Readiness,
+        deadline: Option<Instant>,
+    },
     Signal,
-    Deadline(Instant),
+    Deadline {
+        now: Instant,
+        signal_seen: bool,
+    },
     Shutdown,
     Exit,
 }
@@ -244,39 +355,314 @@ pub(crate) enum ReadinessEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadinessEffect {
     BecameReady,
+    ArmDeadline { deadline: Instant },
     TimedOut { deadline: Instant },
     Disarmed,
 }
 
 impl ReadinessGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: ReadinessState::Unconfigured,
+        }
+    }
+
+    /// Whether a retained signal watcher is needed for this incarnation.
+    pub(crate) fn needs_signal_watch(self) -> bool {
+        matches!(
+            self.state,
+            ReadinessState::Unconfigured | ReadinessState::Waiting { .. }
+        )
+    }
+
     pub(crate) fn step(&mut self, event: ReadinessEvent) -> Option<ReadinessEffect> {
-        match (*self, event) {
-            (Self::Immediate, _) | (Self::Ready, _) | (Self::Disarmed, _) => None,
-            (Self::Waiting { .. }, ReadinessEvent::Signal) => {
-                *self = Self::Ready;
+        match (self.state, event) {
+            (
+                ReadinessState::Unconfigured,
+                ReadinessEvent::Configure {
+                    readiness: Readiness::Immediate,
+                    ..
+                },
+            ) => {
+                self.state = ReadinessState::Immediate;
                 Some(ReadinessEffect::BecameReady)
             }
             (
-                Self::Waiting {
+                ReadinessState::Unconfigured,
+                ReadinessEvent::Configure {
+                    readiness: Readiness::Manual | Readiness::AfterInit,
+                    deadline,
+                },
+            ) => {
+                self.state = ReadinessState::Waiting { deadline };
+                deadline.map(|deadline| ReadinessEffect::ArmDeadline { deadline })
+            }
+            (ReadinessState::Waiting { .. }, ReadinessEvent::Signal)
+            | (
+                ReadinessState::Waiting { .. },
+                ReadinessEvent::Deadline {
+                    signal_seen: true, ..
+                },
+            ) => {
+                self.state = ReadinessState::Ready;
+                Some(ReadinessEffect::BecameReady)
+            }
+            (
+                ReadinessState::Waiting {
                     deadline: Some(deadline),
                 },
-                ReadinessEvent::Deadline(now),
+                ReadinessEvent::Deadline {
+                    now,
+                    signal_seen: false,
+                },
             ) if now >= deadline => {
-                *self = Self::Disarmed;
+                self.state = ReadinessState::Disarmed;
                 Some(ReadinessEffect::TimedOut { deadline })
             }
-            (Self::Waiting { .. }, ReadinessEvent::Shutdown | ReadinessEvent::Exit) => {
-                *self = Self::Disarmed;
+            (
+                ReadinessState::Unconfigured | ReadinessState::Waiting { .. },
+                ReadinessEvent::Shutdown | ReadinessEvent::Exit,
+            ) => {
+                self.state = ReadinessState::Disarmed;
                 Some(ReadinessEffect::Disarmed)
             }
-            (Self::Waiting { .. }, ReadinessEvent::Deadline(_)) => None,
+            (
+                ReadinessState::Waiting { .. },
+                ReadinessEvent::Deadline {
+                    signal_seen: false, ..
+                },
+            )
+            | (ReadinessState::Immediate | ReadinessState::Ready | ReadinessState::Disarmed, _)
+            | (
+                ReadinessState::Unconfigured,
+                ReadinessEvent::Signal | ReadinessEvent::Deadline { .. },
+            )
+            | (ReadinessState::Waiting { .. }, ReadinessEvent::Configure { .. }) => None,
         }
+    }
+}
+
+/// Cross-incarnation liveness encoded once as an epoch state, rather than an
+/// epoch pair plus an independently mutable `live` bit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScopeEpochs {
+    Idle { last_stopped: u64 },
+    Live { current: u64, last_stopped: u64 },
+    Exhausted { last_stopped: u64 },
+}
+
+impl Default for ScopeEpochs {
+    fn default() -> Self {
+        Self::Idle { last_stopped: 0 }
+    }
+}
+
+impl ScopeEpochs {
+    pub(crate) fn begin(&mut self) -> Option<u64> {
+        let last_stopped = match *self {
+            Self::Idle { last_stopped } => last_stopped,
+            // One scope cell cannot own two simultaneous drivers. Rejecting
+            // a second begin also prevents it from invalidating the live
+            // driver's epoch while trying to advance the counter.
+            Self::Live { .. } | Self::Exhausted { .. } => return None,
+        };
+        let Some(current) = last_stopped.checked_add(1) else {
+            *self = Self::Exhausted { last_stopped };
+            return None;
+        };
+        // Reserve MAX as poison so no observable epoch can alias the
+        // permanently exhausted state.
+        if current == u64::MAX {
+            *self = Self::Exhausted { last_stopped };
+            return None;
+        }
+        *self = Self::Live {
+            current,
+            last_stopped,
+        };
+        Some(current)
+    }
+
+    pub(crate) fn live_epoch(self) -> Option<u64> {
+        match self {
+            Self::Idle { .. } | Self::Exhausted { .. } => None,
+            Self::Live { current, .. } => Some(current),
+        }
+    }
+
+    pub(crate) fn request_target(self) -> Option<(u64, bool)> {
+        match self {
+            Self::Live { current, .. } => Some((current, false)),
+            Self::Idle { last_stopped } => last_stopped
+                .checked_add(1)
+                .filter(|target| *target != u64::MAX)
+                .map(|target| (target, true)),
+            Self::Exhausted { .. } => None,
+        }
+    }
+
+    pub(crate) fn finish(&mut self, epoch: u64) -> bool {
+        match *self {
+            Self::Live {
+                current,
+                last_stopped,
+            } if current == epoch => {
+                *self = Self::Idle {
+                    last_stopped: last_stopped.max(epoch),
+                };
+                true
+            }
+            Self::Idle { .. } | Self::Live { .. } | Self::Exhausted { .. } => false,
+        }
+    }
+
+    pub(crate) fn is_current(self, epoch: u64) -> bool {
+        self.live_epoch() == Some(epoch)
+    }
+
+    pub(crate) fn request_is_pending(self, epoch: u64) -> bool {
+        matches!(self, Self::Idle { last_stopped } if epoch > last_stopped)
+    }
+
+    pub(crate) fn finished(self, epoch: u64) -> bool {
+        match self {
+            Self::Idle { last_stopped }
+            | Self::Live { last_stopped, .. }
+            | Self::Exhausted { last_stopped } => last_stopped >= epoch,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupPhase {
+    Pending,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ScopePhase {
+    Starting,
+    Running,
+    StartupFailed,
+    Draining {
+        reason: StopReason,
+        startup: StartupPhase,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DrainEffect {
+    pub(crate) startup_pending: bool,
+}
+
+/// Authoritative lifecycle and finish policy for one scope incarnation.
+///
+/// `ScopeRecord` is only this machine's observation projection; epoch-tagged
+/// requests use [`ScopeEpochs`] and do not encode this phase a second time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ScopeLifecycle {
+    phase: ScopePhase,
+}
+
+impl ScopeLifecycle {
+    pub(crate) fn starting() -> Self {
+        Self {
+            phase: ScopePhase::Starting,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn running() -> Self {
+        Self {
+            phase: ScopePhase::Running,
+        }
+    }
+
+    pub(crate) fn is_starting(&self) -> bool {
+        self.phase == ScopePhase::Starting
+    }
+
+    pub(crate) fn startup_complete(&self) -> bool {
+        matches!(
+            self.phase,
+            ScopePhase::Running
+                | ScopePhase::Draining {
+                    startup: StartupPhase::Complete,
+                    ..
+                }
+        )
+    }
+
+    pub(crate) fn startup_failed(&self) -> bool {
+        matches!(
+            self.phase,
+            ScopePhase::StartupFailed
+                | ScopePhase::Draining {
+                    startup: StartupPhase::Failed,
+                    ..
+                }
+        )
+    }
+
+    pub(crate) fn is_draining(&self) -> bool {
+        matches!(self.phase, ScopePhase::Draining { .. })
+    }
+
+    pub(crate) fn draining_reason(&self) -> Option<&StopReason> {
+        match &self.phase {
+            ScopePhase::Draining { reason, .. } => Some(reason),
+            ScopePhase::Starting | ScopePhase::Running | ScopePhase::StartupFailed => None,
+        }
+    }
+
+    pub(crate) fn complete_startup(&mut self) -> bool {
+        if self.phase != ScopePhase::Starting {
+            return false;
+        }
+        self.phase = ScopePhase::Running;
+        true
+    }
+
+    /// Records only the first startup failure, so simultaneous failing
+    /// initial children cannot publish the transition twice.
+    pub(crate) fn fail_startup(&mut self) -> bool {
+        if self.phase != ScopePhase::Starting {
+            return false;
+        }
+        self.phase = ScopePhase::StartupFailed;
+        true
+    }
+
+    pub(crate) fn begin_drain(&mut self, reason: StopReason) -> Option<DrainEffect> {
+        let startup = match self.phase {
+            ScopePhase::Starting => StartupPhase::Pending,
+            ScopePhase::Running => StartupPhase::Complete,
+            ScopePhase::StartupFailed => StartupPhase::Failed,
+            ScopePhase::Draining { .. } => return None,
+        };
+        let startup_pending = startup == StartupPhase::Pending;
+        self.phase = ScopePhase::Draining { reason, startup };
+        Some(DrainEffect { startup_pending })
+    }
+
+    pub(crate) fn finish_if_ready(
+        &self,
+        ordered: bool,
+        has_children: bool,
+        all_terminal: bool,
+    ) -> Option<StopReason> {
+        if let Some(reason) = self.draining_reason() {
+            return all_terminal.then(|| reason.clone());
+        }
+        (!self.startup_failed() && ordered && has_children && all_terminal)
+            .then_some(StopReason::Finished)
     }
 }
 
 impl PartialEq for DeadlineEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.at == other.at && self.order == other.order
+        self.at == other.at && self.handle == other.handle
     }
 }
 
@@ -293,76 +679,49 @@ impl Ord for DeadlineEntry {
         other
             .at
             .cmp(&self.at)
-            .then_with(|| other.order.cmp(&self.order))
+            .then_with(|| other.handle.cmp(&self.handle))
     }
 }
 
 /// The engine's single deadline priority queue.
 #[derive(Debug)]
 pub(crate) struct DeadlineQueue<K> {
-    next_order: u64,
+    // Keys are both registration identity and equal-deadline arming order.
+    // They are never reused, so a stale handle can only miss.
+    next_key: u64,
     entries: BinaryHeap<DeadlineEntry>,
-    slots: Vec<DeadlineSlot<K>>,
-    free: Vec<usize>,
-    len: usize,
+    registrations: BTreeMap<DeadlineHandle, K>,
 }
 
-/// A generation-checked registration for one armed deadline.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct DeadlineHandle {
-    index: usize,
-    generation: u64,
-}
-
-#[derive(Debug)]
-struct DeadlineSlot<K> {
-    generation: u64,
-    key: Option<K>,
-}
+/// A never-reused registration for one armed deadline.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct DeadlineHandle(u64);
 
 #[derive(Debug)]
 struct DeadlineEntry {
     at: Instant,
-    order: u64,
     handle: DeadlineHandle,
 }
 
 impl<K> Default for DeadlineQueue<K> {
     fn default() -> Self {
         Self {
-            next_order: 0,
+            next_key: 0,
             entries: BinaryHeap::new(),
-            slots: Vec::new(),
-            free: Vec::new(),
-            len: 0,
+            registrations: BTreeMap::new(),
         }
     }
 }
 
 impl<K> DeadlineQueue<K> {
     pub(crate) fn push(&mut self, at: Instant, key: K) -> DeadlineHandle {
-        let order = self.next_arming_order();
-        let handle = if let Some(index) = self.free.pop() {
-            let slot = &mut self.slots[index];
-            debug_assert!(slot.key.is_none());
-            slot.key = Some(key);
-            DeadlineHandle {
-                index,
-                generation: slot.generation,
-            }
-        } else {
-            let index = self.slots.len();
-            self.slots.push(DeadlineSlot {
-                generation: 0,
-                key: Some(key),
-            });
-            DeadlineHandle {
-                index,
-                generation: 0,
-            }
-        };
-        self.len += 1;
-        self.entries.push(DeadlineEntry { at, order, handle });
+        let handle = self.next_handle();
+        let replaced = self.registrations.insert(handle, key);
+        debug_assert!(
+            replaced.is_none(),
+            "monotonic deadline keys are never reused"
+        );
+        self.entries.push(DeadlineEntry { at, handle });
         handle
     }
 
@@ -389,51 +748,26 @@ impl<K> DeadlineQueue<K> {
         }
     }
 
-    fn next_arming_order(&mut self) -> u64 {
-        if self.next_order == u64::MAX {
-            // Preserve the relative arming order of every live registration,
-            // while dropping tombstones, before the sequence space wraps.
-            // Handles address the separate generational arena and remain
-            // valid across this rebuild.
-            let slots = &self.slots;
-            let mut entries = std::mem::take(&mut self.entries).into_vec();
-            entries.retain(|entry| Self::is_active_in(slots, entry.handle));
-            entries.sort_unstable_by_key(|entry| entry.order);
-            for (order, entry) in entries.iter_mut().enumerate() {
-                entry.order = u64::try_from(order)
-                    .expect("live deadline count cannot exceed the arming sequence space");
-            }
-            self.next_order = u64::try_from(entries.len())
-                .expect("live deadline count cannot exceed the arming sequence space");
-            self.entries = BinaryHeap::from(entries);
+    fn next_handle(&mut self) -> DeadlineHandle {
+        let Some(next) = self.next_key.checked_add(1) else {
+            panic!("deadline key space exhausted");
+        };
+        // Reserve the maximum value as poison. Once reached, the counter stays
+        // poisoned and every later push fails instead of wrapping or reusing.
+        if next == u64::MAX {
+            self.next_key = u64::MAX;
+            panic!("deadline key space exhausted");
         }
-        let order = self.next_order;
-        self.next_order += 1;
-        order
+        self.next_key = next;
+        DeadlineHandle(next)
     }
 
     fn take(&mut self, handle: DeadlineHandle) -> Option<K> {
-        let slot = self.slots.get_mut(handle.index)?;
-        if slot.generation != handle.generation {
-            return None;
-        }
-        let key = slot.key.take()?;
-        self.len -= 1;
-        if let Some(next) = slot.generation.checked_add(1) {
-            slot.generation = next;
-            self.free.push(handle.index);
-        }
-        Some(key)
+        self.registrations.remove(&handle)
     }
 
     fn is_active(&self, handle: DeadlineHandle) -> bool {
-        Self::is_active_in(&self.slots, handle)
-    }
-
-    fn is_active_in(slots: &[DeadlineSlot<K>], handle: DeadlineHandle) -> bool {
-        slots
-            .get(handle.index)
-            .is_some_and(|slot| slot.generation == handle.generation && slot.key.is_some())
+        self.registrations.contains_key(&handle)
     }
 
     fn prune_stale_head(&mut self) {
@@ -447,32 +781,28 @@ impl<K> DeadlineQueue<K> {
     }
 
     fn compact_if_sparse(&mut self) {
-        if self.entries.len() > self.len.saturating_mul(2) {
-            let slots = &self.slots;
+        if self.entries.len() > self.registrations.len().saturating_mul(2) {
+            let registrations = &self.registrations;
             self.entries
-                .retain(|entry| Self::is_active_in(slots, entry.handle));
+                .retain(|entry| registrations.contains_key(&entry.handle));
         }
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.registrations.len()
     }
 
     #[cfg(test)]
     pub(crate) fn storage_len(&self) -> usize {
         self.entries.len()
     }
-
-    #[cfg(test)]
-    fn registration_slots_len(&self) -> usize {
-        self.slots.len()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -486,8 +816,9 @@ mod tests {
 
     use super::{
         ArbitrationClass, DeadlineHandle, DeadlineQueue, ExitDispatch, IntensityState,
-        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeMode,
-        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
+        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeEpochs,
+        ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
+        schedule_restart, tidy_abort_beat,
     };
 
     #[test]
@@ -528,6 +859,90 @@ mod tests {
         assert_eq!(abort.advance(start), Some(StopAction::Escalate));
         assert_eq!(
             abort.advance(abort.deadline().expect("tidy deadline")),
+            Some(StopAction::HardAbort { after_grace: false })
+        );
+    }
+
+    #[test]
+    fn repeated_force_expedites_without_rewinding_the_ladder() {
+        let start = Instant::now();
+        let grace = Duration::from_secs(30);
+        let mut ladder = StopLadder::new(Shutdown::Graceful { grace });
+
+        assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
+        ladder.force(start);
+        ladder.force(start);
+        assert_eq!(ladder.advance(start), Some(StopAction::Escalate));
+
+        let tidy = ladder
+            .deadline()
+            .expect("forced ladder keeps its tidy beat");
+        assert_eq!(
+            tidy,
+            start + tidy_abort_beat(Duration::ZERO),
+            "a forced ladder takes the zero-grace tidy beat, not one scaled \
+             to the grace it skipped"
+        );
+
+        let mut unforced = StopLadder::new(Shutdown::Graceful { grace });
+        assert_eq!(unforced.advance(start), Some(StopAction::Cancel));
+        assert_eq!(unforced.advance(start + grace), Some(StopAction::Escalate));
+        assert_eq!(
+            unforced.deadline(),
+            Some(start + grace + tidy_abort_beat(grace)),
+            "an unforced ladder still scales its tidy beat to its grace"
+        );
+
+        ladder.force(start);
+        assert_eq!(
+            ladder.advance(start),
+            None,
+            "force does not skip the tidy beat"
+        );
+        assert_eq!(
+            ladder.advance(tidy),
+            Some(StopAction::HardAbort { after_grace: false })
+        );
+        ladder.force(tidy);
+        assert_eq!(
+            ladder.advance(tidy),
+            None,
+            "a finished ladder stays finished"
+        );
+    }
+
+    #[test]
+    fn framework_abort_and_ack_are_owned_by_the_same_stop_ladder() {
+        let start = Instant::now();
+        let mut ladder = StopLadder::for_framework_driver(Shutdown::Abort);
+
+        assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
+        assert_eq!(ladder.advance(start), Some(StopAction::Escalate));
+        let tidy = ladder
+            .deadline()
+            .expect("abort policy keeps the first tidy beat");
+        assert_eq!(
+            ladder.advance(tidy),
+            Some(StopAction::AbortFramework { after_grace: false })
+        );
+        ladder.acknowledge_framework_abort();
+        let framework_tidy = ladder
+            .deadline()
+            .expect("framework acknowledgment has a bounded tidy beat");
+        assert_eq!(ladder.advance(framework_tidy), None);
+        assert_eq!(ladder.deadline(), None);
+
+        let mut unacked = StopLadder::for_framework_driver(Shutdown::Abort);
+        assert_eq!(unacked.advance(start), Some(StopAction::Cancel));
+        assert_eq!(unacked.advance(start), Some(StopAction::Escalate));
+        let tidy = unacked.deadline().expect("abort tidy beat");
+        assert_eq!(
+            unacked.advance(tidy),
+            Some(StopAction::AbortFramework { after_grace: false })
+        );
+        let framework_tidy = unacked.deadline().expect("framework tidy beat");
+        assert_eq!(
+            unacked.advance(framework_tidy),
             Some(StopAction::HardAbort { after_grace: false })
         );
     }
@@ -641,36 +1056,161 @@ mod tests {
     }
 
     #[test]
-    fn readiness_signal_wins_at_its_deadline_and_shutdown_disarms() {
+    fn stable_run_settles_restart_attempt_at_the_exact_boundary() {
+        let start = Instant::now();
+        let stable_for = Duration::from_secs(10);
+        let mut restarts = RestartState::new();
+        assert_eq!(restarts.schedule(), (1, 1));
+        assert!(!restarts.settle_if_stable(
+            start,
+            start + stable_for - Duration::from_nanos(1),
+            stable_for,
+        ));
+        assert_eq!(restarts.schedule(), (2, 2));
+        assert!(restarts.settle_if_stable(start, start + stable_for, stable_for));
+        assert_eq!(restarts.schedule(), (1, 3));
+
+        assert!(
+            !restarts.settle_if_stable(start, start - Duration::from_nanos(1), stable_for),
+            "a regressed clock cannot forgive restart pressure"
+        );
+    }
+
+    #[test]
+    fn readiness_configuration_and_signal_deadline_race_are_engine_owned() {
         let deadline = Instant::now();
-        let mut ready = ReadinessGate::Waiting {
-            deadline: Some(deadline),
-        };
+        let mut ready = ReadinessGate::new();
         assert_eq!(
-            ready.step(ReadinessEvent::Signal),
+            ready.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::Manual,
+                deadline: Some(deadline),
+            }),
+            Some(ReadinessEffect::ArmDeadline { deadline })
+        );
+        assert_eq!(
+            ready.step(ReadinessEvent::Deadline {
+                now: deadline,
+                signal_seen: true,
+            }),
             Some(ReadinessEffect::BecameReady)
         );
-        assert_eq!(ready.step(ReadinessEvent::Deadline(deadline)), None);
+        assert_eq!(
+            ready.step(ReadinessEvent::Deadline {
+                now: deadline,
+                signal_seen: false,
+            }),
+            None
+        );
 
-        let mut shutdown = ReadinessGate::Waiting {
-            deadline: Some(deadline),
-        };
+        let mut timed_out = ReadinessGate::new();
+        assert_eq!(
+            timed_out.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::AfterInit,
+                deadline: Some(deadline),
+            }),
+            Some(ReadinessEffect::ArmDeadline { deadline })
+        );
+        assert_eq!(
+            timed_out.step(ReadinessEvent::Deadline {
+                now: deadline,
+                signal_seen: false,
+            }),
+            Some(ReadinessEffect::TimedOut { deadline })
+        );
+
+        let mut shutdown = ReadinessGate::new();
+        assert_eq!(
+            shutdown.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::Manual,
+                deadline: None,
+            }),
+            None
+        );
         assert_eq!(
             shutdown.step(ReadinessEvent::Shutdown),
             Some(ReadinessEffect::Disarmed)
         );
-        assert_eq!(shutdown.step(ReadinessEvent::Deadline(deadline)), None);
     }
 
     #[test]
-    fn one_priority_queue_orders_equal_deadlines_by_arming_order() {
+    fn scope_lifecycle_owns_first_failure_drain_status_and_finish_policy() {
+        let mut lifecycle = ScopeLifecycle::starting();
+        assert!(lifecycle.fail_startup());
+        assert!(
+            !lifecycle.fail_startup(),
+            "simultaneous initial failures publish one transition"
+        );
+        assert_eq!(lifecycle.finish_if_ready(true, true, true), None);
+        let drain = lifecycle
+            .begin_drain(crate::exit::StopReason::ShutdownRequested)
+            .expect("a failed startup can begin draining");
+        assert!(!drain.startup_pending);
+        assert_eq!(
+            lifecycle.finish_if_ready(false, true, true),
+            Some(crate::exit::StopReason::ShutdownRequested)
+        );
+
+        let mut running = ScopeLifecycle::starting();
+        assert!(running.complete_startup());
+        assert_eq!(running.finish_if_ready(true, false, true), None);
+        assert_eq!(
+            running.finish_if_ready(true, true, true),
+            Some(crate::exit::StopReason::Finished)
+        );
+
+        let mut starting = ScopeLifecycle::starting();
+        let drain = starting
+            .begin_drain(crate::exit::StopReason::ShutdownRequested)
+            .expect("starting can begin draining");
+        assert!(drain.startup_pending);
+    }
+
+    #[test]
+    fn scope_epoch_exhaustion_is_poisoned_without_minting_or_reuse() {
+        let mut epochs = ScopeEpochs::default();
+        assert_eq!(epochs.request_target(), Some((1, true)));
+        let first = epochs.begin().expect("first epoch is available");
+        assert_eq!(epochs.live_epoch(), Some(first));
+        assert_eq!(epochs.request_target(), Some((first, false)));
+        assert_eq!(epochs.begin(), None, "a live epoch cannot be replaced");
+        assert!(!epochs.finish(first + 1));
+        assert_eq!(epochs.live_epoch(), Some(first));
+        assert!(epochs.finish(first));
+        assert!(!epochs.finish(first), "a stopped epoch cannot finish twice");
+        assert_eq!(epochs.live_epoch(), None);
+        assert!(epochs.finished(first));
+        assert!(epochs.request_is_pending(first + 1));
+
+        let mut exhausted = ScopeEpochs::Idle {
+            last_stopped: u64::MAX - 2,
+        };
+        let last = exhausted.begin().expect("last non-poison epoch");
+        assert_eq!(last, u64::MAX - 1);
+        assert!(exhausted.finish(last));
+        assert_eq!(exhausted.begin(), None, "MAX is reserved as poison");
+        assert_eq!(exhausted.live_epoch(), None);
+        assert_eq!(exhausted.request_target(), None);
+        assert_eq!(exhausted.begin(), None, "poisoning is permanent");
+        assert!(!exhausted.finish(u64::MAX));
+    }
+
+    #[test]
+    fn one_priority_queue_orders_deadlines_then_equal_deadline_fifo() {
         let now = Instant::now();
+        let later = now + Duration::from_secs(1);
         let mut deadlines = DeadlineQueue::default();
-        deadlines.push(now, "first");
-        deadlines.push(now, "second");
+        deadlines.push(later, "later-first");
+        deadlines.push(now, "now-first");
+        deadlines.push(later, "later-second");
+        deadlines.push(now, "now-second");
+
         assert_eq!(deadlines.next(), Some(now));
-        assert_eq!(deadlines.pop_due(now), Some("first"));
-        assert_eq!(deadlines.pop_due(now), Some("second"));
+        assert_eq!(deadlines.pop_due(now), Some("now-first"));
+        assert_eq!(deadlines.pop_due(now), Some("now-second"));
+        assert_eq!(deadlines.pop_due(now), None);
+        assert_eq!(deadlines.next(), Some(later));
+        assert_eq!(deadlines.pop_due(later), Some("later-first"));
+        assert_eq!(deadlines.pop_due(later), Some("later-second"));
     }
 
     #[test]
@@ -682,15 +1222,14 @@ mod tests {
         for _ in 0..10_000 {
             let cancelled = deadlines.push(far_future, "cancelled");
             assert!(deadlines.cancel(cancelled));
-            assert_eq!(deadlines.len(), 1);
+            assert_eq!(
+                deadlines.len(),
+                1,
+                "the registration map keeps only live payloads"
+            );
             assert!(
                 deadlines.storage_len() <= 2,
                 "heap tombstones must stay proportional to live deadlines"
-            );
-            assert_eq!(
-                deadlines.registration_slots_len(),
-                2,
-                "registration slots must be reused"
             );
         }
 
@@ -700,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_deadline_drops_payload_and_stale_handle_misses_reused_slot() {
+    fn cancellation_and_queue_drop_own_payloads_while_stale_handles_stay_absent() {
         struct DropProbe(Arc<AtomicUsize>);
 
         impl Drop for DropProbe {
@@ -720,45 +1259,47 @@ mod tests {
         );
 
         let current = deadlines.push(Instant::now(), DropProbe(Arc::clone(&drops)));
-        assert_eq!(stale.index, current.index, "the vacant slot is reused");
-        assert_ne!(stale.generation, current.generation);
         assert!(
-            !deadlines.cancel(stale),
-            "a stale handle misses the replacement"
+            current > stale,
+            "deadline keys are monotonic and never reused"
         );
-        assert!(deadlines.cancel(current));
+        assert!(!deadlines.cancel(stale), "a stale handle remains absent");
+        assert_eq!(
+            deadlines.len(),
+            1,
+            "stale cancellation preserves the live key"
+        );
+        drop(deadlines);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]
-    fn deadline_generation_exhaustion_retires_the_slot() {
-        let mut deadlines = DeadlineQueue::default();
-        let original = deadlines.push(Instant::now(), "retired");
-        deadlines.slots[original.index].generation = u64::MAX;
-        let exhausted = DeadlineHandle {
-            index: original.index,
-            generation: u64::MAX,
-        };
-
-        assert!(deadlines.cancel(exhausted));
-        let current = deadlines.push(Instant::now(), "current");
-        assert_ne!(exhausted.index, current.index);
-        assert!(!deadlines.cancel(exhausted));
-        assert_eq!(deadlines.pop_due(Instant::now()), Some("current"));
-    }
-
-    #[test]
-    fn arming_order_exhaustion_rebases_without_changing_equal_deadline_order() {
+    fn deadline_key_exhaustion_never_mints_poison_or_reuses_a_key() {
         let now = Instant::now();
-        let mut deadlines = DeadlineQueue::default();
-        deadlines.push(now, "first");
-        deadlines.push(now, "second");
-        deadlines.next_order = u64::MAX;
-        deadlines.push(now, "third");
+        let mut deadlines = DeadlineQueue {
+            next_key: u64::MAX - 2,
+            ..DeadlineQueue::default()
+        };
+        let last = deadlines.push(now, "last usable");
+        assert_eq!(last, DeadlineHandle(u64::MAX - 1));
+        assert!(deadlines.cancel(last));
 
-        assert_eq!(deadlines.pop_due(now), Some("first"));
-        assert_eq!(deadlines.pop_due(now), Some("second"));
-        assert_eq!(deadlines.pop_due(now), Some("third"));
+        let first_exhausted = catch_unwind(AssertUnwindSafe(|| deadlines.push(now, "poison")));
+        assert!(first_exhausted.is_err(), "the poison key is never minted");
+        assert_eq!(deadlines.next_key, u64::MAX);
+        assert!(
+            !deadlines
+                .registrations
+                .contains_key(&DeadlineHandle(u64::MAX))
+        );
+
+        let still_exhausted = catch_unwind(AssertUnwindSafe(|| deadlines.push(now, "wrapped")));
+        assert!(
+            still_exhausted.is_err(),
+            "the exhausted domain stays poisoned"
+        );
+        assert!(deadlines.registrations.is_empty());
+        assert!(deadlines.entries.is_empty());
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{assert_quiet, poll_until};
+use crate::common::{POLL_TIMEOUT, assert_quiet, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
     Guard, LifecycleEventKind, LifecycleItem, Readiness, Shutdown, StartupError,
@@ -138,7 +138,7 @@ async fn timers_and_offload_completions_never_cross_an_incarnation_boundary() {
         .await
         .expect("actor live");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             generations.load(Ordering::SeqCst) >= 2
         })
         .await
@@ -227,7 +227,7 @@ async fn offload_completion_wins_at_the_exact_deadline() {
         .await
         .expect("actor live");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             armed.load(Ordering::SeqCst) && offload_started.load(Ordering::SeqCst)
         })
         .await,
@@ -300,7 +300,7 @@ async fn dropping_scoped_guard_suppresses_the_continuation() {
     system.wait_started().await.expect("actor starts");
     actor.send(GuardMessage::Start).await.expect("actor live");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             guard_dropped.load(Ordering::SeqCst)
         })
         .await,
@@ -313,6 +313,51 @@ async fn dropping_scoped_guard_suppresses_the_continuation() {
     actor.send(GuardMessage::Stop).await.expect("actor live");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(deliveries.load(Ordering::SeqCst), 0);
+}
+
+struct ExportGuardActor;
+
+impl Actor for ExportGuardActor {
+    type Msg = ();
+    type Args = tokio::sync::oneshot::Sender<Guard>;
+
+    async fn init(
+        guard_sender: Self::Args,
+        context: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        let guard = context
+            .offload_scoped(std::future::pending::<()>(), |_| (), Duration::MAX)
+            .expect("scoped offload accepted");
+        guard_sender
+            .send(guard)
+            .expect("test still awaits cancellation guard");
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn guard_reports_incarnation_cancellation() {
+    let (guard_sender, guard_receiver) = tokio::sync::oneshot::channel();
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "guard-exporter",
+        ActorOnceDef::<ExportGuardActor>::new(guard_sender),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    let guard = guard_receiver.await.expect("actor exports guard");
+    assert!(!guard.is_cancelled());
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("actor stops");
+    assert!(guard.is_cancelled());
 }
 
 struct DropLog {
@@ -499,7 +544,7 @@ async fn dropping_run_blocking_future_cancels_and_detaches_its_thread() {
         .expect("actor live");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             cancelled.load(Ordering::SeqCst)
         })
         .await
@@ -981,7 +1026,7 @@ async fn queued_offload_panic_survives_hard_abort() {
         .await
         .expect("mailbox accepts before readiness");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             queued.load(Ordering::SeqCst)
         })
         .await,
@@ -1057,7 +1102,7 @@ async fn hard_abort_preserves_owned_offload_panic_over_handler_destructor() {
     system.wait_started().await.expect("actor starts");
     actor.send(()).await.expect("actor accepts trigger");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             queued.load(Ordering::SeqCst)
         })
         .await,
@@ -1161,7 +1206,7 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_panic() {
         .await
         .expect("actor live");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             log.lock().expect("drop log mutex poisoned").len() == 2
         })
         .await
@@ -1241,7 +1286,7 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_error() {
         .await
         .expect("actor live");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             log.lock().expect("drop log mutex poisoned").len() == 2
         })
         .await

@@ -5,6 +5,9 @@ use std::{
     time::Duration,
 };
 
+/// Shared wall-clock budget for eventually-consistent test observations.
+pub(crate) const POLL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Polls a pinned future once with a no-op waker.
 pub(crate) fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     let mut context = Context::from_waker(Waker::noop());

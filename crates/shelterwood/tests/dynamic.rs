@@ -7,18 +7,41 @@ use std::{
 };
 
 use crate::common::{
-    ReleaseGate, advance_time, assert_quiet,
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet,
     policy::never,
     poll_once, poll_until,
     waiting::{task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
-    Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicTree, ExitError,
-    ExitKind, ExitResult, NotAdmittingCause, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
-    RemoveOutcome, ReserveError, RestartCondition, RestartPolicy, Retention, ScopeRef,
-    SendErrorKind, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, System, TaskDef, TaskOnceDef,
-    Tree,
+    Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicScopeRef,
+    DynamicTree, ExitError, ExitKind, ExitResult, NotAdmittingCause, RawActor, RawContext, RawDef,
+    RawOnceDef, Readiness, RemoveOutcome, ReserveError, RestartCondition, RestartPolicy, Retention,
+    ScopeRef, SendErrorKind, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, System, TaskDef,
+    TaskOnceDef, Tree,
 };
+
+/// Waits until a fused drop has finished releasing its id.
+///
+/// Dropping a polled fused `Admission` only fires the fused-cancel latch.
+/// The driver then marks the membership `removing` and runs the stop ladder,
+/// so a flag stored from inside the child's own shutdown handler is raised
+/// *within* the removal window, while the dynamic entry is still held.
+/// Reusing the id off that flag alone therefore races the only producer of
+/// `ReserveError::RemovalInProgress`: a surviving entry whose member is
+/// already `removing`.
+///
+/// Removal completion releases the entry before it withdraws residency, so
+/// an absent resident is a sound — slightly conservative — signal that the
+/// id is free again.
+async fn wait_for_id_release(scope: &DynamicScopeRef, id: &str) {
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            scope.child(id).is_none()
+        })
+        .await,
+        "removal of {id} did not release its id"
+    );
+}
 
 struct DropProbe(Arc<AtomicBool>);
 
@@ -76,6 +99,71 @@ impl RawActor for WaitingRaw {
         context.shutdown_token().cancelled().await;
         Ok(())
     }
+}
+
+struct SignalledWaitingRaw {
+    started: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RawActor for SignalledWaitingRaw {
+    type Msg = ();
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        self.started.store(true, Ordering::SeqCst);
+        context.shutdown_token().cancelled().await;
+        self.cancelled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn signalled_waiting_tree(started: Arc<AtomicBool>, cancelled: Arc<AtomicBool>) -> Tree {
+    let mut tree = Tree::new();
+    let (_, completion) = tree
+        .add_task_once(
+            "worker",
+            TaskOnceDef::new(move |context| async move {
+                started.store(true, Ordering::SeqCst);
+                context.shutdown_token().cancelled().await;
+                cancelled.store(true, Ordering::SeqCst);
+                Ok::<_, ExitError>(())
+            }),
+        )
+        .expect("valid signalled task");
+    drop(completion);
+    tree
+}
+
+#[tokio::test]
+async fn scope_dynamic_conversion_and_exact_dynamic_scope_removal_are_publicly_usable() {
+    let ordered = Tree::new().spawn().expect("runtime is available");
+    let ordered_scope: ScopeRef = ordered.scope();
+    assert!(ordered_scope.dynamic().is_none());
+    ordered
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("ordered root stops");
+
+    let dynamic = DynamicTree::new().spawn().expect("runtime is available");
+    dynamic.wait_started().await.expect("dynamic root starts");
+    let dynamic_scope = dynamic.scope();
+    let erased: &ScopeRef = dynamic_scope.as_scope();
+    let recovered = erased.dynamic().expect("dynamic capability is recoverable");
+    assert_eq!(recovered.as_scope(), erased);
+
+    let nested = dynamic_scope
+        .add_subtree_once("nested-dynamic", SubtreeOnceDef::new(DynamicTree::new()))
+        .await
+        .expect("dynamic subtree is admitted")
+        .into_handles();
+    assert_eq!(
+        dynamic_scope.remove_dynamic_scope(&nested).await,
+        RemoveOutcome::Removed
+    );
+    dynamic
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root stops");
 }
 
 #[tokio::test]
@@ -456,7 +544,7 @@ async fn removal_is_synchronous_detached_and_shared() {
     ));
     drop(first);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             cancelled.load(Ordering::SeqCst)
         })
         .await
@@ -532,6 +620,140 @@ async fn reserved_cell_removal_wins_a_queued_split_definition() {
         .expect("root stops");
 }
 
+#[test]
+fn admission_runtime_guards_leave_reservation_ids_reusable() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let (system, scope, task, mut admission) = runtime.block_on(async {
+        let system = DynamicTree::new().spawn().expect("runtime is available");
+        system.wait_started().await.expect("root starts");
+        let scope = system.scope();
+        let slot = scope
+            .reserve_task("poll-outside")
+            .expect("reservation starts inside the runtime");
+        let task = slot.task_ref();
+        let admission = Box::pin(slot.define(waiting_task()));
+        (system, scope, task, admission)
+    });
+
+    assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
+    assert!(matches!(
+        scope.reserve_task("poll-outside"),
+        Err(ReserveError::NoRuntime)
+    ));
+    assert!(matches!(
+        scope.reserve_task("reserve-outside"),
+        Err(ReserveError::NoRuntime)
+    ));
+    let mut immediate = Box::pin(scope.add_task("add-outside", waiting_task()));
+    assert!(matches!(
+        poll_once(immediate.as_mut()),
+        std::task::Poll::Ready(Err(ReserveError::NoRuntime))
+    ));
+    assert!(matches!(
+        poll_once(admission.as_mut()),
+        std::task::Poll::Ready(Err(ReserveError::NoRuntime))
+    ));
+    assert!(poll_once(admission.as_mut()).is_pending());
+
+    runtime.block_on(async {
+        assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
+        for id in ["reserve-outside", "add-outside", "poll-outside"] {
+            let task = scope
+                .add_task(id, waiting_task())
+                .await
+                .unwrap_or_else(|error| panic!("id `{id}` remains reusable: {error:?}"))
+                .into_handles();
+            assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+        }
+        system
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("root stops");
+    });
+    assert!(matches!(
+        scope.reserve_task("stopped-outside"),
+        Err(ReserveError::NoRuntime)
+    ));
+}
+
+#[tokio::test]
+async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+
+    let mut fused = Box::pin(scope.add_task("fused-select", waiting_task()));
+    assert!(poll_once(fused.as_mut()).is_pending());
+    tokio::select! {
+        biased;
+        () = std::future::ready(()) => {}
+        result = fused => panic!("ready branch must win over admission: {result:?}"),
+    }
+    let reused = scope
+        .add_task("fused-select", waiting_task())
+        .await
+        .expect("select dropping a fused admission frees its id")
+        .into_handles();
+    assert_eq!(scope.remove_task(&reused).await, RemoveOutcome::Removed);
+
+    let split_started = Arc::new(AtomicBool::new(false));
+    let split_cancelled = Arc::new(AtomicBool::new(false));
+    let slot = scope
+        .reserve_task("split-timeout")
+        .expect("split reservation");
+    let task = slot.task_ref();
+    let mut split = Box::pin(slot.define(TaskDef::new({
+        let split_started = Arc::clone(&split_started);
+        let split_cancelled = Arc::clone(&split_cancelled);
+        move |context| {
+            let split_started = Arc::clone(&split_started);
+            let split_cancelled = Arc::clone(&split_cancelled);
+            async move {
+                split_started.store(true, Ordering::SeqCst);
+                context.shutdown_token().cancelled().await;
+                split_cancelled.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    })));
+    assert!(poll_once(split.as_mut()).is_pending());
+    let timed_admission = async move {
+        let _split = split;
+        std::future::pending::<()>().await;
+    };
+    assert!(
+        tokio::time::timeout(Duration::ZERO, timed_admission)
+            .await
+            .is_err()
+    );
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            split_started.load(Ordering::SeqCst)
+        })
+        .await,
+        "timing out a polled split admission detaches the running child"
+    );
+    assert!(matches!(
+        scope.reserve_task("split-timeout"),
+        Err(ReserveError::DuplicateId(_))
+    ));
+    assert_quiet(Duration::from_millis(20), || {
+        split_cancelled.load(Ordering::SeqCst)
+    })
+    .await;
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert!(split_cancelled.load(Ordering::SeqCst));
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
 #[tokio::test]
 async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
@@ -567,18 +789,19 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     ));
     assert!(poll_once(fused.as_mut()).is_pending());
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             fused_started.load(Ordering::SeqCst)
         })
         .await
     );
     drop(fused);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             fused_cancelled.load(Ordering::SeqCst)
         })
         .await
     );
+    wait_for_id_release(&scope, "fused-after-admission").await;
     let reused = scope
         .add_task("fused-after-admission", waiting_task())
         .await
@@ -607,7 +830,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     assert!(poll_once(split.as_mut()).is_pending());
     drop(split);
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             split_started.load(Ordering::SeqCst)
         })
         .await
@@ -640,7 +863,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     })));
     assert!(poll_once(split_after.as_mut()).is_pending());
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             split_after_started.load(Ordering::SeqCst)
         })
         .await
@@ -654,6 +877,133 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         scope.remove_task(&split_after_task).await,
         RemoveOutcome::Removed
     );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
+async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+
+    let actor_started = Arc::new(AtomicBool::new(false));
+    let actor_cancelled = Arc::new(AtomicBool::new(false));
+    let mut fused_actor = Box::pin(scope.add_raw(
+        "fused-actor",
+        RawDef::factory({
+            let actor_started = Arc::clone(&actor_started);
+            let actor_cancelled = Arc::clone(&actor_cancelled);
+            move || SignalledWaitingRaw {
+                started: Arc::clone(&actor_started),
+                cancelled: Arc::clone(&actor_cancelled),
+            }
+        }),
+    ));
+    assert!(poll_once(fused_actor.as_mut()).is_pending());
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            actor_started.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    drop(fused_actor);
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            actor_cancelled.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    wait_for_id_release(&scope, "fused-actor").await;
+    let actor = scope
+        .add_raw("fused-actor", RawDef::factory(|| WaitingRaw))
+        .await
+        .expect("fused actor drop frees its id")
+        .into_handles();
+    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
+
+    let subtree_started = Arc::new(AtomicBool::new(false));
+    let subtree_cancelled = Arc::new(AtomicBool::new(false));
+    let mut fused_subtree = Box::pin(scope.add_subtree_once(
+        "fused-subtree",
+        SubtreeOnceDef::new(signalled_waiting_tree(
+            Arc::clone(&subtree_started),
+            Arc::clone(&subtree_cancelled),
+        )),
+    ));
+    assert!(poll_once(fused_subtree.as_mut()).is_pending());
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            subtree_started.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    drop(fused_subtree);
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            subtree_cancelled.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    wait_for_id_release(&scope, "fused-subtree").await;
+    let subtree = scope
+        .add_subtree_once("fused-subtree", SubtreeOnceDef::new(waiting_tree()))
+        .await
+        .expect("fused subtree drop frees its id")
+        .into_handles();
+    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+
+    let actor_started = Arc::new(AtomicBool::new(false));
+    let actor_cancelled = Arc::new(AtomicBool::new(false));
+    let slot = scope
+        .reserve_actor("split-actor")
+        .expect("actor reservation succeeds");
+    let actor = slot.actor_ref();
+    let mut split_actor = Box::pin(slot.define_once_raw(RawOnceDef::new(SignalledWaitingRaw {
+        started: Arc::clone(&actor_started),
+        cancelled: Arc::clone(&actor_cancelled),
+    })));
+    assert!(poll_once(split_actor.as_mut()).is_pending());
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            actor_started.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    drop(split_actor);
+    assert_quiet(Duration::from_millis(20), || {
+        actor_cancelled.load(Ordering::SeqCst)
+    })
+    .await;
+    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
+    assert!(actor_cancelled.load(Ordering::SeqCst));
+
+    let subtree_started = Arc::new(AtomicBool::new(false));
+    let subtree_cancelled = Arc::new(AtomicBool::new(false));
+    let slot = scope
+        .reserve_subtree::<Tree>("split-subtree")
+        .expect("subtree reservation succeeds");
+    let subtree = slot.scope_ref();
+    let mut split_subtree = Box::pin(slot.define_once(SubtreeOnceDef::new(
+        signalled_waiting_tree(Arc::clone(&subtree_started), Arc::clone(&subtree_cancelled)),
+    )));
+    assert!(poll_once(split_subtree.as_mut()).is_pending());
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            subtree_started.load(Ordering::SeqCst)
+        })
+        .await
+    );
+    drop(split_subtree);
+    assert_quiet(Duration::from_millis(20), || {
+        subtree_cancelled.load(Ordering::SeqCst)
+    })
+    .await;
+    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    assert!(subtree_cancelled.load(Ordering::SeqCst));
+
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -687,7 +1037,7 @@ async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
         .expect("task admitted")
         .into_handles();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             started.load(Ordering::SeqCst)
         })
         .await
@@ -788,6 +1138,20 @@ async fn dropping_undefined_dynamic_slots_terminalizes_cells_and_frees_ids() {
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
 
+    let actor_slot = scope
+        .reserve_actor::<()>("actor")
+        .expect("actor reservation");
+    let abandoned_actor = actor_slot.actor_ref();
+    drop(actor_slot);
+    assert_eq!(
+        abandoned_actor
+            .send(())
+            .await
+            .expect_err("abandoned actor is terminal")
+            .kind,
+        SendErrorKind::Terminated
+    );
+
     let task_slot = scope.reserve_task("worker").expect("task reservation");
     let abandoned_task = task_slot.task_ref();
     drop(task_slot);
@@ -812,6 +1176,12 @@ async fn dropping_undefined_dynamic_slots_terminalizes_cells_and_frees_ids() {
         .expect("task id was released")
         .into_handles();
     assert_eq!(scope.remove_task(&worker).await, RemoveOutcome::Removed);
+    let actor = scope
+        .add_raw("actor", RawDef::factory(|| WaitingRaw))
+        .await
+        .expect("actor id was released")
+        .into_handles();
+    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
     let nested = scope
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
@@ -865,7 +1235,7 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
     let system = root.spawn().expect("runtime is available");
 
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             first_started.load(Ordering::SeqCst)
         })
         .await
@@ -958,7 +1328,7 @@ fn pending_restart_subtree(
 
 async fn await_first_restart_window(root: &ScopeRef, starts: &Arc<AtomicUsize>) {
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             starts.load(Ordering::SeqCst) == 1
         })
         .await
@@ -1157,7 +1527,7 @@ async fn draining_scopes_reject_admission_and_treat_removal_as_absent() {
     let scope = system.scope();
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             cancelled.load(Ordering::SeqCst)
         })
         .await

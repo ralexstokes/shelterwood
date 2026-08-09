@@ -7,11 +7,13 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{PanicOnDrop, ReleaseGate, assert_quiet, policy::never, poll_until};
+use crate::common::{
+    POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_quiet, policy::never, poll_until,
+};
 use shelterwood::{
     Actor, ActorOnceDef, Context, DynamicTree, ExitError, ExitKind, ExitResult, Intensity,
-    Readiness, Retention, Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeOnceDef,
-    TaskDef, TaskOnceDef, Tree,
+    LifecycleEventKind, LifecycleItem, Readiness, Retention, ScopeState, Shutdown, StartupError,
+    StartupFailureCause, StopReason, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 #[tokio::test]
@@ -258,7 +260,7 @@ async fn replacement_starts_only_after_the_old_future_is_destroyed() {
         .await
         .expect("initial incarnation starts");
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             starts.load(Ordering::SeqCst) >= 2
         })
         .await
@@ -304,7 +306,7 @@ async fn ordered_teardown_is_reverse_and_joins_before_advancing() {
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
 
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             order.lock().expect("order mutex poisoned").as_slice() == [2]
         })
         .await
@@ -315,14 +317,14 @@ async fn ordered_teardown_is_reverse_and_joins_before_advancing() {
     .await;
     gates[2].release();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             order.lock().expect("order mutex poisoned").as_slice() == [2, 1]
         })
         .await
     );
     gates[1].release();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             order.lock().expect("order mutex poisoned").as_slice() == [2, 1, 0]
         })
         .await
@@ -363,7 +365,7 @@ async fn dynamic_teardown_cancels_children_concurrently() {
     system.wait_started().await.expect("tree starts");
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             cancelled.iter().all(|flag| flag.load(Ordering::SeqCst))
         })
         .await
@@ -374,6 +376,77 @@ async fn dynamic_teardown_cancels_children_concurrently() {
         .await
         .expect("shutdown task joins")
         .expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn concurrent_initial_failures_publish_one_startup_failed_scope_edge() {
+    let release = Arc::new(tokio::sync::Barrier::new(3));
+    let mut tree = DynamicTree::new();
+    for index in 0..2 {
+        tree.add_task(
+            format!("child-{index}"),
+            TaskDef::new({
+                let release = Arc::clone(&release);
+                move |_| {
+                    let release = Arc::clone(&release);
+                    async move {
+                        release.wait().await;
+                        Err(ExitError::message(format!("failure-{index}")))
+                    }
+                }
+            })
+            .restart(never())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness"),
+        )
+        .expect("valid task");
+    }
+
+    let system = tree.spawn().expect("runtime is available");
+    let mut lifecycle = system.scope().subscribe_lifecycle();
+    release.wait().await;
+
+    let mut exits = 0;
+    let mut startup_failed_edges = 0;
+    while exits < 2 {
+        let item = tokio::time::timeout(Duration::from_secs(2), lifecycle.recv())
+            .await
+            .expect("both concurrent exits are bounded")
+            .expect("the root lifecycle remains open");
+        let LifecycleItem::Event(event) = item else {
+            panic!("the small fixture cannot lag");
+        };
+        match event.kind {
+            LifecycleEventKind::Exited { .. } => exits += 1,
+            LifecycleEventKind::ScopeState {
+                state: ScopeState::StartupFailed,
+            } => startup_failed_edges += 1,
+            _ => {}
+        }
+    }
+    while let Ok(item) = lifecycle.try_recv() {
+        if matches!(
+            item,
+            LifecycleItem::Event(shelterwood::LifecycleEvent {
+                kind: LifecycleEventKind::ScopeState {
+                    state: ScopeState::StartupFailed,
+                },
+                ..
+            })
+        ) {
+            startup_failed_edges += 1;
+        }
+    }
+
+    assert_eq!(
+        startup_failed_edges, 1,
+        "the first initial failure owns the root startup transition"
+    );
+    assert!(system.wait_started().await.is_err());
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed dynamic root shuts down");
 }
 
 #[tokio::test]

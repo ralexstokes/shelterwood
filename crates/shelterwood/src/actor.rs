@@ -39,9 +39,116 @@ pub trait Actor: Sized + Send + 'static {
     }
 }
 
+struct ActorContextCore<'a, M> {
+    raw: &'a mut RawContext<M>,
+}
+
+impl<'a, M: Send + 'static> ActorContextCore<'a, M> {
+    fn new(raw: &'a mut RawContext<M>) -> Self {
+        Self { raw }
+    }
+
+    fn reborrow(&mut self) -> ActorContextCore<'_, M> {
+        ActorContextCore::new(&mut *self.raw)
+    }
+
+    fn id(&self) -> &ChildId {
+        self.raw.id()
+    }
+
+    fn incarnation(&self) -> Incarnation {
+        self.raw.incarnation()
+    }
+
+    fn myself(&self) -> ActorRef<M> {
+        self.raw.myself()
+    }
+
+    fn scope(&self) -> ScopeRef {
+        self.raw.scope()
+    }
+
+    fn shutdown_token(&self) -> CancellationToken {
+        self.raw.shutdown_token()
+    }
+
+    fn abort_token(&self) -> CancellationToken {
+        self.raw.abort_token()
+    }
+
+    fn request_scope_shutdown(&self) {
+        self.raw.request_scope_shutdown();
+    }
+
+    fn run_blocking<F, T>(&self, operation: F) -> Blocking<T>
+    where
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.raw.run_blocking(operation)
+    }
+}
+
+macro_rules! actor_context_forwarders {
+    ($actor:ident) => {
+        /// Returns this actor's child id.
+        #[must_use]
+        pub fn id(&self) -> &ChildId {
+            self.core.id()
+        }
+
+        /// Returns this actor's current incarnation.
+        #[must_use]
+        pub fn incarnation(&self) -> Incarnation {
+            self.core.incarnation()
+        }
+
+        /// Returns a membership-addressed handle to this actor.
+        #[must_use]
+        pub fn myself(&self) -> ActorRef<$actor::Msg> {
+            self.core.myself()
+        }
+
+        /// Returns this actor's supervising scope.
+        #[must_use]
+        pub fn scope(&self) -> ScopeRef {
+            self.core.scope()
+        }
+
+        /// Returns the cooperative shutdown token.
+        #[must_use]
+        pub fn shutdown_token(&self) -> CancellationToken {
+            self.core.shutdown_token()
+        }
+
+        /// Returns the escalation token.
+        #[must_use]
+        pub fn abort_token(&self) -> CancellationToken {
+            self.core.abort_token()
+        }
+
+        /// Requests shutdown of the supervising scope without waiting.
+        pub fn request_scope_shutdown(&self) {
+            self.core.request_scope_shutdown();
+        }
+
+        /// Starts blocking work tied to actor shutdown and returned-future drop.
+        ///
+        /// Cancellation is cooperative; a hard-aborted operation's OS thread
+        /// detaches and may outlive this actor incarnation.
+        pub fn run_blocking<F, T>(&self, operation: F) -> Blocking<T>
+        where
+            F: FnOnce(CancellationToken) -> T + Send + 'static,
+            T: Send + 'static,
+        {
+            self.core.run_blocking(operation)
+        }
+    };
+}
+
 /// Callback context used by both live and frozen-prefix handler deliveries.
 pub struct Context<'a, A: Actor> {
-    raw: &'a mut RawContext<A::Msg>,
+    core: ActorContextCore<'a, A::Msg>,
     draining: bool,
     actor: PhantomData<fn() -> A>,
 }
@@ -50,8 +157,8 @@ impl<A: Actor> fmt::Debug for Context<'_, A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Context")
-            .field("id", self.raw.id())
-            .field("incarnation", &self.raw.incarnation())
+            .field("id", self.core.id())
+            .field("incarnation", &self.core.incarnation())
             .field("draining", &self.draining)
             .finish_non_exhaustive()
     }
@@ -60,64 +167,25 @@ impl<A: Actor> fmt::Debug for Context<'_, A> {
 impl<'a, A: Actor> Context<'a, A> {
     fn new(raw: &'a mut RawContext<A::Msg>, draining: bool) -> Self {
         Self {
-            raw,
+            core: ActorContextCore::new(raw),
             draining,
             actor: PhantomData,
         }
     }
 
-    /// Returns this actor's child id.
-    #[must_use]
-    pub fn id(&self) -> &ChildId {
-        self.raw.id()
-    }
-
-    /// Returns this actor's current incarnation.
-    #[must_use]
-    pub fn incarnation(&self) -> Incarnation {
-        self.raw.incarnation()
-    }
-
-    /// Returns a membership-addressed handle to this actor.
-    #[must_use]
-    pub fn myself(&self) -> ActorRef<A::Msg> {
-        self.raw.myself()
-    }
-
-    /// Returns this actor's supervising scope.
-    #[must_use]
-    pub fn scope(&self) -> ScopeRef {
-        self.raw.scope()
-    }
-
-    /// Returns the cooperative shutdown token.
-    #[must_use]
-    pub fn shutdown_token(&self) -> CancellationToken {
-        self.raw.shutdown_token()
-    }
-
-    /// Returns the escalation token.
-    #[must_use]
-    pub fn abort_token(&self) -> CancellationToken {
-        self.raw.abort_token()
-    }
-
-    /// Requests shutdown of the supervising scope without waiting.
-    pub fn request_scope_shutdown(&self) {
-        self.raw.request_scope_shutdown();
-    }
+    actor_context_forwarders!(A);
 
     /// Releases this incarnation's readiness gate while live.
     pub fn mark_ready(&self) {
         if !self.draining {
-            self.raw.mark_ready();
+            self.core.raw.mark_ready();
         }
     }
 
     /// Requests a clean local stop after the current callback.
     pub fn stop(&mut self) {
         if !self.draining {
-            self.raw.stop();
+            self.core.raw.stop();
         }
     }
 
@@ -132,7 +200,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.draining {
             Err(Rejected::new(message))
         } else {
-            self.raw.continue_with(message)
+            self.core.raw.continue_with(message)
         }
     }
 
@@ -149,7 +217,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.draining {
             Err(Rejected::new((key, message)))
         } else {
-            self.raw.set_timeout(key, message, after)
+            self.core.raw.set_timeout(key, message, after)
         }
     }
 
@@ -167,7 +235,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.draining {
             Err(Rejected::new((key, message)))
         } else {
-            self.raw.set_interval(key, message, period)
+            self.core.raw.set_interval(key, message, period)
         }
     }
 
@@ -179,7 +247,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.draining {
             Err(Rejected::new(()))
         } else {
-            Ok(self.raw.clear_timer(key))
+            Ok(self.core.raw.clear_timer(key))
         }
     }
 
@@ -198,7 +266,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.draining {
             Err(Rejected::new((work, continuation)))
         } else {
-            self.raw.offload(work, continuation, deadline)
+            self.core.raw.offload(work, continuation, deadline)
         }
     }
 
@@ -217,31 +285,24 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.draining {
             Err(Rejected::new((work, continuation)))
         } else {
-            self.raw.offload_scoped(work, continuation, deadline)
+            self.core.raw.offload_scoped(work, continuation, deadline)
         }
-    }
-
-    /// Starts blocking work tied to actor shutdown and returned-future drop.
-    ///
-    /// Cancellation is cooperative; a hard-aborted operation's OS thread
-    /// detaches and may outlive this actor incarnation.
-    pub fn run_blocking<F, T>(&self, operation: F) -> Blocking<T>
-    where
-        F: FnOnce(CancellationToken) -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        self.raw.run_blocking(operation)
     }
 
     /// Re-enters a same-message actor with this exact context and stage.
     pub fn for_actor<B: Actor<Msg = A::Msg>>(&mut self) -> Context<'_, B> {
-        Context::new(self.raw, self.draining)
+        let draining = self.draining;
+        Context {
+            core: self.core.reborrow(),
+            draining,
+            actor: PhantomData,
+        }
     }
 }
 
 /// Narrowed context supplied only to [`Actor::on_stop`].
 pub struct StopContext<'a, A: Actor> {
-    raw: &'a mut RawContext<A::Msg>,
+    core: ActorContextCore<'a, A::Msg>,
     actor: PhantomData<fn() -> A>,
 }
 
@@ -249,8 +310,8 @@ impl<A: Actor> fmt::Debug for StopContext<'_, A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StopContext")
-            .field("id", self.raw.id())
-            .field("incarnation", &self.raw.incarnation())
+            .field("id", self.core.id())
+            .field("incarnation", &self.core.incarnation())
             .finish_non_exhaustive()
     }
 }
@@ -258,67 +319,19 @@ impl<A: Actor> fmt::Debug for StopContext<'_, A> {
 impl<'a, A: Actor> StopContext<'a, A> {
     fn new(raw: &'a mut RawContext<A::Msg>) -> Self {
         Self {
-            raw,
+            core: ActorContextCore::new(raw),
             actor: PhantomData,
         }
     }
 
-    /// Returns this actor's child id.
-    #[must_use]
-    pub fn id(&self) -> &ChildId {
-        self.raw.id()
-    }
-
-    /// Returns this actor's current incarnation.
-    #[must_use]
-    pub fn incarnation(&self) -> Incarnation {
-        self.raw.incarnation()
-    }
-
-    /// Returns a membership-addressed handle to this actor.
-    #[must_use]
-    pub fn myself(&self) -> ActorRef<A::Msg> {
-        self.raw.myself()
-    }
-
-    /// Returns this actor's supervising scope.
-    #[must_use]
-    pub fn scope(&self) -> ScopeRef {
-        self.raw.scope()
-    }
-
-    /// Returns the cooperative shutdown token.
-    #[must_use]
-    pub fn shutdown_token(&self) -> CancellationToken {
-        self.raw.shutdown_token()
-    }
-
-    /// Returns the escalation token.
-    #[must_use]
-    pub fn abort_token(&self) -> CancellationToken {
-        self.raw.abort_token()
-    }
-
-    /// Requests shutdown of the supervising scope without waiting.
-    pub fn request_scope_shutdown(&self) {
-        self.raw.request_scope_shutdown();
-    }
-
-    /// Starts blocking work tied to actor shutdown and returned-future drop.
-    ///
-    /// Cancellation is cooperative; a hard-aborted operation's OS thread
-    /// detaches and may outlive this actor incarnation.
-    pub fn run_blocking<F, T>(&self, operation: F) -> Blocking<T>
-    where
-        F: FnOnce(CancellationToken) -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        self.raw.run_blocking(operation)
-    }
+    actor_context_forwarders!(A);
 
     /// Re-enters a same-message actor with the same narrowed stop context.
     pub fn for_actor<B: Actor<Msg = A::Msg>>(&mut self) -> StopContext<'_, B> {
-        StopContext::new(self.raw)
+        StopContext {
+            core: self.core.reborrow(),
+            actor: PhantomData,
+        }
     }
 }
 
@@ -492,54 +505,15 @@ impl<A: Actor> ActorDef<A> {
         }
     }
 
-    /// Overrides the restart policy.
-    #[must_use]
-    pub fn restart(mut self, restart: RestartPolicy) -> Self {
-        self.options.restart = Some(restart);
-        self
-    }
-
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor mailbox kind and capacity.
-    #[must_use]
-    pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
-        self.options.mailbox = Some(mailbox);
-        self
-    }
-
-    /// Overrides frozen-prefix drain versus discard behavior.
-    #[must_use]
-    pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
-        self.options.mailbox_shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor's declared readiness mode.
-    #[must_use]
-    pub fn readiness(mut self, readiness: Readiness) -> Self {
-        self.options.readiness = Some(readiness);
-        self
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(
+        restart,
+        shutdown,
+        mailbox,
+        mailbox_shutdown,
+        actor_readiness,
+        structural_readiness_deadline,
+        retention,
+    );
 
     pub(crate) fn into_raw(self) -> RawDef<Handler<A>> {
         let factory = self.factory;
@@ -581,47 +555,14 @@ impl<A: Actor> ActorOnceDef<A> {
         }
     }
 
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor mailbox kind and capacity.
-    #[must_use]
-    pub fn mailbox(mut self, mailbox: Mailbox) -> Self {
-        self.options.mailbox = Some(mailbox);
-        self
-    }
-
-    /// Overrides frozen-prefix drain versus discard behavior.
-    #[must_use]
-    pub fn mailbox_shutdown(mut self, shutdown: MailboxShutdown) -> Self {
-        self.options.mailbox_shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides the actor's declared readiness mode.
-    #[must_use]
-    pub fn readiness(mut self, readiness: Readiness) -> Self {
-        self.options.readiness = Some(readiness);
-        self
-    }
-
-    /// Overrides the structural readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(
+        shutdown,
+        mailbox,
+        mailbox_shutdown,
+        actor_readiness,
+        structural_readiness_deadline,
+        retention,
+    );
 
     pub(crate) fn into_raw(self) -> RawOnceDef<Handler<A>> {
         let readiness = self.options.readiness.unwrap_or(Readiness::AfterInit);

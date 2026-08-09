@@ -6,10 +6,11 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, assert_quiet, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
 use shelterwood::{
-    Actor, ActorDef, ActorOnceDef, Context, DynamicTree, ExitError, ExitResult, Handler, RawActor,
-    RawContext, RawOnceDef, Readiness, StopContext, TaskDef, Tree,
+    Actor, ActorDef, ActorOnceDef, ActorRef, Context, DynamicTree, ExitError, ExitResult, Handler,
+    Mailbox, RawActor, RawContext, RawOnceDef, Readiness, ScopeRef, SendErrorKind, StopContext,
+    TaskDef, Tree,
 };
 
 #[derive(Clone)]
@@ -330,7 +331,7 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         .expect("dynamic actor admitted")
         .into_handles();
     assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             dynamic_events
                 .lock()
                 .expect("events mutex poisoned")
@@ -396,4 +397,119 @@ async fn manual_readiness_override_on_a_wrapped_handler_stays_gated() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
+}
+
+enum ContextSurfaceMessage {
+    Enter,
+    Queued,
+    SelfSent,
+}
+
+struct ContextSurfaceActor {
+    entered: ReleaseGate,
+    release: ReleaseGate,
+    observed: Option<tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>>,
+    stopped: Option<tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>>,
+}
+
+impl Actor for ContextSurfaceActor {
+    type Msg = ContextSurfaceMessage;
+    type Args = (
+        ReleaseGate,
+        ReleaseGate,
+        tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>,
+        tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>,
+    );
+
+    async fn init(
+        (entered, release, observed, stopped): Self::Args,
+        _: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        Ok(Self {
+            entered,
+            release,
+            observed: Some(observed),
+            stopped: Some(stopped),
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            ContextSurfaceMessage::Enter => {
+                self.entered.release();
+                self.release.wait().await;
+
+                let myself: ActorRef<ContextSurfaceMessage> = context.myself();
+                let scope: ScopeRef = context.scope();
+                let error = myself
+                    .try_send(ContextSurfaceMessage::SelfSent)
+                    .expect_err("the one-slot mailbox is already full");
+                assert_eq!(error.kind, SendErrorKind::Full);
+                assert!(matches!(error.message, ContextSurfaceMessage::SelfSent));
+                self.observed
+                    .take()
+                    .expect("surface observation is sent once")
+                    .send((myself, scope))
+                    .expect("test still awaits typed context handles");
+            }
+            ContextSurfaceMessage::Queued => context.stop(),
+            ContextSurfaceMessage::SelfSent => {
+                panic!("a self-send rejected from the full mailbox must not be delivered")
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_stop(&mut self, context: &mut StopContext<'_, Self>) {
+        let myself: ActorRef<ContextSurfaceMessage> = context.myself();
+        let scope: ScopeRef = context.scope();
+        self.stopped
+            .take()
+            .expect("stop-context observation is sent once")
+            .send((myself, scope))
+            .expect("test still awaits typed stop-context handles");
+    }
+}
+
+#[tokio::test]
+async fn typed_context_handles_preserve_identity_and_self_send_capacity() {
+    let entered = ReleaseGate::default();
+    let release = ReleaseGate::default();
+    let (observed, observation) = tokio::sync::oneshot::channel();
+    let (stopped, stop_observation) = tokio::sync::oneshot::channel();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "context-surface",
+            ActorOnceDef::<ContextSurfaceActor>::new((
+                entered.clone(),
+                release.clone(),
+                observed,
+                stopped,
+            ))
+            .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+
+    actor
+        .send(ContextSurfaceMessage::Enter)
+        .await
+        .expect("actor enters handler");
+    entered.wait().await;
+    actor
+        .try_send(ContextSurfaceMessage::Queued)
+        .expect("the sole pending slot is filled");
+    release.release();
+
+    let (myself, scope) = observation.await.expect("actor reports its handles");
+    assert_eq!(myself, actor);
+    assert_eq!(scope, system.scope());
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    let (stopping_myself, stopping_scope) = stop_observation
+        .await
+        .expect("actor reports stop-context handles");
+    assert_eq!(stopping_myself, actor);
+    assert_eq!(stopping_scope, scope);
 }

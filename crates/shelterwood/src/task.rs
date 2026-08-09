@@ -1,6 +1,7 @@
 //! Supervised task definitions, contexts, and handles.
 
 use std::{
+    convert::Infallible,
     fmt,
     future::Future,
     hash::{Hash, Hasher},
@@ -11,7 +12,8 @@ use std::{
 use crate::{
     ChildId, Exit, ExitError, ExitResult, Incarnation, Membership, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
-    driver::MemberCell,
+    cells::MemberCell,
+    definition::DefinitionSource,
     policy::CommonOptions,
     runtime::{self, Latch},
 };
@@ -55,7 +57,7 @@ impl CancellationToken {
     /// Waits until cancellation is requested.
     pub async fn cancelled(&self) {
         if let Some(secondary) = &self.secondary {
-            let _ = crate::driver::select(self.primary.fired(), secondary.fired()).await;
+            let _ = runtime::select_two(self.primary.fired(), secondary.fired()).await;
         } else {
             self.primary.fired().await;
         }
@@ -114,8 +116,18 @@ impl TaskContext {
     }
 
     /// Releases manual readiness. Repeated calls are no-ops.
+    ///
+    /// Once cooperative shutdown or escalation has begun this incarnation is
+    /// already stopping, so readiness can no longer be published and the call
+    /// is a no-op as well.
     pub fn mark_ready(&self) {
-        self.ready.fire();
+        if !self.is_stopping() {
+            self.ready.fire();
+        }
+    }
+
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.shutdown.is_cancelled() || self.abort.is_cancelled()
     }
 }
 
@@ -147,42 +159,13 @@ impl TaskDef {
         }
     }
 
-    /// Overrides the restart policy.
-    #[must_use]
-    pub fn restart(mut self, restart: RestartPolicy) -> Self {
-        self.options.restart = Some(restart);
-        self
-    }
-
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides task readiness (`Immediate` or `Manual`).
-    pub fn readiness(mut self, readiness: Readiness) -> Result<Self, PolicyError> {
-        if readiness == Readiness::AfterInit {
-            return Err(PolicyError::UnsupportedReadiness);
-        }
-        self.options.readiness = Some(readiness);
-        Ok(self)
-    }
-
-    /// Overrides the readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(
+        restart,
+        shutdown,
+        task_readiness,
+        task_readiness_deadline,
+        retention,
+    );
 }
 
 type OnceTaskFuture<T> = Pin<Box<dyn Future<Output = Result<T, ExitError>> + Send + 'static>>;
@@ -218,40 +201,12 @@ impl<T: Send + 'static> TaskOnceDef<T> {
         }
     }
 
-    /// Overrides the shutdown policy.
-    #[must_use]
-    pub fn shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.options.shutdown = Some(shutdown);
-        self
-    }
-
-    /// Overrides task readiness (`Immediate` or `Manual`).
-    pub fn readiness(mut self, readiness: Readiness) -> Result<Self, PolicyError> {
-        if readiness == Readiness::AfterInit {
-            return Err(PolicyError::UnsupportedReadiness);
-        }
-        self.options.readiness = Some(readiness);
-        Ok(self)
-    }
-
-    /// Overrides the readiness deadline.
-    #[must_use]
-    pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-        self.options.readiness_deadline = deadline;
-        self
-    }
-
-    /// Overrides terminal-membership retention.
-    #[must_use]
-    pub fn retention(mut self, retention: Retention) -> Self {
-        self.options.retention = Some(retention);
-        self
-    }
+    common_options_setters!(shutdown, task_readiness, task_readiness_deadline, retention,);
 
     pub(crate) fn erase(self, completion: runtime::OneShotSender<T>) -> OnceTask {
         let body = self.body;
         OnceTask {
-            body: OnceTaskBody::Available(Box::new(move |context| {
+            source: DefinitionSource::OneShot(Box::new(move |context| {
                 Box::pin(async move {
                     match body(context).await {
                         Ok(value) => {
@@ -268,13 +223,18 @@ impl<T: Send + 'static> TaskOnceDef<T> {
 }
 
 pub(crate) struct OnceTask {
-    pub(crate) body: OnceTaskBody,
+    source: DefinitionSource<Infallible, OnceTaskFactory>,
     pub(crate) options: CommonOptions,
 }
 
-pub(crate) enum OnceTaskBody {
-    Available(Box<dyn FnOnce(TaskContext) -> TaskFuture + Send + 'static>),
-    Spent,
+type OnceTaskFactory = Box<dyn FnOnce(TaskContext) -> TaskFuture + Send + 'static>;
+
+impl OnceTask {
+    pub(crate) fn take_body(&mut self) -> OnceTaskFactory {
+        self.source
+            .take_one_shot()
+            .expect("one-shot task construction invoked more than once")
+    }
 }
 
 /// A cheap membership-addressed task handle.
@@ -359,14 +319,25 @@ impl<T> OneShotTaskRef<T> {
     /// The typed value is released only when terminal publication classifies
     /// the membership as [`crate::ExitKind::Completed`]. Any competing
     /// failure, panic, abort, readiness timeout, or never-started verdict wins
-    /// even if the task body produced a value first.
+    /// even if the task body produced a value first. That precedence is
+    /// deliberately asymmetric: a body that returned `Err` keeps its
+    /// [`crate::ExitKind::Failed`] verdict through a racing forced abort,
+    /// while a body that returned `Ok` does not — the value is dropped and
+    /// the claim resolves `Err` with the abort verdict.
     pub async fn wait(self) -> Result<T, Exit> {
         let Self { completion, task } = self;
         let exit = task.wait().await;
         if !matches!(exit.kind(), crate::ExitKind::Completed) {
             return Err(exit);
         }
-        completion.receive().await.ok_or(exit)
+        // The erased one-shot body sends before returning success, and this
+        // receiver is the sole completion claim. A published Completed verdict
+        // with a closed, empty channel is therefore a framework invariant
+        // violation, not an application exit that can be reported as `Err`.
+        Ok(completion
+            .receive()
+            .await
+            .expect("completed one-shot task must publish its typed value"))
     }
 }
 
@@ -380,19 +351,75 @@ mod tests {
 
     use crate::{
         ChildId, Exit, ExitKind,
-        driver::MemberCell,
+        cells::MemberCell,
         identity::ScopeIdentity,
         runtime::{self, JoinOutcome, Latch, Timeout},
     };
 
-    use super::{CancellationToken, OneShotTaskRef, TaskRef};
+    use super::{CancellationToken, OneShotTaskRef, TaskContext, TaskRef};
+
+    fn task_context() -> (TaskContext, Latch, Latch, Latch) {
+        let id = ChildId::from("task");
+        let mut identity = ScopeIdentity::new();
+        let membership = identity.mint_membership(&id).expect("membership available");
+        let mut incarnations = identity.incarnation_counter(membership);
+        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+            .expect("incarnation available");
+        let shutdown = Latch::default();
+        let abort = Latch::default();
+        let ready = Latch::default();
+        let context = TaskContext::new(
+            id,
+            incarnation,
+            shutdown.clone(),
+            abort.clone(),
+            ready.clone(),
+        );
+        (context, shutdown, abort, ready)
+    }
+
+    #[test]
+    fn live_task_context_can_publish_readiness() {
+        let (context, shutdown, abort, ready) = task_context();
+
+        assert!(!context.is_stopping());
+        context.mark_ready();
+
+        assert!(ready.is_fired());
+        assert!(!shutdown.is_fired());
+        assert!(!abort.is_fired());
+    }
+
+    #[test]
+    fn shutdown_first_prevents_task_readiness_publication() {
+        let (context, shutdown, abort, ready) = task_context();
+
+        assert!(shutdown.fire());
+        assert!(context.is_stopping());
+        context.mark_ready();
+
+        assert!(!ready.is_fired());
+        assert!(!abort.is_fired());
+    }
+
+    #[test]
+    fn abort_first_prevents_task_readiness_publication() {
+        let (context, shutdown, abort, ready) = task_context();
+
+        assert!(abort.fire());
+        assert!(context.is_stopping());
+        context.mark_ready();
+
+        assert!(!ready.is_fired());
+        assert!(!shutdown.is_fired());
+    }
 
     fn one_shot_claim<T>() -> (
         runtime::OneShotSender<T>,
         OneShotTaskRef<T>,
         std::sync::Arc<MemberCell>,
     ) {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("task");
         let membership = identity.mint_membership(&id).expect("membership available");
         let member = MemberCell::new(id, membership);
@@ -424,6 +451,16 @@ mod tests {
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
         member.terminalize(exit.clone());
         assert_eq!(waiting.await, Err(exit));
+    }
+
+    #[crate::runtime::test]
+    #[should_panic(expected = "completed one-shot task must publish its typed value")]
+    async fn completed_terminal_publication_requires_a_typed_value() {
+        let (sender, claim, member) = one_shot_claim::<u8>();
+        drop(sender);
+        member.terminalize(Exit::new(ExitKind::Completed, false));
+
+        let _ = claim.wait().await;
     }
 
     #[crate::runtime::test]
@@ -466,15 +503,15 @@ mod tests {
             let primary = Latch::default();
             let local = Latch::default();
             let operation = CancellationToken::from_latch(primary.clone()).child(local.clone());
-            let waiter = runtime::spawn((), async move {
+            let waiter = runtime::spawn(async move {
                 operation.cancelled().await;
             });
 
-            let primary_firer = runtime::spawn((), async move {
+            let primary_firer = runtime::spawn(async move {
                 runtime::yield_now().await;
                 primary.fire()
             });
-            let local_firer = runtime::spawn((), async move {
+            let local_firer = runtime::spawn(async move {
                 runtime::yield_now().await;
                 local.fire()
             });

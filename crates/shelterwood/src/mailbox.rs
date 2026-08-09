@@ -1,12 +1,11 @@
 //! Membership-owned actor mailboxes and request/reply capabilities.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     fmt,
     future::Future,
     hash::{Hash, Hasher},
     num::NonZeroUsize,
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
@@ -15,7 +14,11 @@ use std::{
 
 use crate::{
     ChildId, Incarnation, Mailbox, Membership,
-    driver::{MemberCell, Signal, SignalWatcher},
+    cells::{MailboxControl, MailboxDisposal, MailboxTermination, MemberCell},
+    runtime::{
+        OneShotClose, OneShotReceiver, OneShotSender, PanicAccumulator, PanicPayload, Signal,
+        SignalWatcher, resume_panic,
+    },
 };
 
 /// The kind of a failed actor send.
@@ -167,54 +170,114 @@ impl fmt::Display for ReplyError {
 
 impl std::error::Error for ReplyError {}
 
-enum ReplyOutcome<T> {
-    Pending,
-    Value(T),
-    Dropped,
+trait DeadlineOperation {
+    type Output;
+
+    /// Polls the operation before or after the shared deadline transition.
+    ///
+    /// This is a second operation poll after the timer becomes ready so
+    /// completion or acceptance at the exact boundary wins before
+    /// operation-specific timeout cleanup runs. It may remain pending only
+    /// when an atomic completion transition won but has not published its
+    /// payload yet; that transition must wake the registered operation waker.
+    fn poll_deadlined(
+        &mut self,
+        context: &mut Context<'_>,
+        budget: crate::deadline::Deadline,
+        elapsed: bool,
+    ) -> Poll<Self::Output>;
+
+    /// Resolves a zero-width budget without ever attempting the operation.
+    ///
+    /// A zero budget is a short-circuit, not a raced deadline: nothing is
+    /// submitted and no completion is observed, so this reports the
+    /// operation's timeout outcome and performs only its own cleanup.
+    fn short_circuit(&mut self) -> Self::Output;
 }
 
-struct ReplyState<T> {
-    outcome: ReplyOutcome<T>,
-    receiver_alive: bool,
-    waker: Option<Waker>,
+/// First-poll deadline capture shared by every public mailbox deadline future.
+struct Deadlined<F> {
+    operation: F,
+    duration: Duration,
+    budget: Option<crate::deadline::Deadline>,
+    timer: Option<crate::runtime::BoxedSleep>,
+    started: bool,
+    elapsed: bool,
+    done: bool,
 }
 
-struct ReplyShared<T> {
-    state: Mutex<ReplyState<T>>,
-}
-
-impl<T> ReplyShared<T> {
-    fn poll(&self, context: &mut Context<'_>) -> Poll<Result<T, ReplyError>> {
-        let mut state = self.state.lock().expect("reply mutex poisoned");
-        match std::mem::replace(&mut state.outcome, ReplyOutcome::Pending) {
-            ReplyOutcome::Value(value) => {
-                state.receiver_alive = false;
-                Poll::Ready(Ok(value))
-            }
-            ReplyOutcome::Dropped => {
-                state.receiver_alive = false;
-                Poll::Ready(Err(ReplyError::Dropped))
-            }
-            ReplyOutcome::Pending => {
-                state.waker = Some(context.waker().clone());
-                Poll::Pending
-            }
+impl<F> Deadlined<F> {
+    fn new(operation: F, duration: Duration) -> Self {
+        Self {
+            operation,
+            duration,
+            budget: None,
+            timer: None,
+            started: false,
+            elapsed: false,
+            done: false,
         }
     }
+}
 
-    fn close_receiver(&self) {
-        let mut state = self.state.lock().expect("reply mutex poisoned");
-        state.receiver_alive = false;
-        state.waker = None;
-        if matches!(state.outcome, ReplyOutcome::Value(_)) {
-            state.outcome = ReplyOutcome::Pending;
+impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        if !this.started {
+            this.started = true;
+            let budget = crate::runtime::deadline(this.duration);
+            this.budget = Some(budget);
+            if !this.duration.is_zero() {
+                this.timer = Some(crate::runtime::sleep_deadline(budget));
+            }
         }
+        // A zero budget short-circuits: the operation is never attempted, so
+        // nothing is submitted and no completion is observed. The expiry
+        // boundary below governs only non-zero budgets, and the two rules
+        // therefore never compete.
+        if this.duration.is_zero() {
+            this.done = true;
+            return Poll::Ready(this.operation.short_circuit());
+        }
+        let budget = this
+            .budget
+            .expect("a started deadline future retains its captured budget");
+        if let Poll::Ready(result) = this.operation.poll_deadlined(context, budget, false) {
+            this.done = true;
+            return Poll::Ready(result);
+        }
+        if !this.elapsed {
+            if this
+                .timer
+                .as_mut()
+                .expect("an unelapsed deadline future retains its timer")
+                .as_mut()
+                .poll(context)
+                .is_pending()
+            {
+                return Poll::Pending;
+            }
+            // The timer is a one-shot future: polling it again after it
+            // resolves panics. Latch the transition and release it, so an
+            // elapsed poll that stays pending re-polls only the operation.
+            this.elapsed = true;
+            this.timer = None;
+        }
+        let result = this.operation.poll_deadlined(context, budget, true);
+        this.done = result.is_ready();
+        result
     }
 }
 
 /// A consuming, infallible reply capability.
+///
+/// Dropping an unanswered capability is completion: its receiver observes
+/// [`ReplyError::Dropped`]. Dropping or timing out the receiver instead closes
+/// the channel, so a late [`Reply::send`] safely discards its value.
 pub struct Reply<T> {
-    shared: Arc<ReplyShared<T>>,
+    sender: Option<OneShotSender<T>>,
     answered: bool,
 }
 
@@ -231,20 +294,14 @@ impl<T: Send + 'static> Reply<T> {
     /// Creates a reply capability and its single owned receiver.
     #[must_use]
     pub fn channel() -> (Self, ReplyReceiver<T>) {
-        let shared = Arc::new(ReplyShared {
-            state: Mutex::new(ReplyState {
-                outcome: ReplyOutcome::Pending,
-                receiver_alive: true,
-                waker: None,
-            }),
-        });
+        let (sender, receiver) = crate::runtime::oneshot();
         (
             Self {
-                shared: Arc::clone(&shared),
+                sender: Some(sender),
                 answered: false,
             },
             ReplyReceiver {
-                shared: Some(shared),
+                receiver: Some(receiver),
             },
         )
     }
@@ -252,44 +309,17 @@ impl<T: Send + 'static> Reply<T> {
     /// Consumes the capability and delivers or discards the reply.
     pub fn send(mut self, value: T) {
         self.answered = true;
-        let wake = {
-            let mut state = self.shared.state.lock().expect("reply mutex poisoned");
-            if state.receiver_alive && matches!(state.outcome, ReplyOutcome::Pending) {
-                state.outcome = ReplyOutcome::Value(value);
-                state.waker.take()
-            } else {
-                None
-            }
-        };
-        if let Some(waker) = wake {
-            waker.wake();
-        }
-    }
-}
-
-impl<T> Drop for Reply<T> {
-    fn drop(&mut self) {
-        if self.answered {
-            return;
-        }
-        let wake = {
-            let mut state = self.shared.state.lock().expect("reply mutex poisoned");
-            if matches!(state.outcome, ReplyOutcome::Pending) {
-                state.outcome = ReplyOutcome::Dropped;
-                state.waker.take()
-            } else {
-                None
-            }
-        };
-        if let Some(waker) = wake {
-            waker.wake();
-        }
+        let sender = self
+            .sender
+            .take()
+            .expect("an unanswered reply retains its sender");
+        let _ = sender.send(value);
     }
 }
 
 /// The owned, non-cloneable receive half of [`Reply::channel`].
 pub struct ReplyReceiver<T> {
-    shared: Option<Arc<ReplyShared<T>>>,
+    receiver: Option<OneShotReceiver<T>>,
 }
 
 impl<T> fmt::Debug for ReplyReceiver<T> {
@@ -304,39 +334,60 @@ impl<T: Send + 'static> ReplyReceiver<T> {
     /// Consumes the receiver and waits within one response-only budget.
     pub fn recv(mut self, deadline: Duration) -> ReplyReceive<T> {
         ReplyReceive {
-            shared: self.shared.take(),
-            deadline,
-            timer: None,
-            started: false,
-            done: false,
+            deadlined: Deadlined::new(
+                ReplyOperation {
+                    receiver: self.receiver.take().expect("unused reply receiver is live"),
+                },
+                deadline,
+            ),
         }
     }
 }
 
-impl<T> Drop for ReplyReceiver<T> {
-    fn drop(&mut self) {
-        if let Some(shared) = &self.shared {
-            shared.close_receiver();
+struct ReplyOperation<T> {
+    receiver: OneShotReceiver<T>,
+}
+
+impl<T> DeadlineOperation for ReplyOperation<T> {
+    type Output = Result<T, ReplyError>;
+
+    fn poll_deadlined(
+        &mut self,
+        context: &mut Context<'_>,
+        _budget: crate::deadline::Deadline,
+        elapsed: bool,
+    ) -> Poll<Self::Output> {
+        match self.receiver.poll_receive(context) {
+            Poll::Ready(Some(value)) => Poll::Ready(Ok(value)),
+            Poll::Ready(None) => Poll::Ready(Err(ReplyError::Dropped)),
+            Poll::Pending if elapsed => match self.receiver.close_and_poll_receive(context) {
+                OneShotClose::Value(value) => Poll::Ready(Ok(value)),
+                OneShotClose::SenderClosed => Poll::Ready(Err(ReplyError::Dropped)),
+                OneShotClose::Empty => Poll::Ready(Err(ReplyError::Timeout)),
+                OneShotClose::Pending => Poll::Pending,
+            },
+            Poll::Pending => Poll::Pending,
         }
+    }
+
+    fn short_circuit(&mut self) -> Self::Output {
+        self.receiver.close();
+        Err(ReplyError::Timeout)
     }
 }
 
 /// Future returned by [`ReplyReceiver::recv`].
 #[must_use]
 pub struct ReplyReceive<T> {
-    shared: Option<Arc<ReplyShared<T>>>,
-    deadline: Duration,
-    timer: Option<crate::driver::DriverSleep>,
-    started: bool,
-    done: bool,
+    deadlined: Deadlined<ReplyOperation<T>>,
 }
 
 impl<T> fmt::Debug for ReplyReceive<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ReplyReceive")
-            .field("started", &self.started)
-            .field("done", &self.done)
+            .field("started", &self.deadlined.started)
+            .field("done", &self.deadlined.done)
             .finish_non_exhaustive()
     }
 }
@@ -345,50 +396,7 @@ impl<T: Send + 'static> Future for ReplyReceive<T> {
     type Output = Result<T, ReplyError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.started {
-            self.started = true;
-            let budget = crate::driver::deadline(self.deadline);
-            if self.deadline.is_zero() {
-                self.done = true;
-                if let Some(shared) = &self.shared {
-                    shared.close_receiver();
-                }
-                return Poll::Ready(Err(ReplyError::Timeout));
-            }
-            self.timer = Some(crate::driver::sleep_deadline(budget));
-        }
-        let shared = Arc::clone(
-            self.shared
-                .as_ref()
-                .expect("pending reply receive must retain its shared state"),
-        );
-        if let Poll::Ready(result) = shared.poll(context) {
-            self.done = true;
-            return Poll::Ready(result);
-        }
-        if self
-            .timer
-            .as_mut()
-            .expect("started reply receive must have a timer")
-            .as_mut()
-            .poll(context)
-            .is_ready()
-        {
-            shared.close_receiver();
-            self.done = true;
-            return Poll::Ready(Err(ReplyError::Timeout));
-        }
-        Poll::Pending
-    }
-}
-
-impl<T> Drop for ReplyReceive<T> {
-    fn drop(&mut self) {
-        if !self.done
-            && let Some(shared) = &self.shared
-        {
-            shared.close_receiver();
-        }
+        Pin::new(&mut self.deadlined).poll(context)
     }
 }
 
@@ -433,6 +441,12 @@ struct OperationState<M> {
 struct SendOperation<M> {
     state: Mutex<OperationState<M>>,
 }
+
+// Lock order is mailbox state, then send-operation state. Code that starts
+// from an operation lock must release it before entering the mailbox. Paths
+// that take only the operation lock (polling, detached teardown) never reach
+// back into mailbox state. This keeps acceptance, withdrawal, and waiter
+// registration on one acyclic ordering.
 
 impl<M> SendOperation<M> {
     fn new(message: M) -> Arc<Self> {
@@ -516,30 +530,19 @@ struct MailboxState<M> {
     latest: Option<Envelope<M>>,
     waiters: WaiterQueue<M>,
     accepted: u64,
-    delivered: u64,
-    conflated: u64,
-    sends_rejected: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct WaiterId(u64);
 
-struct WaiterEntry<M> {
-    operation: Arc<SendOperation<M>>,
-    previous: Option<WaiterId>,
-    next: Option<WaiterId>,
-}
-
-/// FIFO registrations with constant-time removal by a send operation.
+/// FIFO registrations with direct removal by a send operation.
 ///
-/// The mailbox mutex serializes every mutation, so a compact intrusive list
-/// can use monotonic local ids without another synchronization layer. The ids
-/// are never reused, which also prevents a stale cancellation from unlinking
-/// a later operation.
+/// Monotonic keys are insertion order, so the first map entry is the oldest
+/// waiter. Keys are never reused, making stale cancellation ids harmless.
+/// `u64::MAX` is a poison key and is never minted; exhaustion remains poisoned
+/// instead of wrapping back into the live id domain.
 struct WaiterQueue<M> {
-    entries: HashMap<WaiterId, WaiterEntry<M>>,
-    head: Option<WaiterId>,
-    tail: Option<WaiterId>,
+    entries: BTreeMap<WaiterId, Arc<SendOperation<M>>>,
     next_id: u64,
     #[cfg(test)]
     direct_removals: usize,
@@ -548,9 +551,7 @@ struct WaiterQueue<M> {
 impl<M> Default for WaiterQueue<M> {
     fn default() -> Self {
         Self {
-            entries: HashMap::new(),
-            head: None,
-            tail: None,
+            entries: BTreeMap::new(),
             next_id: 0,
             #[cfg(test)]
             direct_removals: 0,
@@ -569,30 +570,17 @@ impl<M> WaiterQueue<M> {
     }
 
     fn push_back(&mut self, operation: Arc<SendOperation<M>>) -> WaiterId {
-        let id = WaiterId(self.next_id);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("mailbox waiter identity space exhausted");
-        let previous = self.tail;
-        let replaced = self.entries.insert(
-            id,
-            WaiterEntry {
-                operation,
-                previous,
-                next: None,
-            },
-        );
-        debug_assert!(replaced.is_none());
-        if let Some(previous) = previous {
-            self.entries
-                .get_mut(&previous)
-                .expect("tail registration must be live")
-                .next = Some(id);
-        } else {
-            self.head = Some(id);
+        let Some(next) = self.next_id.checked_add(1) else {
+            panic!("mailbox waiter identity space exhausted");
+        };
+        if next == u64::MAX {
+            self.next_id = u64::MAX;
+            panic!("mailbox waiter identity space exhausted");
         }
-        self.tail = Some(id);
+        self.next_id = next;
+        let id = WaiterId(next);
+        let replaced = self.entries.insert(id, operation);
+        debug_assert!(replaced.is_none());
         id
     }
 
@@ -602,50 +590,28 @@ impl<M> WaiterQueue<M> {
     }
 
     fn observe_all(&self, incarnation: Incarnation) {
-        for entry in self.entries.values() {
-            entry.operation.observe(incarnation);
+        for operation in self.entries.values() {
+            operation.observe(incarnation);
         }
     }
 
     fn pop_front(&mut self) -> Option<(WaiterId, Arc<SendOperation<M>>)> {
-        let id = self.head?;
-        self.remove(id).map(|operation| (id, operation))
+        let entry = self.entries.pop_first();
+        #[cfg(test)]
+        if entry.is_some() {
+            self.direct_removals = self.direct_removals.saturating_add(1);
+        }
+        entry
     }
 
     fn remove(&mut self, id: WaiterId) -> Option<Arc<SendOperation<M>>> {
-        let entry = self.entries.remove(&id)?;
+        let operation = self.entries.remove(&id)?;
         #[cfg(test)]
         {
             self.direct_removals = self.direct_removals.saturating_add(1);
         }
-        if let Some(previous) = entry.previous {
-            self.entries
-                .get_mut(&previous)
-                .expect("previous registration must be live")
-                .next = entry.next;
-        } else {
-            self.head = entry.next;
-        }
-        if let Some(next) = entry.next {
-            self.entries
-                .get_mut(&next)
-                .expect("next registration must be live")
-                .previous = entry.previous;
-        } else {
-            self.tail = entry.previous;
-        }
-        Some(entry.operation)
+        Some(operation)
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct MailboxStats {
-    pub(crate) accepted: u64,
-    pub(crate) delivered: u64,
-    pub(crate) conflated: u64,
-    pub(crate) sends_rejected: u64,
-    pub(crate) depth: usize,
-    pub(crate) capacity: usize,
 }
 
 struct Promotion<M: Send + 'static> {
@@ -663,6 +629,9 @@ impl<M: Send + 'static> Default for Promotion<M> {
 }
 
 impl<M: Send + 'static> Promotion<M> {
+    // Drop is the completion path on every ownership edge. `finish` only
+    // names the intentional consume point; its Drop still wakes all accepted
+    // senders and isolates every displaced-message destructor.
     fn finish(self) {}
 
     fn finish_isolated(mut self) {
@@ -680,24 +649,12 @@ impl<M: Send + 'static> Promotion<M> {
 
 impl<M: Send + 'static> Drop for Promotion<M> {
     fn drop(&mut self) {
-        let already_panicking = std::thread::panicking();
-        let mut first_panic = None;
+        let mut panics = PanicAccumulator::default();
         for waker in self.wakers.drain(..) {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| waker.wake()))
-                && first_panic.is_none()
-            {
-                first_panic = Some(payload);
-            }
+            panics.run(|| waker.wake());
         }
         for displaced in self.displaced.drain(..) {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(displaced)))
-                && first_panic.is_none()
-            {
-                first_panic = Some(payload);
-            }
-        }
-        if !already_panicking && let Some(payload) = first_panic {
-            resume_unwind(payload);
+            panics.run(|| drop(displaced));
         }
     }
 }
@@ -708,29 +665,21 @@ struct Termination<M> {
 }
 
 impl<M> Termination<M> {
-    fn finish(
-        &mut self,
-        retired: &mut Vec<Arc<SendOperation<M>>>,
-    ) -> Option<Box<dyn std::any::Any + Send + 'static>> {
-        let mut first_panic = None;
+    fn finish(&mut self, retired: &mut Vec<Arc<SendOperation<M>>>) -> Option<PanicPayload> {
+        let mut panics = PanicAccumulator::default();
         let final_incarnation = self.final_incarnation;
         while let Some((registration, waiter)) = self.waiters.pop_front() {
             waiter.clear_registration(registration);
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+            panics.run(|| {
                 waiter.terminate(final_incarnation);
-            })) && first_panic.is_none()
-            {
-                first_panic = Some(payload);
-            }
+            });
             // A withdrawn sender may leave this as the final operation owner,
             // so retain it for the same isolated path as unread messages.
             retired.push(waiter);
         }
-        first_panic
+        panics.take()
     }
 }
-
-pub(crate) trait MailboxDisposal: Send {}
 
 struct MailboxPayload<M> {
     queue: Option<VecDeque<Envelope<M>>>,
@@ -740,40 +689,19 @@ struct MailboxPayload<M> {
 
 impl<M> Drop for MailboxPayload<M> {
     fn drop(&mut self) {
-        let already_panicking = std::thread::panicking();
-        let mut first_panic = None;
+        let mut panics = PanicAccumulator::default();
         if let Some(mut queue) = self.queue.take() {
             while let Some(envelope) = queue.pop_front() {
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(envelope)))
-                    && first_panic.is_none()
-                {
-                    first_panic = Some(payload);
-                }
+                panics.run(|| drop(envelope));
             }
         }
-        if let Some(latest) = self.latest.take()
-            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(latest)))
-            && first_panic.is_none()
-        {
-            first_panic = Some(payload);
+        if let Some(latest) = self.latest.take() {
+            panics.run(|| drop(latest));
         }
         for waiter in self.retired.drain(..) {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(waiter)))
-                && first_panic.is_none()
-            {
-                first_panic = Some(payload);
-            }
-        }
-        if !already_panicking && let Some(payload) = first_panic {
-            resume_unwind(payload);
+            panics.run(|| drop(waiter));
         }
     }
-}
-
-impl<M: Send> MailboxDisposal for MailboxPayload<M> {}
-
-pub(crate) trait MailboxTermination: Send {
-    fn finish(self: Box<Self>) -> Option<Box<dyn MailboxDisposal>>;
 }
 
 struct MailboxTeardown<M: Send + 'static> {
@@ -783,35 +711,30 @@ struct MailboxTeardown<M: Send + 'static> {
 }
 
 impl<M: Send + 'static> MailboxTeardown<M> {
-    fn finish_framework(&mut self) -> Option<Box<dyn std::any::Any + Send + 'static>> {
-        let mut first_panic = None;
-        if let Some(changed) = self.changed.take()
-            && let Err(payload) = catch_unwind(AssertUnwindSafe(|| changed.pulse()))
-        {
-            first_panic = Some(payload);
+    fn finish_framework(&mut self) -> Option<PanicPayload> {
+        let mut panics = PanicAccumulator::default();
+        if let Some(changed) = self.changed.take() {
+            panics.run(|| changed.pulse());
         }
         if let Some(mut termination) = self.termination.take() {
-            let panic = termination.finish(&mut self.payload.get_mut().retired);
-            if first_panic.is_none() {
-                first_panic = panic;
-            }
+            panics.record(termination.finish(&mut self.payload.get_mut().retired));
         }
-        first_panic
+        panics.take()
     }
 }
 
 impl<M: Send + 'static> MailboxTermination for MailboxTeardown<M> {
-    fn finish(mut self: Box<Self>) -> Option<Box<dyn MailboxDisposal>> {
+    fn finish(mut self: Box<Self>) -> Option<MailboxDisposal> {
         let panic = self.finish_framework();
         let payload = self
             .payload
             .take()
-            .map(|payload| Box::new(payload) as Box<dyn MailboxDisposal>);
+            .map(|payload| Box::new(payload) as MailboxDisposal);
         if let Some(panic) = panic {
             if let Some(payload) = payload {
                 crate::runtime::dispose_detached(payload);
             }
-            resume_unwind(panic);
+            resume_panic(panic);
         }
         payload
     }
@@ -819,25 +742,12 @@ impl<M: Send + 'static> MailboxTermination for MailboxTeardown<M> {
 
 impl<M: Send + 'static> Drop for MailboxTeardown<M> {
     fn drop(&mut self) {
-        let already_panicking = std::thread::panicking();
-        let panic = self.finish_framework();
+        let mut panics = PanicAccumulator::default();
+        panics.record(self.finish_framework());
         if let Some(payload) = self.payload.take() {
             crate::runtime::dispose_detached(payload);
         }
-        if !already_panicking && let Some(panic) = panic {
-            resume_unwind(panic);
-        }
     }
-}
-
-/// Type-erased control used by the supervision driver.
-pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
-    fn configure(&self, mailbox: Mailbox);
-    fn bind(&self, incarnation: Incarnation);
-    fn freeze(&self, incarnation: Incarnation);
-    fn close(&self, incarnation: Incarnation) -> Option<Box<dyn MailboxDisposal>>;
-    fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>>;
-    fn stats(&self) -> MailboxStats;
 }
 
 pub(crate) struct MailboxCell<M> {
@@ -867,9 +777,6 @@ impl<M: Send + 'static> MailboxCell<M> {
                 latest: None,
                 waiters: WaiterQueue::default(),
                 accepted: 0,
-                delivered: 0,
-                conflated: 0,
-                sends_rejected: 0,
             }),
             changed: Signal::default(),
         })
@@ -905,16 +812,10 @@ impl<M: Send + 'static> MailboxCell<M> {
                             });
                             None
                         }
-                        Some(MailboxKind::Latest) => {
-                            let displaced = state.latest.replace(Envelope {
-                                message,
-                                accepted_sequence,
-                            });
-                            state.conflated = state
-                                .conflated
-                                .saturating_add(u64::from(displaced.is_some()));
-                            displaced
-                        }
+                        Some(MailboxKind::Latest) => state.latest.replace(Envelope {
+                            message,
+                            accepted_sequence,
+                        }),
                         None => unreachable!(),
                     };
                     drop(state);
@@ -938,38 +839,28 @@ impl<M: Send + 'static> MailboxCell<M> {
     fn try_send(&self, message: M) -> Result<Incarnation, SendError<M>> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         match state.status {
-            BindingStatus::Terminal(final_incarnation) => {
-                state.sends_rejected = state.sends_rejected.saturating_add(1);
-                Err(SendError {
-                    actor_id: self.actor_id.clone(),
-                    incarnation_observed: final_incarnation,
-                    message,
-                    kind: SendErrorKind::Terminated,
-                })
-            }
-            BindingStatus::Unbound => {
-                state.sends_rejected = state.sends_rejected.saturating_add(1);
-                Err(SendError {
-                    actor_id: self.actor_id.clone(),
-                    incarnation_observed: None,
-                    message,
-                    kind: SendErrorKind::NotRunning,
-                })
-            }
-            BindingStatus::Frozen(incarnation) => {
-                state.sends_rejected = state.sends_rejected.saturating_add(1);
-                Err(SendError {
-                    actor_id: self.actor_id.clone(),
-                    incarnation_observed: Some(incarnation),
-                    message,
-                    kind: SendErrorKind::NotRunning,
-                })
-            }
+            BindingStatus::Terminal(final_incarnation) => Err(SendError {
+                actor_id: self.actor_id.clone(),
+                incarnation_observed: final_incarnation,
+                message,
+                kind: SendErrorKind::Terminated,
+            }),
+            BindingStatus::Unbound => Err(SendError {
+                actor_id: self.actor_id.clone(),
+                incarnation_observed: None,
+                message,
+                kind: SendErrorKind::NotRunning,
+            }),
+            BindingStatus::Frozen(incarnation) => Err(SendError {
+                actor_id: self.actor_id.clone(),
+                incarnation_observed: Some(incarnation),
+                message,
+                kind: SendErrorKind::NotRunning,
+            }),
             BindingStatus::Bound(incarnation) => match state.kind {
                 Some(MailboxKind::Queue(capacity))
                     if !state.waiters.is_empty() || state.queue.len() >= capacity.get() =>
                 {
-                    state.sends_rejected = state.sends_rejected.saturating_add(1);
                     Err(SendError {
                         actor_id: self.actor_id.clone(),
                         incarnation_observed: Some(incarnation),
@@ -995,23 +886,17 @@ impl<M: Send + 'static> MailboxCell<M> {
                         message,
                         accepted_sequence,
                     });
-                    state.conflated = state
-                        .conflated
-                        .saturating_add(u64::from(displaced.is_some()));
                     drop(state);
                     self.changed.pulse();
                     drop(displaced);
                     Ok(incarnation)
                 }
-                None => {
-                    state.sends_rejected = state.sends_rejected.saturating_add(1);
-                    Err(SendError {
-                        actor_id: self.actor_id.clone(),
-                        incarnation_observed: None,
-                        message,
-                        kind: SendErrorKind::NotRunning,
-                    })
-                }
+                None => Err(SendError {
+                    actor_id: self.actor_id.clone(),
+                    incarnation_observed: None,
+                    message,
+                    kind: SendErrorKind::NotRunning,
+                }),
             },
         }
     }
@@ -1057,7 +942,6 @@ impl<M: Send + 'static> MailboxCell<M> {
         } else {
             Promotion::default()
         };
-        state.delivered = state.delivered.saturating_add(u64::from(message.is_some()));
         drop(state);
         if message.is_some() {
             self.changed.pulse();
@@ -1079,27 +963,20 @@ impl<M: Send + 'static> MailboxCell<M> {
         self.changed.watcher()
     }
 
-    pub(crate) fn stats(&self) -> MailboxStats {
-        let state = self.state.lock().expect("mailbox mutex poisoned");
-        let (depth, capacity) = match state.kind {
-            Some(MailboxKind::Queue(capacity)) => (state.queue.len(), capacity.get()),
-            Some(MailboxKind::Latest) => (usize::from(state.latest.is_some()), 1),
-            None => (0, 0),
-        };
-        MailboxStats {
-            accepted: state.accepted,
-            delivered: state.delivered,
-            conflated: state.conflated,
-            sends_rejected: state.sends_rejected,
-            depth,
-            capacity,
-        }
+    fn accepted_sequence(&self) -> u64 {
+        self.state.lock().expect("mailbox mutex poisoned").accepted
     }
 }
 
 impl<M> MailboxCell<M> {
     fn withdraw(&self, operation: &Arc<SendOperation<M>>) -> Withdrawal<M> {
         let mut mailbox = self.state.lock().expect("mailbox mutex poisoned");
+        let current_observation = match mailbox.status {
+            BindingStatus::Bound(incarnation) | BindingStatus::Frozen(incarnation) => {
+                Some(incarnation)
+            }
+            BindingStatus::Unbound | BindingStatus::Terminal(_) => None,
+        };
         let (result, registration) = {
             let mut state = operation
                 .state
@@ -1113,7 +990,12 @@ impl<M> MailboxCell<M> {
                     let message = message
                         .take()
                         .expect("a waiting operation must retain its message");
-                    let observed = *newest_observed;
+                    // The mailbox lock makes this one evidence snapshot: a
+                    // binding either precedes withdrawal and contributes its
+                    // incarnation, or follows the completed withdrawal. This
+                    // also covers an operation first submitted by an elapsed
+                    // (including zero-duration) deadline poll.
+                    let observed = (*newest_observed).or(current_observation);
                     state.outcome = OperationOutcome::Withdrawn;
                     state.waker = None;
                     (
@@ -1175,6 +1057,14 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         if matches!(state.status, BindingStatus::Terminal(_)) {
             return;
         }
+        debug_assert!(
+            state.kind.is_some(),
+            "mailbox must be configured before its first bind"
+        );
+        debug_assert!(
+            matches!(state.status, BindingStatus::Unbound),
+            "mailbox must close the prior incarnation before rebinding"
+        );
         state.status = BindingStatus::Bound(incarnation);
         state.last_bound = Some(incarnation);
         // Binding is an observation edge for every operation that remained
@@ -1198,7 +1088,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }
     }
 
-    fn close(&self, incarnation: Incarnation) -> Option<Box<dyn MailboxDisposal>> {
+    fn close(&self, incarnation: Incarnation) -> Option<MailboxDisposal> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         if !matches!(
             state.status,
@@ -1216,7 +1106,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             queue: Some(queue),
             latest,
             retired: Vec::new(),
-        }))
+        }) as MailboxDisposal)
     }
 
     fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>> {
@@ -1245,8 +1135,14 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }))
     }
 
-    fn stats(&self) -> MailboxStats {
-        self.stats()
+    #[cfg(debug_assertions)]
+    fn bind_order_valid(&self) -> bool {
+        let state = self.state.lock().expect("mailbox mutex poisoned");
+        state.kind.is_some()
+            && matches!(
+                state.status,
+                BindingStatus::Unbound | BindingStatus::Terminal(_)
+            )
     }
 }
 
@@ -1287,7 +1183,6 @@ fn promote_waiters<M: Send + 'static>(state: &mut MailboxState<M>) -> Promotion<
                     message,
                     accepted_sequence,
                 }) {
-                    state.conflated = state.conflated.saturating_add(1);
                     promotion.displaced.push(displaced);
                 }
             }
@@ -1347,11 +1242,12 @@ impl<M: Send + 'static> ActorRef<M> {
     /// Sends within one acceptance budget, recovering an unaccepted message.
     pub fn send_timeout(&self, message: M, deadline: Duration) -> SendTimeout<M> {
         SendTimeout {
-            send: Some(self.send(message)),
-            deadline,
-            timer: None,
-            started: false,
-            done: false,
+            deadlined: Deadlined::new(
+                TimedSend {
+                    send: self.send(message),
+                },
+                deadline,
+            ),
         }
     }
 
@@ -1376,15 +1272,16 @@ impl<M: Send + 'static> ActorRef<M> {
         deadline: Duration,
     ) -> CallFuture<M, T> {
         CallFuture {
-            actor: self.clone(),
-            make_msg: Some(Box::new(make_msg)),
-            deadline,
-            timer: None,
-            send: None,
-            reply: None,
-            accepted: None,
-            started: false,
-            done: false,
+            deadlined: Deadlined::new(
+                CallOperation {
+                    actor: self.clone(),
+                    make_msg: Some(Box::new(make_msg)),
+                    send: None,
+                    reply: None,
+                    accepted: None,
+                },
+                deadline,
+            ),
         }
     }
 }
@@ -1516,20 +1413,66 @@ impl<M> Drop for SendFuture<M> {
 /// Cancellation-safe future returned by [`ActorRef::send_timeout`].
 #[must_use]
 pub struct SendTimeout<M> {
-    send: Option<SendFuture<M>>,
-    deadline: Duration,
-    timer: Option<crate::driver::DriverSleep>,
-    started: bool,
-    done: bool,
+    deadlined: Deadlined<TimedSend<M>>,
+}
+
+struct TimedSend<M> {
+    send: SendFuture<M>,
 }
 
 impl<M> fmt::Debug for SendTimeout<M> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SendTimeout")
-            .field("started", &self.started)
-            .field("done", &self.done)
+            .field("started", &self.deadlined.started)
+            .field("done", &self.deadlined.done)
             .finish_non_exhaustive()
+    }
+}
+
+fn withdraw_send<M: Send + 'static>(send: &mut SendFuture<M>) -> Result<Incarnation, SendError<M>> {
+    let actor_id = send.actor.id().clone();
+    match send.withdraw() {
+        Withdrawal::Withdrawn { message, observed } => Err(SendError {
+            actor_id,
+            incarnation_observed: observed,
+            message,
+            kind: SendErrorKind::TimedOut,
+        }),
+        Withdrawal::Accepted(incarnation) => Ok(incarnation),
+        Withdrawal::Terminated { message, observed } => Err(SendError {
+            actor_id,
+            incarnation_observed: observed,
+            message,
+            kind: SendErrorKind::Terminated,
+        }),
+    }
+}
+
+impl<M: Send + 'static> DeadlineOperation for TimedSend<M> {
+    type Output = Result<Incarnation, SendError<M>>;
+
+    fn poll_deadlined(
+        &mut self,
+        context: &mut Context<'_>,
+        _budget: crate::deadline::Deadline,
+        elapsed: bool,
+    ) -> Poll<Self::Output> {
+        if let Poll::Ready(result) = Pin::new(&mut self.send).poll(context) {
+            return Poll::Ready(result);
+        }
+        if !elapsed {
+            Poll::Pending
+        } else {
+            Poll::Ready(withdraw_send(&mut self.send))
+        }
+    }
+
+    fn short_circuit(&mut self) -> Self::Output {
+        // The send was never polled, so it was never submitted: withdrawal
+        // recovers the message and reports the mailbox's current binding as
+        // the newest incarnation observed during the attempt.
+        withdraw_send(&mut self.send)
     }
 }
 
@@ -1537,161 +1480,94 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
     type Output = Result<Incarnation, SendError<M>>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.started {
-            self.started = true;
-            let budget = crate::driver::deadline(self.deadline);
-            if self.deadline.is_zero() {
-                let actor_id = self
-                    .send
-                    .as_ref()
-                    .expect("pending timed send retains send")
-                    .actor
-                    .id()
-                    .clone();
-                let current = self
-                    .send
-                    .as_ref()
-                    .expect("pending timed send retains send")
-                    .actor
-                    .mailbox
-                    .current_observation();
-                let withdrawal = self
-                    .send
-                    .as_mut()
-                    .expect("pending timed send retains send")
-                    .withdraw();
-                let Withdrawal::Withdrawn { message, observed } = withdrawal else {
-                    unreachable!("an unpolled send cannot already be accepted")
-                };
-                self.done = true;
-                return Poll::Ready(Err(SendError {
-                    actor_id,
-                    incarnation_observed: observed.or(current),
-                    message,
-                    kind: SendErrorKind::TimedOut,
-                }));
-            }
-            self.timer = Some(crate::driver::sleep_deadline(budget));
-        }
-        let send = self.send.as_mut().expect("pending timed send retains send");
-        if let Poll::Ready(result) = Pin::new(send).poll(context) {
-            self.done = true;
-            return Poll::Ready(result);
-        }
-        if self
-            .timer
-            .as_mut()
-            .expect("started timed send has a timer")
-            .as_mut()
-            .poll(context)
-            .is_ready()
-        {
-            let send = self.send.as_mut().expect("pending timed send retains send");
-            let actor_id = send.actor.id().clone();
-            match send.withdraw() {
-                Withdrawal::Withdrawn { message, observed } => {
-                    self.done = true;
-                    Poll::Ready(Err(SendError {
-                        actor_id,
-                        incarnation_observed: observed,
-                        message,
-                        kind: SendErrorKind::TimedOut,
-                    }))
-                }
-                Withdrawal::Accepted(incarnation) => {
-                    self.done = true;
-                    Poll::Ready(Ok(incarnation))
-                }
-                Withdrawal::Terminated { message, observed } => {
-                    self.done = true;
-                    Poll::Ready(Err(SendError {
-                        actor_id,
-                        incarnation_observed: observed,
-                        message,
-                        kind: SendErrorKind::Terminated,
-                    }))
-                }
-            }
-        } else {
-            Poll::Pending
-        }
+        Pin::new(&mut self.deadlined).poll(context)
     }
 }
 
 /// Cancellation-safe future returned by [`ActorRef::call`].
 #[must_use]
 pub struct CallFuture<M, T> {
+    deadlined: Deadlined<CallOperation<M, T>>,
+}
+
+struct CallOperation<M, T> {
     actor: ActorRef<M>,
     make_msg: Option<Box<dyn FnOnce(Reply<T>) -> M + Send + 'static>>,
-    deadline: Duration,
-    timer: Option<crate::driver::DriverSleep>,
     send: Option<SendFuture<M>>,
-    reply: Option<Arc<ReplyShared<T>>>,
+    reply: Option<OneShotReceiver<T>>,
     accepted: Option<Incarnation>,
-    started: bool,
-    done: bool,
 }
 
 impl<M, T> fmt::Debug for CallFuture<M, T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CallFuture")
-            .field("started", &self.started)
-            .field("accepted", &self.accepted)
-            .field("done", &self.done)
+            .field("started", &self.deadlined.started)
+            .field("accepted", &self.deadlined.operation.accepted)
+            .field("done", &self.deadlined.done)
             .finish_non_exhaustive()
     }
 }
 
-impl<M, T> CallFuture<M, T> {
+impl<M, T> CallOperation<M, T> {
     fn poll_reply(
-        &self,
+        &mut self,
         context: &mut Context<'_>,
         incarnation: Incarnation,
         deadline_elapsed: bool,
     ) -> Poll<Result<Replied<T>, CallError>> {
         let reply = self
             .reply
-            .as_ref()
+            .as_mut()
             .expect("accepted call retains reply state");
-        match reply.poll(context) {
-            Poll::Ready(Ok(value)) => Poll::Ready(Ok(Replied { value, incarnation })),
-            Poll::Ready(Err(ReplyError::Dropped)) => Poll::Ready(Err(CallError {
+        match reply.poll_receive(context) {
+            Poll::Ready(Some(value)) => Poll::Ready(Ok(Replied { value, incarnation })),
+            Poll::Ready(None) => Poll::Ready(Err(CallError {
                 actor_id: self.actor.id().clone(),
                 incarnation_observed: Some(incarnation),
                 kind: CallErrorKind::ReplyDropped,
             })),
-            Poll::Ready(Err(ReplyError::Timeout)) => unreachable!(),
-            Poll::Pending if deadline_elapsed => {
-                reply.close_receiver();
-                Poll::Ready(Err(CallError {
+            Poll::Pending if deadline_elapsed => match reply.close_and_poll_receive(context) {
+                OneShotClose::Value(value) => Poll::Ready(Ok(Replied { value, incarnation })),
+                OneShotClose::SenderClosed => Poll::Ready(Err(CallError {
+                    actor_id: self.actor.id().clone(),
+                    incarnation_observed: Some(incarnation),
+                    kind: CallErrorKind::ReplyDropped,
+                })),
+                OneShotClose::Empty => Poll::Ready(Err(CallError {
                     actor_id: self.actor.id().clone(),
                     incarnation_observed: Some(incarnation),
                     kind: CallErrorKind::ResponseTimedOut,
-                }))
-            }
+                })),
+                OneShotClose::Pending => Poll::Pending,
+            },
             Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn close_reply(&mut self) {
+        if let Some(reply) = &mut self.reply {
+            reply.close();
         }
     }
 }
 
-impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
+impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M, T> {
     type Output = Result<Replied<T>, CallError>;
 
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.started {
-            self.started = true;
-            // Capture the one overall budget before invoking user code. A
-            // slow message constructor consumes acceptance/response time.
-            let budget = crate::driver::deadline(self.deadline);
-            if self.deadline.is_zero() {
-                self.done = true;
-                return Poll::Ready(Err(CallError {
-                    actor_id: self.actor.id().clone(),
-                    incarnation_observed: self.actor.mailbox.current_observation(),
-                    kind: CallErrorKind::AcceptanceTimedOut,
-                }));
+    fn poll_deadlined(
+        &mut self,
+        context: &mut Context<'_>,
+        budget: crate::deadline::Deadline,
+        elapsed: bool,
+    ) -> Poll<Self::Output> {
+        if self.make_msg.is_some() {
+            if elapsed {
+                return Poll::Ready(self.short_circuit());
             }
+            // Capture the one overall budget before invoking user code. A
+            // slow message constructor consumes acceptance/response time. The
+            // shared scaffold captured `budget` before this callback runs.
             let (reply, mut receiver) = Reply::channel();
             let message =
                 self.make_msg
@@ -1701,17 +1577,11 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
             // at the exact deadline win. Construction is different: no send
             // existed before it completed, so do not start one after the
             // captured budget is strictly in the past.
-            if budget.is_overdue(crate::driver::now()) {
-                self.done = true;
-                return Poll::Ready(Err(CallError {
-                    actor_id: self.actor.id().clone(),
-                    incarnation_observed: self.actor.mailbox.current_observation(),
-                    kind: CallErrorKind::AcceptanceTimedOut,
-                }));
+            if budget.is_overdue(crate::runtime::now()) {
+                return Poll::Ready(self.short_circuit());
             }
-            self.reply = receiver.shared.take();
+            self.reply = receiver.receiver.take();
             self.send = Some(self.actor.send(message));
-            self.timer = Some(crate::driver::sleep_deadline(budget));
         }
 
         if self.accepted.is_none() {
@@ -1725,10 +1595,7 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
                     self.send = None;
                 }
                 Poll::Ready(Err(error)) => {
-                    if let Some(reply) = &self.reply {
-                        reply.close_receiver();
-                    }
-                    self.done = true;
+                    self.close_reply();
                     return Poll::Ready(Err(CallError {
                         actor_id: error.actor_id,
                         incarnation_observed: error.incarnation_observed,
@@ -1739,67 +1606,63 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
             }
         }
 
-        if let Some(accepted) = self.accepted
-            && let Poll::Ready(result) = self.poll_reply(context, accepted, false)
-        {
-            self.done = true;
-            return Poll::Ready(result);
+        // Acceptance released the send future, so the reply is the only
+        // remaining source of an outcome. An elapsed reply poll may still be
+        // pending when a completion transition won without publishing its
+        // payload yet; that transition wakes the registered waker, so waiting
+        // is the answer rather than reaching for a send that no longer exists.
+        if let Some(accepted) = self.accepted {
+            return self.poll_reply(context, accepted, elapsed);
         }
 
-        if self
-            .timer
-            .as_mut()
-            .expect("started call has a timer")
-            .as_mut()
-            .poll(context)
-            .is_pending()
-        {
+        if !elapsed {
             return Poll::Pending;
         }
 
-        if let Some(accepted) = self.accepted {
-            let result = self.poll_reply(context, accepted, true);
-            self.done = true;
-            result
-        } else {
-            let actor_id = self.actor.id().clone();
-            let send = self
-                .send
+        let result = withdraw_send(
+            self.send
                 .as_mut()
-                .expect("unaccepted call retains send future");
-            let result = match send.withdraw() {
-                Withdrawal::Withdrawn { observed, .. } => CallError {
-                    actor_id,
-                    incarnation_observed: observed,
-                    kind: CallErrorKind::AcceptanceTimedOut,
-                },
-                Withdrawal::Accepted(incarnation) => {
-                    let result = self.poll_reply(context, incarnation, true);
-                    self.done = true;
-                    return result;
-                }
-                Withdrawal::Terminated { observed, .. } => CallError {
-                    actor_id,
-                    incarnation_observed: observed,
-                    kind: CallErrorKind::Terminated,
-                },
-            };
-            if let Some(reply) = &self.reply {
-                reply.close_receiver();
+                .expect("an unaccepted call retains its send future"),
+        );
+        self.send = None;
+        match result {
+            Ok(incarnation) => {
+                self.accepted = Some(incarnation);
+                self.poll_reply(context, incarnation, true)
             }
-            self.done = true;
-            Poll::Ready(Err(result))
+            Err(error) => {
+                self.close_reply();
+                Poll::Ready(Err(CallError {
+                    actor_id: error.actor_id,
+                    incarnation_observed: error.incarnation_observed,
+                    kind: match error.kind {
+                        SendErrorKind::TimedOut => CallErrorKind::AcceptanceTimedOut,
+                        SendErrorKind::Terminated => CallErrorKind::Terminated,
+                        SendErrorKind::NotRunning | SendErrorKind::Full => {
+                            unreachable!("withdrawal returns only timed-out or terminal errors")
+                        }
+                    },
+                }))
+            }
         }
+    }
+
+    fn short_circuit(&mut self) -> Self::Output {
+        // No message was ever constructed, so there is nothing to withdraw
+        // and no accepting incarnation to report.
+        Err(CallError {
+            actor_id: self.actor.id().clone(),
+            incarnation_observed: self.actor.mailbox.current_observation(),
+            kind: CallErrorKind::AcceptanceTimedOut,
+        })
     }
 }
 
-impl<M, T> Drop for CallFuture<M, T> {
-    fn drop(&mut self) {
-        if !self.done
-            && let Some(reply) = &self.reply
-        {
-            reply.close_receiver();
-        }
+impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
+    type Output = Result<Replied<T>, CallError>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.deadlined).poll(context)
     }
 }
 
@@ -1833,7 +1696,7 @@ impl<M: Send + 'static> MailboxReceiver<M> {
     }
 
     pub(crate) fn accepted_sequence(&self) -> u64 {
-        self.mailbox.stats().accepted
+        self.mailbox.accepted_sequence()
     }
 
     pub(crate) async fn changed(&mut self) {
@@ -1853,7 +1716,7 @@ mod tests {
         task::{Context, Poll, Wake, Waker},
     };
 
-    use crate::{ChildId, Mailbox, SendErrorKind, driver::MemberCell, identity::ScopeIdentity};
+    use crate::{ChildId, Mailbox, SendErrorKind, cells::MemberCell, identity::ScopeIdentity};
 
     use super::{ActorRef, MailboxCell, MailboxControl};
 
@@ -1874,7 +1737,7 @@ mod tests {
     }
 
     fn actor() -> (Arc<MailboxCell<u8>>, ActorRef<u8>) {
-        let mut identity = ScopeIdentity::new().expect("scope identity available");
+        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("actor");
         let member = MemberCell::new(
             id.clone(),
@@ -1888,6 +1751,42 @@ mod tests {
     fn park_with(future: &mut std::pin::Pin<Box<super::SendFuture<u8>>>, waker: &Waker) {
         let mut context = Context::from_waker(waker);
         assert!(future.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "mailbox must be configured before its first bind")]
+    fn binding_before_configuration_trips_the_driver_contract() {
+        let (mailbox, _) = actor();
+        let mut identity = ScopeIdentity::new();
+        let membership = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available");
+        let mut incarnations = identity.incarnation_counter(membership);
+        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+            .expect("incarnation available");
+
+        MailboxControl::bind(&*mailbox, incarnation);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "mailbox must close the prior incarnation before rebinding")]
+    fn rebinding_before_close_trips_the_driver_contract() {
+        let (mailbox, _) = actor();
+        MailboxControl::configure(&*mailbox, Mailbox::default());
+        let mut identity = ScopeIdentity::new();
+        let membership = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available");
+        let mut incarnations = identity.incarnation_counter(membership);
+        let first = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+            .expect("first incarnation available");
+        let second = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+            .expect("second incarnation available");
+
+        MailboxControl::bind(&*mailbox, first);
+        MailboxControl::bind(&*mailbox, second);
     }
 
     #[test]
@@ -1949,7 +1848,7 @@ mod tests {
         park_with(&mut third, &counting);
         MailboxControl::configure(&*mailbox, Mailbox::default());
         let mut generations = {
-            let mut identity = ScopeIdentity::new().expect("scope identity available");
+            let mut identity = ScopeIdentity::new();
             let membership = identity
                 .mint_membership(&ChildId::from("actor"))
                 .expect("membership available");
@@ -2059,5 +1958,122 @@ mod tests {
         assert!(Arc::ptr_eq(&removed, &second));
         removed.clear_registration(second_id);
         assert!(waiters.is_empty());
+    }
+
+    #[test]
+    fn waiter_queue_preserves_fifo_across_removal() {
+        let mut waiters = super::WaiterQueue::default();
+        let first = super::SendOperation::new(1_u8);
+        let second = super::SendOperation::new(2_u8);
+        let third = super::SendOperation::new(3_u8);
+        let first_id = waiters.push_back(Arc::clone(&first));
+        let second_id = waiters.push_back(Arc::clone(&second));
+        let third_id = waiters.push_back(Arc::clone(&third));
+
+        assert!(Arc::ptr_eq(
+            &waiters.remove(second_id).expect("middle waiter is live"),
+            &second
+        ));
+        let (popped_first, operation) = waiters.pop_front().expect("head remains live");
+        assert_eq!(popped_first, first_id);
+        assert!(Arc::ptr_eq(&operation, &first));
+        let (popped_third, operation) = waiters.pop_front().expect("tail remains live");
+        assert_eq!(popped_third, third_id);
+        assert!(Arc::ptr_eq(&operation, &third));
+        assert!(waiters.is_empty());
+    }
+
+    #[test]
+    fn waiter_identity_exhaustion_poison_is_never_minted() {
+        let mut waiters = super::WaiterQueue {
+            next_id: u64::MAX - 2,
+            ..super::WaiterQueue::default()
+        };
+        let last = waiters.push_back(super::SendOperation::new(1_u8));
+        assert_eq!(last, super::WaiterId(u64::MAX - 1));
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                waiters.push_back(super::SendOperation::new(2_u8));
+            }))
+            .is_err(),
+            "the poison key is never minted"
+        );
+        assert_eq!(waiters.next_id, u64::MAX);
+        assert!(!waiters.entries.contains_key(&super::WaiterId(u64::MAX)));
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                waiters.push_back(super::SendOperation::new(3_u8));
+            }))
+            .is_err(),
+            "the exhausted domain stays poisoned"
+        );
+    }
+
+    /// Stays pending on its first elapsed poll, modelling an atomic
+    /// completion transition that won without publishing its payload yet.
+    #[derive(Default)]
+    struct PendingOnFirstExpiry {
+        elapsed_polls: usize,
+    }
+
+    impl super::DeadlineOperation for PendingOnFirstExpiry {
+        type Output = usize;
+
+        fn poll_deadlined(
+            &mut self,
+            _context: &mut Context<'_>,
+            _budget: crate::deadline::Deadline,
+            elapsed: bool,
+        ) -> Poll<usize> {
+            if !elapsed {
+                return Poll::Pending;
+            }
+            self.elapsed_polls += 1;
+            if self.elapsed_polls < 2 {
+                Poll::Pending
+            } else {
+                Poll::Ready(self.elapsed_polls)
+            }
+        }
+
+        fn short_circuit(&mut self) -> usize {
+            0
+        }
+    }
+
+    #[crate::runtime::test(start_paused = true)]
+    async fn an_expired_deadline_future_never_repolls_its_resolved_timer() {
+        let width = std::time::Duration::from_secs(1);
+        let mut future = Box::pin(super::Deadlined::new(
+            PendingOnFirstExpiry::default(),
+            width,
+        ));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        assert!(future.as_mut().poll(&mut context).is_pending());
+        crate::runtime::advance(width * 2).await;
+        // The timer resolves here and the operation stays pending, so the
+        // scaffold must latch the expiry rather than poll the timer again.
+        assert!(future.as_mut().poll(&mut context).is_pending());
+
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(2)));
+    }
+
+    #[test]
+    fn a_zero_budget_short_circuits_without_polling_the_operation() {
+        let mut future = Box::pin(super::Deadlined::new(
+            PendingOnFirstExpiry::default(),
+            std::time::Duration::ZERO,
+        ));
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(0)));
+        assert_eq!(
+            future.operation.elapsed_polls, 0,
+            "a zero budget never attempts the operation"
+        );
     }
 }

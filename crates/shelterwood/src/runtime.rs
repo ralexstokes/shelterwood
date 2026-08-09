@@ -1,13 +1,15 @@
 //! The only boundary between the library and its async runtime.
 
 use std::{
+    any::Any,
     fmt,
     future::Future,
     ops::RangeBounds,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -17,8 +19,123 @@ use tokio::{
     task, time,
 };
 
+use crate::deadline::Deadline;
+
 #[cfg(test)]
 pub(crate) use tokio::test;
+
+/// Advances a paused test clock, keeping timer control in this module.
+#[cfg(test)]
+pub(crate) async fn advance(duration: Duration) {
+    time::advance(duration).await;
+}
+
+/// Runtime-owned spelling for an unwind payload crossing a framework boundary.
+pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
+
+/// Catches application code without requiring every caller to repeat the
+/// `AssertUnwindSafe` boundary vocabulary.
+pub(crate) fn catch_panic<T>(operation: impl FnOnce() -> T) -> Result<T, PanicPayload> {
+    catch_unwind(AssertUnwindSafe(operation))
+}
+
+/// Discards an optional panic payload without trusting its destructor.
+pub(crate) fn discard_panic(payload: Option<PanicPayload>) {
+    if let Some(payload) = payload
+        && let Err(hostile_payload) = catch_panic(|| drop(payload))
+    {
+        // A payload whose own destructor panics cannot be dropped safely:
+        // dropping the replacement payload would merely recurse outside the
+        // boundary. Leak only this already-panicking diagnostic.
+        std::mem::forget(hostile_payload);
+    }
+}
+
+/// Resumes one captured panic payload at the framework boundary.
+pub(crate) fn resume_panic(payload: PanicPayload) -> ! {
+    resume_unwind(payload)
+}
+
+/// Retains the first panic and safely discards a later cleanup panic.
+pub(crate) fn keep_first_panic(first: &mut Option<PanicPayload>, candidate: Option<PanicPayload>) {
+    if first.is_none() {
+        *first = candidate;
+    } else {
+        discard_panic(candidate);
+    }
+}
+
+/// Resumes the primary panic, or the cleanup panic when there is no primary.
+/// During an existing unwind both are contained to prevent a double panic.
+///
+/// Containment is only correct where losing the diagnostic is the lesser
+/// outcome, which is true in a destructor and false on a normal return path.
+/// Callers that own the sole surviving copy of an authoritative panic must use
+/// [`resume_preferred_panic_outside_unwind`] instead.
+pub(crate) fn resume_preferred_panic(primary: Option<PanicPayload>, cleanup: Option<PanicPayload>) {
+    if std::thread::panicking() {
+        discard_panic(primary);
+        discard_panic(cleanup);
+    } else if let Some(payload) = primary {
+        discard_panic(cleanup);
+        resume_panic(payload);
+    } else if let Some(payload) = cleanup {
+        resume_panic(payload);
+    }
+}
+
+/// Resumes exactly as [`resume_preferred_panic`], but never contains the
+/// payload.
+///
+/// This is the variant for call sites that are not destructors and have
+/// already taken sole ownership of the panic. Silently discarding there would
+/// erase the authoritative diagnostic and let the caller continue past a
+/// failure it believes it re-raised, so the caller's non-unwinding precondition
+/// is asserted rather than absorbed.
+pub(crate) fn resume_preferred_panic_outside_unwind(
+    primary: Option<PanicPayload>,
+    cleanup: Option<PanicPayload>,
+) {
+    debug_assert!(
+        !std::thread::panicking(),
+        "an unwinding caller must contain its payloads with resume_preferred_panic"
+    );
+    if let Some(payload) = primary {
+        discard_panic(cleanup);
+        resume_panic(payload);
+    } else if let Some(payload) = cleanup {
+        resume_panic(payload);
+    }
+}
+
+/// Collects independent cleanup panics while allowing every cleanup step to
+/// run. Dropping the accumulator resumes the first panic unless another unwind
+/// is already in progress; callers that need to defer that decision can
+/// [`take`](Self::take) the payload.
+#[derive(Default)]
+pub(crate) struct PanicAccumulator {
+    first: Option<PanicPayload>,
+}
+
+impl PanicAccumulator {
+    pub(crate) fn run(&mut self, operation: impl FnOnce()) {
+        self.record(catch_panic(operation).err());
+    }
+
+    pub(crate) fn record(&mut self, candidate: Option<PanicPayload>) {
+        keep_first_panic(&mut self.first, candidate);
+    }
+
+    pub(crate) fn take(&mut self) -> Option<PanicPayload> {
+        self.first.take()
+    }
+}
+
+impl Drop for PanicAccumulator {
+    fn drop(&mut self) {
+        resume_preferred_panic(None, self.first.take());
+    }
+}
 
 pub(crate) fn now() -> std::time::Instant {
     time::Instant::now().into_std()
@@ -26,6 +143,130 @@ pub(crate) fn now() -> std::time::Instant {
 
 pub(crate) fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
+}
+
+pub(crate) type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+pub(crate) fn deadline(duration: Duration) -> Deadline {
+    Deadline::after(now(), duration)
+}
+
+pub(crate) fn sleep_deadline(deadline: Deadline) -> BoxedSleep {
+    Box::pin(async move {
+        match deadline.instant() {
+            Some(deadline) => sleep_until_std(deadline).await,
+            None => std::future::pending().await,
+        }
+    })
+}
+
+pub(crate) fn sleep_until(deadline: std::time::Instant) -> BoxedSleep {
+    Box::pin(sleep_until_std(deadline))
+}
+
+pub(crate) struct ActorWork {
+    handle: Option<JoinHandle<()>>,
+    abort: AbortHandle,
+}
+
+impl ActorWork {
+    pub(crate) fn abort(&self) {
+        self.abort.abort();
+    }
+
+    pub(crate) async fn join(mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        let _ = join(handle).await;
+    }
+}
+
+impl Drop for ActorWork {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+pub(crate) fn spawn_actor_work(future: impl Future<Output = ()> + Send + 'static) -> ActorWork {
+    let handle = spawn(future);
+    let abort = handle.abort_handle();
+    ActorWork {
+        handle: Some(handle),
+        abort,
+    }
+}
+
+pub(crate) struct BlockingWork<T> {
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T: Send + 'static> BlockingWork<T> {
+    pub(crate) async fn join(mut self) -> T {
+        let handle = self
+            .handle
+            .take()
+            .expect("blocking operation was joined more than once");
+        join_resuming(handle).await
+    }
+}
+
+pub(crate) fn spawn_blocking_work<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> BlockingWork<T> {
+    BlockingWork {
+        handle: Some(spawn_blocking(operation)),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Signal {
+    inner: WatchSender<()>,
+}
+
+impl Default for Signal {
+    fn default() -> Self {
+        Self { inner: watch(()).0 }
+    }
+}
+
+impl Clone for Signal {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl Signal {
+    pub(crate) fn pulse(&self) {
+        self.inner.pulse();
+    }
+
+    pub(crate) fn watcher(&self) -> SignalWatcher {
+        SignalWatcher {
+            inner: self.inner.watcher(),
+            _signal: self.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    fn watcher_count(&self) -> usize {
+        self.inner.receiver_count()
+    }
+}
+
+pub(crate) struct SignalWatcher {
+    inner: WatchReceiver<()>,
+    // Retain the source through every watcher so channel closure cannot turn
+    // into a spurious pulse.
+    _signal: Signal,
+}
+
+impl SignalWatcher {
+    pub(crate) async fn changed(&mut self) {
+        self.inner.changed().await;
+    }
 }
 
 /// Ownership wrapper for user values retained by framework state.
@@ -96,13 +337,11 @@ where
         else {
             return;
         };
-        let panic = catch_unwind(AssertUnwindSafe(|| drop(value)))
-            .err()
-            .map(contain_panic_payload);
+        let panic = catch_panic(|| drop(value)).err().map(contain_panic_payload);
         // Completion is framework bookkeeping. Contain it as well so a
         // hostile waker or a runtime teardown race cannot unwind a blocking
         // worker or double-panic while the job is being dropped.
-        let _ = catch_unwind(AssertUnwindSafe(|| completion(panic)));
+        discard_panic(catch_panic(|| completion(panic)).err());
     }
 }
 
@@ -123,11 +362,12 @@ where
 {
     if is_available() {
         let worker = Arc::clone(&job);
-        if let Ok(handle) = catch_unwind(AssertUnwindSafe(|| {
-            task::spawn_blocking(move || worker.finish())
-        })) {
-            drop(handle);
-            return;
+        match catch_panic(|| task::spawn_blocking(move || worker.finish())) {
+            Ok(handle) => {
+                drop(handle);
+                return;
+            }
+            Err(payload) => discard_panic(Some(payload)),
         }
     }
 
@@ -246,35 +486,157 @@ impl Latch {
     }
 }
 
+const ONESHOT_OPEN: u8 = 0;
+const ONESHOT_SENDING: u8 = 1;
+const ONESHOT_SENT: u8 = 2;
+const ONESHOT_SENDER_CLOSED: u8 = 3;
+const ONESHOT_RECEIVER_CLOSED: u8 = 4;
+
 /// Sending half of a runtime-backed single-delivery channel.
-pub(crate) struct OneShotSender<T>(oneshot::Sender<T>);
+pub(crate) struct OneShotSender<T> {
+    channel: Option<oneshot::Sender<T>>,
+    state: Arc<AtomicU8>,
+}
 
 /// Receiving half of a runtime-backed single-delivery channel.
-pub(crate) struct OneShotReceiver<T>(oneshot::Receiver<T>);
+pub(crate) struct OneShotReceiver<T> {
+    channel: oneshot::Receiver<T>,
+    state: Arc<AtomicU8>,
+}
+
+/// Outcome after atomically closing a single-delivery receive side.
+pub(crate) enum OneShotClose<T> {
+    /// A value was sent before the receiver closed.
+    Value(T),
+    /// The sender was dropped before the receiver closed.
+    SenderClosed,
+    /// The receiver closed while the sender was still live and empty.
+    Empty,
+    /// The send transition won but has not published its value yet.
+    Pending,
+}
 
 pub(crate) fn oneshot<T>() -> (OneShotSender<T>, OneShotReceiver<T>) {
-    let (sender, receiver) = oneshot::channel();
-    (OneShotSender(sender), OneShotReceiver(receiver))
+    let (channel_sender, channel_receiver) = oneshot::channel();
+    let state = Arc::new(AtomicU8::new(ONESHOT_OPEN));
+    (
+        OneShotSender {
+            channel: Some(channel_sender),
+            state: Arc::clone(&state),
+        },
+        OneShotReceiver {
+            channel: channel_receiver,
+            state,
+        },
+    )
 }
 
 impl<T> OneShotSender<T> {
-    pub(crate) fn send(self, value: T) -> Result<(), T> {
-        self.0.send(value)
+    pub(crate) fn send(mut self, value: T) -> Result<(), T> {
+        if self
+            .state
+            .compare_exchange(
+                ONESHOT_OPEN,
+                ONESHOT_SENDING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(value);
+        }
+        let sender = self
+            .channel
+            .take()
+            .expect("a live one-shot sender retains its channel");
+        match sender.send(value) {
+            Ok(()) => {
+                self.state.store(ONESHOT_SENT, Ordering::Release);
+                Ok(())
+            }
+            Err(value) => {
+                self.state.store(ONESHOT_RECEIVER_CLOSED, Ordering::Release);
+                Err(value)
+            }
+        }
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.0.is_closed()
+        self.channel.as_ref().is_none_or(oneshot::Sender::is_closed)
+    }
+}
+
+impl<T> Drop for OneShotSender<T> {
+    fn drop(&mut self) {
+        if self.channel.is_some() {
+            let _ = self.state.compare_exchange(
+                ONESHOT_OPEN,
+                ONESHOT_SENDER_CLOSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
     }
 }
 
 impl<T> OneShotReceiver<T> {
+    pub(crate) fn poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<T>> {
+        Pin::new(&mut self.channel).poll(context).map(Result::ok)
+    }
+
+    /// Closes the receive side unless send or sender-drop won first.
+    ///
+    /// The shared transition word distinguishes sender-drop from receiver
+    /// close, which Tokio's post-close `try_recv` result alone cannot do. A
+    /// send that wins but is preempted before publishing returns `Pending`;
+    /// the preceding channel poll registered the wake for its completion.
+    pub(crate) fn close_and_poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> OneShotClose<T> {
+        match self.state.compare_exchange(
+            ONESHOT_OPEN,
+            ONESHOT_RECEIVER_CLOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.channel.close();
+                OneShotClose::Empty
+            }
+            Err(ONESHOT_SENDER_CLOSED) => OneShotClose::SenderClosed,
+            Err(ONESHOT_SENDING) | Err(ONESHOT_SENT) => {
+                match Pin::new(&mut self.channel).poll(context) {
+                    std::task::Poll::Ready(Ok(value)) => OneShotClose::Value(value),
+                    std::task::Poll::Ready(Err(_)) => OneShotClose::SenderClosed,
+                    std::task::Poll::Pending => OneShotClose::Pending,
+                }
+            }
+            Err(ONESHOT_RECEIVER_CLOSED) => OneShotClose::Empty,
+            Err(other) => unreachable!("unknown one-shot transition state {other}"),
+        }
+    }
+
+    pub(crate) fn close(&mut self) {
+        let _ = self.state.compare_exchange(
+            ONESHOT_OPEN,
+            ONESHOT_RECEIVER_CLOSED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.channel.close();
+    }
+
     pub(crate) async fn receive(self) -> Option<T> {
-        self.0.await.ok()
+        self.channel.await.ok()
     }
 
     #[cfg(test)]
     pub(crate) fn try_receive(&mut self) -> Option<T> {
-        self.0.try_recv().ok()
+        self.channel.try_recv().ok()
     }
 }
 
@@ -463,9 +825,8 @@ impl<T> fmt::Debug for BroadcastReceiver<T> {
     }
 }
 
-/// A spawned operation whose identity is retained through joining.
-pub(crate) struct JoinHandle<I, T> {
-    id: I,
+/// A spawned operation owned by the library.
+pub(crate) struct JoinHandle<T> {
     inner: task::JoinHandle<T>,
 }
 
@@ -478,7 +839,7 @@ impl AbortHandle {
     }
 }
 
-impl<I, T> JoinHandle<I, T> {
+impl<T> JoinHandle<T> {
     pub(crate) fn abort_handle(&self) -> AbortHandle {
         AbortHandle(self.inner.abort_handle())
     }
@@ -510,30 +871,28 @@ pub(crate) enum JoinOutcome<T> {
     Cancelled,
 }
 
-pub(crate) fn spawn<I, F>(id: I, future: F) -> JoinHandle<I, F::Output>
+pub(crate) fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
     JoinHandle {
-        id,
         inner: task::spawn(future),
     }
 }
 
-pub(crate) fn spawn_blocking<I, F, T>(id: I, operation: F) -> JoinHandle<I, T>
+pub(crate) fn spawn_blocking<F, T>(operation: F) -> JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     JoinHandle {
-        id,
         inner: task::spawn_blocking(operation),
     }
 }
 
-pub(crate) async fn join<I, T>(handle: JoinHandle<I, T>) -> JoinOutcome<T> {
-    let JoinHandle { inner, .. } = handle;
+pub(crate) async fn join<T>(handle: JoinHandle<T>) -> JoinOutcome<T> {
+    let JoinHandle { inner } = handle;
     match inner.await {
         Ok(value) => JoinOutcome::Ok { value },
         Err(error) if error.is_panic() => JoinOutcome::Panic {
@@ -546,11 +905,11 @@ pub(crate) async fn join<I, T>(handle: JoinHandle<I, T>) -> JoinOutcome<T> {
     }
 }
 
-pub(crate) async fn join_resuming<I, T>(handle: JoinHandle<I, T>) -> (I, T) {
-    let JoinHandle { id, inner } = handle;
+pub(crate) async fn join_resuming<T>(handle: JoinHandle<T>) -> T {
+    let JoinHandle { inner } = handle;
     match inner.await {
-        Ok(value) => (id, value),
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Ok(value) => value,
+        Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
         Err(error) => {
             debug_assert!(error.is_cancelled());
             panic!("library-owned operation task was unexpectedly cancelled")
@@ -558,17 +917,21 @@ pub(crate) async fn join_resuming<I, T>(handle: JoinHandle<I, T>) -> (I, T) {
     }
 }
 
-fn contain_panic_payload(payload: Box<dyn std::any::Any + Send + 'static>) -> Option<String> {
-    let message = catch_unwind(AssertUnwindSafe(|| panic_message(payload.as_ref())))
-        .ok()
-        .flatten();
+fn contain_panic_payload(payload: PanicPayload) -> Option<String> {
+    let message = match catch_panic(|| panic_message(payload.as_ref())) {
+        Ok(message) => message,
+        Err(inspection_panic) => {
+            discard_panic(Some(inspection_panic));
+            None
+        }
+    };
     // A custom panic payload is user-owned too. Its destructor may panic, so
     // discard it under a fresh unwind boundary before publishing completion.
-    let _ = catch_unwind(AssertUnwindSafe(|| drop(payload)));
+    discard_panic(Some(payload));
     message
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send + 'static)) -> Option<String> {
+fn panic_message(payload: &(dyn Any + Send + 'static)) -> Option<String> {
     if let Some(message) = payload.downcast_ref::<&str>() {
         Some((*message).to_owned())
     } else {
@@ -601,9 +964,15 @@ where
 
 pub(crate) type MpscSender<T> = mpsc::Sender<T>;
 pub(crate) type MpscReceiver<T> = mpsc::Receiver<T>;
+pub(crate) type UnboundedMpscSender<T> = mpsc::UnboundedSender<T>;
+pub(crate) type UnboundedMpscReceiver<T> = mpsc::UnboundedReceiver<T>;
 
 pub(crate) fn bounded_mpsc<T>(capacity: usize) -> (MpscSender<T>, MpscReceiver<T>) {
     mpsc::channel(capacity)
+}
+
+pub(crate) fn unbounded_mpsc<T>() -> (UnboundedMpscSender<T>, UnboundedMpscReceiver<T>) {
+    mpsc::unbounded_channel()
 }
 
 pub(crate) async fn mpsc_send<T>(sender: &MpscSender<T>, value: T) -> Result<(), T> {
@@ -611,6 +980,14 @@ pub(crate) async fn mpsc_send<T>(sender: &MpscSender<T>, value: T) -> Result<(),
 }
 
 pub(crate) fn mpsc_try_recv<T>(receiver: &mut MpscReceiver<T>) -> Option<T> {
+    receiver.try_recv().ok()
+}
+
+pub(crate) fn unbounded_mpsc_send<T>(sender: &UnboundedMpscSender<T>, value: T) -> Result<(), T> {
+    sender.send(value).map_err(|error| error.0)
+}
+
+pub(crate) fn unbounded_mpsc_try_recv<T>(receiver: &mut UnboundedMpscReceiver<T>) -> Option<T> {
     receiver.try_recv().ok()
 }
 
@@ -674,11 +1051,27 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
-        task::Poll,
+        task::{Context, Poll, Waker},
         time::Duration,
     };
 
-    use super::{DisposalJob, JoinOutcome, Latch, Timeout, join, spawn, timeout, yield_now};
+    use super::{
+        DisposalJob, JoinOutcome, Latch, OneShotClose, Signal, Timeout, discard_panic, join,
+        oneshot, spawn, timeout, yield_now,
+    };
+
+    struct RecursivelyPanickingPayload;
+
+    impl Drop for RecursivelyPanickingPayload {
+        fn drop(&mut self) {
+            std::panic::panic_any(RecursivelyPanickingPayload);
+        }
+    }
+
+    #[test]
+    fn discarding_a_recursively_hostile_panic_payload_is_contained() {
+        discard_panic(Some(Box::new(RecursivelyPanickingPayload)));
+    }
 
     struct PanickingDrop(Arc<AtomicUsize>);
 
@@ -710,6 +1103,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn closing_oneshot_distinguishes_value_sender_drop_and_receiver_win() {
+        let mut context = Context::from_waker(Waker::noop());
+        let (sender, mut receiver) = oneshot();
+        sender.send(1_u8).expect("receiver is live");
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::Value(1)
+        ));
+
+        let (sender, mut receiver) = oneshot::<u8>();
+        drop(sender);
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::SenderClosed
+        ));
+
+        let (sender, mut receiver) = oneshot::<u8>();
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::Empty
+        ));
+        assert_eq!(sender.send(1), Err(1));
+    }
+
+    #[test]
+    fn quiet_signal_wait_cancellation_keeps_one_watch_registration() {
+        let signal = Signal::default();
+        let mut watcher = signal.watcher();
+        assert_eq!(signal.watcher_count(), 1);
+
+        for _ in 0..10_000 {
+            let mut changed = Box::pin(watcher.changed());
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(changed.as_mut().poll(&mut context).is_pending());
+            drop(changed);
+            assert_eq!(signal.watcher_count(), 1);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn exactly_one_concurrent_fire_performs_the_transition() {
         const FIRERS: usize = 32;
@@ -720,7 +1153,7 @@ mod tests {
         for _ in 0..FIRERS {
             let latch = latch.clone();
             let ready = Arc::clone(&ready);
-            firers.push(spawn((), async move {
+            firers.push(spawn(async move {
                 ready.fetch_add(1, Ordering::AcqRel);
                 while ready.load(Ordering::Acquire) != FIRERS {
                     yield_now().await;
@@ -752,7 +1185,7 @@ mod tests {
         for _ in 0..WAITERS {
             let latch = latch.clone();
             let parked = Arc::clone(&parked);
-            waiters.push(spawn((), async move {
+            waiters.push(spawn(async move {
                 let mut fired = Box::pin(latch.fired());
                 let first_poll =
                     std::future::poll_fn(|context| Poll::Ready(fired.as_mut().poll(context))).await;

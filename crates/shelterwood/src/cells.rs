@@ -17,7 +17,7 @@ use std::{
 
 use crate::{
     ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, ScopeState, Strategy,
-    engine::ScopeEpochs,
+    engine::{Epoch, RequestTarget, ScopeEpochs},
     exit::{StartupError, StopReason},
     identity::{FenceCounter, ScopeIdentity},
     observe::{
@@ -405,7 +405,7 @@ struct ScopeControl {
 
 #[derive(Clone, Copy, Debug)]
 struct ScopeRequest {
-    epoch: u64,
+    epoch: Epoch,
     consumed: bool,
 }
 
@@ -993,7 +993,7 @@ impl ScopeCell {
         }
     }
 
-    pub(crate) fn begin_incarnation(&self) -> Option<u64> {
+    pub(crate) fn begin_incarnation(&self) -> Option<Epoch> {
         self.with_observation_gate(|| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             let epoch = control.epochs.begin()?;
@@ -1012,17 +1012,17 @@ impl ScopeCell {
         })
     }
 
-    pub(crate) fn finish_incarnation(&self, epoch: u64, reason: StopReason) {
+    pub(crate) fn finish_incarnation(&self, epoch: Epoch, reason: StopReason) {
         self.finish_incarnation_with_terminal(epoch, reason, None);
     }
 
-    pub(crate) fn finish_root_incarnation(&self, epoch: u64, reason: StopReason, exit: Exit) {
+    pub(crate) fn finish_root_incarnation(&self, epoch: Epoch, reason: StopReason, exit: Exit) {
         self.finish_incarnation_with_terminal(epoch, reason, Some(exit));
     }
 
     fn finish_incarnation_with_terminal(
         &self,
-        epoch: u64,
+        epoch: Epoch,
         reason: StopReason,
         terminal_exit: Option<Exit>,
     ) {
@@ -1104,9 +1104,12 @@ impl ScopeCell {
         }
     }
 
-    pub(crate) fn request_shutdown(&self) -> Option<u64> {
+    pub(crate) fn request_shutdown(&self) -> Option<Epoch> {
         let mut control = self.control.lock().expect("scope control mutex poisoned");
-        let (target, pending_incarnation) = control.epochs.request_target()?;
+        let RequestTarget {
+            epoch: target,
+            pending_incarnation,
+        } = control.epochs.request_target()?;
         if control
             .shutdown
             .is_none_or(|request| request.epoch < target)
@@ -1133,7 +1136,7 @@ impl ScopeCell {
         })
     }
 
-    pub(crate) fn has_stop_request(&self, epoch: u64) -> bool {
+    pub(crate) fn has_stop_request(&self, epoch: Epoch) -> bool {
         let control = self.control.lock().expect("scope control mutex poisoned");
         control
             .shutdown
@@ -1141,7 +1144,7 @@ impl ScopeCell {
             || control.force.is_some_and(|request| request.epoch == epoch)
     }
 
-    pub(crate) fn take_shutdown_request(&self, epoch: u64) -> bool {
+    pub(crate) fn take_shutdown_request(&self, epoch: Epoch) -> bool {
         let mut control = self.control.lock().expect("scope control mutex poisoned");
         match control.shutdown.as_mut() {
             Some(request) if request.epoch == epoch && !request.consumed => {
@@ -1152,7 +1155,7 @@ impl ScopeCell {
         }
     }
 
-    pub(crate) fn force_shutdown(&self, epoch: u64) {
+    pub(crate) fn force_shutdown(&self, epoch: Epoch) {
         let mut control = self.control.lock().expect("scope control mutex poisoned");
         if control.epochs.is_current(epoch) {
             control.force = Some(ScopeRequest {
@@ -1164,7 +1167,7 @@ impl ScopeCell {
         self.member.record.pulse();
     }
 
-    pub(crate) fn take_force_request(&self, epoch: u64) -> bool {
+    pub(crate) fn take_force_request(&self, epoch: Epoch) -> bool {
         let mut control = self.control.lock().expect("scope control mutex poisoned");
         match control.force.as_mut() {
             Some(request) if request.epoch == epoch && !request.consumed => {
@@ -1175,7 +1178,7 @@ impl ScopeCell {
         }
     }
 
-    pub(crate) fn incarnation_finished(&self, epoch: u64) -> bool {
+    pub(crate) fn incarnation_finished(&self, epoch: Epoch) -> bool {
         let control = self.control.lock().expect("scope control mutex poisoned");
         control.epochs.finished(epoch)
     }

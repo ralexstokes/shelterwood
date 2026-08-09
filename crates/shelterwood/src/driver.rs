@@ -13,7 +13,7 @@ use crate::{
     cells::{DynamicRoute, MemberStage, ResidentProjection, ScopeCell},
     deadline::Deadline,
     engine::{
-        ArbitrationClass, DeadlineHandle, DeadlineQueue, ExitDispatch, IntensityState,
+        ArbitrationClass, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch, IntensityState,
         MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState,
         ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
         schedule_restart,
@@ -587,7 +587,7 @@ fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<Shutd
     }
 }
 
-async fn wait_for_incarnation(scope: &ScopeCell, epoch: u64) {
+async fn wait_for_incarnation(scope: &ScopeCell, epoch: Epoch) {
     let mut watcher = scope.signal().watcher();
     loop {
         if scope.incarnation_finished(epoch)
@@ -950,7 +950,7 @@ struct ScopeRuntime {
     is_root: bool,
     parent_ready: Option<Latch>,
     dynamic: Option<Arc<DynamicControl>>,
-    epoch: u64,
+    epoch: Epoch,
     ancestor_shutdown: Option<Latch>,
     ancestor_shutdown_seen: bool,
     ancestor_abort: Option<Latch>,
@@ -2500,7 +2500,7 @@ fn mint_child_incarnation(slot: &Arc<SlotCell>, counter: &mut FenceCounter) -> O
 /// identity exhaustion.
 struct ScopeEpochGuard {
     scope: Arc<ScopeCell>,
-    epoch: Option<u64>,
+    epoch: Option<Epoch>,
 }
 
 impl ScopeEpochGuard {
@@ -2520,7 +2520,7 @@ impl ScopeEpochGuard {
         self.scope.finish_incarnation(epoch, reason);
     }
 
-    fn transfer(mut self) -> u64 {
+    fn transfer(mut self) -> Epoch {
         self.epoch
             .take()
             .expect("an owned scope epoch transfers at most once")
@@ -2957,7 +2957,7 @@ mod tests {
         LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline,
         RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause,
         StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
-        engine::{ScopeLifecycle, StopLadder, arbitrate},
+        engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
@@ -3994,7 +3994,7 @@ mod tests {
 
     struct ObserveScopeOnStartupWake {
         scope: Arc<ScopeCell>,
-        epoch: Option<u64>,
+        epoch: Option<Epoch>,
         observed: Mutex<Option<(MemberStage, Option<bool>)>>,
     }
 

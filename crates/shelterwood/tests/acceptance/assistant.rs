@@ -179,7 +179,7 @@ struct GatewayFixture {
     duplicate_notices: UnboundedReceiver<()>,
 }
 
-fn gateway(fail_once: bool) -> GatewayFixture {
+fn gateway() -> GatewayFixture {
     let (processed, processed_log) = unbounded_channel();
     let (duplicate_notices, duplicates_log) = unbounded_channel();
     let mut tree = Tree::new();
@@ -203,7 +203,7 @@ fn gateway(fail_once: bool) -> GatewayFixture {
         state: TransportState {
             delivered: Arc::default(),
             processed,
-            fail_once: Arc::new(AtomicBool::new(fail_once)),
+            fail_once: Arc::new(AtomicBool::new(true)),
         },
     }));
     let bridge_gate = ReleaseGate::default();
@@ -421,7 +421,7 @@ fn event_is_restart_for(event: &LifecycleEvent, membership: Membership) -> bool 
 
 #[tokio::test]
 async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_and_remount() {
-    let mut gateway = gateway(true);
+    let mut gateway = gateway();
     let mut root_tree = Tree::new();
     let sessions = root_tree
         .add_subtree_once("sessions", SubtreeOnceDef::new(DynamicTree::new()))

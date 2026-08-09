@@ -1407,7 +1407,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
         };
-        report.record(RecordedOutcome::Returned(result));
+        report.record(RecordedOutcome::returned(result));
     });
     let abort_handle = handle.abort_handle();
 
@@ -1753,7 +1753,7 @@ impl ScopeRuntime {
                 true
             }
             ReadinessEffect::TimedOut { deadline } => {
-                self.begin_stop_child(key, Some(RecordedOutcome::ReadinessTimedOut { deadline }));
+                self.begin_stop_child(key, Some(RecordedOutcome::readiness_timed_out(deadline)));
                 false
             }
             ReadinessEffect::Disarmed => false,
@@ -1888,7 +1888,7 @@ impl ScopeRuntime {
                 StopAction::AbortFramework { phase } => {
                     active.hard_abort_phase = Some(phase);
                     if active.forced_outcome.is_none() {
-                        active.forced_outcome = Some(RecordedOutcome::Aborted { phase });
+                        active.forced_outcome = Some(RecordedOutcome::aborted(phase));
                     }
                     active
                         .framework_abort
@@ -3575,7 +3575,7 @@ mod tests {
         let exit = DriverEvent::Child(ChildEvent::Exited {
             child: trip,
             incarnation,
-            recorded: Some(RecordedOutcome::Returned(Err(ExitError::message(
+            recorded: Some(RecordedOutcome::returned(Err(ExitError::message(
                 "trip intensity",
             )))),
             join: JoinVerdict::Completed,
@@ -3800,12 +3800,12 @@ mod tests {
     fn owned_report_token_consumes_or_falls_back_once() {
         let shutdown = Latch::default();
         let (token, receiver) = report_channel(shutdown.clone(), None);
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         shutdown.fire();
         let report = receiver.receive();
         assert!(matches!(
             report.outcome,
-            Some(RecordedOutcome::Returned(Ok(())))
+            Some(outcome) if matches!(outcome.kind(), ExitKind::Completed)
         ));
         assert_eq!(report.cancellation, Cancellation::NotObserved);
 
@@ -3823,11 +3823,11 @@ mod tests {
         let shutdown = Latch::default();
         let (token, receiver) = report_channel(shutdown.clone(), None);
         shutdown.fire();
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         let report = receiver.receive();
         assert!(matches!(
             report.outcome,
-            Some(RecordedOutcome::Returned(Ok(())))
+            Some(outcome) if matches!(outcome.kind(), ExitKind::Completed)
         ));
         assert_eq!(report.cancellation, Cancellation::Observed);
     }
@@ -3838,7 +3838,7 @@ mod tests {
         let local_stop = Latch::default();
         let (token, receiver) = report_channel(shutdown, Some(local_stop.clone()));
         local_stop.fire();
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         assert_eq!(receiver.receive().cancellation, Cancellation::Observed);
     }
 

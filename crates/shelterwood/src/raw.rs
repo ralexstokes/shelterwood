@@ -13,8 +13,9 @@ use std::{
 };
 
 use crate::{
-    ActorRef, CancellationToken, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown,
-    PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, ScopeRef, Shutdown,
+    ActorRef, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown, PolicyError, Readiness,
+    ReadinessDeadline, RestartPolicy, Retention, ScopeRef, Shutdown,
+    cancellation::CancellationToken,
     cells::{MailboxControl, MemberCell},
     definition::DefinitionSource,
     mailbox::{MailboxCell, MailboxReceiver},

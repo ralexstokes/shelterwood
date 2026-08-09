@@ -6,6 +6,7 @@
 mod definition;
 mod actor;
 mod admission;
+mod cancellation;
 mod cells;
 mod deadline;
 mod driver;
@@ -23,6 +24,7 @@ mod tree;
 
 pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use admission::{NotAdmittingCause, RemoveOutcome, ReserveError};
+pub use cancellation::CancellationToken;
 pub use exit::{
     Exit, ExitError, ExitKind, ExitResult, IntensityTrip, ShutdownStraggler, ShutdownTimeout,
     StartupError, StartupFailure, StartupFailureCause, StopReason,
@@ -45,7 +47,7 @@ pub use policy::{
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,
 };
-pub use task::{CancellationToken, OneShotTaskRef, TaskContext, TaskDef, TaskOnceDef, TaskRef};
+pub use task::{OneShotTaskRef, TaskContext, TaskDef, TaskOnceDef, TaskRef};
 pub use tree::{
     ActorSlot, Admission, AdmissionReceipt, BuildError, DynamicActorSlot, DynamicScopeRef,
     DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, Removal, ScopeRef, StartOrShutdownError,

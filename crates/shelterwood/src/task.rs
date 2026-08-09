@@ -12,6 +12,7 @@ use std::{
 use crate::{
     ChildId, Exit, ExitError, ExitResult, Incarnation, Membership, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
+    cancellation::CancellationToken,
     cells::MemberCell,
     definition::DefinitionSource,
     policy::CommonOptions,
@@ -20,49 +21,6 @@ use crate::{
 
 pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
 pub(crate) type TaskFactory = Arc<dyn Fn(TaskContext) -> TaskFuture + Send + Sync + 'static>;
-
-/// A library-owned cancellation token.
-#[derive(Clone, Debug, Default)]
-pub struct CancellationToken {
-    primary: Latch,
-    secondary: Option<Latch>,
-}
-
-impl CancellationToken {
-    pub(crate) fn from_latch(latch: Latch) -> Self {
-        Self {
-            primary: latch,
-            secondary: None,
-        }
-    }
-
-    pub(crate) fn from_latches(primary: Latch, secondary: Latch) -> Self {
-        Self {
-            primary,
-            secondary: Some(secondary),
-        }
-    }
-
-    pub(crate) fn child(&self, cancellation: Latch) -> Self {
-        debug_assert!(self.secondary.is_none());
-        Self::from_latches(self.primary.clone(), cancellation)
-    }
-
-    /// Reports whether cancellation has been requested.
-    #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        self.primary.is_fired() || self.secondary.as_ref().is_some_and(Latch::is_fired)
-    }
-
-    /// Waits until cancellation is requested.
-    pub async fn cancelled(&self) {
-        if let Some(secondary) = &self.secondary {
-            let _ = runtime::select_two(self.primary.fired(), secondary.fired()).await;
-        } else {
-            self.primary.fired().await;
-        }
-    }
-}
 
 /// Per-incarnation capabilities supplied to a supervised task.
 #[derive(Clone, Debug)]
@@ -359,17 +317,16 @@ mod tests {
     use std::{
         future::Future,
         task::{Context, Poll, Waker},
-        time::Duration,
     };
 
     use crate::{
         ChildId, Exit, ExitKind,
         cells::MemberCell,
         identity::ScopeIdentity,
-        runtime::{self, JoinOutcome, Latch, Timeout},
+        runtime::{self, Latch},
     };
 
-    use super::{CancellationToken, OneShotTaskRef, TaskContext, TaskRef};
+    use super::{OneShotTaskRef, TaskContext, TaskRef};
 
     fn task_context() -> (TaskContext, Latch, Latch, Latch) {
         let id = ChildId::from("task");
@@ -474,73 +431,5 @@ mod tests {
         member.terminalize(Exit::new(ExitKind::Completed, false));
 
         let _ = claim.wait().await;
-    }
-
-    #[crate::runtime::test]
-    async fn local_cancellation_cancels_only_the_derived_token() {
-        let primary = Latch::default();
-        let local = Latch::default();
-        let supervisor = CancellationToken::from_latch(primary.clone());
-        let operation = supervisor.child(local.clone());
-
-        assert!(local.fire());
-        assert!(matches!(
-            runtime::timeout(Duration::from_secs(1), operation.cancelled()).await,
-            Timeout::Completed(())
-        ));
-        assert!(operation.is_cancelled());
-        assert!(!supervisor.is_cancelled());
-        assert!(!primary.is_fired());
-    }
-
-    #[crate::runtime::test]
-    async fn supervisor_cancellation_cancels_the_derived_token() {
-        let primary = Latch::default();
-        let local = Latch::default();
-        let supervisor = CancellationToken::from_latch(primary.clone());
-        let operation = supervisor.child(local.clone());
-
-        assert!(primary.fire());
-        assert!(matches!(
-            runtime::timeout(Duration::from_secs(1), operation.cancelled()).await,
-            Timeout::Completed(())
-        ));
-        assert!(supervisor.is_cancelled());
-        assert!(operation.is_cancelled());
-        assert!(!local.is_fired());
-    }
-
-    #[crate::runtime::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn simultaneous_supervisor_and_local_cancellation_wake_the_operation() {
-        for _ in 0..128 {
-            let primary = Latch::default();
-            let local = Latch::default();
-            let operation = CancellationToken::from_latch(primary.clone()).child(local.clone());
-            let waiter = runtime::spawn(async move {
-                operation.cancelled().await;
-            });
-
-            let primary_firer = runtime::spawn(async move {
-                runtime::yield_now().await;
-                primary.fire()
-            });
-            let local_firer = runtime::spawn(async move {
-                runtime::yield_now().await;
-                local.fire()
-            });
-
-            assert!(matches!(
-                runtime::join(primary_firer).await,
-                JoinOutcome::Ok { value: true }
-            ));
-            assert!(matches!(
-                runtime::join(local_firer).await,
-                JoinOutcome::Ok { value: true }
-            ));
-            assert!(matches!(
-                runtime::timeout(Duration::from_secs(1), runtime::join(waiter)).await,
-                Timeout::Completed(JoinOutcome::Ok { value: () })
-            ));
-        }
     }
 }

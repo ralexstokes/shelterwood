@@ -1116,6 +1116,7 @@ struct ScopeRuntime {
     hard_forced: bool,
     ordered_stop_progressing: bool,
     ordered_stop_cursor: Option<ChildKey>,
+    ordered_stop_waiting: Option<ChildKey>,
     #[cfg(test)]
     ordered_stop_inspections: usize,
     completion: Option<ScopeCompletion>,
@@ -1952,6 +1953,17 @@ impl ScopeRuntime {
             return;
         }
         self.ordered_stop_progressing = true;
+        if let Some(key) = self.ordered_stop_waiting {
+            let waiting = self
+                .children
+                .get(key)
+                .is_some_and(|child| !child.is_terminal() || child.is_disposing());
+            if waiting {
+                self.ordered_stop_progressing = false;
+                return;
+            }
+            self.ordered_stop_waiting = None;
+        }
         while let Some(key) = self.ordered_stop_cursor {
             self.ordered_stop_cursor = self.children.previous_key(key);
             #[cfg(test)]
@@ -1963,6 +1975,7 @@ impl ScopeRuntime {
             }
             self.begin_stop_child(key, None);
             if self.children[key].active.is_some() || self.children[key].is_disposing() {
+                self.ordered_stop_waiting = Some(key);
                 break;
             }
         }
@@ -2830,6 +2843,7 @@ async fn run_scope_incarnation(
         hard_forced: false,
         ordered_stop_progressing: false,
         ordered_stop_cursor: None,
+        ordered_stop_waiting: None,
         #[cfg(test)]
         ordered_stop_inspections: 0,
         completion: None,
@@ -3424,6 +3438,7 @@ mod tests {
             hard_forced: false,
             ordered_stop_progressing: false,
             ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
             ordered_stop_inspections: 0,
             completion: None,
         };
@@ -3557,6 +3572,7 @@ mod tests {
             hard_forced: true,
             ordered_stop_progressing: false,
             ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
             ordered_stop_inspections: 0,
             completion: None,
         };
@@ -3567,6 +3583,7 @@ mod tests {
 
         assert!(scope.children.values().all(ChildRuntime::is_terminal));
         assert!(!scope.ordered_stop_progressing);
+        assert_eq!(scope.ordered_stop_waiting, None);
         assert_eq!(
             scope.ordered_stop_inspections, CHILDREN,
             "the reverse cursor inspects each ordered child exactly once"
@@ -3641,6 +3658,7 @@ mod tests {
             hard_forced: false,
             ordered_stop_progressing: false,
             ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
             ordered_stop_inspections: 0,
             completion: None,
         };
@@ -4896,6 +4914,7 @@ mod tests {
             hard_forced: false,
             ordered_stop_progressing: false,
             ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
             ordered_stop_inspections: 0,
             completion: None,
         };
@@ -5018,6 +5037,7 @@ mod tests {
             hard_forced: false,
             ordered_stop_progressing: false,
             ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
             ordered_stop_inspections: 0,
             completion: None,
         };

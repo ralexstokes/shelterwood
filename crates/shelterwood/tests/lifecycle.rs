@@ -340,6 +340,86 @@ async fn ordered_teardown_is_reverse_and_joins_before_advancing() {
 }
 
 #[tokio::test]
+async fn ordered_teardown_keeps_its_frontier_when_an_earlier_child_exits() {
+    let first_stopping = Arc::new(AtomicBool::new(false));
+    let middle_exit = ReleaseGate::default();
+    let last_stopping = ReleaseGate::default();
+    let last_exit = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "first",
+        TaskDef::new({
+            let first_stopping = Arc::clone(&first_stopping);
+            move |context| {
+                let first_stopping = Arc::clone(&first_stopping);
+                async move {
+                    context.shutdown_token().cancelled().await;
+                    first_stopping.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        }),
+    )
+    .expect("valid first task");
+    let middle = tree
+        .add_task(
+            "middle",
+            TaskDef::new({
+                let middle_exit = middle_exit.clone();
+                move |_| {
+                    let middle_exit = middle_exit.clone();
+                    async move {
+                        middle_exit.wait().await;
+                        Ok(())
+                    }
+                }
+            }),
+        )
+        .expect("valid middle task");
+    tree.add_task(
+        "last",
+        TaskDef::new({
+            let last_stopping = last_stopping.clone();
+            let last_exit = last_exit.clone();
+            move |context| {
+                let last_stopping = last_stopping.clone();
+                let last_exit = last_exit.clone();
+                async move {
+                    context.shutdown_token().cancelled().await;
+                    last_stopping.release();
+                    last_exit.wait().await;
+                    Ok(())
+                }
+            }
+        }),
+    )
+    .expect("valid last task");
+
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
+    tokio::time::timeout(POLL_TIMEOUT, last_stopping.wait())
+        .await
+        .expect("the reverse-order frontier starts stopping");
+
+    middle_exit.release();
+    tokio::time::timeout(POLL_TIMEOUT, middle.wait())
+        .await
+        .expect("the earlier child exits independently");
+    assert_quiet(Duration::from_millis(15), || {
+        first_stopping.load(Ordering::SeqCst)
+    })
+    .await;
+
+    last_exit.release();
+    shutdown
+        .await
+        .expect("shutdown task joins")
+        .expect("clean shutdown");
+    assert!(first_stopping.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn dynamic_teardown_cancels_children_concurrently() {
     let cancelled = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
     let gate = ReleaseGate::default();

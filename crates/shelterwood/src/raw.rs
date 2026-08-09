@@ -347,25 +347,13 @@ impl<M> EventQueue<M> {
     }
 }
 
-trait ErasedTimerKey: Send {
-    fn as_any(&self) -> &dyn Any;
-}
-
-struct StoredTimerKey<K>(K);
-
-impl<K: Send + 'static> ErasedTimerKey for StoredTimerKey<K> {
-    fn as_any(&self) -> &dyn Any {
-        &self.0
-    }
-}
-
 enum TimerMessage<M> {
     Once(M),
-    Interval(Box<dyn Fn() -> M + Send + 'static>),
+    Interval(M, fn(&M) -> M),
 }
 
 struct TimerEntry<M> {
-    key: Box<dyn ErasedTimerKey>,
+    key: Box<dyn Any + Send>,
     /// `None` when the requested delay overflows the clock: a deadline that
     /// never arrives, mirroring the offload path — never "due now".
     deadline: Option<Instant>,
@@ -430,7 +418,7 @@ impl<M> TimerStore<M> {
         let _ = self.remove(&key);
         let hash = self.hash_key(&key);
         self.keyed.entry(hash).or_default().push(TimerEntry {
-            key: Box::new(StoredTimerKey(key)),
+            key: Box::new(key),
             deadline,
             arming_order,
             message,
@@ -457,7 +445,7 @@ impl<M> TimerStore<M> {
                 {
                     probes += 1;
                 }
-                entry.key.as_any().downcast_ref::<K>() == Some(key)
+                entry.key.downcast_ref::<K>() == Some(key)
             })?;
             #[cfg(test)]
             {
@@ -832,7 +820,6 @@ pub struct RawContext<M> {
     local_stop: Latch,
     readiness: Readiness,
     mailbox_shutdown: MailboxShutdown,
-    mailbox: Arc<MailboxCell<M>>,
     receiver: MailboxReceiver<M>,
     resources: RawResources<M>,
 }
@@ -865,7 +852,6 @@ impl<M: Send + 'static> RawContext<M> {
             local_stop: run.local_stop,
             readiness,
             mailbox_shutdown: run.mailbox_shutdown,
-            mailbox: Arc::clone(&mailbox),
             receiver: MailboxReceiver::new(mailbox, run.incarnation),
             resources: RawResources::default(),
         }
@@ -946,7 +932,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// loop's `Context::stop` is built on (§1 principle 5); the child's
     /// configured §10 ladder bounds the stop.
     pub fn stop(&mut self) {
-        self.mailbox.freeze(self.incarnation);
+        self.receiver.freeze();
         self.freeze_and_report();
         self.local_stop.fire();
     }
@@ -999,10 +985,9 @@ impl<M: Send + 'static> RawContext<M> {
             let _ = self.clear_timer(&key);
             return Ok(());
         }
-        let make_message = Box::new(move || message.clone());
         self.replace_timer(
             key,
-            TimerMessage::Interval(make_message),
+            TimerMessage::Interval(message, Clone::clone),
             period,
             Some(period),
         );
@@ -1381,10 +1366,10 @@ impl<M: Send + 'static> RawContext<M> {
         if let Some(period) = entry.period {
             let deadline = crate::deadline::Deadline::after(runtime::now(), period).instant();
             entry.deadline = deadline;
-            let TimerMessage::Interval(make_message) = &entry.message else {
+            let TimerMessage::Interval(message, clone_message) = &entry.message else {
                 unreachable!("an interval timer must own a message factory")
             };
-            let message = make_message();
+            let message = clone_message(message);
             self.resources.timers.arm_deadline(arming, deadline);
             return Some(message);
         }
@@ -1459,7 +1444,7 @@ impl<M: Send + 'static> RawContext<M> {
 
 /// Restartable raw-actor definition.
 pub struct RawDef<R: RawActor> {
-    factory: Arc<dyn Fn() -> R + Send + Sync + 'static>,
+    factory: Box<dyn Fn() -> R + Send + Sync + 'static>,
     pub(crate) options: CommonOptions,
 }
 
@@ -1476,7 +1461,7 @@ impl<R: RawActor> RawDef<R> {
     /// Creates a restartable definition from a repeatable actor factory.
     pub fn factory(factory: impl Fn() -> R + Send + Sync + 'static) -> Self {
         Self {
-            factory: Arc::new(factory),
+            factory: Box::new(factory),
             options: CommonOptions::default(),
         }
     }

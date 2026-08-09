@@ -298,26 +298,13 @@ impl DynamicControl {
     }
 }
 
-fn dynamic_control(scope: &ScopeCell) -> Option<Arc<DynamicControl>> {
-    // The cells layer stores the route erased because it may not name a driver
-    // type. `set_dynamic_route` is the only writer, so a failed downcast is a
-    // driver bug, not an absent route: resolving it to `None` would fail open,
-    // reporting `NoLiveIncarnation` and `AlreadyAbsent` for a live scope.
-    Some(
-        scope
-            .dynamic_route()?
-            .resolve()
-            .unwrap_or_else(|_| panic!("the dynamic route is always a DynamicControl")),
-    )
-}
-
 fn resident_projection(slot: &SlotCell) -> ResidentProjection {
     ResidentProjection::new(Arc::clone(&slot.member), slot.scope.clone())
 }
 
 pub(crate) struct DynamicReservation {
     pub(crate) slot: Arc<SlotCell>,
-    pub(crate) control: Arc<DynamicControl>,
+    pub(crate) control: Arc<dyn DynamicRoute>,
 }
 
 pub(crate) fn reserve_dynamic(
@@ -332,7 +319,7 @@ pub(crate) fn reserve_dynamic(
     if matches!(scope.member.record().stage, MemberStage::Terminal(_)) {
         return Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal));
     }
-    let control = dynamic_control(scope).ok_or(ReserveError::NotAdmitting(
+    let control = scope.dynamic_route().ok_or(ReserveError::NotAdmitting(
         NotAdmittingCause::NoLiveIncarnation,
     ))?;
     match scope.record().state {
@@ -349,6 +336,16 @@ pub(crate) fn reserve_dynamic(
             ));
         }
     }
+    let slot = control.reserve(scope, id, child_scope)?;
+    Ok(DynamicReservation { slot, control })
+}
+
+fn reserve_dynamic_slot(
+    control: &DynamicControl,
+    scope: &Arc<ScopeCell>,
+    id: ChildId,
+    child_scope: Option<ScopeFlavor>,
+) -> Result<Arc<SlotCell>, ReserveError> {
     let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
     if !state.accepting {
         return Err(ReserveError::NotAdmitting(NotAdmittingCause::Draining));
@@ -370,13 +367,18 @@ pub(crate) fn reserve_dynamic(
             removal_started: false,
         },
     );
-    Ok(DynamicReservation {
-        slot,
-        control: Arc::clone(&control),
-    })
+    Ok(slot)
 }
 
 pub(crate) fn start_admission(
+    control: Arc<dyn DynamicRoute>,
+    slot: Arc<SlotCell>,
+    fused_cancel: Option<Latch>,
+) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
+    control.start_admission(slot, fused_cancel)
+}
+
+fn start_dynamic_admission(
     control: Arc<DynamicControl>,
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
@@ -385,8 +387,9 @@ pub(crate) fn start_admission(
         return Err(ReserveError::NoRuntime);
     }
     let (sender, response) = runtime::oneshot();
+    let route: Arc<dyn DynamicRoute> = control.clone();
     let request = AdmissionRequest {
-        control: Arc::downgrade(&control),
+        control: Arc::downgrade(&route),
         slot,
         fused_cancel,
         response: Obligation::new(sender, |sender| {
@@ -403,7 +406,7 @@ pub(crate) fn start_admission(
 }
 
 fn cancel_dynamic_reservation_parts(
-    control: &Arc<DynamicControl>,
+    control: &DynamicControl,
     slot: &Arc<SlotCell>,
 ) -> (
     Option<runtime::Isolated<ChildConstruction>>,
@@ -424,7 +427,11 @@ fn cancel_dynamic_reservation_parts(
     (definition, removed)
 }
 
-pub(crate) fn cancel_dynamic_reservation(control: &Arc<DynamicControl>, slot: &Arc<SlotCell>) {
+pub(crate) fn cancel_dynamic_reservation(control: &dyn DynamicRoute, slot: &Arc<SlotCell>) {
+    control.cancel_reservation(slot);
+}
+
+fn cancel_dynamic_reservation_impl(control: &DynamicControl, slot: &Arc<SlotCell>) {
     let (definition, removed) = cancel_dynamic_reservation_parts(control, slot);
     // The entry's drop completes its removal response; it must follow the
     // member's terminal publication and isolated definition disposal.
@@ -432,10 +439,14 @@ pub(crate) fn cancel_dynamic_reservation(control: &Arc<DynamicControl>, slot: &A
 }
 
 pub(crate) fn signal_fused_cancel(
-    control: &Arc<DynamicControl>,
+    control: &dyn DynamicRoute,
     membership: Membership,
     latch: &Latch,
 ) {
+    control.signal_fused_cancel(membership, latch);
+}
+
+fn signal_fused_cancel_impl(control: &DynamicControl, membership: Membership, latch: &Latch) {
     if latch.fire() {
         queue_driver_event(control, DriverEvent::Removal(membership));
     }
@@ -452,9 +463,18 @@ pub(crate) fn remove_dynamic(
     ) {
         return completed_removal(RemoveOutcome::AlreadyAbsent);
     }
-    let Some(control) = dynamic_control(scope) else {
+    let Some(control) = scope.dynamic_route() else {
         return completed_removal(RemoveOutcome::AlreadyAbsent);
     };
+    control.remove(scope, id, exact)
+}
+
+fn remove_dynamic_impl(
+    control: &DynamicControl,
+    scope: &Arc<ScopeCell>,
+    id: &ChildId,
+    exact: Option<Membership>,
+) -> RemovalResponse {
     let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
     let Some(entry) = state.entries.get_mut(id) else {
         return completed_removal(RemoveOutcome::AlreadyAbsent);
@@ -485,9 +505,53 @@ pub(crate) fn remove_dynamic(
     drop(state);
     scope.transition_child(&member, |record| record.removing = true, None);
     if member.removal.fire() {
-        queue_driver_event(&control, DriverEvent::Removal(membership));
+        queue_driver_event(control, DriverEvent::Removal(membership));
     }
     response
+}
+
+impl DynamicRoute for DynamicControl {
+    fn reserve(
+        &self,
+        scope: &Arc<ScopeCell>,
+        id: ChildId,
+        child_scope: Option<ScopeFlavor>,
+    ) -> Result<Arc<SlotCell>, ReserveError> {
+        reserve_dynamic_slot(self, scope, id, child_scope)
+    }
+
+    fn start_admission(
+        self: Arc<Self>,
+        slot: Arc<SlotCell>,
+        fused_cancel: Option<Latch>,
+    ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
+        start_dynamic_admission(self, slot, fused_cancel)
+    }
+
+    fn cancel_reservation(&self, slot: &Arc<SlotCell>) {
+        cancel_dynamic_reservation_impl(self, slot);
+    }
+
+    fn signal_fused_cancel(&self, membership: Membership, latch: &Latch) {
+        signal_fused_cancel_impl(self, membership, latch);
+    }
+
+    fn remove(
+        &self,
+        scope: &Arc<ScopeCell>,
+        id: &ChildId,
+        exact: Option<Membership>,
+    ) -> RemovalResponse {
+        remove_dynamic_impl(self, scope, id, exact)
+    }
+
+    #[cfg(test)]
+    fn request_forwarder_probe(&self) -> (Latch, Latch) {
+        (
+            self.request_forwarder_close.clone(),
+            self.request_forwarder_ended.clone(),
+        )
+    }
 }
 
 fn queue_driver_event(control: &DynamicControl, event: DriverEvent) {
@@ -502,7 +566,7 @@ fn queue_driver_event(control: &DynamicControl, event: DriverEvent) {
 }
 
 struct AdmissionRequest {
-    control: Weak<DynamicControl>,
+    control: Weak<dyn DynamicRoute>,
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
     response: Obligation<runtime::OneShotSender<Result<(), ReserveError>>>,
@@ -2264,14 +2328,16 @@ impl ScopeRuntime {
     }
 
     fn handle_admission(&mut self, mut request: AdmissionRequest) {
-        let Some(control) = request.control.upgrade() else {
+        let Some(request_control) = request.control.upgrade() else {
             request.complete(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
             return;
         };
-        if self
-            .dynamic
-            .as_ref()
-            .is_none_or(|current| !Arc::ptr_eq(current, &control))
+        let Some(control) = self.dynamic.as_ref().cloned() else {
+            request.complete(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
+            return;
+        };
+        let current_route: Arc<dyn DynamicRoute> = control.clone();
+        if !Arc::ptr_eq(&current_route, &request_control)
             || self.lifecycle.is_draining()
             || self.lifecycle.startup_failed()
         {
@@ -2655,7 +2721,7 @@ async fn run_scope_incarnation(
             );
         }
         drop(state);
-        root.set_dynamic_route(Some(DynamicRoute::new(Arc::clone(control))));
+        root.set_dynamic_route(Some(control.clone()));
     }
     root.set_admitted_children(
         plan.children
@@ -2973,8 +3039,8 @@ mod tests {
         ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
         GateCapture, MemberCell, MemberStage, Obligation, Pending, RemovalResponses,
         RuntimeStorage, ScopeCell, ScopeEpochGuard, ScopeFlavor, ScopeRuntime, complete_removals,
-        driver_event_class, dynamic_control, mint_child_incarnation, report_channel,
-        resident_projection, restart_shutdown_work, run_nested_tree, run_scope_incarnation,
+        driver_event_class, mint_child_incarnation, report_channel, resident_projection,
+        restart_shutdown_work, run_nested_tree, run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -4338,16 +4404,19 @@ mod tests {
         let slot = scope
             .reserve_task("retained")
             .expect("unadmitted reservation is retained");
-        let control = dynamic_control(&scope.as_scope().cell)
+        let control = scope
+            .as_scope()
+            .cell
+            .dynamic_route()
             .expect("the live dynamic scope exposes its control");
-        let forwarder_ended = control.request_forwarder_ended.clone();
+        let (forwarder_close, forwarder_ended) = control.request_forwarder_probe();
 
         system
             .shutdown(Duration::from_secs(1))
             .await
             .expect("driver teardown completes");
 
-        assert!(control.request_forwarder_close.is_fired());
+        assert!(forwarder_close.is_fired());
         assert!(matches!(
             crate::runtime::timeout(Duration::from_secs(1), forwarder_ended.fired()).await,
             crate::runtime::Timeout::Completed(())
@@ -4397,7 +4466,7 @@ mod tests {
                     removal_started: false,
                 },
             );
-        root.set_dynamic_route(Some(super::DynamicRoute::new(Arc::clone(&control))));
+        root.set_dynamic_route(Some(control.clone()));
 
         let captures = root.probe_gate_captures();
         let gate = root.observation_gate();
@@ -4452,7 +4521,7 @@ mod tests {
                 !crate::runtime::is_available(),
                 "Tokio context is not inherited by a foreign thread"
             );
-            super::signal_fused_cancel(&foreign_control, second, &Latch::default());
+            super::signal_fused_cancel(foreign_control.as_ref(), second, &Latch::default());
         })
         .join()
         .expect("foreign-thread removal signaling succeeds");
@@ -4498,7 +4567,7 @@ mod tests {
         let mut responses = Vec::with_capacity(ADMISSIONS);
         for _ in 0..ADMISSIONS {
             responses.push(
-                super::start_admission(Arc::clone(&control), Arc::clone(&slot), None)
+                super::start_admission(control.clone(), Arc::clone(&slot), None)
                     .expect("runtime is available"),
             );
         }
@@ -4541,8 +4610,11 @@ mod tests {
         let system = DynamicTree::new().spawn().expect("runtime is available");
         let root = system.scope();
         system.wait_started().await.expect("dynamic root starts");
-        let control =
-            dynamic_control(&root.as_scope().cell).expect("running dynamic root has a control");
+        let control = root
+            .as_scope()
+            .cell
+            .dynamic_route()
+            .expect("running dynamic root has a control");
         let weak = Arc::downgrade(&control);
         drop(control);
 

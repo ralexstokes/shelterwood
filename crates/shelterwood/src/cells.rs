@@ -3,10 +3,10 @@
 //! These cells are the neutral synchronization and observation projection
 //! layer shared by public handles, mailboxes, actor/task contexts, and the
 //! mutable supervision driver. In particular, this module does not depend on
-//! driver state or declaration-plan slots.
+//! mutable driver state. Its dynamic-route interface names declaration slots
+//! only as opaque capability payloads; their state remains owned elsewhere.
 
 use std::{
-    any::Any,
     fmt,
     sync::{
         Arc, Mutex, OnceLock, RwLock, Weak,
@@ -17,6 +17,7 @@ use std::{
 
 use crate::{
     ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, ScopeState, Strategy,
+    admission::{RemoveOutcome, ReserveError},
     engine::{Epoch, RequestTarget, ScopeEpochs},
     exit::{StartupError, StopReason},
     identity::ScopeIdentity,
@@ -24,6 +25,7 @@ use crate::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
         LifecycleHub, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
     },
+    plan::SlotCell,
     policy::{ResolvedCommonOptions, ScopeFlavor},
     runtime::{self, Latch},
 };
@@ -318,23 +320,33 @@ pub(crate) struct ScopeRecord {
     pub(crate) total_restarts: u64,
 }
 
-#[derive(Clone)]
-pub(crate) struct DynamicRoute(Arc<dyn Any + Send + Sync>);
+pub(crate) trait DynamicRoute: Send + Sync {
+    fn reserve(
+        &self,
+        scope: &Arc<ScopeCell>,
+        id: ChildId,
+        child_scope: Option<ScopeFlavor>,
+    ) -> Result<Arc<SlotCell>, ReserveError>;
 
-impl fmt::Debug for DynamicRoute {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("DynamicRoute").finish()
-    }
-}
+    fn start_admission(
+        self: Arc<Self>,
+        slot: Arc<SlotCell>,
+        fused_cancel: Option<Latch>,
+    ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError>;
 
-impl DynamicRoute {
-    pub(crate) fn new<T: Any + Send + Sync>(route: Arc<T>) -> Self {
-        Self(route)
-    }
+    fn cancel_reservation(&self, slot: &Arc<SlotCell>);
 
-    pub(crate) fn resolve<T: Any + Send + Sync>(self) -> Result<Arc<T>, Self> {
-        Arc::downcast(self.0).map_err(Self)
-    }
+    fn signal_fused_cancel(&self, membership: Membership, latch: &Latch);
+
+    fn remove(
+        &self,
+        scope: &Arc<ScopeCell>,
+        id: &ChildId,
+        exact: Option<Membership>,
+    ) -> runtime::OneShotReceiver<RemoveOutcome>;
+
+    #[cfg(test)]
+    fn request_forwarder_probe(&self) -> (Latch, Latch);
 }
 
 /// Driver-independent view of one declaration slot while its membership is
@@ -426,7 +438,7 @@ pub(crate) struct ScopeCell {
     config: runtime::WatchSender<ObservationConfig>,
     record: runtime::WatchSender<ScopeRecord>,
     control: Mutex<ScopeControl>,
-    dynamic_route: Mutex<Option<DynamicRoute>>,
+    dynamic_route: Mutex<Option<Arc<dyn DynamicRoute>>>,
     current_children: runtime::WatchSender<Vec<ResidentChild>>,
     parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
     observation_gate: RwLock<Arc<Mutex<()>>>,
@@ -1233,7 +1245,7 @@ impl ScopeCell {
         drop(residents);
     }
 
-    pub(crate) fn set_dynamic_route(&self, route: Option<DynamicRoute>) {
+    pub(crate) fn set_dynamic_route(&self, route: Option<Arc<dyn DynamicRoute>>) {
         *self
             .dynamic_route
             .lock()
@@ -1241,7 +1253,7 @@ impl ScopeCell {
         self.member.record.pulse();
     }
 
-    pub(crate) fn dynamic_route(&self) -> Option<DynamicRoute> {
+    pub(crate) fn dynamic_route(&self) -> Option<Arc<dyn DynamicRoute>> {
         self.dynamic_route
             .lock()
             .expect("scope dynamic-route mutex poisoned")

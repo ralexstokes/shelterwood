@@ -51,7 +51,7 @@ pub type ExitResult = Result<(), ExitError>;
 pub struct ExitError(Arc<ExitErrorInner>);
 
 enum ExitErrorInner {
-    Application(Arc<dyn Error + Send + Sync + 'static>),
+    Application(Box<dyn Error + Send + Sync + 'static>),
     IntensityTrip(StructuredIntensityTrip),
     StartupFailure(StructuredStartupFailure),
 }
@@ -60,7 +60,7 @@ impl ExitError {
     /// Creates an application error from a displayable message.
     #[must_use]
     pub fn message(message: impl Into<String>) -> Self {
-        Self(Arc::new(ExitErrorInner::Application(Arc::new(
+        Self(Arc::new(ExitErrorInner::Application(Box::new(
             MessageError(message.into()),
         ))))
     }
@@ -111,7 +111,7 @@ where
     E: Error + Send + Sync + 'static,
 {
     fn from(value: E) -> Self {
-        Self(Arc::new(ExitErrorInner::Application(Arc::new(value))))
+        Self(Arc::new(ExitErrorInner::Application(Box::new(value))))
     }
 }
 

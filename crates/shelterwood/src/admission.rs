@@ -1,6 +1,6 @@
 //! Dynamic membership admission errors and removal outcomes.
 
-use crate::policy::{ChildId, InvalidPolicy};
+use crate::{identity::ChildId, policy::InvalidPolicy};
 
 /// A child reservation or dynamic admission error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

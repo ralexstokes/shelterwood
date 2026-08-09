@@ -19,7 +19,7 @@ use crate::{
     cells::{MailboxControl, MemberCell},
     definition::DefinitionSource,
     mailbox::{MailboxCell, MailboxReceiver},
-    policy::CommonOptions,
+    policy::{ChildMode, CommonOptions},
     runtime::{
         self, ActorWork, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher, catch_panic,
         discard_panic, keep_first_panic, resume_preferred_panic,
@@ -1673,6 +1673,14 @@ pub(crate) struct RawConstruction {
 }
 
 impl RawConstruction {
+    pub(crate) fn mode(&self) -> ChildMode {
+        if self.source.is_one_shot() {
+            ChildMode::OneShot
+        } else {
+            ChildMode::Restartable
+        }
+    }
+
     pub(crate) fn one_shot(&self) -> bool {
         self.source.is_one_shot()
     }

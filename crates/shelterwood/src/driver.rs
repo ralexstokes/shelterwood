@@ -1015,6 +1015,10 @@ impl ChildArena {
             .map(|(key, _)| *key)
     }
 
+    fn previous_key(&self, key: ChildKey) -> Option<ChildKey> {
+        self.children.range(..key).next_back().map(|(key, _)| *key)
+    }
+
     fn values(&self) -> impl Iterator<Item = &ChildRuntime> {
         self.children.values()
     }
@@ -1111,6 +1115,9 @@ struct ScopeRuntime {
     ancestor_abort_seen: bool,
     hard_forced: bool,
     ordered_stop_progressing: bool,
+    ordered_stop_cursor: Option<ChildKey>,
+    #[cfg(test)]
+    ordered_stop_inspections: usize,
     completion: Option<ScopeCompletion>,
 }
 
@@ -1924,7 +1931,10 @@ impl ScopeRuntime {
         }
         self.root.set_state(ScopeState::Draining);
         match self.root.flavor {
-            ScopeFlavor::Ordered => self.stop_next_ordered(),
+            ScopeFlavor::Ordered => {
+                self.ordered_stop_cursor = self.children.keys().next_back();
+                self.stop_next_ordered();
+            }
             ScopeFlavor::Dynamic => {
                 let children: Vec<_> = self.children.keys().collect();
                 for child in children {
@@ -1942,12 +1952,15 @@ impl ScopeRuntime {
             return;
         }
         self.ordered_stop_progressing = true;
-        loop {
-            let Some(key) = self.children.keys().rev().find(|key| {
-                !self.children[*key].is_terminal() || self.children[*key].is_disposing()
-            }) else {
-                break;
-            };
+        while let Some(key) = self.ordered_stop_cursor {
+            self.ordered_stop_cursor = self.children.previous_key(key);
+            #[cfg(test)]
+            {
+                self.ordered_stop_inspections += 1;
+            }
+            if self.children[key].is_terminal() && !self.children[key].is_disposing() {
+                continue;
+            }
             self.begin_stop_child(key, None);
             if self.children[key].active.is_some() || self.children[key].is_disposing() {
                 break;
@@ -2816,6 +2829,9 @@ async fn run_scope_incarnation(
         ancestor_abort_seen: false,
         hard_forced: false,
         ordered_stop_progressing: false,
+        ordered_stop_cursor: None,
+        #[cfg(test)]
+        ordered_stop_inspections: 0,
         completion: None,
         // Transfer last: every fallible setup expression above remains
         // covered by the pre-driver guard, and completed construction moves
@@ -3407,6 +3423,8 @@ mod tests {
             ancestor_abort_seen: false,
             hard_forced: false,
             ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -3538,6 +3556,8 @@ mod tests {
             ancestor_abort_seen: false,
             hard_forced: true,
             ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -3547,6 +3567,10 @@ mod tests {
 
         assert!(scope.children.values().all(ChildRuntime::is_terminal));
         assert!(!scope.ordered_stop_progressing);
+        assert_eq!(
+            scope.ordered_stop_inspections, CHILDREN,
+            "the reverse cursor inspects each ordered child exactly once"
+        );
     }
 
     #[crate::runtime::test]
@@ -3616,6 +3640,8 @@ mod tests {
             ancestor_abort_seen: false,
             hard_forced: false,
             ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -4869,6 +4895,8 @@ mod tests {
             ancestor_abort_seen: false,
             hard_forced: false,
             ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -4989,6 +5017,8 @@ mod tests {
             ancestor_abort_seen: false,
             hard_forced: false,
             ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;

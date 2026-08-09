@@ -408,9 +408,17 @@ impl SnapshotHub {
             return;
         };
         if sender.receiver_count() > 0 {
-            sender.send_modify(|state| {
+            sender.send_if_modified(|state| {
+                // `close` and publication serialize on the retained watch
+                // state. The atomic is the fast path; this check prevents a
+                // publisher that passed it just before closure from mutating
+                // the terminal value afterward.
+                if state.closed {
+                    return false;
+                }
                 state.snapshot = snapshot();
                 state.generation = state.generation.saturating_add(1);
+                true
             });
         }
     }
@@ -567,20 +575,34 @@ impl LifecycleHub {
             kind = ?event.kind,
             "scope lifecycle event"
         );
-        if !self.closed.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        self.channels.signal.send_if_modified(|signal| {
+            // Enqueue and activity notification share the same linearization
+            // point as closure. A publisher that passed the atomic fast-path
+            // check cannot append after receivers have observed `closed`.
+            if signal.closed {
+                return false;
+            }
             let _ = self.channels.events.send(event);
             // The watch version is also the no-loss activity notification for
             // async receivers. Its value changes only for explicit lag.
-            self.channels.signal.pulse();
-        }
+            true
+        });
     }
 
     pub(crate) fn publish_lagged(&self, dropped: u64) {
-        if !self.closed.load(Ordering::Acquire) {
-            self.channels.signal.send_modify(|signal| {
-                signal.explicit_lag = signal.explicit_lag.saturating_add(dropped);
-            });
+        if self.closed.load(Ordering::Acquire) {
+            return;
         }
+        self.channels.signal.send_if_modified(|signal| {
+            if signal.closed {
+                return false;
+            }
+            signal.explicit_lag = signal.explicit_lag.saturating_add(dropped);
+            true
+        });
     }
 
     pub(crate) fn close(&self) {
@@ -619,18 +641,104 @@ pub enum WaitError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, atomic::Ordering},
+        thread,
+    };
+
     use crate::{
-        ScopeState,
+        Intensity, ScopeState,
         identity::ScopeIdentity,
-        observe::{LifecycleEvent, LifecycleEventKind, LifecycleItem},
+        observe::{
+            LifecycleEvent, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, ScopeKind,
+            ScopeSnapshot,
+        },
     };
 
     use super::{LIFECYCLE_EVENT_CAPACITY, LifecycleHub, SnapshotHub};
+
+    fn snapshot(state: ScopeState) -> Arc<ScopeSnapshot> {
+        Arc::new(ScopeSnapshot {
+            state,
+            kind: ScopeKind::Dynamic,
+            strategy: None,
+            intensity: Intensity::default(),
+            total_restarts: 0,
+            lifecycle_seq: 0,
+            children: Arc::from([]),
+        })
+    }
 
     #[test]
     fn snapshot_projection_is_skipped_without_subscribers() {
         let hub = SnapshotHub::default();
         hub.publish(|| panic!("projection must be lazy when no receiver exists"));
+    }
+
+    #[crate::runtime::test]
+    async fn snapshot_publication_that_linearizes_before_close_is_drained() {
+        let hub = Arc::new(SnapshotHub::default());
+        let mut snapshots = hub.subscribe(snapshot(ScopeState::Unstarted));
+        let (entered, wait_for_release) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+
+        let publisher = {
+            let hub = Arc::clone(&hub);
+            thread::spawn(move || {
+                hub.publish(|| {
+                    entered.send(()).expect("test remains active");
+                    released.recv().expect("publisher is released");
+                    snapshot(ScopeState::Running)
+                });
+            })
+        };
+        wait_for_release
+            .recv()
+            .expect("publisher reaches the serialized channel update");
+        let closer = {
+            let hub = Arc::clone(&hub);
+            thread::spawn(move || hub.close())
+        };
+        while !hub.closed.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        release.send(()).expect("publisher is still waiting");
+        publisher.join().expect("publisher does not panic");
+        closer.join().expect("closer does not panic");
+
+        assert_eq!(
+            snapshots
+                .changed()
+                .await
+                .expect("publication precedes close")
+                .state,
+            ScopeState::Running
+        );
+        assert!(snapshots.changed().await.is_err());
+        hub.publish(|| panic!("publication after close must remain lazy"));
+
+        let mut after_close = hub.subscribe(snapshot(ScopeState::Stopped {
+            reason: crate::StopReason::Finished,
+        }));
+        assert!(matches!(
+            after_close.borrow_latest().state,
+            ScopeState::Stopped {
+                reason: crate::StopReason::Finished
+            }
+        ));
+        assert!(after_close.changed().await.is_err());
+    }
+
+    #[crate::runtime::test]
+    async fn lifecycle_close_wakes_parked_receivers() {
+        let hub = Arc::new(LifecycleHub::default());
+        let mut events = hub.subscribe();
+        let waiter = crate::runtime::spawn(async move { events.recv().await });
+        crate::runtime::yield_now().await;
+
+        hub.close();
+
+        assert_eq!(crate::runtime::join_resuming(waiter).await, None);
     }
 
     #[test]
@@ -668,5 +776,38 @@ mod tests {
             panic!("expected the retained suffix");
         };
         assert_eq!(first_retained.seq, 3);
+    }
+
+    #[test]
+    fn lifecycle_close_drains_the_queued_prefix_and_rejects_late_publication() {
+        let mut identity = ScopeIdentity::new();
+        let membership = identity
+            .mint_membership(&crate::ChildId::from("scope"))
+            .expect("membership available");
+        let event = |seq| LifecycleEvent {
+            scope_path: Vec::new(),
+            scope: membership,
+            seq,
+            kind: LifecycleEventKind::ScopeState {
+                state: ScopeState::Running,
+            },
+        };
+        let hub = LifecycleHub::default();
+        let mut events = hub.subscribe();
+
+        hub.publish_lagged(2);
+        hub.publish(event(1));
+        hub.close();
+        hub.publish_lagged(3);
+        hub.publish(event(2));
+
+        assert_eq!(events.try_recv(), Ok(LifecycleItem::Lagged { dropped: 2 }));
+        assert_eq!(events.try_recv(), Ok(LifecycleItem::Event(event(1))));
+        assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+        assert_eq!(
+            hub.subscribe().try_recv(),
+            Err(LifecycleTryRecvError::Closed),
+            "post-close subscribers start at the drained terminal edge"
+        );
     }
 }

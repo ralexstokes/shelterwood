@@ -3571,7 +3571,7 @@ mod tests {
         );
     }
 
-    #[crate::runtime::test]
+    #[crate::runtime::test(start_paused = true)]
     async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
         const CYCLES: usize = 1_000;
 

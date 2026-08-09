@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, Barrier, Condvar, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -154,14 +154,24 @@ async fn timers_and_offload_completions_never_cross_an_incarnation_boundary() {
 enum DetachedBlockingMessage {
     Poison,
     Fresh,
+    Stop,
     StaleCompletion,
+}
+
+struct DetachedBlockingResult(ReleaseGate);
+
+impl Drop for DetachedBlockingResult {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 struct DetachedBlockingActor {
     generation: usize,
-    thread_started: Arc<Barrier>,
+    thread_started: ReleaseGate,
     thread_release: Arc<(Mutex<bool>, Condvar)>,
-    thread_done: Arc<AtomicBool>,
+    result_disposed: ReleaseGate,
+    fresh_seen: ReleaseGate,
     stale_seen: Arc<AtomicBool>,
 }
 
@@ -169,9 +179,10 @@ impl Actor for DetachedBlockingActor {
     type Msg = DetachedBlockingMessage;
     type Args = (
         usize,
-        Arc<Barrier>,
+        ReleaseGate,
         Arc<(Mutex<bool>, Condvar)>,
-        Arc<AtomicBool>,
+        ReleaseGate,
+        ReleaseGate,
         Arc<AtomicBool>,
     );
 
@@ -180,8 +191,9 @@ impl Actor for DetachedBlockingActor {
             generation: args.0,
             thread_started: args.1,
             thread_release: args.2,
-            thread_done: args.3,
-            stale_seen: args.4,
+            result_disposed: args.3,
+            fresh_seen: args.4,
+            stale_seen: args.5,
         })
     }
 
@@ -189,11 +201,11 @@ impl Actor for DetachedBlockingActor {
         match message {
             DetachedBlockingMessage::Poison => {
                 assert_eq!(self.generation, 1);
-                let thread_started = Arc::clone(&self.thread_started);
+                let thread_started = self.thread_started.clone();
                 let thread_release = Arc::clone(&self.thread_release);
-                let thread_done = Arc::clone(&self.thread_done);
+                let result_disposed = self.result_disposed.clone();
                 let work = context.run_blocking(move |cancellation| {
-                    thread_started.wait();
+                    thread_started.release();
                     let (released, changed) = &*thread_release;
                     let mut released = released.lock().expect("release mutex poisoned");
                     while !*released {
@@ -205,9 +217,9 @@ impl Actor for DetachedBlockingActor {
                         cancellation.is_cancelled(),
                         "the old incarnation cancels detached blocking work"
                     );
-                    thread_done.store(true, Ordering::SeqCst);
+                    DetachedBlockingResult(result_disposed)
                 });
-                self.thread_started.wait();
+                self.thread_started.wait().await;
                 context
                     .offload(
                         work,
@@ -218,6 +230,11 @@ impl Actor for DetachedBlockingActor {
                 Err(ExitError::message("poisoned incarnation"))
             }
             DetachedBlockingMessage::Fresh => {
+                assert_eq!(self.generation, 2);
+                self.fresh_seen.release();
+                Ok(())
+            }
+            DetachedBlockingMessage::Stop => {
                 assert_eq!(self.generation, 2);
                 context.stop();
                 Ok(())
@@ -233,9 +250,10 @@ impl Actor for DetachedBlockingActor {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
     let generations = Arc::new(AtomicUsize::new(0));
-    let thread_started = Arc::new(Barrier::new(2));
+    let thread_started = ReleaseGate::default();
     let thread_release = Arc::new((Mutex::new(false), Condvar::new()));
-    let thread_done = Arc::new(AtomicBool::new(false));
+    let result_disposed = ReleaseGate::default();
+    let fresh_seen = ReleaseGate::default();
     let stale_seen = Arc::new(AtomicBool::new(false));
     let mut tree = Tree::new();
     let actor = tree
@@ -243,16 +261,18 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
             "actor",
             ActorDef::<DetachedBlockingActor>::factory({
                 let generations = Arc::clone(&generations);
-                let thread_started = Arc::clone(&thread_started);
+                let thread_started = thread_started.clone();
                 let thread_release = Arc::clone(&thread_release);
-                let thread_done = Arc::clone(&thread_done);
+                let result_disposed = result_disposed.clone();
+                let fresh_seen = fresh_seen.clone();
                 let stale_seen = Arc::clone(&stale_seen);
                 move || {
                     (
                         generations.fetch_add(1, Ordering::SeqCst) + 1,
-                        Arc::clone(&thread_started),
+                        thread_started.clone(),
                         Arc::clone(&thread_release),
-                        Arc::clone(&thread_done),
+                        result_disposed.clone(),
+                        fresh_seen.clone(),
                         Arc::clone(&stale_seen),
                     )
                 }
@@ -276,22 +296,25 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
     let (released, changed) = &*thread_release;
     *released.lock().expect("release mutex poisoned") = true;
     changed.notify_one();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            thread_done.load(Ordering::SeqCst)
-        })
-        .await,
-        "detached old-incarnation thread completes"
-    );
-    assert_quiet(Duration::from_millis(20), || {
-        stale_seen.load(Ordering::SeqCst)
-    })
-    .await;
+    tokio::time::timeout(POLL_TIMEOUT, result_disposed.wait())
+        .await
+        .expect("the detached blocking result is disposed");
 
     actor
         .send(DetachedBlockingMessage::Fresh)
         .await
         .expect("replacement remains live");
+    tokio::time::timeout(POLL_TIMEOUT, fresh_seen.wait())
+        .await
+        .expect("replacement processes the synchronization message");
+    assert_quiet(Duration::from_millis(20), || {
+        stale_seen.load(Ordering::SeqCst)
+    })
+    .await;
+    actor
+        .send(DetachedBlockingMessage::Stop)
+        .await
+        .expect("replacement accepts the final stop");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert!(!stale_seen.load(Ordering::SeqCst));
 }

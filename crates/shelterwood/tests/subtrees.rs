@@ -141,21 +141,26 @@ async fn one_shot_subtree_lowering_failure_retains_structured_provenance() {
 #[tokio::test]
 async fn over_budget_restart_is_charged_but_never_spawned() {
     let starts = Arc::new(AtomicUsize::new(0));
-    let release_first = ReleaseGate::default();
+    let releases = Arc::new([
+        ReleaseGate::default(),
+        ReleaseGate::default(),
+        ReleaseGate::default(),
+    ]);
     let mut root = Tree::new();
     root.intensity(Intensity::new(2, Duration::from_secs(10)).expect("valid intensity"));
     root.add_task(
         "failing",
         TaskDef::new({
             let starts = Arc::clone(&starts);
-            let release_first = release_first.clone();
+            let releases = Arc::clone(&releases);
             move |_| {
                 let incarnation = starts.fetch_add(1, Ordering::SeqCst);
-                let release_first = release_first.clone();
+                let release = releases
+                    .get(incarnation)
+                    .cloned()
+                    .expect("the over-budget restart is never spawned");
                 async move {
-                    if incarnation == 0 {
-                        release_first.wait().await;
-                    }
+                    release.wait().await;
                     Err(ExitError::message("retry"))
                 }
             }
@@ -169,7 +174,55 @@ async fn over_budget_restart_is_charged_but_never_spawned() {
         .wait_started()
         .await
         .expect("immediate readiness starts root");
-    release_first.release();
+    releases[0].release();
+    let mut trace = Vec::new();
+    let mut scheduled = 0usize;
+    loop {
+        let item = events
+            .recv()
+            .await
+            .expect("the lifecycle stream remains open through scope failure");
+        let LifecycleItem::Event(event) = item else {
+            panic!("the short restart trace cannot lag");
+        };
+        match event.kind {
+            LifecycleEventKind::Exited { .. } => trace.push("exited"),
+            LifecycleEventKind::RestartScheduled { attempt, .. } => {
+                scheduled += 1;
+                trace.push("scheduled");
+                let expected_attempt =
+                    (0..scheduled).fold(RestartAttempt::ZERO, |attempt, _| attempt.bump());
+                let expected_total =
+                    (0..scheduled).fold(shelterwood::TotalRestarts::ZERO, |total, _| total.bump());
+                let expected_count =
+                    (0..scheduled).fold(shelterwood::RestartCount::ZERO, |count, _| count.bump());
+                assert_eq!(attempt, expected_attempt);
+                let snapshot = scope.snapshot();
+                assert_eq!(
+                    snapshot.total_restarts, expected_total,
+                    "the public scope counter advances with each scheduling event"
+                );
+                assert_eq!(
+                    snapshot
+                        .child("failing")
+                        .expect("the restartable child is retained")
+                        .restart_count,
+                    expected_count,
+                    "the membership counter includes the scheduling charge"
+                );
+                if scheduled < releases.len() {
+                    releases[scheduled].release();
+                }
+            }
+            LifecycleEventKind::ScopeState {
+                state: shelterwood::ScopeState::Draining,
+            } => {
+                trace.push("draining");
+                break;
+            }
+            _ => {}
+        }
+    }
     let reason = system.wait().await;
     let StopReason::IntensityTripped(trip) = reason else {
         panic!("expected intensity trip");
@@ -180,26 +233,12 @@ async fn over_budget_restart_is_charged_but_never_spawned() {
         3,
         "fourth spawn is suppressed"
     );
-
+    assert_eq!(scheduled, 3);
     assert_eq!(
         scope.snapshot().total_restarts,
         shelterwood::TotalRestarts::ZERO.bump().bump().bump(),
-        "the tripping scheduling charge advances the public scope counter"
+        "the tripping scheduling charge remains visible after failure"
     );
-    let mut trace = Vec::new();
-    while let Some(item) = events.recv().await {
-        let LifecycleItem::Event(event) = item else {
-            panic!("the short restart trace cannot lag");
-        };
-        match event.kind {
-            LifecycleEventKind::Exited { .. } => trace.push("exited"),
-            LifecycleEventKind::RestartScheduled { .. } => trace.push("scheduled"),
-            LifecycleEventKind::ScopeState {
-                state: shelterwood::ScopeState::Draining,
-            } => trace.push("draining"),
-            _ => {}
-        }
-    }
     assert_eq!(
         trace,
         [

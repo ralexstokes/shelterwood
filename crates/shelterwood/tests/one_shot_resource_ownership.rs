@@ -1,4 +1,10 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::common::{
     ConsumeCount, ConsumeGuard, POLL_TIMEOUT, ReleaseGate, policy::never, poll_once, poll_until,
@@ -383,6 +389,57 @@ fn one_shot_subtree_with_guard(count: &ConsumeCount, mode: &'static str) -> Tree
     tree
 }
 
+struct CancelledResourceActor {
+    _guard: ConsumeGuard,
+}
+
+impl Actor for CancelledResourceActor {
+    type Msg = ();
+    type Args = (ConsumeGuard, Arc<AtomicBool>);
+
+    async fn init(
+        (guard, started): Self::Args,
+        _: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        started.store(true, Ordering::SeqCst);
+        Ok(Self { _guard: guard })
+    }
+
+    async fn handle(&mut self, _: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+        std::future::pending().await
+    }
+}
+
+struct CancelledResourceRawActor {
+    _guard: ConsumeGuard,
+    started: Arc<AtomicBool>,
+}
+
+impl RawActor for CancelledResourceRawActor {
+    type Msg = ();
+
+    async fn run(&mut self, _: &mut RawContext<Self::Msg>) -> ExitResult {
+        self.started.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+fn cancelled_one_shot_subtree(count: &ConsumeCount, started: Arc<AtomicBool>) -> Tree {
+    let guard = count.guard();
+    let mut tree = Tree::new();
+    let (_task, _completion) = tree
+        .add_task_once(
+            "resource",
+            TaskOnceDef::new(move |_| async move {
+                let _guard = guard;
+                started.store(true, Ordering::SeqCst);
+                std::future::pending::<Result<(), ExitError>>().await
+            }),
+        )
+        .expect("valid task");
+    tree
+}
+
 #[tokio::test]
 async fn cancelling_inflight_one_shot_adds_drops_every_kind_resource_once() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
@@ -390,55 +447,73 @@ async fn cancelling_inflight_one_shot_adds_drops_every_kind_resource_once() {
     let scope = system.scope();
 
     let task_count = ConsumeCount::default();
+    let task_started = Arc::new(AtomicBool::new(false));
     let task_guard = task_count.guard();
     let mut task = Box::pin(scope.add_task_once(
         "task",
-        TaskOnceDef::new(move |_| async move {
-            let _guard = task_guard;
-            std::future::pending::<Result<(), ExitError>>().await
+        TaskOnceDef::new({
+            let task_started = Arc::clone(&task_started);
+            move |_| async move {
+                let _guard = task_guard;
+                task_started.store(true, Ordering::SeqCst);
+                std::future::pending::<Result<(), ExitError>>().await
+            }
         }),
     ));
     assert!(poll_once(task.as_mut()).is_pending());
     drop(task);
 
     let actor_count = ConsumeCount::default();
+    let actor_started = Arc::new(AtomicBool::new(false));
     let mut actor = Box::pin(scope.add_actor_once(
         "actor",
-        ActorOnceDef::<ResourceActor>::new(ResourceArgs {
-            guard: actor_count.guard(),
-            mode: ActorResourceMode::Normal,
-        }),
+        ActorOnceDef::<CancelledResourceActor>::new((
+            actor_count.guard(),
+            Arc::clone(&actor_started),
+        )),
     ));
     assert!(poll_once(actor.as_mut()).is_pending());
     drop(actor);
 
     let raw_count = ConsumeCount::default();
+    let raw_started = Arc::new(AtomicBool::new(false));
     let mut raw = Box::pin(scope.add_raw_once(
         "raw",
-        RawOnceDef::new(resource_raw_actor(&raw_count, RawResourceMode::Normal)),
+        RawOnceDef::new(CancelledResourceRawActor {
+            _guard: raw_count.guard(),
+            started: Arc::clone(&raw_started),
+        }),
     ));
     assert!(poll_once(raw.as_mut()).is_pending());
     drop(raw);
 
     let subtree_count = ConsumeCount::default();
+    let subtree_started = Arc::new(AtomicBool::new(false));
     let mut subtree = Box::pin(scope.add_subtree_once(
         "subtree",
-        SubtreeOnceDef::new(one_shot_subtree_with_guard(&subtree_count, "normal")),
+        SubtreeOnceDef::new(cancelled_one_shot_subtree(
+            &subtree_count,
+            Arc::clone(&subtree_started),
+        )),
     ));
     assert!(poll_once(subtree.as_mut()).is_pending());
     drop(subtree);
 
-    for (kind, count) in [
-        ("task", &task_count),
-        ("actor", &actor_count),
-        ("raw actor", &raw_count),
-        ("subtree", &subtree_count),
+    for (kind, count, started) in [
+        ("task", &task_count, &task_started),
+        ("actor", &actor_count, &actor_started),
+        ("raw actor", &raw_count, &raw_started),
+        ("subtree", &subtree_count, &subtree_started),
     ] {
         assert!(
             poll_until(POLL_TIMEOUT, Duration::from_millis(1), || count.get() == 1).await,
             "cancelled {kind} admission disposes its resource"
         );
         count.assert_once();
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "cancelled {kind} admission never starts construction"
+        );
     }
 
     system
@@ -449,6 +524,10 @@ async fn cancelling_inflight_one_shot_adds_drops_every_kind_resource_once() {
     actor_count.assert_once();
     raw_count.assert_once();
     subtree_count.assert_once();
+    assert!(!task_started.load(Ordering::SeqCst));
+    assert!(!actor_started.load(Ordering::SeqCst));
+    assert!(!raw_started.load(Ordering::SeqCst));
+    assert!(!subtree_started.load(Ordering::SeqCst));
 }
 
 #[tokio::test]

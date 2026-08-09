@@ -1,7 +1,7 @@
 //! Mutable runtime shell and shared handle state.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     ops::{Bound, Index, IndexMut},
     sync::{Arc, Mutex, Weak, mpsc},
     time::{Duration, Instant},
@@ -205,10 +205,23 @@ struct DynamicState {
     entries: HashMap<ChildId, DynamicEntry>,
 }
 
+/// Admission requests awaiting the scope's single forwarder task.
+///
+/// `forwarding` is only cleared by the forwarder after observing an empty
+/// queue under this lock, and submitters push and consult it under the same
+/// lock, so a queued request always has a live forwarder destined to drain
+/// it.
+#[derive(Default)]
+struct AdmissionQueue {
+    pending: VecDeque<AdmissionRequest>,
+    forwarding: bool,
+}
+
 pub(crate) struct DynamicControl {
     scope: Weak<ScopeCell>,
     events: runtime::MpscSender<DriverEvent>,
     state: Mutex<DynamicState>,
+    admissions: Mutex<AdmissionQueue>,
 }
 
 impl DynamicControl {
@@ -220,6 +233,7 @@ impl DynamicControl {
                 accepting: true,
                 entries: HashMap::new(),
             }),
+            admissions: Mutex::default(),
         })
     }
 
@@ -339,10 +353,45 @@ pub(crate) fn start_admission(
             let _ = sender.send(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
         }),
     };
-    runtime::spawn(async move {
-        let _ = runtime::mpsc_send(&control.events, DriverEvent::Admission(request)).await;
-    });
+    // The driver channel is bounded and a split admission may be dropped
+    // right after this first poll (drop detaches), so the send cannot live in
+    // the caller-held future. Spawning one detached sender task per admission
+    // would let a saturated driver channel accumulate one live task per
+    // pending admission; instead requests queue here and at most one
+    // forwarder task per scope drains them in FIFO order, keeping
+    // pending-admission memory proportional to the requests themselves.
+    let start_forwarder = {
+        let mut admissions = control
+            .admissions
+            .lock()
+            .expect("admission queue mutex poisoned");
+        admissions.pending.push_back(request);
+        !std::mem::replace(&mut admissions.forwarding, true)
+    };
+    if start_forwarder {
+        runtime::spawn(forward_admissions(control));
+    }
     Ok(response)
+}
+
+async fn forward_admissions(control: Arc<DynamicControl>) {
+    loop {
+        let request = {
+            let mut admissions = control
+                .admissions
+                .lock()
+                .expect("admission queue mutex poisoned");
+            let Some(request) = admissions.pending.pop_front() else {
+                admissions.forwarding = false;
+                return;
+            };
+            request
+        };
+        // A failed send returns and drops the request, whose response
+        // obligation then completes with `Terminal`. Keep draining so every
+        // queued admission is answered even after the driver stops.
+        let _ = runtime::mpsc_send(&control.events, DriverEvent::Admission(request)).await;
+    }
 }
 
 fn cancel_dynamic_reservation_parts(
@@ -4345,6 +4394,66 @@ mod tests {
         drop(held_gate);
         let response = worker.join().expect("removal transition completes");
         drop(response);
+    }
+
+    #[crate::runtime::test]
+    async fn saturated_admissions_share_one_forwarder_task_and_all_resolve() {
+        const ADMISSIONS: usize = 64;
+
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
+        let (events, event_receiver) = crate::runtime::bounded_mpsc(1);
+        let control = DynamicControl::new(&root, events);
+        let child_id = ChildId::from("worker");
+        let member = MemberCell::new(
+            child_id.clone(),
+            root.child_identity
+                .lock()
+                .expect("scope identity mutex poisoned")
+                .mint_membership(&child_id)
+                .expect("child membership available"),
+        );
+        let slot = SlotCell::new(Arc::clone(&member), None);
+
+        let baseline = crate::runtime::alive_task_count();
+        let mut responses = Vec::with_capacity(ADMISSIONS);
+        for _ in 0..ADMISSIONS {
+            responses.push(
+                super::start_admission(Arc::clone(&control), Arc::clone(&slot), None)
+                    .expect("runtime is available"),
+            );
+        }
+
+        // Let the forwarder run until it parks on the saturated driver
+        // channel; pending admissions must not each hold a live sender task.
+        for _ in 0..64 {
+            crate::runtime::yield_now().await;
+        }
+        assert!(
+            crate::runtime::alive_task_count() <= baseline + 1,
+            "saturated admissions share one forwarder task instead of spawning one each"
+        );
+
+        // Ending the driver channel answers every queued admission through
+        // its response obligation.
+        drop(event_receiver);
+        for response in responses {
+            assert!(matches!(
+                response.receive().await,
+                Some(Err(crate::ReserveError::NotAdmitting(
+                    crate::NotAdmittingCause::Terminal
+                )))
+            ));
+        }
+
+        let mut alive = crate::runtime::alive_task_count();
+        for _ in 0..1_024 {
+            if alive == baseline {
+                break;
+            }
+            crate::runtime::yield_now().await;
+            alive = crate::runtime::alive_task_count();
+        }
+        assert_eq!(alive, baseline, "the forwarder exits once its queue drains");
     }
 
     #[crate::runtime::test]

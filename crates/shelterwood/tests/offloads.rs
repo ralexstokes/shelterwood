@@ -6,10 +6,10 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, assert_quiet, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
-    Guard, LifecycleEventKind, LifecycleItem, Readiness, Shutdown, StartupError,
+    Guard, LifecycleEventKind, LifecycleItem, Mailbox, Readiness, Shutdown, StartupError,
     StartupFailureCause, Tree,
 };
 
@@ -1265,6 +1265,254 @@ impl Actor for FailTeardownActor {
             .expect("offload accepted");
         Err(ExitError::message("injected handler failure"))
     }
+}
+
+const FLOOD: usize = 256;
+
+enum FloodMessage {
+    Start,
+    Completed(usize),
+}
+
+struct FloodActor {
+    seen: Vec<bool>,
+    delivered: usize,
+    completed_work: Arc<AtomicUsize>,
+    release: ReleaseGate,
+}
+
+impl Actor for FloodActor {
+    type Msg = FloodMessage;
+    type Args = (Arc<AtomicUsize>, ReleaseGate);
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            seen: vec![false; FLOOD],
+            delivered: 0,
+            completed_work: args.0,
+            release: args.1,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            FloodMessage::Start => {
+                for index in 0..FLOOD {
+                    let completed_work = Arc::clone(&self.completed_work);
+                    context
+                        .offload(
+                            async move {
+                                completed_work.fetch_add(1, Ordering::SeqCst);
+                                index
+                            },
+                            move |result| {
+                                FloodMessage::Completed(
+                                    result.expect("flooded offload completes within its budget"),
+                                )
+                            },
+                            Duration::MAX,
+                        )
+                        .expect("live offload accepted");
+                }
+                // Hold the loop here so every completion queues before any
+                // is consumed: completion storage is 1:1 with the offloads
+                // this incarnation started, never dropped or conflated.
+                self.release.wait().await;
+                Ok(())
+            }
+            FloodMessage::Completed(index) => {
+                assert!(
+                    !self.seen[index],
+                    "each flooded completion is delivered exactly once"
+                );
+                self.seen[index] = true;
+                self.delivered += 1;
+                if self.delivered == FLOOD {
+                    context.stop();
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A completion flood: every offload finishes while the loop is held, so all
+/// completions queue in incarnation-internal storage before one is consumed,
+/// and every one of them is still delivered exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offload_completion_flood_is_absorbed_and_fully_delivered() {
+    let completed_work = Arc::new(AtomicUsize::new(0));
+    let release = ReleaseGate::default();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "flood",
+            ActorOnceDef::<FloodActor>::new((Arc::clone(&completed_work), release.clone())),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor.send(FloodMessage::Start).await.expect("actor live");
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            completed_work.load(Ordering::SeqCst) == FLOOD
+        })
+        .await
+    );
+    release.release();
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+const CYCLES: usize = 64;
+
+enum CycleMessage {
+    Start,
+    Completed(usize),
+}
+
+struct CycleActor {
+    next: usize,
+}
+
+impl CycleActor {
+    fn offload_next(&self, context: &mut Context<'_, Self>) {
+        let value = self.next;
+        context
+            .offload(
+                async move { value },
+                move |result| CycleMessage::Completed(result.expect("cycle offload completes")),
+                Duration::MAX,
+            )
+            .expect("live offload accepted");
+    }
+}
+
+impl Actor for CycleActor {
+    type Msg = CycleMessage;
+    type Args = ();
+
+    async fn init((): Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self { next: 0 })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            CycleMessage::Start => self.offload_next(context),
+            CycleMessage::Completed(value) => {
+                assert_eq!(value, self.next, "steady-state cycles deliver in order");
+                self.next += 1;
+                if self.next == CYCLES {
+                    context.stop();
+                } else {
+                    self.offload_next(context);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Steady-state offload churn: the loop goes idle between completions, so
+/// finished-offload bookkeeping is reclaimed continuously rather than only
+/// when the next offload starts or the incarnation tears down, and every
+/// cycle's completion is delivered.
+#[tokio::test]
+async fn sequential_offload_cycles_deliver_every_completion() {
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once("cycles", ActorOnceDef::<CycleActor>::new(()))
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor.send(CycleMessage::Start).await.expect("actor live");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+const SATURATE: usize = 64;
+
+enum SaturateMessage {
+    Ping,
+    Completed,
+}
+
+struct SaturatedActor {
+    issued: usize,
+    delivered: usize,
+    peak_backlog: Arc<AtomicUsize>,
+}
+
+impl Actor for SaturatedActor {
+    type Msg = SaturateMessage;
+    type Args = (ReleaseGate, Arc<AtomicUsize>);
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        args.0.wait().await;
+        Ok(Self {
+            issued: 0,
+            delivered: 0,
+            peak_backlog: args.1,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            SaturateMessage::Ping => {
+                self.peak_backlog
+                    .fetch_max(self.issued - self.delivered, Ordering::SeqCst);
+                self.issued += 1;
+                context
+                    .offload(
+                        async {},
+                        |result| {
+                            assert_eq!(result, Err(DeadlineElapsed));
+                            SaturateMessage::Completed
+                        },
+                        Duration::ZERO,
+                    )
+                    .expect("live offload accepted");
+            }
+            SaturateMessage::Completed => {
+                self.delivered += 1;
+                if self.delivered == SATURATE {
+                    context.stop();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A continuously nonempty mailbox cannot starve queued offload completions:
+/// the completions queued at each mailbox delivery are consumed ahead of
+/// later mailbox input, so the completion backlog stays proportional to the
+/// actor's own in-flight issuance instead of growing with mailbox history.
+#[tokio::test]
+async fn saturated_mailbox_does_not_grow_the_completion_backlog() {
+    let gate = ReleaseGate::default();
+    let peak_backlog = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "saturated",
+            ActorOnceDef::<SaturatedActor>::new((gate.clone(), Arc::clone(&peak_backlog)))
+                .mailbox(Mailbox::queue(SATURATE).expect("non-zero capacity")),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    for _ in 0..SATURATE {
+        actor
+            .send(SaturateMessage::Ping)
+            .await
+            .expect("mailbox accepts during init");
+    }
+    gate.release();
+    system.wait_started().await.expect("actor starts");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert!(
+        peak_backlog.load(Ordering::SeqCst) <= 2,
+        "queued completions drain ahead of later mailbox input instead of \
+         accumulating while the mailbox stays nonempty"
+    );
 }
 
 /// §5.5's teardown order holds on the error path too: a handler `Err` joins

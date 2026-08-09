@@ -465,6 +465,122 @@ async fn non_runtime_reservation_cancellation_contains_destructor_panic() {
         .expect("dynamic root shuts down");
 }
 
+struct HostileFallbackCapture {
+    dropped: tokio::sync::mpsc::UnboundedSender<ThreadId>,
+    blocker: Option<DestructorBlocker>,
+    panic: Option<&'static str>,
+}
+
+impl Drop for HostileFallbackCapture {
+    fn drop(&mut self) {
+        let _ = self.dropped.send(thread::current().id());
+        drop(self.blocker.take());
+        if let Some(message) = self.panic {
+            panic!("{message}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_runtime_disposals_share_one_thread_and_contain_panics() {
+    const VALUES: usize = 8;
+
+    let test_thread = thread::current().id();
+    let tree = DynamicTree::new();
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+    let gate = DestructorGate::default();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+
+    let mut tasks = Vec::with_capacity(VALUES);
+    let mut admissions = Vec::with_capacity(VALUES);
+    for index in 0..VALUES {
+        let slot = scope
+            .reserve_task(format!("hostile-{index}"))
+            .expect("task reservation");
+        tasks.push(slot.task_ref());
+        admissions.push(slot.define(TaskDef::new({
+            let capture = HostileFallbackCapture {
+                dropped: dropped.clone(),
+                // The first destructor blocks so every later job queues
+                // behind it on the shared fallback disposal thread.
+                blocker: (index == 0).then(|| gate.blocker()),
+                panic: (index == VALUES - 1).then_some("hostile fallback destructor"),
+            };
+            move |_| {
+                let _ = &capture;
+                async { Ok(()) }
+            }
+        })));
+    }
+    drop(dropped);
+
+    let dropper = thread::spawn(move || {
+        let dropper_thread = thread::current().id();
+        drop(admissions);
+        dropper_thread
+    });
+    let dropper_thread = dropper
+        .join()
+        .expect("dropping definitions outside a Tokio runtime never blocks or panics the caller");
+
+    wait_for_destructor(&gate).await;
+    gate.release();
+
+    let mut disposal_threads = Vec::with_capacity(VALUES);
+    while disposal_threads.len() < VALUES {
+        disposal_threads.push(drops.recv().await.expect("every capture is disposed"));
+    }
+    assert!(drops.recv().await.is_none());
+    let disposal_thread = disposal_threads[0];
+    assert!(
+        disposal_threads
+            .iter()
+            .all(|thread| *thread == disposal_thread),
+        "queued fallback disposals share one disposal thread instead of one thread per value"
+    );
+    assert_ne!(disposal_thread, dropper_thread);
+    assert_ne!(disposal_thread, test_thread);
+    for task in tasks {
+        assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
+    }
+
+    // A contained destructor panic must not wedge the shared queue: a later
+    // non-runtime disposal still completes off the submitting thread.
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let slot = scope
+        .reserve_task("after-panic")
+        .expect("task reservation after a contained panic");
+    let admission = slot.define(TaskDef::new({
+        let capture = HostileFallbackCapture {
+            dropped,
+            blocker: None,
+            panic: None,
+        };
+        move |_| {
+            let _ = &capture;
+            async { Ok(()) }
+        }
+    }));
+    let late_dropper = thread::spawn(move || {
+        let dropper_thread = thread::current().id();
+        drop(admission);
+        dropper_thread
+    });
+    let late_dropper_thread = late_dropper.join().expect("late cancellation never panics");
+    let late_disposal_thread = drops
+        .recv()
+        .await
+        .expect("disposal keeps running after a contained destructor panic");
+    assert_ne!(late_disposal_thread, late_dropper_thread);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root shuts down");
+}
+
 #[tokio::test]
 async fn unadmitted_removal_completes_after_blocking_definition_disposal() {
     let tree = DynamicTree::new();

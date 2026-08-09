@@ -130,24 +130,9 @@ enum Fault {
 struct DurableTopology {
     operations: Arc<Mutex<HashMap<u64, OperationRecord>>>,
     current: Arc<Mutex<Option<Mount>>>,
-    faults: Arc<Mutex<HashMap<u64, Fault>>>,
 }
 
 impl DurableTopology {
-    fn inject(&self, operation: u64, fault: Fault) {
-        self.faults
-            .lock()
-            .expect("fault map mutex poisoned")
-            .insert(operation, fault);
-    }
-
-    fn take_fault(&self, operation: u64) -> Option<Fault> {
-        self.faults
-            .lock()
-            .expect("fault map mutex poisoned")
-            .remove(&operation)
-    }
-
     fn operation(&self, operation: u64) -> Option<OperationRecord> {
         self.operations
             .lock()
@@ -166,6 +151,10 @@ struct RouterArgs {
     ranges: DynamicScopeRef,
     directory: ActorRef<DirectoryMessage>,
     durable: DurableTopology,
+    /// Fault injection as plain per-incarnation config: once-semantics come
+    /// from the durable journal (a retry finds the record its first attempt
+    /// wrote before crashing), not from mutating shared state.
+    faults: HashMap<u64, Fault>,
 }
 
 struct RouterActor(RouterArgs);
@@ -265,7 +254,16 @@ impl RouterActor {
     }
 
     async fn replace(&self, operation: u64) -> Result<Route, ExitError> {
-        if let Some(record) = self.0.durable.operation(operation) {
+        let record = self.0.durable.operation(operation);
+        // A configured fault fires only on the operation's first attempt,
+        // recognized by the absence of a durable record: every crash window
+        // under test opens after the attempt journaled itself, so a retry
+        // can never re-arm the fault.
+        let fault = record
+            .is_none()
+            .then(|| self.0.faults.get(&operation).copied())
+            .flatten();
+        if let Some(record) = record {
             match record {
                 OperationRecord::Committed {
                     candidate,
@@ -318,7 +316,6 @@ impl RouterActor {
                 },
             );
 
-        let fault = self.0.durable.take_fault(operation);
         if matches!(fault, Some(Fault::BeforeCommit)) {
             return Err(ExitError::message("injected pre-commit router crash"));
         }
@@ -462,6 +459,10 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
                 ranges: ranges.clone(),
                 directory: directory.clone(),
                 durable: durable.clone(),
+                faults: HashMap::from([
+                    (1, Fault::BeforeCommit),
+                    (2, Fault::AfterCommitBeforeReply),
+                ]),
             }),
         )
         .expect("valid topology writer");
@@ -469,7 +470,6 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
     system.wait_started().await.expect("store starts");
     let root_scope = system.scope();
 
-    durable.inject(1, Fault::BeforeCommit);
     let first_error = router
         .call(
             |reply| RouterMessage::Replace {
@@ -505,7 +505,6 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
         shelterwood::StopReason::ShutdownRequested
     );
 
-    durable.inject(2, Fault::AfterCommitBeforeReply);
     let second_error = router
         .call(
             |reply| RouterMessage::Replace {

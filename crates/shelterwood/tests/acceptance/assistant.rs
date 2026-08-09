@@ -1,9 +1,6 @@
 use std::{
     collections::HashSet,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -220,9 +217,6 @@ fn gateway() -> GatewayFixture {
 
 #[derive(Clone)]
 struct SessionControlArgs {
-    /// Crash injection, kept as an atomic: it must survive the restart it
-    /// causes and the actor read-and-clears it itself.
-    crash_once: Arc<AtomicBool>,
     rehydrated: UnboundedSender<()>,
     stop_entered: UnboundedSender<()>,
     stop_gate: ReleaseGate,
@@ -252,9 +246,10 @@ impl Actor for SessionControlActor {
                 let _ = self.0.rehydrated.send(());
             }
             SessionControlMessage::Crash => {
-                if self.0.crash_once.swap(false, Ordering::SeqCst) {
-                    panic!("injected session-control panic");
-                }
+                // The crashing incarnation consumes this message and a
+                // restart cannot replay it, so the injection needs no
+                // once-flag.
+                panic!("injected session-control panic");
             }
         }
         Ok(())
@@ -286,36 +281,28 @@ impl Actor for StreamActor {
     }
 }
 
-#[derive(Clone)]
-struct ToolArgs {
-    /// Crash injection, kept as an atomic: it must survive the restart it
-    /// causes and the actor read-and-clears it itself.
-    crash_once: Arc<AtomicBool>,
-    completions: UnboundedSender<()>,
-}
-
 enum ToolMessage {
     Crash,
     Work,
     Completed(Result<u64, DeadlineElapsed>),
 }
 
-struct ToolActor(ToolArgs);
+struct ToolActor(UnboundedSender<()>);
 
 impl Actor for ToolActor {
     type Msg = ToolMessage;
-    type Args = ToolArgs;
+    type Args = UnboundedSender<()>;
 
-    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
-        Ok(Self(args))
+    async fn init(completions: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self(completions))
     }
 
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         match message {
             ToolMessage::Crash => {
-                if self.0.crash_once.swap(false, Ordering::SeqCst) {
-                    panic!("injected tool panic");
-                }
+                // As with the session control actor: the message is consumed
+                // by the incarnation it crashes.
+                panic!("injected tool panic");
             }
             ToolMessage::Work => {
                 context
@@ -327,7 +314,7 @@ impl Actor for ToolActor {
                     .expect("live tool accepts incarnation-owned offload");
             }
             ToolMessage::Completed(Ok(7)) => {
-                let _ = self.0.completions.send(());
+                let _ = self.0.send(());
             }
             ToolMessage::Completed(Ok(value)) => {
                 return Err(ExitError::message(format!(
@@ -376,7 +363,6 @@ fn session_fixture() -> SessionFixture {
         .add_actor(
             "control",
             ActorDef::<SessionControlActor>::cloned(SessionControlArgs {
-                crash_once: Arc::new(AtomicBool::new(true)),
                 rehydrated,
                 stop_entered,
                 stop_gate: stop_gate.clone(),
@@ -543,14 +529,10 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     );
 
     let (completions, mut completed) = unbounded_channel();
-    let tool_args = ToolArgs {
-        crash_once: Arc::new(AtomicBool::new(true)),
-        completions,
-    };
     let tool = tools
         .add_actor(
             "temporary-tool",
-            ActorDef::<ToolActor>::cloned(tool_args.clone()).restart(RestartPolicy::default()),
+            ActorDef::<ToolActor>::cloned(completions).restart(RestartPolicy::default()),
         )
         .await
         .expect("temporary tool admitted")

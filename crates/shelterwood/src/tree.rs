@@ -697,8 +697,11 @@ impl<H> AdmissionReceipt<H> {
 /// Fused additions abort on drop; split definitions detach after their first
 /// poll starts admission. Reservation and that first poll require an ambient
 /// Tokio runtime. A first poll outside one returns [`ReserveError::NoRuntime`]
-/// and releases the reservation. Like a fused future, it remains pending if
-/// polled again after completion.
+/// and releases the reservation. If the driver's internal completion route is
+/// lost, release builds fail closed with [`ReserveError::NotAdmitting`] and a
+/// [`crate::NotAdmittingCause::Terminal`] cause. Debug builds additionally
+/// assert that the completion obligation regressed.
+/// Like a fused future, it remains pending if polled again after completion.
 #[must_use]
 pub struct Admission<H> {
     state: AdmissionState<H>,
@@ -989,6 +992,10 @@ impl<T: Subtree> DynamicSubtreeSlot<T> {
 }
 
 /// Observation future for a synchronously latched dynamic removal.
+///
+/// If the driver's internal completion route is lost after the request is
+/// latched, release builds fail closed with [`RemoveOutcome::Removed`]; debug
+/// builds additionally assert that the completion obligation regressed.
 #[must_use]
 pub struct Removal {
     inner: Pin<Box<dyn Future<Output = RemoveOutcome> + Send + 'static>>,
@@ -1004,10 +1011,15 @@ impl Removal {
     fn new(response: crate::driver::RemovalResponse) -> Self {
         Self {
             inner: Box::pin(async move {
-                response
-                    .receive()
-                    .await
-                    .expect("removal response obligation must complete")
+                response.receive().await.unwrap_or_else(|| {
+                    // The driver's removal `Obligation` publishes `Removed`
+                    // on every destruction path. A missing response therefore
+                    // means the terminal route vanished after removal latched:
+                    // preserve the removal goal, but flag the invariant break
+                    // in debug builds just as admission does above.
+                    debug_assert!(false, "removal response obligation must complete");
+                    RemoveOutcome::Removed
+                })
             }),
         }
     }
@@ -1192,7 +1204,14 @@ impl Subtree for DynamicTree {}
 
 #[cfg(test)]
 mod tests {
-    use super::{DynamicTree, Tree, sealed::Sealed};
+    use std::{
+        future::Future,
+        panic::{AssertUnwindSafe, catch_unwind},
+        pin::Pin,
+        task::{Context, Waker},
+    };
+
+    use super::{DynamicTree, Removal, Tree, sealed::Sealed};
     use crate::identity::ScopeIdentity;
 
     #[test]
@@ -1208,6 +1227,28 @@ mod tests {
         let core = <DynamicTree as Sealed>::into_core(tree);
         assert_eq!(ScopeIdentity::current_thread_creations(), after_tree);
         drop(core);
+    }
+
+    #[test]
+    fn closed_removal_response_fails_closed_after_debug_diagnostic() {
+        let (sender, response) = crate::runtime::oneshot();
+        drop(sender);
+        let mut removal = Removal::new(response);
+        let mut context = Context::from_waker(Waker::noop());
+        let observed = catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(&mut removal).poll(&mut context)
+        }));
+
+        #[cfg(debug_assertions)]
+        assert!(
+            observed.is_err(),
+            "debug builds expose the broken removal response obligation"
+        );
+        #[cfg(not(debug_assertions))]
+        assert_eq!(
+            observed.expect("release fallback does not panic"),
+            std::task::Poll::Ready(crate::RemoveOutcome::Removed)
+        );
     }
 }
 

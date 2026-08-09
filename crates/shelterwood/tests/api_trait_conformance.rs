@@ -1,4 +1,4 @@
-use std::{cell::Cell, error::Error, hash::Hash, time::Duration};
+use std::{cell::Cell, error::Error, hash::Hash, ops::Deref, time::Duration};
 
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ActorSlot, Admission, Blocking, BuildError, CallError,
@@ -19,6 +19,11 @@ fn assert_send_type<T: Send>() {}
 fn assert_send_sync<T: Send + Sync>() {}
 fn assert_copy_eq_hash_send_sync<T: Copy + Eq + Hash + Send + Sync>() {}
 fn assert_clone_eq_hash_send_sync<T: Clone + Eq + Hash + Send + Sync>() {}
+fn assert_deref<T, U: ?Sized>()
+where
+    T: Deref<Target = U>,
+{
+}
 fn assert_static<T: 'static>() {}
 
 #[test]
@@ -38,6 +43,12 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     assert_clone_eq_hash_send_sync::<TaskRef>();
     assert_clone_eq_hash_send_sync::<ScopeRef>();
     assert_clone_eq_hash_send_sync::<DynamicScopeRef>();
+    // Dynamic scope handles inherit every observation/control method through
+    // this relationship, so adding a ScopeRef method cannot omit it here.
+    assert_deref::<DynamicScopeRef, ScopeRef>();
+    // Existing inherent methods remain addressable through UFCS as well as
+    // ordinary method syntax.
+    let _ = DynamicScopeRef::id;
     assert_send_sync::<SnapshotReceiver>();
     assert_send_sync::<LifecycleEvents>();
     assert_send_sync::<CancellationToken>();

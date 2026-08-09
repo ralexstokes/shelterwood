@@ -537,6 +537,18 @@ struct OffloadFutureState {
     cancelled: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OffloadPoll {
+    Pending,
+    Finished,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OffloadScope {
+    Unscoped,
+    Scoped,
+}
+
 struct SharedOffloadState {
     // Polling takes the future out of this mutex. Cancellation either takes
     // an idle future or marks an in-progress poll so that the poller disposes
@@ -576,10 +588,10 @@ impl SharedOffloadState {
         state.future.take()
     }
 
-    fn finish_poll(&self, future: OffloadFuture, pending: bool) -> Option<OffloadFuture> {
+    fn finish_poll(&self, future: OffloadFuture, outcome: OffloadPoll) -> Option<OffloadFuture> {
         let mut state = self.state.lock().expect("offload future mutex poisoned");
         state.polling = false;
-        if pending && !state.cancelled {
+        if outcome == OffloadPoll::Pending && !state.cancelled {
             debug_assert!(state.future.is_none());
             state.future = Some(future);
             None
@@ -632,7 +644,7 @@ impl Future for SharedOffloadFuture {
         let polled = catch_panic(|| future.as_mut().poll(context));
         match polled {
             Ok(Poll::Pending) => {
-                let dispose = self.0.finish_poll(future, true);
+                let dispose = self.0.finish_poll(future, OffloadPoll::Pending);
                 if dispose.is_some() {
                     self.0.dispose(dispose);
                     self.0.finished.fire();
@@ -642,13 +654,13 @@ impl Future for SharedOffloadFuture {
                 }
             }
             Ok(Poll::Ready(())) => {
-                let dispose = self.0.finish_poll(future, false);
+                let dispose = self.0.finish_poll(future, OffloadPoll::Finished);
                 self.0.dispose(dispose);
                 self.0.finished.fire();
                 Poll::Ready(())
             }
             Err(payload) => {
-                let dispose = self.0.finish_poll(future, false);
+                let dispose = self.0.finish_poll(future, OffloadPoll::Finished);
                 self.0.record(payload);
                 self.0.dispose(dispose);
                 self.0.finished.fire();
@@ -1029,7 +1041,7 @@ impl<M: Send + 'static> RawContext<M> {
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> M + Send + 'static,
     {
-        self.start_offload(work, continuation, deadline, false)
+        self.start_offload(work, continuation, deadline, OffloadScope::Unscoped)
             .map(|_| ())
     }
 
@@ -1049,7 +1061,7 @@ impl<M: Send + 'static> RawContext<M> {
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> M + Send + 'static,
     {
-        self.start_offload(work, continuation, deadline, true)
+        self.start_offload(work, continuation, deadline, OffloadScope::Scoped)
             .map(|guard| guard.expect("scoped offload must produce a guard"))
     }
 
@@ -1127,7 +1139,7 @@ impl<M: Send + 'static> RawContext<M> {
         work: F,
         continuation: C,
         deadline: Duration,
-        scoped: bool,
+        scope: OffloadScope,
     ) -> Result<Option<Guard>, Rejected<(F, C)>>
     where
         F: Future<Output = T> + Send + 'static,
@@ -1142,7 +1154,7 @@ impl<M: Send + 'static> RawContext<M> {
 
         let cancellation = Latch::default();
         let finished = Latch::default();
-        let guard = scoped.then(|| Guard {
+        let guard = (scope == OffloadScope::Scoped).then(|| Guard {
             cancellation: cancellation.clone(),
             finished: finished.clone(),
             armed: true,

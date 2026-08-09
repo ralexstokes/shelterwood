@@ -274,6 +274,17 @@ macro_rules! impl_slot_debug {
     };
 }
 
+/// Routes a definition rejected before admission through isolated disposal.
+///
+/// A failed reservation returns before framework state owns the supplied
+/// definition, so dropping it inline would run a possibly blocking or
+/// panicking user destructor on the caller instead of producing an ordinary
+/// [`ReserveError`].
+fn dispose_rejected<D: Send + 'static>(definition: D, error: ReserveError) -> ReserveError {
+    runtime::dispose_detached(definition);
+    error
+}
+
 fn attach_actor_slot<M: Send + 'static>(slot: Arc<SlotCell>) -> ActorSlot<M> {
     let mailbox = MailboxCell::new(slot.member.id().clone());
     slot.member.attach_mailbox(mailbox.clone());
@@ -322,7 +333,10 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: ActorDef<A>,
         ) -> Result<ActorRef<A::Msg>, ReserveError> {
-            self.reserve_actor(id).map(|slot| slot.define(definition))
+            match self.reserve_actor(id) {
+                Ok(slot) => Ok(slot.define(definition)),
+                Err(error) => Err(dispose_rejected(definition, error)),
+            }
         }
 
         #[doc = $add_actor_once_doc]
@@ -331,8 +345,10 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: ActorOnceDef<A>,
         ) -> Result<ActorRef<A::Msg>, ReserveError> {
-            self.reserve_actor(id)
-                .map(|slot| slot.define_once(definition))
+            match self.reserve_actor(id) {
+                Ok(slot) => Ok(slot.define_once(definition)),
+                Err(error) => Err(dispose_rejected(definition, error)),
+            }
         }
 
         #[doc = $add_raw_doc]
@@ -341,8 +357,10 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: RawDef<R>,
         ) -> Result<ActorRef<R::Msg>, ReserveError> {
-            self.reserve_actor(id)
-                .map(|slot| slot.define_raw(definition))
+            match self.reserve_actor(id) {
+                Ok(slot) => Ok(slot.define_raw(definition)),
+                Err(error) => Err(dispose_rejected(definition, error)),
+            }
         }
 
         #[doc = $add_raw_once_doc]
@@ -351,8 +369,10 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: RawOnceDef<R>,
         ) -> Result<ActorRef<R::Msg>, ReserveError> {
-            self.reserve_actor(id)
-                .map(|slot| slot.define_once_raw(definition))
+            match self.reserve_actor(id) {
+                Ok(slot) => Ok(slot.define_once_raw(definition)),
+                Err(error) => Err(dispose_rejected(definition, error)),
+            }
         }
 
         #[doc = $reserve_task_doc]
@@ -368,7 +388,10 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: TaskDef,
         ) -> Result<TaskRef, ReserveError> {
-            self.reserve_task(id).map(|slot| slot.define(definition))
+            match self.reserve_task(id) {
+                Ok(slot) => Ok(slot.define(definition)),
+                Err(error) => Err(dispose_rejected(definition, error)),
+            }
         }
 
         #[doc = $add_task_once_doc]
@@ -377,8 +400,10 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: TaskOnceDef<T>,
         ) -> Result<(TaskRef, OneShotTaskRef<T>), ReserveError> {
-            self.reserve_task(id)
-                .map(|slot| slot.define_once(definition))
+            match self.reserve_task(id) {
+                Ok(slot) => Ok(slot.define_once(definition)),
+                Err(error) => Err(dispose_rejected(definition, error)),
+            }
         }
 
         #[doc = $reserve_subtree_doc]
@@ -399,8 +424,10 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: SubtreeDef<T>,
         ) -> Result<T::Ref, ReserveError> {
-            self.reserve_subtree::<T>(id)
-                .map(|slot| slot.define(definition))
+            match self.reserve_subtree::<T>(id) {
+                Ok(slot) => Ok(slot.define(definition)),
+                Err(error) => Err(dispose_rejected(definition, error)),
+            }
         }
 
         #[doc = $add_subtree_once_doc]
@@ -409,8 +436,10 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: SubtreeOnceDef<T>,
         ) -> Result<T::Ref, ReserveError> {
-            self.reserve_subtree::<T>(id)
-                .map(|slot| slot.define_once(definition))
+            match self.reserve_subtree::<T>(id) {
+                Ok(slot) => Ok(slot.define_once(definition)),
+                Err(error) => Err(dispose_rejected(definition, error)),
+            }
         }
     };
 }
@@ -1456,7 +1485,7 @@ impl DynamicScopeRef {
             Ok(slot) => slot
                 .core
                 .define_raw(definition.into_raw(), AdmissionOwnership::Fused),
-            Err(error) => Admission::error(error),
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
 
@@ -1470,7 +1499,7 @@ impl DynamicScopeRef {
             Ok(slot) => slot
                 .core
                 .define_once_raw(definition.into_raw(), AdmissionOwnership::Fused),
-            Err(error) => Admission::error(error),
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
 
@@ -1482,7 +1511,7 @@ impl DynamicScopeRef {
     ) -> Admission<ActorRef<R::Msg>> {
         match self.reserve_actor(id) {
             Ok(slot) => slot.core.define_raw(definition, AdmissionOwnership::Fused),
-            Err(error) => Admission::error(error),
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
 
@@ -1496,7 +1525,7 @@ impl DynamicScopeRef {
             Ok(slot) => slot
                 .core
                 .define_once_raw(definition, AdmissionOwnership::Fused),
-            Err(error) => Admission::error(error),
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
 
@@ -1515,7 +1544,7 @@ impl DynamicScopeRef {
     pub fn add_task(&self, id: impl Into<ChildId>, definition: TaskDef) -> Admission<TaskRef> {
         match self.reserve_task(id) {
             Ok(slot) => slot.core.define(definition, AdmissionOwnership::Fused),
-            Err(error) => Admission::error(error),
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
 
@@ -1527,7 +1556,7 @@ impl DynamicScopeRef {
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
         match self.reserve_task(id) {
             Ok(slot) => slot.core.define_once(definition, AdmissionOwnership::Fused),
-            Err(error) => Admission::error(error),
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
 
@@ -1552,7 +1581,7 @@ impl DynamicScopeRef {
     ) -> Admission<T::Ref> {
         match self.reserve_subtree::<T>(id) {
             Ok(slot) => slot.core.define(definition, AdmissionOwnership::Fused),
-            Err(error) => Admission::error(error),
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
 
@@ -1564,7 +1593,7 @@ impl DynamicScopeRef {
     ) -> Admission<T::Ref> {
         match self.reserve_subtree::<T>(id) {
             Ok(slot) => slot.core.define_once(definition, AdmissionOwnership::Fused),
-            Err(error) => Admission::error(error),
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
 

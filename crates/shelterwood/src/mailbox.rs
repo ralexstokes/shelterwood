@@ -17,7 +17,7 @@ use crate::{
     cells::{MailboxControl, MailboxDisposal, MailboxTermination, MemberCell},
     runtime::{
         OneShotClose, OneShotReceiver, OneShotSender, PanicAccumulator, PanicPayload, Signal,
-        SignalWatcher, resume_panic,
+        SignalWatcher, dispose_detached, resume_panic,
     },
 };
 
@@ -271,11 +271,42 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
     }
 }
 
+/// Reply receive state that keeps user value destruction off framework and
+/// caller drop glue.
+///
+/// A reply value stored before the receive side is cancelled is user-owned:
+/// destroying it inline could block or panic whoever dropped the receiver.
+/// The disposal function is captured at construction, where the value type's
+/// `Send + 'static` bounds hold, so unbounded holders can still route an
+/// unclaimed stored value through isolated disposal on drop.
+struct ReplyState<T> {
+    inner: OneShotReceiver<T>,
+    dispose: fn(T),
+}
+
+impl<T: Send + 'static> ReplyState<T> {
+    fn new(inner: OneShotReceiver<T>) -> Self {
+        Self {
+            inner,
+            dispose: dispose_detached::<T>,
+        }
+    }
+}
+
+impl<T> Drop for ReplyState<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.inner.close_and_take() {
+            (self.dispose)(value);
+        }
+    }
+}
+
 /// A consuming, infallible reply capability.
 ///
 /// Dropping an unanswered capability is completion: its receiver observes
 /// [`ReplyError::Dropped`]. Dropping or timing out the receiver instead closes
-/// the channel, so a late [`Reply::send`] safely discards its value.
+/// the channel, so a late [`Reply::send`] safely discards its value through
+/// isolated disposal.
 pub struct Reply<T> {
     sender: Option<OneShotSender<T>>,
     answered: bool,
@@ -301,7 +332,7 @@ impl<T: Send + 'static> Reply<T> {
                 answered: false,
             },
             ReplyReceiver {
-                receiver: Some(receiver),
+                receiver: Some(ReplyState::new(receiver)),
             },
         )
     }
@@ -313,13 +344,18 @@ impl<T: Send + 'static> Reply<T> {
             .sender
             .take()
             .expect("an unanswered reply retains its sender");
-        let _ = sender.send(value);
+        // A cancelled receiver rejects the value. Destroying it inline would
+        // run a possibly blocking or panicking user destructor on the replying
+        // actor; route the discard through isolated disposal instead.
+        if let Err(unclaimed) = sender.send(value) {
+            dispose_detached(unclaimed);
+        }
     }
 }
 
 /// The owned, non-cloneable receive half of [`Reply::channel`].
 pub struct ReplyReceiver<T> {
-    receiver: Option<OneShotReceiver<T>>,
+    receiver: Option<ReplyState<T>>,
 }
 
 impl<T> fmt::Debug for ReplyReceiver<T> {
@@ -345,7 +381,7 @@ impl<T: Send + 'static> ReplyReceiver<T> {
 }
 
 struct ReplyOperation<T> {
-    receiver: OneShotReceiver<T>,
+    receiver: ReplyState<T>,
 }
 
 impl<T> DeadlineOperation for ReplyOperation<T> {
@@ -357,10 +393,10 @@ impl<T> DeadlineOperation for ReplyOperation<T> {
         _budget: crate::deadline::Deadline,
         elapsed: bool,
     ) -> Poll<Self::Output> {
-        match self.receiver.poll_receive(context) {
+        match self.receiver.inner.poll_receive(context) {
             Poll::Ready(Some(value)) => Poll::Ready(Ok(value)),
             Poll::Ready(None) => Poll::Ready(Err(ReplyError::Dropped)),
-            Poll::Pending if elapsed => match self.receiver.close_and_poll_receive(context) {
+            Poll::Pending if elapsed => match self.receiver.inner.close_and_poll_receive(context) {
                 OneShotClose::Value(value) => Poll::Ready(Ok(value)),
                 OneShotClose::SenderClosed => Poll::Ready(Err(ReplyError::Dropped)),
                 OneShotClose::Empty => Poll::Ready(Err(ReplyError::Timeout)),
@@ -371,7 +407,7 @@ impl<T> DeadlineOperation for ReplyOperation<T> {
     }
 
     fn short_circuit(&mut self) -> Self::Output {
-        self.receiver.close();
+        self.receiver.inner.close();
         Err(ReplyError::Timeout)
     }
 }
@@ -1326,6 +1362,9 @@ impl<M> Hash for ActorRef<M> {
 pub struct SendFuture<M> {
     actor: ActorRef<M>,
     operation: Arc<SendOperation<M>>,
+    // Captured where `M: Send + 'static` holds so the unbounded `Drop` impl
+    // can route a withdrawn message through isolated disposal.
+    dispose: fn(M),
     submitted: bool,
     done: bool,
 }
@@ -1335,6 +1374,7 @@ impl<M: Send + 'static> SendFuture<M> {
         Self {
             actor,
             operation: SendOperation::new(message),
+            dispose: dispose_detached::<M>,
             submitted: false,
             done: false,
         }
@@ -1405,7 +1445,16 @@ impl<M: Send + 'static> Future for SendFuture<M> {
 impl<M> Drop for SendFuture<M> {
     fn drop(&mut self) {
         if !self.done {
-            let _ = self.actor.mailbox.withdraw(&self.operation);
+            // Cancellation recovers the unaccepted message with no caller
+            // left to hand it to. Destroying it inline would run a possibly
+            // blocking or panicking user destructor in this drop glue, so
+            // route the payload through isolated disposal.
+            match self.actor.mailbox.withdraw(&self.operation) {
+                Withdrawal::Withdrawn { message, .. } | Withdrawal::Terminated { message, .. } => {
+                    (self.dispose)(message);
+                }
+                Withdrawal::Accepted(_) => {}
+            }
         }
     }
 }
@@ -1494,7 +1543,7 @@ struct CallOperation<M, T> {
     actor: ActorRef<M>,
     make_msg: Option<Box<dyn FnOnce(Reply<T>) -> M + Send + 'static>>,
     send: Option<SendFuture<M>>,
-    reply: Option<OneShotReceiver<T>>,
+    reply: Option<ReplyState<T>>,
     accepted: Option<Incarnation>,
 }
 
@@ -1520,34 +1569,36 @@ impl<M, T> CallOperation<M, T> {
             .reply
             .as_mut()
             .expect("accepted call retains reply state");
-        match reply.poll_receive(context) {
+        match reply.inner.poll_receive(context) {
             Poll::Ready(Some(value)) => Poll::Ready(Ok(Replied { value, incarnation })),
             Poll::Ready(None) => Poll::Ready(Err(CallError {
                 actor_id: self.actor.id().clone(),
                 incarnation_observed: Some(incarnation),
                 kind: CallErrorKind::ReplyDropped,
             })),
-            Poll::Pending if deadline_elapsed => match reply.close_and_poll_receive(context) {
-                OneShotClose::Value(value) => Poll::Ready(Ok(Replied { value, incarnation })),
-                OneShotClose::SenderClosed => Poll::Ready(Err(CallError {
-                    actor_id: self.actor.id().clone(),
-                    incarnation_observed: Some(incarnation),
-                    kind: CallErrorKind::ReplyDropped,
-                })),
-                OneShotClose::Empty => Poll::Ready(Err(CallError {
-                    actor_id: self.actor.id().clone(),
-                    incarnation_observed: Some(incarnation),
-                    kind: CallErrorKind::ResponseTimedOut,
-                })),
-                OneShotClose::Pending => Poll::Pending,
-            },
+            Poll::Pending if deadline_elapsed => {
+                match reply.inner.close_and_poll_receive(context) {
+                    OneShotClose::Value(value) => Poll::Ready(Ok(Replied { value, incarnation })),
+                    OneShotClose::SenderClosed => Poll::Ready(Err(CallError {
+                        actor_id: self.actor.id().clone(),
+                        incarnation_observed: Some(incarnation),
+                        kind: CallErrorKind::ReplyDropped,
+                    })),
+                    OneShotClose::Empty => Poll::Ready(Err(CallError {
+                        actor_id: self.actor.id().clone(),
+                        incarnation_observed: Some(incarnation),
+                        kind: CallErrorKind::ResponseTimedOut,
+                    })),
+                    OneShotClose::Pending => Poll::Pending,
+                }
+            }
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn close_reply(&mut self) {
         if let Some(reply) = &mut self.reply {
-            reply.close();
+            reply.inner.close();
         }
     }
 }

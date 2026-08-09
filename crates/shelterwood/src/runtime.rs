@@ -630,6 +630,16 @@ impl<T> OneShotReceiver<T> {
         self.channel.close();
     }
 
+    /// Closes the receive side and recovers a value stored before the close.
+    ///
+    /// Tokio retains a value sent before `close`, so this is the cancellation
+    /// hook that lets callers route an unclaimed stored value through isolated
+    /// disposal instead of destroying it in their own drop glue.
+    pub(crate) fn close_and_take(&mut self) -> Option<T> {
+        self.close();
+        self.channel.try_recv().ok()
+    }
+
     pub(crate) async fn receive(self) -> Option<T> {
         self.channel.await.ok()
     }

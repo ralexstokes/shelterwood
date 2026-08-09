@@ -210,7 +210,14 @@ impl<T: Send + 'static> TaskOnceDef<T> {
                 Box::pin(async move {
                     match body(context).await {
                         Ok(value) => {
-                            let _ = completion.send(value);
+                            // A rejected send means the completion claim was
+                            // abandoned. Destroying the value here would run a
+                            // possibly blocking or panicking user destructor
+                            // inside the supervised task future, hanging it or
+                            // replacing a Completed verdict with Panicked.
+                            if let Err(abandoned) = completion.send(value) {
+                                runtime::dispose_detached(abandoned);
+                            }
                             Ok(())
                         }
                         Err(error) => Err(error),

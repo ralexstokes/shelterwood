@@ -364,37 +364,55 @@ impl<A: Actor> RawActor for Handler<A> {
         self.readiness
     }
 
-    /// Runs one incarnation, leaning on the raw incarnation boundary for all
-    /// panic and teardown machinery: after this future returns or panics, the
-    /// raw runner freezes the mailbox and incarnation resources, joins them,
-    /// and only then drops this handler (§5.5's resource-before-actor order),
-    /// preserving a callback panic as the authoritative exit. Storing the
-    /// actor in `self` rather than a frame local is what keeps its drop after
-    /// that join on the `Err` and panic paths.
+    /// Runs one incarnation, leaning on the raw incarnation boundary for the
+    /// panic machinery: a callback panic unwinds straight through this frame,
+    /// and the raw runner freezes the mailbox and incarnation resources,
+    /// joins them, and only then drops this handler (§5.5's
+    /// resource-before-actor order), preserving the panic as the
+    /// authoritative exit. Storing the actor in `self` rather than a frame
+    /// local is what keeps its drop after that join on the `Err` and panic
+    /// paths. Callback *errors* cannot lean on that boundary the same way:
+    /// this wrapper is the advertised raw-decorator composition point, so a
+    /// decorator — not the raw runner — may resume after this future
+    /// returns, and it must not observe still-live incarnation resources;
+    /// every error exit therefore freezes and joins them here first.
     async fn run(&mut self, raw: &mut RawContext<Self::Msg>) -> ExitResult {
         let args = self
             .args
             .take()
             .expect("handler actor initialization invoked more than once");
-        let actor = {
+        let initialized = {
             let mut context = Context::<A>::new(raw, false);
-            A::init(args, &mut context).await?
+            A::init(args, &mut context).await
         };
-        let actor = self.actor.insert(actor);
+        let actor = match initialized {
+            Ok(actor) => self.actor.insert(actor),
+            Err(error) => return fail_after_teardown(raw, error).await,
+        };
         if raw.readiness() == Readiness::AfterInit {
             raw.mark_ready();
         }
 
         while let Some(message) = raw.recv().await {
-            let mut context = Context::<A>::new(raw, false);
-            actor.handle(message, &mut context).await?;
+            let handled = {
+                let mut context = Context::<A>::new(raw, false);
+                actor.handle(message, &mut context).await
+            };
+            if let Err(error) = handled {
+                return fail_after_teardown(raw, error).await;
+            }
         }
 
         match raw.mailbox_shutdown() {
             MailboxShutdown::Drain => {
                 while let Some(message) = raw.try_recv() {
-                    let mut context = Context::<A>::new(raw, true);
-                    actor.handle(message, &mut context).await?;
+                    let handled = {
+                        let mut context = Context::<A>::new(raw, true);
+                        actor.handle(message, &mut context).await
+                    };
+                    if let Err(error) = handled {
+                        return fail_after_teardown(raw, error).await;
+                    }
                 }
             }
             MailboxShutdown::Discard => {
@@ -408,6 +426,19 @@ impl<A: Actor> RawActor for Handler<A> {
         actor.on_stop(&mut context).await;
         Ok(())
     }
+}
+
+/// Propagates a callback error after §5.5's orderly teardown: incarnation-owned
+/// work is frozen, cancelled, and joined before control returns to the caller,
+/// which at the advertised composition point may be a raw decorator rather
+/// than the raw incarnation boundary itself.
+async fn fail_after_teardown<M: Send + 'static>(
+    raw: &mut RawContext<M>,
+    error: ExitError,
+) -> ExitResult {
+    raw.freeze_resources();
+    raw.join_resources().await;
+    Err(error)
 }
 
 type ArgsFactory<A> = Arc<dyn Fn() -> <A as Actor>::Args + Send + Sync + 'static>;

@@ -1,5 +1,6 @@
 //! Callback-oriented actors composed through the public [`Handler`] raw-actor
-//! wrapper, which encapsulates the callback loop's internal teardown discipline.
+//! wrapper, which encapsulates the callback loop's error-path freeze-and-join
+//! discipline.
 
 use std::{fmt, future::Future, hash::Hash, marker::PhantomData, sync::Arc, time::Duration};
 

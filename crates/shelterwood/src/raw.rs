@@ -835,9 +835,10 @@ pub trait RawActor: Send + 'static {
 
     /// Runs one incarnation using the membership-owned mailbox binding.
     ///
-    /// The framework calls this method exactly once on the raw actor value
-    /// installed as an incarnation's root; it never re-enters `run` on that
-    /// value. A restart constructs a fresh root value.
+    /// The framework calls this method at most once on an incarnation's root
+    /// raw-actor value and never re-enters it on that value. Shutdown may
+    /// destroy a constructed root before its run begins; a restart that reaches
+    /// construction obtains a fresh root value.
     ///
     /// [`RawContext::recv`] freezes external intake and returns `None` when
     /// shutdown begins. A raw loop must then honor
@@ -1116,9 +1117,9 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Receives the next accepted message, biased toward shutdown.
     ///
-    /// While the incarnation is running, a panic retained from an offload
-    /// future or continuation resumes from this receive path before another
-    /// event is delivered.
+    /// While the incarnation is running, a retained offload-work panic resumes
+    /// from this receive path before another event is delivered. A panic while
+    /// materializing a continuation surfaces directly from this receive call.
     pub async fn recv(&mut self) -> Option<M> {
         loop {
             if self.local_stop.is_fired() {
@@ -1144,9 +1145,10 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Receives one ready event without awaiting or consulting shutdown.
     ///
-    /// Outside shutdown drain, this resumes any panic retained from an offload
-    /// future or continuation before returning another event. During drain it
-    /// reads the frozen accepted mailbox prefix directly.
+    /// Outside shutdown drain, this resumes a retained offload-work panic before
+    /// returning another event; a continuation-materialization panic surfaces
+    /// directly from this call. During drain it reads the frozen accepted
+    /// mailbox prefix directly.
     pub fn try_recv(&mut self) -> Option<M> {
         if self.is_stopping() {
             self.freeze_and_report();

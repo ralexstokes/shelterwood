@@ -127,8 +127,8 @@ below is a reachable escape hatch:
 - **L3 — handler actor**: `Actor`/`init`/`handle`, keyed timers,
   continuations, offloads. The "simple things easy" layer. Its public
   `Handler<A>` wrapper is the composition point for raw decorators and
-  encapsulates the callback loop's error-path resource discipline; decorators
-  need no framework-internal teardown surface.
+  encapsulates the callback loop's error-path freeze-and-join discipline;
+  decorators need no framework-internal teardown surface.
 - **L4 — observation**: snapshots and lifecycle events over L1's single
   publication path.
 
@@ -657,9 +657,10 @@ trait RawActor: Send + 'static {
   on the same context and share its readiness, stop state, timers, offloads,
   watches, and identity; the context cannot escape into work that outlives
   the run.
-- The framework invokes `run` exactly once on the root raw-actor value
-  installed for each incarnation; it never re-enters `run` on that value. A
-  restart obtains a fresh root value from the definition's construction source.
+- The framework invokes `run` at most once on an incarnation's root raw-actor
+  value and never re-enters `run` on that value. Shutdown may destroy a root
+  value before its run begins; a restart that reaches construction obtains a
+  fresh root value from the definition's source.
 - `Handler<A>` is the public composition point that encapsulates the generated
   callback loop, including its error-path freeze-and-join discipline.
   Decorators wrap `Handler<A>` through the public raw-actor surface; they do

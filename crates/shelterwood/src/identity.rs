@@ -1,7 +1,8 @@
-//! Membership and incarnation identity.
+//! Child, membership, and incarnation identity.
 
 use std::{
     collections::{HashMap, hash_map::Entry},
+    fmt,
     hash::Hash,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -9,13 +10,55 @@ use std::{
 #[cfg(test)]
 use std::cell::Cell;
 
-use crate::ChildId;
-
 static NEXT_LINEAGE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 thread_local! {
     static CURRENT_THREAD_SCOPE_CREATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A child identifier within one scope.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ChildId(String);
+
+impl ChildId {
+    pub(crate) fn validate(value: impl Into<String>) -> Result<Self, IdError> {
+        let value = value.into();
+        if value.is_empty() {
+            Err(IdError::Empty)
+        } else {
+            Ok(Self(value))
+        }
+    }
+
+    /// Returns the identifier as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ChildId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl From<&str> for ChildId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<String> for ChildId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IdError {
+    Empty,
 }
 
 /// A child's identity within one supervising scope.

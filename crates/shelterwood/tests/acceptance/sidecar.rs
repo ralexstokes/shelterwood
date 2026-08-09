@@ -1,7 +1,7 @@
 use std::{
     future,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -15,23 +15,42 @@ use shelterwood::{
 };
 
 type JournalEvent = (usize, &'static str, &'static str);
-type JournalEntries = Arc<Mutex<Vec<JournalEvent>>>;
 
-#[derive(Clone, Debug, Default)]
-struct HostJournal(JournalEntries);
+/// The sender half handed to children: events reach the host by message
+/// passing, so no child ever shares mutable journal state with the test.
+#[derive(Clone, Debug)]
+struct HostJournal(tokio::sync::mpsc::UnboundedSender<JournalEvent>);
 
 impl HostJournal {
-    fn push(&self, cycle: usize, child: &'static str, event: &'static str) {
-        self.0
-            .lock()
-            .expect("host journal mutex poisoned")
-            .push((cycle, child, event));
+    fn new() -> (Self, JournalLog) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self(sender),
+            JournalLog {
+                receiver,
+                entries: Vec::new(),
+            },
+        )
     }
 
-    fn events(&self, cycle: usize, child: &'static str) -> Vec<&'static str> {
-        self.0
-            .lock()
-            .expect("host journal mutex poisoned")
+    fn push(&self, cycle: usize, child: &'static str, event: &'static str) {
+        // A host that never reads its log has dropped the receiver.
+        let _ = self.0.send((cycle, child, event));
+    }
+}
+
+/// The host's receiving half of the journal.
+struct JournalLog {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<JournalEvent>,
+    entries: Vec<JournalEvent>,
+}
+
+impl JournalLog {
+    fn events(&mut self, cycle: usize, child: &'static str) -> Vec<&'static str> {
+        while let Ok(event) = self.receiver.try_recv() {
+            self.entries.push(event);
+        }
+        self.entries
             .iter()
             .filter_map(|(entry_cycle, entry_child, event)| {
                 (*entry_cycle == cycle && *entry_child == child).then_some(*event)
@@ -202,7 +221,7 @@ fn sidecar(cycle: usize, journal: HostJournal) -> SidecarFixture {
 
 #[tokio::test]
 async fn sidecar_runs_two_host_owned_cycles_with_readiness_and_policy_exact_shutdown() {
-    let journal = HostJournal::default();
+    let (journal, mut log) = HostJournal::new();
 
     for cycle in 0..2 {
         let fixture = sidecar(cycle, journal.clone());
@@ -252,14 +271,14 @@ async fn sidecar_runs_two_host_owned_cycles_with_readiness_and_policy_exact_shut
             ExitKind::Aborted { after_grace: true }
         ));
         assert_eq!(
-            journal.events(cycle, "abort-worker"),
+            log.events(cycle, "abort-worker"),
             ["started", "cancelled", "aborted"]
         );
         assert_eq!(
-            journal.events(cycle, "graceful-worker"),
+            log.events(cycle, "graceful-worker"),
             ["started", "cancelled", "aborted"]
         );
-        assert_eq!(journal.events(cycle, "actor"), ["started", "stopped"]);
+        assert_eq!(log.events(cycle, "actor"), ["started", "stopped"]);
     }
 }
 
@@ -271,7 +290,10 @@ struct FailedStartupFixture {
     suffix_started: Arc<AtomicBool>,
 }
 
-fn failing_sidecar(journal: HostJournal) -> FailedStartupFixture {
+fn failing_sidecar() -> FailedStartupFixture {
+    // This scenario asserts child states, not journal events, so the log is
+    // dropped and every push is a no-op.
+    let (journal, _) = HostJournal::new();
     let gate = ReleaseGate::default();
     let prefix_one = Arc::new(AtomicBool::new(false));
     let prefix_two = Arc::new(AtomicBool::new(false));
@@ -284,7 +306,7 @@ fn failing_sidecar(journal: HostJournal) -> FailedStartupFixture {
     .expect("valid config task");
     tree.add_task(
         "telemetry",
-        cooperative_task(99, "telemetry", journal, Arc::clone(&prefix_two)),
+        cooperative_task(99, "telemetry", journal.clone(), Arc::clone(&prefix_two)),
     )
     .expect("valid telemetry task");
     tree.add_task(
@@ -314,10 +336,7 @@ fn failing_sidecar(journal: HostJournal) -> FailedStartupFixture {
     .expect("valid suffix task");
     let mut actors = Tree::new();
     actors
-        .add_actor_once(
-            "probe",
-            ActorOnceDef::<ProbeActor>::new((99, HostJournal::default())),
-        )
+        .add_actor_once("probe", ActorOnceDef::<ProbeActor>::new((99, journal)))
         .expect("valid actor subtree");
     tree.add_subtree_once("actors", SubtreeOnceDef::new(actors))
         .expect("valid actor subtree");
@@ -332,7 +351,7 @@ fn failing_sidecar(journal: HostJournal) -> FailedStartupFixture {
 
 #[tokio::test]
 async fn sidecar_startup_failure_leaves_prefix_supervised_until_host_rolls_it_back() {
-    let fixture = failing_sidecar(HostJournal::default());
+    let fixture = failing_sidecar();
     let system = fixture.tree.spawn().expect("runtime is available");
     let scope = system.scope();
     assert!(

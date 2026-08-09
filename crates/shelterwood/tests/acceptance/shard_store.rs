@@ -9,6 +9,9 @@ use shelterwood::{
     ExitResult, Membership, RemoveOutcome, Reply, ScopeRef, SubtreeOnceDef, Tree,
 };
 
+/// A shard's durable contents. Deliberately not actor-owned state: the test
+/// reads a retired mount's data after its serving actor is gone, so this
+/// models the disk underneath the actor.
 #[derive(Clone, Debug, Default)]
 struct DurableShard(Arc<Mutex<HashMap<String, u64>>>);
 
@@ -119,6 +122,10 @@ enum Fault {
     AfterCommitBeforeReply,
 }
 
+/// The router's durable operation journal. Router incarnations are replaced
+/// across the injected crashes and each re-init starts from cloned `Args`, so
+/// this is the durable store the §3.3 retry discipline reconciles against —
+/// state that must outlive any incarnation, not shared actor state.
 #[derive(Clone, Default)]
 struct DurableTopology {
     operations: Arc<Mutex<HashMap<u64, OperationRecord>>>,

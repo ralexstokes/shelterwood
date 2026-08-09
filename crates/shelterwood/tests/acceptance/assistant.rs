@@ -29,6 +29,9 @@ async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
 
 #[derive(Clone, Default)]
 struct TransportState {
+    /// The journal's durable ledger. It must survive the injected crash of
+    /// `JournalActor` (a restart re-inits from cloned `Args`), so it models
+    /// the disk underneath the actor rather than actor-owned state.
     delivered: Arc<Mutex<HashSet<u64>>>,
     processed: Arc<AtomicUsize>,
     duplicate_notices: Arc<AtomicUsize>,
@@ -254,12 +257,12 @@ impl Actor for SessionControlActor {
 }
 
 struct StreamActor {
-    values: Arc<Mutex<Vec<u64>>>,
+    values: tokio::sync::mpsc::UnboundedSender<u64>,
 }
 
 impl Actor for StreamActor {
     type Msg = u64;
-    type Args = (ReleaseGate, Arc<Mutex<Vec<u64>>>);
+    type Args = (ReleaseGate, tokio::sync::mpsc::UnboundedSender<u64>);
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
         args.0.wait().await;
@@ -267,10 +270,8 @@ impl Actor for StreamActor {
     }
 
     async fn handle(&mut self, value: u64, _: &mut Context<'_, Self>) -> ExitResult {
-        self.values
-            .lock()
-            .expect("stream values mutex poisoned")
-            .push(value);
+        // A fixture whose log is never read has dropped the receiver.
+        let _ = self.values.send(value);
         Ok(())
     }
 }
@@ -335,7 +336,7 @@ struct SessionFixture {
     control: ActorRef<SessionControlMessage>,
     stream: ActorRef<u64>,
     stream_gate: ReleaseGate,
-    stream_values: Arc<Mutex<Vec<u64>>>,
+    stream_log: tokio::sync::mpsc::UnboundedReceiver<u64>,
     rehydrated: Arc<AtomicUsize>,
     stop_entered: Arc<AtomicBool>,
     stop_gate: ReleaseGate,
@@ -348,11 +349,11 @@ fn session_fixture() -> SessionFixture {
         .add_subtree_once("tools", SubtreeOnceDef::new(tools_tree))
         .expect("nested tool scope declared");
     let stream_gate = ReleaseGate::default();
-    let stream_values = Arc::new(Mutex::new(Vec::new()));
+    let (stream_values, stream_log) = tokio::sync::mpsc::unbounded_channel();
     let stream = tree
         .add_actor_once(
             "stream",
-            ActorOnceDef::<StreamActor>::new((stream_gate.clone(), Arc::clone(&stream_values)))
+            ActorOnceDef::<StreamActor>::new((stream_gate.clone(), stream_values))
                 .mailbox(Mailbox::latest()),
         )
         .expect("stream actor declared");
@@ -377,7 +378,7 @@ fn session_fixture() -> SessionFixture {
         control,
         stream,
         stream_gate,
-        stream_values,
+        stream_log,
         rehydrated,
         stop_entered,
         stop_gate,
@@ -441,7 +442,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
 
     let session_data = session_fixture();
     let stream_gate = session_data.stream_gate.clone();
-    let stream_values = Arc::clone(&session_data.stream_values);
+    let mut stream_log = session_data.stream_log;
     let rehydrated = Arc::clone(&session_data.rehydrated);
     let stop_entered = Arc::clone(&session_data.stop_entered);
     let stop_gate = session_data.stop_gate.clone();
@@ -476,11 +477,12 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         )
         .await
         .expect("session aggregate readiness completes");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            *stream_values.lock().expect("stream values mutex poisoned") == [3]
-        })
-        .await,
+    let newest = tokio::time::timeout(POLL_TIMEOUT, stream_log.recv())
+        .await
+        .expect("released stream handles its retained update")
+        .expect("stream actor is alive");
+    assert_eq!(
+        newest, 3,
         "latest mailbox keeps the newest accepted streaming update"
     );
     assert!(
@@ -744,7 +746,7 @@ impl Actor for IdleSessionActor {
 async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight() {
     let (evictions, mut evicted) = tokio::sync::mpsc::unbounded_channel();
     let activities = Arc::new(AtomicUsize::new(0));
-    let stream_values = Arc::new(Mutex::new(Vec::new()));
+    let (stream_values, mut stream_log) = tokio::sync::mpsc::unbounded_channel();
     let mut session = Tree::new();
     let idle = session
         .add_actor(
@@ -756,7 +758,7 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
     let stream = session
         .add_actor_once(
             "stream",
-            ActorOnceDef::<StreamActor>::new((stream_gate.clone(), Arc::clone(&stream_values)))
+            ActorOnceDef::<StreamActor>::new((stream_gate.clone(), stream_values))
                 .mailbox(Mailbox::latest()),
         )
         .expect("stream actor declared");
@@ -777,16 +779,11 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
 
     // Mid-life streaming works and the idle timer is armed from init.
     stream.send(5).await.expect("stream accepts mid-life value");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            stream_values
-                .lock()
-                .expect("stream values mutex poisoned")
-                .as_slice()
-                == [5]
-        })
+    let mid_life = tokio::time::timeout(POLL_TIMEOUT, stream_log.recv())
         .await
-    );
+        .expect("live stream handles the mid-life value")
+        .expect("stream actor is alive");
+    assert_eq!(mid_life, 5);
 
     // Activity half-way through the idle window replaces the deadline …
     tokio::time::advance(Duration::from_secs(30)).await;
@@ -823,12 +820,8 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
         .try_send(9)
         .expect_err("a cancelled stream rejects new values");
     assert_eq!(error.kind, shelterwood::SendErrorKind::Terminated);
-    assert_eq!(
-        stream_values
-            .lock()
-            .expect("stream values mutex poisoned")
-            .as_slice(),
-        [5],
+    assert!(
+        stream_log.try_recv().is_err(),
         "no value leaks past cancellation"
     );
     system

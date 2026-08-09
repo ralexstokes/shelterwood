@@ -25,7 +25,7 @@ pub use exit::{
     Exit, ExitError, ExitKind, ExitResult, IntensityTrip, ShutdownStraggler, ShutdownTimeout,
     StartupError, StartupFailure, StartupFailureCause, StopReason,
 };
-pub use identity::{Incarnation, Membership};
+pub use identity::{ChildId, Incarnation, Membership};
 pub use mailbox::{
     ActorRef, CallError, CallErrorKind, CallFuture, Replied, Reply, ReplyError, ReplyReceive,
     ReplyReceiver, SendError, SendErrorKind, SendFuture, SendTimeout,
@@ -37,9 +37,9 @@ pub use observe::{
 };
 pub use plan::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use policy::{
-    Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, InvalidPolicy, Jitter,
-    Mailbox, MailboxShutdown, PolicyError, PolicyField, Readiness, ReadinessDeadline,
-    RestartCondition, RestartPolicy, Retention, ScopeDefaults, Shutdown, Strategy,
+    Backoff, BackoffFactor, DefaultsInheritance, Intensity, InvalidPolicy, Jitter, Mailbox,
+    MailboxShutdown, PolicyError, PolicyField, Readiness, ReadinessDeadline, RestartCondition,
+    RestartPolicy, Retention, ScopeDefaults, Shutdown, Strategy,
 };
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,

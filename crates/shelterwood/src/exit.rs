@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{identity::Membership, policy::ChildId};
+use crate::identity::{ChildId, Membership};
 
 /// The terminal reason for a scope incarnation or root system.
 #[derive(Clone, Debug, Eq, PartialEq)]

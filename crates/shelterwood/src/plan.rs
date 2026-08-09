@@ -9,10 +9,10 @@ use crate::{
     ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults, Strategy,
     cells::{MemberCell, ScopeCell},
     definition::DefinitionSource,
-    identity::ScopeIdentity,
+    identity::{IdError, ScopeIdentity},
     policy::{
-        CommonOptions, IdError, InvalidPolicy, PolicyField, ResolvedCommonOptions,
-        ResolvedDefaults, ScopeFlavor, resolve_common,
+        CommonOptions, InvalidPolicy, PolicyField, ResolvedCommonOptions, ResolvedDefaults,
+        ScopeFlavor, resolve_common,
     },
     raw::RawConstruction,
     runtime::{self, Isolated, Latch},

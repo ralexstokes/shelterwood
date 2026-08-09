@@ -331,24 +331,34 @@ impl MemberCell {
                 published = true;
             }
         });
-        // Mailbox terminality and waiter completion must become visible before
-        // member terminality. The watch pulse is deliberately delayed until
-        // teardown has synchronously finished and unread payload ownership has
-        // moved to detached disposal.
+        // The terminal record is stored before mailbox discharge so reentrant
+        // mailbox wakers observe the winning exit. The ordering guarantee for
+        // notification-driven readers is discharge-before-pulse, not
+        // discharge-before-store: a direct borrow can see `Terminal` while
+        // teardown is still running. A hostile mailbox waker may panic, but
+        // that panic is resumed only after the pulse so it cannot strand a
+        // waiter parked on membership terminality.
         let teardown = match &mut *self.mailbox.lock().expect("member mailbox mutex poisoned") {
             MemberMailbox::Terminal { teardown, .. } => teardown.take(),
             MemberMailbox::Unattached | MemberMailbox::Attached(_) => {
                 unreachable!("terminal publication requires terminal mailbox state")
             }
         };
-        if let Some(teardown) = teardown
-            && let Some(payload) = teardown.finish()
-        {
-            runtime::dispose_detached(payload);
+        let mut teardown_panic = None;
+        if let Some(teardown) = teardown {
+            match runtime::catch_panic(|| teardown.finish()) {
+                Ok(Some(payload)) => runtime::dispose_detached(payload),
+                Ok(None) => {}
+                Err(payload) => teardown_panic = Some(payload),
+            }
         }
-        if published {
-            self.record.pulse();
-        }
+        let pulse_panic = published
+            .then(|| runtime::catch_panic(|| self.record.pulse()).err())
+            .flatten();
+        runtime::resume_preferred_panic(runtime::UnwindPanics {
+            primary: teardown_panic,
+            cleanup: pulse_panic,
+        });
     }
 
     pub(crate) async fn wait_terminal(&self) -> Exit {

@@ -385,6 +385,14 @@ Consequences (normative):
   `ScopeState` event (B.6, B.4) — before its streams close, so
   `wait_stopped()` (B.9) and snapshot/lifecycle subscribers resolve
   structurally, never merely by stream closure.
+- Terminal publication has one precise internal order: store the terminal
+  cell record, synchronously discharge parked mailbox operations, then pulse
+  the cell's single change signal. A direct or reentrant borrow MAY therefore
+  observe the terminal record while mailbox discharge is still in progress;
+  the guarantee is **discharge-before-pulse**, not discharge-before-store. A
+  panic collected while waking mailbox operations MUST be resumed only after
+  the cell pulse, so a hostile mailbox waker cannot strand membership-level
+  terminal waiters.
 - Declaration is O(n): no re-projection of the full child list on every
   builder mutation; no shadow runtime object maintained during declaration;
   no global counters joining side tables [#367]. Pre-spawn snapshots, if

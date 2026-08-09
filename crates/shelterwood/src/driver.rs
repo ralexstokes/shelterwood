@@ -3086,16 +3086,20 @@ mod tests {
     use std::{
         future::{self, Future},
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::{Arc, Barrier, Mutex},
+        sync::{
+            Arc, Barrier, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
 
     use crate::{
         ActorRef, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
-        GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness,
-        ReadinessDeadline, RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError,
-        StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+        GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox,
+        RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, Retention, ScopeState,
+        SendErrorKind, StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef,
+        TaskDef, Tree,
         engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
         identity::{IncarnationCounter, ScopeIdentity},
@@ -3140,6 +3144,43 @@ mod tests {
 
         async fn run(&mut self, _: &mut crate::RawContext<Self::Msg>) -> crate::ExitResult {
             future::pending().await
+        }
+    }
+
+    struct PanicWake;
+
+    impl Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            panic!("injected mailbox waker panic");
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            panic!("injected mailbox waker panic");
+        }
+    }
+
+    struct CountWake(Arc<AtomicUsize>);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ExitOnSignalRaw {
+        exit: Latch,
+    }
+
+    impl crate::RawActor for ExitOnSignalRaw {
+        type Msg = u8;
+
+        async fn run(&mut self, _: &mut crate::RawContext<Self::Msg>) -> crate::ExitResult {
+            self.exit.fired().await;
+            Ok(())
         }
     }
 
@@ -4179,6 +4220,135 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.observe();
         }
+    }
+
+    #[test]
+    fn panicking_mailbox_waker_cannot_skip_the_terminal_pulse() {
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+
+        let mut parked_send = Box::pin(actor.send(1));
+        let panicking_waker = Waker::from(Arc::new(PanicWake));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&panicking_waker))
+                .is_pending()
+        );
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let terminal_waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+        let mut terminal = Box::pin(member.wait_terminal());
+        assert!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&terminal_waker))
+                .is_pending()
+        );
+
+        catch_unwind(AssertUnwindSafe(|| {
+            member.terminalize(Exit::never_started());
+        }))
+        .expect_err("the hostile mailbox waker still surfaces its panic");
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "membership terminality is pulsed before the mailbox panic resumes"
+        );
+        assert!(matches!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(error)) if error.kind == SendErrorKind::Terminated
+        ));
+    }
+
+    #[crate::runtime::test]
+    async fn mailbox_waker_panic_is_contained_without_wedging_system_completion() {
+        let exit = Latch::default();
+        let mut tree = Tree::new();
+        let actor = tree
+            .add_raw_once(
+                "worker",
+                RawOnceDef::new(ExitOnSignalRaw { exit: exit.clone() })
+                    .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
+            )
+            .expect("valid actor");
+        let plan = tree.lower_for_test();
+        let member = Arc::clone(&plan.children[0].slot.member);
+        let root = Arc::clone(&plan.root);
+        let mut system = super::spawn_system(plan);
+        root.wait_started().await.expect("actor starts");
+        actor
+            .try_send(1)
+            .expect("the first message fills the queue");
+
+        let mut parked_send = Box::pin(actor.send(2));
+        let panicking_waker = Waker::from(Arc::new(PanicWake));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&panicking_waker))
+                .is_pending()
+        );
+
+        let waiter_started = Latch::default();
+        let terminal_waiter = crate::runtime::spawn({
+            let member = Arc::clone(&member);
+            let waiter_started = waiter_started.clone();
+            async move {
+                waiter_started.fire();
+                member.wait_terminal().await
+            }
+        });
+        waiter_started.fired().await;
+        exit.fire();
+
+        let member_exit = match crate::runtime::timeout(
+            Duration::from_secs(2),
+            crate::runtime::join(terminal_waiter),
+        )
+        .await
+        {
+            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { value }) => value,
+            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Panic { message }) => {
+                panic!("the terminal waiter panicked: {message:?}")
+            }
+            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Cancelled) => {
+                panic!("the terminal waiter was cancelled")
+            }
+            crate::runtime::Timeout::Elapsed => {
+                panic!("the terminal waiter was not pulsed after the mailbox panic")
+            }
+        };
+        assert!(matches!(member_exit.kind(), ExitKind::Completed));
+
+        let reason = match crate::runtime::timeout(Duration::from_secs(2), system.wait()).await {
+            crate::runtime::Timeout::Completed(reason) => reason,
+            crate::runtime::Timeout::Elapsed => {
+                panic!("the system monitor did not contain the driver unwind")
+            }
+        };
+        assert_eq!(reason, StopReason::ShutdownRequested);
+        let root_exit = root.member.wait_terminal().await;
+        assert!(matches!(
+            root_exit.kind(),
+            ExitKind::Panicked { message }
+                if message.as_deref() == Some("injected mailbox waker panic")
+        ));
     }
 
     #[test]

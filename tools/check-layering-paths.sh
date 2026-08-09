@@ -5,26 +5,20 @@ set -euo pipefail
 # default scans the repository from the invoking directory as before.
 cd "${SHELTERWOOD_ENFORCEMENT_ROOT:-.}"
 
-readonly below_driver_layers=(
-  crates/shelterwood/src/admission.rs
-  crates/shelterwood/src/actor.rs
-  crates/shelterwood/src/cancellation.rs
-  crates/shelterwood/src/cells.rs
-  crates/shelterwood/src/deadline.rs
-  crates/shelterwood/src/definition.rs
-  crates/shelterwood/src/engine.rs
-  crates/shelterwood/src/exit.rs
-  crates/shelterwood/src/identity.rs
-  crates/shelterwood/src/mailbox.rs
-  crates/shelterwood/src/observe.rs
-  crates/shelterwood/src/plan.rs
-  crates/shelterwood/src/policy.rs
-  crates/shelterwood/src/raw.rs
-  crates/shelterwood/src/runtime.rs
-  crates/shelterwood/src/task.rs
-)
 readonly driver_path="crates/shelterwood/src/driver.rs"
 readonly tree_path="crates/shelterwood/src/tree.rs"
+
+# Every top-level Rust module except the two orchestration layers belongs below
+# the driver. Derive the set so adding a module cannot silently bypass this
+# check; lib.rs is the crate root and is allowed to wire every layer together.
+below_driver_layers=()
+for path in crates/shelterwood/src/*.rs; do
+  case "$path" in
+    "$driver_path"|"$tree_path"|crates/shelterwood/src/lib.rs) ;;
+    *) below_driver_layers+=("$path") ;;
+  esac
+done
+readonly -a below_driver_layers
 
 check_forbidden() {
   local message="$1"

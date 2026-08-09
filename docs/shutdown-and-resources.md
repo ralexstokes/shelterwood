@@ -8,10 +8,10 @@ cooperative cancellation -> grace expiry -> tidy-abort beat -> hard abort
 
 `Shutdown::Abort` is the zero-grace point on that ladder. The shutdown token
 still fires strictly before the abort token, and the tidy beat still occurs.
-`ExitKind::Aborted { after_grace }` distinguishes hard abort after an expired
-grace (`true`) from the immediate policy (`false`). These token transitions are
-observable inside a child; lifecycle events report the eventual exit, not
-separate ladder steps.
+`ExitKind::Aborted { phase }` distinguishes hard abort after an expired
+grace (`GracePhase::AfterGrace`) from an abort within grace
+(`GracePhase::WithinGrace`). These token transitions are observable inside a
+child; lifecycle events report the eventual exit, not separate ladder steps.
 
 ## Grace is an upper bound
 

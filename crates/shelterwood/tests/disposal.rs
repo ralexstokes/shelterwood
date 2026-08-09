@@ -15,8 +15,8 @@ use crate::common::{
     poll_until,
 };
 use shelterwood::{
-    Backoff, CallErrorKind, ChildState, DynamicTree, ExitError, ExitKind, ExitResult, Jitter,
-    LifecycleEventKind, LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef,
+    Backoff, CallErrorKind, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult,
+    Jitter, LifecycleEventKind, LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef,
     Readiness, ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition,
     RestartPolicy, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
@@ -245,7 +245,7 @@ async fn panicking_unread_messages_are_all_disposed_without_reclassifying_the_ac
         }
     };
     assert!(matches!(exit.kind(), ExitKind::Completed));
-    assert!(exit.cancelled());
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -819,7 +819,7 @@ async fn hard_shutdown_detaches_a_blocking_factory_disposal() {
     result.expect("post-exit disposal is not an actor straggler");
     let exit = task.wait().await;
     assert!(matches!(exit.kind(), ExitKind::Completed));
-    assert!(exit.cancelled());
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
 #[tokio::test]

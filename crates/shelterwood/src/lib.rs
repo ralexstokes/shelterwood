@@ -26,8 +26,9 @@ pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use admission::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use cancellation::CancellationToken;
 pub use exit::{
-    Exit, ExitError, ExitKind, ExitResult, IntensityTrip, ShutdownStraggler, ShutdownTimeout,
-    StartupError, StartupFailure, StartupFailureCause, StopReason,
+    Cancellation, Exit, ExitError, ExitKind, ExitResult, GracePhase, IntensityTrip,
+    ShutdownStraggler, ShutdownTimeout, StartupError, StartupFailure, StartupFailureCause,
+    StopReason,
 };
 pub use identity::{ChildId, Incarnation, Membership};
 pub use mailbox::{

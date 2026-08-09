@@ -2,14 +2,15 @@ use std::{cell::Cell, error::Error, hash::Hash, time::Duration};
 
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ActorSlot, Admission, Blocking, BuildError, CallError,
-    CallFuture, CancellationToken, Context, DeadlineElapsed, DefaultsInheritance, DynamicActorSlot,
-    DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError, ExitResult,
-    Guard, Handler, Incarnation, Intensity, LifecycleEvents, LifecycleTryRecvError, Mailbox,
-    MailboxShutdown, Membership, OneShotTaskRef, RawActor, RawContext, RawDef, RawOnceDef,
-    Readiness, ReadinessDeadline, Removal, Reply, ReplyReceive, ReplyReceiver, ReserveError,
-    RestartPolicy, Retention, ScopeDefaults, ScopeRef, SendError, SendFuture, SendTimeout,
-    Shutdown, SnapshotClosed, SnapshotReceiver, StopContext, Strategy, SubtreeDef, SubtreeOnceDef,
-    SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, Tree, WaitError,
+    CallFuture, Cancellation, CancellationToken, Context, DeadlineElapsed, DefaultsInheritance,
+    DynamicActorSlot, DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError,
+    ExitResult, GracePhase, Guard, Handler, Incarnation, Intensity, LifecycleEvents,
+    LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, OneShotTaskRef, RawActor,
+    RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, Removal, Reply, ReplyReceive,
+    ReplyReceiver, ReserveError, RestartPolicy, Retention, ScopeDefaults, ScopeRef, SendError,
+    SendFuture, SendTimeout, Shutdown, SnapshotClosed, SnapshotReceiver, StopContext, Strategy,
+    SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, Tree,
+    WaitError,
 };
 
 fn assert_error<T: Error>() {}
@@ -24,6 +25,8 @@ fn assert_static<T: 'static>() {}
 fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     assert_copy_eq_hash_send_sync::<Membership>();
     assert_copy_eq_hash_send_sync::<Incarnation>();
+    assert_copy_eq_hash_send_sync::<Cancellation>();
+    assert_copy_eq_hash_send_sync::<GracePhase>();
 
     assert_clone_eq_hash_send_sync::<ActorRef<Cell<()>>>();
     assert_clone_eq_hash_send_sync::<TaskRef>();

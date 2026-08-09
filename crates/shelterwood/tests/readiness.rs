@@ -10,8 +10,8 @@ use crate::common::{
     POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, policy::never, poll_until,
 };
 use shelterwood::{
-    ChildState, DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline, ScopeState,
-    Shutdown, StartupError, StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
+    Cancellation, ChildState, DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline,
+    ScopeState, Shutdown, StartupError, StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
 };
 
 #[tokio::test]
@@ -241,7 +241,7 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
     advance_time(width).await;
     let exit = shutdown_task.wait().await;
     assert!(matches!(exit.kind(), ExitKind::Completed));
-    assert!(exit.cancelled());
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
 #[tokio::test]
@@ -808,7 +808,7 @@ async fn nested_startup_rollback_includes_runtime_added_members() {
     runtime_cancelled.wait().await;
     let runtime_exit = runtime.wait().await;
     assert!(matches!(runtime_exit.kind(), ExitKind::Completed));
-    assert!(runtime_exit.cancelled());
+    assert_eq!(runtime_exit.cancellation(), Cancellation::Observed);
     assert!(matches!(
         nested.wait_stopped().await,
         shelterwood::StopReason::StartupFailed(_)

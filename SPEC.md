@@ -1214,12 +1214,13 @@ One classification, produced at one point, used by every consumer.
 - One public exit type covers: `Completed`, `Failed(error)`, `Panicked`
   (carrying the panic message when the payload downcasts to a string — the
   payload itself is never retained, since exits ride `Clone` snapshots and
-  events), `ReadinessTimedOut { deadline }`, `Aborted { after_grace }`,
-  and the membership-level `NeverStarted`, with
+  events), `ReadinessTimedOut { deadline }`, `Aborted { phase:
+  GracePhase }`, and the membership-level `NeverStarted`, with
   cancellation ("supervisor asked it to stop" vs "finished on its own") as
-  an orthogonal, explicit `cancelled: bool` field on every variant.
-  Grace-expiry abort (`after_grace: true`) and scope-level shutdown-timeout
-  are distinguishable. `NeverStarted` is the terminal outcome of a
+  an orthogonal, explicit `Cancellation::{Observed, NotObserved}` value on
+  every exit. `GracePhase::{WithinGrace, AfterGrace}` distinguishes whether
+  cooperative grace expired before an abort; scope-level shutdown-timeout
+  remains a separate verdict. `NeverStarted` is the terminal outcome of a
   membership that ends with no incarnation ever spawned — a declaring
   tree dropped unspawned, a rejected or withdrawn insertion (§3.2, §8),
   removal before first spawn, or a startup abort terminalizing
@@ -1234,11 +1235,11 @@ One classification, produced at one point, used by every consumer.
   The token fires for every engine-initiated stop — scope teardown,
   dynamic removal, readiness-timeout teardown, `shutdown(0)`'s immediate
   escalation — and for local `ctx.stop()`, which arms the same ladder
-  (§10), so a self-stopped actor's exit reads `cancelled: true`. A stop
+  (§10), so a self-stopped actor's exit reads `Cancellation::Observed`. A stop
   racing natural completion needs no third rule: whichever of token-fire
   and outcome-record happened first decides the flag. `NeverStarted`
   sits outside the rule — no incarnation, no token — and carries
-  `cancelled: false` uniformly, whether the membership ended by
+  `Cancellation::NotObserved` uniformly, whether the membership ended by
   tree-drop, withdrawal, rejection, or startup abort: the variant itself
   already says nothing ran.
 - **Verdict precedence.** When one incarnation's end admits several
@@ -1263,8 +1264,8 @@ One classification, produced at one point, used by every consumer.
     structured application error the task already produced, which is the
     only evidence naming *why* the child was failing.
   - A recorded `Completed` does **not** survive: cancellation overrides
-    it and the exit reads `Aborted { after_grace }` with
-    `cancelled: true`. A supervisor that destroyed a child before its
+    it and the exit reads `Aborted { phase }` with
+    `Cancellation::Observed`. A supervisor that destroyed a child before its
     success was observable did not get a successful child. Concretely, a
     one-shot task whose body returned `Ok(value)` inside that window
     exits `Aborted` and `OneShotTaskRef::wait` yields `Err(exit)` — the
@@ -1856,10 +1857,10 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   before teardown advances, exactly as under grace expiry. The policy does
   not pre-decide the classification: §7's classifier still reads what
   actually happened, so a child that yields an outcome during the beat
-  exits `Completed`/`Failed` (with `cancelled: true`), and
-  `Aborted { after_grace: false }` records only a hard abort actually
+  exits `Completed`/`Failed` (with `Cancellation::Observed`), and
+  `Aborted { phase: GracePhase::WithinGrace }` records only a hard abort actually
   reached — the future destroyed before yielding — distinguishable from
-  grace-expiry abort (`after_grace: true`). The one boundary case, where
+  grace-expiry abort (`phase: GracePhase::AfterGrace`). The one boundary case, where
   the beat expires and the hard abort lands *after* the body recorded its
   outcome but before the join retires, is settled by §7's precedence and
   not here: a recorded `Failed` survives that abort, a recorded
@@ -1869,7 +1870,7 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   contract. Cancellation-before-escalation ordering is observable to the
   child itself — its `shutdown_token` fires strictly before its
   `abort_token` (B.2), which is what C.2's sidecar reads from the child's
-  own journal — and in the exit's `cancelled`/`after_grace` fields;
+  own journal — and in the exit's `cancellation`/`phase` fields;
   lifecycle events carry **no ladder-transition events** (B.4's inventory
   is deliberately exit-only here), so §13.10's ordering assertions are
   built from child-side observations, not the event stream.
@@ -1881,7 +1882,7 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
 - **Driver death discharges; it never absolves.** A scope driver
   destroyed with obligations outstanding resolves all of them on the way
   down: still-active descendants publish the coarse kill verdict —
-  `Aborted { after_grace: false }` with `cancelled: true` — memberships
+  `Aborted { phase: GracePhase::WithinGrace }` with `Cancellation::Observed` — memberships
   terminalize (sends fail `Terminated`, exit-awaiting surfaces resolve),
   in-flight admissions and removals resolve their enumerated rejections,
   and every `Added` is paired with its `Removed` before the scope's own
@@ -2081,7 +2082,7 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   `shutdown_and_wait()` on its handle (incarnation-targeted, B.9) —
   tears down through the ordinary
   §10 ladders, publishes `Stopped { reason: ShutdownRequested }` (B.6),
-  and exits at its parent as `Completed` with `cancelled: true` (§7): a
+  and exits at its parent as `Completed` with `Cancellation::Observed` (§7): a
   requested stop is a cooperative completion, not a failure. The
   parent's restart policy then applies as usual — `OnFailure` leaves the
   scope down; `Always` restarts it, and because the shutdown latch is
@@ -2988,7 +2989,7 @@ stop), `abort_token()` (fires at escalation — grace expiry, or
 immediately under `Abort` policy; the tidy-abort beat runs after it
 fires, and §10's classification rule applies: a task that yields an
 outcome during the beat classifies by that outcome, while a future
-destroyed by the ensuing hard abort records `Aborted { after_grace }`),
+destroyed by the ensuing hard abort records `Aborted { phase }`),
 `mark_ready()` (one-shot by construction; no-op only where declared
 readiness makes it meaningless, and that is a documented no-op, not a silent
 state change — the same rule covers a stopping incarnation: once either
@@ -3210,8 +3211,9 @@ One public type (§7): variants `Completed`, `Failed(error)` (the error
 value, not a string), `Panicked { message: Option<String> }` (the panic
 message when the payload downcasts to a string; the payload is never
 retained), `ReadinessTimedOut { deadline }`,
-`Aborted { after_grace }`, `NeverStarted` (membership terminal with no
-incarnation ever spawned, §7); orthogonal `cancelled: bool` on all.
+`Aborted { phase: GracePhase }`, `NeverStarted` (membership terminal with no
+incarnation ever spawned, §7); orthogonal
+`Cancellation::{Observed, NotObserved}` on every exit.
 `ReadinessTimedOut.deadline` is the absolute expiry instant —
 `std::time::Instant` per this appendix's time rule, B.6's `restart_at`
 convention — so a retained exit stays interpretable; the configured
@@ -3630,7 +3632,7 @@ conflation, outlines, metrics) and port in full alongside it.
    startup, per-child `Abort` vs `Graceful`, startup-failure reporting with
    the started prefix left running (then host-driven rollback — the
    motivation for `start_or_shutdown()`), grace-bound enforcement with
-   `after_grace: true` and cancellation-before-escalation ordering read
+   `phase: GracePhase::AfterGrace` and cancellation-before-escalation ordering read
    from the child's own journal, and two full embed/run/stop cycles in one
    process.
 3. **Trading engine — cyclic wiring, pipelining, and a restart breaker.**

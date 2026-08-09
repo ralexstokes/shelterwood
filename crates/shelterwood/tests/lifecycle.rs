@@ -11,9 +11,10 @@ use crate::common::{
     POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_quiet, policy::never, poll_until,
 };
 use shelterwood::{
-    Actor, ActorOnceDef, Context, DynamicTree, ExitError, ExitKind, ExitResult, Intensity,
-    LifecycleEventKind, LifecycleItem, Readiness, Retention, ScopeState, Shutdown, StartupError,
-    StartupFailureCause, StopReason, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    Actor, ActorOnceDef, Cancellation, Context, DynamicTree, ExitError, ExitKind, ExitResult,
+    GracePhase, Intensity, LifecycleEventKind, LifecycleItem, Readiness, Retention, ScopeState,
+    Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeOnceDef, TaskDef, TaskOnceDef,
+    Tree,
 };
 
 #[tokio::test]
@@ -82,7 +83,7 @@ async fn fire_and_forget_owner_drop_still_tears_down() {
         .await
         .expect("owner drop completes teardown");
     assert!(matches!(exit.kind(), ExitKind::Completed));
-    assert!(exit.cancelled());
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
 #[tokio::test]
@@ -130,7 +131,9 @@ async fn framework_task_verdicts_remain_typed() {
         .expect("child grace bounds shutdown");
     assert!(matches!(
         abort_task.wait().await.kind(),
-        ExitKind::Aborted { after_grace: true }
+        ExitKind::Aborted {
+            phase: GracePhase::AfterGrace
+        }
     ));
 }
 
@@ -506,10 +509,15 @@ async fn abort_policy_task_exits_aborted_without_grace() {
         .expect("abort policy bounds teardown");
     let exit = task.wait().await;
     assert!(
-        matches!(exit.kind(), ExitKind::Aborted { after_grace: false }),
+        matches!(
+            exit.kind(),
+            ExitKind::Aborted {
+                phase: GracePhase::WithinGrace
+            }
+        ),
         "no grace ever ran, so the abort is not after-grace: {exit:?}"
     );
-    assert!(exit.cancelled());
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
 #[tokio::test]
@@ -536,5 +544,5 @@ async fn completion_during_the_tidy_beat_is_not_reclassified_as_abort() {
         matches!(exit.kind(), ExitKind::Completed),
         "the policy does not pre-decide the classification: {exit:?}"
     );
-    assert!(exit.cancelled());
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
 }

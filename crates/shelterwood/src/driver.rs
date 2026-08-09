@@ -8,8 +8,9 @@ use std::{
 };
 
 use crate::{
-    ChildId, Exit, ExitKind, Incarnation, IntensityTrip, Membership, Readiness, ReadinessDeadline,
-    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    Cancellation, ChildId, Exit, ExitKind, GracePhase, Incarnation, IntensityTrip, Membership,
+    Readiness, ReadinessDeadline, ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure,
+    StartupFailureCause,
     admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
     cells::{DynamicRoute, MailboxControl, MemberStage, ResidentProjection, ScopeCell},
     deadline::Deadline,
@@ -642,14 +643,19 @@ impl SystemRun {
         match runtime::join(driver).await {
             runtime::JoinOutcome::Ok { .. } => {}
             runtime::JoinOutcome::Panic { message, .. } => {
-                let exit = Exit::new(ExitKind::Panicked { message }, false);
+                let exit = Exit::new(ExitKind::Panicked { message }, Cancellation::NotObserved);
                 self.root
                     .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
             }
             runtime::JoinOutcome::Cancelled => {
                 self.root.finish_live_root_incarnation(
                     StopReason::ShutdownRequested,
-                    Exit::new(ExitKind::Aborted { after_grace: false }, true),
+                    Exit::new(
+                        ExitKind::Aborted {
+                            phase: GracePhase::WithinGrace,
+                        },
+                        Cancellation::Observed,
+                    ),
                 );
             }
         }
@@ -739,14 +745,19 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
         match runtime::join(driver).await {
             runtime::JoinOutcome::Ok { value, .. } => value,
             runtime::JoinOutcome::Panic { message, .. } => {
-                let exit = Exit::new(ExitKind::Panicked { message }, false);
+                let exit = Exit::new(ExitKind::Panicked { message }, Cancellation::NotObserved);
                 monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
                 StopReason::ShutdownRequested
             }
             runtime::JoinOutcome::Cancelled => {
                 monitor_root.finish_live_root_incarnation(
                     StopReason::ShutdownRequested,
-                    Exit::new(ExitKind::Aborted { after_grace: false }, true),
+                    Exit::new(
+                        ExitKind::Aborted {
+                            phase: GracePhase::WithinGrace,
+                        },
+                        Cancellation::Observed,
+                    ),
                 );
                 StopReason::ShutdownRequested
             }
@@ -807,7 +818,7 @@ struct ActiveChild {
     abort_handle: runtime::AbortHandle,
     ladder: Option<StopLadder>,
     forced_outcome: Option<RecordedOutcome>,
-    hard_abort_after_grace: Option<bool>,
+    hard_abort_phase: Option<GracePhase>,
     readiness: ReadinessGate,
     readiness_deadline: Option<DeadlineHandle>,
     ready_signal: Latch,
@@ -829,7 +840,12 @@ fn discharge_child_terminality(completion: ChildTerminality) {
     }
     let (exit, exited_incarnation) = if record.last_incarnation.is_some() {
         (
-            Exit::new(ExitKind::Aborted { after_grace: false }, true),
+            Exit::new(
+                ExitKind::Aborted {
+                    phase: GracePhase::WithinGrace,
+                },
+                Cancellation::Observed,
+            ),
             record.incarnation,
         )
     } else {
@@ -1373,7 +1389,9 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         let join = match runtime::join(handle).await {
             runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
             runtime::JoinOutcome::Panic { message, .. } => JoinVerdict::Panicked { message },
-            runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled { after_grace: false },
+            runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled {
+                phase: GracePhase::WithinGrace,
+            },
         };
         exit_ended.fire();
         // The task owns `report`, whose explicit record or Drop fallback runs
@@ -1627,7 +1645,7 @@ impl ScopeRuntime {
             abort_handle,
             ladder: None,
             forced_outcome: None,
-            hard_abort_after_grace: None,
+            hard_abort_phase: None,
             readiness,
             readiness_deadline: None,
             ready_signal: latches.ready,
@@ -1833,10 +1851,10 @@ impl ScopeRuntime {
                 StopAction::Escalate => {
                     active.abort.fire();
                 }
-                StopAction::AbortFramework { after_grace } => {
-                    active.hard_abort_after_grace = Some(after_grace);
+                StopAction::AbortFramework { phase } => {
+                    active.hard_abort_phase = Some(phase);
                     if active.forced_outcome.is_none() {
-                        active.forced_outcome = Some(RecordedOutcome::Aborted { after_grace });
+                        active.forced_outcome = Some(RecordedOutcome::Aborted { phase });
                     }
                     active
                         .framework_abort
@@ -1844,8 +1862,8 @@ impl ScopeRuntime {
                         .expect("framework action belongs only to a framework driver")
                         .fire();
                 }
-                StopAction::HardAbort { after_grace } => {
-                    active.hard_abort_after_grace = Some(after_grace);
+                StopAction::HardAbort { phase } => {
+                    active.hard_abort_phase = Some(phase);
                     active.abort_handle.abort();
                 }
             }
@@ -2040,13 +2058,16 @@ impl ScopeRuntime {
             runtime::dispose_detached(teardown);
         }
         active.readiness.step(ReadinessEvent::Exit);
-        if let (JoinVerdict::Cancelled { .. }, Some(after_grace)) =
-            (&join, active.hard_abort_after_grace)
-        {
-            join = JoinVerdict::Cancelled { after_grace };
+        if let (JoinVerdict::Cancelled { .. }, Some(phase)) = (&join, active.hard_abort_phase) {
+            join = JoinVerdict::Cancelled { phase };
         }
         let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
-        let exit = classify_exit(recorded, join, cancelled);
+        let cancellation = if cancelled {
+            Cancellation::Observed
+        } else {
+            Cancellation::NotObserved
+        };
+        let exit = classify_exit(recorded, join, cancellation);
         child.restarts.settle_if_stable(
             active.started_at,
             runtime::now(),
@@ -2201,7 +2222,7 @@ impl ScopeRuntime {
             // never-started child or a child between restart incarnations
             // keeps its already-authoritative verdict while disposal remains
             // ordered ahead of terminal routing.
-            terminal.exit = Exit::new(ExitKind::Panicked { message }, terminal.exit.cancelled());
+            terminal.exit = Exit::new(ExitKind::Panicked { message }, terminal.exit.cancellation());
         }
 
         let exit = terminal.exit;
@@ -2954,15 +2975,20 @@ async fn run_scope_incarnation(
         if let Some(reason) = scope.finish_if_ready() {
             let root_exit = is_root.then(|| match &reason {
                 StopReason::Finished | StopReason::ShutdownRequested => {
-                    Exit::new(ExitKind::Completed, reason == StopReason::ShutdownRequested)
+                    let cancellation = if reason == StopReason::ShutdownRequested {
+                        Cancellation::Observed
+                    } else {
+                        Cancellation::NotObserved
+                    };
+                    Exit::new(ExitKind::Completed, cancellation)
                 }
                 StopReason::IntensityTripped(trip) => Exit::new(
                     ExitKind::Failed(crate::ExitError::from_intensity_trip(trip.clone())),
-                    false,
+                    Cancellation::NotObserved,
                 ),
                 StopReason::StartupFailed(failure) => Exit::new(
                     ExitKind::Failed(crate::ExitError::from_startup_failure(failure.clone())),
-                    false,
+                    Cancellation::NotObserved,
                 ),
                 StopReason::NeverStarted => Exit::never_started(),
             });
@@ -3024,10 +3050,10 @@ mod tests {
     };
 
     use crate::{
-        ActorRef, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind, Intensity,
-        LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline,
-        RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause,
-        StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+        ActorRef, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
+        GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness,
+        ReadinessDeadline, RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError,
+        StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
         engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
         identity::{FenceCounter, ScopeIdentity},
@@ -3173,7 +3199,12 @@ mod tests {
         scope.finish_root_incarnation(
             epoch,
             StopReason::ShutdownRequested,
-            Exit::new(ExitKind::Aborted { after_grace: false }, true),
+            Exit::new(
+                ExitKind::Aborted {
+                    phase: GracePhase::WithinGrace,
+                },
+                Cancellation::Observed,
+            ),
         );
         assert!(matches!(
             scope.member.record().stage,
@@ -4135,7 +4166,7 @@ mod tests {
         let first_exit = Exit::never_started();
         let probe = Arc::new(ObserveMemberOnMailboxWake {
             member: Arc::clone(&member),
-            competing_exit: Exit::new(ExitKind::Completed, false),
+            competing_exit: Exit::new(ExitKind::Completed, Cancellation::NotObserved),
             observed: Mutex::new(None),
         });
         let waker = Waker::from(Arc::clone(&probe));
@@ -4176,7 +4207,7 @@ mod tests {
         member.stage_terminal_before_mailbox(first_exit.clone());
         let probe = Arc::new(ObserveMemberOnMailboxWake {
             member: Arc::clone(&member),
-            competing_exit: Exit::new(ExitKind::Completed, false),
+            competing_exit: Exit::new(ExitKind::Completed, Cancellation::NotObserved),
             observed: Mutex::new(None),
         });
         let waker = Waker::from(Arc::clone(&probe));
@@ -4212,18 +4243,21 @@ mod tests {
             identity.mint_membership(&id).expect("membership available"),
         );
         let start = Arc::new(Barrier::new(3));
-        let workers = [Exit::never_started(), Exit::new(ExitKind::Completed, false)]
-            .into_iter()
-            .map(|exit| {
-                let member = Arc::clone(&member);
-                let start = Arc::clone(&start);
-                std::thread::spawn(move || {
-                    start.wait();
-                    member.terminalize(exit);
-                    assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
-                })
+        let workers = [
+            Exit::never_started(),
+            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        ]
+        .into_iter()
+        .map(|exit| {
+            let member = Arc::clone(&member);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                member.terminalize(exit);
+                assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
             })
-            .collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
         start.wait();
         for worker in workers {
             worker.join().expect("terminalizer thread succeeds");
@@ -4638,7 +4672,7 @@ mod tests {
         let member = MemberCell::new(id, membership);
         let previous = Exit::new(
             ExitKind::Failed(ExitError::message("last completed incarnation")),
-            false,
+            Cancellation::NotObserved,
         );
         member.update(|record| {
             record.stage = MemberStage::Restarting;
@@ -4715,7 +4749,7 @@ mod tests {
         };
         let previous = Exit::new(
             ExitKind::Failed(ExitError::message("last completed incarnation")),
-            false,
+            Cancellation::NotObserved,
         );
         root.transition_child(
             &scope.children[key].slot.member,
@@ -4967,7 +5001,7 @@ mod tests {
         member.update(|record| {
             record.stage = MemberStage::Restarting;
             record.last_incarnation = Some(first);
-            record.last_exit = Some(Exit::new(ExitKind::Completed, false));
+            record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
         });
         scope.set_state(ScopeState::Stopped {
             reason: StopReason::Finished,
@@ -4989,7 +5023,7 @@ mod tests {
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
         assert!(parent.terminalize_child(
             &member,
-            Exit::new(ExitKind::Completed, false),
+            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
             None,
             false
         ));

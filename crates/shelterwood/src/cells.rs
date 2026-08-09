@@ -9,7 +9,7 @@
 use std::{
     fmt,
     sync::{
-        Arc, Mutex, OnceLock, RwLock, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
@@ -23,7 +23,8 @@ use crate::{
     identity::ScopeIdentity,
     observe::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-        LifecycleHub, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
+        LifecycleHub, LifecycleSeq, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub,
+        SnapshotReceiver,
     },
     plan::SlotCell,
     policy::{ResolvedCommonOptions, ScopeFlavor},
@@ -80,6 +81,13 @@ pub(crate) enum MemberStage {
     Terminal(Exit),
 }
 
+/// Whether a terminal child incarnation failed during aggregate startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartupDisposition {
+    NotAborted,
+    Aborted,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MemberRecord {
     pub(crate) stage: MemberStage,
@@ -105,20 +113,33 @@ pub(crate) struct MemberCell {
 }
 
 #[derive(Default)]
-struct MemberMailbox {
-    control: Option<Arc<dyn MailboxControl>>,
-    terminal: Option<Exit>,
-    teardown: Option<Box<dyn MailboxTermination>>,
+enum MemberMailbox {
+    #[default]
+    Unattached,
+    Attached(Arc<dyn MailboxControl>),
+    Terminal {
+        control: Option<Arc<dyn MailboxControl>>,
+        exit: Exit,
+        teardown: Option<Box<dyn MailboxTermination>>,
+    },
 }
 
 impl fmt::Debug for MemberMailbox {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("MemberMailbox")
-            .field("control", &self.control)
-            .field("terminal", &self.terminal)
-            .field("teardown_pending", &self.teardown.is_some())
-            .finish()
+        match self {
+            Self::Unattached => formatter.write_str("Unattached"),
+            Self::Attached(control) => formatter.debug_tuple("Attached").field(control).finish(),
+            Self::Terminal {
+                control,
+                exit,
+                teardown,
+            } => formatter
+                .debug_struct("Terminal")
+                .field("control", control)
+                .field("exit", exit)
+                .field("teardown_pending", &teardown.is_some())
+                .finish(),
+        }
     }
 }
 
@@ -182,8 +203,12 @@ impl MemberCell {
     #[cfg(test)]
     pub(crate) fn stage_terminal_before_mailbox(&self, exit: Exit) {
         let mut mailbox = self.mailbox.lock().expect("member mailbox mutex poisoned");
-        assert!(mailbox.control.is_none());
-        mailbox.terminal = Some(exit);
+        assert!(matches!(*mailbox, MemberMailbox::Unattached));
+        *mailbox = MemberMailbox::Terminal {
+            control: None,
+            exit,
+            teardown: None,
+        };
     }
 
     pub(crate) fn terminal_disposal_pending(&self) -> bool {
@@ -219,7 +244,7 @@ impl MemberCell {
             crate::policy::resolve_common(
                 &crate::policy::CommonOptions::default(),
                 &crate::policy::ResolvedDefaults::default(),
-                false,
+                crate::policy::ChildMode::Restartable,
                 Readiness::Immediate,
             )
             .expect("library defaults must be valid")
@@ -229,14 +254,26 @@ impl MemberCell {
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
         let terminal_exit = {
             let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            assert!(state.control.is_none(), "a member can own only one mailbox");
-            state.control = Some(Arc::clone(&mailbox));
-            let terminal_exit = state.terminal.clone();
-            if terminal_exit.is_some() {
-                debug_assert!(state.teardown.is_none());
-                state.teardown = mailbox.prepare_termination();
+            match &mut *state {
+                MemberMailbox::Unattached => {
+                    *state = MemberMailbox::Attached(mailbox);
+                    None
+                }
+                MemberMailbox::Attached(_)
+                | MemberMailbox::Terminal {
+                    control: Some(_), ..
+                } => panic!("a member can own only one mailbox"),
+                MemberMailbox::Terminal {
+                    control,
+                    exit,
+                    teardown,
+                } => {
+                    debug_assert!(teardown.is_none());
+                    *teardown = mailbox.prepare_termination();
+                    *control = Some(mailbox);
+                    Some(exit.clone())
+                }
             }
-            terminal_exit
         };
         if let Some(terminal_exit) = terminal_exit {
             self.publish_terminal(terminal_exit);
@@ -244,26 +281,39 @@ impl MemberCell {
     }
 
     pub(crate) fn mailbox(&self) -> Option<Arc<dyn MailboxControl>> {
-        self.mailbox
-            .lock()
-            .expect("member mailbox mutex poisoned")
-            .control
-            .clone()
+        match &*self.mailbox.lock().expect("member mailbox mutex poisoned") {
+            MemberMailbox::Unattached => None,
+            MemberMailbox::Attached(control) => Some(Arc::clone(control)),
+            MemberMailbox::Terminal { control, .. } => control.clone(),
+        }
     }
 
     pub(crate) fn terminalize(&self, exit: Exit) {
         let terminal_exit = {
             let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
-            if let Some(terminal_exit) = &state.terminal {
-                terminal_exit.clone()
-            } else {
-                let teardown = state
-                    .control
-                    .as_ref()
-                    .and_then(|mailbox| mailbox.prepare_termination());
-                state.terminal = Some(exit.clone());
-                state.teardown = teardown;
-                exit
+            match &*state {
+                MemberMailbox::Terminal {
+                    exit: terminal_exit,
+                    ..
+                } => terminal_exit.clone(),
+                MemberMailbox::Unattached => {
+                    *state = MemberMailbox::Terminal {
+                        control: None,
+                        exit: exit.clone(),
+                        teardown: None,
+                    };
+                    exit
+                }
+                MemberMailbox::Attached(control) => {
+                    let control = Arc::clone(control);
+                    let teardown = control.prepare_termination();
+                    *state = MemberMailbox::Terminal {
+                        control: Some(control),
+                        exit: exit.clone(),
+                        teardown,
+                    };
+                    exit
+                }
             }
         };
         self.publish_terminal(terminal_exit);
@@ -284,12 +334,12 @@ impl MemberCell {
         // member terminality. The watch pulse is deliberately delayed until
         // teardown has synchronously finished and unread payload ownership has
         // moved to detached disposal.
-        let teardown = self
-            .mailbox
-            .lock()
-            .expect("member mailbox mutex poisoned")
-            .teardown
-            .take();
+        let teardown = match &mut *self.mailbox.lock().expect("member mailbox mutex poisoned") {
+            MemberMailbox::Terminal { teardown, .. } => teardown.take(),
+            MemberMailbox::Unattached | MemberMailbox::Attached(_) => {
+                unreachable!("terminal publication requires terminal mailbox state")
+            }
+        };
         if let Some(teardown) = teardown
             && let Some(payload) = teardown.finish()
         {
@@ -347,6 +397,30 @@ pub(crate) trait DynamicRoute: Send + Sync {
 
     #[cfg(test)]
     fn request_forwarder_probe(&self) -> (Latch, Latch);
+}
+
+/// Shared critical section for one resident tree's observation projection.
+///
+/// Gate identity, rather than the lock payload, defines tree membership. The
+/// lock deliberately tolerates poisoning: a panic in an observation path must
+/// not permanently wedge later observation or a subtree handoff.
+#[derive(Clone, Debug)]
+pub(crate) struct ObservationGate(Arc<Mutex<()>>);
+
+impl ObservationGate {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(())))
+    }
+
+    pub(crate) fn same_gate(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// Driver-independent view of one declaration slot while its membership is
@@ -447,7 +521,7 @@ pub(crate) struct ScopeCell {
     // inside a mutation callback would self-deadlock; adding one there is safe.
     current_children: runtime::WatchSender<Vec<ResidentChild>>,
     parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
-    observation_gate: RwLock<Arc<Mutex<()>>>,
+    observation_gate: RwLock<ObservationGate>,
     lifecycle_seq: AtomicU64,
     lifecycle: LifecycleHub,
     snapshots: SnapshotHub,
@@ -507,7 +581,7 @@ impl ScopeCell {
             dynamic_route: Mutex::new(None),
             current_children,
             parent,
-            observation_gate: RwLock::new(Arc::new(Mutex::new(()))),
+            observation_gate: RwLock::new(ObservationGate::new()),
             lifecycle_seq: AtomicU64::new(0),
             lifecycle: LifecycleHub::default(),
             snapshots: SnapshotHub::default(),
@@ -554,7 +628,7 @@ impl ScopeCell {
     }
 
     #[cfg(test)]
-    pub(crate) fn observation_gate(&self) -> Arc<Mutex<()>> {
+    pub(crate) fn observation_gate(&self) -> ObservationGate {
         self.current_observation_gate()
     }
 
@@ -582,16 +656,14 @@ impl ScopeCell {
         }
     }
 
-    fn current_observation_gate(&self) -> Arc<Mutex<()>> {
-        Arc::clone(
-            &self
-                .observation_gate
-                .read()
-                .expect("observation gate handoff mutex poisoned"),
-        )
+    fn current_observation_gate(&self) -> ObservationGate {
+        self.observation_gate
+            .read()
+            .expect("observation gate handoff mutex poisoned")
+            .clone()
     }
 
-    fn adopt_observation_gate(&self, parent: &ScopeCell, gate: &Arc<Mutex<()>>) {
+    fn adopt_observation_gate(&self, parent: &ScopeCell, gate: &ObservationGate) {
         debug_assert!(
             !std::ptr::eq(self, parent),
             "a scope cannot adopt from itself"
@@ -600,12 +672,12 @@ impl ScopeCell {
         // Re-homing the parent would first have to acquire that same gate, so
         // rereading its installed pointer here cannot race a parent handoff.
         debug_assert!(
-            Arc::ptr_eq(gate, &parent.current_observation_gate()),
+            gate.same_gate(&parent.current_observation_gate()),
             "observation gates are adopted only in the parent-to-child direction"
         );
         loop {
             let current = self.current_observation_gate();
-            if Arc::ptr_eq(&current, gate) {
+            if current.same_gate(gate) {
                 return;
             }
 
@@ -616,15 +688,13 @@ impl ScopeCell {
             // check may finish its complete edge before handoff. An operation
             // that merely captured this obsolete gate retries after acquiring
             // it and observing the replacement.
-            let current_guard = current
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current_guard = current.lock();
             let mut installed = self
                 .observation_gate
                 .write()
                 .expect("observation gate handoff mutex poisoned");
-            if Arc::ptr_eq(&current, &installed) {
-                *installed = Arc::clone(gate);
+            if current.same_gate(&installed) {
+                *installed = gate.clone();
                 drop(installed);
                 self.adopt_descendant_observation_gates_locked(&current, gate);
                 drop(current_guard);
@@ -640,8 +710,8 @@ impl ScopeCell {
     /// while the handoff is installed recursively.
     fn adopt_descendant_observation_gates_locked(
         &self,
-        previous: &Arc<Mutex<()>>,
-        gate: &Arc<Mutex<()>>,
+        previous: &ObservationGate,
+        gate: &ObservationGate,
     ) {
         let descendants = self.current_children.read_with(|children| {
             children
@@ -654,11 +724,11 @@ impl ScopeCell {
                 .observation_gate
                 .write()
                 .expect("observation gate handoff mutex poisoned");
-            if Arc::ptr_eq(&installed, previous) {
-                *installed = Arc::clone(gate);
+            if installed.same_gate(previous) {
+                *installed = gate.clone();
             } else {
                 assert!(
-                    Arc::ptr_eq(&installed, gate),
+                    installed.same_gate(gate),
                     "one resident tree must share one observation gate"
                 );
             }
@@ -676,10 +746,8 @@ impl ScopeCell {
             let gate = self.current_observation_gate();
             #[cfg(test)]
             self.report_gate_capture(GateCapture::Observation);
-            let guard = gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if Arc::ptr_eq(&gate, &self.current_observation_gate()) {
+            let guard = gate.lock();
+            if gate.same_gate(&self.current_observation_gate()) {
                 let operation = operation
                     .take()
                     .expect("observation operation runs exactly once");
@@ -758,7 +826,7 @@ impl ScopeCell {
         member: &MemberCell,
         exit: Exit,
         exited_incarnation: Option<Incarnation>,
-        startup_aborted: bool,
+        startup: StartupDisposition,
     ) -> bool {
         self.with_observation_gate(|| {
             let record = member.record();
@@ -781,7 +849,9 @@ impl ScopeCell {
                     .and_then(|resident| resident.projection.scope.as_ref())
                     .cloned()
             });
-            member.update_locked(|record| record.startup_aborted = startup_aborted);
+            member.update_locked(|record| {
+                record.startup_aborted = startup == StartupDisposition::Aborted;
+            });
             member.terminalize(exit.clone());
             if record.last_incarnation.is_none()
                 && let Some(scope) = &nested
@@ -881,7 +951,7 @@ impl ScopeCell {
             strategy: (self.flavor == ScopeFlavor::Ordered).then_some(config.strategy),
             intensity: config.intensity,
             total_restarts: record.total_restarts,
-            lifecycle_seq: self.lifecycle_seq.load(Ordering::Acquire),
+            lifecycle_seq: LifecycleSeq::new(self.lifecycle_seq.load(Ordering::Acquire)),
             children: children.into(),
         })
     }
@@ -922,7 +992,7 @@ impl ScopeCell {
             scope_seq: child
                 .scope
                 .as_ref()
-                .map(|scope| scope.lifecycle_seq.load(Ordering::Acquire)),
+                .map(|scope| LifecycleSeq::new(scope.lifecycle_seq.load(Ordering::Acquire))),
         }
     }
 
@@ -956,7 +1026,7 @@ impl ScopeCell {
             })
             .ok()
             .map(|previous| previous.saturating_add(1));
-        let Some(seq) = seq else {
+        let Some(seq) = seq.map(LifecycleSeq::new) else {
             self.lifecycle_seq.store(u64::MAX, Ordering::Release);
             self.publish_snapshot_chain_locked();
             self.lifecycle.publish_lagged(1);
@@ -994,7 +1064,7 @@ impl ScopeCell {
     }
 
     #[cfg(test)]
-    pub(crate) fn replace_observation_gate(&self, gate: Arc<Mutex<()>>) {
+    pub(crate) fn replace_observation_gate(&self, gate: ObservationGate) {
         *self
             .observation_gate
             .write()

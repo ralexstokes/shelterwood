@@ -446,8 +446,11 @@ enum MailboxKind {
 
 struct Envelope<M> {
     message: M,
-    accepted_sequence: u64,
+    accepted_sequence: AcceptedSequence,
 }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct AcceptedSequence(u64);
 
 enum OperationOutcome<M> {
     Waiting {
@@ -573,6 +576,16 @@ enum Submission<M> {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct WaiterId(u64);
 
+impl WaiterId {
+    const ZERO: Self = Self(0);
+    const POISON: Self = Self(u64::MAX);
+
+    fn checked_next(self) -> Option<Self> {
+        let next = self.0.checked_add(1)?;
+        (next != Self::POISON.0).then_some(Self(next))
+    }
+}
+
 /// FIFO registrations with direct removal by a send operation.
 ///
 /// Monotonic keys are insertion order, so the first map entry is the oldest
@@ -581,7 +594,7 @@ struct WaiterId(u64);
 /// instead of wrapping back into the live id domain.
 struct WaiterQueue<M> {
     entries: BTreeMap<WaiterId, Arc<SendOperation<M>>>,
-    next_id: u64,
+    next_id: WaiterId,
     #[cfg(test)]
     direct_removals: usize,
 }
@@ -590,7 +603,7 @@ impl<M> Default for WaiterQueue<M> {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
-            next_id: 0,
+            next_id: WaiterId::ZERO,
             #[cfg(test)]
             direct_removals: 0,
         }
@@ -608,18 +621,14 @@ impl<M> WaiterQueue<M> {
     }
 
     fn push_back(&mut self, operation: Arc<SendOperation<M>>) -> WaiterId {
-        let Some(next) = self.next_id.checked_add(1) else {
+        let Some(next) = self.next_id.checked_next() else {
+            self.next_id = WaiterId::POISON;
             panic!("mailbox waiter identity space exhausted");
         };
-        if next == u64::MAX {
-            self.next_id = u64::MAX;
-            panic!("mailbox waiter identity space exhausted");
-        }
         self.next_id = next;
-        let id = WaiterId(next);
-        let replaced = self.entries.insert(id, operation);
+        let replaced = self.entries.insert(next, operation);
         debug_assert!(replaced.is_none());
-        id
+        next
     }
 
     fn park(&mut self, operation: &Arc<SendOperation<M>>) {
@@ -877,7 +886,7 @@ impl<M: Send + 'static> MailboxCell<M> {
         }
     }
 
-    fn mint_accepted_sequence(&self) -> u64 {
+    fn mint_accepted_sequence(&self) -> AcceptedSequence {
         mint_accepted_sequence(&self.accepted)
     }
 
@@ -948,7 +957,7 @@ impl<M: Send + 'static> MailboxCell<M> {
         &self,
         incarnation: Incarnation,
         mode: ReceiveMode,
-        accepted_through: Option<u64>,
+        accepted_through: Option<AcceptedSequence>,
     ) -> Option<M> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         let eligible = match state.status {
@@ -1008,8 +1017,8 @@ impl<M: Send + 'static> MailboxCell<M> {
         self.changed.watcher()
     }
 
-    fn accepted_sequence(&self) -> u64 {
-        self.accepted.load(Ordering::Acquire)
+    fn accepted_sequence(&self) -> AcceptedSequence {
+        AcceptedSequence(self.accepted.load(Ordering::Acquire))
     }
 }
 
@@ -1191,13 +1200,15 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
     }
 }
 
-fn mint_accepted_sequence(accepted: &AtomicU64) -> u64 {
-    accepted
-        .try_update(Ordering::Release, Ordering::Relaxed, |accepted| {
-            Some(accepted.saturating_add(1))
-        })
-        .expect("accepted sequence updates never reject")
-        .saturating_add(1)
+fn mint_accepted_sequence(accepted: &AtomicU64) -> AcceptedSequence {
+    AcceptedSequence(
+        accepted
+            .try_update(Ordering::Release, Ordering::Relaxed, |accepted| {
+                Some(accepted.saturating_add(1))
+            })
+            .expect("accepted sequence updates never reject")
+            .saturating_add(1),
+    )
 }
 
 fn promote_waiters<M: Send + 'static>(
@@ -1848,7 +1859,7 @@ impl<M: Send + 'static> MailboxReceiver<M> {
             .receive(self.incarnation, ReceiveMode::LiveOnly, None)
     }
 
-    pub(crate) fn try_recv_live_through(&self, accepted_sequence: u64) -> Option<M> {
+    pub(crate) fn try_recv_live_through(&self, accepted_sequence: AcceptedSequence) -> Option<M> {
         self.mailbox.receive(
             self.incarnation,
             ReceiveMode::LiveOnly,
@@ -1856,7 +1867,7 @@ impl<M: Send + 'static> MailboxReceiver<M> {
         )
     }
 
-    pub(crate) fn accepted_sequence(&self) -> u64 {
+    pub(crate) fn accepted_sequence(&self) -> AcceptedSequence {
         self.mailbox.accepted_sequence()
     }
 
@@ -1928,8 +1939,7 @@ mod tests {
             .mint_membership(&ChildId::from("actor"))
             .expect("membership available");
         let mut incarnations = identity.incarnation_counter(membership);
-        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
-            .expect("incarnation available");
+        let incarnation = incarnations.mint().expect("incarnation available");
 
         MailboxControl::bind(&*mailbox, incarnation);
     }
@@ -1945,10 +1955,8 @@ mod tests {
             .mint_membership(&ChildId::from("actor"))
             .expect("membership available");
         let mut incarnations = identity.incarnation_counter(membership);
-        let first = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
-            .expect("first incarnation available");
-        let second = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
-            .expect("second incarnation available");
+        let first = incarnations.mint().expect("first incarnation available");
+        let second = incarnations.mint().expect("second incarnation available");
 
         MailboxControl::bind(&*mailbox, first);
         MailboxControl::bind(&*mailbox, second);
@@ -2017,10 +2025,9 @@ mod tests {
             let membership = identity
                 .mint_membership(&ChildId::from("actor"))
                 .expect("membership available");
-            (membership, identity.incarnation_counter(membership))
+            identity.incarnation_counter(membership)
         };
-        let incarnation = ScopeIdentity::mint_incarnation(generations.0, &mut generations.1)
-            .expect("incarnation available");
+        let incarnation = generations.mint().expect("incarnation available");
 
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -2151,7 +2158,7 @@ mod tests {
     #[test]
     fn waiter_identity_exhaustion_poison_is_never_minted() {
         let mut waiters = super::WaiterQueue {
-            next_id: u64::MAX - 2,
+            next_id: super::WaiterId(u64::MAX - 2),
             ..super::WaiterQueue::default()
         };
         let last = waiters.push_back(super::SendOperation::new(1_u8));
@@ -2164,8 +2171,8 @@ mod tests {
             .is_err(),
             "the poison key is never minted"
         );
-        assert_eq!(waiters.next_id, u64::MAX);
-        assert!(!waiters.entries.contains_key(&super::WaiterId(u64::MAX)));
+        assert_eq!(waiters.next_id, super::WaiterId::POISON);
+        assert!(!waiters.entries.contains_key(&super::WaiterId::POISON));
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
                 waiters.push_back(super::SendOperation::new(3_u8));
@@ -2251,8 +2258,7 @@ mod tests {
             .mint_membership(&ChildId::from("actor"))
             .expect("membership available");
         let mut incarnations = identity.incarnation_counter(membership);
-        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
-            .expect("incarnation available");
+        let incarnation = incarnations.mint().expect("incarnation available");
         MailboxControl::bind(&*mailbox, incarnation);
 
         let mut send = Box::pin(actor.send(1));

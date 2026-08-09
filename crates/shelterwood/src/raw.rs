@@ -18,8 +18,8 @@ use crate::{
     cancellation::CancellationToken,
     cells::{MailboxControl, MemberCell},
     definition::DefinitionSource,
-    mailbox::{MailboxCell, MailboxReceiver},
-    policy::CommonOptions,
+    mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
+    policy::{ChildMode, CommonOptions},
     runtime::{
         self, ActorWork, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher, catch_panic,
         discard_panic, keep_first_panic, resume_preferred_panic,
@@ -352,12 +352,27 @@ enum TimerMessage<M> {
     Interval(M, fn(&M) -> M),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct ArmingOrder(u64);
+
+impl ArmingOrder {
+    const ZERO: Self = Self(0);
+    const MAX: Self = Self(u64::MAX);
+
+    fn saturating_next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct KeyHash(u64);
+
 struct TimerEntry<M> {
     key: Box<dyn Any + Send>,
     /// `None` when the requested delay overflows the clock: a deadline that
     /// never arrives, mirroring the offload path — never "due now".
     deadline: Option<Instant>,
-    arming_order: u64,
+    arming_order: ArmingOrder,
     message: TimerMessage<M>,
     period: Option<Duration>,
 }
@@ -370,9 +385,9 @@ struct TimerEntry<M> {
 /// preserve `Eq` semantics in the unlikely event of a collision.
 struct TimerStore<M> {
     key_hasher: RandomState,
-    keyed: HashMap<u64, Vec<TimerEntry<M>>>,
-    armings: HashMap<u64, u64>,
-    deadlines: BTreeSet<(Instant, u64)>,
+    keyed: HashMap<KeyHash, Vec<TimerEntry<M>>>,
+    armings: HashMap<ArmingOrder, KeyHash>,
+    deadlines: BTreeSet<(Instant, ArmingOrder)>,
     #[cfg(test)]
     lookup_probes: usize,
 }
@@ -391,8 +406,8 @@ impl<M> Default for TimerStore<M> {
 }
 
 impl<M> TimerStore<M> {
-    fn hash_key<K: Hash + 'static>(&self, key: &K) -> u64 {
-        self.key_hasher.hash_one((TypeId::of::<K>(), key))
+    fn hash_key<K: Hash + 'static>(&self, key: &K) -> KeyHash {
+        KeyHash(self.key_hasher.hash_one((TypeId::of::<K>(), key)))
     }
 
     fn is_empty(&self) -> bool {
@@ -409,7 +424,7 @@ impl<M> TimerStore<M> {
         &mut self,
         key: K,
         deadline: Option<Instant>,
-        arming_order: u64,
+        arming_order: ArmingOrder,
         message: TimerMessage<M>,
         period: Option<Duration>,
     ) where
@@ -464,7 +479,7 @@ impl<M> TimerStore<M> {
         Some(entry)
     }
 
-    fn remove_arming(&mut self, arming_order: u64) -> Option<TimerEntry<M>> {
+    fn remove_arming(&mut self, arming_order: ArmingOrder) -> Option<TimerEntry<M>> {
         let hash = self.armings.remove(&arming_order)?;
         let (entry, empty) = {
             let bucket = self
@@ -487,7 +502,7 @@ impl<M> TimerStore<M> {
         Some(entry)
     }
 
-    fn entry_mut(&mut self, arming_order: u64) -> Option<&mut TimerEntry<M>> {
+    fn entry_mut(&mut self, arming_order: ArmingOrder) -> Option<&mut TimerEntry<M>> {
         let hash = *self.armings.get(&arming_order)?;
         let entry = self
             .keyed
@@ -499,10 +514,10 @@ impl<M> TimerStore<M> {
         Some(entry)
     }
 
-    fn take_due(&mut self, now: Instant) -> VecDeque<u64> {
+    fn take_due(&mut self, now: Instant) -> VecDeque<ArmingOrder> {
         let due = self
             .deadlines
-            .range(..=(now, u64::MAX))
+            .range(..=(now, ArmingOrder::MAX))
             .copied()
             .collect::<Vec<_>>();
         for deadline in &due {
@@ -511,7 +526,7 @@ impl<M> TimerStore<M> {
         due.into_iter().map(|(_, arming)| arming).collect()
     }
 
-    fn arm_deadline(&mut self, arming_order: u64, deadline: Option<Instant>) {
+    fn arm_deadline(&mut self, arming_order: ArmingOrder, deadline: Option<Instant>) {
         if let Some(deadline) = deadline {
             self.deadlines.insert((deadline, arming_order));
         }
@@ -523,9 +538,9 @@ impl<M> TimerStore<M> {
 }
 
 struct FiredTimerBatch {
-    armings: VecDeque<u64>,
+    armings: VecDeque<ArmingOrder>,
     continuations_remaining: usize,
-    mailbox_through: u64,
+    mailbox_through: AcceptedSequence,
     mailbox_complete: bool,
     offloads_remaining: usize,
     offloads_complete: bool,
@@ -710,7 +725,7 @@ struct RawResources<M> {
     // capture wait behind the next mailbox message and cannot starve it.
     offloads_lead: usize,
     timers: TimerStore<M>,
-    next_timer_order: u64,
+    next_timer_order: ArmingOrder,
     fired_batch: Option<FiredTimerBatch>,
     events: Arc<EventQueue<M>>,
     panic: Arc<PanicSlot>,
@@ -728,7 +743,7 @@ impl<M> Default for RawResources<M> {
             continuation_needs_external: false,
             offloads_lead: 0,
             timers: TimerStore::default(),
-            next_timer_order: 0,
+            next_timer_order: ArmingOrder::ZERO,
             fired_batch: None,
             events,
             panic: Arc::new(PanicSlot::default()),
@@ -1122,7 +1137,7 @@ impl<M: Send + 'static> RawContext<M> {
     ) where
         K: Hash + Eq + Send + 'static,
     {
-        self.resources.next_timer_order = self.resources.next_timer_order.saturating_add(1);
+        self.resources.next_timer_order = self.resources.next_timer_order.saturating_next();
         let now = runtime::now();
         let deadline = crate::deadline::Deadline::after(now, after).instant();
         self.resources.timers.replace(
@@ -1378,7 +1393,7 @@ impl<M: Send + 'static> RawContext<M> {
         });
     }
 
-    fn deliver_timer(&mut self, arming: u64) -> Option<M> {
+    fn deliver_timer(&mut self, arming: ArmingOrder) -> Option<M> {
         let entry = self.resources.timers.entry_mut(arming)?;
         if let Some(period) = entry.period {
             let deadline = crate::deadline::Deadline::after(runtime::now(), period).instant();
@@ -1685,6 +1700,14 @@ pub(crate) struct RawConstruction {
 }
 
 impl RawConstruction {
+    pub(crate) fn mode(&self) -> ChildMode {
+        if self.source.is_one_shot() {
+            ChildMode::OneShot
+        } else {
+            ChildMode::Restartable
+        }
+    }
+
     pub(crate) fn one_shot(&self) -> bool {
         self.source.is_one_shot()
     }
@@ -2088,7 +2111,11 @@ mod timer_store_tests {
         time::{Duration, Instant},
     };
 
-    use super::{TimerMessage, TimerStore};
+    use super::{ArmingOrder, TimerMessage, TimerStore};
+
+    fn order(value: u64) -> ArmingOrder {
+        ArmingOrder(value)
+    }
 
     #[derive(Eq, PartialEq)]
     struct CollidingKey(u8);
@@ -2113,21 +2140,21 @@ mod timer_store_tests {
         timers.replace(
             7_u8,
             Some(start + Duration::from_secs(3)),
-            1,
+            order(1),
             TimerMessage::Once("old-u8"),
             None,
         );
         timers.replace(
             7_u16,
             Some(start + Duration::from_secs(1)),
-            2,
+            order(2),
             TimerMessage::Once("u16"),
             None,
         );
         timers.replace(
             7_u8,
             Some(start + Duration::from_secs(2)),
-            3,
+            order(3),
             TimerMessage::Once("new-u8"),
             None,
         );
@@ -2135,15 +2162,15 @@ mod timer_store_tests {
         assert_eq!(timers.next_deadline(), Some(start + Duration::from_secs(1)));
         assert_eq!(
             timers.take_due(start + Duration::from_secs(3)),
-            [2, 3],
+            [order(2), order(3)],
             "different key types coexist and replacement takes a fresh order"
         );
         assert_eq!(
-            once(timers.remove_arming(2).expect("u16 timer remains")),
+            once(timers.remove_arming(order(2)).expect("u16 timer remains")),
             "u16"
         );
         assert_eq!(
-            once(timers.remove_arming(3).expect("replacement remains")),
+            once(timers.remove_arming(order(3)).expect("replacement remains")),
             "new-u8"
         );
         assert!(timers.is_empty());
@@ -2152,12 +2179,24 @@ mod timer_store_tests {
     #[test]
     fn hash_collision_uses_exact_erased_key_equality() {
         let mut timers = TimerStore::default();
-        timers.replace(CollidingKey(1), None, 1, TimerMessage::Once("first"), None);
-        timers.replace(CollidingKey(2), None, 2, TimerMessage::Once("second"), None);
         timers.replace(
             CollidingKey(1),
             None,
-            3,
+            order(1),
+            TimerMessage::Once("first"),
+            None,
+        );
+        timers.replace(
+            CollidingKey(2),
+            None,
+            order(2),
+            TimerMessage::Once("second"),
+            None,
+        );
+        timers.replace(
+            CollidingKey(1),
+            None,
+            order(3),
             TimerMessage::Once("replacement"),
             None,
         );
@@ -2202,7 +2241,7 @@ mod timer_store_tests {
             timers.replace(
                 key,
                 Some(start + Duration::from_secs((TIMERS - index) as u64)),
-                index as u64,
+                order(index as u64),
                 TimerMessage::Once(()),
                 None,
             );

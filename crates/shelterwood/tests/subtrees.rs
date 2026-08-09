@@ -9,11 +9,12 @@ use std::{
 
 use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
-    Actor, ActorOnceDef, Backoff, ChildState, Context, DefaultsInheritance, DynamicTree, ExitError,
-    ExitKind, ExitResult, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
-    Mailbox, MailboxShutdown, Readiness, ReadinessDeadline, RestartCondition, RestartPolicy,
-    ScopeDefaults, SendErrorKind, Shutdown, StartupError, StartupFailureCause, StopReason,
-    SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, Tree,
+    Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DefaultsInheritance,
+    DynamicTree, ExitError, ExitKind, ExitResult, GracePhase, Intensity, LifecycleEventKind,
+    LifecycleItem, LifecycleTryRecvError, Mailbox, MailboxShutdown, Readiness, ReadinessDeadline,
+    RestartCondition, RestartPolicy, ScopeDefaults, SendErrorKind, Shutdown, StartupError,
+    StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef,
+    Tree,
 };
 
 #[tokio::test]
@@ -462,7 +463,7 @@ async fn hard_aborted_subtree_descendants_still_publish_exits() {
         .await
         .expect("hard-aborted descendants terminalize");
     assert!(matches!(exit.kind(), ExitKind::Aborted { .. }));
-    assert!(exit.cancelled());
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -671,8 +672,9 @@ async fn locally_requested_subtree_shutdown_reads_cancelled() {
     };
     assert_eq!(id.as_str(), "nested");
     assert!(matches!(exit.kind(), ExitKind::Completed));
-    assert!(
-        exit.cancelled(),
+    assert_eq!(
+        exit.cancellation(),
+        Cancellation::Observed,
         "a locally requested shutdown is still a stop request: {exit:?}"
     );
 }
@@ -1018,11 +1020,15 @@ async fn subtree_shutdown_defaults_inherit_or_reset_end_to_end() {
         .expect("reset library grace eventually escalates");
     assert!(matches!(
         inherited_task.wait().await.kind(),
-        ExitKind::Aborted { after_grace: false }
+        ExitKind::Aborted {
+            phase: GracePhase::WithinGrace
+        }
     ));
     assert!(matches!(
         reset_task.wait().await.kind(),
-        ExitKind::Aborted { after_grace: true }
+        ExitKind::Aborted {
+            phase: GracePhase::AfterGrace
+        }
     ));
 
     system

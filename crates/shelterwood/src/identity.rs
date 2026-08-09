@@ -114,6 +114,7 @@ impl Incarnation {
 struct Generation(u64);
 
 impl Generation {
+    const ZERO: Self = Self(0);
     const POISON: Self = Self(u64::MAX);
 
     fn new(value: u64) -> Option<Self> {
@@ -134,10 +135,14 @@ impl Generation {
     }
 }
 
+/// An unordered identity domain shared by every generation in one fence.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct Lineage(u64);
+
 /// A complete membership fence: its lineage and ordered generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct Fence {
-    lineage: u64,
+    lineage: Lineage,
     generation: Generation,
 }
 
@@ -152,34 +157,45 @@ impl Fence {
 /// `u64::MAX` is poison and is never returned. Once the last usable value has
 /// been minted, no successor can be minted.
 #[derive(Debug)]
-pub(crate) struct FenceCounter {
-    lineage: u64,
-    current: u64,
+struct FenceCounter {
+    lineage: Lineage,
+    current: Generation,
 }
 
 impl FenceCounter {
-    pub(crate) fn new(lineage: u64) -> Self {
+    fn new(lineage: Lineage) -> Self {
         Self {
             lineage,
-            current: 0,
+            current: Generation::ZERO,
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn near_exhaustion(lineage: u64) -> Self {
+    fn from_fence(fence: Fence) -> Self {
         Self {
-            lineage,
-            current: u64::MAX - 2,
+            lineage: fence.lineage,
+            current: fence.generation,
+        }
+    }
+
+    fn sequence() -> Self {
+        Self::new(Lineage(0))
+    }
+
+    #[cfg(test)]
+    fn near_exhaustion(lineage: u64) -> Self {
+        Self {
+            lineage: Lineage(lineage),
+            current: Generation(u64::MAX - 2),
         }
     }
 
     fn mint(&mut self) -> Option<Fence> {
-        let next = self.current.checked_add(1)?;
+        let next = self.current.get().checked_add(1)?;
         let Some(generation) = Generation::new(next) else {
-            self.current = u64::MAX;
+            self.current = Generation::POISON;
             return None;
         };
-        self.current = next;
+        self.current = generation;
         Some(Fence {
             lineage: self.lineage,
             generation,
@@ -191,8 +207,32 @@ impl FenceCounter {
     /// Observation uses the same saturating, poison-never-minted primitive as
     /// membership and incarnation fencing.
     #[cfg(test)]
-    pub(crate) fn mint_sequence(&mut self) -> Option<u64> {
+    fn mint_sequence(&mut self) -> Option<u64> {
         self.mint().map(|fence| fence.generation.get())
+    }
+}
+
+/// A membership and the generation counter that can mint only its incarnations.
+#[derive(Debug)]
+pub(crate) struct IncarnationCounter {
+    membership: Membership,
+    counter: FenceCounter,
+}
+
+impl IncarnationCounter {
+    pub(crate) fn mint(&mut self) -> Option<Incarnation> {
+        self.counter.mint().map(|fence| Incarnation {
+            membership: self.membership,
+            generation: fence.generation,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn near_exhaustion(membership: Membership) -> Self {
+        Self {
+            membership,
+            counter: FenceCounter::near_exhaustion(0),
+        }
     }
 }
 
@@ -221,7 +261,7 @@ impl ScopeIdentity {
             })
             .ok()?
             + 1;
-        Some(FenceCounter::new(lineage))
+        Some(FenceCounter::new(Lineage(lineage)))
     }
 
     #[cfg(test)]
@@ -230,9 +270,9 @@ impl ScopeIdentity {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_counter(id: ChildId, memberships: FenceCounter) -> Self {
+    pub(crate) fn near_exhaustion(id: ChildId, lineage: u64) -> Self {
         Self {
-            memberships: HashMap::from([(id, memberships)]),
+            memberships: HashMap::from([(id, FenceCounter::near_exhaustion(lineage))]),
         }
     }
 
@@ -263,29 +303,19 @@ impl ScopeIdentity {
             Entry::Occupied(mut entry) => entry.get_mut().mint().map(Membership),
             Entry::Vacant(entry) => {
                 debug_assert_ne!(provisional.0.generation, Generation::POISON);
-                entry.insert(FenceCounter {
-                    lineage: provisional.0.lineage,
-                    current: provisional.0.generation.get(),
-                });
+                entry.insert(FenceCounter::from_fence(provisional.0));
                 Some(provisional)
             }
         }
     }
 
-    pub(crate) fn incarnation_counter(&self, _membership: Membership) -> FenceCounter {
+    pub(crate) fn incarnation_counter(&self, membership: Membership) -> IncarnationCounter {
         // Membership already supplies the complete incarnation lineage. The
         // per-membership counter therefore needs only an ordered generation.
-        FenceCounter::new(0)
-    }
-
-    pub(crate) fn mint_incarnation(
-        membership: Membership,
-        counter: &mut FenceCounter,
-    ) -> Option<Incarnation> {
-        counter.mint().map(|fence| Incarnation {
+        IncarnationCounter {
             membership,
-            generation: fence.generation,
-        })
+            counter: FenceCounter::sequence(),
+        }
     }
 }
 
@@ -293,7 +323,7 @@ impl ScopeIdentity {
 mod tests {
     use crate::ChildId;
 
-    use super::{FenceCounter, Generation, ScopeIdentity};
+    use super::{FenceCounter, Generation, IncarnationCounter, ScopeIdentity};
 
     #[test]
     fn cross_scope_tokens_fail_closed() {
@@ -324,15 +354,15 @@ mod tests {
         assert!(!first.supersedes(other));
 
         let mut generations = scope.incarnation_counter(first);
-        let a = ScopeIdentity::mint_incarnation(first, &mut generations)
-            .expect("incarnation available");
-        let b = ScopeIdentity::mint_incarnation(first, &mut generations)
-            .expect("incarnation available");
+        let a = generations.mint().expect("incarnation available");
+        let b = generations.mint().expect("incarnation available");
         assert!(b.supersedes(a));
         assert_eq!(a.membership(), first);
         assert!(
             !b.supersedes(
-                ScopeIdentity::mint_incarnation(second, &mut scope.incarnation_counter(second))
+                scope
+                    .incarnation_counter(second)
+                    .mint()
                     .expect("incarnation available")
             )
         );
@@ -383,8 +413,7 @@ mod tests {
         let id = ChildId::from("worker");
         // A fixture lineage this test does not otherwise allocate, so it
         // cannot collide with an unrelated identity created below.
-        let counter = FenceCounter::near_exhaustion(TEST_LINEAGE);
-        let mut scope = ScopeIdentity::with_counter(id.clone(), counter);
+        let mut scope = ScopeIdentity::near_exhaustion(id.clone(), TEST_LINEAGE);
         let last = scope
             .mint_membership(&id)
             .expect("last usable membership is minted");
@@ -406,7 +435,7 @@ mod tests {
     #[test]
     fn exhausted_stable_domain_rejects_a_rebuilt_declaration() {
         let id = ChildId::from("worker");
-        let mut stable = ScopeIdentity::with_counter(id.clone(), FenceCounter::near_exhaustion(7));
+        let mut stable = ScopeIdentity::near_exhaustion(id.clone(), 7);
         stable
             .mint_membership(&id)
             .expect("last usable stable membership is minted");
@@ -429,11 +458,12 @@ mod tests {
         let membership = scope
             .mint_membership(&ChildId::from("worker"))
             .expect("membership available");
-        let mut incarnations = FenceCounter::near_exhaustion(91);
-        let last = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+        let mut incarnations = IncarnationCounter::near_exhaustion(membership);
+        let last = incarnations
+            .mint()
             .expect("last usable incarnation is minted");
-        assert!(ScopeIdentity::mint_incarnation(membership, &mut incarnations).is_none());
-        assert!(ScopeIdentity::mint_incarnation(membership, &mut incarnations).is_none());
+        assert!(incarnations.mint().is_none());
+        assert!(incarnations.mint().is_none());
         assert_eq!(last.membership(), membership);
     }
 
@@ -447,7 +477,7 @@ mod tests {
         assert!(!Generation::POISON.supersedes(second));
         assert!(!second.supersedes(Generation::POISON));
 
-        let mut sequence = FenceCounter::new(0);
+        let mut sequence = FenceCounter::sequence();
         assert_eq!(sequence.mint_sequence(), Some(1));
     }
 
@@ -456,7 +486,7 @@ mod tests {
     impl MembershipFixture {
         fn at(lineage: u64, generation: u64) -> super::Membership {
             super::Membership(super::Fence {
-                lineage,
+                lineage: super::Lineage(lineage),
                 generation: super::Generation::fixture(generation),
             })
         }

@@ -106,6 +106,13 @@ impl ExitError {
     }
 }
 
+/// Wraps any error as an application-classified [`ExitError`].
+///
+/// The classification is unconditional: converting an [`IntensityTrip`] or a
+/// [`StartupFailure`] through this impl yields an unauthenticated application
+/// error for which [`ExitError::intensity_trip`] and
+/// [`ExitError::startup_failure`] return `None`. The structured,
+/// framework-authenticated variants cannot be produced by user code.
 impl<E> From<E> for ExitError
 where
     E: Error + Send + Sync + 'static,
@@ -142,6 +149,13 @@ impl fmt::Display for MessageError {
 impl Error for MessageError {}
 
 /// A scope restart-budget failure.
+///
+/// This type implements [`std::error::Error`], so `ExitError::from(trip)` or
+/// `?` compiles via the blanket application-error conversion — but that path
+/// produces an ordinary, *unauthenticated* application error for which
+/// [`ExitError::intensity_trip`] returns `None`. Only the framework mints the
+/// structured variant; observe trips through [`ExitError::intensity_trip`]
+/// rather than round-tripping the payload through a user conversion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct IntensityTrip {
@@ -177,6 +191,14 @@ impl fmt::Display for StructuredIntensityTrip {
 impl Error for StructuredIntensityTrip {}
 
 /// A structured nested-scope startup failure.
+///
+/// This type implements [`std::error::Error`], so `ExitError::from(failure)`
+/// or `?` compiles via the blanket application-error conversion — but that
+/// path produces an ordinary, *unauthenticated* application error for which
+/// [`ExitError::startup_failure`] returns `None`. Only the framework mints
+/// the structured variant; observe startup failures through
+/// [`ExitError::startup_failure`] rather than round-tripping the payload
+/// through a user conversion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct StartupFailure {

@@ -11,6 +11,76 @@ pub(crate) enum ScopeFlavor {
     Dynamic,
 }
 
+/// A one-origin backoff attempt that resets after a stable incarnation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RestartAttempt(u64);
+
+impl RestartAttempt {
+    /// The state before a restart has been scheduled.
+    pub const ZERO: Self = Self(0);
+
+    /// Returns the next attempt, saturating at the numeric limit.
+    #[must_use]
+    pub const fn bump(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// Returns the numeric attempt value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Cumulative scheduled-restart charges for one child membership.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RestartCount(u64);
+
+impl RestartCount {
+    /// A membership with no scheduled restarts.
+    pub const ZERO: Self = Self(0);
+
+    /// Returns the next count, saturating at the numeric limit.
+    #[must_use]
+    pub const fn bump(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// Returns the numeric restart count.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Cumulative restart charges across one scope incarnation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TotalRestarts(u64);
+
+impl TotalRestarts {
+    /// A scope incarnation with no restart charges.
+    pub const ZERO: Self = Self(0);
+
+    /// Returns the next total, saturating at the numeric limit.
+    #[must_use]
+    pub const fn bump(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// Returns the numeric restart total.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Whether a child construction can be recreated after its first incarnation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChildMode {
+    Restartable,
+    OneShot,
+}
+
 /// The default bounded FIFO mailbox capacity.
 pub const DEFAULT_MAILBOX_CAPACITY: usize = 64;
 /// The default child shutdown grace.
@@ -168,8 +238,8 @@ impl Backoff {
     ///
     /// Randomness is deliberately supplied as external, range-checked data.
     #[must_use]
-    pub fn next_delay(self, attempt: u64, jitter_sample: JitterSample) -> Duration {
-        let attempt = attempt.max(1);
+    pub fn next_delay(self, attempt: RestartAttempt, jitter_sample: JitterSample) -> Duration {
+        let attempt = attempt.get().max(1);
         let (delay, jitter, maximum) = match self {
             Self::Immediate => return Duration::ZERO,
             Self::Fixed { delay, jitter } => (delay, jitter, delay),
@@ -690,7 +760,7 @@ pub(crate) struct ResolvedCommonOptions {
 pub(crate) fn resolve_common(
     options: &CommonOptions,
     defaults: &ResolvedDefaults,
-    one_shot: bool,
+    mode: ChildMode,
     default_readiness: Readiness,
 ) -> Result<ResolvedCommonOptions, InvalidPolicy> {
     defaults.validate()?;
@@ -708,7 +778,7 @@ pub(crate) fn resolve_common(
         value => value,
     };
     let resolved = ResolvedCommonOptions {
-        restart: if one_shot {
+        restart: if mode == ChildMode::OneShot {
             RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
         } else {
             options.restart.unwrap_or(defaults.child_restart)
@@ -721,7 +791,7 @@ pub(crate) fn resolve_common(
         readiness: options.readiness.unwrap_or(default_readiness),
         readiness_override: options.readiness,
         readiness_deadline,
-        retention: options.retention.unwrap_or(if one_shot {
+        retention: options.retention.unwrap_or(if mode == ChildMode::OneShot {
             Retention::Remove
         } else {
             Retention::Retain
@@ -744,9 +814,21 @@ mod tests {
 
     use super::{
         Backoff, BackoffFactor, Intensity, InvalidPolicy, Jitter, JitterSample, Mailbox,
-        PolicyError, PolicyField, ReadinessDeadline, ResolvedDefaults, RestartCondition,
-        RestartPolicy, ScopeDefaults, Shutdown, tidy_abort_beat,
+        PolicyError, PolicyField, ReadinessDeadline, ResolvedDefaults, RestartAttempt,
+        RestartCondition, RestartCount, RestartPolicy, ScopeDefaults, Shutdown, TotalRestarts,
+        tidy_abort_beat,
     };
+
+    #[test]
+    fn restart_counters_saturate_at_the_numeric_limit() {
+        let attempt = RestartAttempt(u64::MAX);
+        let count = RestartCount(u64::MAX);
+        let total = TotalRestarts(u64::MAX);
+
+        assert_eq!(attempt.bump(), attempt);
+        assert_eq!(count.bump(), count);
+        assert_eq!(total.bump(), total);
+    }
 
     #[test]
     fn shipped_defaults_match_the_normative_policy() {
@@ -794,30 +876,30 @@ mod tests {
         )
         .expect("valid backoff");
         assert_eq!(
-            backoff.next_delay(1, JitterSample::new(0.9)),
+            backoff.next_delay(RestartAttempt(1), JitterSample::new(0.9)),
             Duration::from_millis(10)
         );
         assert_eq!(
-            backoff.next_delay(2, JitterSample::new(0.1)),
+            backoff.next_delay(RestartAttempt(2), JitterSample::new(0.1)),
             Duration::from_millis(20)
         );
         assert_eq!(
-            backoff.next_delay(3, JitterSample::new(0.5)),
+            backoff.next_delay(RestartAttempt(3), JitterSample::new(0.5)),
             Duration::from_millis(35)
         );
         assert_eq!(
-            backoff.next_delay(99, JitterSample::new(0.5)),
+            backoff.next_delay(RestartAttempt(99), JitterSample::new(0.5)),
             Duration::from_millis(35)
         );
 
         let jittered =
             Backoff::fixed(Duration::from_millis(10), Jitter::Equal).expect("valid backoff");
         assert_eq!(
-            jittered.next_delay(1, JitterSample::new(0.0)),
+            jittered.next_delay(RestartAttempt(1), JitterSample::new(0.0)),
             Duration::from_millis(5)
         );
         assert_eq!(
-            jittered.next_delay(1, JitterSample::new(0.5)),
+            jittered.next_delay(RestartAttempt(1), JitterSample::new(0.5)),
             Duration::from_micros(7_500)
         );
     }
@@ -855,12 +937,15 @@ mod tests {
                 f64::INFINITY,
                 f64::NAN,
             ] {
-                assert!(backoff.next_delay(u64::MAX, JitterSample::new(sample)) <= maximum);
+                assert!(
+                    backoff.next_delay(RestartAttempt(u64::MAX), JitterSample::new(sample))
+                        <= maximum
+                );
             }
         }
 
         let fixed = Backoff::fixed(maximum, Jitter::Equal).expect("valid fixed backoff");
-        assert!(fixed.next_delay(u64::MAX, JitterSample::new(1.0)) <= maximum);
+        assert!(fixed.next_delay(RestartAttempt(u64::MAX), JitterSample::new(1.0)) <= maximum);
     }
 
     #[test]
@@ -941,7 +1026,10 @@ mod tests {
             Jitter::None,
         )
         .expect("valid backoff");
-        assert_eq!(doubling.next_delay(1, JitterSample::new(0.9)), base);
+        assert_eq!(
+            doubling.next_delay(RestartAttempt(1), JitterSample::new(0.9)),
+            base
+        );
 
         let flat = Backoff::exponential(
             base,
@@ -950,15 +1038,24 @@ mod tests {
             Jitter::None,
         )
         .expect("valid backoff");
-        assert_eq!(flat.next_delay(1, JitterSample::new(0.0)), base);
-        assert_eq!(flat.next_delay(u64::MAX, JitterSample::new(0.0)), base);
+        assert_eq!(
+            flat.next_delay(RestartAttempt(1), JitterSample::new(0.0)),
+            base
+        );
+        assert_eq!(
+            flat.next_delay(RestartAttempt(u64::MAX), JitterSample::new(0.0)),
+            base
+        );
 
         let fixed = Backoff::fixed(base, Jitter::None).expect("valid backoff");
-        assert_eq!(fixed.next_delay(u64::MAX, JitterSample::new(0.99)), base);
+        assert_eq!(
+            fixed.next_delay(RestartAttempt(u64::MAX), JitterSample::new(0.99)),
+            base
+        );
 
         let huge_fixed = Backoff::fixed(Duration::MAX, Jitter::None).expect("valid backoff");
         assert_eq!(
-            huge_fixed.next_delay(u64::MAX, JitterSample::new(0.5)),
+            huge_fixed.next_delay(RestartAttempt(u64::MAX), JitterSample::new(0.5)),
             Duration::MAX
         );
     }
@@ -975,8 +1072,14 @@ mod tests {
             Jitter::None,
         )
         .expect("valid backoff");
-        assert_eq!(explosive.next_delay(2, JitterSample::new(0.0)), max);
-        assert_eq!(explosive.next_delay(u64::MAX, JitterSample::new(0.0)), max);
+        assert_eq!(
+            explosive.next_delay(RestartAttempt(2), JitterSample::new(0.0)),
+            max
+        );
+        assert_eq!(
+            explosive.next_delay(RestartAttempt(u64::MAX), JitterSample::new(0.0)),
+            max
+        );
 
         let doubling = Backoff::exponential(
             Duration::from_secs(1),
@@ -985,7 +1088,10 @@ mod tests {
             Jitter::None,
         )
         .expect("valid backoff");
-        assert_eq!(doubling.next_delay(200, JitterSample::new(0.0)), max);
+        assert_eq!(
+            doubling.next_delay(RestartAttempt(200), JitterSample::new(0.0)),
+            max
+        );
     }
 
     #[test]
@@ -995,16 +1101,22 @@ mod tests {
         let odd = Duration::from_nanos((1 << 60) + 1);
         let fixed = Backoff::fixed(odd, Jitter::Equal).expect("valid backoff");
         let exact_half = Duration::from_nanos((1 << 59) + 1);
-        assert_eq!(fixed.next_delay(1, JitterSample::new(0.0)), exact_half);
+        assert_eq!(
+            fixed.next_delay(RestartAttempt(1), JitterSample::new(0.0)),
+            exact_half
+        );
         // Non-finite and negative samples clamp to the same exact edge.
         for sample in [f64::NAN, f64::NEG_INFINITY, -3.0] {
-            assert_eq!(fixed.next_delay(1, JitterSample::new(sample)), exact_half);
+            assert_eq!(
+                fixed.next_delay(RestartAttempt(1), JitterSample::new(sample)),
+                exact_half
+            );
         }
 
         let even =
             Backoff::fixed(Duration::from_nanos(1 << 60), Jitter::Equal).expect("valid backoff");
         assert_eq!(
-            even.next_delay(1, JitterSample::new(0.0)),
+            even.next_delay(RestartAttempt(1), JitterSample::new(0.0)),
             Duration::from_nanos(1 << 59)
         );
     }

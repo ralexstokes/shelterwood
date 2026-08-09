@@ -228,6 +228,24 @@ impl fmt::Display for StructuredStartupFailure {
 
 impl Error for StructuredStartupFailure {}
 
+/// Whether an incarnation observed supervisor cancellation before exiting.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Cancellation {
+    /// The incarnation completed without observing supervisor cancellation.
+    NotObserved,
+    /// The incarnation's shutdown token fired before its outcome was recorded.
+    Observed,
+}
+
+/// Whether a forced abort happened before or after cooperative grace expired.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GracePhase {
+    /// The future was aborted before the grace deadline expired.
+    WithinGrace,
+    /// The future was aborted after the grace deadline expired.
+    AfterGrace,
+}
+
 /// The structured result of one child incarnation or never-started
 /// membership.
 ///
@@ -243,14 +261,14 @@ impl Error for StructuredStartupFailure {}
 #[derive(Clone, Debug)]
 pub struct Exit {
     kind: ExitKind,
-    cancelled: bool,
+    cancellation: Cancellation,
 }
 
 impl Exit {
     /// Creates an exit from its kind and cancellation observation.
     #[must_use]
-    pub const fn new(kind: ExitKind, cancelled: bool) -> Self {
-        Self { kind, cancelled }
+    pub const fn new(kind: ExitKind, cancellation: Cancellation) -> Self {
+        Self { kind, cancellation }
     }
 
     /// Returns the exit kind.
@@ -259,11 +277,10 @@ impl Exit {
         &self.kind
     }
 
-    /// Reports whether the incarnation's shutdown token fired before its
-    /// outcome was recorded.
+    /// Returns the incarnation's supervisor-cancellation observation.
     #[must_use]
-    pub const fn cancelled(&self) -> bool {
-        self.cancelled
+    pub const fn cancellation(&self) -> Cancellation {
+        self.cancellation
     }
 
     /// Reports whether this exit participates in failure restart policy.
@@ -275,7 +292,7 @@ impl Exit {
     /// Constructs the membership-level never-started exit.
     #[must_use]
     pub const fn never_started() -> Self {
-        Self::new(ExitKind::NeverStarted, false)
+        Self::new(ExitKind::NeverStarted, Cancellation::NotObserved)
     }
 }
 
@@ -285,7 +302,7 @@ impl Exit {
 /// no content equality to consult.
 impl PartialEq for Exit {
     fn eq(&self, other: &Self) -> bool {
-        self.cancelled == other.cancelled && exit_kind_eq(&self.kind, &other.kind)
+        self.cancellation == other.cancellation && exit_kind_eq(&self.kind, &other.kind)
     }
 }
 
@@ -303,9 +320,7 @@ fn exit_kind_eq(left: &ExitKind, right: &ExitKind) -> bool {
             ExitKind::ReadinessTimedOut { deadline: left },
             ExitKind::ReadinessTimedOut { deadline: right },
         ) => left == right,
-        (ExitKind::Aborted { after_grace: left }, ExitKind::Aborted { after_grace: right }) => {
-            left == right
-        }
+        (ExitKind::Aborted { phase: left }, ExitKind::Aborted { phase: right }) => left == right,
         _ => false,
     }
 }
@@ -333,8 +348,8 @@ pub enum ExitKind {
     },
     /// The incarnation future was destroyed before producing an outcome.
     Aborted {
-        /// Whether cooperative grace expired before the abort.
-        after_grace: bool,
+        /// Cooperative-grace phase in which the abort happened.
+        phase: GracePhase,
     },
     /// The membership terminalized without spawning an incarnation.
     NeverStarted,
@@ -346,14 +361,14 @@ pub(crate) enum RecordedOutcome {
     Returned(ExitResult),
     Panicked { message: Option<String> },
     ReadinessTimedOut { deadline: Instant },
-    Aborted { after_grace: bool },
+    Aborted { phase: GracePhase },
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum JoinVerdict {
     Completed,
     Panicked { message: Option<String> },
-    Cancelled { after_grace: bool },
+    Cancelled { phase: GracePhase },
 }
 
 /// Reconciles task-produced evidence with a later supervisor-forced outcome.
@@ -389,22 +404,24 @@ pub(crate) fn reconcile_recorded_outcomes(
 pub(crate) fn classify_exit(
     recorded: Option<RecordedOutcome>,
     join: JoinVerdict,
-    cancelled: bool,
+    cancellation: Cancellation,
 ) -> Exit {
     let recorded_kind = recorded.map(recorded_kind);
     let join_kind = match join {
         JoinVerdict::Completed => None,
         JoinVerdict::Panicked { message } => Some(ExitKind::Panicked { message }),
-        JoinVerdict::Cancelled { after_grace } => Some(ExitKind::Aborted { after_grace }),
+        JoinVerdict::Cancelled { phase } => Some(ExitKind::Aborted { phase }),
     };
 
     let kind = match (recorded_kind, join_kind) {
         (Some(recorded), Some(join)) if rank(&recorded) >= rank(&join) => recorded,
         (_, Some(join)) => join,
         (Some(recorded), None) => recorded,
-        (None, None) => ExitKind::Aborted { after_grace: false },
+        (None, None) => ExitKind::Aborted {
+            phase: GracePhase::WithinGrace,
+        },
     };
-    Exit::new(kind, cancelled)
+    Exit::new(kind, cancellation)
 }
 
 fn recorded_kind(recorded: RecordedOutcome) -> ExitKind {
@@ -413,7 +430,7 @@ fn recorded_kind(recorded: RecordedOutcome) -> ExitKind {
         RecordedOutcome::Returned(Err(error)) => ExitKind::Failed(error),
         RecordedOutcome::Panicked { message } => ExitKind::Panicked { message },
         RecordedOutcome::ReadinessTimedOut { deadline } => ExitKind::ReadinessTimedOut { deadline },
-        RecordedOutcome::Aborted { after_grace } => ExitKind::Aborted { after_grace },
+        RecordedOutcome::Aborted { phase } => ExitKind::Aborted { phase },
     }
 }
 
@@ -474,8 +491,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ChildId, Exit, ExitError, ExitKind, JoinVerdict, RecordedOutcome, StartupFailure,
-        StartupFailureCause, classify_exit, reconcile_recorded_outcomes,
+        Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, JoinVerdict, RecordedOutcome,
+        StartupFailure, StartupFailureCause, classify_exit, reconcile_recorded_outcomes,
     };
 
     #[test]
@@ -487,29 +504,38 @@ mod tests {
                 "recorded completion",
                 Some(RecordedOutcome::Returned(Ok(()))),
                 JoinVerdict::Completed,
-                false,
-                Exit::new(ExitKind::Completed, false),
+                Cancellation::NotObserved,
+                Exit::new(ExitKind::Completed, Cancellation::NotObserved),
             ),
             (
                 "cancellation overrides recorded completion",
                 Some(RecordedOutcome::Returned(Ok(()))),
-                JoinVerdict::Cancelled { after_grace: true },
-                true,
-                Exit::new(ExitKind::Aborted { after_grace: true }, true),
+                JoinVerdict::Cancelled {
+                    phase: GracePhase::AfterGrace,
+                },
+                Cancellation::Observed,
+                Exit::new(
+                    ExitKind::Aborted {
+                        phase: GracePhase::AfterGrace,
+                    },
+                    Cancellation::Observed,
+                ),
             ),
             (
                 "recorded failure",
                 Some(RecordedOutcome::Returned(Err(failure.clone()))),
                 JoinVerdict::Completed,
-                false,
-                Exit::new(ExitKind::Failed(failure.clone()), false),
+                Cancellation::NotObserved,
+                Exit::new(ExitKind::Failed(failure.clone()), Cancellation::NotObserved),
             ),
             (
                 "late cancellation preserves recorded failure",
                 Some(RecordedOutcome::Returned(Err(failure.clone()))),
-                JoinVerdict::Cancelled { after_grace: true },
-                true,
-                Exit::new(ExitKind::Failed(failure.clone()), true),
+                JoinVerdict::Cancelled {
+                    phase: GracePhase::AfterGrace,
+                },
+                Cancellation::Observed,
+                Exit::new(ExitKind::Failed(failure.clone()), Cancellation::Observed),
             ),
             (
                 "join panic overrides recorded failure",
@@ -517,20 +543,25 @@ mod tests {
                 JoinVerdict::Panicked {
                     message: Some("drop panic".to_owned()),
                 },
-                false,
+                Cancellation::NotObserved,
                 Exit::new(
                     ExitKind::Panicked {
                         message: Some("drop panic".to_owned()),
                     },
-                    false,
+                    Cancellation::NotObserved,
                 ),
             ),
             (
                 "readiness timeout overrides cancellation",
                 Some(RecordedOutcome::ReadinessTimedOut { deadline }),
-                JoinVerdict::Cancelled { after_grace: true },
-                true,
-                Exit::new(ExitKind::ReadinessTimedOut { deadline }, true),
+                JoinVerdict::Cancelled {
+                    phase: GracePhase::AfterGrace,
+                },
+                Cancellation::Observed,
+                Exit::new(
+                    ExitKind::ReadinessTimedOut { deadline },
+                    Cancellation::Observed,
+                ),
             ),
             (
                 "join panic overrides recorded completion",
@@ -538,12 +569,12 @@ mod tests {
                 JoinVerdict::Panicked {
                     message: Some("drop panic".to_owned()),
                 },
-                false,
+                Cancellation::NotObserved,
                 Exit::new(
                     ExitKind::Panicked {
                         message: Some("drop panic".to_owned()),
                     },
-                    false,
+                    Cancellation::NotObserved,
                 ),
             ),
             (
@@ -554,60 +585,94 @@ mod tests {
                 JoinVerdict::Panicked {
                     message: Some("drop panic".to_owned()),
                 },
-                true,
+                Cancellation::Observed,
                 Exit::new(
                     ExitKind::Panicked {
                         message: Some("callback panic".to_owned()),
                     },
-                    true,
+                    Cancellation::Observed,
                 ),
             ),
             (
                 "earlier recorded abort wins a tie",
-                Some(RecordedOutcome::Aborted { after_grace: false }),
-                JoinVerdict::Cancelled { after_grace: true },
-                true,
-                Exit::new(ExitKind::Aborted { after_grace: false }, true),
+                Some(RecordedOutcome::Aborted {
+                    phase: GracePhase::WithinGrace,
+                }),
+                JoinVerdict::Cancelled {
+                    phase: GracePhase::AfterGrace,
+                },
+                Cancellation::Observed,
+                Exit::new(
+                    ExitKind::Aborted {
+                        phase: GracePhase::WithinGrace,
+                    },
+                    Cancellation::Observed,
+                ),
             ),
             (
                 "join cancellation supplies a missing outcome",
                 None,
-                JoinVerdict::Cancelled { after_grace: true },
-                true,
-                Exit::new(ExitKind::Aborted { after_grace: true }, true),
+                JoinVerdict::Cancelled {
+                    phase: GracePhase::AfterGrace,
+                },
+                Cancellation::Observed,
+                Exit::new(
+                    ExitKind::Aborted {
+                        phase: GracePhase::AfterGrace,
+                    },
+                    Cancellation::Observed,
+                ),
             ),
             (
                 "missing outcome fails closed",
                 None,
                 JoinVerdict::Completed,
-                false,
-                Exit::new(ExitKind::Aborted { after_grace: false }, false),
+                Cancellation::NotObserved,
+                Exit::new(
+                    ExitKind::Aborted {
+                        phase: GracePhase::WithinGrace,
+                    },
+                    Cancellation::NotObserved,
+                ),
             ),
         ];
 
-        for (case, recorded, join, cancelled, expected) in cases {
-            assert_eq!(classify_exit(recorded, join, cancelled), expected, "{case}");
+        for (case, recorded, join, cancellation, expected) in cases {
+            assert_eq!(
+                classify_exit(recorded, join, cancellation),
+                expected,
+                "{case}"
+            );
         }
     }
 
     #[test]
     fn failed_exit_equality_is_shared_provenance_not_content() {
         let error = ExitError::message("boom");
-        let exit = Exit::new(ExitKind::Failed(error.clone()), false);
+        let exit = Exit::new(ExitKind::Failed(error.clone()), Cancellation::NotObserved);
 
         // Clones of one error — including framework-published copies —
         // compare equal.
         assert_eq!(exit, exit.clone());
-        assert_eq!(exit, Exit::new(ExitKind::Failed(error.clone()), false));
+        assert_eq!(
+            exit,
+            Exit::new(ExitKind::Failed(error.clone()), Cancellation::NotObserved)
+        );
 
         // Independently created errors with identical content do not.
         assert_ne!(
             exit,
-            Exit::new(ExitKind::Failed(ExitError::message("boom")), false)
+            Exit::new(
+                ExitKind::Failed(ExitError::message("boom")),
+                Cancellation::NotObserved
+            )
         );
 
         // Cancellation remains structural even with shared provenance.
-        assert_ne!(exit, Exit::new(ExitKind::Failed(error), true));
+        assert_ne!(
+            exit,
+            Exit::new(ExitKind::Failed(error), Cancellation::Observed)
+        );
     }
 
     #[test]
@@ -622,20 +687,34 @@ mod tests {
             (
                 "application failure survives forced abort",
                 Some(RecordedOutcome::Returned(Err(failure.clone()))),
-                Some(RecordedOutcome::Aborted { after_grace: true }),
-                Exit::new(ExitKind::Failed(failure), true),
+                Some(RecordedOutcome::Aborted {
+                    phase: GracePhase::AfterGrace,
+                }),
+                Exit::new(ExitKind::Failed(failure), Cancellation::Observed),
             ),
             (
                 "forced readiness timeout overrides completion",
                 Some(RecordedOutcome::Returned(Ok(()))),
                 Some(RecordedOutcome::ReadinessTimedOut { deadline }),
-                Exit::new(ExitKind::ReadinessTimedOut { deadline }, true),
+                Exit::new(
+                    ExitKind::ReadinessTimedOut { deadline },
+                    Cancellation::Observed,
+                ),
             ),
             (
                 "earlier abort evidence wins a tie",
-                Some(RecordedOutcome::Aborted { after_grace: false }),
-                Some(RecordedOutcome::Aborted { after_grace: true }),
-                Exit::new(ExitKind::Aborted { after_grace: false }, true),
+                Some(RecordedOutcome::Aborted {
+                    phase: GracePhase::WithinGrace,
+                }),
+                Some(RecordedOutcome::Aborted {
+                    phase: GracePhase::AfterGrace,
+                }),
+                Exit::new(
+                    ExitKind::Aborted {
+                        phase: GracePhase::WithinGrace,
+                    },
+                    Cancellation::Observed,
+                ),
             ),
         ];
 
@@ -644,8 +723,10 @@ mod tests {
             assert_eq!(
                 classify_exit(
                     reconciled,
-                    JoinVerdict::Cancelled { after_grace: true },
-                    true
+                    JoinVerdict::Cancelled {
+                        phase: GracePhase::AfterGrace
+                    },
+                    Cancellation::Observed
                 ),
                 expected,
                 "{case}"

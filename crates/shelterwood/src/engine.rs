@@ -7,8 +7,11 @@ use std::{
 };
 
 use crate::{
-    Exit, Intensity, JitterSample, Readiness, RestartPolicy, Shutdown, deadline::Deadline,
-    exit::StopReason, policy::tidy_abort_beat,
+    Exit, GracePhase, Intensity, IntensityTrip, JitterSample, Readiness, RestartAttempt,
+    RestartCount, RestartPolicy, Shutdown, TotalRestarts,
+    deadline::Deadline,
+    exit::StopReason,
+    policy::{ScopeFlavor, tidy_abort_beat},
 };
 
 /// Deterministic priority when one driver wake exposes several events.
@@ -32,8 +35,8 @@ pub(crate) fn arbitrate<T>(events: &mut [(ArbitrationClass, T)]) {
 pub(crate) enum StopAction {
     Cancel,
     Escalate,
-    AbortFramework { after_grace: bool },
-    HardAbort { after_grace: bool },
+    AbortFramework { phase: GracePhase },
+    HardAbort { phase: GracePhase },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,7 +54,7 @@ pub(crate) struct StopLadder {
     policy: Shutdown,
     phase: StopPhase,
     deadline: Option<Instant>,
-    after_grace: bool,
+    grace_phase: GracePhase,
     force_requested: bool,
     framework_driver: bool,
     framework_abort_acked: bool,
@@ -71,7 +74,7 @@ impl StopLadder {
             policy,
             phase: StopPhase::Idle,
             deadline: None,
-            after_grace: false,
+            grace_phase: GracePhase::WithinGrace,
             force_requested: false,
             framework_driver,
             framework_abort_acked: false,
@@ -92,7 +95,7 @@ impl StopLadder {
                 && matches!(self.policy, Shutdown::Graceful { .. })
                 && self.deadline.is_some_and(|deadline| now >= deadline)
             {
-                self.after_grace = true;
+                self.grace_phase = GracePhase::AfterGrace;
             }
             self.deadline = Some(now);
         }
@@ -127,7 +130,7 @@ impl StopLadder {
                 let grace = match self.policy {
                     Shutdown::Graceful { grace } => {
                         if !self.force_requested {
-                            self.after_grace = true;
+                            self.grace_phase = GracePhase::AfterGrace;
                         }
                         grace
                     }
@@ -137,7 +140,7 @@ impl StopLadder {
                 // A forced ladder is the `Abort` policy's zero-grace point on
                 // this same ladder (§10), so it takes the zero-grace tidy beat
                 // rather than one scaled to the grace force just skipped. The
-                // `after_grace` provenance above is unaffected: whether grace
+                // Grace-phase provenance above is unaffected: whether grace
                 // actually expired is a separate fact from how long the beat
                 // between escalation and hard abort runs.
                 let beat = if self.force_requested {
@@ -153,13 +156,13 @@ impl StopLadder {
                     self.phase = StopPhase::AbortingFramework;
                     self.deadline = Deadline::after(now, tidy_abort_beat(Duration::ZERO)).instant();
                     Some(StopAction::AbortFramework {
-                        after_grace: self.after_grace,
+                        phase: self.grace_phase,
                     })
                 } else {
                     self.phase = StopPhase::Finished;
                     self.deadline = None;
                     Some(StopAction::HardAbort {
-                        after_grace: self.after_grace,
+                        phase: self.grace_phase,
                     })
                 }
             }
@@ -169,7 +172,7 @@ impl StopLadder {
                 self.phase = StopPhase::Finished;
                 self.deadline = None;
                 (!self.framework_abort_acked).then_some(StopAction::HardAbort {
-                    after_grace: self.after_grace,
+                    phase: self.grace_phase,
                 })
             }
             StopPhase::Cooperative
@@ -214,17 +217,37 @@ pub(crate) fn dispatch_exit(
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct IntensityState {
     charges: VecDeque<Instant>,
-    total_restarts: u64,
+    total_restarts: TotalRestarts,
+}
+
+impl Default for IntensityState {
+    fn default() -> Self {
+        Self {
+            charges: VecDeque::new(),
+            total_restarts: TotalRestarts::ZERO,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IntensityCharge {
     pub(crate) in_window: u64,
-    pub(crate) total_restarts: u64,
+    pub(crate) total_restarts: TotalRestarts,
     pub(crate) tripped: bool,
+}
+
+impl IntensityTrip {
+    pub(crate) fn new(policy: Intensity, charge: IntensityCharge) -> Self {
+        debug_assert_eq!(charge.tripped, charge.in_window > policy.max_restarts);
+        Self {
+            max_restarts: policy.max_restarts,
+            observed_restarts: charge.in_window,
+            within: policy.within,
+        }
+    }
 }
 
 impl IntensityState {
@@ -236,7 +259,7 @@ impl IntensityState {
             self.charges.pop_front();
         }
         self.charges.push_back(now);
-        self.total_restarts = self.total_restarts.saturating_add(1);
+        self.total_restarts = self.total_restarts.bump();
         let in_window = u64::try_from(self.charges.len()).unwrap_or(u64::MAX);
         IntensityCharge {
             in_window,
@@ -248,8 +271,8 @@ impl IntensityState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RestartState {
-    attempt: u64,
-    cumulative: u64,
+    attempt: RestartAttempt,
+    cumulative: RestartCount,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,19 +284,19 @@ pub(crate) struct IncarnationRun {
 impl RestartState {
     pub(crate) fn new() -> Self {
         Self {
-            attempt: 0,
-            cumulative: 0,
+            attempt: RestartAttempt::ZERO,
+            cumulative: RestartCount::ZERO,
         }
     }
 
-    pub(crate) fn schedule(&mut self) -> (u64, u64) {
-        self.attempt = self.attempt.saturating_add(1);
-        self.cumulative = self.cumulative.saturating_add(1);
+    pub(crate) fn schedule(&mut self) -> (RestartAttempt, RestartCount) {
+        self.attempt = self.attempt.bump();
+        self.cumulative = self.cumulative.bump();
         (self.attempt, self.cumulative)
     }
 
     pub(crate) fn settled(&mut self) {
-        self.attempt = 0;
+        self.attempt = RestartAttempt::ZERO;
     }
 
     /// Resets the consecutive-attempt counter after one stable incarnation.
@@ -292,8 +315,8 @@ impl RestartState {
 /// Complete restart verdict consumed verbatim by the scope driver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RestartDecision {
-    pub(crate) attempt: u64,
-    pub(crate) restart_count: u64,
+    pub(crate) attempt: RestartAttempt,
+    pub(crate) restart_count: RestartCount,
     pub(crate) delay: Duration,
     /// Absolute backoff deadline; unrepresentable far-future points are
     /// clamped (B.6: `restart_at` is present exactly in `Restarting`).
@@ -608,6 +631,13 @@ pub(crate) struct DrainEffect {
     pub(crate) startup_pending: bool,
 }
 
+/// The child state relevant to deciding whether a scope can finish.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChildCompletionState {
+    pub(crate) has_children: bool,
+    pub(crate) all_terminal: bool,
+}
+
 /// Authoritative lifecycle and finish policy for one scope incarnation.
 ///
 /// `ScopeRecord` is only this machine's observation projection; epoch-tagged
@@ -700,14 +730,16 @@ impl ScopeLifecycle {
 
     pub(crate) fn finish_if_ready(
         &self,
-        ordered: bool,
-        has_children: bool,
-        all_terminal: bool,
+        flavor: ScopeFlavor,
+        children: ChildCompletionState,
     ) -> Option<StopReason> {
         if let Some(reason) = self.draining_reason() {
-            return all_terminal.then(|| reason.clone());
+            return children.all_terminal.then(|| reason.clone());
         }
-        (!self.startup_failed() && ordered && has_children && all_terminal)
+        (!self.startup_failed()
+            && flavor == ScopeFlavor::Ordered
+            && children.has_children
+            && children.all_terminal)
             .then_some(StopReason::Finished)
     }
 }
@@ -863,15 +895,16 @@ mod tests {
     };
 
     use crate::{
-        Exit, ExitKind, Intensity, JitterSample, RestartCondition, RestartPolicy, Shutdown,
-        policy::Backoff,
+        Cancellation, Exit, ExitKind, GracePhase, Intensity, JitterSample, RestartAttempt,
+        RestartCondition, RestartCount, RestartPolicy, Shutdown, TotalRestarts,
+        policy::{Backoff, ScopeFlavor},
     };
 
     use super::{
-        ArbitrationClass, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch, IncarnationRun,
-        IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate,
-        RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode, StopAction,
-        StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
+        ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
+        IncarnationRun, IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent,
+        ReadinessGate, RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode,
+        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
     };
 
     #[test]
@@ -904,7 +937,9 @@ mod tests {
         assert_eq!(graceful.advance(start + grace), Some(StopAction::Escalate));
         assert_eq!(
             graceful.advance(graceful.deadline().expect("tidy deadline")),
-            Some(StopAction::HardAbort { after_grace: true })
+            Some(StopAction::HardAbort {
+                phase: GracePhase::AfterGrace
+            })
         );
 
         let mut abort = StopLadder::new(Shutdown::Abort);
@@ -912,7 +947,9 @@ mod tests {
         assert_eq!(abort.advance(start), Some(StopAction::Escalate));
         assert_eq!(
             abort.advance(abort.deadline().expect("tidy deadline")),
-            Some(StopAction::HardAbort { after_grace: false })
+            Some(StopAction::HardAbort {
+                phase: GracePhase::WithinGrace
+            })
         );
     }
 
@@ -954,7 +991,9 @@ mod tests {
         );
         assert_eq!(
             ladder.advance(tidy),
-            Some(StopAction::HardAbort { after_grace: false })
+            Some(StopAction::HardAbort {
+                phase: GracePhase::WithinGrace
+            })
         );
         ladder.force(tidy);
         assert_eq!(
@@ -976,7 +1015,9 @@ mod tests {
             .expect("abort policy keeps the first tidy beat");
         assert_eq!(
             ladder.advance(tidy),
-            Some(StopAction::AbortFramework { after_grace: false })
+            Some(StopAction::AbortFramework {
+                phase: GracePhase::WithinGrace
+            })
         );
         ladder.acknowledge_framework_abort();
         let framework_tidy = ladder
@@ -991,12 +1032,16 @@ mod tests {
         let tidy = unacked.deadline().expect("abort tidy beat");
         assert_eq!(
             unacked.advance(tidy),
-            Some(StopAction::AbortFramework { after_grace: false })
+            Some(StopAction::AbortFramework {
+                phase: GracePhase::WithinGrace
+            })
         );
         let framework_tidy = unacked.deadline().expect("framework tidy beat");
         assert_eq!(
             unacked.advance(framework_tidy),
-            Some(StopAction::HardAbort { after_grace: false })
+            Some(StopAction::HardAbort {
+                phase: GracePhase::WithinGrace
+            })
         );
     }
 
@@ -1014,7 +1059,10 @@ mod tests {
 
     #[test]
     fn funnel_dispatch_depends_on_mode_and_membership_state() {
-        let failure = Exit::new(ExitKind::Failed(crate::ExitError::message("boom")), false);
+        let failure = Exit::new(
+            ExitKind::Failed(crate::ExitError::message("boom")),
+            Cancellation::NotObserved,
+        );
         let restart = RestartPolicy::new(RestartCondition::OnFailure, Backoff::Immediate);
         assert_eq!(
             dispatch_exit(
@@ -1054,12 +1102,19 @@ mod tests {
         let trip = state.charge(policy, start + Duration::from_secs(10));
         assert!(trip.tripped);
         assert_eq!(trip.in_window, 2);
-        assert_eq!(trip.total_restarts, 2);
+        assert_eq!(trip.total_restarts, TotalRestarts::ZERO.bump().bump());
+        let trip_payload = crate::IntensityTrip::new(policy, trip);
+        assert_eq!(trip_payload.max_restarts, policy.max_restarts);
+        assert_eq!(trip_payload.observed_restarts, trip.in_window);
+        assert_eq!(trip_payload.within, policy.within);
 
         let aged = state.charge(policy, start + Duration::from_secs(21));
         assert!(!aged.tripped);
         assert_eq!(aged.in_window, 1);
-        assert_eq!(aged.total_restarts, 3);
+        assert_eq!(
+            aged.total_restarts,
+            TotalRestarts::ZERO.bump().bump().bump()
+        );
     }
 
     #[test]
@@ -1078,11 +1133,11 @@ mod tests {
             JitterSample::new(0.5),
         );
 
-        assert_eq!(decision.attempt, 1);
-        assert_eq!(decision.restart_count, 1);
+        assert_eq!(decision.attempt, RestartAttempt::ZERO.bump());
+        assert_eq!(decision.restart_count, RestartCount::ZERO.bump());
         assert_eq!(decision.delay, Duration::ZERO);
         assert_eq!(decision.restart_at, now);
-        assert_eq!(decision.charge.total_restarts, 1);
+        assert_eq!(decision.charge.total_restarts, TotalRestarts::ZERO.bump());
         assert!(decision.charge.tripped);
     }
 
@@ -1118,7 +1173,12 @@ mod tests {
         let start = Instant::now();
         let stable_for = Duration::from_secs(10);
         let mut restarts = RestartState::new();
-        assert_eq!(restarts.schedule(), (1, 1));
+        let attempt_one = RestartAttempt::ZERO.bump();
+        let attempt_two = attempt_one.bump();
+        let count_one = RestartCount::ZERO.bump();
+        let count_two = count_one.bump();
+        let count_three = count_two.bump();
+        assert_eq!(restarts.schedule(), (attempt_one, count_one));
         assert!(!restarts.settle_if_stable(
             IncarnationRun {
                 started_at: start,
@@ -1126,7 +1186,7 @@ mod tests {
             },
             stable_for,
         ));
-        assert_eq!(restarts.schedule(), (2, 2));
+        assert_eq!(restarts.schedule(), (attempt_two, count_two));
         assert!(restarts.settle_if_stable(
             IncarnationRun {
                 started_at: start,
@@ -1134,7 +1194,7 @@ mod tests {
             },
             stable_for,
         ));
-        assert_eq!(restarts.schedule(), (1, 3));
+        assert_eq!(restarts.schedule(), (attempt_one, count_three));
 
         assert!(
             !restarts.settle_if_stable(
@@ -1212,21 +1272,51 @@ mod tests {
             !lifecycle.fail_startup(),
             "simultaneous initial failures publish one transition"
         );
-        assert_eq!(lifecycle.finish_if_ready(true, true, true), None);
+        assert_eq!(
+            lifecycle.finish_if_ready(
+                ScopeFlavor::Ordered,
+                ChildCompletionState {
+                    has_children: true,
+                    all_terminal: true,
+                },
+            ),
+            None
+        );
         let drain = lifecycle
             .begin_drain(crate::exit::StopReason::ShutdownRequested)
             .expect("a failed startup can begin draining");
         assert!(!drain.startup_pending);
         assert_eq!(
-            lifecycle.finish_if_ready(false, true, true),
+            lifecycle.finish_if_ready(
+                ScopeFlavor::Dynamic,
+                ChildCompletionState {
+                    has_children: true,
+                    all_terminal: true,
+                },
+            ),
             Some(crate::exit::StopReason::ShutdownRequested)
         );
 
         let mut running = ScopeLifecycle::starting();
         assert!(running.complete_startup());
-        assert_eq!(running.finish_if_ready(true, false, true), None);
         assert_eq!(
-            running.finish_if_ready(true, true, true),
+            running.finish_if_ready(
+                ScopeFlavor::Ordered,
+                ChildCompletionState {
+                    has_children: false,
+                    all_terminal: true,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            running.finish_if_ready(
+                ScopeFlavor::Ordered,
+                ChildCompletionState {
+                    has_children: true,
+                    all_terminal: true,
+                },
+            ),
             Some(crate::exit::StopReason::Finished)
         );
 

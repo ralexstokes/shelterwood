@@ -12,8 +12,8 @@ use std::{
 
 use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
-    Actor, ActorDef, Context, ExitError, ExitKind, ExitResult, Readiness, SendErrorKind,
-    StartupError, StopReason, TaskDef, Tree,
+    Actor, ActorDef, Context, ExitError, ExitKind, ExitResult, GracePhase, Readiness,
+    SendErrorKind, StartupError, StopReason, TaskDef, Tree,
 };
 
 enum CapacityMessage {
@@ -120,7 +120,12 @@ async fn default_child_shutdown_grace_is_five_seconds() {
 
     let exit = task.wait().await;
     assert!(
-        matches!(exit.kind(), ExitKind::Aborted { after_grace: true }),
+        matches!(
+            exit.kind(),
+            ExitKind::Aborted {
+                phase: GracePhase::AfterGrace
+            }
+        ),
         "an uncooperative task is aborted after the default grace: {exit:?}"
     );
 }

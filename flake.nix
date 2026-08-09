@@ -32,7 +32,7 @@
           ...
         }:
         {
-          part0-enforcement = craneLibNightly.mkCargoDerivation (
+          api-enforcement = craneLibNightly.mkCargoDerivation (
             commonArgs
             // {
               cargoArtifacts = cargoArtifactsNightly;

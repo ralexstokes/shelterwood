@@ -35,10 +35,6 @@ struct TransportState {
     /// the disk underneath the actor rather than actor-owned state.
     delivered: Arc<Mutex<HashSet<u64>>>,
     processed: UnboundedSender<u64>,
-    /// Crash injection, not observation: the flag must survive the restart it
-    /// causes and is read-and-cleared by the actor itself, which a channel
-    /// cannot express — so it stays an atomic.
-    fail_once: Arc<AtomicBool>,
 }
 
 enum IngressMessage {
@@ -119,15 +115,15 @@ impl Actor for JournalActor {
             .insert(id);
         if inserted {
             let _ = self.0.state.processed.send(id);
-        }
-        if inserted && self.0.state.fail_once.swap(false, Ordering::SeqCst) {
+            // The crash window under test, derived from the durable ledger
+            // instead of an injection flag: every fresh durable write crashes
+            // before acknowledgement, so an ack can only come from a
+            // redelivery finding its id already journaled.
             return Err(ExitError::message(
                 "injected crash after durable write before acknowledgement",
             ));
         }
-        if !inserted {
-            let _ = self.0.ingress.try_send(IngressMessage::DuplicateObserved);
-        }
+        let _ = self.0.ingress.try_send(IngressMessage::DuplicateObserved);
         reply.send(());
         Ok(())
     }
@@ -203,7 +199,6 @@ fn gateway() -> GatewayFixture {
         state: TransportState {
             delivered: Arc::default(),
             processed,
-            fail_once: Arc::new(AtomicBool::new(true)),
         },
     }));
     let bridge_gate = ReleaseGate::default();

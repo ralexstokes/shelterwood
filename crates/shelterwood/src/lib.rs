@@ -4,6 +4,7 @@
 
 #[macro_use]
 mod definition;
+mod admission;
 mod actor;
 mod cells;
 mod deadline;
@@ -20,6 +21,7 @@ mod runtime;
 mod task;
 mod tree;
 
+pub use admission::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use exit::{
     Exit, ExitError, ExitKind, ExitResult, IntensityTrip, ShutdownStraggler, ShutdownTimeout,
@@ -35,7 +37,6 @@ pub use observe::{
     LifecycleEvents, LifecycleItem, LifecycleTryRecvError, MembershipStatus, ScopeKind,
     ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
 };
-pub use plan::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use policy::{
     Backoff, BackoffFactor, ChildId, DefaultsInheritance, Intensity, InvalidPolicy, Jitter,
     Mailbox, MailboxShutdown, PolicyError, PolicyField, Readiness, ReadinessDeadline,

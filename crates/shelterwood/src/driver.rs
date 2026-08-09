@@ -10,6 +10,7 @@ use std::{
 use crate::{
     ChildId, Exit, ExitKind, Incarnation, IntensityTrip, Membership, Readiness, ReadinessDeadline,
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
     cells::{DynamicRoute, MemberStage, ResidentProjection, ScopeCell},
     deadline::Deadline,
     engine::{
@@ -25,8 +26,8 @@ use crate::{
     identity::{FenceCounter, ScopeIdentity},
     observe::LifecycleEventKind,
     plan::{
-        BuilderCore, ChildConstruction, ChildPlan, LowerError, NotAdmittingCause, RemoveOutcome,
-        ReserveError, ScopeFactory, ScopePlan, SlotCell, checked_id, mint_reserved_slot,
+        BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
+        checked_id, mint_reserved_slot,
     },
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},

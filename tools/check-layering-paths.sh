@@ -6,6 +6,7 @@ set -euo pipefail
 cd "${SHELTERWOOD_ENFORCEMENT_ROOT:-.}"
 
 readonly below_driver_layers=(
+  crates/shelterwood/src/admission.rs
   crates/shelterwood/src/actor.rs
   crates/shelterwood/src/cells.rs
   crates/shelterwood/src/deadline.rs

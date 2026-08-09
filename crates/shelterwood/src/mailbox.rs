@@ -293,15 +293,17 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
 /// the channel, so a late [`Reply::send`] safely discards its value through
 /// isolated disposal.
 pub struct Reply<T> {
-    sender: Option<OneShotSender<T>>,
-    answered: bool,
+    sender: OneShotSender<T>,
 }
 
 impl<T> fmt::Debug for Reply<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Reply")
-            .field("answered", &self.answered)
+            // `Reply::send` consumes the capability, so every observable
+            // `Reply` is necessarily unanswered. Preserve the public Debug
+            // shape without storing that derivable state.
+            .field("answered", &false)
             .finish_non_exhaustive()
     }
 }
@@ -312,27 +314,19 @@ impl<T: Send + 'static> Reply<T> {
     pub fn channel() -> (Self, ReplyReceiver<T>) {
         let (sender, receiver) = crate::runtime::oneshot();
         (
-            Self {
-                sender: Some(sender),
-                answered: false,
-            },
+            Self { sender },
             ReplyReceiver {
-                receiver: Some(DisposingReceiver::new(receiver)),
+                receiver: DisposingReceiver::new(receiver),
             },
         )
     }
 
     /// Consumes the capability and delivers or discards the reply.
-    pub fn send(mut self, value: T) {
-        self.answered = true;
-        let sender = self
-            .sender
-            .take()
-            .expect("an unanswered reply retains its sender");
+    pub fn send(self, value: T) {
         // A cancelled receiver rejects the value. Destroying it inline would
         // run a possibly blocking or panicking user destructor on the replying
         // actor; route the discard through isolated disposal instead.
-        if let Err(unclaimed) = sender.send(value) {
+        if let Err(unclaimed) = self.sender.send(value) {
             dispose_detached(unclaimed);
         }
     }
@@ -340,7 +334,7 @@ impl<T: Send + 'static> Reply<T> {
 
 /// The owned, non-cloneable receive half of [`Reply::channel`].
 pub struct ReplyReceiver<T> {
-    receiver: Option<DisposingReceiver<T>>,
+    receiver: DisposingReceiver<T>,
 }
 
 impl<T> fmt::Debug for ReplyReceiver<T> {
@@ -353,11 +347,11 @@ impl<T> fmt::Debug for ReplyReceiver<T> {
 
 impl<T: Send + 'static> ReplyReceiver<T> {
     /// Consumes the receiver and waits within one response-only budget.
-    pub fn recv(mut self, deadline: Duration) -> ReplyReceive<T> {
+    pub fn recv(self, deadline: Duration) -> ReplyReceive<T> {
         ReplyReceive {
             deadlined: Deadlined::new(
                 ReplyOperation {
-                    receiver: self.receiver.take().expect("unused reply receiver is live"),
+                    receiver: self.receiver,
                 },
                 deadline,
             ),
@@ -1728,7 +1722,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             // Capture the one overall budget before invoking user code. A
             // slow message constructor consumes acceptance/response time. The
             // shared scaffold captured `budget` before this callback runs.
-            let (reply, mut receiver) = Reply::channel();
+            let (reply, receiver) = Reply::channel();
             let message =
                 self.make_msg
                     .take()
@@ -1740,7 +1734,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             if budget.is_overdue(crate::runtime::now()) {
                 return Poll::Ready(self.short_circuit());
             }
-            self.reply = receiver.receiver.take();
+            self.reply = Some(receiver.receiver);
             self.send = Some(self.actor.send(message));
         }
 
@@ -1922,6 +1916,37 @@ mod tests {
         let mailbox = MailboxCell::new(member.id().clone());
         member.attach_mailbox(mailbox.clone());
         (Arc::clone(&mailbox), ActorRef::new(member, mailbox))
+    }
+
+    #[test]
+    fn reply_debug_still_reports_the_derived_unanswered_state() {
+        let (reply, receiver) = super::Reply::<u8>::channel();
+
+        assert_eq!(format!("{reply:?}"), "Reply { answered: false, .. }");
+
+        drop(reply);
+        drop(receiver);
+    }
+
+    #[crate::runtime::test]
+    async fn reply_halves_preserve_success_drop_and_cancellation_lifecycles() {
+        let deadline = std::time::Duration::from_secs(1);
+
+        let (reply, receiver) = super::Reply::channel();
+        reply.send(7_u8);
+        assert_eq!(receiver.recv(deadline).await, Ok(7));
+
+        let (reply, receiver) = super::Reply::<u8>::channel();
+        drop(reply);
+        assert_eq!(
+            receiver.recv(deadline).await,
+            Err(super::ReplyError::Dropped)
+        );
+
+        let (reply, receiver) = super::Reply::<u8>::channel();
+        drop(receiver);
+        assert!(reply.sender.is_closed());
+        reply.send(9);
     }
 
     fn park_with(future: &mut std::pin::Pin<Box<super::SendFuture<u8>>>, waker: &Waker) {

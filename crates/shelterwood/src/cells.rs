@@ -7,6 +7,7 @@
 //! only as opaque capability payloads; their state remains owned elsewhere.
 
 use std::{
+    any::Any,
     fmt,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak,
@@ -27,7 +28,6 @@ use crate::{
         LifecycleHub, LifecycleSeq, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub,
         SnapshotReceiver,
     },
-    plan::SlotCell,
     policy::{ResolvedCommonOptions, ScopeFlavor},
     runtime::{self, Latch},
 };
@@ -371,21 +371,33 @@ pub(crate) struct ScopeRecord {
     pub(crate) total_restarts: TotalRestarts,
 }
 
+/// Type-erased declaration slot carried by the restart-stable cell layer.
+///
+/// The route implementation chooses the concrete slot allocation. Erasing it
+/// here lets [`ScopeCell`] retain the route without depending on the plan
+/// layer that owns declaration state.
+pub(crate) type ErasedDynamicSlot = dyn Any + Send + Sync;
+
+/// Object-safe dynamic route retained by a restart-stable scope cell.
+pub(crate) type ErasedDynamicRoute = dyn DynamicRoute<Slot = ErasedDynamicSlot>;
+
 pub(crate) trait DynamicRoute: Send + Sync {
+    type Slot: ?Sized + Send + Sync;
+
     fn reserve(
         &self,
         scope: &Arc<ScopeCell>,
         id: ChildId,
         child_scope: Option<ScopeFlavor>,
-    ) -> Result<Arc<SlotCell>, ReserveError>;
+    ) -> Result<Arc<Self::Slot>, ReserveError>;
 
     fn start_admission(
         self: Arc<Self>,
-        slot: Arc<SlotCell>,
+        slot: Arc<Self::Slot>,
         fused_cancel: Option<Latch>,
     ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError>;
 
-    fn cancel_reservation(&self, slot: &Arc<SlotCell>);
+    fn cancel_reservation(&self, slot: &Self::Slot);
 
     fn signal_fused_cancel(&self, membership: Membership, latch: &Latch);
 
@@ -513,7 +525,7 @@ pub(crate) struct ScopeCell {
     config: runtime::WatchSender<ObservationConfig>,
     record: runtime::WatchSender<ScopeRecord>,
     control: Mutex<ScopeControl>,
-    dynamic_route: Mutex<Option<Arc<dyn DynamicRoute>>>,
+    dynamic_route: Mutex<Option<Arc<ErasedDynamicRoute>>>,
     // Dropping a resident emits `Removed` and recursively reads this watch.
     // Every removal path must therefore release the watch guard first:
     // mutation callbacks move removed residents into outer storage, while a
@@ -1333,7 +1345,7 @@ impl ScopeCell {
         drop(residents);
     }
 
-    pub(crate) fn set_dynamic_route(&self, route: Option<Arc<dyn DynamicRoute>>) {
+    pub(crate) fn set_dynamic_route(&self, route: Option<Arc<ErasedDynamicRoute>>) {
         *self
             .dynamic_route
             .lock()
@@ -1341,7 +1353,7 @@ impl ScopeCell {
         self.member.record.pulse();
     }
 
-    pub(crate) fn dynamic_route(&self) -> Option<Arc<dyn DynamicRoute>> {
+    pub(crate) fn dynamic_route(&self) -> Option<Arc<ErasedDynamicRoute>> {
         self.dynamic_route
             .lock()
             .expect("scope dynamic-route mutex poisoned")

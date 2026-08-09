@@ -13,8 +13,8 @@ use crate::{
     StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
     cells::{
-        DynamicRoute, MailboxControl, MemberStage, ResidentProjection, ScopeCell,
-        StartupDisposition,
+        DynamicRoute, ErasedDynamicRoute, ErasedDynamicSlot, MailboxControl, MemberStage,
+        ResidentProjection, ScopeCell, StartupDisposition,
     },
     deadline::Deadline,
     engine::{
@@ -31,7 +31,8 @@ use crate::{
     observe::LifecycleEventKind,
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
-        checked_id, mint_reserved_slot,
+        checked_id, concrete_dynamic_slot, concrete_dynamic_slot_ref, erase_dynamic_slot,
+        mint_reserved_slot,
     },
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
@@ -315,7 +316,7 @@ fn resident_projection(slot: &SlotCell) -> ResidentProjection {
 
 pub(crate) struct DynamicReservation {
     pub(crate) slot: Arc<SlotCell>,
-    pub(crate) control: Arc<dyn DynamicRoute>,
+    pub(crate) control: Arc<ErasedDynamicRoute>,
 }
 
 pub(crate) fn reserve_dynamic(
@@ -347,7 +348,7 @@ pub(crate) fn reserve_dynamic(
             ));
         }
     }
-    let slot = control.reserve(scope, id, child_scope)?;
+    let slot = concrete_dynamic_slot(control.reserve(scope, id, child_scope)?);
     Ok(DynamicReservation { slot, control })
 }
 
@@ -382,11 +383,11 @@ fn reserve_dynamic_slot(
 }
 
 pub(crate) fn start_admission(
-    control: Arc<dyn DynamicRoute>,
+    control: Arc<ErasedDynamicRoute>,
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
 ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
-    control.start_admission(slot, fused_cancel)
+    control.start_admission(erase_dynamic_slot(slot), fused_cancel)
 }
 
 fn start_dynamic_admission(
@@ -417,7 +418,7 @@ fn start_dynamic_admission(
 
 fn cancel_dynamic_reservation_parts(
     control: &DynamicControl,
-    slot: &Arc<SlotCell>,
+    slot: &SlotCell,
 ) -> (
     Option<runtime::Isolated<ChildConstruction>>,
     Option<DynamicEntry>,
@@ -437,11 +438,11 @@ fn cancel_dynamic_reservation_parts(
     (definition, removed)
 }
 
-pub(crate) fn cancel_dynamic_reservation(control: &dyn DynamicRoute, slot: &Arc<SlotCell>) {
-    control.cancel_reservation(slot);
+pub(crate) fn cancel_dynamic_reservation(control: &ErasedDynamicRoute, slot: &Arc<SlotCell>) {
+    control.cancel_reservation(slot.as_ref());
 }
 
-fn cancel_dynamic_reservation_impl(control: &DynamicControl, slot: &Arc<SlotCell>) {
+fn cancel_dynamic_reservation_impl(control: &DynamicControl, slot: &SlotCell) {
     let (definition, removed) = cancel_dynamic_reservation_parts(control, slot);
     // The entry's drop completes its removal response; it must follow the
     // member's terminal publication and isolated definition disposal.
@@ -449,7 +450,7 @@ fn cancel_dynamic_reservation_impl(control: &DynamicControl, slot: &Arc<SlotCell
 }
 
 pub(crate) fn signal_fused_cancel(
-    control: &dyn DynamicRoute,
+    control: &ErasedDynamicRoute,
     membership: Membership,
     latch: &Latch,
 ) {
@@ -521,24 +522,27 @@ fn remove_dynamic_impl(
 }
 
 impl DynamicRoute for DynamicControl {
+    type Slot = ErasedDynamicSlot;
+
     fn reserve(
         &self,
         scope: &Arc<ScopeCell>,
         id: ChildId,
         child_scope: Option<ScopeFlavor>,
-    ) -> Result<Arc<SlotCell>, ReserveError> {
-        reserve_dynamic_slot(self, scope, id, child_scope)
+    ) -> Result<Arc<Self::Slot>, ReserveError> {
+        reserve_dynamic_slot(self, scope, id, child_scope).map(erase_dynamic_slot)
     }
 
     fn start_admission(
         self: Arc<Self>,
-        slot: Arc<SlotCell>,
+        slot: Arc<Self::Slot>,
         fused_cancel: Option<Latch>,
     ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
-        start_dynamic_admission(self, slot, fused_cancel)
+        start_dynamic_admission(self, concrete_dynamic_slot(slot), fused_cancel)
     }
 
-    fn cancel_reservation(&self, slot: &Arc<SlotCell>) {
+    fn cancel_reservation(&self, slot: &Self::Slot) {
+        let slot = concrete_dynamic_slot_ref(slot);
         cancel_dynamic_reservation_impl(self, slot);
     }
 

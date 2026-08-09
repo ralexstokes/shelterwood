@@ -65,6 +65,11 @@ check_forbidden \
   "${driver_layers[@]}"
 
 check_forbidden \
+  "plan references found in the restart-stable cell layer:" \
+  '\bplan::' \
+  crates/shelterwood/src/cells.rs
+
+check_forbidden \
   "child option resolution escaped the shared plan funnel:" \
   '\bresolve_common\b' \
   "${driver_layers[@]}"

@@ -13,8 +13,8 @@ use shelterwood::{
     DynamicTree, ExitError, ExitKind, ExitResult, GracePhase, Intensity, LifecycleEventKind,
     LifecycleItem, LifecycleTryRecvError, Mailbox, MailboxShutdown, Readiness, ReadinessDeadline,
     RestartAttempt, RestartCondition, RestartPolicy, ScopeDefaults, SendErrorKind, Shutdown,
-    StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef,
-    TaskRef, Tree,
+    StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
+    TaskOnceDef, TaskRef, Tree,
 };
 
 #[tokio::test]

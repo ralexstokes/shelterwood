@@ -89,12 +89,15 @@ impl<T> Drop for Obligation<T> {
 struct RecordedReport {
     outcome: Option<RecordedOutcome>,
     cancellation: Cancellation,
+    readiness_signal_seen: bool,
 }
 
 struct ReportCompletion {
     sender: mpsc::Sender<RecordedReport>,
     shutdown: Latch,
     local_stop: Option<Latch>,
+    readiness: Latch,
+    completion_boundary: Latch,
 }
 
 pub(crate) struct ReportToken {
@@ -112,11 +115,14 @@ pub(crate) struct ReportReceiver(mpsc::Receiver<RecordedReport>);
 /// language one — any replacement executor behind `runtime` must preserve it),
 /// so the exit joiner may require an immediately available report: one has
 /// already been sent on every return, panic, and cancellation edge. The
-/// shutdown/local-stop latches are sampled by that same send, making the
-/// report and its cancellation evidence one ordered observation.
+/// shutdown/local-stop and readiness latches are sampled by that same send,
+/// making the report and its completion-boundary evidence one ordered
+/// observation.
 pub(crate) fn report_channel(
     shutdown: Latch,
     local_stop: Option<Latch>,
+    readiness: Latch,
+    completion_boundary: Latch,
 ) -> (ReportToken, ReportReceiver) {
     let (sender, receiver) = mpsc::channel();
     (
@@ -126,6 +132,8 @@ pub(crate) fn report_channel(
                     sender,
                     shutdown,
                     local_stop,
+                    readiness,
+                    completion_boundary,
                 },
                 |completion| completion.send(None),
             ),
@@ -142,10 +150,16 @@ impl ReportCompletion {
             } else {
                 Cancellation::NotObserved
             };
-        let _ = self.sender.send(RecordedReport {
+        let report = RecordedReport {
             outcome,
             cancellation,
-        });
+            readiness_signal_seen: self.readiness.is_fired(),
+        };
+        // Close helper observers at the same boundary as the evidence
+        // snapshot. A capability retained outside the supervised future
+        // cannot publish readiness after the future has completed.
+        self.completion_boundary.fire();
+        let _ = self.sender.send(report);
     }
 }
 
@@ -797,6 +811,7 @@ enum ChildEvent {
         recorded: Option<RecordedOutcome>,
         join: JoinVerdict,
         cancellation: Cancellation,
+        readiness_signal_seen: bool,
     },
     ConstructionDisposed {
         child: ChildKey,
@@ -1366,7 +1381,12 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         construction_release,
         local_stop,
     } = launch;
-    let (report, report_receiver) = report_channel(shutdown, Some(local_stop.clone()));
+    let (report, report_receiver) = report_channel(
+        shutdown,
+        Some(local_stop.clone()),
+        ready.clone(),
+        ended.clone(),
+    );
     let constructed_sender = events.clone();
     let handle = runtime::spawn(async move {
         let body = async move {
@@ -1412,7 +1432,6 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
     let abort_handle = handle.abort_handle();
 
     let exit_sender = events.clone();
-    let exit_ended = ended.clone();
     runtime::spawn(async move {
         let join = match runtime::join(handle).await {
             runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
@@ -1421,7 +1440,6 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 phase: GracePhase::WithinGrace,
             },
         };
-        exit_ended.fire();
         // The task owns `report`, whose explicit record or Drop fallback runs
         // before the join completes. `receive` therefore asserts immediate
         // post-join availability without ever blocking this runtime worker.
@@ -1434,6 +1452,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 recorded: report.outcome,
                 join,
                 cancellation: report.cancellation,
+                readiness_signal_seen: report.readiness_signal_seen,
             }),
         )
         .await;
@@ -2082,6 +2101,7 @@ impl ScopeRuntime {
         recorded: Option<RecordedOutcome>,
         mut join: JoinVerdict,
         cancellation: Cancellation,
+        readiness_signal_seen: bool,
     ) {
         let readiness_effect = self
             .children
@@ -2090,7 +2110,7 @@ impl ScopeRuntime {
             .filter(|active| active.incarnation == incarnation)
             .and_then(|active| {
                 active.readiness.step(ReadinessEvent::Exit {
-                    signal_seen: active.ready_signal.is_fired(),
+                    signal_seen: readiness_signal_seen,
                 })
             });
         let became_ready = readiness_effect
@@ -3027,7 +3047,15 @@ async fn run_scope_incarnation(
                     recorded,
                     join,
                     cancellation,
-                })) => scope.handle_exit(child, incarnation, recorded, join, cancellation),
+                    readiness_signal_seen,
+                })) => scope.handle_exit(
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                ),
                 Pending::Driver(DriverEvent::Child(ChildEvent::ConstructionDisposed {
                     child,
                     panic,
@@ -3618,6 +3646,7 @@ mod tests {
             )))),
             join: JoinVerdict::Completed,
             cancellation: Cancellation::NotObserved,
+            readiness_signal_seen: false,
         });
         let mut pending = [
             restart_shutdown_work(nested),
@@ -3633,7 +3662,15 @@ mod tests {
                     recorded,
                     join,
                     cancellation,
-                })) => scope.handle_exit(child, incarnation, recorded, join, cancellation),
+                    readiness_signal_seen,
+                })) => scope.handle_exit(
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                ),
                 _ => unreachable!("the fixture queues only exit and restart work"),
             }
         }
@@ -3837,18 +3874,23 @@ mod tests {
     #[test]
     fn owned_report_token_consumes_or_falls_back_once() {
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let readiness = Latch::default();
+        let (token, receiver) =
+            report_channel(shutdown.clone(), None, readiness.clone(), Latch::default());
         token.record(RecordedOutcome::Returned(Ok(())));
         shutdown.fire();
+        readiness.fire();
         let report = receiver.receive();
         assert!(matches!(
             report.outcome,
             Some(RecordedOutcome::Returned(Ok(())))
         ));
         assert_eq!(report.cancellation, Cancellation::NotObserved);
+        assert!(!report.readiness_signal_seen);
 
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let (token, receiver) =
+            report_channel(shutdown.clone(), None, Latch::default(), Latch::default());
         shutdown.fire();
         drop(token);
         let report = receiver.receive();
@@ -3859,7 +3901,8 @@ mod tests {
     #[test]
     fn owned_report_token_records_prior_cancellation() {
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let (token, receiver) =
+            report_channel(shutdown.clone(), None, Latch::default(), Latch::default());
         shutdown.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
         let report = receiver.receive();
@@ -3874,10 +3917,31 @@ mod tests {
     fn owned_report_token_records_prior_local_stop() {
         let shutdown = Latch::default();
         let local_stop = Latch::default();
-        let (token, receiver) = report_channel(shutdown, Some(local_stop.clone()));
+        let (token, receiver) = report_channel(
+            shutdown,
+            Some(local_stop.clone()),
+            Latch::default(),
+            Latch::default(),
+        );
         local_stop.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
         assert_eq!(receiver.receive().cancellation, Cancellation::Observed);
+    }
+
+    #[test]
+    fn owned_report_token_records_readiness_at_completion() {
+        let readiness = Latch::default();
+        let completion_boundary = Latch::default();
+        let (token, receiver) = report_channel(
+            Latch::default(),
+            None,
+            readiness.clone(),
+            completion_boundary.clone(),
+        );
+        readiness.fire();
+        token.record(RecordedOutcome::Returned(Ok(())));
+        assert!(completion_boundary.is_fired());
+        assert!(receiver.receive().readiness_signal_seen);
     }
 
     #[test]

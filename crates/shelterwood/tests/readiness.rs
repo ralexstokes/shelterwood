@@ -118,6 +118,43 @@ async fn readiness_fired_before_clean_self_stop_counts_for_startup() {
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 }
 
+#[tokio::test]
+async fn readiness_fired_after_task_completion_cannot_reclassify_the_exit() {
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "late-readiness",
+            TaskDef::new(|context| async move {
+                let late_context = context.clone();
+                tokio::spawn(async move {
+                    late_context.mark_ready();
+                });
+                Ok(())
+            })
+            .restart(never())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+        )
+        .expect("valid task");
+
+    let system = tree.spawn().expect("runtime is available");
+    let startup = system
+        .wait_started()
+        .await
+        .expect_err("readiness after future completion is stale");
+    assert!(matches!(
+        startup,
+        StartupError::StartupFailed(ref failure)
+            if matches!(failure.cause, StartupFailureCause::Child { ref id, .. } if id.as_str() == "late-readiness")
+    ));
+    assert!(matches!(task.wait().await.kind(), ExitKind::Completed));
+    system
+        .shutdown(Duration::ZERO)
+        .await
+        .expect("the completed child has no straggler");
+}
+
 #[tokio::test(start_paused = true)]
 async fn immediate_restart_deadline_rechecks_aggregate_startup() {
     let backoff = Duration::from_secs(30);

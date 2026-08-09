@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    Exit, GracePhase, Intensity, IntensityTrip, Readiness, RestartAttempt, RestartCount,
-    RestartPolicy, Shutdown, TotalRestarts,
+    Exit, GracePhase, Intensity, IntensityTrip, JitterSample, Readiness, RestartAttempt,
+    RestartCount, RestartPolicy, Shutdown, TotalRestarts,
     deadline::Deadline,
     exit::StopReason,
     policy::{ScopeFlavor, tidy_abort_beat},
@@ -210,7 +210,7 @@ pub(crate) fn dispatch_exit(
     if scope == ScopeMode::Draining || membership == MembershipMode::Removing {
         return ExitDispatch::Terminal;
     }
-    if restart.should_restart(exit.is_failure()) {
+    if restart.should_restart(exit) {
         ExitDispatch::ScheduleRestart
     } else {
         ExitDispatch::Terminal
@@ -275,6 +275,12 @@ pub(crate) struct RestartState {
     cumulative: RestartCount,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IncarnationRun {
+    pub(crate) started_at: Instant,
+    pub(crate) stopped_at: Instant,
+}
+
 impl RestartState {
     pub(crate) fn new() -> Self {
         Self {
@@ -297,13 +303,8 @@ impl RestartState {
     ///
     /// Saturating elapsed time deliberately treats a clock regression as a
     /// zero-length run, so it cannot accidentally forgive restart pressure.
-    pub(crate) fn settle_if_stable(
-        &mut self,
-        started_at: Instant,
-        stopped_at: Instant,
-        stable_for: Duration,
-    ) -> bool {
-        if stopped_at.saturating_duration_since(started_at) < stable_for {
+    pub(crate) fn settle_if_stable(&mut self, run: IncarnationRun, stable_for: Duration) -> bool {
+        if run.stopped_at.saturating_duration_since(run.started_at) < stable_for {
             return false;
         }
         self.settled();
@@ -329,7 +330,7 @@ pub(crate) fn schedule_restart(
     intensity_policy: Intensity,
     restart_policy: RestartPolicy,
     now: Instant,
-    jitter_sample: f64,
+    jitter_sample: JitterSample,
 ) -> RestartDecision {
     let (attempt, restart_count) = restarts.schedule();
     let delay = restart_policy.backoff().next_delay(attempt, jitter_sample);
@@ -894,16 +895,16 @@ mod tests {
     };
 
     use crate::{
-        Cancellation, Exit, ExitKind, GracePhase, Intensity, RestartAttempt, RestartCondition,
-        RestartCount, RestartPolicy, Shutdown, TotalRestarts,
+        Cancellation, Exit, ExitKind, GracePhase, Intensity, JitterSample, RestartAttempt,
+        RestartCondition, RestartCount, RestartPolicy, Shutdown, TotalRestarts,
         policy::{Backoff, ScopeFlavor},
     };
 
     use super::{
         ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
-        IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate,
-        RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode, StopAction,
-        StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
+        IncarnationRun, IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent,
+        ReadinessGate, RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode,
+        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
     };
 
     #[test]
@@ -1129,7 +1130,7 @@ mod tests {
             intensity_policy,
             restart_policy,
             now,
-            0.5,
+            JitterSample::new(0.5),
         );
 
         assert_eq!(decision.attempt, RestartAttempt::ZERO.bump());
@@ -1156,7 +1157,7 @@ mod tests {
             intensity_policy,
             restart_policy,
             now,
-            0.5,
+            JitterSample::new(0.5),
         );
 
         assert_eq!(decision.delay, Duration::MAX);
@@ -1179,16 +1180,30 @@ mod tests {
         let count_three = count_two.bump();
         assert_eq!(restarts.schedule(), (attempt_one, count_one));
         assert!(!restarts.settle_if_stable(
-            start,
-            start + stable_for - Duration::from_nanos(1),
+            IncarnationRun {
+                started_at: start,
+                stopped_at: start + stable_for - Duration::from_nanos(1),
+            },
             stable_for,
         ));
         assert_eq!(restarts.schedule(), (attempt_two, count_two));
-        assert!(restarts.settle_if_stable(start, start + stable_for, stable_for));
+        assert!(restarts.settle_if_stable(
+            IncarnationRun {
+                started_at: start,
+                stopped_at: start + stable_for,
+            },
+            stable_for,
+        ));
         assert_eq!(restarts.schedule(), (attempt_one, count_three));
 
         assert!(
-            !restarts.settle_if_stable(start, start - Duration::from_nanos(1), stable_for),
+            !restarts.settle_if_stable(
+                IncarnationRun {
+                    started_at: start,
+                    stopped_at: start - Duration::from_nanos(1),
+                },
+                stable_for,
+            ),
             "a regressed clock cannot forgive restart pressure"
         );
     }

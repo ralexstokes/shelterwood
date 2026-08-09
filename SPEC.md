@@ -142,7 +142,7 @@ any single design rule:
   invariant makes bit-equality correct: §9.2's backoff factor),
   serializable where Part II §21 needs it, and carrying **no
   behavior** beyond small pure derivation functions of the
-  `should_restart(is_failure)` / `next_delay(restart_attempt, jitter_sample)` /
+  `should_restart(exit)` / `next_delay(restart_attempt, JitterSample)` /
   `validate()` shape. Runtime behavior is *derived from* the data by local
   functions; it is never encoded as trait objects, callbacks, or builder
   side effects.
@@ -1705,8 +1705,11 @@ Two separated concerns:
   or exponential: `base × factor^(n−1)` clamped to `max`, with optional
   equal-jitter drawing uniformly from `[d/2, d]`; all durations validated
   non-zero at construction). Delay computation is a pure function of
-  (attempt, policy, jitter sample) — the sample is an input, not drawn
-  inside (§1 implementation shape; D.3 names the source). Pinned
+  (attempt, policy, `JitterSample`) — the sample is an input, not drawn
+  inside (§1 implementation shape; D.3 names the source). `JitterSample`
+  owns the `[0, 1)` invariant: its constructor clamps finite inputs and maps
+  non-finite inputs to zero, while `from_u64_ratio` owns the driver's integer
+  random-source normalization. Pinned
   arithmetic: `factor` is a validated newtype over `f64` — finite and
   `≥ 1.0`, checked at construction — implementing `Eq`/`Hash` as
   bit-equality of the underlying bits, sound because the invariant
@@ -1717,8 +1720,8 @@ Two separated concerns:
   count is used exactly, with no float round-trip; otherwise the base
   delay's whole-nanosecond count is multiplied as `f64`, rounded to the
   nearest nanosecond, and a product at or above `max` saturates to the
-  exact configured `max` (never an overflow panic); jitter maps a
-  pre-drawn `f64` sample in `[0, 1)` as `delay = d/2 + sample × d/2`,
+  exact configured `max` (never an overflow panic); jitter maps the
+  pre-drawn `JitterSample` as `delay = d/2 + sample × d/2`,
   rounded the same way — a zero sample yields the exact half,
   half-nanosecond remainders rounding up with no float round-trip. The
   attempt counter is per
@@ -1734,6 +1737,8 @@ Two separated concerns:
   Each exposes only `ZERO`, a saturating `bump()`, and `get()`; none implements
   arithmetic traits, so the domains cannot be added, substituted, or compared
   across one another accidentally. Running time is
+  passed to the settling decision as one named `IncarnationRun {
+  started_at, stopped_at }`, so its endpoints cannot be transposed, and is
   measured between two engine-stamped instants: the incarnation's **start
   instant**, stamped once when the engine schedules the spawn (the
   `Started` event's instant — the same stamp anchors §6's readiness
@@ -2564,8 +2569,10 @@ Both questions are resolved:
    disarm them. Queued admissions run after all already-observed terminal and
    temporal facts, so they cannot enter a scope that the same wake has made
    non-admitting. The decision layer represents this as an ordered class and
-   pins the complete table without runtime selection; the driver drains all
-   currently eligible inputs into that table before applying effects.
+   pins the complete table without runtime selection; each pending item
+   derives its class through `Pending::class()` rather than accepting a class
+   beside it at collection sites, and the driver drains all currently eligible
+   inputs into that table before applying effects.
 
 (Resolved elsewhere: stage-generic `handle` is rejected — drain-stage
 rejection stays value-level, §5.4; the conflating-mailbox control lane is

@@ -8,9 +8,9 @@ use std::{
 };
 
 use crate::{
-    Cancellation, ChildId, Exit, ExitKind, GracePhase, Incarnation, IntensityTrip, Membership,
-    Readiness, ReadinessDeadline, ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure,
-    StartupFailureCause,
+    Cancellation, ChildId, Exit, ExitKind, GracePhase, Incarnation, IntensityTrip, JitterSample,
+    Membership, Readiness, ReadinessDeadline, ScopeState, ShutdownStraggler, ShutdownTimeout,
+    StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
     cells::{
         DynamicRoute, MailboxControl, MemberStage, ResidentProjection, ScopeCell,
@@ -19,9 +19,9 @@ use crate::{
     deadline::Deadline,
     engine::{
         ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
-        IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate,
-        RestartState, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
-        schedule_restart,
+        IncarnationRun, IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent,
+        ReadinessGate, RestartState, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate,
+        dispatch_exit, schedule_restart,
     },
     exit::{
         JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit,
@@ -2098,8 +2098,10 @@ impl ScopeRuntime {
         let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
         let exit = classify_exit(recorded, join, cancellation);
         child.restarts.settle_if_stable(
-            active.started_at,
-            runtime::now(),
+            IncarnationRun {
+                started_at: active.started_at,
+                stopped_at: runtime::now(),
+            },
             self.intensity_policy.within,
         );
 
@@ -2133,7 +2135,8 @@ impl ScopeRuntime {
                 if !self.lifecycle.startup_complete() {
                     child.initial_ready = false;
                 }
-                let sample = self.jitter.sample(0..u64::MAX) as f64 / u64::MAX as f64;
+                let sample =
+                    JitterSample::from_u64_ratio(self.jitter.sample(0..u64::MAX), u64::MAX);
                 let now = runtime::now();
                 let decision = schedule_restart(
                     &mut child.restarts,
@@ -2832,7 +2835,7 @@ async fn run_scope_incarnation(
     loop {
         let mut pending = Vec::new();
         if root.take_shutdown_request(scope.epoch) {
-            pending.push((ArbitrationClass::ScopeShutdown, Pending::Shutdown));
+            pending.push(Pending::Shutdown.classified());
         }
         for child in scope.pending_restart_shutdowns() {
             pending.push(restart_shutdown_work(child));
@@ -2844,7 +2847,7 @@ async fn run_scope_incarnation(
                 .is_some_and(|latches| latches.shutdown.is_fired())
         {
             scope.ancestor_shutdown_seen = true;
-            pending.push((ArbitrationClass::ScopeShutdown, Pending::AncestorShutdown));
+            pending.push(Pending::AncestorShutdown.classified());
         }
         if !scope.ancestor_abort_seen
             && scope
@@ -2853,16 +2856,15 @@ async fn run_scope_incarnation(
                 .is_some_and(|latches| latches.abort.is_fired())
         {
             scope.ancestor_abort_seen = true;
-            pending.push((ArbitrationClass::ScopeShutdown, Pending::AncestorAbort));
+            pending.push(Pending::AncestorAbort.classified());
         }
         if root.take_force_request(scope.epoch) {
             // Force owns shutdown arbitration: readiness from the same wake
             // cannot publish Running after the stop boundary.
-            pending.push((ArbitrationClass::ScopeShutdown, Pending::Force));
+            pending.push(Pending::Force.classified());
         }
         while let Some(event) = runtime::mpsc_try_recv(&mut event_receiver) {
-            let class = driver_event_class(&event);
-            pending.push((class, Pending::Driver(event)));
+            pending.push(Pending::Driver(event).classified());
         }
         // Disposal completions drain after the bounded lane, and `arbitrate`
         // sorts stably, so a `ConstructionDisposed` always trails every
@@ -2875,17 +2877,11 @@ async fn run_scope_incarnation(
         // one: disposal runs on the blocking pool, so its completion never had
         // a fixed position relative to concurrent exits.
         while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut disposal_event_receiver) {
-            let class = driver_event_class(&event);
-            pending.push((class, Pending::Driver(event)));
+            pending.push(Pending::Driver(event).classified());
         }
         let now = runtime::now();
         while let Some(deadline) = scope.deadlines.pop_due(now) {
-            let class = match deadline {
-                DeadlineKind::Readiness { .. } => ArbitrationClass::ReadinessDeadline,
-                DeadlineKind::Restart { .. } => ArbitrationClass::BackoffDue,
-                DeadlineKind::Stop { .. } => ArbitrationClass::StopDeadline,
-            };
-            pending.push((class, Pending::Deadline(deadline)));
+            pending.push(Pending::Deadline(deadline).classified());
         }
 
         if pending.is_empty() {
@@ -2934,8 +2930,7 @@ async fn run_scope_incarnation(
                     continue;
                 }
                 runtime::ScopeWake::Message(Some(event)) => {
-                    let class = driver_event_class(&event);
-                    pending.push((class, Pending::Driver(event)));
+                    pending.push(Pending::Driver(event).classified());
                 }
                 runtime::ScopeWake::Message(None) => continue,
             }
@@ -3043,15 +3038,31 @@ enum Pending {
     Deadline(DeadlineKind),
 }
 
+impl Pending {
+    fn class(&self) -> ArbitrationClass {
+        match self {
+            Self::Shutdown | Self::AncestorShutdown | Self::AncestorAbort | Self::Force => {
+                ArbitrationClass::ScopeShutdown
+            }
+            Self::RestartShutdown(_) => ArbitrationClass::BackoffDue,
+            Self::Driver(event) => driver_event_class(event),
+            Self::Deadline(DeadlineKind::Readiness { .. }) => ArbitrationClass::ReadinessDeadline,
+            Self::Deadline(DeadlineKind::Restart { .. }) => ArbitrationClass::BackoffDue,
+            Self::Deadline(DeadlineKind::Stop { .. }) => ArbitrationClass::StopDeadline,
+        }
+    }
+
+    fn classified(self) -> (ArbitrationClass, Self) {
+        (self.class(), self)
+    }
+}
+
 fn restart_shutdown_work(child: ChildKey) -> (ArbitrationClass, Pending) {
     // This starts a pending incarnation, so it is restart work, not a
     // scope-shutdown transition. A child exit collected in the same wake must
     // first get the chance to trip intensity or fail startup; the
     // execution-time suppression check then observes that drain.
-    (
-        ArbitrationClass::BackoffDue,
-        Pending::RestartShutdown(child),
-    )
+    Pending::RestartShutdown(child).classified()
 }
 
 fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
@@ -3096,8 +3107,8 @@ mod tests {
         DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
         Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
         ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, complete_removals,
-        driver_event_class, report_channel, resident_projection, restart_shutdown_work,
-        run_nested_tree, run_scope_incarnation,
+        report_channel, resident_projection, restart_shutdown_work, run_nested_tree,
+        run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -3570,7 +3581,7 @@ mod tests {
         });
         let mut pending = [
             restart_shutdown_work(nested),
-            (driver_event_class(&exit), Pending::Driver(exit)),
+            Pending::Driver(exit).classified(),
         ];
         arbitrate(&mut pending);
         for (_, event) in pending {

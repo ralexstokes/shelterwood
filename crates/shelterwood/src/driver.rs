@@ -103,11 +103,13 @@ pub(crate) struct ReportReceiver(mpsc::Receiver<RecordedReport>);
 /// asynchronous handoff race.
 ///
 /// `ReportToken` is owned by the child task and its fail-closed `Drop` sends a
-/// fallback synchronously. Rust drops those task locals before the join handle
-/// becomes ready, so the exit joiner may require an immediately available
-/// report: one has already been sent on every return, panic, and cancellation
-/// edge. The shutdown/local-stop latches are sampled by that same send, making
-/// the report and its cancellation evidence one ordered observation.
+/// fallback synchronously. The runtime resolves `runtime::join` only after the
+/// spawned future has been destroyed (a tokio `JoinHandle` guarantee, not a
+/// language one — any replacement executor behind `runtime` must preserve it),
+/// so the exit joiner may require an immediately available report: one has
+/// already been sent on every return, panic, and cancellation edge. The
+/// shutdown/local-stop latches are sampled by that same send, making the
+/// report and its cancellation evidence one ordered observation.
 pub(crate) fn report_channel(
     shutdown: Latch,
     local_stop: Option<Latch>,

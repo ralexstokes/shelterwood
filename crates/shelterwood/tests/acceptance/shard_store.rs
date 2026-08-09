@@ -560,7 +560,7 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
 
 struct GatedShardActor {
     durable: DurableShard,
-    entered: Arc<std::sync::atomic::AtomicBool>,
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
     gate: Arc<tokio::sync::Notify>,
 }
 
@@ -568,7 +568,7 @@ impl Actor for GatedShardActor {
     type Msg = ShardMessage;
     type Args = (
         DurableShard,
-        Arc<std::sync::atomic::AtomicBool>,
+        tokio::sync::mpsc::UnboundedSender<()>,
         Arc<tokio::sync::Notify>,
     );
 
@@ -583,8 +583,7 @@ impl Actor for GatedShardActor {
 
     async fn handle(&mut self, message: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
         let ShardMessage::Put { key, value, reply } = message;
-        self.entered
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.entered.send(());
         self.gate.notified().await;
         self.durable
             .0
@@ -602,7 +601,7 @@ impl Actor for GatedShardActor {
 #[tokio::test]
 async fn shard_store_retire_waits_for_accepted_requests() {
     let durable = DurableShard::default();
-    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (entered, mut entered_log) = tokio::sync::mpsc::unbounded_channel();
     let gate = Arc::new(tokio::sync::Notify::new());
     let mut root = Tree::new();
     let ranges = root
@@ -615,11 +614,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
     let actor = mount
         .add_actor(
             "shard",
-            ActorDef::<GatedShardActor>::cloned((
-                durable.clone(),
-                Arc::clone(&entered),
-                Arc::clone(&gate),
-            )),
+            ActorDef::<GatedShardActor>::cloned((durable.clone(), entered, Arc::clone(&gate))),
         )
         .expect("valid shard");
     let scope = ranges
@@ -643,13 +638,10 @@ async fn shard_store_retire_waits_for_accepted_requests() {
                 .await
         }
     });
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the accepted write reaches the handler");
+    tokio::time::timeout(Duration::from_secs(1), entered_log.recv())
+        .await
+        .expect("the accepted write reaches the handler")
+        .expect("shard actor is alive");
 
     // Retirement starts while the accepted write is mid-handling;
     // `membership_status` flips synchronously at the call (§13.12).

@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -14,6 +14,7 @@ use shelterwood::{
     LifecycleItem, Mailbox, Membership, RemoveOutcome, Reply, ReserveError, RestartPolicy,
     ScopeState, StopContext, SubtreeOnceDef, Tree,
 };
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
     loop {
@@ -27,14 +28,16 @@ async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct TransportState {
     /// The journal's durable ledger. It must survive the injected crash of
     /// `JournalActor` (a restart re-inits from cloned `Args`), so it models
     /// the disk underneath the actor rather than actor-owned state.
     delivered: Arc<Mutex<HashSet<u64>>>,
-    processed: Arc<AtomicUsize>,
-    duplicate_notices: Arc<AtomicUsize>,
+    processed: UnboundedSender<u64>,
+    /// Crash injection, not observation: the flag must survive the restart it
+    /// causes and is read-and-cleared by the actor itself, which a channel
+    /// cannot express — so it stays an atomic.
     fail_once: Arc<AtomicBool>,
 }
 
@@ -50,7 +53,7 @@ enum JournalMessage {
 #[derive(Clone)]
 struct IngressArgs {
     journal: ActorRef<JournalMessage>,
-    duplicate_notices: Arc<AtomicUsize>,
+    duplicate_notices: UnboundedSender<()>,
 }
 
 struct IngressActor(IngressArgs);
@@ -82,7 +85,7 @@ impl Actor for IngressActor {
                 reply.send(());
             }
             IngressMessage::DuplicateObserved => {
-                self.0.duplicate_notices.fetch_add(1, Ordering::SeqCst);
+                let _ = self.0.duplicate_notices.send(());
             }
         }
         Ok(())
@@ -115,7 +118,7 @@ impl Actor for JournalActor {
             .expect("transport journal mutex poisoned")
             .insert(id);
         if inserted {
-            self.0.state.processed.fetch_add(1, Ordering::SeqCst);
+            let _ = self.0.state.processed.send(id);
         }
         if inserted && self.0.state.fail_once.swap(false, Ordering::SeqCst) {
             return Err(ExitError::message(
@@ -172,9 +175,13 @@ struct GatewayFixture {
     ingress: ActorRef<IngressMessage>,
     bridge: ActorRef<BridgeMessage>,
     bridge_gate: ReleaseGate,
+    processed: UnboundedReceiver<u64>,
+    duplicate_notices: UnboundedReceiver<()>,
 }
 
-fn gateway(state: TransportState) -> GatewayFixture {
+fn gateway(fail_once: bool) -> GatewayFixture {
+    let (processed, processed_log) = unbounded_channel();
+    let (duplicate_notices, duplicates_log) = unbounded_channel();
     let mut tree = Tree::new();
     let ingress_slot = tree
         .reserve_actor::<IngressMessage>("ingress")
@@ -189,11 +196,15 @@ fn gateway(state: TransportState) -> GatewayFixture {
     // no registry and no Option<ActorRef> initialization phase.
     let _defined_ingress = ingress_slot.define(ActorDef::<IngressActor>::cloned(IngressArgs {
         journal: journal.clone(),
-        duplicate_notices: Arc::clone(&state.duplicate_notices),
+        duplicate_notices,
     }));
     let _defined_journal = journal_slot.define(ActorDef::<JournalActor>::cloned(JournalArgs {
         ingress: ingress.clone(),
-        state,
+        state: TransportState {
+            delivered: Arc::default(),
+            processed,
+            fail_once: Arc::new(AtomicBool::new(fail_once)),
+        },
     }));
     let bridge_gate = ReleaseGate::default();
     let bridge = tree
@@ -207,14 +218,18 @@ fn gateway(state: TransportState) -> GatewayFixture {
         ingress,
         bridge,
         bridge_gate,
+        processed: processed_log,
+        duplicate_notices: duplicates_log,
     }
 }
 
 #[derive(Clone)]
 struct SessionControlArgs {
+    /// Crash injection, kept as an atomic: it must survive the restart it
+    /// causes and the actor read-and-clears it itself.
     crash_once: Arc<AtomicBool>,
-    rehydrated: Arc<AtomicUsize>,
-    stop_entered: Arc<AtomicBool>,
+    rehydrated: UnboundedSender<()>,
+    stop_entered: UnboundedSender<()>,
     stop_gate: ReleaseGate,
 }
 
@@ -239,7 +254,7 @@ impl Actor for SessionControlActor {
     async fn handle(&mut self, message: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
         match message {
             SessionControlMessage::Rehydrate => {
-                self.0.rehydrated.fetch_add(1, Ordering::SeqCst);
+                let _ = self.0.rehydrated.send(());
             }
             SessionControlMessage::Crash => {
                 if self.0.crash_once.swap(false, Ordering::SeqCst) {
@@ -251,18 +266,18 @@ impl Actor for SessionControlActor {
     }
 
     async fn on_stop(&mut self, _: &mut StopContext<'_, Self>) {
-        self.0.stop_entered.store(true, Ordering::SeqCst);
+        let _ = self.0.stop_entered.send(());
         self.0.stop_gate.wait().await;
     }
 }
 
 struct StreamActor {
-    values: tokio::sync::mpsc::UnboundedSender<u64>,
+    values: UnboundedSender<u64>,
 }
 
 impl Actor for StreamActor {
     type Msg = u64;
-    type Args = (ReleaseGate, tokio::sync::mpsc::UnboundedSender<u64>);
+    type Args = (ReleaseGate, UnboundedSender<u64>);
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
         args.0.wait().await;
@@ -278,8 +293,10 @@ impl Actor for StreamActor {
 
 #[derive(Clone)]
 struct ToolArgs {
+    /// Crash injection, kept as an atomic: it must survive the restart it
+    /// causes and the actor read-and-clears it itself.
     crash_once: Arc<AtomicBool>,
-    completions: Arc<AtomicUsize>,
+    completions: UnboundedSender<()>,
 }
 
 enum ToolMessage {
@@ -315,7 +332,7 @@ impl Actor for ToolActor {
                     .expect("live tool accepts incarnation-owned offload");
             }
             ToolMessage::Completed(Ok(7)) => {
-                self.0.completions.fetch_add(1, Ordering::SeqCst);
+                let _ = self.0.completions.send(());
             }
             ToolMessage::Completed(Ok(value)) => {
                 return Err(ExitError::message(format!(
@@ -336,9 +353,9 @@ struct SessionFixture {
     control: ActorRef<SessionControlMessage>,
     stream: ActorRef<u64>,
     stream_gate: ReleaseGate,
-    stream_log: tokio::sync::mpsc::UnboundedReceiver<u64>,
-    rehydrated: Arc<AtomicUsize>,
-    stop_entered: Arc<AtomicBool>,
+    stream_log: UnboundedReceiver<u64>,
+    rehydrated: UnboundedReceiver<()>,
+    stop_entered: UnboundedReceiver<()>,
     stop_gate: ReleaseGate,
 }
 
@@ -349,7 +366,7 @@ fn session_fixture() -> SessionFixture {
         .add_subtree_once("tools", SubtreeOnceDef::new(tools_tree))
         .expect("nested tool scope declared");
     let stream_gate = ReleaseGate::default();
-    let (stream_values, stream_log) = tokio::sync::mpsc::unbounded_channel();
+    let (stream_values, stream_log) = unbounded_channel();
     let stream = tree
         .add_actor_once(
             "stream",
@@ -357,16 +374,16 @@ fn session_fixture() -> SessionFixture {
                 .mailbox(Mailbox::latest()),
         )
         .expect("stream actor declared");
-    let rehydrated = Arc::new(AtomicUsize::new(0));
-    let stop_entered = Arc::new(AtomicBool::new(false));
+    let (rehydrated, rehydration_log) = unbounded_channel();
+    let (stop_entered, stop_log) = unbounded_channel();
     let stop_gate = ReleaseGate::default();
     let control = tree
         .add_actor(
             "control",
             ActorDef::<SessionControlActor>::cloned(SessionControlArgs {
                 crash_once: Arc::new(AtomicBool::new(true)),
-                rehydrated: Arc::clone(&rehydrated),
-                stop_entered: Arc::clone(&stop_entered),
+                rehydrated,
+                stop_entered,
                 stop_gate: stop_gate.clone(),
             })
             .restart(RestartPolicy::default()),
@@ -379,8 +396,8 @@ fn session_fixture() -> SessionFixture {
         stream,
         stream_gate,
         stream_log,
-        rehydrated,
-        stop_entered,
+        rehydrated: rehydration_log,
+        stop_entered: stop_log,
         stop_gate,
     }
 }
@@ -404,11 +421,7 @@ fn event_is_restart_for(event: &LifecycleEvent, membership: Membership) -> bool 
 
 #[tokio::test]
 async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_and_remount() {
-    let transport = TransportState {
-        fail_once: Arc::new(AtomicBool::new(true)),
-        ..TransportState::default()
-    };
-    let gateway = gateway(transport.clone());
+    let mut gateway = gateway(true);
     let mut root_tree = Tree::new();
     let sessions = root_tree
         .add_subtree_once("sessions", SubtreeOnceDef::new(DynamicTree::new()))
@@ -443,8 +456,8 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     let session_data = session_fixture();
     let stream_gate = session_data.stream_gate.clone();
     let mut stream_log = session_data.stream_log;
-    let rehydrated = Arc::clone(&session_data.rehydrated);
-    let stop_entered = Arc::clone(&session_data.stop_entered);
+    let mut rehydrated = session_data.rehydrated;
+    let mut stop_entered = session_data.stop_entered;
     let stop_gate = session_data.stop_gate.clone();
     let tools = session_data.tools.clone();
     let control = session_data.control.clone();
@@ -485,12 +498,10 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         newest, 3,
         "latest mailbox keeps the newest accepted streaming update"
     );
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            rehydrated.load(Ordering::SeqCst) >= 1
-        })
+    tokio::time::timeout(POLL_TIMEOUT, rehydrated.recv())
         .await
-    );
+        .expect("session control rehydrates from its init continuation")
+        .expect("control actor is alive");
 
     let forwarded = loop {
         let event = next_event(&mut lifecycle).await;
@@ -536,9 +547,10 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         "session actor panic is isolated and restarted"
     );
 
+    let (completions, mut completed) = unbounded_channel();
     let tool_args = ToolArgs {
         crash_once: Arc::new(AtomicBool::new(true)),
-        completions: Arc::new(AtomicUsize::new(0)),
+        completions,
     };
     let tool = tools
         .add_actor(
@@ -579,13 +591,10 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     tool.send(ToolMessage::Work)
         .await
         .expect("offload request accepted");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            tool_args.completions.load(Ordering::SeqCst) == 1
-        })
-        .await,
-        "incarnation-owned offload completes through the actor loop"
-    );
+    tokio::time::timeout(POLL_TIMEOUT, completed.recv())
+        .await
+        .expect("incarnation-owned offload completes through the actor loop")
+        .expect("tool actor is alive");
     assert_eq!(
         tools.remove_actor(&tool).await,
         RemoveOutcome::Removed,
@@ -612,13 +621,16 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         )
         .await
         .expect("redelivery of the same journal id is acknowledged");
-    assert_eq!(transport.processed.load(Ordering::SeqCst), 1);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            transport.duplicate_notices.load(Ordering::SeqCst) == 1
-        })
-        .await
+    assert_eq!(
+        gateway.processed.try_recv().ok(),
+        Some(7),
+        "the durable write happened exactly once"
     );
+    assert!(gateway.processed.try_recv().is_err());
+    tokio::time::timeout(POLL_TIMEOUT, gateway.duplicate_notices.recv())
+        .await
+        .expect("the redelivered id surfaces as a duplicate notice")
+        .expect("ingress actor is alive");
 
     let mut saw_control_restart = false;
     let mut saw_tool_restart = false;
@@ -634,12 +646,10 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     assert!(saw_control_restart && saw_tool_restart && saw_gateway_restart);
 
     let removal = sessions.remove_scope(&session);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            stop_entered.load(Ordering::SeqCst)
-        })
+    tokio::time::timeout(POLL_TIMEOUT, stop_entered.recv())
         .await
-    );
+        .expect("removal drives the control actor into on_stop")
+        .expect("control actor reports entering on_stop");
     let racing = session_fixture();
     racing.stream_gate.release();
     racing.stop_gate.release();
@@ -699,15 +709,15 @@ enum IdleMessage {
 }
 
 struct IdleSessionActor {
-    evictions: tokio::sync::mpsc::UnboundedSender<()>,
-    activities: Arc<AtomicUsize>,
+    evictions: UnboundedSender<()>,
+    activities: UnboundedSender<()>,
 }
 
 const IDLE_AFTER: Duration = Duration::from_secs(60);
 
 impl Actor for IdleSessionActor {
     type Msg = IdleMessage;
-    type Args = (tokio::sync::mpsc::UnboundedSender<()>, Arc<AtomicUsize>);
+    type Args = (UnboundedSender<()>, UnboundedSender<()>);
 
     async fn init(args: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
         context
@@ -728,7 +738,7 @@ impl Actor for IdleSessionActor {
                 context
                     .set_timeout("idle", IdleMessage::IdleExpired, IDLE_AFTER)
                     .expect("live session re-arms its idle timer");
-                self.activities.fetch_add(1, Ordering::SeqCst);
+                let _ = self.activities.send(());
             }
             IdleMessage::IdleExpired => {
                 let _ = self.evictions.send(());
@@ -744,14 +754,14 @@ impl Actor for IdleSessionActor {
 /// `Terminated` while never leaking another value.
 #[tokio::test(start_paused = true)]
 async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight() {
-    let (evictions, mut evicted) = tokio::sync::mpsc::unbounded_channel();
-    let activities = Arc::new(AtomicUsize::new(0));
-    let (stream_values, mut stream_log) = tokio::sync::mpsc::unbounded_channel();
+    let (evictions, mut evicted) = unbounded_channel();
+    let (activities, mut activity_log) = unbounded_channel();
+    let (stream_values, mut stream_log) = unbounded_channel();
     let mut session = Tree::new();
     let idle = session
         .add_actor(
             "idle",
-            ActorDef::<IdleSessionActor>::cloned((evictions, Arc::clone(&activities))),
+            ActorDef::<IdleSessionActor>::cloned((evictions, activities)),
         )
         .expect("idle actor declared");
     let stream_gate = ReleaseGate::default();
@@ -790,13 +800,10 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
     idle.send(IdleMessage::Activity)
         .await
         .expect("live session accepts activity");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            activities.load(Ordering::SeqCst) == 1
-        })
-        .await,
-        "the activity is handled (and the timer re-armed) before time moves"
-    );
+    tokio::time::timeout(POLL_TIMEOUT, activity_log.recv())
+        .await
+        .expect("the activity is handled (and the timer re-armed) before time moves")
+        .expect("idle actor is alive");
     // … so the original deadline passing evicts nothing …
     tokio::time::advance(Duration::from_secs(40)).await;
     assert!(

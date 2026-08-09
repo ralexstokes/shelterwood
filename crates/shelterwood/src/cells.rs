@@ -438,6 +438,24 @@ pub(crate) struct ScopeCell {
     observation_closed: AtomicBool,
     #[cfg(test)]
     runtime_storage: Mutex<RuntimeStorage>,
+    #[cfg(test)]
+    gate_capture_probe: Mutex<Option<std::sync::mpsc::Sender<GateCapture>>>,
+}
+
+/// One observation-gate capture reported to a test probe.
+///
+/// A capture is reported after a thread has cloned the gate it is about to
+/// acquire and before it blocks on that acquisition. Unit tests use these
+/// reports as explicit barriers in place of scheduler or strong-count
+/// polling: receiving a capture proves the reporting thread committed to the
+/// gate that was current at that instant.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GateCapture {
+    /// [`ScopeCell::with_observation_gate`] captured its current gate.
+    Observation,
+    /// Gate adoption captured an obsolete gate it must acquire to hand off.
+    Adoption,
 }
 
 #[cfg(test)]
@@ -481,6 +499,8 @@ impl ScopeCell {
             observation_closed: AtomicBool::new(false),
             #[cfg(test)]
             runtime_storage: Mutex::new(RuntimeStorage::default()),
+            #[cfg(test)]
+            gate_capture_probe: Mutex::new(None),
         })
     }
 
@@ -523,6 +543,30 @@ impl ScopeCell {
         self.current_observation_gate()
     }
 
+    /// Installs a probe reporting every gate capture made through this scope.
+    #[cfg(test)]
+    pub(crate) fn probe_gate_captures(&self) -> std::sync::mpsc::Receiver<GateCapture> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *self
+            .gate_capture_probe
+            .lock()
+            .expect("gate capture probe mutex poisoned") = Some(sender);
+        receiver
+    }
+
+    #[cfg(test)]
+    fn report_gate_capture(&self, capture: GateCapture) {
+        if let Some(probe) = &*self
+            .gate_capture_probe
+            .lock()
+            .expect("gate capture probe mutex poisoned")
+        {
+            // The probe channel is unbounded, so reporting never blocks and
+            // cannot reorder the acquisition it announces.
+            let _ = probe.send(capture);
+        }
+    }
+
     fn current_observation_gate(&self) -> Arc<Mutex<()>> {
         Arc::clone(
             &self
@@ -538,6 +582,9 @@ impl ScopeCell {
             if Arc::ptr_eq(&current, gate) {
                 return;
             }
+
+            #[cfg(test)]
+            self.report_gate_capture(GateCapture::Adoption);
 
             // An operation that passed `with_observation_gate`'s pointer
             // check may finish its complete edge before handoff. An operation
@@ -601,6 +648,8 @@ impl ScopeCell {
         let mut operation = Some(operation);
         loop {
             let gate = self.current_observation_gate();
+            #[cfg(test)]
+            self.report_gate_capture(GateCapture::Observation);
             let guard = gate
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -4,11 +4,15 @@ use std::{
     time::Duration,
 };
 
+use crate::common::ReleaseGate;
 use shelterwood::{
     Actor, ActorDef, ActorRef, CallErrorKind, Context, DynamicScopeRef, DynamicTree, ExitError,
     ExitResult, Membership, RemoveOutcome, Reply, ScopeRef, SubtreeOnceDef, Tree,
 };
 
+/// A shard's durable contents. Deliberately not actor-owned state: the test
+/// reads a retired mount's data after its serving actor is gone, so this
+/// models the disk underneath the actor.
 #[derive(Clone, Debug, Default)]
 struct DurableShard(Arc<Mutex<HashMap<String, u64>>>);
 
@@ -119,28 +123,17 @@ enum Fault {
     AfterCommitBeforeReply,
 }
 
+/// The router's durable operation journal. Router incarnations are replaced
+/// across the injected crashes and each re-init starts from cloned `Args`, so
+/// this is the durable store the §3.3 retry discipline reconciles against —
+/// state that must outlive any incarnation, not shared actor state.
 #[derive(Clone, Default)]
 struct DurableTopology {
     operations: Arc<Mutex<HashMap<u64, OperationRecord>>>,
     current: Arc<Mutex<Option<Mount>>>,
-    faults: Arc<Mutex<HashMap<u64, Fault>>>,
 }
 
 impl DurableTopology {
-    fn inject(&self, operation: u64, fault: Fault) {
-        self.faults
-            .lock()
-            .expect("fault map mutex poisoned")
-            .insert(operation, fault);
-    }
-
-    fn take_fault(&self, operation: u64) -> Option<Fault> {
-        self.faults
-            .lock()
-            .expect("fault map mutex poisoned")
-            .remove(&operation)
-    }
-
     fn operation(&self, operation: u64) -> Option<OperationRecord> {
         self.operations
             .lock()
@@ -159,6 +152,10 @@ struct RouterArgs {
     ranges: DynamicScopeRef,
     directory: ActorRef<DirectoryMessage>,
     durable: DurableTopology,
+    /// Fault injection as plain per-incarnation config: once-semantics come
+    /// from the durable journal (a retry finds the record its first attempt
+    /// wrote before crashing), not from mutating shared state.
+    faults: HashMap<u64, Fault>,
 }
 
 struct RouterActor(RouterArgs);
@@ -258,7 +255,16 @@ impl RouterActor {
     }
 
     async fn replace(&self, operation: u64) -> Result<Route, ExitError> {
-        if let Some(record) = self.0.durable.operation(operation) {
+        let record = self.0.durable.operation(operation);
+        // A configured fault fires only on the operation's first attempt,
+        // recognized by the absence of a durable record: every crash window
+        // under test opens after the attempt journaled itself, so a retry
+        // can never re-arm the fault.
+        let fault = record
+            .is_none()
+            .then(|| self.0.faults.get(&operation).copied())
+            .flatten();
+        if let Some(record) = record {
             match record {
                 OperationRecord::Committed {
                     candidate,
@@ -311,7 +317,6 @@ impl RouterActor {
                 },
             );
 
-        let fault = self.0.durable.take_fault(operation);
         if matches!(fault, Some(Fault::BeforeCommit)) {
             return Err(ExitError::message("injected pre-commit router crash"));
         }
@@ -455,6 +460,10 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
                 ranges: ranges.clone(),
                 directory: directory.clone(),
                 durable: durable.clone(),
+                faults: HashMap::from([
+                    (1, Fault::BeforeCommit),
+                    (2, Fault::AfterCommitBeforeReply),
+                ]),
             }),
         )
         .expect("valid topology writer");
@@ -462,7 +471,6 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
     system.wait_started().await.expect("store starts");
     let root_scope = system.scope();
 
-    durable.inject(1, Fault::BeforeCommit);
     let first_error = router
         .call(
             |reply| RouterMessage::Replace {
@@ -498,7 +506,6 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
         shelterwood::StopReason::ShutdownRequested
     );
 
-    durable.inject(2, Fault::AfterCommitBeforeReply);
     let second_error = router
         .call(
             |reply| RouterMessage::Replace {
@@ -553,16 +560,16 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
 
 struct GatedShardActor {
     durable: DurableShard,
-    entered: Arc<std::sync::atomic::AtomicBool>,
-    gate: Arc<tokio::sync::Notify>,
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    gate: ReleaseGate,
 }
 
 impl Actor for GatedShardActor {
     type Msg = ShardMessage;
     type Args = (
         DurableShard,
-        Arc<std::sync::atomic::AtomicBool>,
-        Arc<tokio::sync::Notify>,
+        tokio::sync::mpsc::UnboundedSender<()>,
+        ReleaseGate,
     );
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
@@ -576,9 +583,8 @@ impl Actor for GatedShardActor {
 
     async fn handle(&mut self, message: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
         let ShardMessage::Put { key, value, reply } = message;
-        self.entered
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.gate.notified().await;
+        let _ = self.entered.send(());
+        self.gate.wait().await;
         self.durable
             .0
             .lock()
@@ -595,8 +601,8 @@ impl Actor for GatedShardActor {
 #[tokio::test]
 async fn shard_store_retire_waits_for_accepted_requests() {
     let durable = DurableShard::default();
-    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let gate = Arc::new(tokio::sync::Notify::new());
+    let (entered, mut entered_log) = tokio::sync::mpsc::unbounded_channel();
+    let gate = ReleaseGate::default();
     let mut root = Tree::new();
     let ranges = root
         .add_subtree_once("ranges", SubtreeOnceDef::new(DynamicTree::new()))
@@ -608,11 +614,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
     let actor = mount
         .add_actor(
             "shard",
-            ActorDef::<GatedShardActor>::cloned((
-                durable.clone(),
-                Arc::clone(&entered),
-                Arc::clone(&gate),
-            )),
+            ActorDef::<GatedShardActor>::cloned((durable.clone(), entered, gate.clone())),
         )
         .expect("valid shard");
     let scope = ranges
@@ -636,13 +638,10 @@ async fn shard_store_retire_waits_for_accepted_requests() {
                 .await
         }
     });
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the accepted write reaches the handler");
+    tokio::time::timeout(Duration::from_secs(1), entered_log.recv())
+        .await
+        .expect("the accepted write reaches the handler")
+        .expect("shard actor is alive");
 
     // Retirement starts while the accepted write is mid-handling;
     // `membership_status` flips synchronously at the call (§13.12).
@@ -665,7 +664,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
         .await
         .expect("removal is underway");
 
-    gate.notify_one();
+    gate.release();
     write
         .await
         .expect("write task joins")

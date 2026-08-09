@@ -1,11 +1,4 @@
-use std::{
-    future,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{future, time::Duration};
 
 use crate::common::{POLL_TIMEOUT, ReleaseGate, policy::never, poll_until};
 use shelterwood::{
@@ -15,23 +8,42 @@ use shelterwood::{
 };
 
 type JournalEvent = (usize, &'static str, &'static str);
-type JournalEntries = Arc<Mutex<Vec<JournalEvent>>>;
 
-#[derive(Clone, Debug, Default)]
-struct HostJournal(JournalEntries);
+/// The sender half handed to children: events reach the host by message
+/// passing, so no child ever shares mutable journal state with the test.
+#[derive(Clone, Debug)]
+struct HostJournal(tokio::sync::mpsc::UnboundedSender<JournalEvent>);
 
 impl HostJournal {
-    fn push(&self, cycle: usize, child: &'static str, event: &'static str) {
-        self.0
-            .lock()
-            .expect("host journal mutex poisoned")
-            .push((cycle, child, event));
+    fn new() -> (Self, JournalLog) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self(sender),
+            JournalLog {
+                receiver,
+                entries: Vec::new(),
+            },
+        )
     }
 
-    fn events(&self, cycle: usize, child: &'static str) -> Vec<&'static str> {
-        self.0
-            .lock()
-            .expect("host journal mutex poisoned")
+    fn push(&self, cycle: usize, child: &'static str, event: &'static str) {
+        // A host that never reads its log has dropped the receiver.
+        let _ = self.0.send((cycle, child, event));
+    }
+}
+
+/// The host's receiving half of the journal.
+struct JournalLog {
+    receiver: tokio::sync::mpsc::UnboundedReceiver<JournalEvent>,
+    entries: Vec<JournalEvent>,
+}
+
+impl JournalLog {
+    fn events(&mut self, cycle: usize, child: &'static str) -> Vec<&'static str> {
+        while let Ok(event) = self.receiver.try_recv() {
+            self.entries.push(event);
+        }
+        self.entries
             .iter()
             .filter_map(|(entry_cycle, entry_child, event)| {
                 (*entry_cycle == cycle && *entry_child == child).then_some(*event)
@@ -40,17 +52,10 @@ impl HostJournal {
     }
 }
 
-fn cooperative_task(
-    cycle: usize,
-    child: &'static str,
-    journal: HostJournal,
-    started: Arc<AtomicBool>,
-) -> TaskDef {
+fn cooperative_task(cycle: usize, child: &'static str, journal: HostJournal) -> TaskDef {
     TaskDef::new(move |context| {
         let journal = journal.clone();
-        let started = Arc::clone(&started);
         async move {
-            started.store(true, Ordering::SeqCst);
             journal.push(cycle, child, "started");
             context.shutdown_token().cancelled().await;
             journal.push(cycle, child, "cancelled");
@@ -60,18 +65,11 @@ fn cooperative_task(
     .restart(never())
 }
 
-fn gated_task(
-    cycle: usize,
-    gate: ReleaseGate,
-    journal: HostJournal,
-    started: Arc<AtomicBool>,
-) -> TaskDef {
+fn gated_task(cycle: usize, gate: ReleaseGate, journal: HostJournal) -> TaskDef {
     TaskDef::new(move |context| {
         let gate = gate.clone();
         let journal = journal.clone();
-        let started = Arc::clone(&started);
         async move {
-            started.store(true, Ordering::SeqCst);
             journal.push(cycle, "config", "started");
             gate.wait().await;
             context.mark_ready();
@@ -136,34 +134,21 @@ impl Actor for ProbeActor {
 struct SidecarFixture {
     tree: Tree,
     readiness: ReleaseGate,
-    config_started: Arc<AtomicBool>,
     abort_task: TaskRef,
     graceful_task: TaskRef,
 }
 
 fn sidecar(cycle: usize, journal: HostJournal) -> SidecarFixture {
     let readiness = ReleaseGate::default();
-    let config_started = Arc::new(AtomicBool::new(false));
-    let telemetry_started = Arc::new(AtomicBool::new(false));
     let mut tree = Tree::new();
     tree.add_task(
         "config",
-        gated_task(
-            cycle,
-            readiness.clone(),
-            journal.clone(),
-            Arc::clone(&config_started),
-        ),
+        gated_task(cycle, readiness.clone(), journal.clone()),
     )
     .expect("valid config task");
     tree.add_task(
         "telemetry",
-        cooperative_task(
-            cycle,
-            "telemetry",
-            journal.clone(),
-            Arc::clone(&telemetry_started),
-        ),
+        cooperative_task(cycle, "telemetry", journal.clone()),
     )
     .expect("valid telemetry task");
     let abort_task = tree
@@ -194,7 +179,6 @@ fn sidecar(cycle: usize, journal: HostJournal) -> SidecarFixture {
     SidecarFixture {
         tree,
         readiness,
-        config_started,
         abort_task,
         graceful_task,
     }
@@ -202,7 +186,7 @@ fn sidecar(cycle: usize, journal: HostJournal) -> SidecarFixture {
 
 #[tokio::test]
 async fn sidecar_runs_two_host_owned_cycles_with_readiness_and_policy_exact_shutdown() {
-    let journal = HostJournal::default();
+    let (journal, mut log) = HostJournal::new();
 
     for cycle in 0..2 {
         let fixture = sidecar(cycle, journal.clone());
@@ -210,7 +194,7 @@ async fn sidecar_runs_two_host_owned_cycles_with_readiness_and_policy_exact_shut
         let scope = system.scope();
         assert!(
             poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-                fixture.config_started.load(Ordering::SeqCst)
+                log.events(cycle, "config") == ["started"]
             })
             .await
         );
@@ -252,39 +236,32 @@ async fn sidecar_runs_two_host_owned_cycles_with_readiness_and_policy_exact_shut
             ExitKind::Aborted { after_grace: true }
         ));
         assert_eq!(
-            journal.events(cycle, "abort-worker"),
+            log.events(cycle, "abort-worker"),
             ["started", "cancelled", "aborted"]
         );
         assert_eq!(
-            journal.events(cycle, "graceful-worker"),
+            log.events(cycle, "graceful-worker"),
             ["started", "cancelled", "aborted"]
         );
-        assert_eq!(journal.events(cycle, "actor"), ["started", "stopped"]);
+        assert_eq!(log.events(cycle, "actor"), ["started", "stopped"]);
     }
 }
 
 struct FailedStartupFixture {
     tree: Tree,
     gate: ReleaseGate,
-    prefix_one: Arc<AtomicBool>,
-    prefix_two: Arc<AtomicBool>,
-    suffix_started: Arc<AtomicBool>,
+    log: JournalLog,
 }
 
-fn failing_sidecar(journal: HostJournal) -> FailedStartupFixture {
+fn failing_sidecar() -> FailedStartupFixture {
+    let (journal, log) = HostJournal::new();
     let gate = ReleaseGate::default();
-    let prefix_one = Arc::new(AtomicBool::new(false));
-    let prefix_two = Arc::new(AtomicBool::new(false));
-    let suffix_started = Arc::new(AtomicBool::new(false));
     let mut tree = Tree::new();
-    tree.add_task(
-        "config",
-        gated_task(99, gate.clone(), journal.clone(), Arc::clone(&prefix_one)),
-    )
-    .expect("valid config task");
+    tree.add_task("config", gated_task(99, gate.clone(), journal.clone()))
+        .expect("valid config task");
     tree.add_task(
         "telemetry",
-        cooperative_task(99, "telemetry", journal, Arc::clone(&prefix_two)),
+        cooperative_task(99, "telemetry", journal.clone()),
     )
     .expect("valid telemetry task");
     tree.add_task(
@@ -303,9 +280,9 @@ fn failing_sidecar(journal: HostJournal) -> FailedStartupFixture {
     tree.add_task(
         "suffix",
         TaskDef::new({
-            let suffix_started = Arc::clone(&suffix_started);
+            let journal = journal.clone();
             move |_| {
-                suffix_started.store(true, Ordering::SeqCst);
+                journal.push(99, "suffix", "started");
                 future::pending()
             }
         })
@@ -314,30 +291,21 @@ fn failing_sidecar(journal: HostJournal) -> FailedStartupFixture {
     .expect("valid suffix task");
     let mut actors = Tree::new();
     actors
-        .add_actor_once(
-            "probe",
-            ActorOnceDef::<ProbeActor>::new((99, HostJournal::default())),
-        )
+        .add_actor_once("probe", ActorOnceDef::<ProbeActor>::new((99, journal)))
         .expect("valid actor subtree");
     tree.add_subtree_once("actors", SubtreeOnceDef::new(actors))
         .expect("valid actor subtree");
-    FailedStartupFixture {
-        tree,
-        gate,
-        prefix_one,
-        prefix_two,
-        suffix_started,
-    }
+    FailedStartupFixture { tree, gate, log }
 }
 
 #[tokio::test]
 async fn sidecar_startup_failure_leaves_prefix_supervised_until_host_rolls_it_back() {
-    let fixture = failing_sidecar(HostJournal::default());
+    let mut fixture = failing_sidecar();
     let system = fixture.tree.spawn().expect("runtime is available");
     let scope = system.scope();
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            fixture.prefix_one.load(Ordering::SeqCst)
+            fixture.log.events(99, "config") == ["started"]
         })
         .await
     );
@@ -346,9 +314,12 @@ async fn sidecar_startup_failure_leaves_prefix_supervised_until_host_rolls_it_ba
         .wait_started()
         .await
         .expect_err("manual readiness times out");
-    assert!(fixture.prefix_one.load(Ordering::SeqCst));
-    assert!(fixture.prefix_two.load(Ordering::SeqCst));
-    assert!(!fixture.suffix_started.load(Ordering::SeqCst));
+    assert_eq!(fixture.log.events(99, "config"), ["started", "ready"]);
+    assert_eq!(fixture.log.events(99, "telemetry"), ["started"]);
+    assert!(
+        fixture.log.events(99, "suffix").is_empty(),
+        "ordered startup never reaches the suffix"
+    );
     let snapshot = scope.snapshot();
     assert_eq!(snapshot.state, shelterwood::ScopeState::StartupFailed);
     assert!(matches!(

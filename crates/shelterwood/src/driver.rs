@@ -236,6 +236,10 @@ impl DynamicControl {
             #[cfg(test)]
             request_forwarder_ended,
         });
+        // Off-runtime construction (unit tests only) safely skips the
+        // forwarder: `reserve_dynamic`/`start_admission` fail closed with
+        // `NoRuntime` before anything can enqueue, and a live driver — the
+        // only other producer — exists only inside the runtime.
         if runtime::is_available() {
             runtime::spawn(async move {
                 loop {

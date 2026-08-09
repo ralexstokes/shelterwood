@@ -915,14 +915,18 @@ impl ScopeCell {
     }
 
     fn emit_locked(&self, kind: LifecycleEventKind) {
-        // The resident-tree observation gate serializes every mint. The
+        // The resident-tree observation gate serializes every mint; the
         // atomic is the published watermark as well as the counter, avoiding
-        // a second, provably uncontended lock on every lifecycle edge.
+        // a second, provably uncontended lock on every lifecycle edge. The
+        // mint is still a compare-and-swap so an emit that ever escaped the
+        // gate could reorder events but never duplicate a sequence value.
         let seq = self
             .lifecycle_seq
-            .load(Ordering::Relaxed)
-            .checked_add(1)
-            .filter(|seq| *seq != u64::MAX);
+            .try_update(Ordering::Release, Ordering::Relaxed, |current| {
+                current.checked_add(1).filter(|seq| *seq != u64::MAX)
+            })
+            .ok()
+            .map(|previous| previous.saturating_add(1));
         let Some(seq) = seq else {
             self.lifecycle_seq.store(u64::MAX, Ordering::Release);
             self.publish_snapshot_chain_locked();
@@ -932,7 +936,6 @@ impl ScopeCell {
             }
             return;
         };
-        self.lifecycle_seq.store(seq, Ordering::Release);
         self.publish_snapshot_chain_locked();
 
         let scope = self.member.membership();

@@ -578,6 +578,14 @@ impl LifecycleHub {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
+        self.publish_past_fast_path(event);
+    }
+
+    /// The enqueue half of [`publish`](Self::publish), after the atomic
+    /// fast-path check. Split out so tests can pin the close race: calling
+    /// this on a closed hub is exactly a publisher that read `closed ==
+    /// false` and then lost the linearization race to `close`.
+    fn publish_past_fast_path(&self, event: LifecycleEvent) {
         self.channels.signal.send_if_modified(|signal| {
             // Enqueue and activity notification share the same linearization
             // point as closure. A publisher that passed the atomic fast-path
@@ -739,6 +747,33 @@ mod tests {
         hub.close();
 
         assert_eq!(crate::runtime::join_resuming(waiter).await, None);
+    }
+
+    #[test]
+    fn lifecycle_publication_that_lost_the_close_race_appends_nothing() {
+        let mut identity = ScopeIdentity::new();
+        let membership = identity
+            .mint_membership(&crate::ChildId::from("scope"))
+            .expect("membership available");
+        let hub = LifecycleHub::default();
+        let mut events = hub.subscribe();
+        hub.close();
+
+        // A publisher that read `closed == false` and then lost the
+        // linearization race to `close` must append nothing.
+        hub.publish_past_fast_path(LifecycleEvent {
+            scope_path: Vec::new(),
+            scope: membership,
+            seq: 1,
+            kind: LifecycleEventKind::ScopeState {
+                state: ScopeState::Running,
+            },
+        });
+
+        assert!(matches!(
+            events.try_recv(),
+            Err(LifecycleTryRecvError::Closed)
+        ));
     }
 
     #[test]

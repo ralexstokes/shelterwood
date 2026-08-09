@@ -83,6 +83,8 @@ expect_case layering-driver-below check-layering-paths.sh \
   "upward driver or tree references found below the driver layer:"
 expect_case layering-cancellation-driver-below check-layering-paths.sh \
   "upward driver or tree references found below the driver layer:"
+expect_case layering-scope-driver-below check-layering-paths.sh \
+  "upward driver or tree references found below the driver layer:"
 expect_case layering-tree-below check-layering-paths.sh \
   "upward driver or tree references found below the driver layer:"
 expect_case layering-tree-in-driver check-layering-paths.sh \

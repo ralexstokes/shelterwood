@@ -1274,7 +1274,7 @@ fn dispatch_child_construction(
                         id,
                         incarnation,
                         member: Arc::clone(&child.slot.member),
-                        scope: crate::ScopeRef {
+                        scope: crate::scope::ScopeRef {
                             cell: Arc::clone(root),
                         },
                         shutdown: latches.shutdown.clone(),

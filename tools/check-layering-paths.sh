@@ -21,6 +21,7 @@ readonly below_driver_layers=(
   crates/shelterwood/src/policy.rs
   crates/shelterwood/src/raw.rs
   crates/shelterwood/src/runtime.rs
+  crates/shelterwood/src/scope.rs
   crates/shelterwood/src/task.rs
 )
 readonly driver_path="crates/shelterwood/src/driver.rs"

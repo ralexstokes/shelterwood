@@ -1264,6 +1264,23 @@ mod tests {
         assert!(timeout.as_mut().poll(&mut context).is_pending());
     }
 
+    #[tokio::test]
+    async fn scope_wait_prefers_signal_when_both_control_futures_are_ready() {
+        let (_sender, mut receiver) = super::bounded_mpsc::<()>(1);
+
+        let wake = super::wait_scope(
+            super::ScopeWait {
+                signal: std::future::ready(()),
+                parent_shutdown: std::future::ready(()),
+            },
+            &mut receiver,
+            None,
+        )
+        .await;
+
+        assert!(matches!(wake, super::ScopeWake::Signal));
+    }
+
     struct RecursivelyPanickingPayload;
 
     impl Drop for RecursivelyPanickingPayload {

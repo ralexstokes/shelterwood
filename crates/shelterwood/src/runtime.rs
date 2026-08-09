@@ -650,6 +650,36 @@ impl<T> OneShotReceiver<T> {
     }
 }
 
+/// One-shot receive state that keeps user value destruction off framework and
+/// holder drop glue.
+///
+/// A value stored before the receive side is cancelled is user-owned:
+/// destroying it inline could block or panic whoever dropped the holder. The
+/// disposal function is captured at construction, where the value type's
+/// `Send + 'static` bounds hold, so unbounded holders can still route an
+/// unclaimed stored value through isolated disposal on drop.
+pub(crate) struct DisposingReceiver<T> {
+    pub(crate) inner: OneShotReceiver<T>,
+    dispose: fn(T),
+}
+
+impl<T: Send + 'static> DisposingReceiver<T> {
+    pub(crate) fn new(inner: OneShotReceiver<T>) -> Self {
+        Self {
+            inner,
+            dispose: dispose_detached::<T>,
+        }
+    }
+}
+
+impl<T> Drop for DisposingReceiver<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.inner.close_and_take() {
+            (self.dispose)(value);
+        }
+    }
+}
+
 /// Publishing half of a runtime-backed conflating state channel.
 pub(crate) struct WatchSender<T>(watch::Sender<T>);
 

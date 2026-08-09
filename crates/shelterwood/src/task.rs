@@ -303,7 +303,7 @@ impl Hash for TaskRef {
 /// The sole claim to a one-shot task's typed completion value.
 #[must_use]
 pub struct OneShotTaskRef<T> {
-    completion: runtime::OneShotReceiver<T>,
+    completion: runtime::DisposingReceiver<T>,
     task: TaskRef,
 }
 
@@ -316,9 +316,12 @@ impl<T> fmt::Debug for OneShotTaskRef<T> {
     }
 }
 
-impl<T> OneShotTaskRef<T> {
+impl<T: Send + 'static> OneShotTaskRef<T> {
     pub(crate) fn new(completion: runtime::OneShotReceiver<T>, task: TaskRef) -> Self {
-        Self { completion, task }
+        Self {
+            completion: runtime::DisposingReceiver::new(completion),
+            task,
+        }
     }
 
     /// Consumes the claim and waits for the authoritative terminal verdict.
@@ -329,11 +332,13 @@ impl<T> OneShotTaskRef<T> {
     /// even if the task body produced a value first. That precedence is
     /// deliberately asymmetric: a body that returned `Err` keeps its
     /// [`crate::ExitKind::Failed`] verdict through a racing forced abort,
-    /// while a body that returned `Ok` does not — the value is dropped and
-    /// the claim resolves `Err` with the abort verdict.
-    pub async fn wait(self) -> Result<T, Exit> {
-        let Self { completion, task } = self;
-        let exit = task.wait().await;
+    /// while a body that returned `Ok` does not — the value is discarded
+    /// through isolated disposal and the claim resolves `Err` with the abort
+    /// verdict. An unclaimed stored value is likewise disposed in isolation
+    /// when the claim is dropped, so a blocking or panicking destructor never
+    /// runs on the dropping thread.
+    pub async fn wait(mut self) -> Result<T, Exit> {
+        let exit = self.task.wait().await;
         if !matches!(exit.kind(), crate::ExitKind::Completed) {
             return Err(exit);
         }
@@ -341,10 +346,11 @@ impl<T> OneShotTaskRef<T> {
         // receiver is the sole completion claim. A published Completed verdict
         // with a closed, empty channel is therefore a framework invariant
         // violation, not an application exit that can be reported as `Err`.
-        Ok(completion
-            .receive()
-            .await
-            .expect("completed one-shot task must publish its typed value"))
+        Ok(
+            std::future::poll_fn(|context| self.completion.inner.poll_receive(context))
+                .await
+                .expect("completed one-shot task must publish its typed value"),
+        )
     }
 }
 
@@ -421,7 +427,7 @@ mod tests {
         assert!(!shutdown.is_fired());
     }
 
-    fn one_shot_claim<T>() -> (
+    fn one_shot_claim<T: Send + 'static>() -> (
         runtime::OneShotSender<T>,
         OneShotTaskRef<T>,
         std::sync::Arc<MemberCell>,

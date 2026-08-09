@@ -19,7 +19,12 @@
       # Repository docs and their packaged doctest copies are compared in the
       # clean build sandbox, so keep Markdown alongside Cargo sources.
       extraSourceFilter =
-        path: type: type == "regular" && builtins.match ".*\\.md" (toString path) != null;
+        path: type:
+        type == "regular"
+        && (
+          builtins.match ".*\\.md" (toString path) != null
+          || builtins.match ".*/\\.config/nextest\\.toml" (toString path) != null
+        );
       extraChecks =
         pkgs:
         let

@@ -1831,7 +1831,13 @@ Resolution and mechanics:
   a child declaring `queue` with deferred capacity under a scope
   default of `latest()` gets `queue` at the library default capacity —
   the scope default neither converts the declared kind nor supplies a
-  capacity across kinds.
+  capacity across kinds. For the full outward walk, suppose the root
+  defaults to `queue(10)`, an inheriting child scope defaults to
+  `latest()`, and an inheriting grandchild scope contains an actor declared
+  with `queue_inherit()`: that actor resolves to `queue(10)`, because the
+  intervening `latest()` is passed over when resolving queue capacity. If
+  the grandchild edge is `Reset` instead, the same declaration resolves to
+  the library `queue(64)`; the reset severs the root's contribution.
 - Validation is eager: any configuration that would fail spawn fails at the
   point of declaration where it is decidable — duplicate/empty ids at add
   time, zero capacities at construction, zero backoff durations at

@@ -444,13 +444,18 @@ impl ReadinessGate {
     }
 }
 
-/// One scope incarnation's driver-ownership token.
+/// One scope incarnation's ownership token: minted for the driver that runs
+/// the incarnation, and also addressed forward by a shutdown request that
+/// targets the next incarnation before any driver has begun it.
 ///
 /// Epochs are minted per scope in strictly increasing order starting at
 /// [`Epoch::FIRST`], and `u64::MAX` is never minted ([`Epoch::successor`]
 /// reserves it to poison [`ScopeEpochs`] exhaustion). Plain ordering is
 /// therefore total over every minted epoch, so `Epoch` derives `Ord` where
 /// identity generations instead guard their in-band poison with `supersedes`.
+/// Unlike an incarnation identity, an epoch carries no scope tag, so ordering
+/// is meaningful only between epochs of one scope; every comparison site
+/// draws both operands from that scope's own control plane.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Epoch(u64);
 
@@ -1251,6 +1256,11 @@ mod tests {
         let last = exhausted.begin().expect("last non-poison epoch");
         assert_eq!(last, Epoch(u64::MAX - 1));
         assert!(exhausted.finish(last));
+        assert_eq!(
+            exhausted.request_target(),
+            None,
+            "an idle request cannot address the reserved poison epoch"
+        );
         assert_eq!(exhausted.begin(), None, "MAX is reserved as poison");
         assert_eq!(exhausted.live_epoch(), None);
         assert_eq!(exhausted.request_target(), None);

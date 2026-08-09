@@ -439,6 +439,10 @@ pub(crate) struct ScopeCell {
     record: runtime::WatchSender<ScopeRecord>,
     control: Mutex<ScopeControl>,
     dynamic_route: Mutex<Option<Arc<dyn DynamicRoute>>>,
+    // Dropping a resident emits `Removed` and recursively reads this watch.
+    // Mutation callbacks must therefore move removed residents out and drop
+    // them only after the watch guard has been released; dropping one from
+    // inside `send_modify`/`send_if_modified` would self-deadlock.
     current_children: runtime::WatchSender<Vec<ResidentChild>>,
     parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
     observation_gate: RwLock<Arc<Mutex<()>>>,
@@ -585,7 +589,15 @@ impl ScopeCell {
         )
     }
 
-    fn adopt_observation_gate(&self, gate: &Arc<Mutex<()>>) {
+    fn adopt_observation_gate(&self, parent: &ScopeCell, gate: &Arc<Mutex<()>>) {
+        debug_assert!(
+            !std::ptr::eq(self, parent),
+            "a scope cannot adopt from itself"
+        );
+        debug_assert!(
+            Arc::ptr_eq(gate, &parent.current_observation_gate()),
+            "observation gates are adopted only in the parent-to-child direction"
+        );
         loop {
             let current = self.current_observation_gate();
             if Arc::ptr_eq(&current, gate) {
@@ -1201,7 +1213,7 @@ impl ScopeCell {
             self.clear_residents_locked();
             for child in children {
                 if let Some(scope) = &child.scope {
-                    scope.adopt_observation_gate(&gate);
+                    scope.adopt_observation_gate(self, &gate);
                     scope.parent.replace(Some(Arc::downgrade(self)));
                 }
                 child
@@ -1220,7 +1232,7 @@ impl ScopeCell {
         self.with_observation_gate(|| {
             let gate = self.current_observation_gate();
             if let Some(scope) = &child.scope {
-                scope.adopt_observation_gate(&gate);
+                scope.adopt_observation_gate(self, &gate);
                 scope.parent.replace(Some(Arc::downgrade(self)));
             }
             let id = child.member.id().clone();

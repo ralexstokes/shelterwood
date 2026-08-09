@@ -460,6 +460,9 @@ impl<A: Actor> fmt::Debug for ActorDef<A> {
 
 impl<A: Actor> ActorDef<A> {
     /// Creates a restartable definition by cloning args inside each incarnation.
+    ///
+    /// The retained restartable source is shared, so the captured args must be
+    /// [`Sync`] even though each clone is made by one incarnation at a time.
     pub fn cloned(args: A::Args) -> Self
     where
         A::Args: Clone + Sync,

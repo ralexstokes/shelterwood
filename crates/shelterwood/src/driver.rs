@@ -104,8 +104,8 @@ pub(crate) struct ReportReceiver(mpsc::Receiver<RecordedReport>);
 ///
 /// `ReportToken` is owned by the child task and its fail-closed `Drop` sends a
 /// fallback synchronously. Rust drops those task locals before the join handle
-/// becomes ready, so the exit joiner may safely perform the blocking receive:
-/// a report has already been sent on every return, panic, and cancellation
+/// becomes ready, so the exit joiner may require an immediately available
+/// report: one has already been sent on every return, panic, and cancellation
 /// edge. The shutdown/local-stop latches are sampled by that same send, making
 /// the report and its cancellation evidence one ordered observation.
 pub(crate) fn report_channel(
@@ -148,8 +148,8 @@ impl ReportToken {
 impl ReportReceiver {
     fn receive(self) -> RecordedReport {
         self.0
-            .recv()
-            .expect("owned report token must record or fall back")
+            .try_recv()
+            .expect("owned report token must record or fall back before its task joins")
     }
 }
 

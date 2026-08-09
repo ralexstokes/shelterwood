@@ -84,10 +84,13 @@ these, in order.
    escalation, exit classification, child identity: each exists exactly once,
    as a named primitive, and every subsystem consumes that primitive.
    [#361, #363, #364, #370]
-3. **Invariants live in ownership and types, not comments.** A rule that two
-   modules must both remember is a design defect. Exactly-once effects are
-   expressed by consuming owned values (drop = the fallback effect), not by
-   `Mutex<Option<_>>` take-once flags. [#360, #363]
+3. **Construction invariants live in ownership and types, not comments.** A
+   rule that two modules must both remember is a design defect. Exactly-once
+   construction effects are expressed by consuming owned values (drop = the
+   fallback effect), not by `Mutex<Option<_>>` take-once flags. Internal
+   synchronization may still use an optional payload as a non-panicking claim
+   protocol when it does not re-assert a construction capability. [#360,
+   #363]
 4. **Capabilities are never erased and re-asserted.** If the caller proved a
    capability statically (a dynamic scope, a restartable actor), every value
    derived from it carries that proof in its type. Runtime downgrades
@@ -565,8 +568,9 @@ established in the construction-path types, before erasure:
   what they can accept (owned, non-re-mintable args) and return
   (`OneShotTaskRef<T>`), not in how long the child runs.
 - **Restartable** (`add_*`-family): the caller supplies an args *source* —
-  `Args: Clone`, or `Fn() -> Args` re-minted at restart time (so a restart
-  can observe the current world: re-resolve an address, fresh timestamp).
+  `Args: Clone + Sync`, or `Fn() -> Args + Send + Sync` re-minted at restart
+  time (so a restart can observe the current world: re-resolve an address,
+  fresh timestamp).
   This is OTP's `{M, F, A}` translated into ownership: the args value is the
   per-spawn argument, and whether you can clone or re-mint it *is* your
   restart capability. For subtree children the args source *is* the
@@ -576,11 +580,13 @@ established in the construction-path types, before erasure:
 - The erased internal representation of one-shot construction is
   `FnOnce`-shaped all the way down: the closure owns the resource, the
   runner owns the closure, and init-panic / startup-failure /
-  shutdown-before-start all reduce to dropping the owner. `Mutex<Option<_>>`
-  take-once tricks MUST NOT appear, publicly or privately — and the same
-  owned-token shape MUST be reused for the other take-once sites the origin
-  accumulated (cancel guards, readiness signals, exit-report claims): build
-  the consuming primitive once (§1 principle 3, §7).
+  shutdown-before-start all reduce to dropping the owner. Within construction
+  payloads, `Mutex<Option<_>>` take-once tricks MUST NOT appear, publicly or
+  privately — and the same owned-token shape MUST be reused for construction
+  claims throughout the lowering and incarnation path. This prohibition does
+  not cover internal, non-panicking synchronization claims such as disposal
+  completion, where losing the claim race is an ordinary no-op rather than a
+  re-asserted construction capability (§1 principle 3, §7).
 - **Every user-supplied construction source executes inside the single
   incarnation runner** (§7): the restartable forms' `Fn() -> Args` factory
   and `Args::clone`, task body factories, raw-actor factories, and subtree
@@ -1462,21 +1468,21 @@ impl<T: Subtree> SubtreeSlot<T> { fn scope_ref(&self) -> T::Ref; }
 // bound is pinned here, once. Constructors yield default options;
 // options attach via the consuming setters listed in the §8 rule:
 impl<A: Actor> ActorDef<A> {
-    fn cloned(args: A::Args) -> Self where A::Args: Clone;
-    fn factory(f: impl Fn() -> A::Args + Send + 'static) -> Self;
+    fn cloned(args: A::Args) -> Self where A::Args: Clone + Sync;
+    fn factory(f: impl Fn() -> A::Args + Send + Sync + 'static) -> Self;
 }
 impl<A: Actor> ActorOnceDef<A> {
     fn new(args: A::Args) -> Self;               // owned, consumed
 }
 impl<R: RawActor> RawDef<R> {
-    fn factory(f: impl Fn() -> R + Send + 'static) -> Self;
+    fn factory(f: impl Fn() -> R + Send + Sync + 'static) -> Self;
         // the actor value is the per-incarnation input (§4.3)
 }
 impl<R: RawActor> RawOnceDef<R> {
     fn new(actor: R) -> Self;                    // owned `R`, consumed
 }
 impl TaskDef {
-    fn new<F>(factory: impl Fn(TaskContext) -> F + Send + 'static) -> Self
+    fn new<F>(factory: impl Fn(TaskContext) -> F + Send + Sync + 'static) -> Self
         where F: Future<Output = ExitResult> + Send + 'static;
         // §4.1's exact bound — re-invoked with a fresh `TaskContext`
         // (by value, B.2) for each incarnation
@@ -1486,7 +1492,7 @@ impl<T: Send + 'static> TaskOnceDef<T> {
         where F: Future<Output = Result<T, ExitError>> + Send + 'static;
 }
 impl<T: Subtree> SubtreeDef<T> {
-    fn factory(f: impl Fn() -> T + Send + 'static) -> Self;
+    fn factory(f: impl Fn() -> T + Send + Sync + 'static) -> Self;
         // re-lowered per incarnation; a failed lowering is the
         // incarnation's startup failure (§11's lowering rule)
 }
@@ -1649,9 +1655,9 @@ Rules (normative):
 - **Construction-source bounds are pinned in the def constructors
   above** — one
   place, verbatim, per §4.2's capability rule: restartable forms carry a
-  re-mintable source (`Args: Clone` or a `Fn` factory; task bodies a
-  `Fn(TaskContext)` factory; raw actors `Fn() -> R`; subtrees
-  `Fn() -> T`), `_once` forms consume owned values. Cyclic wiring
+  re-mintable shared source (`Args: Clone + Sync` or a `Fn + Send + Sync`
+  factory; task bodies a `Fn(TaskContext)` factory; raw actors `Fn() -> R`;
+  subtrees `Fn() -> T`), `_once` forms consume owned values. Cyclic wiring
   thereby reduces to ordering: every ref a
   factory needs is minted from a sibling slot before any factory is
   written, so factories capture real `ActorRef`s — no `Option<ActorRef>`,
@@ -3567,9 +3573,12 @@ least these. Policy/config data additionally follows §1's plain-data rule
   borrows its handle or owns a clone is implementation latitude; the
   `Send` bound is not.
 - **Closures accepted by the API**: stated at each site (§5.5, §8, §17,
-  B.9) — ingress-path closures that run at concurrent call sites carry
-  `Fn + Send + Sync`; observation predicates and construction sources
-  that run from one place at a time carry `Send` without `Sync`.
+  B.9) — ingress-path closures that run at concurrent call sites and shared
+  restartable construction sources carry `Fn + Send + Sync`. Their invocation
+  still occurs inside one incarnation (§4.2); `Sync` is required because the
+  retained source itself is shared. Equivalently, `ActorDef::cloned` requires
+  `Args: Clone + Sync`. Observation predicates that run from one place at a
+  time carry `FnMut + Send` without `Sync`.
 - **Exactly-once operations are consuming.** Where ownership enforces
   at-most-once (§1 principle 3), the method takes `self`:
   `Guard::cancel`/`detach` (B.7), `Reply::send`, `ReplyReceiver::recv`

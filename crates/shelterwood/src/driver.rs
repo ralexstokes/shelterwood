@@ -387,9 +387,8 @@ fn start_dynamic_admission(
         return Err(ReserveError::NoRuntime);
     }
     let (sender, response) = runtime::oneshot();
-    let route: Arc<dyn DynamicRoute> = control.clone();
     let request = AdmissionRequest {
-        control: Arc::downgrade(&route),
+        control: Arc::downgrade(&control),
         slot,
         fused_cancel,
         response: Obligation::new(sender, |sender| {
@@ -566,7 +565,9 @@ fn queue_driver_event(control: &DynamicControl, event: DriverEvent) {
 }
 
 struct AdmissionRequest {
-    control: Weak<dyn DynamicRoute>,
+    // Concrete so rejection can dispose the reservation through the very
+    // control that reserved it, even when it is no longer the live route.
+    control: Weak<DynamicControl>,
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
     response: Obligation<runtime::OneShotSender<Result<(), ReserveError>>>,
@@ -2328,16 +2329,14 @@ impl ScopeRuntime {
     }
 
     fn handle_admission(&mut self, mut request: AdmissionRequest) {
-        let Some(request_control) = request.control.upgrade() else {
+        let Some(control) = request.control.upgrade() else {
             request.complete(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
             return;
         };
-        let Some(control) = self.dynamic.as_ref().cloned() else {
-            request.complete(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
-            return;
-        };
-        let current_route: Arc<dyn DynamicRoute> = control.clone();
-        if !Arc::ptr_eq(&current_route, &request_control)
+        if self
+            .dynamic
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &control))
             || self.lifecycle.is_draining()
             || self.lifecycle.startup_failed()
         {

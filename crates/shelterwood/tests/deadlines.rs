@@ -483,7 +483,7 @@ async fn overflowing_shutdown_grace_does_not_escalate() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn overflowing_restart_delay_never_restarts_immediately() {
+async fn overflowing_restart_delay_clamps_far_future_and_never_restarts_immediately() {
     let release_failure = ReleaseGate::default();
     let starts = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
@@ -518,10 +518,16 @@ async fn overflowing_restart_delay_never_restarts_immediately() {
         .expect("first incarnation starts");
     release_failure.release();
 
+    // SPEC B.6: `restart_at` is present exactly in `Restarting`; a delay
+    // too distant for the clock clamps to a far-future instant.
+    let century = Duration::from_secs(60 * 60 * 24 * 365 * 100);
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             system.scope().child("restart").is_some_and(|child| {
-                matches!(child.state, ChildState::Restarting) && child.restart_at.is_none()
+                matches!(child.state, ChildState::Restarting)
+                    && child
+                        .restart_at
+                        .is_some_and(|at| at > std::time::Instant::now() + century)
             })
         })
         .await

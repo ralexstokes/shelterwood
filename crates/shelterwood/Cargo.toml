@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "MIT OR Apache-2.0"
+description = "A structured-supervision and actor runtime for asynchronous Rust"
+documentation = "https://docs.rs/shelterwood"
+homepage = "https://github.com/ralexstokes/shelterwood"
+repository = "https://github.com/ralexstokes/shelterwood"
 autotests = false
 
 [dependencies]

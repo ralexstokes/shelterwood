@@ -230,6 +230,16 @@ impl Error for StructuredStartupFailure {}
 
 /// The structured result of one child incarnation or never-started
 /// membership.
+///
+/// # Equality
+///
+/// `Exit` equality is structural for every variant except
+/// [`ExitKind::Failed`], whose [`ExitError`] payload compares by
+/// **shared provenance** (the same erased error allocation), not by error
+/// content: an exit and its clones — including the copies the framework
+/// publishes through snapshots and lifecycle events — compare equal,
+/// while two independently constructed errors with identical messages do
+/// not. Compare failure content through [`ExitError::as_error`] instead.
 #[derive(Clone, Debug)]
 pub struct Exit {
     kind: ExitKind,
@@ -269,6 +279,10 @@ impl Exit {
     }
 }
 
+/// Equality per the type-level contract: structural on every variant,
+/// except that [`ExitKind::Failed`] payloads compare by shared provenance
+/// ([`Arc::ptr_eq`] on the erased error), because a type-erased error has
+/// no content equality to consult.
 impl PartialEq for Exit {
     fn eq(&self, other: &Self) -> bool {
         self.cancelled == other.cancelled && exit_kind_eq(&self.kind, &other.kind)
@@ -303,6 +317,9 @@ pub enum ExitKind {
     /// The incarnation returned successfully.
     Completed,
     /// User code returned an error.
+    ///
+    /// Under [`Exit`]'s `PartialEq`, this payload compares by shared
+    /// provenance, not by error content — see [`Exit`]'s equality docs.
     Failed(ExitError),
     /// User code or destruction panicked.
     Panicked {
@@ -571,6 +588,26 @@ mod tests {
         for (case, recorded, join, cancelled, expected) in cases {
             assert_eq!(classify_exit(recorded, join, cancelled), expected, "{case}");
         }
+    }
+
+    #[test]
+    fn failed_exit_equality_is_shared_provenance_not_content() {
+        let error = ExitError::message("boom");
+        let exit = Exit::new(ExitKind::Failed(error.clone()), false);
+
+        // Clones of one error — including framework-published copies —
+        // compare equal.
+        assert_eq!(exit, exit.clone());
+        assert_eq!(exit, Exit::new(ExitKind::Failed(error.clone()), false));
+
+        // Independently created errors with identical content do not.
+        assert_ne!(
+            exit,
+            Exit::new(ExitKind::Failed(ExitError::message("boom")), false)
+        );
+
+        // Cancellation remains structural even with shared provenance.
+        assert_ne!(exit, Exit::new(ExitKind::Failed(error), true));
     }
 
     #[test]

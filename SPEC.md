@@ -1695,11 +1695,16 @@ Two separated concerns:
   bit-equality of the underlying bits, sound because the invariant
   excludes NaN and required because `Backoff` is §1 plain data carrying
   the universal `Eq` bound; delay computation is pinned to nanosecond
-  precision: the base delay's whole-nanosecond count is multiplied as
-  `f64`, rounded to the nearest nanosecond, saturating (Appendix A's
-  far-future clamp — never an overflow panic); jitter maps a pre-drawn
-  `f64` sample in `[0, 1)` as `delay = d/2 + sample × d/2`, rounded the
-  same way. The attempt counter is per
+  precision: when the effective multiplier is exactly one — the first
+  attempt, a factor of `1.0`, or a fixed delay — the whole-nanosecond
+  count is used exactly, with no float round-trip; otherwise the base
+  delay's whole-nanosecond count is multiplied as `f64`, rounded to the
+  nearest nanosecond, and a product at or above `max` saturates to the
+  exact configured `max` (never an overflow panic); jitter maps a
+  pre-drawn `f64` sample in `[0, 1)` as `delay = d/2 + sample × d/2`,
+  rounded the same way — a zero sample yields the exact half,
+  half-nanosecond remainders rounding up with no float round-trip. The
+  attempt counter is per
   membership: `n = 1` on the first scheduled restart, incremented per
   scheduled restart — a restart scheduled and then cancelled by teardown
   still advanced it, mirroring the intensity charge below — and reset by

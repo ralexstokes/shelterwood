@@ -199,10 +199,24 @@ impl Backoff {
                 max,
                 jitter,
             } => {
-                let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
-                let nanos = duration_nanos(base) * factor.get().powi(exponent);
-                let clamped = nanos.min(duration_nanos(max));
-                (duration_from_nanos(clamped), jitter, max)
+                let delay = if attempt == 1 || factor.get() == 1.0 {
+                    // The multiplier is exactly one, so the product is the
+                    // base itself. Skipping the float round-trip keeps the
+                    // delay exact above 2^53 nanoseconds.
+                    base
+                } else {
+                    let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
+                    let nanos = duration_nanos(base) * factor.get().powi(exponent);
+                    if nanos < duration_nanos(max) {
+                        duration_from_nanos(nanos)
+                    } else {
+                        // At or above the cap, saturate to the exact
+                        // configured maximum rather than to a float
+                        // round-trip of it.
+                        max
+                    }
+                };
+                (delay.min(max), jitter, max)
             }
         };
         let delay = match jitter {
@@ -213,7 +227,14 @@ impl Backoff {
                 } else {
                     0.0
                 };
-                duration_from_nanos(duration_nanos(delay) * (0.5 + sample * 0.5))
+                if sample == 0.0 {
+                    // The lower jitter edge is exactly half the delay,
+                    // rounded to the nearest nanosecond without a float
+                    // round-trip.
+                    half_duration(delay)
+                } else {
+                    duration_from_nanos(duration_nanos(delay) * (0.5 + sample * 0.5))
+                }
             }
         };
         // Floating-point duration conversion can round an extreme value a
@@ -245,6 +266,17 @@ impl Backoff {
 
 fn duration_nanos(duration: Duration) -> f64 {
     duration.as_nanos() as f64
+}
+
+/// Halves a delay exactly, rounding half a nanosecond up — the same
+/// direction the float path rounds an exact `.5` remainder.
+fn half_duration(duration: Duration) -> Duration {
+    let nanos = duration.as_nanos().div_ceil(2);
+    let seconds =
+        u64::try_from(nanos / 1_000_000_000).expect("a halved delay fits the duration range");
+    let subsecond =
+        u32::try_from(nanos % 1_000_000_000).expect("nanosecond remainder is below one billion");
+    Duration::new(seconds, subsecond)
 }
 
 fn duration_from_nanos(nanos: f64) -> Duration {
@@ -839,23 +871,129 @@ mod tests {
             Intensity::new(1, Duration::ZERO),
             Err(PolicyError::ZeroDuration)
         );
+        let factor = BackoffFactor::new(2.0).expect("valid factor");
+        assert_eq!(
+            Backoff::exponential(Duration::ZERO, factor, Duration::from_secs(1), Jitter::None),
+            Err(PolicyError::ZeroDuration)
+        );
+        assert_eq!(
+            Backoff::exponential(Duration::from_secs(1), factor, Duration::ZERO, Jitter::None),
+            Err(PolicyError::ZeroDuration)
+        );
         assert_eq!(
             Backoff::exponential(
                 Duration::from_secs(2),
-                BackoffFactor::new(2.0).expect("valid factor"),
+                factor,
                 Duration::from_secs(1),
                 Jitter::None,
             ),
             Err(PolicyError::BackoffMaximumBeforeBase)
         );
-        assert_eq!(
-            BackoffFactor::new(f64::NAN),
-            Err(PolicyError::InvalidBackoffFactor)
+        let just_below_one = f64::from_bits(1.0_f64.to_bits() - 1);
+        for invalid in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            just_below_one,
+            0.5,
+            0.0,
+            -1.0,
+        ] {
+            assert_eq!(
+                BackoffFactor::new(invalid),
+                Err(PolicyError::InvalidBackoffFactor),
+                "factor {invalid} must be rejected"
+            );
+        }
+        assert!(BackoffFactor::new(1.0).is_ok());
+        assert!(BackoffFactor::new(f64::MAX).is_ok());
+        assert!(Mailbox::queue(1).is_ok());
+        assert!(ReadinessDeadline::bounded(Duration::from_nanos(1)).is_ok());
+        assert!(Intensity::new(0, Duration::from_nanos(1)).is_ok());
+        assert!(Backoff::fixed(Duration::from_nanos(1), Jitter::Equal).is_ok());
+        assert!(
+            Backoff::exponential(
+                Duration::from_nanos(1),
+                BackoffFactor::new(1.0).expect("valid factor"),
+                Duration::from_nanos(1),
+                Jitter::Equal,
+            )
+            .is_ok(),
+            "an exponential maximum equal to its base is valid"
         );
-        assert_eq!(
-            BackoffFactor::new(0.5),
-            Err(PolicyError::InvalidBackoffFactor)
-        );
+    }
+
+    #[test]
+    fn unit_multiplier_backoff_delays_are_exact_beyond_float_precision() {
+        // 2^60 + 1 whole nanoseconds cannot survive an f64 round-trip.
+        let base = Duration::from_nanos((1 << 60) + 1);
+        let doubling = Backoff::exponential(
+            base,
+            BackoffFactor::new(2.0).expect("valid factor"),
+            Duration::MAX,
+            Jitter::None,
+        )
+        .expect("valid backoff");
+        assert_eq!(doubling.next_delay(1, 0.9), base);
+
+        let flat = Backoff::exponential(
+            base,
+            BackoffFactor::new(1.0).expect("valid factor"),
+            Duration::MAX,
+            Jitter::None,
+        )
+        .expect("valid backoff");
+        assert_eq!(flat.next_delay(1, 0.0), base);
+        assert_eq!(flat.next_delay(u64::MAX, 0.0), base);
+
+        let fixed = Backoff::fixed(base, Jitter::None).expect("valid backoff");
+        assert_eq!(fixed.next_delay(u64::MAX, 0.99), base);
+
+        let huge_fixed = Backoff::fixed(Duration::MAX, Jitter::None).expect("valid backoff");
+        assert_eq!(huge_fixed.next_delay(u64::MAX, 0.5), Duration::MAX);
+    }
+
+    #[test]
+    fn saturated_backoff_delays_land_exactly_on_the_configured_maximum() {
+        // One nanosecond below `Duration::MAX` does not survive an f64
+        // round-trip, so an exact saturation is observable.
+        let max = Duration::MAX - Duration::from_nanos(1);
+        let explosive = Backoff::exponential(
+            Duration::from_nanos(1),
+            BackoffFactor::new(f64::MAX).expect("finite factor"),
+            max,
+            Jitter::None,
+        )
+        .expect("valid backoff");
+        assert_eq!(explosive.next_delay(2, 0.0), max);
+        assert_eq!(explosive.next_delay(u64::MAX, 0.0), max);
+
+        let doubling = Backoff::exponential(
+            Duration::from_secs(1),
+            BackoffFactor::new(2.0).expect("valid factor"),
+            max,
+            Jitter::None,
+        )
+        .expect("valid backoff");
+        assert_eq!(doubling.next_delay(200, 0.0), max);
+    }
+
+    #[test]
+    fn zero_sample_equal_jitter_is_the_exact_half_delay() {
+        // Half of an odd nanosecond count rounds up by exactly half a
+        // nanosecond; the float path would land one nanosecond short.
+        let odd = Duration::from_nanos((1 << 60) + 1);
+        let fixed = Backoff::fixed(odd, Jitter::Equal).expect("valid backoff");
+        let exact_half = Duration::from_nanos((1 << 59) + 1);
+        assert_eq!(fixed.next_delay(1, 0.0), exact_half);
+        // Non-finite and negative samples clamp to the same exact edge.
+        for sample in [f64::NAN, f64::NEG_INFINITY, -3.0] {
+            assert_eq!(fixed.next_delay(1, sample), exact_half);
+        }
+
+        let even =
+            Backoff::fixed(Duration::from_nanos(1 << 60), Jitter::Equal).expect("valid backoff");
+        assert_eq!(even.next_delay(1, 0.0), Duration::from_nanos(1 << 59));
     }
 
     #[test]

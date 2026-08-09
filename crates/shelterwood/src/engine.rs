@@ -294,7 +294,9 @@ pub(crate) struct RestartDecision {
     pub(crate) attempt: u64,
     pub(crate) restart_count: u64,
     pub(crate) delay: Duration,
-    pub(crate) restart_at: Option<Instant>,
+    /// Absolute backoff deadline; unrepresentable far-future points are
+    /// clamped (B.6: `restart_at` is present exactly in `Restarting`).
+    pub(crate) restart_at: Instant,
     pub(crate) charge: IntensityCharge,
 }
 
@@ -308,7 +310,7 @@ pub(crate) fn schedule_restart(
 ) -> RestartDecision {
     let (attempt, restart_count) = restarts.schedule();
     let delay = restart_policy.backoff().next_delay(attempt, jitter_sample);
-    let restart_at = Deadline::after(now, delay).instant();
+    let restart_at = Deadline::saturating_after(now, delay);
     let charge = intensity.charge(intensity_policy, now);
     RestartDecision {
         attempt,
@@ -1028,13 +1030,13 @@ mod tests {
         assert_eq!(decision.attempt, 1);
         assert_eq!(decision.restart_count, 1);
         assert_eq!(decision.delay, Duration::ZERO);
-        assert_eq!(decision.restart_at, Some(now));
+        assert_eq!(decision.restart_at, now);
         assert_eq!(decision.charge.total_restarts, 1);
         assert!(decision.charge.tripped);
     }
 
     #[test]
-    fn overflowing_restart_delay_has_no_immediate_spawn_deadline() {
+    fn overflowing_restart_delay_clamps_to_a_far_future_deadline() {
         let now = Instant::now();
         let intensity_policy = Intensity::new(5, Duration::from_secs(10)).expect("valid intensity");
         let restart_policy = RestartPolicy::new(
@@ -1052,7 +1054,12 @@ mod tests {
             0.5,
         );
 
-        assert_eq!(decision.restart_at, None);
+        assert_eq!(decision.delay, Duration::MAX);
+        let century = Duration::from_secs(60 * 60 * 24 * 365 * 100);
+        assert!(
+            decision.restart_at > now + century,
+            "an unrepresentable backoff deadline clamps far future, never near now"
+        );
     }
 
     #[test]

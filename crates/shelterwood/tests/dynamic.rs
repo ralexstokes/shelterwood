@@ -15,8 +15,9 @@ use crate::common::{
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicTree, ExitError,
     ExitKind, ExitResult, NotAdmittingCause, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
-    RemoveOutcome, ReserveError, RestartCondition, RestartPolicy, Retention, SendErrorKind,
-    Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    RemoveOutcome, ReserveError, RestartCondition, RestartPolicy, Retention, ScopeRef,
+    SendErrorKind, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, System, TaskDef, TaskOnceDef,
+    Tree,
 };
 
 struct DropProbe(Arc<AtomicBool>);
@@ -907,14 +908,12 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
         .expect("root stops");
 }
 
-#[tokio::test(start_paused = true)]
-async fn pending_restart_window_stop_targets_the_next_incarnation_once() {
-    let factories = Arc::new(AtomicUsize::new(0));
-    let starts = Arc::new(AtomicUsize::new(0));
-    let width = Duration::from_secs(10);
-    let subtree = SubtreeDef::factory({
-        let factories = Arc::clone(&factories);
-        let starts = Arc::clone(&starts);
+fn pending_restart_subtree(
+    width: Duration,
+    factories: Arc<AtomicUsize>,
+    starts: Arc<AtomicUsize>,
+) -> SubtreeDef<Tree> {
+    SubtreeDef::factory({
         move || {
             let generation = factories.fetch_add(1, Ordering::SeqCst) + 1;
             let mut tree = Tree::new();
@@ -954,7 +953,63 @@ async fn pending_restart_window_stop_targets_the_next_incarnation_once() {
     .restart(RestartPolicy::new(
         RestartCondition::Always,
         Backoff::fixed(width, shelterwood::Jitter::None).expect("non-zero backoff"),
-    ));
+    ))
+}
+
+async fn await_first_restart_window(root: &ScopeRef, starts: &Arc<AtomicUsize>) {
+    assert!(
+        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
+            starts.load(Ordering::SeqCst) == 1
+        })
+        .await
+    );
+    root.wait_for_child(
+        "nested",
+        |child| matches!(child.state, ChildState::Restarting),
+        Duration::MAX,
+    )
+    .await
+    .expect("the first incarnation enters its explicit restart window");
+}
+
+async fn pending_restart_fixture(
+    width: Duration,
+) -> (
+    System<shelterwood::DynamicScopeRef>,
+    ScopeRef,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
+    let factories = Arc::new(AtomicUsize::new(0));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let subtree = pending_restart_subtree(width, Arc::clone(&factories), Arc::clone(&starts));
+    let mut root = DynamicTree::new();
+    let nested = root.add_subtree("nested", subtree).expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("first incarnation starts");
+    let root_scope = system.scope();
+    await_first_restart_window(root_scope.as_scope(), &starts).await;
+
+    (system, nested, factories, starts)
+}
+
+/// The ordered-parent twin of [`pending_restart_fixture`]. Restart suppression,
+/// ordered startup progression and reverse teardown all differ from the dynamic
+/// flavor, so the pending-incarnation stop needs its own coverage here.
+async fn ordered_pending_restart_fixture(
+    width: Duration,
+) -> (
+    System<ScopeRef>,
+    ScopeRef,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
+    let factories = Arc::new(AtomicUsize::new(0));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let subtree = pending_restart_subtree(width, Arc::clone(&factories), Arc::clone(&starts));
     let mut root = Tree::new();
     let nested = root.add_subtree("nested", subtree).expect("valid subtree");
     let system = root.spawn().expect("runtime is available");
@@ -962,44 +1017,112 @@ async fn pending_restart_window_stop_targets_the_next_incarnation_once() {
         .wait_started()
         .await
         .expect("first incarnation starts");
-    assert!(
-        poll_until(Duration::from_secs(1), Duration::from_millis(1), || {
-            starts.load(Ordering::SeqCst) == 1
-        })
-        .await
-    );
-    system
-        .scope()
-        .wait_for_child(
-            "nested",
-            |child| matches!(child.state, ChildState::Restarting),
-            Duration::MAX,
-        )
-        .await
-        .expect("the first incarnation enters its explicit restart window");
+    let root_scope = system.scope();
+    await_first_restart_window(&root_scope, &starts).await;
 
-    let nested_wait = nested.clone();
-    let stop_started = ReleaseGate::default();
-    let stop = tokio::spawn({
-        let stop_started = stop_started.clone();
-        async move {
-            stop_started.release();
-            nested_wait.shutdown_and_wait(Duration::from_secs(1)).await
-        }
-    });
-    stop_started.wait().await;
-    assert_quiet(Duration::from_secs(1), || stop.is_finished()).await;
-    advance_time(width).await;
-    stop.await
-        .expect("stop waiter joins")
-        .expect("next incarnation cooperates");
+    (system, nested, factories, starts)
+}
+
+async fn assert_pending_restart_shutdown_is_expedited<R: Clone>(
+    width: Duration,
+    system: System<R>,
+    nested: ScopeRef,
+    factories: Arc<AtomicUsize>,
+    starts: Arc<AtomicUsize>,
+) {
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        nested.shutdown_and_wait(Duration::from_secs(1)),
+    )
+    .await
+    .expect("shutdown does not wait for the pending restart deadline")
+    .expect("the pending incarnation stops cooperatively");
     assert_eq!(starts.load(Ordering::SeqCst), 2);
-    advance_time(width / 2).await;
+    assert_eq!(
+        factories.load(Ordering::SeqCst),
+        2,
+        "shutdown must start exactly the pending incarnation without waiting for backoff"
+    );
+    if width == Duration::MAX {
+        // An unrepresentable deadline schedules no restart at all, so there is
+        // no later incarnation to reach. Only the quiet window applies.
+        advance_time(Duration::from_secs(1)).await;
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            2,
+            "an unrepresentable deadline must not resurrect the stopped incarnation"
+        );
+        system.shutdown(Duration::ZERO).await.expect("root stops");
+        return;
+    }
+
+    // The expedited incarnation exited cooperatively, so `Always` schedules an
+    // ordinary backoff restart. Cross the whole window: a storm assertion that
+    // never reaches a *later* incarnation only re-measures the quiet interior
+    // of the window it already observed.
+    advance_time(width + Duration::from_secs(1)).await;
+    assert!(
+        poll_until(Duration::from_secs(5), Duration::from_millis(1), || {
+            starts.load(Ordering::SeqCst) >= 3
+        })
+        .await,
+        "a consumed pending request must not suppress the ordinary backoff restart"
+    );
     assert_eq!(
         starts.load(Ordering::SeqCst),
-        2,
-        "a consumed per-incarnation latch must not cause a stop/restart storm"
+        3,
+        "exactly one incarnation follows the expedited stop"
     );
+    assert_eq!(
+        factories.load(Ordering::SeqCst),
+        3,
+        "the backoff restart re-lowers the subtree exactly once"
+    );
+    advance_time(width * 3).await;
+    assert_quiet(Duration::from_secs(1), || {
+        starts.load(Ordering::SeqCst) != 3
+    })
+    .await;
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_restart_shutdown_expedites_finite_and_unrepresentable_backoff() {
+    for width in [Duration::from_secs(60 * 60), Duration::MAX] {
+        let (system, nested, factories, starts) = pending_restart_fixture(width).await;
+        assert_pending_restart_shutdown_is_expedited(width, system, nested, factories, starts)
+            .await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ordered_parent_pending_restart_shutdown_is_expedited() {
+    let width = Duration::from_secs(60 * 60);
+    let (system, nested, factories, starts) = ordered_pending_restart_fixture(width).await;
+    assert_pending_restart_shutdown_is_expedited(width, system, nested, factories, starts).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_batch_removal_suppresses_pending_restart_shutdown() {
+    let (system, nested, factories, starts) =
+        pending_restart_fixture(Duration::from_secs(60 * 60)).await;
+
+    // Both level-triggered commands are latched before yielding to the
+    // driver. Removal owns restart suppression even though the nested scope's
+    // pending shutdown would otherwise expedite its next incarnation.
+    let removal = system.scope().remove_scope(&nested);
+    nested.request_shutdown();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), removal)
+            .await
+            .expect("removal does not wait for restart backoff"),
+        RemoveOutcome::Removed
+    );
+    assert_eq!(factories.load(Ordering::SeqCst), 1);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
     system.shutdown(Duration::ZERO).await.expect("root stops");
 }
 

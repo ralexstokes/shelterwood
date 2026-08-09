@@ -1143,6 +1143,7 @@ impl ScopeCell {
 
     pub(crate) fn request_shutdown(&self) -> u64 {
         let mut control = self.control.lock().expect("scope control mutex poisoned");
+        let pending_incarnation = !control.live;
         let target = if control.live {
             control.current_epoch
         } else {
@@ -1159,7 +1160,32 @@ impl ScopeCell {
         }
         drop(control);
         self.member.record.pulse();
+        // A nested scope has no live driver while its parent is retaining it
+        // in restart backoff. Wake that parent as well so it can start the
+        // pending incarnation immediately; that incarnation consumes the
+        // stop and begins the timeout-bounded teardown required by B.9.
+        if pending_incarnation
+            && let Some(parent) = self.parent.read_cloned().as_ref().and_then(Weak::upgrade)
+        {
+            parent.member.record.pulse();
+        }
         target
+    }
+
+    fn has_pending_incarnation_shutdown(&self) -> bool {
+        let control = self.control.lock().expect("scope control mutex poisoned");
+        !control.live
+            && control.shutdown.is_some_and(|request| {
+                !request.consumed && request.epoch > control.last_stopped_epoch
+            })
+    }
+
+    fn has_stop_request(&self, epoch: u64) -> bool {
+        let control = self.control.lock().expect("scope control mutex poisoned");
+        control
+            .shutdown
+            .is_some_and(|request| request.epoch == epoch)
+            || control.force.is_some_and(|request| request.epoch == epoch)
     }
 
     fn take_shutdown_request(&self, epoch: u64) -> bool {
@@ -2270,6 +2296,67 @@ enum SpawnBody {
 }
 
 impl ScopeRuntime {
+    fn restart_is_suppressed(&self, key: ChildKey) -> bool {
+        if self.phase.is_draining()
+            || self.hard_forced
+            || self.root.has_stop_request(self.epoch)
+            || self.ancestor_shutdown.as_ref().is_some_and(Latch::is_fired)
+            || self.ancestor_abort.as_ref().is_some_and(Latch::is_fired)
+        {
+            return true;
+        }
+        let Some(child) = self.children.get(key) else {
+            return true;
+        };
+        let record = child.slot.member.record();
+        if record.removing || child.slot.member.removal.is_fired() {
+            return true;
+        }
+        self.dynamic.as_ref().is_some_and(|control| {
+            control
+                .state
+                .lock()
+                .expect("dynamic-state mutex poisoned")
+                .entries
+                .values()
+                .find(|entry| entry.slot.member.membership() == child.slot.member.membership())
+                .is_some_and(|entry| {
+                    entry.removal_started
+                        || entry.fused_cancel.as_ref().is_some_and(Latch::is_fired)
+                })
+        })
+    }
+
+    fn pending_restart_shutdowns(&self) -> Vec<ChildKey> {
+        self.children
+            .keys()
+            .filter(|key| {
+                let child = &self.children[*key];
+                // Only a nested scope can hold a pending-incarnation stop, and
+                // only its own control plane can answer whether one exists.
+                // Both are cheap, so they gate the suppression sweep, which
+                // takes the dynamic-state lock and scans every entry.
+                child.active.is_none()
+                    && matches!(child.slot.member.record().stage, MemberStage::Restarting)
+                    && child
+                        .slot
+                        .scope
+                        .as_ref()
+                        .is_some_and(|scope| scope.has_pending_incarnation_shutdown())
+                    && !self.restart_is_suppressed(*key)
+            })
+            .collect()
+    }
+
+    fn expedite_restart_shutdown(&mut self, key: ChildKey) {
+        // Collection and execution are separated by arbitration. Recheck
+        // every level-triggered stop source so teardown/removal latched in the
+        // same batch suppresses user construction immediately.
+        if !self.restart_is_suppressed(key) {
+            self.spawn_child(key);
+        }
+    }
+
     #[cfg(test)]
     fn record_storage(&self) {
         *self
@@ -2288,7 +2375,11 @@ impl ScopeRuntime {
         let Some(child) = self.children.get(key) else {
             return;
         };
-        if self.phase.is_draining() || child.is_terminal() || child.is_disposing() {
+        if self.phase.is_draining()
+            || child.active.is_some()
+            || child.is_terminal()
+            || child.is_disposing()
+        {
             return;
         }
         let child = &mut self.children[key];
@@ -3752,6 +3843,9 @@ async fn run_scope_incarnation(
         if root.take_shutdown_request(epoch) {
             pending.push((ArbitrationClass::ScopeShutdown, Pending::Shutdown));
         }
+        for child in scope.pending_restart_shutdowns() {
+            pending.push(restart_shutdown_work(child));
+        }
         if !scope.ancestor_shutdown_seen
             && scope
                 .ancestor_shutdown
@@ -3776,17 +3870,7 @@ async fn run_scope_incarnation(
             ));
         }
         while let Some(event) = runtime::mpsc_try_recv(&mut event_receiver) {
-            let class = match event {
-                DriverEvent::Child(ChildEvent::SelfStop { .. }) => {
-                    ArbitrationClass::MembershipRemoval
-                }
-                DriverEvent::Child(ChildEvent::Constructed { .. })
-                | DriverEvent::Child(ChildEvent::Ready { .. }) => ArbitrationClass::ReadinessSignal,
-                DriverEvent::Child(
-                    ChildEvent::Exited { .. } | ChildEvent::ConstructionDisposed { .. },
-                ) => ArbitrationClass::ChildExit,
-                DriverEvent::Admission(_) => ArbitrationClass::Admission,
-            };
+            let class = driver_event_class(&event);
             pending.push((class, Pending::Driver(event)));
         }
         let now = runtime::now();
@@ -3841,19 +3925,7 @@ async fn run_scope_incarnation(
                     continue;
                 }
                 runtime::ScopeWake::Message(Some(event)) => {
-                    let class = match event {
-                        DriverEvent::Child(ChildEvent::SelfStop { .. }) => {
-                            ArbitrationClass::MembershipRemoval
-                        }
-                        DriverEvent::Child(ChildEvent::Constructed { .. })
-                        | DriverEvent::Child(ChildEvent::Ready { .. }) => {
-                            ArbitrationClass::ReadinessSignal
-                        }
-                        DriverEvent::Child(
-                            ChildEvent::Exited { .. } | ChildEvent::ConstructionDisposed { .. },
-                        ) => ArbitrationClass::ChildExit,
-                        DriverEvent::Admission(_) => ArbitrationClass::Admission,
-                    };
+                    let class = driver_event_class(&event);
                     pending.push((class, Pending::Driver(event)));
                 }
                 runtime::ScopeWake::Message(None) => continue,
@@ -3870,6 +3942,7 @@ async fn run_scope_incarnation(
                     }
                     scope.begin_drain(StopReason::ShutdownRequested);
                 }
+                Pending::RestartShutdown(child) => scope.expedite_restart_shutdown(child),
                 Pending::AncestorShutdown => {
                     scope.begin_drain(StopReason::ShutdownRequested);
                 }
@@ -3946,12 +4019,37 @@ async fn run_scope_incarnation(
 
 enum Pending {
     Shutdown,
+    RestartShutdown(ChildKey),
     AncestorShutdown,
     AncestorAbort,
     Force,
     Removal(Membership),
     Driver(DriverEvent),
     Deadline(DeadlineKind),
+}
+
+fn restart_shutdown_work(child: ChildKey) -> (ArbitrationClass, Pending) {
+    // This starts a pending incarnation, so it is restart work, not a
+    // scope-shutdown transition. A child exit collected in the same wake must
+    // first get the chance to trip intensity or fail startup; the
+    // execution-time suppression check then observes that drain.
+    (
+        ArbitrationClass::BackoffDue,
+        Pending::RestartShutdown(child),
+    )
+}
+
+fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
+    match event {
+        DriverEvent::Child(ChildEvent::SelfStop { .. }) => ArbitrationClass::MembershipRemoval,
+        DriverEvent::Child(ChildEvent::Constructed { .. } | ChildEvent::Ready { .. }) => {
+            ArbitrationClass::ReadinessSignal
+        }
+        DriverEvent::Child(ChildEvent::Exited { .. } | ChildEvent::ConstructionDisposed { .. }) => {
+            ArbitrationClass::ChildExit
+        }
+        DriverEvent::Admission(_) => ArbitrationClass::Admission,
+    }
 }
 
 #[cfg(test)]
@@ -3965,11 +4063,12 @@ mod tests {
     };
 
     use crate::{
-        ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, LifecycleEventKind,
+        ActorRef, ChildId, DynamicTree, Exit, ExitError, ExitKind, Intensity, LifecycleEventKind,
         LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline, RemoveOutcome,
         Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause, StopReason,
-        SubtreeOnceDef, TaskDef, Tree,
-        exit::RecordedOutcome,
+        SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+        engine::arbitrate,
+        exit::{JoinVerdict, RecordedOutcome},
         identity::{FenceCounter, ScopeIdentity},
         mailbox::MailboxCell,
         runtime::Latch,
@@ -3977,10 +4076,11 @@ mod tests {
     };
 
     use super::{
-        ChildArena, ChildRuntime, DynamicControl, DynamicEntry, MemberCell, MemberStage,
-        Obligation, RemovalResponses, RuntimeStorage, ScopeCell, ScopeFlavor, ScopePhase, Signal,
-        StartupPhase, complete_removals, mint_child_incarnation, report_channel, run_nested_tree,
-        run_scope_incarnation,
+        ChildArena, ChildEvent, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
+        MemberCell, MemberStage, Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell,
+        ScopeFlavor, ScopePhase, ScopeRuntime, Signal, StartupPhase, complete_removals,
+        driver_event_class, mint_child_incarnation, report_channel, restart_shutdown_work,
+        run_nested_tree, run_scope_incarnation,
     };
 
     fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
@@ -4113,6 +4213,142 @@ mod tests {
             );
             assert!(!phase.begin_drain(StopReason::Finished));
         }
+    }
+
+    #[crate::runtime::test]
+    async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
+        let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tree = Tree::new();
+        tree.intensity(Intensity::new(0, Duration::from_secs(10)).expect("valid intensity"));
+        tree.add_subtree(
+            "nested",
+            SubtreeDef::factory({
+                let factories = Arc::clone(&factories);
+                move || {
+                    factories.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Tree::new()
+                }
+            }),
+        )
+        .expect("valid subtree");
+        tree.add_task("trip", TaskDef::new(|_| future::pending()))
+            .expect("valid task");
+
+        let mut plan = lower_tree_for_test(tree);
+        let root = Arc::clone(&plan.root);
+        let epoch = root.begin_incarnation();
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| Arc::clone(&child.slot))
+                .collect(),
+        );
+        let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let mut children = ChildArena::with_capacity(plan.children.len());
+        plan.children.reverse();
+        while let Some(child) = plan.children.pop() {
+            children.insert(ChildRuntime::from_plan(child, &root));
+        }
+        let nested = children
+            .keys()
+            .find(|key| children[*key].slot.member.id().as_str() == "nested")
+            .expect("nested child key");
+        let trip = children
+            .keys()
+            .find(|key| children[*key].slot.member.id().as_str() == "trip")
+            .expect("tripping child key");
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            flavor: plan.flavor,
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            phase: ScopePhase::Running,
+            next_ordered_start: 0,
+            is_root: true,
+            parent_ready: None,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown: None,
+            ancestor_shutdown_seen: false,
+            ancestor_abort: None,
+            ancestor_abort_ack: None,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        root.transition_child(
+            &scope.children[nested].slot.member,
+            |record| {
+                record.incarnation = None;
+                record.stage = MemberStage::Restarting;
+            },
+            None,
+        );
+        scope.children[nested]
+            .slot
+            .scope
+            .as_ref()
+            .expect("nested scope cell")
+            .request_shutdown();
+        assert_eq!(scope.pending_restart_shutdowns(), vec![nested]);
+
+        scope.spawn_child(trip);
+        let incarnation = scope.children[trip]
+            .active
+            .as_ref()
+            .expect("tripping child is active")
+            .incarnation;
+        scope.children[trip]
+            .active
+            .as_ref()
+            .expect("tripping child is active")
+            .abort_handle
+            .abort();
+        let exit = DriverEvent::Child(ChildEvent::Exited {
+            child: trip,
+            incarnation,
+            recorded: Some(RecordedOutcome::Returned(Err(ExitError::message(
+                "trip intensity",
+            )))),
+            join: JoinVerdict::Completed,
+            cancelled: false,
+        });
+        let mut pending = [
+            restart_shutdown_work(nested),
+            (driver_event_class(&exit), Pending::Driver(exit)),
+        ];
+        arbitrate(&mut pending);
+        for (_, event) in pending {
+            match event {
+                Pending::RestartShutdown(child) => scope.expedite_restart_shutdown(child),
+                Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancelled,
+                })) => scope.handle_exit(child, incarnation, recorded, join, cancelled),
+                _ => unreachable!("the fixture queues only exit and restart work"),
+            }
+        }
+
+        crate::runtime::yield_now().await;
+        crate::runtime::yield_now().await;
+
+        assert!(scope.phase.is_draining());
+        assert_eq!(
+            factories.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the production guard must suppress the expedited factory after intensity drain"
+        );
     }
 
     #[test]

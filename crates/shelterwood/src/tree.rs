@@ -1007,6 +1007,10 @@ impl fmt::Debug for Removal {
     }
 }
 
+fn lost_removal_response_outcome() -> RemoveOutcome {
+    RemoveOutcome::Removed
+}
+
 impl Removal {
     fn new(response: crate::driver::RemovalResponse) -> Self {
         Self {
@@ -1018,7 +1022,7 @@ impl Removal {
                     // preserve the removal goal, but flag the invariant break
                     // in debug builds just as admission does above.
                     debug_assert!(false, "removal response obligation must complete");
-                    RemoveOutcome::Removed
+                    lost_removal_response_outcome()
                 })
             }),
         }
@@ -1227,6 +1231,14 @@ mod tests {
         let core = <DynamicTree as Sealed>::into_core(tree);
         assert_eq!(ScopeIdentity::current_thread_creations(), after_tree);
         drop(core);
+    }
+
+    #[test]
+    fn lost_removal_response_policy_fails_closed() {
+        assert_eq!(
+            super::lost_removal_response_outcome(),
+            crate::RemoveOutcome::Removed
+        );
     }
 
     #[test]

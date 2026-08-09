@@ -812,13 +812,6 @@ decided semantics are: `call` is allowed, conflation-away surfaces as
 `ReplyDropped`, and the documentation teaches this next to the §3.3 retry
 discipline.
 
-Where this specification calls for **isolated** or **detached** disposal, the
-guarantee is that user destruction runs off the submitting caller's thread and
-that each value has its own panic-containment boundary. The worker's identity,
-the number of disposal workers, and whether distinct disposal jobs share a
-thread are implementation details, not observable ordering or affinity
-contracts.
-
 ### 5.2 The handler event loop
 
 The generated loop services, in this documented priority with explicit
@@ -2934,7 +2927,7 @@ marked *(II)* ship with the named Part II feature.
 | Snapshot channel | conflating watch, capacity 1 | Structural |
 | `call` / `send_timeout` deadline | **none — always explicit** | One budget per call (§5.1); zero deadline fails immediately |
 | Identity counters | `u64`, saturating | Fail-closed overflow, decided once in the fencing primitive (§3.1); lifecycle `seq`/`lifecycle_seq` mint through the same primitive (B.4's exhaustion rule) |
-| Far-future deadline | `restart_at` clamps to the largest safely armable instant; surfaces that permit an absent deadline treat unarmable budgets as never arriving | Never substitute the budget's start instant or panic on `Instant + Duration` overflow |
+| Far-future clamp | timer arithmetic saturates to a far-future instant | Instead of panicking on `Instant + Duration` overflow |
 
 ---
 
@@ -2985,14 +2978,6 @@ No runtime time type is public (D.3 clause 1 checks this during initial
 development): the `runtime` module converts at the boundary, and under
 virtual time its clock mints the instants — still `std` values, mutually
 coherent, which is all any contract here compares.
-
-An absolute deadline that cannot be represented or safely armed MUST NOT be
-replaced with its budget's start instant. Operations whose surface permits an
-absent deadline treat that budget as never arriving. A `ChildSnapshot` in
-`Restarting` instead requires a present `restart_at`: the exact point is
-clamped to the largest safely armable far-future instant, and that same clamped
-instant drives the restart wake. An overflowing backoff therefore never turns
-into an immediate restart.
 
 Rows marked *(II)* ship with the named Part II feature.
 
@@ -3316,11 +3301,8 @@ ChildSnapshot   { id, membership,                       // §3 identity types
                   restart_at: Option<Instant>,          // present exactly in Restarting: the
                                                         //   backoff deadline as an absolute
                                                         //   runtime-clock instant (D.3) — a retained
-                                                        //   snapshot stays interpretable; an exact
-                                                        //   point too distant for the clock is
-                                                        //   clamped to the largest safely armable
-                                                        //   far-future instant; render relative by
-                                                        //   subtracting now
+                                                        //   snapshot stays interpretable; render
+                                                        //   relative by subtracting now
                   nested: Option<ScopeSnapshot>,         // recursive for scope children; None while
                                                          //   no incarnation is live and the membership
                                                          //   is non-terminal (restart window); a

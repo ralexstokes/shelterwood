@@ -516,9 +516,10 @@ impl Drop for HostileFallbackCapture {
 }
 
 #[tokio::test]
-async fn non_runtime_disposals_run_off_callers_and_contain_panics() {
+async fn non_runtime_disposals_share_one_thread_and_contain_panics() {
     const VALUES: usize = 8;
 
+    let test_thread = thread::current().id();
     let tree = DynamicTree::new();
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("dynamic root starts");
@@ -536,8 +537,8 @@ async fn non_runtime_disposals_run_off_callers_and_contain_panics() {
         admissions.push(slot.define(TaskDef::new({
             let capture = HostileFallbackCapture {
                 dropped: dropped.clone(),
-                // Include a blocking destructor to exercise isolation without
-                // requiring any particular disposal-worker topology.
+                // The first destructor blocks so every later job queues
+                // behind it on the shared fallback disposal thread.
                 blocker: (index == 0).then(|| gate.blocker()),
                 panic: (index == VALUES - 1).then_some("hostile fallback destructor"),
             };
@@ -566,12 +567,15 @@ async fn non_runtime_disposals_run_off_callers_and_contain_panics() {
         disposal_threads.push(drops.recv().await.expect("every capture is disposed"));
     }
     assert!(drops.recv().await.is_none());
+    let disposal_thread = disposal_threads[0];
     assert!(
         disposal_threads
             .iter()
-            .all(|thread| *thread != dropper_thread),
-        "every disposal runs off the thread that submitted it"
+            .all(|thread| *thread == disposal_thread),
+        "queued fallback disposals share one disposal thread instead of one thread per value"
     );
+    assert_ne!(disposal_thread, dropper_thread);
+    assert_ne!(disposal_thread, test_thread);
     for task in tasks {
         assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     }

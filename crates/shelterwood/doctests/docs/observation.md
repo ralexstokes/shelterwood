@@ -29,11 +29,10 @@ These values use `LifecycleSeq`. `LifecycleSeq::EXHAUSTED` is the permanent
 watermark after the sequence space is exhausted and is never emitted on an
 event; `get()` exposes the underlying `u64` when numeric integration requires it.
 
-A child in `Restarting` always exposes its absolute backoff deadline through
+A child in `Restarting` normally exposes its absolute backoff deadline through
 `restart_at`. If the requested delay is too large for the platform clock to
-represent or arm safely, the deadline is clamped to the largest armable
-far-future instant. That same clamped instant drives the restart, so overflow
-never substitutes the scheduling instant or causes an immediate restart.
+represent, `restart_at` is `None`; the child remains in `Restarting` until
+removal or shutdown rather than restarting immediately.
 
 If the event's scope token is absent from the snapshot, use causal introduction:
 

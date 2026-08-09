@@ -245,6 +245,17 @@ impl PanicSlot {
     }
 }
 
+/// Incarnation-internal completion storage for offload continuations.
+///
+/// The queue is deliberately unbounded. Every entry is produced by work this
+/// incarnation itself started — exactly one completion per offload — so its
+/// population is bounded by the actor's own in-flight offload count plus
+/// completions accepted but not yet consumed; no external sender can reach
+/// it. Bounded-mailbox policy governs external input only (SPEC §5.5:
+/// offload completions do not consume mailbox capacity), and imposing a
+/// bound here would either block the offload task or drop a completion the
+/// total-continuation contract promises to deliver. Freezing at stop clears
+/// the queue, and dropped `RawResources` clear it on every exit path.
 struct EventQueue<M> {
     // Timer batches snapshot the number of currently queued events. Insertion
     // and the snapshot share this lock, so FIFO order itself is the sequence
@@ -729,6 +740,15 @@ impl<M> RawResources<M> {
         dropped_continuations
     }
 
+    /// Drops ledger entries for offloads that already finished, keeping a
+    /// long-lived incarnation's ledger O(in-flight) rather than
+    /// O(offloads-ever-issued). Invoked at the two cheap points that bound
+    /// steady-state retention: when a new offload starts and when the loop
+    /// goes idle.
+    fn reclaim_finished(&mut self) {
+        self.offloads.retain(|offload| !offload.finished.is_fired());
+    }
+
     fn resume_pending_panic(&self) {
         // Reached from the actor's own receive path, never from cleanup. The
         // take is destructive, so containment here would drop the retained
@@ -985,6 +1005,14 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     /// Starts incarnation-owned async work with one total deadline budget.
+    ///
+    /// Completions re-enter the loop through incarnation-internal storage
+    /// that does not consume mailbox capacity (SPEC §5.5). That storage is
+    /// unbounded but self-limiting: it holds at most one entry per offload
+    /// this incarnation has started and not yet consumed, and only the actor
+    /// itself can start offloads, so its population is bounded by the
+    /// caller's own in-flight count. Bookkeeping for finished offloads is
+    /// reclaimed when a new offload starts and when the loop goes idle.
     pub fn offload<F, T, C>(
         &mut self,
         work: F,
@@ -1001,6 +1029,9 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     /// Starts guarded incarnation-owned async work with one deadline budget.
+    ///
+    /// Completion storage follows [`offload`](Self::offload): unbounded but
+    /// limited to one entry per unconsumed offload the actor itself started.
     pub fn offload_scoped<F, T, C>(
         &mut self,
         work: F,
@@ -1100,12 +1131,8 @@ impl<M: Send + 'static> RawContext<M> {
         if self.is_stopping() || !self.resources.accepting {
             return Err(Rejected::new((work, continuation)));
         }
-        // Completed offloads no longer need their resources; prune them here
-        // so a long-lived incarnation's ledger stays O(in-flight), not
-        // O(offloads-ever-issued).
-        self.resources
-            .offloads
-            .retain(|offload| !offload.finished.is_fired());
+        // Completed offloads no longer need their resources.
+        self.resources.reclaim_finished();
 
         let cancellation = Latch::default();
         let finished = Latch::default();
@@ -1336,6 +1363,9 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     async fn wait_for_event(&mut self) {
+        // The loop is about to go idle: reclaim finished offload bookkeeping
+        // now so steady-state retention never waits for the next offload.
+        self.resources.reclaim_finished();
         let sleep = self.next_timer_deadline().map_or_else(
             || Box::pin(std::future::pending()) as runtime::BoxedSleep,
             runtime::sleep_until,
@@ -1930,6 +1960,32 @@ mod tests {
             panic_message(&payload),
             Some("unit offload destructor panic")
         );
+    }
+
+    #[test]
+    fn finished_offload_ledger_entries_are_reclaimed_eagerly() {
+        let mut resources = RawResources::<()>::default();
+        for finished in [true, false, true] {
+            let completion = Latch::default();
+            if finished {
+                completion.fire();
+            }
+            resources.offloads.push(OffloadResource {
+                cancellation: Latch::default(),
+                finished: completion,
+                state: None,
+                task: None,
+            });
+        }
+
+        resources.reclaim_finished();
+
+        assert_eq!(
+            resources.offloads.len(),
+            1,
+            "reclamation retains exactly the unfinished offloads"
+        );
+        assert!(!resources.offloads[0].finished.is_fired());
     }
 
     #[test]

@@ -2364,12 +2364,6 @@ async fn run_scope_incarnation(
     let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
     let dynamic =
         (plan.root.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(events.clone()));
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
     // Transfer children one at a time. The not-yet-converted suffix remains
     // owned by ScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
@@ -2389,7 +2383,6 @@ async fn run_scope_incarnation(
                 .iter()
                 .map(|(key, child)| (&child.slot, *key)),
         );
-        root.set_dynamic_route(Some(control.clone()));
     }
     let next_ordered_start = children.keys().next();
     let mut scope = ScopeRuntime {
@@ -2415,10 +2408,26 @@ async fn run_scope_incarnation(
         // the raw epoch directly into ScopeRuntime's synchronous epilogue.
         epoch: epoch.transfer(),
     };
-    #[cfg(test)]
-    scope.record_storage();
     plan.armed = false;
     drop(plan);
+
+    // ScopeRuntime owns teardown before the route becomes public. If either
+    // route notification or initial-child publication unwinds, its epilogue
+    // closes dynamic state, terminalizes every child, and clears any resident
+    // prefix. Install the fully keyed route before publishing Added so a
+    // synchronous observer never sees membership without its control plane.
+    if let Some(control) = &scope.dynamic {
+        scope.root.set_dynamic_route(Some(control.clone()));
+    }
+    scope.root.set_admitted_children(
+        scope
+            .children
+            .values()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    #[cfg(test)]
+    scope.record_storage();
 
     match scope.root.flavor {
         ScopeFlavor::Ordered => scope.progress_startup(),
@@ -2698,8 +2707,8 @@ mod tests {
     use crate::{
         ActorRef, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
         GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness,
-        ReadinessDeadline, RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError,
-        StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+        ReadinessDeadline, RemoveOutcome, ReserveError, Retention, ScopeState, SendErrorKind,
+        StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
         engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
         identity::{IncarnationCounter, ScopeIdentity},
@@ -2713,8 +2722,9 @@ mod tests {
         AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
         DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
         Pending, RemovalRequest, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
-        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, report_channel,
-        resident_projection, restart_shutdown_work, run_nested_tree, run_scope_incarnation,
+        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, cancel_dynamic_reservation,
+        report_channel, reserve_dynamic, resident_projection, restart_shutdown_work,
+        run_nested_tree, run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -3705,7 +3715,92 @@ mod tests {
                 removed += 1;
             }
         }
-        assert_eq!(removed, 2, "every Added edge needs a matching Removed edge");
+        assert_eq!(
+            removed, 0,
+            "conversion must finish before publication begins"
+        );
+    }
+
+    struct ReserveOnLifecycleWake {
+        scope: Arc<ScopeCell>,
+        result: Mutex<Option<Result<(), ReserveError>>>,
+        observed: Latch,
+    }
+
+    impl ReserveOnLifecycleWake {
+        fn observe(&self) {
+            let mut result = self.result.lock().expect("observation mutex poisoned");
+            if result.is_none() {
+                *result = Some(
+                    reserve_dynamic(&self.scope, ChildId::from("reentrant"), None).map(
+                        |reservation| {
+                            cancel_dynamic_reservation(
+                                reservation.control.as_ref(),
+                                &reservation.slot,
+                            );
+                        },
+                    ),
+                );
+                self.observed.fire();
+            }
+        }
+    }
+
+    impl Wake for ReserveOnLifecycleWake {
+        fn wake(self: Arc<Self>) {
+            self.observe();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observe();
+        }
+    }
+
+    #[crate::runtime::test]
+    async fn initial_added_wake_observes_the_keyed_dynamic_route() {
+        let mut tree = DynamicTree::new();
+        tree.add_task("initial", TaskDef::new(|_| future::pending()))
+            .expect("valid task");
+        let plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let mut events = root.subscribe_lifecycle();
+        let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
+        assert!(events.recv().await.is_some(), "Starting is observed first");
+
+        let probe = Arc::new(ReserveOnLifecycleWake {
+            scope: Arc::clone(&root),
+            result: Mutex::new(None),
+            observed: Latch::default(),
+        });
+        let waker = Waker::from(Arc::clone(&probe));
+        let mut added = Box::pin(events.recv());
+        assert!(
+            added
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
+        let abort = driver.abort_handle();
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(1), probe.observed.fired()).await,
+            crate::runtime::Timeout::Completed(())
+        ));
+        drop(added);
+        assert!(matches!(
+            probe
+                .result
+                .lock()
+                .expect("observation mutex poisoned")
+                .as_ref(),
+            Some(Ok(()))
+        ));
+        abort.abort();
+        assert!(matches!(
+            crate::runtime::join(driver).await,
+            crate::runtime::JoinOutcome::Cancelled
+        ));
     }
 
     struct TrySendOnWake {

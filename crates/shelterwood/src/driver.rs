@@ -3116,10 +3116,10 @@ mod tests {
     use super::{
         AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
         DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
-        Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
-        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, complete_removals,
-        report_channel, resident_projection, restart_shutdown_work, run_nested_tree,
-        run_scope_incarnation,
+        Obligation, Pending, RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell,
+        ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
+        complete_removals, report_channel, resident_projection, restart_shutdown_work,
+        run_nested_tree, run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -3223,6 +3223,22 @@ mod tests {
 
         fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ObserveWakeCount {
+        wakes: Arc<AtomicUsize>,
+        observed: Mutex<Option<usize>>,
+    }
+
+    impl Wake for ObserveWakeCount {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            *self.observed.lock().expect("observation mutex poisoned") =
+                Some(self.wakes.load(Ordering::SeqCst));
         }
     }
 
@@ -4603,6 +4619,143 @@ mod tests {
             Some(SendErrorKind::Terminated)
         );
         assert!(changed.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn supervised_terminality_pulse_follows_mailbox_termination() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+
+        let mailbox_wakes = Arc::new(AtomicUsize::new(0));
+        let mailbox_waker = Waker::from(Arc::new(CountWake(Arc::clone(&mailbox_wakes))));
+        let mut parked_send = Box::pin(actor.send(1));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&mailbox_waker))
+                .is_pending()
+        );
+
+        let probe = Arc::new(ObserveWakeCount {
+            wakes: Arc::clone(&mailbox_wakes),
+            observed: Mutex::new(None),
+        });
+        let terminal_waker = Waker::from(Arc::clone(&probe));
+        let mut terminal = Box::pin(member.wait_terminal());
+        assert!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&terminal_waker))
+                .is_pending()
+        );
+
+        assert!(root.terminalize_child(
+            &member,
+            Exit::never_started(),
+            None,
+            StartupDisposition::Aborted,
+        ));
+
+        assert_eq!(
+            *probe.observed.lock().expect("observation mutex poisoned"),
+            Some(1),
+            "the supervised terminal pulse must follow parked-sender discharge"
+        );
+        assert!(member.record().startup_aborted);
+        assert!(matches!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(error)) if error.kind == SendErrorKind::Terminated
+        ));
+    }
+
+    #[test]
+    fn supervised_mailbox_teardown_panic_precedes_terminal_pulse_panic() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+
+        let mailbox_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let mailbox_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &mailbox_payload_dropped,
+        ))));
+        let mut parked_send = Box::pin(actor.send(1));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&mailbox_waker))
+                .is_pending()
+        );
+
+        let terminal_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let terminal_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &terminal_payload_dropped,
+        ))));
+        let mut terminal = Box::pin(member.wait_terminal());
+        assert!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&terminal_waker))
+                .is_pending()
+        );
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            root.terminalize_child(
+                &member,
+                Exit::never_started(),
+                None,
+                StartupDisposition::Aborted,
+            );
+        }))
+        .expect_err("the primary mailbox panic still surfaces");
+        assert_eq!(
+            mailbox_payload_dropped.load(Ordering::SeqCst),
+            0,
+            "the primary mailbox payload is retained for the caller"
+        );
+        assert_eq!(
+            terminal_payload_dropped.load(Ordering::SeqCst),
+            1,
+            "the later terminal-pulse panic is contained as cleanup"
+        );
+        drop(payload);
+        assert_eq!(mailbox_payload_dropped.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(error)) if error.kind == SendErrorKind::Terminated
+        ));
     }
 
     #[test]

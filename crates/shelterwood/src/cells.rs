@@ -291,14 +291,32 @@ impl MemberCell {
     }
 
     pub(crate) fn terminalize(&self, exit: Exit) {
-        self.terminalize_with_wakes(exit, None);
+        self.terminalize_with_wakes(exit, None, None);
     }
 
     fn terminalize_locked(&self, exit: Exit, wakes: &mut ObservationWakes) {
-        self.terminalize_with_wakes(exit, Some(wakes));
+        self.terminalize_with_wakes(exit, Some(wakes), None);
     }
 
-    fn terminalize_with_wakes(&self, exit: Exit, wakes: Option<&mut ObservationWakes>) {
+    fn terminalize_child_locked(
+        &self,
+        exit: Exit,
+        startup: StartupDisposition,
+        wakes: &mut ObservationWakes,
+    ) {
+        self.terminalize_with_wakes(
+            exit,
+            Some(wakes),
+            Some(startup == StartupDisposition::Aborted),
+        );
+    }
+
+    fn terminalize_with_wakes(
+        &self,
+        exit: Exit,
+        wakes: Option<&mut ObservationWakes>,
+        startup_aborted: Option<bool>,
+    ) {
         let terminal_exit = {
             let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
             match &*state {
@@ -326,20 +344,24 @@ impl MemberCell {
                 }
             }
         };
-        self.publish_terminal_with_wakes(terminal_exit, wakes);
+        self.publish_terminal_with_wakes(terminal_exit, wakes, startup_aborted);
     }
 
     fn publish_terminal(&self, terminal_exit: Exit) {
-        self.publish_terminal_with_wakes(terminal_exit, None);
+        self.publish_terminal_with_wakes(terminal_exit, None, None);
     }
 
     fn publish_terminal_with_wakes(
         &self,
         terminal_exit: Exit,
         wakes: Option<&mut ObservationWakes>,
+        startup_aborted: Option<bool>,
     ) {
         let mut published = false;
         self.record.modify_silently(|record| {
+            if let Some(startup_aborted) = startup_aborted {
+                record.startup_aborted = startup_aborted;
+            }
             if !matches!(record.stage, MemberStage::Terminal(_)) {
                 record.incarnation = None;
                 record.restart_at = None;
@@ -348,6 +370,7 @@ impl MemberCell {
                 published = true;
             }
         });
+        let record_changed = published || startup_aborted.is_some();
         // Store before discharge so reentrant mailbox wakers observe the
         // winning exit. Notification-driven readers still see
         // discharge-before-pulse; tree-scoped publication defers both until
@@ -366,7 +389,12 @@ impl MemberCell {
                     }
                 });
             }
-            if published {
+            // A supervised terminal edge updates `startup_aborted` even if a
+            // competing terminalizer won the stage transition. Its record
+            // pulse remains required, but mailbox discharge must lead it: by
+            // flush time every record mutation is already visible, so an
+            // earlier pulse would expose `Terminal` before teardown finished.
+            if record_changed {
                 wakes.pulse(&self.record);
             }
             return;
@@ -379,7 +407,7 @@ impl MemberCell {
                 Err(payload) => teardown_panic = Some(payload),
             }
         }
-        let pulse_panic = published
+        let pulse_panic = record_changed
             .then(|| runtime::catch_panic(|| self.record.pulse()).err())
             .flatten();
         runtime::resume_preferred_panic(runtime::UnwindPanics {
@@ -964,10 +992,7 @@ impl ScopeCell {
                     .and_then(|resident| resident.projection.scope.as_ref())
                     .cloned()
             });
-            member.update_locked(wakes, |record| {
-                record.startup_aborted = startup == StartupDisposition::Aborted;
-            });
-            member.terminalize_locked(exit.clone(), wakes);
+            member.terminalize_child_locked(exit.clone(), startup, wakes);
             if record.last_incarnation.is_none()
                 && let Some(scope) = &nested
             {

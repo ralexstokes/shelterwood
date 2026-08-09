@@ -3312,6 +3312,93 @@ mod tests {
     }
 
     #[test]
+    fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
+        const UPDATES: usize = 2_000;
+
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let first = Intensity::new(1, Duration::from_secs(1)).expect("valid first intensity");
+        let second = Intensity::new(2, Duration::from_secs(2)).expect("valid second intensity");
+        scope.set_observation_config(Default::default(), first);
+
+        let start = Arc::new(Barrier::new(2));
+        let writer_scope = Arc::clone(&scope);
+        let writer_start = Arc::clone(&start);
+        let writer = std::thread::spawn(move || {
+            writer_start.wait();
+            for update in 0..UPDATES {
+                let intensity = if update % 2 == 0 { second } else { first };
+                writer_scope.set_observation_config(Default::default(), intensity);
+            }
+        });
+
+        start.wait();
+        for _ in 0..UPDATES {
+            let intensity = scope.snapshot().intensity;
+            assert!(
+                intensity == first || intensity == second,
+                "a snapshot observes one complete configuration update"
+            );
+        }
+        writer.join().expect("config writer completes");
+    }
+
+    #[test]
+    fn plain_resident_state_is_released_before_recursive_removed_publication() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let first = isolated_scope("first", ScopeFlavor::Dynamic);
+        let second = isolated_scope("second", ScopeFlavor::Dynamic);
+        let first_slot = SlotCell::new(Arc::clone(&first.member), Some(first));
+        let second_slot = SlotCell::new(Arc::clone(&second.member), Some(second));
+        let mut events = root.subscribe_lifecycle();
+        let snapshots = root.subscribe_snapshots();
+
+        root.set_admitted_children(vec![
+            resident_projection(&first_slot),
+            resident_projection(&second_slot),
+        ]);
+        root.clear_residents();
+
+        assert!(root.resident_projections().is_empty());
+        assert!(snapshots.borrow_latest().children.is_empty());
+        let mut added = 0;
+        let mut removed = 0;
+        while let Ok(LifecycleItem::Event(event)) = events.try_recv() {
+            match event.kind {
+                LifecycleEventKind::Added { .. } => added += 1,
+                LifecycleEventKind::Removed { .. } => removed += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((added, removed), (2, 2));
+    }
+
+    #[test]
+    fn plain_parent_state_preserves_nested_snapshot_propagation() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        let mut incarnations = IncarnationCounter::near_exhaustion(nested.member.membership());
+        nested.member.update(|record| {
+            record.incarnation = incarnations.mint();
+            record.stage = MemberStage::Starting;
+        });
+        let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        root.set_admitted_children(vec![resident_projection(&nested_slot)]);
+        let snapshots = root.subscribe_snapshots();
+        let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
+
+        nested.set_observation_config(Default::default(), intensity);
+
+        assert_eq!(
+            snapshots
+                .borrow_latest()
+                .child("nested")
+                .and_then(|child| child.nested.as_deref())
+                .map(|snapshot| snapshot.intensity),
+            Some(intensity)
+        );
+    }
+
+    #[test]
     fn pre_admission_observer_retries_after_gate_handoff() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);

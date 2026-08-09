@@ -444,12 +444,30 @@ impl ReadinessGate {
     }
 }
 
+/// One scope incarnation's driver-ownership token.
+///
+/// Epochs are minted per scope in strictly increasing order and `u64::MAX` is
+/// never minted (it is reserved to poison [`ScopeEpochs`] exhaustion), so
+/// plain ordering is total over every minted epoch — unlike identity
+/// generations, no poison value can enter a comparison.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct Epoch(u64);
+
+/// The epoch a scope shutdown request lands on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestTarget {
+    pub(crate) epoch: Epoch,
+    /// The target incarnation has not begun: the request addresses the next
+    /// epoch a future driver will mint.
+    pub(crate) pending_incarnation: bool,
+}
+
 /// Cross-incarnation liveness encoded once as an epoch state, rather than an
 /// epoch pair plus an independently mutable `live` bit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScopeEpochs {
     Idle { last_stopped: u64 },
-    Live { current: u64, last_stopped: u64 },
+    Live { current: Epoch, last_stopped: u64 },
     Exhausted { last_stopped: u64 },
 }
 
@@ -460,7 +478,7 @@ impl Default for ScopeEpochs {
 }
 
 impl ScopeEpochs {
-    pub(crate) fn begin(&mut self) -> Option<u64> {
+    pub(crate) fn begin(&mut self) -> Option<Epoch> {
         let last_stopped = match *self {
             Self::Idle { last_stopped } => last_stopped,
             // One scope cell cannot own two simultaneous drivers. Rejecting
@@ -478,6 +496,7 @@ impl ScopeEpochs {
             *self = Self::Exhausted { last_stopped };
             return None;
         }
+        let current = Epoch(current);
         *self = Self::Live {
             current,
             last_stopped,
@@ -485,32 +504,38 @@ impl ScopeEpochs {
         Some(current)
     }
 
-    pub(crate) fn live_epoch(self) -> Option<u64> {
+    pub(crate) fn live_epoch(self) -> Option<Epoch> {
         match self {
             Self::Idle { .. } | Self::Exhausted { .. } => None,
             Self::Live { current, .. } => Some(current),
         }
     }
 
-    pub(crate) fn request_target(self) -> Option<(u64, bool)> {
+    pub(crate) fn request_target(self) -> Option<RequestTarget> {
         match self {
-            Self::Live { current, .. } => Some((current, false)),
+            Self::Live { current, .. } => Some(RequestTarget {
+                epoch: current,
+                pending_incarnation: false,
+            }),
             Self::Idle { last_stopped } => last_stopped
                 .checked_add(1)
                 .filter(|target| *target != u64::MAX)
-                .map(|target| (target, true)),
+                .map(|target| RequestTarget {
+                    epoch: Epoch(target),
+                    pending_incarnation: true,
+                }),
             Self::Exhausted { .. } => None,
         }
     }
 
-    pub(crate) fn finish(&mut self, epoch: u64) -> bool {
+    pub(crate) fn finish(&mut self, epoch: Epoch) -> bool {
         match *self {
             Self::Live {
                 current,
                 last_stopped,
             } if current == epoch => {
                 *self = Self::Idle {
-                    last_stopped: last_stopped.max(epoch),
+                    last_stopped: last_stopped.max(epoch.0),
                 };
                 true
             }
@@ -518,19 +543,19 @@ impl ScopeEpochs {
         }
     }
 
-    pub(crate) fn is_current(self, epoch: u64) -> bool {
+    pub(crate) fn is_current(self, epoch: Epoch) -> bool {
         self.live_epoch() == Some(epoch)
     }
 
-    pub(crate) fn request_is_pending(self, epoch: u64) -> bool {
-        matches!(self, Self::Idle { last_stopped } if epoch > last_stopped)
+    pub(crate) fn request_is_pending(self, epoch: Epoch) -> bool {
+        matches!(self, Self::Idle { last_stopped } if epoch.0 > last_stopped)
     }
 
-    pub(crate) fn finished(self, epoch: u64) -> bool {
+    pub(crate) fn finished(self, epoch: Epoch) -> bool {
         match self {
             Self::Idle { last_stopped }
             | Self::Live { last_stopped, .. }
-            | Self::Exhausted { last_stopped } => last_stopped >= epoch,
+            | Self::Exhausted { last_stopped } => last_stopped >= epoch.0,
         }
     }
 }
@@ -817,10 +842,10 @@ mod tests {
     };
 
     use super::{
-        ArbitrationClass, DeadlineHandle, DeadlineQueue, ExitDispatch, IntensityState,
-        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState, ScopeEpochs,
-        ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
-        schedule_restart, tidy_abort_beat,
+        ArbitrationClass, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch, IntensityState,
+        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RequestTarget,
+        RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate,
+        dispatch_exit, schedule_restart, tidy_abort_beat,
     };
 
     #[test]
@@ -1175,30 +1200,42 @@ mod tests {
     #[test]
     fn scope_epoch_exhaustion_is_poisoned_without_minting_or_reuse() {
         let mut epochs = ScopeEpochs::default();
-        assert_eq!(epochs.request_target(), Some((1, true)));
+        assert_eq!(
+            epochs.request_target(),
+            Some(RequestTarget {
+                epoch: Epoch(1),
+                pending_incarnation: true,
+            })
+        );
         let first = epochs.begin().expect("first epoch is available");
         assert_eq!(epochs.live_epoch(), Some(first));
-        assert_eq!(epochs.request_target(), Some((first, false)));
+        assert_eq!(
+            epochs.request_target(),
+            Some(RequestTarget {
+                epoch: first,
+                pending_incarnation: false,
+            })
+        );
         assert_eq!(epochs.begin(), None, "a live epoch cannot be replaced");
-        assert!(!epochs.finish(first + 1));
+        assert!(!epochs.finish(Epoch(first.0 + 1)));
         assert_eq!(epochs.live_epoch(), Some(first));
         assert!(epochs.finish(first));
         assert!(!epochs.finish(first), "a stopped epoch cannot finish twice");
         assert_eq!(epochs.live_epoch(), None);
         assert!(epochs.finished(first));
-        assert!(epochs.request_is_pending(first + 1));
+        assert!(epochs.request_is_pending(Epoch(first.0 + 1)));
 
         let mut exhausted = ScopeEpochs::Idle {
             last_stopped: u64::MAX - 2,
         };
         let last = exhausted.begin().expect("last non-poison epoch");
-        assert_eq!(last, u64::MAX - 1);
+        assert_eq!(last, Epoch(u64::MAX - 1));
         assert!(exhausted.finish(last));
         assert_eq!(exhausted.begin(), None, "MAX is reserved as poison");
         assert_eq!(exhausted.live_epoch(), None);
         assert_eq!(exhausted.request_target(), None);
         assert_eq!(exhausted.begin(), None, "poisoning is permanent");
-        assert!(!exhausted.finish(u64::MAX));
+        assert!(!exhausted.finish(Epoch(u64::MAX)));
     }
 
     #[test]

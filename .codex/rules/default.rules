@@ -1,10 +1,10 @@
-# Kokage's tracked devshell wrapper is required for every project tool. Allow
+# Shelterwood's tracked devshell wrapper is required for every project tool. Allow
 # the tracked task runner and the recurring, bounded tool families to leave the
 # sandbox without an approval round trip.
 prefix_rule(
     pattern = ["./tools/dev", "just"],
     decision = "allow",
-    justification = "Run Kokage's tracked just recipes through its pinned Nix devshell.",
+    justification = "Run Shelterwood's tracked just recipes through its pinned Nix devshell.",
     match = [
         "./tools/dev just ci",
         "./tools/dev just ci-nix",
@@ -19,7 +19,7 @@ prefix_rule(
 prefix_rule(
     pattern = ["./tools/dev", "cargo", ["check", "build", "test", "nextest", "run"]],
     decision = "allow",
-    justification = "Run Kokage's routine Cargo verification commands through its pinned Nix devshell.",
+    justification = "Run Shelterwood's routine Cargo verification commands through its pinned Nix devshell.",
     match = [
         "./tools/dev cargo check --workspace --all-targets --all-features",
         "./tools/dev cargo build --workspace",
@@ -30,7 +30,7 @@ prefix_rule(
     not_match = [
         "./tools/dev cargo clean",
         "./tools/dev cargo install cargo-edit",
-        "./tools/dev cargo package -p kokage --allow-dirty",
+        "./tools/dev cargo package -p shelterwood --allow-dirty",
         "./tools/dev cargo publish",
     ],
 )
@@ -38,7 +38,7 @@ prefix_rule(
 prefix_rule(
     pattern = ["./tools/dev", "cargo", "+nightly", ["clippy", "fmt"]],
     decision = "allow",
-    justification = "Run Kokage's pinned nightly lint and formatting commands through its Nix devshell.",
+    justification = "Run Shelterwood's pinned nightly lint and formatting commands through its Nix devshell.",
     match = [
         "./tools/dev cargo +nightly clippy --workspace --all-targets --all-features",
         "./tools/dev cargo +nightly fmt --all -- --check",
@@ -54,9 +54,9 @@ prefix_rule(
 prefix_rule(
     pattern = ["./tools/dev", "env", "TRYBUILD=overwrite", "cargo", "test"],
     decision = "allow",
-    justification = "Run Kokage's trybuild snapshot tests through its pinned Nix devshell.",
+    justification = "Run Shelterwood's trybuild snapshot tests through its pinned Nix devshell.",
     match = [
-        "./tools/dev env TRYBUILD=overwrite cargo test -p kokage --test derive_ui",
+        "./tools/dev env TRYBUILD=overwrite cargo test -p shelterwood --test derive_ui",
     ],
     not_match = [
         "./tools/dev env RUSTFLAGS=-Dwarnings cargo test",
@@ -68,7 +68,7 @@ prefix_rule(
 prefix_rule(
     pattern = ["./tools/dev", ["mdbook", "nixfmt"]],
     decision = "allow",
-    justification = "Run Kokage's documentation and Nix formatters through its pinned Nix devshell.",
+    justification = "Run Shelterwood's documentation and Nix formatters through its pinned Nix devshell.",
     match = [
         "./tools/dev mdbook build docs",
         "./tools/dev nixfmt --check flake.nix nix/crane-checks.nix",

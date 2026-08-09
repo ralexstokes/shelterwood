@@ -21,8 +21,8 @@ use crate::{
     mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
     policy::{ChildMode, CommonOptions},
     runtime::{
-        self, ActorWork, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher, catch_panic,
-        discard_panic, keep_first_panic, resume_preferred_panic,
+        self, ActorWork, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher,
+        UnwindPanics, catch_panic, discard_panic, keep_first_panic, resume_preferred_panic,
         resume_preferred_panic_outside_unwind,
     },
 };
@@ -786,7 +786,10 @@ impl<M> RawResources<M> {
         // Reached from the actor's own receive path, never from cleanup. The
         // take is destructive, so containment here would drop the retained
         // offload diagnostic and let the loop keep running.
-        resume_preferred_panic_outside_unwind(self.panic.take(), None);
+        resume_preferred_panic_outside_unwind(UnwindPanics {
+            primary: self.panic.take(),
+            cleanup: None,
+        });
     }
 
     async fn join_offloads(&mut self) {
@@ -1635,7 +1638,10 @@ impl<R: RawActor> Drop for RawIncarnationOwner<R> {
         let mut cleanup = PanicAccumulator::default();
         cleanup.run(|| self.drop_raw());
         cleanup.run(|| self.drop_actor());
-        resume_preferred_panic(primary_panic, cleanup.take());
+        resume_preferred_panic(UnwindPanics {
+            primary: primary_panic,
+            cleanup: cleanup.take(),
+        });
     }
 }
 
@@ -1688,7 +1694,10 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
             // containing the primary payload here would strand `result` at
             // `None` and report the actor's panic as the framework expect
             // below.
-            resume_preferred_panic_outside_unwind(owner.take_primary_panic(), cleanup_panic);
+            resume_preferred_panic_outside_unwind(UnwindPanics {
+                primary: owner.take_primary_panic(),
+                cleanup: cleanup_panic,
+            });
             result.expect("an incarnation without a primary panic returns a result")
         })
     }
@@ -1771,7 +1780,8 @@ mod tests {
         SharedOffloadState,
     };
     use crate::runtime::{
-        Latch, PanicPayload, Signal, resume_preferred_panic, resume_preferred_panic_outside_unwind,
+        Latch, PanicPayload, Signal, UnwindPanics, resume_preferred_panic,
+        resume_preferred_panic_outside_unwind,
     };
 
     fn marker(value: usize) -> QueuedEvent<usize> {
@@ -1795,10 +1805,10 @@ mod tests {
     #[test]
     fn primary_panic_precedence_discards_a_secondary_cleanup_panic() {
         let payload = catch_unwind(AssertUnwindSafe(|| {
-            resume_preferred_panic(
-                Some(Box::new("primary actor panic")),
-                Some(Box::new("secondary cleanup panic")),
-            );
+            resume_preferred_panic(UnwindPanics {
+                primary: Some(Box::new("primary actor panic")),
+                cleanup: Some(Box::new("secondary cleanup panic")),
+            });
         }))
         .expect_err("the primary panic is resumed");
         assert_eq!(panic_message(&payload), Some("primary actor panic"));
@@ -1807,18 +1817,27 @@ mod tests {
     #[test]
     fn the_incarnation_return_path_resumes_a_primary_panic_it_solely_owns() {
         let payload = catch_unwind(AssertUnwindSafe(|| {
-            resume_preferred_panic_outside_unwind(Some(Box::new("primary actor panic")), None);
+            resume_preferred_panic_outside_unwind(UnwindPanics {
+                primary: Some(Box::new("primary actor panic")),
+                cleanup: None,
+            });
         }))
         .expect_err("a sole-owned primary panic is never contained");
         assert_eq!(panic_message(&payload), Some("primary actor panic"));
 
         let payload = catch_unwind(AssertUnwindSafe(|| {
-            resume_preferred_panic_outside_unwind(None, Some(Box::new("cleanup panic")));
+            resume_preferred_panic_outside_unwind(UnwindPanics {
+                primary: None,
+                cleanup: Some(Box::new("cleanup panic")),
+            });
         }))
         .expect_err("cleanup stands in when there is no primary panic");
         assert_eq!(panic_message(&payload), Some("cleanup panic"));
 
-        resume_preferred_panic_outside_unwind(None, None);
+        resume_preferred_panic_outside_unwind(UnwindPanics {
+            primary: None,
+            cleanup: None,
+        });
     }
 
     struct BlockingPollDrop {

@@ -1273,13 +1273,13 @@ impl ScopeRef {
         &self,
         id: impl Into<ChildId>,
         mut pred: P,
-        deadline: Duration,
+        timeout: Duration,
     ) -> Result<crate::ChildSnapshot, WaitError>
     where
         P: FnMut(&crate::ChildSnapshot) -> bool + Send,
     {
         let id = id.into();
-        let expires = crate::deadline::Deadline::after(crate::runtime::now(), deadline);
+        let expires = crate::deadline::Deadline::after(crate::runtime::now(), timeout);
         let mut snapshots = self.subscribe_snapshots();
 
         loop {
@@ -1442,12 +1442,12 @@ impl DynamicScopeRef {
         &self,
         id: impl Into<ChildId>,
         pred: P,
-        deadline: Duration,
+        timeout: Duration,
     ) -> Result<crate::ChildSnapshot, WaitError>
     where
         P: FnMut(&crate::ChildSnapshot) -> bool + Send,
     {
-        self.0.wait_for_child(id, pred, deadline).await
+        self.0.wait_for_child(id, pred, timeout).await
     }
 
     /// Requests shutdown without waiting.

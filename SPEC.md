@@ -796,6 +796,15 @@ it), and none between mailbox messages and timer or offload deliveries
 beyond §5.2's loop priority. Conflating mailboxes order by replacement:
 the survivor is the newest accepted value.
 
+**Destruction venue.** Live `latest()` displacement drops the displaced
+payload inline on the displacing task, after acceptance of its replacement
+is visible. This is the deliberate hot-path exception: a panicking foreign
+payload destructor surfaces on that task even though the replacement remains
+accepted. Every framework-initiated discard — including teardown,
+timeout/withdrawal cleanup, and batch disposal — runs detached from the
+initiating task with per-element panic containment. No single disposal-thread
+identity is promised.
+
 Request/reply on a conflating mailbox is a correctness trap (a barrier can
 be conflated away). A static fence is not possible — mailbox kind is
 per-declaration configuration, invisible in `ActorRef<M>`'s type — so the
@@ -868,6 +877,10 @@ local `ctx.stop()`): close
 external intake to freeze the accepted prefix; drain or drop that prefix
 per the mailbox shutdown policy (`Drain` delivers it, `Discard` drops
 it — §10; handlers observe draining state); then `on_stop`.
+For `Discard`, the actor loop returns without draining and the framework
+disposes the frozen prefix under §5.1's detached, per-element containment
+rule. A payload-destructor panic there is a disposal fault: it MUST NOT
+reclassify the actor's exit or skip `on_stop`.
 The stop boundary is exact about what drains: **only the frozen accepted
 mailbox prefix** — under `queue`, every accepted-but-undelivered message
 at the freeze, in acceptance order; under `latest()`, the surviving slot
@@ -1249,7 +1262,9 @@ One classification, produced at one point, used by every consumer.
   observation is orthogonal and never competes. Concretely: a panic is
   never masked,
   wherever it lands (`run`, `on_stop` — superseding the run's outcome,
-  §4.1 — or a destructor, via the fallback report token); and a
+  §4.1 — or an incarnation-owned destructor, via the fallback report token;
+  §5.1's detached message-disposal faults are outside the incarnation
+  verdict); and a
   readiness-deadline expiry names the *cause* even when the teardown it
   triggers ends in a grace-expiry abort (the mechanism).
 - **`Aborted` genuinely competes with a recorded outcome, and the rule is

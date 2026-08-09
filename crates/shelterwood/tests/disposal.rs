@@ -1478,6 +1478,52 @@ async fn acceptance_timed_out_call_disposes_recovered_message_off_the_caller() {
 }
 
 #[tokio::test]
+async fn overdue_call_construction_disposes_message_off_constructor_task_and_contains_panic() {
+    let (constructed, mut construction_threads) = tokio::sync::mpsc::unbounded_channel();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "unread",
+            RawOnceDef::new(Unread::<ProbedCall<DropProbe>>::default()),
+        )
+        .expect("valid actor");
+
+    let probe = DropProbe::panicking(dropped, "overdue call message destructor");
+    let error = actor
+        .call(
+            move |reply| {
+                constructed
+                    .send(thread::current().id())
+                    .expect("construction thread is observed");
+                // The deadline is captured immediately before invoking this
+                // synchronous constructor, so sleeping here deterministically
+                // finishes construction outside the call's total budget.
+                thread::sleep(Duration::from_millis(25));
+                ProbedCall {
+                    _reply: reply,
+                    _probe: probe,
+                }
+            },
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("overdue construction times out before mailbox submission");
+    assert!(matches!(error.kind, CallErrorKind::AcceptanceTimedOut));
+
+    let construction_thread = construction_threads
+        .recv()
+        .await
+        .expect("constructor reports its thread");
+    let disposal_thread = drops
+        .recv()
+        .await
+        .expect("overdue message destructor runs despite its contained panic");
+    assert_ne!(disposal_thread, construction_thread);
+    drop(tree);
+}
+
+#[tokio::test]
 async fn dropped_unstarted_call_disposes_constructor_off_the_caller() {
     let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
     let mut tree = Tree::new();

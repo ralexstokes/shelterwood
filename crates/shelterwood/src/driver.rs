@@ -209,12 +209,12 @@ struct DynamicState {
 pub(crate) struct DynamicControl {
     events: runtime::MpscSender<DriverEvent>,
     state: Mutex<DynamicState>,
-    admissions: runtime::UnboundedMpscSender<AdmissionRequest>,
+    requests: runtime::UnboundedMpscSender<DriverEvent>,
 }
 
 impl DynamicControl {
     fn new(events: runtime::MpscSender<DriverEvent>) -> Arc<Self> {
-        let (admissions, mut admission_receiver) = runtime::unbounded_mpsc();
+        let (requests, mut request_receiver) = runtime::unbounded_mpsc();
         let forward_events = events.clone();
         let control = Arc::new(Self {
             events,
@@ -222,19 +222,16 @@ impl DynamicControl {
                 accepting: true,
                 entries: HashMap::new(),
             }),
-            admissions,
+            requests,
         });
         if runtime::is_available() {
             runtime::spawn(async move {
-                while let Some(request) =
-                    runtime::unbounded_mpsc_recv(&mut admission_receiver).await
+                while let Some(request) = runtime::unbounded_mpsc_recv(&mut request_receiver).await
                 {
-                    // A failed send returns and drops the request, whose
-                    // response obligation then completes with `Terminal`.
-                    // Keep draining so every queued admission is answered
-                    // after the driver stops.
-                    let _ =
-                        runtime::mpsc_send(&forward_events, DriverEvent::Admission(request)).await;
+                    // A failed admission send drops its response obligation,
+                    // completing it with `Terminal`. Keep draining so every
+                    // queued request is discharged after the driver stops.
+                    let _ = runtime::mpsc_send(&forward_events, request).await;
                 }
             });
         }
@@ -362,7 +359,7 @@ pub(crate) fn start_admission(
     // the caller-held future. One persistent forwarder per scope drains this
     // unbounded FIFO, keeping pending-admission memory proportional to the
     // requests without a second mutex-protected channel implementation.
-    let _ = runtime::unbounded_mpsc_send(&control.admissions, request);
+    let _ = runtime::unbounded_mpsc_send(&control.requests, DriverEvent::Admission(request));
     Ok(response)
 }
 
@@ -401,7 +398,7 @@ pub(crate) fn signal_fused_cancel(
     latch: &Latch,
 ) {
     if latch.fire() {
-        queue_driver_event(&control.events, DriverEvent::Removal(membership));
+        queue_driver_event(control, DriverEvent::Removal(membership));
     }
 }
 
@@ -449,22 +446,20 @@ pub(crate) fn remove_dynamic(
     drop(state);
     scope.transition_child(&member, |record| record.removing = true, None);
     if member.removal.fire() {
-        queue_driver_event(&control.events, DriverEvent::Removal(membership));
+        queue_driver_event(&control, DriverEvent::Removal(membership));
     }
     response
 }
 
-fn queue_driver_event(events: &runtime::MpscSender<DriverEvent>, event: DriverEvent) {
-    let Err(event) = runtime::mpsc_try_send(events, event) else {
+fn queue_driver_event(control: &DynamicControl, event: DriverEvent) {
+    let Err(event) = runtime::mpsc_try_send(&control.events, event) else {
         return;
     };
-    if !runtime::is_available() {
-        return;
-    }
-    let events = events.clone();
-    runtime::spawn(async move {
-        let _ = runtime::mpsc_send(&events, event).await;
-    });
+    // The unbounded send is synchronous and runtime-independent, so a drop or
+    // removal from a foreign thread cannot lose the edge when the bounded
+    // driver lane is full. The per-scope forwarder applies backpressure only
+    // on that saturated fallback; the normal removal path stays allocation-free.
+    let _ = runtime::unbounded_mpsc_send(&control.requests, event);
 }
 
 struct AdmissionRequest {
@@ -4367,6 +4362,53 @@ mod tests {
         drop(held_gate);
         let response = worker.join().expect("removal transition completes");
         drop(response);
+    }
+
+    #[crate::runtime::test]
+    async fn saturated_removal_from_a_foreign_thread_reaches_the_driver() {
+        let mut identity = ScopeIdentity::new();
+        let first_id = ChildId::from("first");
+        let second_id = ChildId::from("second");
+        let first = identity
+            .mint_membership(&first_id)
+            .expect("first membership available");
+        let second = identity
+            .mint_membership(&second_id)
+            .expect("second membership available");
+        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+        assert!(
+            events.try_send(DriverEvent::Removal(first)).is_ok(),
+            "the fixture saturates the bounded driver lane"
+        );
+        let control = DynamicControl::new(events);
+        let foreign_control = Arc::clone(&control);
+        std::thread::spawn(move || {
+            assert!(
+                !crate::runtime::is_available(),
+                "Tokio context is not inherited by a foreign thread"
+            );
+            super::signal_fused_cancel(&foreign_control, second, &Latch::default());
+        })
+        .join()
+        .expect("foreign-thread removal signaling succeeds");
+
+        let Some(DriverEvent::Removal(observed_first)) = event_receiver.recv().await else {
+            panic!("the saturated event remains first");
+        };
+        assert_eq!(observed_first, first);
+        let second_event =
+            match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+                crate::runtime::Timeout::Completed(event) => {
+                    event.expect("the control forwarder remains open")
+                }
+                crate::runtime::Timeout::Elapsed => {
+                    panic!("the off-runtime removal edge must not be lost")
+                }
+            };
+        let DriverEvent::Removal(observed_second) = second_event else {
+            panic!("the forwarded event is the requested removal");
+        };
+        assert_eq!(observed_second, second);
     }
 
     #[crate::runtime::test]

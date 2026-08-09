@@ -1832,6 +1832,10 @@ impl<M: Send + 'static> MailboxReceiver<M> {
         self.mailbox.accepted_sequence()
     }
 
+    pub(crate) fn freeze(&self) {
+        self.mailbox.freeze(self.incarnation);
+    }
+
     pub(crate) async fn changed(&mut self) {
         self.watcher.changed().await;
     }

@@ -131,7 +131,10 @@ impl SlotEndpoint for DynamicSlotEndpoint {
 impl Drop for DynamicSlotEndpoint {
     fn drop(&mut self) {
         if let Some(reservation) = &self.0 {
-            crate::driver::cancel_dynamic_reservation(&reservation.control, &reservation.slot);
+            crate::driver::cancel_dynamic_reservation(
+                reservation.control.as_ref(),
+                &reservation.slot,
+            );
         }
     }
 }
@@ -739,7 +742,7 @@ impl<H> PendingAdmission<H> {
 
     fn cancel_reservation(&self) {
         crate::driver::cancel_dynamic_reservation(
-            &self.reservation.control,
+            self.reservation.control.as_ref(),
             &self.reservation.slot,
         );
     }
@@ -865,7 +868,7 @@ impl<H> Drop for Admission<H> {
                 // the same order the in-flight path uses.
                 if let Some(cancel) = &pending.fused_cancel {
                     crate::driver::signal_fused_cancel(
-                        &pending.reservation.control,
+                        pending.reservation.control.as_ref(),
                         pending.reservation.slot.member.membership(),
                         cancel,
                     );
@@ -875,7 +878,7 @@ impl<H> Drop for Admission<H> {
             AdmissionState::InFlight { pending, .. } => {
                 if let Some(cancel) = &pending.fused_cancel {
                     crate::driver::signal_fused_cancel(
-                        &pending.reservation.control,
+                        pending.reservation.control.as_ref(),
                         pending.reservation.slot.member.membership(),
                         cancel,
                     );
@@ -1023,9 +1026,10 @@ impl Future for Removal {
 
 /// A restartable subtree definition.
 pub struct SubtreeDef<T: Subtree> {
-    factory: Box<dyn Fn() -> T + Send + Sync + 'static>,
+    factory: Arc<dyn Fn() -> BuilderCore + Send + Sync + 'static>,
     options: CommonOptions,
     defaults: DefaultsInheritance,
+    subtree: PhantomData<fn() -> T>,
 }
 
 impl<T: Subtree> fmt::Debug for SubtreeDef<T> {
@@ -1042,9 +1046,10 @@ impl<T: Subtree> SubtreeDef<T> {
     /// Creates a restartable subtree from a repeatable declaration source.
     pub fn factory(factory: impl Fn() -> T + Send + Sync + 'static) -> Self {
         Self {
-            factory: Box::new(factory),
+            factory: Arc::new(move || <T as sealed::Sealed>::into_core(factory())),
             options: CommonOptions::default(),
             defaults: DefaultsInheritance::Inherit,
+            subtree: PhantomData,
         }
     }
 
@@ -1060,9 +1065,7 @@ impl<T: Subtree> SubtreeDef<T> {
     fn erase(self) -> ScopeConstruction {
         let factory = self.factory;
         ScopeConstruction {
-            source: DefinitionSource::Restartable(Arc::new(move || {
-                <T as sealed::Sealed>::into_core(factory())
-            })),
+            source: DefinitionSource::Restartable(factory),
             options: self.options,
             defaults: self.defaults,
         }

@@ -1970,11 +1970,19 @@ impl ScopeRuntime {
             {
                 self.ordered_stop_inspections += 1;
             }
-            if self.children[key].is_terminal() && !self.children[key].is_disposing() {
+            // The cursor key is held across await boundaries, so never index
+            // the arena with it: a reclaimed slot is treated as already gone.
+            let Some(child) = self.children.get(key) else {
+                continue;
+            };
+            if child.is_terminal() && !child.is_disposing() {
                 continue;
             }
             self.begin_stop_child(key, None);
-            if self.children[key].active.is_some() || self.children[key].is_disposing() {
+            let Some(child) = self.children.get(key) else {
+                continue;
+            };
+            if child.active.is_some() || child.is_disposing() {
                 self.ordered_stop_waiting = Some(key);
                 break;
             }

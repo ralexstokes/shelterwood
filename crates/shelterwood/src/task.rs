@@ -22,6 +22,12 @@ use crate::{
 pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
 pub(crate) type TaskFactory = Arc<dyn Fn(TaskContext) -> TaskFuture + Send + Sync + 'static>;
 
+pub(crate) struct TaskContextLatches {
+    pub(crate) shutdown: Latch,
+    pub(crate) abort: Latch,
+    pub(crate) ready: Latch,
+}
+
 /// Per-incarnation capabilities supplied to a supervised task.
 #[derive(Clone, Debug)]
 pub struct TaskContext {
@@ -33,19 +39,13 @@ pub struct TaskContext {
 }
 
 impl TaskContext {
-    pub(crate) fn new(
-        id: ChildId,
-        incarnation: Incarnation,
-        shutdown: Latch,
-        abort: Latch,
-        ready: Latch,
-    ) -> Self {
+    pub(crate) fn new(id: ChildId, incarnation: Incarnation, latches: TaskContextLatches) -> Self {
         Self {
             id,
             incarnation,
-            shutdown: CancellationToken::from_latch(shutdown),
-            abort: CancellationToken::from_latch(abort),
-            ready,
+            shutdown: CancellationToken::from_latch(latches.shutdown),
+            abort: CancellationToken::from_latch(latches.abort),
+            ready: latches.ready,
         }
     }
 
@@ -326,7 +326,7 @@ mod tests {
         runtime::{self, Latch},
     };
 
-    use super::{OneShotTaskRef, TaskContext, TaskRef};
+    use super::{OneShotTaskRef, TaskContext, TaskContextLatches, TaskRef};
 
     fn task_context() -> (TaskContext, Latch, Latch, Latch) {
         let id = ChildId::from("task");
@@ -340,9 +340,11 @@ mod tests {
         let context = TaskContext::new(
             id,
             incarnation,
-            shutdown.clone(),
-            abort.clone(),
-            ready.clone(),
+            TaskContextLatches {
+                shutdown: shutdown.clone(),
+                abort: abort.clone(),
+                ready: ready.clone(),
+            },
         );
         (context, shutdown, abort, ready)
     }

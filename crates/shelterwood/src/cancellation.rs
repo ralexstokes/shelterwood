@@ -17,16 +17,12 @@ impl CancellationToken {
         }
     }
 
-    pub(crate) fn from_latches(primary: Latch, secondary: Latch) -> Self {
-        Self {
-            primary,
-            secondary: Some(secondary),
-        }
-    }
-
     pub(crate) fn child(&self, cancellation: Latch) -> Self {
         debug_assert!(self.secondary.is_none());
-        Self::from_latches(self.primary.clone(), cancellation)
+        Self {
+            primary: self.primary.clone(),
+            secondary: Some(cancellation),
+        }
     }
 
     /// Reports whether cancellation has been requested.

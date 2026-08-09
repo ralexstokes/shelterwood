@@ -380,7 +380,13 @@ impl SnapshotHub {
             })
             .0
         });
-        if sender.receiver_count() == 0 {
+        // `close` may win between the first atomic check and lazy sender
+        // initialization. Reconcile the channel state after initialization so
+        // that first subscriber still observes closure; once installed,
+        // `close` itself performs this publication and wakeup.
+        if self.closed.load(Ordering::Acquire) {
+            sender.send_modify(|state| state.closed = true);
+        } else if sender.receiver_count() == 0 {
             sender.send_modify(|state| {
                 state.snapshot = initial;
                 state.generation = state.generation.saturating_add(1);

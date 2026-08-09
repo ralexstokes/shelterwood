@@ -2912,7 +2912,7 @@ marked *(II)* ship with the named Part II feature.
 | Snapshot channel | conflating watch, capacity 1 | Structural |
 | `call` / `send_timeout` deadline | **none — always explicit** | One budget per call (§5.1); zero deadline fails immediately |
 | Identity counters | `u64`, saturating | Fail-closed overflow, decided once in the fencing primitive (§3.1); lifecycle `seq`/`lifecycle_seq` mint through the same primitive (B.4's exhaustion rule) |
-| Far-future clamp | timer arithmetic saturates to a far-future instant | Instead of panicking on `Instant + Duration` overflow |
+| Unrepresentable deadline | **never arrives** | `Instant + Duration` overflow or an exact point the runtime cannot arm produces no deadline; it MUST NOT substitute the budget's start or any other instant |
 
 ---
 
@@ -3283,11 +3283,15 @@ ChildSnapshot   { id, membership,                       // §3 identity types
                                                         //   conflating watch may skip states —
                                                         //   events are the history surface)
                   restart_policy, retention,
-                  restart_at: Option<Instant>,          // present exactly in Restarting: the
-                                                        //   backoff deadline as an absolute
-                                                        //   runtime-clock instant (D.3) — a retained
-                                                        //   snapshot stays interpretable; render
-                                                        //   relative by subtracting now
+                  restart_at: Option<Instant>,          // a representable, exactly armable backoff
+                                                        //   deadline while Restarting, as an absolute
+                                                        //   runtime-clock instant (D.3); None outside
+                                                        //   Restarting and also for an unrepresentable
+                                                        //   or unarmable requested point. No earlier or
+                                                        //   alternative deadline is substituted: that
+                                                        //   restart remains pending until removal or
+                                                        //   shutdown. Render a present value relative
+                                                        //   by subtracting now
                   nested: Option<ScopeSnapshot>,         // recursive for scope children; None while
                                                          //   no incarnation is live and the membership
                                                          //   is non-terminal (restart window); a

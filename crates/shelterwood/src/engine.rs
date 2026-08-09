@@ -318,9 +318,9 @@ pub(crate) struct RestartDecision {
     pub(crate) attempt: RestartAttempt,
     pub(crate) restart_count: RestartCount,
     pub(crate) delay: Duration,
-    /// Absolute backoff deadline; unrepresentable far-future points are
-    /// clamped (B.6: `restart_at` is present exactly in `Restarting`).
-    pub(crate) restart_at: Instant,
+    /// Absolute backoff deadline, or `None` when the exact point cannot be
+    /// represented and armed by the runtime clock.
+    pub(crate) restart_at: Option<Instant>,
     pub(crate) charge: IntensityCharge,
 }
 
@@ -334,7 +334,7 @@ pub(crate) fn schedule_restart(
 ) -> RestartDecision {
     let (attempt, restart_count) = restarts.schedule();
     let delay = restart_policy.backoff().next_delay(attempt, jitter_sample);
-    let restart_at = Deadline::saturating_after(now, delay);
+    let restart_at = Deadline::after(now, delay).instant();
     let charge = intensity.charge(intensity_policy, now);
     RestartDecision {
         attempt,
@@ -1136,13 +1136,13 @@ mod tests {
         assert_eq!(decision.attempt, RestartAttempt::ZERO.bump());
         assert_eq!(decision.restart_count, RestartCount::ZERO.bump());
         assert_eq!(decision.delay, Duration::ZERO);
-        assert_eq!(decision.restart_at, now);
+        assert_eq!(decision.restart_at, Some(now));
         assert_eq!(decision.charge.total_restarts, TotalRestarts::ZERO.bump());
         assert!(decision.charge.tripped);
     }
 
     #[test]
-    fn overflowing_restart_delay_clamps_to_a_far_future_deadline() {
+    fn overflowing_restart_delay_has_no_substitute_deadline() {
         let now = Instant::now();
         let intensity_policy = Intensity::new(5, Duration::from_secs(10)).expect("valid intensity");
         let restart_policy = RestartPolicy::new(
@@ -1161,11 +1161,7 @@ mod tests {
         );
 
         assert_eq!(decision.delay, Duration::MAX);
-        let century = Duration::from_secs(60 * 60 * 24 * 365 * 100);
-        assert!(
-            decision.restart_at > now + century,
-            "an unrepresentable backoff deadline clamps far future, never near now"
-        );
+        assert_eq!(decision.restart_at, None);
     }
 
     #[test]

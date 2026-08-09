@@ -31,8 +31,9 @@ event; `get()` exposes the underlying `u64` when numeric integration requires it
 
 A child in `Restarting` normally exposes its absolute backoff deadline through
 `restart_at`. If the requested delay is too large for the platform clock to
-represent, `restart_at` is `None`; the child remains in `Restarting` until
-removal or shutdown rather than restarting immediately.
+represent and arm exactly, `restart_at` is `None`; no earlier or alternative
+deadline is substituted, and the child remains in `Restarting` until removal
+or shutdown rather than restarting immediately.
 
 If the event's scope token is absent from the snapshot, use causal introduction:
 

@@ -1105,11 +1105,13 @@ pub(crate) async fn sleep_until_std(deadline: std::time::Instant) {
     // tokio rounds the deadline up to the next whole millisecond with a
     // panicking add before tick conversion, so a deadline flush against
     // the clock limit would panic at arming time rather than when it was
-    // computed. Deadline::after already withholds such deadlines, making
-    // this clamp a pass-through for them; it guards instants that arrive
-    // by any other route.
-    let deadline = Deadline::clamp_armable(deadline);
-    time::sleep_until(time::Instant::from_std(deadline)).await;
+    // computed. Absolute instants that arrive by another route obey the same
+    // never-substitute rule as relative budgets: if this exact point cannot
+    // be armed, it never arrives.
+    match Deadline::at(deadline).instant() {
+        Some(deadline) => time::sleep_until(time::Instant::from_std(deadline)).await,
+        None => std::future::pending().await,
+    }
 }
 
 pub(crate) enum Timeout<T> {
@@ -1245,25 +1247,40 @@ mod tests {
     };
 
     use super::{
-        Deadline, DisposalJob, DisposalPanic, JoinOutcome, Latch, OneShotClose, Signal, Timeout,
+        DisposalJob, DisposalPanic, JoinOutcome, Latch, OneShotClose, Signal, Timeout,
         discard_panic, join, oneshot, spawn, timeout, yield_now,
     };
 
+    fn latest_representable(started_at: std::time::Instant) -> std::time::Instant {
+        let mut low = Duration::ZERO;
+        let mut high = Duration::MAX;
+        assert!(started_at.checked_add(high).is_none());
+        while high - low > Duration::from_nanos(1) {
+            let mid = low + (high - low) / 2;
+            if started_at.checked_add(mid).is_some() {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        started_at + low
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn arming_a_deadline_flush_against_the_clock_limit_stays_pending() {
+    async fn unarmable_absolute_deadline_stays_pending_without_substitution() {
         let now = std::time::Instant::now();
-        let flush = Deadline::saturating_after(now, Duration::MAX) + Deadline::ARMING_HEADROOM;
+        let flush = latest_representable(now);
         let mut sleep = std::pin::pin!(super::sleep_until_std(flush));
         let mut context = Context::from_waker(Waker::noop());
-        // The timer registers on first poll: without the arming clamp this
-        // panicked inside tokio's millisecond round-up rather than parking.
+        // The timer registers on first poll: passing this instant to tokio
+        // would panic during its millisecond round-up rather than parking.
         assert!(sleep.as_mut().poll(&mut context).is_pending());
     }
 
     #[tokio::test(start_paused = true)]
     async fn timeout_with_an_unarmable_budget_never_elapses() {
         let now = super::now();
-        let flush = Deadline::saturating_after(now, Duration::MAX) + Deadline::ARMING_HEADROOM;
+        let flush = latest_representable(now);
         // The paused clock is frozen, so the budget reconstructs the flush
         // deadline exactly and the unarmable-budget guard must engage.
         let budget = flush - now;

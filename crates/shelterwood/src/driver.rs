@@ -210,12 +210,21 @@ pub(crate) struct DynamicControl {
     events: runtime::MpscSender<DriverEvent>,
     state: Mutex<DynamicState>,
     requests: runtime::UnboundedMpscSender<DriverEvent>,
+    request_forwarder_close: Latch,
+    #[cfg(test)]
+    request_forwarder_ended: Latch,
 }
 
 impl DynamicControl {
     fn new(events: runtime::MpscSender<DriverEvent>) -> Arc<Self> {
         let (requests, mut request_receiver) = runtime::unbounded_mpsc();
         let forward_events = events.clone();
+        let request_forwarder_close = Latch::default();
+        let close_forwarder = request_forwarder_close.clone();
+        #[cfg(test)]
+        let request_forwarder_ended = Latch::default();
+        #[cfg(test)]
+        let forwarder_ended = request_forwarder_ended.clone();
         let control = Arc::new(Self {
             events,
             state: Mutex::new(DynamicState {
@@ -223,16 +232,38 @@ impl DynamicControl {
                 entries: HashMap::new(),
             }),
             requests,
+            request_forwarder_close,
+            #[cfg(test)]
+            request_forwarder_ended,
         });
         if runtime::is_available() {
             runtime::spawn(async move {
-                while let Some(request) = runtime::unbounded_mpsc_recv(&mut request_receiver).await
-                {
+                loop {
+                    let request = match runtime::select_two(
+                        close_forwarder.fired(),
+                        runtime::unbounded_mpsc_recv(&mut request_receiver),
+                    )
+                    .await
+                    {
+                        runtime::Either::Left(()) | runtime::Either::Right(None) => break,
+                        runtime::Either::Right(Some(request)) => request,
+                    };
                     // A failed admission send drops its response obligation,
-                    // completing it with `Terminal`. Keep draining so every
-                    // queued request is discharged after the driver stops.
-                    let _ = runtime::mpsc_send(&forward_events, request).await;
+                    // completing it with `Terminal`. Explicit closure drops
+                    // this request and the queued suffix for the same result.
+                    if matches!(
+                        runtime::select_two(
+                            close_forwarder.fired(),
+                            runtime::mpsc_send(&forward_events, request),
+                        )
+                        .await,
+                        runtime::Either::Left(())
+                    ) {
+                        break;
+                    }
                 }
+                #[cfg(test)]
+                forwarder_ended.fire();
             });
         }
         control
@@ -243,6 +274,10 @@ impl DynamicControl {
         state.accepting = false;
         let entries = std::mem::take(&mut state.entries);
         drop(state);
+        // Reservation handles may retain this control after scope teardown.
+        // Stop the sole per-scope forwarder explicitly instead of waiting for
+        // every clone of its unbounded sender to disappear.
+        self.request_forwarder_close.fire();
         let mut retained = HashMap::new();
         for (id, entry) in entries {
             if !entry.admitted {
@@ -4289,6 +4324,32 @@ mod tests {
         );
         drop(entries);
         assert_eq!(response.try_receive(), Some(RemoveOutcome::Removed));
+    }
+
+    #[crate::runtime::test]
+    async fn retained_unadmitted_slot_does_not_retain_the_request_forwarder() {
+        let system = DynamicTree::new().spawn().expect("runtime is available");
+        system.wait_started().await.expect("root starts");
+        let scope = system.scope();
+        let slot = scope
+            .reserve_task("retained")
+            .expect("unadmitted reservation is retained");
+        let control = dynamic_control(&scope.as_scope().cell)
+            .expect("the live dynamic scope exposes its control");
+        let forwarder_ended = control.request_forwarder_ended.clone();
+
+        system
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("driver teardown completes");
+
+        assert!(control.request_forwarder_close.is_fired());
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(1), forwarder_ended.fired()).await,
+            crate::runtime::Timeout::Completed(())
+        ));
+        drop(slot);
+        drop(control);
     }
 
     #[test]

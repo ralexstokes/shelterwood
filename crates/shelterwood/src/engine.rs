@@ -7,8 +7,10 @@ use std::{
 };
 
 use crate::{
-    Exit, GracePhase, Intensity, Readiness, RestartPolicy, Shutdown, deadline::Deadline,
-    exit::StopReason, policy::tidy_abort_beat,
+    Exit, GracePhase, Intensity, Readiness, RestartPolicy, Shutdown,
+    deadline::Deadline,
+    exit::StopReason,
+    policy::{ScopeFlavor, tidy_abort_beat},
 };
 
 /// Deterministic priority when one driver wake exposes several events.
@@ -607,6 +609,13 @@ pub(crate) struct DrainEffect {
     pub(crate) startup_pending: bool,
 }
 
+/// The child state relevant to deciding whether a scope can finish.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ChildCompletionState {
+    pub(crate) has_children: bool,
+    pub(crate) all_terminal: bool,
+}
+
 /// Authoritative lifecycle and finish policy for one scope incarnation.
 ///
 /// `ScopeRecord` is only this machine's observation projection; epoch-tagged
@@ -699,14 +708,16 @@ impl ScopeLifecycle {
 
     pub(crate) fn finish_if_ready(
         &self,
-        ordered: bool,
-        has_children: bool,
-        all_terminal: bool,
+        flavor: ScopeFlavor,
+        children: ChildCompletionState,
     ) -> Option<StopReason> {
         if let Some(reason) = self.draining_reason() {
-            return all_terminal.then(|| reason.clone());
+            return children.all_terminal.then(|| reason.clone());
         }
-        (!self.startup_failed() && ordered && has_children && all_terminal)
+        (!self.startup_failed()
+            && flavor == ScopeFlavor::Ordered
+            && children.has_children
+            && children.all_terminal)
             .then_some(StopReason::Finished)
     }
 }
@@ -863,14 +874,15 @@ mod tests {
 
     use crate::{
         Cancellation, Exit, ExitKind, GracePhase, Intensity, RestartCondition, RestartPolicy,
-        Shutdown, policy::Backoff,
+        Shutdown,
+        policy::{Backoff, ScopeFlavor},
     };
 
     use super::{
-        ArbitrationClass, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch, IntensityState,
-        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RequestTarget,
-        RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate,
-        dispatch_exit, schedule_restart, tidy_abort_beat,
+        ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
+        IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate,
+        RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode, StopAction,
+        StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
     };
 
     #[test]
@@ -1212,21 +1224,51 @@ mod tests {
             !lifecycle.fail_startup(),
             "simultaneous initial failures publish one transition"
         );
-        assert_eq!(lifecycle.finish_if_ready(true, true, true), None);
+        assert_eq!(
+            lifecycle.finish_if_ready(
+                ScopeFlavor::Ordered,
+                ChildCompletionState {
+                    has_children: true,
+                    all_terminal: true,
+                },
+            ),
+            None
+        );
         let drain = lifecycle
             .begin_drain(crate::exit::StopReason::ShutdownRequested)
             .expect("a failed startup can begin draining");
         assert!(!drain.startup_pending);
         assert_eq!(
-            lifecycle.finish_if_ready(false, true, true),
+            lifecycle.finish_if_ready(
+                ScopeFlavor::Dynamic,
+                ChildCompletionState {
+                    has_children: true,
+                    all_terminal: true,
+                },
+            ),
             Some(crate::exit::StopReason::ShutdownRequested)
         );
 
         let mut running = ScopeLifecycle::starting();
         assert!(running.complete_startup());
-        assert_eq!(running.finish_if_ready(true, false, true), None);
         assert_eq!(
-            running.finish_if_ready(true, true, true),
+            running.finish_if_ready(
+                ScopeFlavor::Ordered,
+                ChildCompletionState {
+                    has_children: false,
+                    all_terminal: true,
+                },
+            ),
+            None
+        );
+        assert_eq!(
+            running.finish_if_ready(
+                ScopeFlavor::Ordered,
+                ChildCompletionState {
+                    has_children: true,
+                    all_terminal: true,
+                },
+            ),
             Some(crate::exit::StopReason::Finished)
         );
 

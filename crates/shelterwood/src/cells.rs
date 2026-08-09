@@ -81,6 +81,13 @@ pub(crate) enum MemberStage {
     Terminal(Exit),
 }
 
+/// Whether a terminal child incarnation failed during aggregate startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartupDisposition {
+    NotAborted,
+    Aborted,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MemberRecord {
     pub(crate) stage: MemberStage,
@@ -237,7 +244,7 @@ impl MemberCell {
             crate::policy::resolve_common(
                 &crate::policy::CommonOptions::default(),
                 &crate::policy::ResolvedDefaults::default(),
-                false,
+                crate::policy::ChildMode::Restartable,
                 Readiness::Immediate,
             )
             .expect("library defaults must be valid")
@@ -819,7 +826,7 @@ impl ScopeCell {
         member: &MemberCell,
         exit: Exit,
         exited_incarnation: Option<Incarnation>,
-        startup_aborted: bool,
+        startup: StartupDisposition,
     ) -> bool {
         self.with_observation_gate(|| {
             let record = member.record();
@@ -842,7 +849,9 @@ impl ScopeCell {
                     .and_then(|resident| resident.projection.scope.as_ref())
                     .cloned()
             });
-            member.update_locked(|record| record.startup_aborted = startup_aborted);
+            member.update_locked(|record| {
+                record.startup_aborted = startup == StartupDisposition::Aborted;
+            });
             member.terminalize(exit.clone());
             if record.last_incarnation.is_none()
                 && let Some(scope) = &nested

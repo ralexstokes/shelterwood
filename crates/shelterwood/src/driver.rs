@@ -12,12 +12,15 @@ use crate::{
     Readiness, ReadinessDeadline, ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure,
     StartupFailureCause,
     admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
-    cells::{DynamicRoute, MailboxControl, MemberStage, ResidentProjection, ScopeCell},
+    cells::{
+        DynamicRoute, MailboxControl, MemberStage, ResidentProjection, ScopeCell,
+        StartupDisposition,
+    },
     deadline::Deadline,
     engine::{
-        ArbitrationClass, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch, IntensityState,
-        MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState,
-        ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
+        ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
+        IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent, ReadinessGate,
+        RestartState, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
         schedule_restart,
     },
     exit::{
@@ -861,9 +864,12 @@ fn discharge_child_terminality(completion: ChildTerminality) {
     {
         scope.terminalize_never_started();
     }
-    completion
-        .root
-        .terminalize_child(&completion.slot.member, exit, exited_incarnation, false);
+    completion.root.terminalize_child(
+        &completion.slot.member,
+        exit,
+        exited_incarnation,
+        StartupDisposition::NotAborted,
+    );
 }
 
 struct ChildRuntime {
@@ -885,7 +891,7 @@ struct ChildRuntime {
 struct PendingTerminal {
     exit: Exit,
     exited_incarnation: Option<Incarnation>,
-    startup_aborted: bool,
+    startup: StartupDisposition,
 }
 
 impl ChildRuntime {
@@ -944,10 +950,9 @@ impl ChildRuntime {
         root: &ScopeCell,
         exit: Exit,
         exited_incarnation: Option<Incarnation>,
-        startup_aborted: bool,
+        startup: StartupDisposition,
     ) -> bool {
-        let changed =
-            root.terminalize_child(&self.slot.member, exit, exited_incarnation, startup_aborted);
+        let changed = root.terminalize_child(&self.slot.member, exit, exited_incarnation, startup);
         if matches!(self.slot.member.record().stage, MemberStage::Terminal(_)) {
             self.terminality.complete(drop);
         }
@@ -1569,12 +1574,16 @@ impl ScopeRuntime {
                 .record()
                 .last_exit
                 .unwrap_or_else(Exit::never_started);
-            let pre_ready =
-                child.initial && !self.lifecycle.startup_complete() && !child.initial_ready;
+            let startup =
+                if child.initial && !self.lifecycle.startup_complete() && !child.initial_ready {
+                    StartupDisposition::Aborted
+                } else {
+                    StartupDisposition::NotAborted
+                };
             // Exhaustion is a terminal outcome, not an exceptional cleanup
             // path. Join retained-definition disposal before terminality,
             // retention, removal completion, or ordered-scope progression.
-            self.begin_terminal_disposal(key, exit, None, pre_ready);
+            self.begin_terminal_disposal(key, exit, None, startup);
             return;
         };
 
@@ -1844,7 +1853,7 @@ impl ScopeRuntime {
             // A never-ran child and a child stopped between restart
             // incarnations share the same post-disposal terminal route. Hard
             // shutdown still detaches disposal through `hard_forced` below.
-            self.begin_terminal_disposal(key, exit, None, false);
+            self.begin_terminal_disposal(key, exit, None, StartupDisposition::NotAborted);
         }
     }
 
@@ -2110,9 +2119,15 @@ impl ScopeRuntime {
                 // membership failed before its *initial* readiness edge. A
                 // later incarnation stopped pre-ready (e.g. during drain)
                 // does not rewind it.
-                let pre_ready =
-                    child.initial && !self.lifecycle.startup_complete() && !child.initial_ready;
-                self.begin_terminal_disposal(key, exit, Some(incarnation), pre_ready);
+                let startup = if child.initial
+                    && !self.lifecycle.startup_complete()
+                    && !child.initial_ready
+                {
+                    StartupDisposition::Aborted
+                } else {
+                    StartupDisposition::NotAborted
+                };
+                self.begin_terminal_disposal(key, exit, Some(incarnation), startup);
             }
             ExitDispatch::ScheduleRestart => {
                 if !self.lifecycle.startup_complete() {
@@ -2181,7 +2196,7 @@ impl ScopeRuntime {
         key: ChildKey,
         exit: Exit,
         exited_incarnation: Option<Incarnation>,
-        startup_aborted: bool,
+        startup: StartupDisposition,
     ) {
         let construction = {
             let Some(child) = self.children.get_mut(key) else {
@@ -2193,7 +2208,7 @@ impl ScopeRuntime {
             child.pending_terminal = Some(PendingTerminal {
                 exit,
                 exited_incarnation,
-                startup_aborted,
+                startup,
             });
             child.slot.member.set_terminal_disposal_pending(true);
             child.construction.take()
@@ -2257,17 +2272,21 @@ impl ScopeRuntime {
         // when its pre-readiness position still routes the scope's startup
         // failure below. Incarnation exhaustion is the reachable case:
         // it terminalizes an unspawned membership while `pre_ready` holds.
-        let startup_aborted = terminal.exited_incarnation.is_some() && terminal.startup_aborted;
+        let startup = if terminal.exited_incarnation.is_some() {
+            terminal.startup
+        } else {
+            StartupDisposition::NotAborted
+        };
         self.children[key].terminalize(
             &self.root,
             exit.clone(),
             terminal.exited_incarnation,
-            startup_aborted,
+            startup,
         );
         let removing = self.children[key].slot.member.record().removing;
         if removing {
             self.finalize_removal(key);
-        } else if terminal.startup_aborted && !self.lifecycle.is_draining() {
+        } else if terminal.startup == StartupDisposition::Aborted && !self.lifecycle.is_draining() {
             self.fail_startup(key, exit);
             if self.children[key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
@@ -2308,7 +2327,12 @@ impl ScopeRuntime {
                     && !self.children[later].is_disposing()
                     && !self.children[later].is_terminal()
                 {
-                    self.begin_terminal_disposal(later, Exit::never_started(), None, false);
+                    self.begin_terminal_disposal(
+                        later,
+                        Exit::never_started(),
+                        None,
+                        StartupDisposition::NotAborted,
+                    );
                 }
             }
         }
@@ -2369,9 +2393,11 @@ impl ScopeRuntime {
             .values()
             .all(|child| child.is_terminal() && !child.is_disposing());
         self.lifecycle.finish_if_ready(
-            self.root.flavor == ScopeFlavor::Ordered,
-            !self.children.is_empty(),
-            all_terminal,
+            self.root.flavor,
+            ChildCompletionState {
+                has_children: !self.children.is_empty(),
+                all_terminal,
+            },
         )
     }
 
@@ -3073,9 +3099,9 @@ mod tests {
         AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
         DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
         Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
-        ScopeFlavor, ScopeRole, ScopeRuntime, complete_removals, driver_event_class,
-        report_channel, resident_projection, restart_shutdown_work, run_nested_tree,
-        run_scope_incarnation,
+        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, complete_removals,
+        driver_event_class, report_channel, resident_projection, restart_shutdown_work,
+        run_nested_tree, run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -5042,7 +5068,7 @@ mod tests {
             &member,
             Exit::new(ExitKind::Completed, Cancellation::NotObserved),
             None,
-            false
+            StartupDisposition::NotAborted,
         ));
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
         snapshots
@@ -5066,7 +5092,12 @@ mod tests {
         parent.set_admitted_children(vec![resident_projection(&slot)]);
         let mut snapshots = parent.subscribe_snapshots();
 
-        assert!(parent.terminalize_child(&nested.member, Exit::never_started(), None, false));
+        assert!(parent.terminalize_child(
+            &nested.member,
+            Exit::never_started(),
+            None,
+            StartupDisposition::NotAborted,
+        ));
         snapshots
             .changed()
             .await

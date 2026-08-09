@@ -3079,7 +3079,7 @@ LifecycleEvent { scope_path, scope, seq, kind }
               cell through the same §3.2 machinery; its token and
               sequence behave exactly like a nested scope's — one
               uniform identity for every emitting scope, root included
-  seq:        u64 from the emitting scope's single monotone sequence,
+  seq:        LifecycleSeq from the emitting scope's single monotone sequence,
               owned by the scope's membership cell — continuous across
               subtree restart (a rebuilt incarnation continues it; only
               a replacement membership starts fresh, and `scope`
@@ -3167,7 +3167,8 @@ Ordering and delivery contract:
   it. The same
   protocol is the post-`Lagged` resync. The documentation MUST teach
   it in this form.
-- `seq`/`lifecycle_seq` mint through §3.1's one primitive: `u64`,
+- `LifecycleSeq` exposes `get()` plus the documented `EXHAUSTED` sentinel;
+  `seq`/`lifecycle_seq` mint through §3.1's one primitive: `u64`,
   saturating advance, the saturated value poisoned and never minted.
   Exhaustion — unreachable at `u64` scale, pinned per §3.1's
   decide-once rule — fails closed for observation: the scope mints no
@@ -3280,7 +3281,7 @@ ChildSnapshot   { id, membership,                       // §3 identity types
                                                          //   ScopeSnapshot — Stopped { NeverStarted }
                                                          //   included (§3.2) — so traversal reaches
                                                          //   the terminal scope state
-                  scope_seq: Option<u64> }               // scope children only (None otherwise): the
+                  scope_seq: Option<LifecycleSeq> }      // scope children only (None otherwise): the
                                                          //   nested scope's lifecycle_seq watermark,
                                                          //   sampled at the same publication point —
                                                          //   equal to nested.lifecycle_seq whenever
@@ -3309,7 +3310,7 @@ ScopeSnapshot   { state: Unstarted                              // membership ex
                                                                 //   scope-state twin of §7's exit
                   kind: Ordered | Dynamic, strategy (ordered only), intensity,
                   total_restarts,                        // charges per §9.2 — group respawns count
-                  lifecycle_seq,                         // aligns events with snapshots (§12)
+                  lifecycle_seq: LifecycleSeq,           // aligns events with snapshots (§12)
                   children: Vec<ChildSnapshot> }         // declaration order (ordered scopes);
                                                          //   admission order (dynamic scopes) —
                                                          //   pre-admission reserved cells are

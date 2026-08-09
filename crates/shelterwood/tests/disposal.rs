@@ -118,6 +118,14 @@ impl Drop for PanicAnyOnDrop {
     }
 }
 
+struct NonStringPanicOnDrop;
+
+impl Drop for NonStringPanicOnDrop {
+    fn drop(&mut self) {
+        std::panic::panic_any(17_u8);
+    }
+}
+
 struct Unread<M>(PhantomData<M>);
 
 impl<M> Default for Unread<M> {
@@ -293,6 +301,32 @@ async fn factory_capture_destructor_panics_are_isolated_classified_and_independe
     assert!(matches!(
         second_exit.kind(),
         ExitKind::Panicked { message } if message.as_deref() == Some("second factory destructor")
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_string_factory_destructor_panic_remains_a_panic_exit() {
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "non-string",
+            TaskDef::new({
+                let capture = NonStringPanicOnDrop;
+                move |_| {
+                    let _ = &capture;
+                    async { Ok(()) }
+                }
+            })
+            .restart(never()),
+        )
+        .expect("valid task");
+
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("task starts");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert!(matches!(
+        task.wait().await.kind(),
+        ExitKind::Panicked { message: None }
     ));
 }
 

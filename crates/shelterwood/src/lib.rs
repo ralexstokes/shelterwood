@@ -4,8 +4,8 @@
 
 #[macro_use]
 mod definition;
-mod admission;
 mod actor;
+mod admission;
 mod cells;
 mod deadline;
 mod driver;
@@ -21,8 +21,8 @@ mod runtime;
 mod task;
 mod tree;
 
-pub use admission::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
+pub use admission::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use exit::{
     Exit, ExitError, ExitKind, ExitResult, IntensityTrip, ShutdownStraggler, ShutdownTimeout,
     StartupError, StartupFailure, StartupFailureCause, StopReason,

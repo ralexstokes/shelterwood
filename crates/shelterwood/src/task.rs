@@ -333,8 +333,7 @@ mod tests {
         let mut identity = ScopeIdentity::new();
         let membership = identity.mint_membership(&id).expect("membership available");
         let mut incarnations = identity.incarnation_counter(membership);
-        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
-            .expect("incarnation available");
+        let incarnation = incarnations.mint().expect("incarnation available");
         let shutdown = Latch::default();
         let abort = Latch::default();
         let ready = Latch::default();

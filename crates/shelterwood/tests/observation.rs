@@ -655,7 +655,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
 }
 
 #[tokio::test]
-async fn rebased_declared_handles_keep_their_map_identity() {
+async fn rebased_declared_handles_and_incarnations_keep_identity() {
     fn hashed(value: &impl std::hash::Hash) -> u64 {
         use std::hash::Hasher;
         let mut hasher = std::hash::DefaultHasher::new();
@@ -702,9 +702,16 @@ async fn rebased_declared_handles_keep_their_map_identity() {
     let system = outer.spawn().expect("runtime is available");
 
     let mut admissions = Vec::new();
-    while admissions.len() < 2 {
-        if let LifecycleEventKind::Added { membership, .. } = next_event(&mut events).await.kind {
-            admissions.push(membership);
+    let mut starts = Vec::new();
+    while admissions.len() < 2 || starts.len() < 2 {
+        match next_event(&mut events).await.kind {
+            LifecycleEventKind::Added { membership, .. } => admissions.push(membership),
+            LifecycleEventKind::Started {
+                membership,
+                incarnation,
+                ..
+            } => starts.push((membership, incarnation)),
+            _ => {}
         }
     }
 
@@ -729,6 +736,8 @@ async fn rebased_declared_handles_keep_their_map_identity() {
         "handle identity survives the rebase that refreshed its membership"
     );
     assert_eq!(second.membership(), admissions[1]);
+    assert_eq!(starts[1].0, second.membership());
+    assert_eq!(starts[1].1.membership(), second.membership());
 
     system
         .shutdown(Duration::from_secs(1))

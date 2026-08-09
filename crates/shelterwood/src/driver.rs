@@ -23,7 +23,7 @@ use crate::{
         JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit,
         reconcile_recorded_outcomes,
     },
-    identity::{FenceCounter, ScopeIdentity},
+    identity::IncarnationCounter,
     observe::LifecycleEventKind,
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
@@ -852,7 +852,7 @@ struct ChildRuntime {
     construction: runtime::Isolated<ChildConstruction>,
     pending_terminal: Option<PendingTerminal>,
     options: crate::policy::ResolvedCommonOptions,
-    incarnations: FenceCounter,
+    incarnations: IncarnationCounter,
     restarts: RestartState,
     restart_deadline: Option<DeadlineHandle>,
     active: Option<ActiveChild>,
@@ -1539,7 +1539,7 @@ impl ScopeRuntime {
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);
         }
-        let Some(incarnation) = mint_child_incarnation(&child.slot, &mut child.incarnations) else {
+        let Some(incarnation) = child.incarnations.mint() else {
             let exit = child
                 .slot
                 .member
@@ -2587,10 +2587,6 @@ impl ScopeRuntime {
     }
 }
 
-fn mint_child_incarnation(slot: &Arc<SlotCell>, counter: &mut FenceCounter) -> Option<Incarnation> {
-    ScopeIdentity::mint_incarnation(slot.member.membership(), counter)
-}
-
 /// Owns a scope epoch until a `ScopeRuntime` has taken over its teardown.
 ///
 /// Nested lowering can await isolated disposal before a driver exists. If
@@ -3041,7 +3037,7 @@ mod tests {
         StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
         engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
-        identity::{FenceCounter, ScopeIdentity},
+        identity::{IncarnationCounter, ScopeIdentity},
         mailbox::MailboxCell,
         plan::SlotCell,
         runtime::Latch,
@@ -3052,8 +3048,8 @@ mod tests {
         DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
         Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
         ScopeFlavor, ScopeRole, ScopeRuntime, complete_removals, driver_event_class,
-        mint_child_incarnation, report_channel, resident_projection, restart_shutdown_work,
-        run_nested_tree, run_scope_incarnation,
+        report_channel, resident_projection, restart_shutdown_work, run_nested_tree,
+        run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -4660,14 +4656,13 @@ mod tests {
             record.stage = MemberStage::Restarting;
             record.last_exit = Some(previous.clone());
         });
-        let slot = SlotCell::new(Arc::clone(&member), None);
-        let mut counter = FenceCounter::near_exhaustion(71);
+        let mut counter = IncarnationCounter::near_exhaustion(membership);
 
-        assert!(mint_child_incarnation(&slot, &mut counter).is_some());
-        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(counter.mint().is_some());
+        assert!(counter.mint().is_none());
         assert!(matches!(member.record().stage, MemberStage::Restarting));
         assert_eq!(member.record().last_exit, Some(previous));
-        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(counter.mint().is_none());
     }
 
     #[crate::runtime::test]
@@ -4719,12 +4714,12 @@ mod tests {
         plan.armed = false;
         drop(plan);
 
-        scope.children[key].incarnations = FenceCounter::near_exhaustion(71);
-        let first = {
-            let child = &mut scope.children[key];
-            mint_child_incarnation(&child.slot, &mut child.incarnations)
-                .expect("the last usable incarnation mints")
-        };
+        scope.children[key].incarnations =
+            IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
+        let first = scope.children[key]
+            .incarnations
+            .mint()
+            .expect("the last usable incarnation mints");
         let previous = Exit::new(
             ExitKind::Failed(ExitError::message("last completed incarnation")),
             false,
@@ -4841,11 +4836,9 @@ mod tests {
         // Burn the counter's last usable generation without touching the
         // member record: the child is still an unspawned initial member, so
         // its very first `spawn_child` exhausts before any incarnation runs.
-        scope.children[key].incarnations = FenceCounter::near_exhaustion(73);
-        {
-            let child = &mut scope.children[key];
-            assert!(mint_child_incarnation(&child.slot, &mut child.incarnations).is_some());
-        }
+        scope.children[key].incarnations =
+            IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
+        assert!(scope.children[key].incarnations.mint().is_some());
         assert!(scope.children[key].initial);
         assert!(!scope.children[key].initial_ready);
         assert_eq!(
@@ -4905,8 +4898,7 @@ mod tests {
         let nested_member = MemberCell::new(nested_id, nested_membership);
 
         let worker_id = ChildId::from("worker");
-        let mut child_identity =
-            ScopeIdentity::with_counter(worker_id.clone(), FenceCounter::near_exhaustion(7));
+        let mut child_identity = ScopeIdentity::near_exhaustion(worker_id.clone(), 7);
         child_identity
             .mint_membership(&worker_id)
             .expect("last usable membership is minted before the rebuild");
@@ -4974,8 +4966,8 @@ mod tests {
         parent.set_admitted_children(vec![resident_projection(&slot)]);
         let mut snapshots = scope.subscribe_snapshots();
         let mut events = scope.subscribe_lifecycle();
-        let mut counter = FenceCounter::near_exhaustion(83);
-        let first = mint_child_incarnation(&slot, &mut counter).expect("last incarnation mints");
+        let mut counter = IncarnationCounter::near_exhaustion(membership);
+        let first = counter.mint().expect("last incarnation mints");
         member.update(|record| {
             record.stage = MemberStage::Restarting;
             record.last_incarnation = Some(first);
@@ -4985,7 +4977,7 @@ mod tests {
             reason: StopReason::Finished,
         });
 
-        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(counter.mint().is_none());
         assert!(matches!(member.record().stage, MemberStage::Restarting));
         assert!(matches!(
             events.try_recv(),

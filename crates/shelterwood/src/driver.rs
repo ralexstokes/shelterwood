@@ -781,7 +781,7 @@ enum ChildEvent {
     },
     ConstructionDisposed {
         child: ChildKey,
-        panic: Option<Option<String>>,
+        outcome: runtime::DisposalOutcome,
     },
 }
 
@@ -1929,7 +1929,7 @@ impl ScopeRuntime {
             // The incarnation has already exited; only its retained factory
             // remains. Hard escalation detaches that cleanup, but must not
             // rewrite the actor's recorded verdict.
-            self.handle_construction_disposed(key, None);
+            self.handle_construction_disposed(key, runtime::DisposalOutcome::Clean);
         }
     }
 
@@ -2158,13 +2158,13 @@ impl ScopeRuntime {
             child.construction.take()
         };
         let Some(construction) = construction else {
-            self.handle_construction_disposed(key, None);
+            self.handle_construction_disposed(key, runtime::DisposalOutcome::Clean);
             return;
         };
 
         if self.hard_forced {
             runtime::dispose_detached(construction);
-            self.handle_construction_disposed(key, None);
+            self.handle_construction_disposed(key, runtime::DisposalOutcome::Clean);
             return;
         }
 
@@ -2173,10 +2173,13 @@ impl ScopeRuntime {
         // failure to spawn an auxiliary async joiner cannot strand the child.
         let sender = self.disposal_events.clone();
         let signal = self.root.signal().clone();
-        runtime::dispose_then(construction, move |panic| {
+        runtime::dispose_then(construction, move |outcome| {
             if runtime::unbounded_mpsc_send(
                 &sender,
-                DriverEvent::Child(ChildEvent::ConstructionDisposed { child: key, panic }),
+                DriverEvent::Child(ChildEvent::ConstructionDisposed {
+                    child: key,
+                    outcome,
+                }),
             )
             .is_ok()
             {
@@ -2185,7 +2188,7 @@ impl ScopeRuntime {
         });
     }
 
-    fn handle_construction_disposed(&mut self, key: ChildKey, panic: Option<Option<String>>) {
+    fn handle_construction_disposed(&mut self, key: ChildKey, outcome: runtime::DisposalOutcome) {
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
@@ -2194,7 +2197,7 @@ impl ScopeRuntime {
         };
         child.slot.member.set_terminal_disposal_pending(false);
         if terminal.exited_incarnation.is_some()
-            && let Some(message) = panic
+            && let runtime::DisposalOutcome::Panicked { message } = outcome
             && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
         {
             // Only an exited incarnation can own a destructor failure. A
@@ -2945,8 +2948,8 @@ async fn run_scope_incarnation(
                 })) => scope.handle_exit(child, incarnation, recorded, join, cancelled),
                 Pending::Driver(DriverEvent::Child(ChildEvent::ConstructionDisposed {
                     child,
-                    panic,
-                })) => scope.handle_construction_disposed(child, panic),
+                    outcome,
+                })) => scope.handle_construction_disposed(child, outcome),
                 Pending::Deadline(deadline) => scope.handle_deadline(deadline),
             }
         }
@@ -4747,7 +4750,7 @@ mod tests {
         ));
         assert_eq!(root.snapshot().children.len(), 1);
 
-        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, outcome }) =
             disposal_event_receiver
                 .recv()
                 .await
@@ -4759,7 +4762,7 @@ mod tests {
             event_receiver.try_recv(),
             Ok(DriverEvent::Child(ChildEvent::Ready { .. }))
         ));
-        scope.handle_construction_disposed(child, panic);
+        scope.handle_construction_disposed(child, outcome);
 
         assert!(!scope.children[key].is_disposing());
         assert!(matches!(
@@ -4848,7 +4851,7 @@ mod tests {
         scope.spawn_child(key);
         assert!(scope.children[key].is_disposing());
 
-        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, outcome }) =
             disposal_event_receiver
                 .recv()
                 .await
@@ -4856,7 +4859,7 @@ mod tests {
         else {
             panic!("only construction disposal was armed")
         };
-        scope.handle_construction_disposed(child, panic);
+        scope.handle_construction_disposed(child, outcome);
 
         assert!(matches!(
             scope.children[key].slot.member.record().stage,

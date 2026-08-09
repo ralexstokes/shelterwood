@@ -1118,17 +1118,22 @@ impl<M: Send + 'static> RawContext<M> {
     /// Receives the next accepted message, biased toward shutdown.
     ///
     /// While the incarnation is running, a retained offload-work panic resumes
-    /// from this receive path before another event is delivered. A panic while
-    /// materializing a continuation surfaces directly from this receive call.
+    /// from this receive path before another event is delivered. A panic in an
+    /// offload's continuation closure — the `FnOnce` that builds the message
+    /// from the offload result, not a [`continue_with`](Self::continue_with)
+    /// continuation, which is a plain stored message and cannot panic here —
+    /// surfaces directly from this receive call.
     pub async fn recv(&mut self) -> Option<M> {
         loop {
             if self.local_stop.is_fired() {
                 self.freeze_and_report();
                 // `stop()` originates on this task, but the configured
-                // shutdown ladder is owned by the driver. Wait for its helper
-                // to observe the local-stop latch and fire the shared shutdown
-                // token before ending the raw loop; removing this await would
-                // let a local stop bypass that cross-task handshake.
+                // shutdown ladder is owned by the driver. The driver's helper
+                // only observes the local-stop latch and forwards
+                // `ChildEvent::SelfStop`; it is the driver's stop ladder that
+                // fires the shared shutdown token. Wait for that token before
+                // ending the raw loop; removing this await would let a local
+                // stop bypass that cross-task handshake.
                 self.shutdown.cancelled().await;
                 return None;
             }
@@ -1145,10 +1150,12 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Receives one ready event without awaiting or consulting shutdown.
     ///
-    /// Outside shutdown drain, this resumes a retained offload-work panic before
-    /// returning another event; a continuation-materialization panic surfaces
-    /// directly from this call. During drain it reads the frozen accepted
-    /// mailbox prefix directly.
+    /// Outside shutdown drain, this resumes a retained offload-work panic
+    /// before returning another event; a panic in an offload's continuation
+    /// closure (the message-building `FnOnce`, not a
+    /// [`continue_with`](Self::continue_with) continuation, which is a plain
+    /// stored message) surfaces directly from this call. During drain it reads
+    /// the frozen accepted mailbox prefix directly.
     pub fn try_recv(&mut self) -> Option<M> {
         if self.is_stopping() {
             self.freeze_and_report();

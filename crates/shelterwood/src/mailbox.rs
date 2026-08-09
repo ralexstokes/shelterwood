@@ -1368,6 +1368,10 @@ pub struct SendFuture<M> {
 enum SendFutureState<M> {
     Immediate(Option<M>),
     Parked(Arc<SendOperation<M>>),
+    // Acceptance is remembered so a completed send stays idempotently
+    // observable, matching the retained-operation behaviour this state
+    // machine replaced.
+    Sent(Incarnation),
     Done,
 }
 
@@ -1393,6 +1397,7 @@ impl<M: Send + 'static> SendFuture<M> {
                 observed: self.mailbox.current_observation(),
             },
             SendFutureState::Parked(operation) => self.mailbox.withdraw(&operation),
+            SendFutureState::Sent(incarnation) => Withdrawal::Accepted(incarnation),
             SendFutureState::Done => panic!("a completed send was withdrawn"),
         }
     }
@@ -1406,7 +1411,10 @@ impl<M> fmt::Debug for SendFuture<M> {
                 "submitted",
                 &!matches!(self.state, SendFutureState::Immediate(_)),
             )
-            .field("done", &matches!(self.state, SendFutureState::Done))
+            .field(
+                "done",
+                &matches!(self.state, SendFutureState::Sent(_) | SendFutureState::Done),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -1422,7 +1430,7 @@ impl<M: Send + 'static> Future for SendFuture<M> {
                 .expect("an unsubmitted send retains its message");
             match this.mailbox.submit(message) {
                 Submission::Accepted(incarnation) => {
-                    this.state = SendFutureState::Done;
+                    this.state = SendFutureState::Sent(incarnation);
                     return Poll::Ready(Ok(incarnation));
                 }
                 Submission::Parked(operation) => {
@@ -1443,6 +1451,9 @@ impl<M: Send + 'static> Future for SendFuture<M> {
             }
         }
 
+        if let SendFutureState::Sent(incarnation) = this.state {
+            return Poll::Ready(Ok(incarnation));
+        }
         let SendFutureState::Parked(operation) = &this.state else {
             panic!("a completed send future was polled")
         };
@@ -1454,7 +1465,7 @@ impl<M: Send + 'static> Future for SendFuture<M> {
             OperationOutcome::Accepted(incarnation) => {
                 let incarnation = *incarnation;
                 drop(operation_state);
-                this.state = SendFutureState::Done;
+                this.state = SendFutureState::Sent(incarnation);
                 Poll::Ready(Ok(incarnation))
             }
             OperationOutcome::Terminated {
@@ -1500,7 +1511,7 @@ impl<M> Drop for SendFuture<M> {
                 }
                 Withdrawal::Accepted(_) => {}
             },
-            SendFutureState::Done => {}
+            SendFutureState::Sent(_) | SendFutureState::Done => {}
         }
     }
 }
@@ -2197,5 +2208,67 @@ mod tests {
             future.operation.elapsed_polls, 0,
             "a zero budget never attempts the operation"
         );
+    }
+
+    #[test]
+    fn an_accepted_send_reports_acceptance_on_every_poll() {
+        let (mailbox, actor) = actor();
+        MailboxControl::configure(&*mailbox, Mailbox::default());
+        let mut identity = ScopeIdentity::new();
+        let membership = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available");
+        let mut incarnations = identity.incarnation_counter(membership);
+        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
+            .expect("incarnation available");
+        MailboxControl::bind(&*mailbox, incarnation);
+
+        let mut send = Box::pin(actor.send(1));
+        let mut context = Context::from_waker(Waker::noop());
+        let Poll::Ready(Ok(first)) = send.as_mut().poll(&mut context) else {
+            panic!("a bound, non-full mailbox accepts immediately")
+        };
+        let Poll::Ready(Ok(second)) = send.as_mut().poll(&mut context) else {
+            panic!("a completed send stays observable")
+        };
+        assert_eq!(first, second);
+        assert_eq!(first, incarnation);
+    }
+
+    struct CountedDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountedDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn dropping_a_never_polled_send_disposes_the_message_exactly_once() {
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("actor");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        let mailbox: Arc<MailboxCell<CountedDrop>> = MailboxCell::new(member.id().clone());
+        member.attach_mailbox(mailbox.clone());
+        let actor = ActorRef::new(member, Arc::clone(&mailbox));
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        drop(actor.send(CountedDrop(Arc::clone(&drops))));
+
+        // The never-submitted message routes through detached isolated
+        // disposal on another thread, so acknowledge it with a bounded wait.
+        for _ in 0..1_000 {
+            if drops.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let state = mailbox.state.lock().expect("mailbox mutex poisoned");
+        assert!(state.queue.is_empty());
+        assert!(state.waiters.is_empty());
     }
 }

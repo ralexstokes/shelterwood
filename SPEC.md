@@ -829,30 +829,32 @@ applying between successive continuations. Timers whose deadlines fire
 at the same instant deliver in **arming order** — the order their
 *current* armings were established; re-arming a key (§5.3's
 replacement) takes the new position — and the bounded retraction turn
-below runs once for the whole simultaneous batch: messages queued at
-the fire instant deliver first, then the still-armed members of the
-batch in arming order. Within class 3, ordering between mailbox and
+below runs once for the whole simultaneous batch: work captured in the
+batch's bounded source prefixes delivers first, then the still-armed members
+of the batch in arming order. Within class 3, ordering between mailbox and
 offload deliveries stays deliberately unspecified (§5.1's ordering
 contract promises per-sender FIFO and nothing more).
 
 For this ordering rule, a timer **fires** when the event loop observes due
-armings and takes their timer batch. "Queued at the fire instant" therefore
-means present at that batch-take linearization point, not merely present when
-the wall clock passed the timer's deadline.
+armings and begins taking their timer batch, not merely when the wall clock
+passes the timer's deadline. Batch formation records a bounded prefix of each
+input source — continuations, mailbox acceptances, and offload completions —
+at that source's own cutoff. The sources do not share a global linearization
+point: work arriving concurrently with batch formation may land on either side
+of its source cutoff, and class 3 promises no ordering across sources.
 
 Already-queued messages get one bounded turn to retract an elapsed timer:
-when a timer fires, the messages queued *at that instant* are delivered
-first (they may `clear_timer` the fired key), then the timer message goes
-through if still armed.
+when a timer fires, messages captured by the batch's mailbox prefix are
+delivered first (they may `clear_timer` the fired key), then the timer message
+goes through if still armed.
 
 Timers rank last deliberately; the asymmetry is the rationale. A timer's
-lateness under this order is bounded: once a timer fires, only work already
-queued *at that instant* — queued messages (capped by mailbox capacity),
-offload completions already delivered to the loop (an offload still in
-flight holds nothing back: its completion arrives after the fire instant
-and waits behind the timer), and already-scheduled continuations — runs
-before it; work arriving or scheduled *after* the fire instant,
-continuations included, does not preempt the fired timer. The continuation
+lateness under this order is bounded: once a timer fires, only each source's
+captured prefix — queued messages (capped by mailbox capacity), offload
+completions through the recorded offload watermark, and continuations through
+the recorded queue length — runs before it. An offload still in flight holds
+nothing back; work arriving after its source cutoff, continuations included,
+does not preempt the fired timer. The continuation
 clause is load-bearing — continuations are self-replenishing, so without it
 a continuation chain could starve a fired timer forever despite the
 per-continuation fairness turn above. The reverse order is unbounded: timers are

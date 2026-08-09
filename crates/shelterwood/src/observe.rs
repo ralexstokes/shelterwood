@@ -22,6 +22,30 @@ pub const LIFECYCLE_EVENT_CAPACITY: usize = 128;
 // requested and effective capacities to remain equal.
 const _: () = assert!(LIFECYCLE_EVENT_CAPACITY.is_power_of_two());
 
+/// A sequence in one scope membership's lifecycle event domain.
+///
+/// Values increase monotonically and remain continuous across restarts of the
+/// same membership. A replacement membership starts a distinct sequence
+/// domain, identified by its [`Membership`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LifecycleSeq(u64);
+
+impl LifecycleSeq {
+    /// Permanent watermark used after the lifecycle sequence space is
+    /// exhausted. This value is never assigned to an event.
+    pub const EXHAUSTED: Self = Self(u64::MAX);
+
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the underlying numeric sequence value.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// One item read from a lifecycle subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -43,7 +67,7 @@ pub struct LifecycleEvent {
     /// Membership identity of the emitting scope.
     pub scope: Membership,
     /// Emitting scope's membership-owned sequence number.
-    pub seq: u64,
+    pub seq: LifecycleSeq,
     /// State transition carried by this event.
     pub kind: LifecycleEventKind,
 }
@@ -228,7 +252,7 @@ pub struct ChildSnapshot {
     /// Recursive state of a scope child when its incarnation is live or terminal.
     pub nested: Option<Arc<ScopeSnapshot>>,
     /// Lifecycle watermark of a scope child, including restart windows.
-    pub scope_seq: Option<u64>,
+    pub scope_seq: Option<LifecycleSeq>,
 }
 
 /// Arc-shareable recursive current-state projection for one scope.
@@ -245,7 +269,7 @@ pub struct ScopeSnapshot {
     /// Cumulative restart charges across children in this incarnation.
     pub total_restarts: u64,
     /// This scope membership's lifecycle watermark.
-    pub lifecycle_seq: u64,
+    pub lifecycle_seq: LifecycleSeq,
     /// Children in declaration or admission order.
     pub children: Arc<[ChildSnapshot]>,
 }
@@ -284,7 +308,7 @@ impl ScopeSnapshot {
     /// For the scope represented by this snapshot itself, compare the event's
     /// membership with the corresponding scope handle and use [`Self::lifecycle_seq`].
     #[must_use]
-    pub fn watermark(&self, membership: Membership) -> Option<u64> {
+    pub fn watermark(&self, membership: Membership) -> Option<LifecycleSeq> {
         self.children.iter().find_map(|child| {
             if child.membership == membership {
                 child.scope_seq
@@ -570,7 +594,7 @@ impl LifecycleHub {
     pub(crate) fn publish(&self, event: LifecycleEvent) {
         tracing::trace!(
             scope = ?event.scope,
-            seq = event.seq,
+            seq = event.seq.get(),
             path = ?event.scope_path,
             kind = ?event.kind,
             "scope lifecycle event"
@@ -663,7 +687,7 @@ mod tests {
         },
     };
 
-    use super::{LIFECYCLE_EVENT_CAPACITY, LifecycleHub, SnapshotHub};
+    use super::{LIFECYCLE_EVENT_CAPACITY, LifecycleHub, LifecycleSeq, SnapshotHub};
 
     fn snapshot(state: ScopeState) -> Arc<ScopeSnapshot> {
         Arc::new(ScopeSnapshot {
@@ -672,7 +696,7 @@ mod tests {
             strategy: None,
             intensity: Intensity::default(),
             total_restarts: 0,
-            lifecycle_seq: 0,
+            lifecycle_seq: LifecycleSeq::new(0),
             children: Arc::from([]),
         })
     }
@@ -764,7 +788,7 @@ mod tests {
         hub.publish_past_fast_path(LifecycleEvent {
             scope_path: Vec::new(),
             scope: membership,
-            seq: 1,
+            seq: LifecycleSeq::new(1),
             kind: LifecycleEventKind::ScopeState {
                 state: ScopeState::Running,
             },
@@ -785,7 +809,7 @@ mod tests {
         let event = |seq| LifecycleEvent {
             scope_path: Vec::new(),
             scope: membership,
-            seq,
+            seq: LifecycleSeq::new(seq),
             kind: LifecycleEventKind::ScopeState {
                 state: ScopeState::Running,
             },
@@ -810,7 +834,7 @@ mod tests {
         else {
             panic!("expected the retained suffix");
         };
-        assert_eq!(first_retained.seq, 3);
+        assert_eq!(first_retained.seq.get(), 3);
     }
 
     #[test]
@@ -822,7 +846,7 @@ mod tests {
         let event = |seq| LifecycleEvent {
             scope_path: Vec::new(),
             scope: membership,
-            seq,
+            seq: LifecycleSeq::new(seq),
             kind: LifecycleEventKind::ScopeState {
                 state: ScopeState::Running,
             },

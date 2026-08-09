@@ -36,8 +36,8 @@ pub use mailbox::{
 };
 pub use observe::{
     ChildSnapshot, ChildState, LIFECYCLE_EVENT_CAPACITY, LifecycleEvent, LifecycleEventKind,
-    LifecycleEvents, LifecycleItem, LifecycleTryRecvError, MembershipStatus, ScopeKind,
-    ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
+    LifecycleEvents, LifecycleItem, LifecycleSeq, LifecycleTryRecvError, MembershipStatus,
+    ScopeKind, ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
 };
 pub use policy::{
     Backoff, BackoffFactor, DefaultsInheritance, Intensity, InvalidPolicy, Jitter, Mailbox,

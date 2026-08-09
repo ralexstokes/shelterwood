@@ -13,10 +13,10 @@ use crate::common::{
 };
 use shelterwood::{
     Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LIFECYCLE_EVENT_CAPACITY,
-    LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleTryRecvError,
-    MembershipStatus, RemoveOutcome, RestartCondition, RestartPolicy, Retention, ScopeKind,
-    ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef,
-    TaskRef, Tree, WaitError,
+    LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleSeq,
+    LifecycleTryRecvError, MembershipStatus, RemoveOutcome, RestartCondition, RestartPolicy,
+    Retention, ScopeKind, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef, SubtreeOnceDef,
+    TaskDef, TaskOnceDef, TaskRef, Tree, WaitError,
 };
 
 async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
@@ -34,7 +34,7 @@ async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
     }
 }
 
-fn event_watermark(scope: &ScopeRef, event: &LifecycleEvent) -> Option<u64> {
+fn event_watermark(scope: &ScopeRef, event: &LifecycleEvent) -> Option<LifecycleSeq> {
     let snapshot = scope.snapshot();
     if event.scope == scope.membership() {
         Some(snapshot.lifecycle_seq)
@@ -51,7 +51,7 @@ async fn event_woken_pull_snapshots_are_consistent_at_first_start_and_final_stop
         .expect("valid subtree");
     let initial = nested.snapshot();
     assert_eq!(initial.state, ScopeState::Unstarted);
-    assert_eq!(initial.lifecycle_seq, 0);
+    assert_eq!(initial.lifecycle_seq.get(), 0);
 
     // Deliberately create no snapshot receiver: the pull path must not depend
     // on watch publication having any subscribers.
@@ -468,7 +468,11 @@ async fn descendant_events_forward_with_origin_identity_path_and_causal_order() 
     let mut last_by_origin = HashMap::new();
     for event in &seen {
         if let Some(previous) = last_by_origin.insert(event.scope, event.seq) {
-            assert_eq!(event.seq, previous + 1, "origin sequences stay gap-free");
+            assert_eq!(
+                event.seq.get(),
+                previous.get() + 1,
+                "origin sequences stay gap-free"
+            );
         }
     }
     let snapshot = root.snapshot();
@@ -622,7 +626,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
             break event;
         }
     };
-    assert_eq!(starting.seq, stopped_seq + 1);
+    assert_eq!(starting.seq.get(), stopped_seq.get() + 1);
     assert_eq!(starting.scope, scope_membership);
 
     let second_child = loop {

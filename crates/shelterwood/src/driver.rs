@@ -3080,11 +3080,9 @@ mod tests {
         let second = isolated_scope("second", ScopeFlavor::Ordered);
         let first_gate = first.observation_gate();
         let second_gate = second.observation_gate();
-        assert!(!Arc::ptr_eq(&first_gate, &second_gate));
+        assert!(!first_gate.same_gate(&second_gate));
 
-        let held = first_gate
-            .lock()
-            .expect("first observation gate starts healthy");
+        let held = first_gate.lock();
         let (completed, receiver) = std::sync::mpsc::sync_channel(0);
         let worker = std::thread::spawn(move || {
             second.set_state(ScopeState::Starting);
@@ -3098,6 +3096,22 @@ mod tests {
             Ok(()),
             "holding one system's gate must not stall another system"
         );
+    }
+
+    #[test]
+    fn observation_gate_poison_does_not_wedge_later_observation() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let gate = scope.observation_gate();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _held = gate.lock();
+                panic!("inject observation failure");
+            }))
+            .is_err()
+        );
+
+        scope.set_state(ScopeState::Starting);
+        assert_eq!(scope.record().state, ScopeState::Starting);
     }
 
     #[test]
@@ -3196,10 +3210,10 @@ mod tests {
 
         root.set_admitted_children(vec![resident_projection(&slot)]);
 
-        assert!(Arc::ptr_eq(
-            &root.observation_gate(),
-            &nested.observation_gate()
-        ));
+        assert!(
+            root.observation_gate()
+                .same_gate(&nested.observation_gate())
+        );
     }
 
     #[test]
@@ -3209,17 +3223,18 @@ mod tests {
         let leaf = isolated_scope("leaf", ScopeFlavor::Ordered);
         let leaf_slot = SlotCell::new(Arc::clone(&leaf.member), Some(Arc::clone(&leaf)));
         nested.set_admitted_children(vec![resident_projection(&leaf_slot)]);
-        assert!(Arc::ptr_eq(
-            &nested.observation_gate(),
-            &leaf.observation_gate()
-        ));
+        assert!(
+            nested
+                .observation_gate()
+                .same_gate(&leaf.observation_gate())
+        );
 
         let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
         root.set_admitted_children(vec![resident_projection(&nested_slot)]);
 
         let root_gate = root.observation_gate();
-        assert!(Arc::ptr_eq(&root_gate, &nested.observation_gate()));
-        assert!(Arc::ptr_eq(&root_gate, &leaf.observation_gate()));
+        assert!(root_gate.same_gate(&nested.observation_gate()));
+        assert!(root_gate.same_gate(&leaf.observation_gate()));
     }
 
     #[test]
@@ -3228,9 +3243,7 @@ mod tests {
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
         let captures = nested.probe_gate_captures();
         let prior_gate = nested.observation_gate();
-        let held = prior_gate
-            .lock()
-            .expect("pre-admission observation gate starts healthy");
+        let held = prior_gate.lock();
         let observer = Arc::clone(&nested);
         let worker = std::thread::spawn(move || observer.set_state(ScopeState::Starting));
 
@@ -3258,10 +3271,10 @@ mod tests {
             "the handoff forces one retry capture on the root gate"
         );
         assert_eq!(nested.record().state, ScopeState::Starting);
-        assert!(Arc::ptr_eq(
-            &root.observation_gate(),
-            &nested.observation_gate()
-        ));
+        assert!(
+            root.observation_gate()
+                .same_gate(&nested.observation_gate())
+        );
     }
 
     #[crate::runtime::test]
@@ -3588,10 +3601,10 @@ mod tests {
             .recv()
             .expect("adoption reports completion after the edge");
         adoption.join().expect("gate handoff completes");
-        assert!(Arc::ptr_eq(
-            &root.observation_gate(),
-            &nested.observation_gate()
-        ));
+        assert!(
+            root.observation_gate()
+                .same_gate(&nested.observation_gate())
+        );
     }
 
     #[test]
@@ -4471,7 +4484,7 @@ mod tests {
 
         let captures = root.probe_gate_captures();
         let gate = root.observation_gate();
-        let held_gate = gate.lock().expect("observation gate starts healthy");
+        let held_gate = gate.lock();
         let removal_root = Arc::clone(&root);
         let removal_id = child_id.clone();
         let worker =
@@ -5062,7 +5075,10 @@ mod tests {
         else {
             panic!("expected the final mintable event");
         };
-        assert_eq!(event.seq, u64::MAX - 1);
-        assert_eq!(scope.snapshot().lifecycle_seq, u64::MAX);
+        assert_eq!(event.seq.get(), u64::MAX - 1);
+        assert_eq!(
+            scope.snapshot().lifecycle_seq,
+            crate::LifecycleSeq::EXHAUSTED
+        );
     }
 }

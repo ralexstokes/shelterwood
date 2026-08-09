@@ -159,6 +159,24 @@ pub(crate) fn now() -> std::time::Instant {
     time::Instant::now().into_std()
 }
 
+// Keep each timer registration comfortably inside tokio's millisecond tick
+// range. Tokio caps instants beyond its private `u64::MAX - 3` tick sentinel,
+// which would otherwise make a valid but very distant std Instant fire early.
+// Rechecking the original absolute point after bounded slices preserves exact
+// never-early semantics without coupling this crate to that private constant.
+const MAX_TIMER_SLICE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+fn next_timer_deadline(
+    current: std::time::Instant,
+    requested: std::time::Instant,
+) -> Option<std::time::Instant> {
+    if requested <= current {
+        return None;
+    }
+    let slice = requested.duration_since(current).min(MAX_TIMER_SLICE);
+    current.checked_add(slice)
+}
+
 pub(crate) fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
@@ -1108,9 +1126,15 @@ pub(crate) async fn sleep_until_std(deadline: std::time::Instant) {
     // computed. Absolute instants that arrive by another route obey the same
     // never-substitute rule as relative budgets: if this exact point cannot
     // be armed, it never arrives.
-    match Deadline::at(deadline).instant() {
-        Some(deadline) => time::sleep_until(time::Instant::from_std(deadline)).await,
-        None => std::future::pending().await,
+    loop {
+        let current = now();
+        let Some(next) = next_timer_deadline(current, deadline) else {
+            return;
+        };
+        match Deadline::at(next).instant() {
+            Some(next) => time::sleep_until(time::Instant::from_std(next)).await,
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -1128,12 +1152,24 @@ where
     // against the clock limit would still panic at arming. Route the
     // budget through Deadline so an unarmable timeout never elapses,
     // matching sleep_deadline's overflow semantics.
-    if deadline(duration).instant().is_none() {
+    let Some(deadline) = deadline(duration).instant() else {
         return Timeout::Completed(future.await);
+    };
+    if duration <= MAX_TIMER_SLICE {
+        return match time::timeout(duration, future).await {
+            Ok(value) => Timeout::Completed(value),
+            Err(_) => Timeout::Elapsed,
+        };
     }
-    match time::timeout(duration, future).await {
-        Ok(value) => Timeout::Completed(value),
-        Err(_) => Timeout::Elapsed,
+    let sleep = sleep_until_std(deadline);
+    tokio::pin!(future);
+    tokio::pin!(sleep);
+    tokio::select! {
+        // Match tokio::time::timeout's boundary rule: the operation receives
+        // the first poll when it and a zero-duration timer are both ready.
+        biased;
+        value = &mut future => Timeout::Completed(value),
+        () = &mut sleep => Timeout::Elapsed,
     }
 }
 
@@ -1247,8 +1283,8 @@ mod tests {
     };
 
     use super::{
-        DisposalJob, DisposalPanic, JoinOutcome, Latch, OneShotClose, Signal, Timeout,
-        discard_panic, join, oneshot, spawn, timeout, yield_now,
+        DisposalJob, DisposalPanic, JoinOutcome, Latch, MAX_TIMER_SLICE, OneShotClose, Signal,
+        Timeout, discard_panic, join, next_timer_deadline, oneshot, spawn, timeout, yield_now,
     };
 
     fn latest_representable(started_at: std::time::Instant) -> std::time::Instant {
@@ -1275,6 +1311,47 @@ mod tests {
         // The timer registers on first poll: passing this instant to tokio
         // would panic during its millisecond round-up rather than parking.
         assert!(sleep.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[test]
+    fn deadline_beyond_tokios_tick_range_is_armed_in_a_bounded_slice() {
+        // Tokio 1.53 reserves the top three u64 millisecond ticks. The exact
+        // value is test evidence only: production uses a small stable slice
+        // rather than depending on tokio's private sentinel.
+        let beyond_tokio_ticks = Duration::from_millis(u64::MAX - 2);
+        let current = std::time::Instant::now();
+        let requested = current
+            .checked_add(beyond_tokio_ticks)
+            .expect("the platform represents points beyond tokio's tick range");
+
+        assert_eq!(
+            next_timer_deadline(current, requested),
+            current.checked_add(MAX_TIMER_SLICE)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_beyond_tokios_tick_range_does_not_fire_at_the_first_slice() {
+        let current = super::now();
+        let requested = current
+            .checked_add(Duration::from_millis(u64::MAX - 2))
+            .expect("the platform represents points beyond tokio's tick range");
+        let mut sleep = std::pin::pin!(super::sleep_until_std(requested));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(sleep.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(MAX_TIMER_SLICE).await;
+        assert!(
+            sleep.as_mut().poll(&mut context).is_pending(),
+            "finishing an internal slice must not finish the requested sleep"
+        );
+    }
+
+    #[test]
+    fn already_due_clock_limit_needs_no_timer_arm() {
+        let edge = latest_representable(std::time::Instant::now());
+
+        assert_eq!(next_timer_deadline(edge, edge), None);
     }
 
     #[tokio::test(start_paused = true)]

@@ -10,12 +10,14 @@ use std::time::{Duration, Instant};
 pub(crate) struct Deadline(Option<Instant>);
 
 impl Deadline {
-    /// Captures an absolute point only when the runtime can arm it exactly.
+    /// Captures an absolute point only when the runtime can schedule it safely.
     ///
     /// A representable instant within [`Self::ARMING_HEADROOM`] of the clock
-    /// limit still cannot be handed to the timer safely. Such a point has the
-    /// same never-arrives semantics as an overflowing relative budget; it is
-    /// never replaced with an earlier, merely armable instant.
+    /// limit still cannot be handed to the timer safely. More distant points
+    /// can be reached through bounded internal timer slices, but a point at
+    /// the clock ceiling has the same never-arrives semantics as an
+    /// overflowing relative budget; it is never replaced with an earlier
+    /// public deadline.
     pub(crate) fn at(instant: Instant) -> Self {
         Self(instant.checked_add(Self::ARMING_HEADROOM).map(|_| instant))
     }
@@ -29,9 +31,18 @@ impl Deadline {
     /// would be armed for it, so due-ness checks and timer wakes can
     /// never disagree at the clock boundary.
     pub(crate) fn after(started_at: Instant, duration: Duration) -> Self {
-        started_at
-            .checked_add(duration)
-            .map_or(Self(None), Self::at)
+        let Some(instant) = started_at.checked_add(duration) else {
+            return Self(None);
+        };
+
+        // An exact zero budget is already due at its starting clock value and
+        // never has to cross the timer boundary. Preserve it even when that
+        // value is too close to Instant's ceiling for a future timer arm.
+        if duration.is_zero() {
+            Self(Some(instant))
+        } else {
+            Self::at(instant)
+        }
     }
 
     /// Returns the representable absolute deadline, if there is one.
@@ -132,6 +143,16 @@ mod tests {
         );
         assert!(!flush.is_due(now + armable));
         assert!(!flush.is_overdue(now + armable));
+    }
+
+    #[test]
+    fn zero_budget_at_the_clock_limit_remains_due() {
+        let edge = latest_representable(Instant::now());
+        let deadline = Deadline::after(edge, Duration::ZERO);
+
+        assert_eq!(deadline.instant(), Some(edge));
+        assert!(deadline.is_due(edge));
+        assert!(!deadline.is_overdue(edge));
     }
 
     #[test]

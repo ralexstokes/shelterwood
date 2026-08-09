@@ -29,11 +29,13 @@ These values use `LifecycleSeq`. `LifecycleSeq::EXHAUSTED` is the permanent
 watermark after the sequence space is exhausted and is never emitted on an
 event; `get()` exposes the underlying `u64` when numeric integration requires it.
 
-A child in `Restarting` normally exposes its absolute backoff deadline through
-`restart_at`. If the requested delay is too large for the platform clock to
-represent and arm exactly, `restart_at` is `None`; no earlier or alternative
-deadline is substituted, and the child remains in `Restarting` until removal
-or shutdown rather than restarting immediately.
+A child in `Restarting` normally exposes its exact absolute backoff deadline
+through `restart_at`. The runtime waits for very distant points in bounded
+internal timer slices, so the timer implementation cannot clamp them to an
+earlier tick. If the requested point cannot be represented or safely scheduled,
+`restart_at` is `None`; no earlier or alternative public deadline is
+substituted, and the child remains in `Restarting` until removal or shutdown
+rather than restarting immediately.
 
 If the event's scope token is absent from the snapshot, use causal introduction:
 

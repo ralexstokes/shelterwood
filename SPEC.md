@@ -3283,12 +3283,14 @@ ChildSnapshot   { id, membership,                       // §3 identity types
                                                         //   conflating watch may skip states —
                                                         //   events are the history surface)
                   restart_policy, retention,
-                  restart_at: Option<Instant>,          // a representable, exactly armable backoff
+                  restart_at: Option<Instant>,          // a representable, safely schedulable backoff
                                                         //   deadline while Restarting, as an absolute
                                                         //   runtime-clock instant (D.3); None outside
                                                         //   Restarting and also for an unrepresentable
-                                                        //   or unarmable requested point. No earlier or
-                                                        //   alternative deadline is substituted: that
+                                                        //   or unschedulable requested point. The runtime
+                                                        //   may wait in bounded internal timer slices,
+                                                        //   but no earlier or alternative public deadline
+                                                        //   is substituted: that
                                                         //   restart remains pending until removal or
                                                         //   shutdown. Render a present value relative
                                                         //   by subtracting now

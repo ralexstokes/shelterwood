@@ -1951,9 +1951,10 @@ impl ScopeRuntime {
                         record.last_exit = Some(exit.clone());
                         record.restart_count = decision.restart_count;
                         // Publish the derived schedule even when intensity
-                        // prevents spawning it. `None` remains reserved for
-                        // an unrepresentable clock deadline.
-                        record.restart_at = decision.restart_at;
+                        // prevents spawning it. The engine clamps
+                        // unrepresentable deadlines far future, so
+                        // `restart_at` is present exactly while restarting.
+                        record.restart_at = Some(decision.restart_at);
                         record.stage = MemberStage::Restarting;
                     },
                     LifecycleEventKind::Exited {
@@ -1981,12 +1982,10 @@ impl ScopeRuntime {
                     }
                     self.begin_drain(StopReason::IntensityTripped(trip));
                 } else {
-                    if let Some(restart_at) = decision.restart_at {
-                        child.restart_deadline = Some(
-                            self.deadlines
-                                .push(restart_at, DeadlineKind::Restart { child: key }),
-                        );
-                    }
+                    child.restart_deadline = Some(
+                        self.deadlines
+                            .push(decision.restart_at, DeadlineKind::Restart { child: key }),
+                    );
                 }
             }
         }

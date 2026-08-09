@@ -20,6 +20,25 @@ impl Deadline {
         self.0
     }
 
+    /// Captures a duration budget as an absolute instant, saturating to a
+    /// far-future point when the exact deadline overflows the clock.
+    ///
+    /// This is the far-future clamp: callers that must surface a present
+    /// absolute point — a `Restarting` snapshot's `restart_at` — use this
+    /// instead of [`Deadline::after`]'s never-arrives `None`.
+    pub(crate) fn saturating_after(started_at: Instant, duration: Duration) -> Instant {
+        let mut budget = duration;
+        loop {
+            if let Some(instant) = started_at.checked_add(budget) {
+                return instant;
+            }
+            // Halving converges, and the first representable budget after
+            // an overflowing one is at least half the clock's remaining
+            // range — still far future.
+            budget /= 2;
+        }
+    }
+
     /// Reports whether a representable deadline has elapsed.
     pub(crate) fn is_due(self, now: Instant) -> bool {
         self.0.is_some_and(|deadline| now >= deadline)
@@ -48,6 +67,22 @@ mod tests {
         assert_eq!(deadline.instant(), None);
         assert!(!deadline.is_due(now));
         assert!(!deadline.is_overdue(now));
+    }
+
+    #[test]
+    fn saturating_after_matches_exact_addition_when_representable() {
+        let now = Instant::now();
+        assert_eq!(
+            Deadline::saturating_after(now, Duration::from_secs(1)),
+            now + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn saturating_after_clamps_overflow_to_a_far_future_instant() {
+        let now = Instant::now();
+        let century = Duration::from_secs(60 * 60 * 24 * 365 * 100);
+        assert!(Deadline::saturating_after(now, Duration::MAX) > now + century);
     }
 
     #[test]

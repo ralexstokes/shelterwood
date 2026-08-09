@@ -166,6 +166,29 @@ impl Drop for DetachedBlockingResult {
     }
 }
 
+#[derive(Default)]
+struct BlockingThreadRelease {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl BlockingThreadRelease {
+    fn gate(&self) -> Arc<(Mutex<bool>, Condvar)> {
+        Arc::clone(&self.gate)
+    }
+
+    fn release(&self) {
+        let (released, changed) = &*self.gate;
+        *released.lock().expect("release mutex poisoned") = true;
+        changed.notify_all();
+    }
+}
+
+impl Drop for BlockingThreadRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 struct DetachedBlockingActor {
     generation: usize,
     thread_started: ReleaseGate,
@@ -251,7 +274,9 @@ impl Actor for DetachedBlockingActor {
 async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
     let generations = Arc::new(AtomicUsize::new(0));
     let thread_started = ReleaseGate::default();
-    let thread_release = Arc::new((Mutex::new(false), Condvar::new()));
+    // A failed assertion must not leave Tokio's blocking pool stuck waiting
+    // while the test runtime tries to shut down.
+    let thread_release = BlockingThreadRelease::default();
     let result_disposed = ReleaseGate::default();
     let fresh_seen = ReleaseGate::default();
     let stale_seen = Arc::new(AtomicBool::new(false));
@@ -262,7 +287,7 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
             ActorDef::<DetachedBlockingActor>::factory({
                 let generations = Arc::clone(&generations);
                 let thread_started = thread_started.clone();
-                let thread_release = Arc::clone(&thread_release);
+                let thread_release = thread_release.gate();
                 let result_disposed = result_disposed.clone();
                 let fresh_seen = fresh_seen.clone();
                 let stale_seen = Arc::clone(&stale_seen);
@@ -293,9 +318,7 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
         "replacement starts while the old blocking thread remains detached"
     );
 
-    let (released, changed) = &*thread_release;
-    *released.lock().expect("release mutex poisoned") = true;
-    changed.notify_one();
+    thread_release.release();
     tokio::time::timeout(POLL_TIMEOUT, result_disposed.wait())
         .await
         .expect("the detached blocking result is disposed");

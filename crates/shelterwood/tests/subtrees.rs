@@ -178,9 +178,9 @@ async fn over_budget_restart_is_charged_but_never_spawned() {
     let mut trace = Vec::new();
     let mut scheduled = 0usize;
     loop {
-        let item = events
-            .recv()
+        let item = tokio::time::timeout(POLL_TIMEOUT, events.recv())
             .await
+            .expect("the next lifecycle event arrives promptly")
             .expect("the lifecycle stream remains open through scope failure");
         let LifecycleItem::Event(event) = item else {
             panic!("the short restart trace cannot lag");

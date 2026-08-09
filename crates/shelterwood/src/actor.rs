@@ -3,10 +3,10 @@
 use std::{fmt, future::Future, hash::Hash, marker::PhantomData, sync::Arc, time::Duration};
 
 use crate::{
-    ActorRef, Blocking, CancellationToken, ChildId, DeadlineElapsed, ExitError, ExitResult, Guard,
-    Incarnation, Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
+    ActorRef, Blocking, ChildId, DeadlineElapsed, ExitError, ExitResult, Guard, Incarnation,
+    Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
     ReadinessDeadline, Rejected, RestartPolicy, Retention, ScopeRef, Shutdown,
-    policy::CommonOptions,
+    cancellation::CancellationToken, policy::CommonOptions,
 };
 
 /// Callback-oriented actor contract.

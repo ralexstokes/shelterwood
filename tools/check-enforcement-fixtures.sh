@@ -87,6 +87,8 @@ expect_case layering-tree-below check-layering-paths.sh \
   "upward driver or tree references found below the driver layer:"
 expect_case layering-tree-in-driver check-layering-paths.sh \
   "upward tree references found in the driver layer:"
+expect_case layering-tree-in-driver-module check-layering-paths.sh \
+  "upward tree references found in the driver layer:"
 expect_case layering-resolve-common check-layering-paths.sh \
   "child option resolution escaped the shared plan funnel:"
 expect_case layering-checked-id check-layering-paths.sh \

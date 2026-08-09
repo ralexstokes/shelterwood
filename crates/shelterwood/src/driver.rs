@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     ops::{Bound, Index, IndexMut},
-    sync::{Arc, Mutex, Weak, mpsc},
+    sync::{Arc, Mutex, OnceLock, Weak},
     time::{Duration, Instant},
 };
 
@@ -92,7 +92,7 @@ struct RecordedReport {
 }
 
 struct ReportCompletion {
-    sender: mpsc::Sender<RecordedReport>,
+    report: Arc<OnceLock<RecordedReport>>,
     shutdown: Latch,
     local_stop: Option<Latch>,
 }
@@ -101,48 +101,51 @@ pub(crate) struct ReportToken {
     completion: Obligation<ReportCompletion>,
 }
 
-pub(crate) struct ReportReceiver(mpsc::Receiver<RecordedReport>);
+pub(crate) struct ReportClaim(Arc<OnceLock<RecordedReport>>);
 
 /// Couples the child task's outcome report to its join verdict without an
 /// asynchronous handoff race.
 ///
-/// `ReportToken` is owned by the child task and its fail-closed `Drop` sends a
-/// fallback synchronously. The runtime resolves `runtime::join` only after the
-/// spawned future has been destroyed (a tokio `JoinHandle` guarantee, not a
-/// language one — any replacement executor behind `runtime` must preserve it),
-/// so the exit joiner may require an immediately available report: one has
-/// already been sent on every return, panic, and cancellation edge. The
-/// shutdown/local-stop latches are sampled by that same send, making the
-/// report and its cancellation evidence one ordered observation.
-pub(crate) fn report_channel(
+/// `ReportToken` is owned by the child task and its fail-closed `Drop` fills a
+/// shared cell synchronously. The runtime resolves `runtime::join` only after
+/// the spawned future has been destroyed (a tokio `JoinHandle` guarantee, not
+/// a language one — any replacement executor behind `runtime` must preserve
+/// it), so the exit joiner may consume the cell immediately: its claim is the
+/// sole surviving owner and the cell is initialized on every return, panic,
+/// and cancellation edge. The shutdown/local-stop latches are sampled by that
+/// same initialization, making the report and its cancellation evidence one
+/// ordered observation.
+pub(crate) fn report_slot(
     shutdown: Latch,
     local_stop: Option<Latch>,
-) -> (ReportToken, ReportReceiver) {
-    let (sender, receiver) = mpsc::channel();
+) -> (ReportToken, ReportClaim) {
+    let report = Arc::new(OnceLock::new());
     (
         ReportToken {
             completion: Obligation::new(
                 ReportCompletion {
-                    sender,
+                    report: Arc::clone(&report),
                     shutdown,
                     local_stop,
                 },
-                |completion| completion.send(None),
+                |completion| completion.fill(None),
             ),
         },
-        ReportReceiver(receiver),
+        ReportClaim(report),
     )
 }
 
 impl ReportCompletion {
-    fn send(self, outcome: Option<RecordedOutcome>) {
+    fn fill(self, outcome: Option<RecordedOutcome>) {
         let cancellation =
             if self.shutdown.is_fired() || self.local_stop.as_ref().is_some_and(Latch::is_fired) {
                 Cancellation::Observed
             } else {
                 Cancellation::NotObserved
             };
-        let _ = self.sender.send(RecordedReport {
+        // Ownership supplies exactly one `ReportCompletion`; ignoring the
+        // impossible occupied-cell result keeps the Drop fallback infallible.
+        let _ = self.report.set(RecordedReport {
             outcome,
             cancellation,
         });
@@ -152,14 +155,17 @@ impl ReportCompletion {
 impl ReportToken {
     pub(crate) fn record(mut self, outcome: RecordedOutcome) {
         self.completion
-            .complete(|completion| completion.send(Some(outcome)));
+            .complete(|completion| completion.fill(Some(outcome)));
     }
 }
 
-impl ReportReceiver {
+impl ReportClaim {
     fn receive(self) -> RecordedReport {
-        self.0
-            .try_recv()
+        Arc::try_unwrap(self.0)
+            .unwrap_or_else(|_| {
+                panic!("owned report token must be destroyed before its task joins")
+            })
+            .into_inner()
             .expect("owned report token must record or fall back before its task joins")
     }
 }
@@ -1366,7 +1372,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         construction_release,
         local_stop,
     } = launch;
-    let (report, report_receiver) = report_channel(shutdown, Some(local_stop.clone()));
+    let (report, report_claim) = report_slot(shutdown, Some(local_stop.clone()));
     let constructed_sender = events.clone();
     let handle = runtime::spawn(async move {
         let body = async move {
@@ -1423,9 +1429,10 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         };
         exit_ended.fire();
         // The task owns `report`, whose explicit record or Drop fallback runs
-        // before the join completes. `receive` therefore asserts immediate
-        // post-join availability without ever blocking this runtime worker.
-        let report = report_receiver.receive();
+        // before the join completes. `receive` therefore asserts sole
+        // ownership and immediate post-join availability without ever
+        // blocking this runtime worker.
+        let report = report_claim.receive();
         let _ = runtime::mpsc_send(
             &exit_sender,
             DriverEvent::Child(ChildEvent::Exited {
@@ -3108,9 +3115,8 @@ mod tests {
         AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
         DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
         Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
-        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, complete_removals,
-        report_channel, resident_projection, restart_shutdown_work, run_nested_tree,
-        run_scope_incarnation,
+        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, complete_removals, report_slot,
+        resident_projection, restart_shutdown_work, run_nested_tree, run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -3799,10 +3805,10 @@ mod tests {
     #[test]
     fn owned_report_token_consumes_or_falls_back_once() {
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let (token, claim) = report_slot(shutdown.clone(), None);
         token.record(RecordedOutcome::Returned(Ok(())));
         shutdown.fire();
-        let report = receiver.receive();
+        let report = claim.receive();
         assert!(matches!(
             report.outcome,
             Some(RecordedOutcome::Returned(Ok(())))
@@ -3810,10 +3816,10 @@ mod tests {
         assert_eq!(report.cancellation, Cancellation::NotObserved);
 
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let (token, claim) = report_slot(shutdown.clone(), None);
         shutdown.fire();
         drop(token);
-        let report = receiver.receive();
+        let report = claim.receive();
         assert!(report.outcome.is_none());
         assert_eq!(report.cancellation, Cancellation::Observed);
     }
@@ -3821,10 +3827,10 @@ mod tests {
     #[test]
     fn owned_report_token_records_prior_cancellation() {
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let (token, claim) = report_slot(shutdown.clone(), None);
         shutdown.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
-        let report = receiver.receive();
+        let report = claim.receive();
         assert!(matches!(
             report.outcome,
             Some(RecordedOutcome::Returned(Ok(())))
@@ -3836,10 +3842,51 @@ mod tests {
     fn owned_report_token_records_prior_local_stop() {
         let shutdown = Latch::default();
         let local_stop = Latch::default();
-        let (token, receiver) = report_channel(shutdown, Some(local_stop.clone()));
+        let (token, claim) = report_slot(shutdown, Some(local_stop.clone()));
         local_stop.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
-        assert_eq!(receiver.receive().cancellation, Cancellation::Observed);
+        assert_eq!(claim.receive().cancellation, Cancellation::Observed);
+    }
+
+    #[test]
+    fn report_cell_falls_back_while_its_owner_thread_unwinds() {
+        let shutdown = Latch::default();
+        let (token, claim) = report_slot(shutdown.clone(), None);
+        let worker = std::thread::spawn(move || {
+            let _token = token;
+            shutdown.fire();
+            panic!("inject child-task panic");
+        });
+
+        assert!(worker.join().is_err());
+        let report = claim.receive();
+        assert!(report.outcome.is_none());
+        assert_eq!(report.cancellation, Cancellation::Observed);
+    }
+
+    #[crate::runtime::test]
+    async fn cancelled_task_report_cell_is_ready_after_join() {
+        let shutdown = Latch::default();
+        let entered = Latch::default();
+        let (token, claim) = report_slot(shutdown.clone(), None);
+        let task_entered = entered.clone();
+        let task = crate::runtime::spawn(async move {
+            let _token = token;
+            task_entered.fire();
+            future::pending::<()>().await;
+        });
+        entered.fired().await;
+
+        shutdown.fire();
+        task.abort_handle().abort();
+        assert!(matches!(
+            crate::runtime::join(task).await,
+            crate::runtime::JoinOutcome::Cancelled
+        ));
+
+        let report = claim.receive();
+        assert!(report.outcome.is_none());
+        assert_eq!(report.cancellation, Cancellation::Observed);
     }
 
     #[test]

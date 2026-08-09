@@ -94,6 +94,15 @@ check_forbidden \
   "\\b(crate|super)::($tree_root_export_pattern)\\b|\\buse[[:space:]]+(crate|super)::\\{[^;]*\\b($tree_root_export_pattern)\\b" \
   "$scope_path"
 
+# A glob import of the crate root pulls in every tree-layer re-export without
+# naming any of them, so neither pattern above can see it. The grouped
+# alternative covers a `*` anywhere inside a `use (crate|super)::{ ... };`
+# tree, which `--multiline` lets span rustfmt-normalized lines.
+check_forbidden \
+  "glob imports of the crate root found in the scope layer:" \
+  '\buse[[:space:]]+(crate|super)::(\*|\{[^;]*\*)' \
+  "$scope_path"
+
 # A crate-root alias can hide both direct root exports and the module names
 # checked above. Extract direct and grouped `self` aliases, then scan uses of
 # each exact identifier so unrelated aliases remain permitted.

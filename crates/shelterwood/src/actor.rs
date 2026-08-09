@@ -1,15 +1,12 @@
 //! Callback-oriented actors layered entirely on the public raw-actor surface.
 
-use std::{
-    fmt, future::Future, hash::Hash, marker::PhantomData, panic::resume_unwind, sync::Arc,
-    time::Duration,
-};
+use std::{fmt, future::Future, hash::Hash, marker::PhantomData, sync::Arc, time::Duration};
 
 use crate::{
     ActorRef, Blocking, CancellationToken, ChildId, DeadlineElapsed, ExitError, ExitResult, Guard,
     Incarnation, Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
     ReadinessDeadline, Rejected, RestartPolicy, Retention, ScopeRef, Shutdown,
-    policy::CommonOptions, raw::CatchUnwindFuture,
+    policy::CommonOptions,
 };
 
 /// Callback-oriented actor contract.
@@ -367,6 +364,13 @@ impl<A: Actor> RawActor for Handler<A> {
         self.readiness
     }
 
+    /// Runs one incarnation, leaning on the raw incarnation boundary for all
+    /// panic and teardown machinery: after this future returns or panics, the
+    /// raw runner freezes the mailbox and incarnation resources, joins them,
+    /// and only then drops this handler (§5.5's resource-before-actor order),
+    /// preserving a callback panic as the authoritative exit. Storing the
+    /// actor in `self` rather than a frame local is what keeps its drop after
+    /// that join on the `Err` and panic paths.
     async fn run(&mut self, raw: &mut RawContext<Self::Msg>) -> ExitResult {
         let args = self
             .args
@@ -376,99 +380,34 @@ impl<A: Actor> RawActor for Handler<A> {
             let mut context = Context::<A>::new(raw, false);
             A::init(args, &mut context).await?
         };
-        self.actor = Some(actor);
+        let actor = self.actor.insert(actor);
         if raw.readiness() == Readiness::AfterInit {
             raw.mark_ready();
         }
 
-        let live_failure = loop {
-            let received = CatchUnwindFuture::new(raw.recv()).await;
-            let message = match received {
-                Ok(Some(message)) => message,
-                Ok(None) => break None,
-                Err(payload) => resume_unwind(payload),
-            };
-            let actor = self
-                .actor
-                .as_mut()
-                .expect("initialized handler retains its actor");
-            if let Err(failure) = handle_message(actor, raw, message, false).await {
-                break Some(failure);
-            }
-        };
+        while let Some(message) = raw.recv().await {
+            let mut context = Context::<A>::new(raw, false);
+            actor.handle(message, &mut context).await?;
+        }
 
-        let failure = match (live_failure, raw.mailbox_shutdown()) {
-            (Some(failure), _) => Some(failure),
-            (None, MailboxShutdown::Drain) => {
-                let mut failure = None;
+        match raw.mailbox_shutdown() {
+            MailboxShutdown::Drain => {
                 while let Some(message) = raw.try_recv() {
-                    let actor = self
-                        .actor
-                        .as_mut()
-                        .expect("initialized handler retains its actor");
-                    if let Err(current) = handle_message(actor, raw, message, true).await {
-                        failure = Some(current);
-                        break;
-                    }
+                    let mut context = Context::<A>::new(raw, true);
+                    actor.handle(message, &mut context).await?;
                 }
-                failure
             }
-            (None, MailboxShutdown::Discard) => {
+            MailboxShutdown::Discard => {
                 while let Some(message) = raw.try_recv() {
                     drop(message);
                 }
-                None
             }
-        };
-
-        if let Some(failure) = failure {
-            return match failure {
-                HandlerFailure::Returned(error) => fail_after_teardown(raw, error).await,
-                HandlerFailure::Panicked(payload) => resume_unwind(payload),
-            };
         }
 
         let mut context = StopContext::<A>::new(raw);
-        let actor = self
-            .actor
-            .as_mut()
-            .expect("initialized handler retains its actor");
-        if let Err(payload) = CatchUnwindFuture::new(actor.on_stop(&mut context)).await {
-            resume_unwind(payload);
-        }
+        actor.on_stop(&mut context).await;
         Ok(())
     }
-}
-
-enum HandlerFailure {
-    Returned(ExitError),
-    Panicked(Box<dyn std::any::Any + Send + 'static>),
-}
-
-async fn handle_message<A: Actor>(
-    actor: &mut A,
-    raw: &mut RawContext<A::Msg>,
-    message: A::Msg,
-    draining: bool,
-) -> Result<(), HandlerFailure> {
-    let mut context = Context::<A>::new(raw, draining);
-    match CatchUnwindFuture::new(actor.handle(message, &mut context)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(HandlerFailure::Returned(error)),
-        Err(payload) => Err(HandlerFailure::Panicked(payload)),
-    }
-}
-
-/// Propagates a handler error after §5.5's orderly teardown order: incarnation-owned
-/// work is frozen, cancelled, and joined before actor state — which the
-/// caller still owns — is dropped at its frame's exit.
-async fn fail_after_teardown<M: Send + 'static>(
-    raw: &mut RawContext<M>,
-    error: ExitError,
-) -> ExitResult {
-    raw.freeze_resources();
-    raw.join_resources().await;
-    Err(error)
 }
 
 type ArgsFactory<A> = Arc<dyn Fn() -> <A as Actor>::Args + Send + Sync + 'static>;

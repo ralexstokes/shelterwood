@@ -349,6 +349,119 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         .expect("tree shuts down");
 }
 
+struct ResumeProbeDecorator<R> {
+    inner: R,
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl<R: RawActor> RawActor for ResumeProbeDecorator<R> {
+    type Msg = R::Msg;
+
+    fn readiness(&self) -> Readiness {
+        self.inner.readiness()
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        let result = self.inner.run(context).await;
+        self.log
+            .lock()
+            .expect("teardown log mutex poisoned")
+            .push("decorator-resumed");
+        result
+    }
+}
+
+struct TeardownDropLog {
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Drop for TeardownDropLog {
+    fn drop(&mut self) {
+        self.log
+            .lock()
+            .expect("teardown log mutex poisoned")
+            .push("offload-destroyed");
+    }
+}
+
+enum OffloadThenFailMessage {
+    Start,
+}
+
+struct OffloadThenFailActor {
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Actor for OffloadThenFailActor {
+    type Msg = OffloadThenFailMessage;
+    type Args = Arc<Mutex<Vec<&'static str>>>;
+
+    async fn init(log: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self { log })
+    }
+
+    async fn handle(
+        &mut self,
+        OffloadThenFailMessage::Start: Self::Msg,
+        context: &mut Context<'_, Self>,
+    ) -> ExitResult {
+        let guard = TeardownDropLog {
+            log: Arc::clone(&self.log),
+        };
+        context
+            .offload(
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                },
+                |_| OffloadThenFailMessage::Start,
+                Duration::MAX,
+            )
+            .expect("live offload accepted");
+        Err(ExitError::message("injected handler failure"))
+    }
+}
+
+/// `Handler` is the advertised raw-decorator composition point, so the raw
+/// incarnation boundary is not necessarily its immediate caller: a callback
+/// error must freeze and join incarnation-owned work inside `Handler::run`,
+/// before a decorator that resumes after delegating can observe still-live
+/// offloads.
+#[tokio::test]
+async fn handler_error_joins_offloads_before_returning_to_a_raw_decorator() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "erroring",
+            RawOnceDef::new(ResumeProbeDecorator {
+                inner: Handler::<OffloadThenFailActor>::new(Arc::clone(&log)),
+                log: Arc::clone(&log),
+            }),
+        )
+        .expect("valid decorated actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor
+        .send(OffloadThenFailMessage::Start)
+        .await
+        .expect("actor live");
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            log.lock().expect("teardown log mutex poisoned").len() == 2
+        })
+        .await
+    );
+    assert_eq!(
+        *log.lock().expect("teardown log mutex poisoned"),
+        ["offload-destroyed", "decorator-resumed"]
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree shuts down");
+}
+
 struct InertActor;
 
 impl Actor for InertActor {

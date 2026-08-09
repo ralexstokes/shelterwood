@@ -1320,9 +1320,11 @@ mod tests {
         // rather than depending on tokio's private sentinel.
         let beyond_tokio_ticks = Duration::from_millis(u64::MAX - 2);
         let current = std::time::Instant::now();
-        let requested = current
-            .checked_add(beyond_tokio_ticks)
-            .expect("the platform represents points beyond tokio's tick range");
+        let Some(requested) = current.checked_add(beyond_tokio_ticks) else {
+            // Some platforms have a narrower Instant domain than Tokio's
+            // u64 millisecond tick range, so this boundary cannot be tested.
+            return;
+        };
 
         assert_eq!(
             next_timer_deadline(current, requested),
@@ -1333,9 +1335,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn deadline_beyond_tokios_tick_range_does_not_fire_at_the_first_slice() {
         let current = super::now();
-        let requested = current
-            .checked_add(Duration::from_millis(u64::MAX - 2))
-            .expect("the platform represents points beyond tokio's tick range");
+        let Some(requested) = current.checked_add(Duration::from_millis(u64::MAX - 2)) else {
+            // See `deadline_beyond_tokios_tick_range_is_armed_in_a_bounded_slice`.
+            return;
+        };
         let mut sleep = std::pin::pin!(super::sleep_until_std(requested));
         let mut context = Context::from_waker(Waker::noop());
 

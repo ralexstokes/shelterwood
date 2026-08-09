@@ -142,7 +142,7 @@ any single design rule:
   invariant makes bit-equality correct: §9.2's backoff factor),
   serializable where Part II §21 needs it, and carrying **no
   behavior** beyond small pure derivation functions of the
-  `should_restart(is_failure)` / `next_delay(attempt, jitter_sample)` /
+  `should_restart(is_failure)` / `next_delay(restart_attempt, jitter_sample)` /
   `validate()` shape. Runtime behavior is *derived from* the data by local
   functions; it is never encoded as trait objects, callbacks, or builder
   side effects.
@@ -1727,7 +1727,13 @@ Two separated concerns:
   still advanced it, mirroring the intensity charge below — and reset by
   an incarnation that exits after running at least the scope's intensity
   window `within` (one clock answers "has it settled"); the snapshot's
-  `restart_count` (B.6) is its non-resetting cumulative twin. Running time is
+  `restart_count` (B.6) is its non-resetting cumulative twin. These three
+  reset-distinct domains are public opaque values: `RestartAttempt` for the
+  resettable backoff position, `RestartCount` for one membership's cumulative
+  charges, and `TotalRestarts` for one scope incarnation's cumulative charges.
+  Each exposes only `ZERO`, a saturating `bump()`, and `get()`; none implements
+  arithmetic traits, so the domains cannot be added, substituted, or compared
+  across one another accidentally. Running time is
   measured between two engine-stamped instants: the incarnation's **start
   instant**, stamped once when the engine schedules the spawn (the
   `Started` event's instant — the same stamp anchors §6's readiness
@@ -3091,7 +3097,8 @@ LifecycleEvent { scope_path, scope, seq, kind }
         Started          { id, membership, incarnation }  // incarnation spawned
         Ready            { id, membership, incarnation }  // readiness gate released (§6)
         Exited           { id, membership, incarnation, exit }   // the §7 exit type
-        RestartScheduled { id, membership, attempt, delay }      // charged per §9.2
+        RestartScheduled { id, membership,
+                           attempt: RestartAttempt, delay }       // charged per §9.2
         Removed          { id, membership,
                            last_incarnation: Option<Incarnation> }  // terminal; None = never started
         ScopeState       { state }                        // the emitting scope's own B.6 state transitions
@@ -3256,7 +3263,7 @@ ChildSnapshot   { id, membership,                       // §3 identity types
                          | StartupAborted { exit },     // terminal pre-ready failure (§6)
                   last_exit: Option<Exit>,              // newest prior exit, if any incarnation has exited
                   membership_status: Active | Removing,
-                  restart_count,                        // cumulative scheduled-restart charges for
+                  restart_count: RestartCount,          // cumulative scheduled-restart charges for
                                                         //   this membership (§9.2): incremented at
                                                         //   scheduling, never reset, the over-budget
                                                         //   scheduled-but-never-spawned charge
@@ -3309,7 +3316,7 @@ ScopeSnapshot   { state: Unstarted                              // membership ex
                                                                 //   aborted ordered sibling (§6) — the
                                                                 //   scope-state twin of §7's exit
                   kind: Ordered | Dynamic, strategy (ordered only), intensity,
-                  total_restarts,                        // charges per §9.2 — group respawns count
+                  total_restarts: TotalRestarts,         // charges per §9.2 — group respawns count
                   lifecycle_seq: LifecycleSeq,           // aligns events with snapshots (§12)
                   children: Vec<ChildSnapshot> }         // declaration order (ordered scopes);
                                                          //   admission order (dynamic scopes) —

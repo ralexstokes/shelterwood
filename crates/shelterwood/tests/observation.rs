@@ -14,9 +14,9 @@ use crate::common::{
 use shelterwood::{
     Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LIFECYCLE_EVENT_CAPACITY,
     LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleSeq,
-    LifecycleTryRecvError, MembershipStatus, RemoveOutcome, RestartCondition, RestartPolicy,
-    Retention, ScopeKind, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef, SubtreeOnceDef,
-    TaskDef, TaskOnceDef, TaskRef, Tree, WaitError,
+    LifecycleTryRecvError, MembershipStatus, RemoveOutcome, RestartCondition, RestartCount,
+    RestartPolicy, Retention, ScopeKind, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef,
+    SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, TotalRestarts, Tree, WaitError,
 };
 
 async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
@@ -598,10 +598,10 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     assert!(child.incarnation.is_none());
     assert!(child.nested.is_none());
     assert!(child.restart_at.is_some());
-    assert_eq!(child.restart_count, 1);
-    assert_eq!(restart_window.total_restarts, 1);
+    assert_eq!(child.restart_count, RestartCount::ZERO.bump());
+    assert_eq!(restart_window.total_restarts, TotalRestarts::ZERO.bump());
     assert_eq!(child.scope_seq, Some(stopped_seq));
-    assert_eq!(nested.snapshot().total_restarts, 1);
+    assert_eq!(nested.snapshot().total_restarts, TotalRestarts::ZERO.bump());
     assert_eq!(
         restart_window
             .descendant(["nested"])
@@ -641,7 +641,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
         "corresponding descendants retain ordering across a scope restart"
     );
     assert_eq!(nested.membership(), scope_membership);
-    assert_eq!(nested.snapshot().total_restarts, 0);
+    assert_eq!(nested.snapshot().total_restarts, TotalRestarts::ZERO);
     assert!(nested.snapshot().lifecycle_seq >= starting.seq);
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
@@ -1310,7 +1310,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
         running.intensity,
         Intensity::new(7, Duration::from_secs(90)).expect("valid intensity")
     );
-    assert_eq!(running.total_restarts, 0);
+    assert_eq!(running.total_restarts, TotalRestarts::ZERO);
     assert_eq!(
         running
             .children
@@ -1327,7 +1327,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     assert!(matches!(nested_row.state, ChildState::Running));
     assert_eq!(nested_row.last_exit, None);
     assert_eq!(nested_row.membership_status, MembershipStatus::Active);
-    assert_eq!(nested_row.restart_count, 0);
+    assert_eq!(nested_row.restart_count, RestartCount::ZERO);
     assert!(
         nested_row.restart_policy.is_never(),
         "a one-shot subtree cannot restart"

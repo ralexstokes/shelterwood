@@ -12,9 +12,9 @@ use shelterwood::{
     Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DefaultsInheritance,
     DynamicTree, ExitError, ExitKind, ExitResult, GracePhase, Intensity, LifecycleEventKind,
     LifecycleItem, LifecycleTryRecvError, Mailbox, MailboxShutdown, Readiness, ReadinessDeadline,
-    RestartCondition, RestartPolicy, ScopeDefaults, SendErrorKind, Shutdown, StartupError,
-    StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef,
-    Tree,
+    RestartAttempt, RestartCondition, RestartPolicy, ScopeDefaults, SendErrorKind, Shutdown,
+    StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
+    TaskOnceDef, TaskRef, Tree,
 };
 
 #[tokio::test]
@@ -743,7 +743,10 @@ async fn restart_attempt_resets_after_a_ready_incarnation_settles() {
             Ok(_) | Err(_) => panic!("unexpected future lifecycle variant"),
         }
     }
-    assert_eq!(attempts, [1, 1]);
+    assert_eq!(
+        attempts,
+        [RestartAttempt::ZERO.bump(), RestartAttempt::ZERO.bump()]
+    );
 
     system
         .shutdown(Duration::from_secs(1))

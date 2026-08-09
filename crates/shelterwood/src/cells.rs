@@ -16,7 +16,8 @@ use std::{
 };
 
 use crate::{
-    ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, ScopeState, Strategy,
+    ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, RestartCount,
+    ScopeState, Strategy, TotalRestarts,
     admission::{RemoveOutcome, ReserveError},
     engine::{Epoch, RequestTarget, ScopeEpochs},
     exit::{StartupError, StopReason},
@@ -94,7 +95,7 @@ pub(crate) struct MemberRecord {
     pub(crate) incarnation: Option<Incarnation>,
     pub(crate) last_incarnation: Option<Incarnation>,
     pub(crate) last_exit: Option<Exit>,
-    pub(crate) restart_count: u64,
+    pub(crate) restart_count: RestartCount,
     pub(crate) restart_at: Option<Instant>,
     pub(crate) removing: bool,
     pub(crate) startup_aborted: bool,
@@ -150,7 +151,7 @@ impl MemberCell {
             incarnation: None,
             last_incarnation: None,
             last_exit: None,
-            restart_count: 0,
+            restart_count: RestartCount::ZERO,
             restart_at: None,
             removing: false,
             startup_aborted: false,
@@ -367,7 +368,7 @@ impl MemberCell {
 pub(crate) struct ScopeRecord {
     pub(crate) state: ScopeState,
     pub(crate) startup: Option<Result<(), StartupError>>,
-    pub(crate) total_restarts: u64,
+    pub(crate) total_restarts: TotalRestarts,
 }
 
 pub(crate) trait DynamicRoute: Send + Sync {
@@ -567,7 +568,7 @@ impl ScopeCell {
         let (record, _) = runtime::watch(ScopeRecord {
             state: ScopeState::Unstarted,
             startup: None,
-            total_restarts: 0,
+            total_restarts: TotalRestarts::ZERO,
         });
         let (current_children, _) = runtime::watch(Vec::new());
         let (parent, _) = runtime::watch(None);
@@ -763,7 +764,7 @@ impl ScopeCell {
         self.with_observation_gate(|| {
             self.record.send_modify(|record| {
                 if state == ScopeState::Starting {
-                    record.total_restarts = 0;
+                    record.total_restarts = TotalRestarts::ZERO;
                 }
                 record.state = state.clone();
             });
@@ -806,7 +807,7 @@ impl ScopeCell {
     pub(crate) fn publish_child_restart(
         &self,
         member: &MemberCell,
-        total_restarts: u64,
+        total_restarts: TotalRestarts,
         update: impl FnOnce(&mut MemberRecord),
         exited: LifecycleEventKind,
         scheduled: LifecycleEventKind,
@@ -1098,7 +1099,7 @@ impl ScopeCell {
             let epoch = control.epochs.begin()?;
             let state = ScopeState::Starting;
             self.record.send_modify(|record| {
-                record.total_restarts = 0;
+                record.total_restarts = TotalRestarts::ZERO;
                 record.state = state.clone();
             });
             // Hold epoch ownership through its observation projection. A

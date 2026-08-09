@@ -2070,6 +2070,10 @@ impl ScopeRuntime {
             // A local stop is reported on a separate helper task. Preserve
             // the application task's mark-ready-before-stop order even when
             // arbitration observes the stop before the readiness event.
+            // An inverted `stop(); mark_ready()` sequence may also count as
+            // ready here when its latch fires before the driver observes the
+            // stop — licensed by the spec's "fired before ... a clean
+            // self-stop is observed" wording (§6).
             self.handle_ready(key, incarnation);
         }
         if self
@@ -3671,6 +3675,155 @@ mod tests {
             factories.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the production guard must suppress the expedited factory after intensity drain"
+        );
+    }
+
+    /// A `mark_ready(); stop()` child reports its local stop and exit on
+    /// helper tasks, so one driver wake can collect both while the fired
+    /// readiness latch's Ready event is still undrained — and arbitration
+    /// orders the stop ahead of the readiness signal. `handle_self_stop`
+    /// must consult the fired latch before `begin_stop_child`'s Shutdown
+    /// step disarms the gate, or the clean post-ready exit is misread as a
+    /// pre-ready stop and spuriously aborts startup.
+    #[crate::runtime::test]
+    async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "ready-then-stop",
+            TaskDef::new(|_| future::pending::<crate::ExitResult>())
+                .readiness(Readiness::Manual)
+                .expect("manual readiness is valid")
+                .readiness_deadline(ReadinessDeadline::Unbounded),
+        )
+        .expect("valid task");
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+        let mut children = ChildArena::default();
+        let key = children
+            .insert(child)
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::starting(),
+            next_ordered_start: Some(key),
+            role: ScopeRole::Root,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        scope.spawn_child(key);
+        let active = scope.children[key]
+            .active
+            .as_ref()
+            .expect("spawned child is active");
+        let incarnation = active.incarnation;
+        // The application task fired its readiness latch before stopping;
+        // the driver has not yet drained the corresponding Ready event.
+        assert!(active.ready_signal.fire());
+        active.abort_handle.abort();
+
+        let mut pending = [
+            Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+                child: key,
+                incarnation,
+                recorded: Some(RecordedOutcome::Returned(Ok(()))),
+                join: JoinVerdict::Completed,
+                cancellation: Cancellation::NotObserved,
+                readiness_signal_seen: true,
+            }))
+            .classified(),
+            Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop {
+                child: key,
+                incarnation,
+            }))
+            .classified(),
+        ];
+        arbitrate(&mut pending);
+        assert!(
+            matches!(
+                pending[0].1,
+                Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop { .. }))
+            ),
+            "the regression premise: arbitration orders the stop ahead of the exit"
+        );
+        for (_, event) in pending {
+            match event {
+                Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop {
+                    child,
+                    incarnation,
+                })) => scope.handle_self_stop(child, incarnation),
+                Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                })) => scope.handle_exit(
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                ),
+                _ => unreachable!("the fixture queues only the stop and the exit"),
+            }
+        }
+
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
+            disposal_event_receiver
+                .recv()
+                .await
+                .expect("disposal reports completion")
+        else {
+            panic!("only construction disposal was armed")
+        };
+        scope.handle_construction_disposed(child, panic);
+
+        assert!(
+            scope.lifecycle.startup_complete(),
+            "the ready-before-stop child completes startup"
+        );
+        assert!(
+            matches!(root.record().startup, Some(Ok(()))),
+            "a fired readiness latch must survive a same-batch local stop: {:?}",
+            root.record().startup
+        );
+        assert_eq!(root.record().state, ScopeState::Running);
+        assert!(matches!(
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::Completed)
+        ));
+        assert!(
+            !scope.children[key].slot.member.record().startup_aborted,
+            "a post-ready clean self-stop is not a startup abort"
         );
     }
 

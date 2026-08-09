@@ -216,16 +216,12 @@ pub(crate) fn spawn_actor_work(future: impl Future<Output = ()> + Send + 'static
 }
 
 pub(crate) struct BlockingWork<T> {
-    handle: Option<JoinHandle<T>>,
+    handle: JoinHandle<T>,
 }
 
 impl<T: Send + 'static> BlockingWork<T> {
-    pub(crate) async fn join(mut self) -> T {
-        let handle = self
-            .handle
-            .take()
-            .expect("blocking operation was joined more than once");
-        join_resuming(handle).await
+    pub(crate) async fn join(self) -> T {
+        join_resuming(self.handle).await
     }
 }
 
@@ -233,7 +229,7 @@ pub(crate) fn spawn_blocking_work<T: Send + 'static>(
     operation: impl FnOnce() -> T + Send + 'static,
 ) -> BlockingWork<T> {
     BlockingWork {
-        handle: Some(spawn_blocking(operation)),
+        handle: spawn_blocking(operation),
     }
 }
 

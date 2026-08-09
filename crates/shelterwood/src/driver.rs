@@ -2052,6 +2052,19 @@ impl ScopeRuntime {
     }
 
     fn handle_self_stop(&mut self, key: ChildKey, incarnation: Incarnation) {
+        let ready_before_stop = self
+            .children
+            .get(key)
+            .and_then(|child| child.active.as_ref())
+            .is_some_and(|active| {
+                active.incarnation == incarnation && active.ready_signal.is_fired()
+            });
+        if ready_before_stop {
+            // A local stop is reported on a separate helper task. Preserve
+            // the application task's mark-ready-before-stop order even when
+            // arbitration observes the stop before the readiness event.
+            self.handle_ready(key, incarnation);
+        }
         if self
             .children
             .get(key)
@@ -2070,6 +2083,26 @@ impl ScopeRuntime {
         mut join: JoinVerdict,
         cancellation: Cancellation,
     ) {
+        let readiness_effect = self
+            .children
+            .get_mut(key)
+            .and_then(|child| child.active.as_mut())
+            .filter(|active| active.incarnation == incarnation)
+            .and_then(|active| {
+                active.readiness.step(ReadinessEvent::Exit {
+                    signal_seen: active.ready_signal.is_fired(),
+                })
+            });
+        let became_ready = readiness_effect
+            .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
+            .unwrap_or(false);
+        if became_ready {
+            // Match the natural signal-before-exit order: ordered startup may
+            // advance, and a sole ready child completes aggregate startup
+            // before its post-ready exit is classified.
+            self.progress_startup();
+        }
+
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
@@ -2091,7 +2124,6 @@ impl ScopeRuntime {
         {
             runtime::dispose_detached(teardown);
         }
-        active.readiness.step(ReadinessEvent::Exit);
         if let (JoinVerdict::Cancelled { .. }, Some(phase)) = (&join, active.hard_abort_phase) {
             join = JoinVerdict::Cancelled { phase };
         }
@@ -2372,7 +2404,13 @@ impl ScopeRuntime {
                     self.progress_startup();
                 }
             }
-            DeadlineKind::Restart { child } => self.spawn_child(child),
+            DeadlineKind::Restart { child } => {
+                self.spawn_child(child);
+                // A restart-deadline caller is outside `progress_startup`'s
+                // ordered loop. Revisit the aggregate in case this spawn's
+                // immediate-readiness effect released its last gate.
+                self.progress_startup();
+            }
             DeadlineKind::Stop { child, incarnation } => {
                 if self
                     .children

@@ -19,7 +19,7 @@ use crate::{
     deadline::Deadline,
     engine::{
         ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
-        IncarnationRun, IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent,
+        IncarnationRun, IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent,
         ReadinessGate, RestartState, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate,
         dispatch_exit, schedule_restart,
     },
@@ -2110,12 +2110,12 @@ impl ScopeRuntime {
         } else {
             ScopeMode::Running
         };
-        let member_mode = if child.slot.member.record().removing {
-            MembershipMode::Removing
+        let membership_status = if child.slot.member.record().removing {
+            MembershipStatus::Removing
         } else {
-            MembershipMode::Active
+            MembershipStatus::Active
         };
-        match dispatch_exit(&exit, child.options.restart, mode, member_mode) {
+        match dispatch_exit(&exit, child.options.restart, mode, membership_status) {
             ExitDispatch::Terminal => {
                 // §6's startup abort is a startup-sequence property: the
                 // membership failed before its *initial* readiness edge. A

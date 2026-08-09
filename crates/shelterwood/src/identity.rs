@@ -4,7 +4,10 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     fmt,
     hash::Hash,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 #[cfg(test)]
@@ -18,8 +21,10 @@ thread_local! {
 }
 
 /// A child identifier within one scope.
+// Shared text keeps error evidence allocation-free: every rejected send and
+// call clones the id, so a clone must be a refcount bump, not a heap copy.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ChildId(String);
+pub struct ChildId(Arc<str>);
 
 impl ChildId {
     pub(crate) fn validate(value: impl Into<String>) -> Result<Self, IdError> {
@@ -27,7 +32,7 @@ impl ChildId {
         if value.is_empty() {
             Err(IdError::Empty)
         } else {
-            Ok(Self(value))
+            Ok(Self(Arc::from(value)))
         }
     }
 
@@ -46,13 +51,13 @@ impl fmt::Display for ChildId {
 
 impl From<&str> for ChildId {
     fn from(value: &str) -> Self {
-        Self(value.to_owned())
+        Self(Arc::from(value))
     }
 }
 
 impl From<String> for ChildId {
     fn from(value: String) -> Self {
-        Self(value)
+        Self(Arc::from(value))
     }
 }
 

@@ -5,20 +5,28 @@ set -euo pipefail
 # default scans the repository from the invoking directory as before.
 cd "${SHELTERWOOD_ENFORCEMENT_ROOT:-.}"
 
-readonly driver_path="crates/shelterwood/src/driver.rs"
-readonly tree_path="crates/shelterwood/src/tree.rs"
+readonly source_root="crates/shelterwood/src"
+readonly driver_path="$source_root/driver.rs"
+readonly tree_path="$source_root/tree.rs"
 
-# Every top-level Rust module except the two orchestration layers belongs below
-# the driver. Derive the set so adding a module cannot silently bypass this
-# check; lib.rs is the crate root and is allowed to wire every layer together.
+# Every Rust source except the two orchestration modules and their submodules
+# belongs below the driver. Derive all three sets recursively so either a flat
+# module or the conventional `module/mod.rs` layout cannot silently bypass the
+# check; lib.rs is the crate root and may wire every layer together.
 below_driver_layers=()
-for path in crates/shelterwood/src/*.rs; do
+driver_layers=()
+tree_layers=()
+while IFS= read -r -d '' path; do
   case "$path" in
-    "$driver_path"|"$tree_path"|crates/shelterwood/src/lib.rs) ;;
+    "$source_root/lib.rs") ;;
+    "$driver_path"|"$source_root/driver/"*) driver_layers+=("$path") ;;
+    "$tree_path"|"$source_root/tree/"*) tree_layers+=("$path") ;;
     *) below_driver_layers+=("$path") ;;
   esac
-done
+done < <(find "$source_root" -type f -name '*.rs' -print0)
 readonly -a below_driver_layers
+readonly -a driver_layers
+readonly -a tree_layers
 
 check_forbidden() {
   local message="$1"
@@ -54,16 +62,16 @@ check_forbidden \
 check_forbidden \
   "upward tree references found in the driver layer:" \
   '\btree::' \
-  "$driver_path"
+  "${driver_layers[@]}"
 
 check_forbidden \
   "child option resolution escaped the shared plan funnel:" \
   '\bresolve_common\b' \
-  "$driver_path"
+  "${driver_layers[@]}"
 
 check_forbidden \
   "dynamic child-id validation escaped the reservation boundary:" \
   '\bchecked_id\b' \
-  "$tree_path"
+  "${tree_layers[@]}"
 
 echo "supervision layering restrictions: clean"

@@ -320,7 +320,7 @@ mod tests {
     };
 
     use crate::{
-        ChildId, Exit, ExitKind,
+        Cancellation, ChildId, Exit, ExitKind, GracePhase,
         cells::MemberCell,
         identity::ScopeIdentity,
         runtime::{self, Latch},
@@ -407,7 +407,7 @@ mod tests {
         let mut context = Context::from_waker(Waker::noop());
 
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
-        member.terminalize(Exit::new(ExitKind::Completed, false));
+        member.terminalize(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
         assert_eq!(waiting.await, Ok(42));
     }
 
@@ -417,7 +417,12 @@ mod tests {
         sender.send(42_u8).expect("claim remains open");
         let mut waiting = Box::pin(claim.wait());
         let mut context = Context::from_waker(Waker::noop());
-        let exit = Exit::new(ExitKind::Aborted { after_grace: false }, true);
+        let exit = Exit::new(
+            ExitKind::Aborted {
+                phase: GracePhase::WithinGrace,
+            },
+            Cancellation::Observed,
+        );
 
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
         member.terminalize(exit.clone());
@@ -429,7 +434,7 @@ mod tests {
     async fn completed_terminal_publication_requires_a_typed_value() {
         let (sender, claim, member) = one_shot_claim::<u8>();
         drop(sender);
-        member.terminalize(Exit::new(ExitKind::Completed, false));
+        member.terminalize(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
 
         let _ = claim.wait().await;
     }

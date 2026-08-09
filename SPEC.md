@@ -835,6 +835,11 @@ batch in arming order. Within class 3, ordering between mailbox and
 offload deliveries stays deliberately unspecified (§5.1's ordering
 contract promises per-sender FIFO and nothing more).
 
+For this ordering rule, a timer **fires** when the event loop observes due
+armings and takes their timer batch. "Queued at the fire instant" therefore
+means present at that batch-take linearization point, not merely present when
+the wall clock passed the timer's deadline.
+
 Already-queued messages get one bounded turn to retract an elapsed timer:
 when a timer fires, the messages queued *at that instant* are delivered
 first (they may `clear_timer` the fired key), then the timer message goes

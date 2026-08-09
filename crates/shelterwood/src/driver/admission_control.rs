@@ -14,7 +14,7 @@ use crate::{
     runtime::{self, Latch},
 };
 
-use super::{DriverEvent, Obligation};
+use super::{ChildKey, DriverEvent, Obligation, RemovalRequest};
 
 pub(crate) type RemovalResponse = runtime::OneShotReceiver<RemoveOutcome>;
 
@@ -53,27 +53,104 @@ fn completed_removal(outcome: RemoveOutcome) -> RemovalResponse {
 
 pub(super) struct DynamicEntry {
     pub(super) slot: Arc<SlotCell>,
-    pub(super) admitted: bool,
-    pub(super) fused_cancel: Option<Latch>,
+    state: DynamicMembershipState,
     pub(super) removal: Obligation<RemovalResponses>,
-    pub(super) removal_started: bool,
+}
+
+// The authoritative dynamic control-plane phase. `MemberRecord::removing`
+// is only its public observation projection; driver decisions use this enum.
+// A resident owns its arena key, so removal and restart paths never have to
+// rediscover the corresponding `ChildRuntime` with a linear scan.
+enum DynamicMembershipState {
+    Reserved,
+    Resident {
+        key: ChildKey,
+        fused_cancel: Option<Latch>,
+    },
+    Removing {
+        key: ChildKey,
+    },
 }
 
 impl DynamicEntry {
-    fn reserved(slot: Arc<SlotCell>) -> Self {
+    pub(super) fn reserved(slot: Arc<SlotCell>) -> Self {
         Self {
             slot,
-            admitted: false,
-            fused_cancel: None,
+            state: DynamicMembershipState::Reserved,
             removal: Obligation::new(RemovalResponses::default(), complete_removals),
-            removal_started: false,
         }
     }
 
-    fn admitted(slot: Arc<SlotCell>) -> Self {
+    pub(super) fn resident(
+        slot: Arc<SlotCell>,
+        key: ChildKey,
+        fused_cancel: Option<Latch>,
+    ) -> Self {
         Self {
-            admitted: true,
-            ..Self::reserved(slot)
+            slot,
+            state: DynamicMembershipState::Resident { key, fused_cancel },
+            removal: Obligation::new(RemovalResponses::default(), complete_removals),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn removing(slot: Arc<SlotCell>, key: ChildKey, removal: RemovalResponses) -> Self {
+        Self {
+            slot,
+            state: DynamicMembershipState::Removing { key },
+            removal: Obligation::new(removal, complete_removals),
+        }
+    }
+
+    pub(super) fn is_reserved(&self) -> bool {
+        matches!(self.state, DynamicMembershipState::Reserved)
+    }
+
+    pub(super) fn is_removing(&self) -> bool {
+        matches!(self.state, DynamicMembershipState::Removing { .. })
+    }
+
+    fn removal_requested(&self) -> bool {
+        match &self.state {
+            DynamicMembershipState::Resident { fused_cancel, .. } => {
+                fused_cancel.as_ref().is_some_and(Latch::is_fired)
+            }
+            DynamicMembershipState::Removing { .. } => true,
+            DynamicMembershipState::Reserved => false,
+        }
+    }
+
+    pub(super) fn key(&self) -> Option<ChildKey> {
+        match self.state {
+            DynamicMembershipState::Reserved => None,
+            DynamicMembershipState::Resident { key, .. }
+            | DynamicMembershipState::Removing { key } => Some(key),
+        }
+    }
+
+    pub(super) fn matches_key(&self, key: ChildKey) -> bool {
+        self.key() == Some(key)
+    }
+
+    pub(super) fn promote(&mut self, key: ChildKey, fused_cancel: Option<Latch>) {
+        debug_assert!(self.is_reserved(), "only a reservation can become resident");
+        self.state = DynamicMembershipState::Resident { key, fused_cancel };
+    }
+
+    pub(super) fn mark_removing(&mut self) -> Option<ChildKey> {
+        let key = self.key()?;
+        self.state = DynamicMembershipState::Removing { key };
+        Some(key)
+    }
+
+    pub(super) fn restart_is_suppressed(&self, key: ChildKey) -> bool {
+        match &self.state {
+            DynamicMembershipState::Reserved => false,
+            DynamicMembershipState::Resident {
+                key: resident,
+                fused_cancel,
+            } => *resident == key && fused_cancel.as_ref().is_some_and(Latch::is_fired),
+            DynamicMembershipState::Removing { key: removing } => *removing == key,
         }
     }
 }
@@ -150,12 +227,15 @@ impl DynamicControl {
         control
     }
 
-    pub(super) fn register_initial<'a>(&self, slots: impl IntoIterator<Item = &'a Arc<SlotCell>>) {
+    pub(super) fn register_initial<'a>(
+        &self,
+        slots: impl IntoIterator<Item = (&'a Arc<SlotCell>, ChildKey)>,
+    ) {
         let mut state = self.state.lock().expect("dynamic-state mutex poisoned");
-        for slot in slots {
+        for (slot, key) in slots {
             state.entries.insert(
                 slot.member.id().clone(),
-                DynamicEntry::admitted(Arc::clone(slot)),
+                DynamicEntry::resident(Arc::clone(slot), key, None),
             );
         }
     }
@@ -171,7 +251,7 @@ impl DynamicControl {
         self.request_forwarder_close.fire();
         let mut retained = HashMap::new();
         for (id, entry) in entries {
-            if !entry.admitted {
+            if entry.is_reserved() {
                 let definition = entry.slot.take_never_started();
                 dispose_definition_then(definition, move || drop(entry));
             } else {
@@ -234,7 +314,7 @@ fn reserve_dynamic_slot(
         return Err(ReserveError::NotAdmitting(NotAdmittingCause::Draining));
     }
     if let Some(existing) = state.entries.get(&id) {
-        if existing.slot.member.record().removing {
+        if existing.removal_requested() {
             return Err(ReserveError::RemovalInProgress(id));
         }
         return Err(ReserveError::DuplicateId(id));
@@ -290,7 +370,7 @@ pub(super) fn cancel_dynamic_reservation_parts(
     let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
     let id = slot.member.id().clone();
     let cancelled = state.entries.get(&id).is_some_and(|entry| {
-        entry.slot.member.membership() == slot.member.membership() && !entry.admitted
+        entry.slot.member.membership() == slot.member.membership() && entry.is_reserved()
     });
     let removed = cancelled.then(|| state.entries.remove(&id)).flatten();
     drop(state);
@@ -313,17 +393,28 @@ fn cancel_dynamic_reservation_impl(control: &DynamicControl, slot: &Arc<SlotCell
     dispose_definition_then(definition, move || drop(removed));
 }
 
-pub(crate) fn signal_fused_cancel(
-    control: &dyn DynamicRoute,
-    membership: Membership,
-    latch: &Latch,
-) {
-    control.signal_fused_cancel(membership, latch);
+pub(crate) fn signal_fused_cancel(control: &dyn DynamicRoute, slot: &Arc<SlotCell>, latch: &Latch) {
+    control.signal_fused_cancel(slot, latch);
 }
 
-fn signal_fused_cancel_impl(control: &DynamicControl, membership: Membership, latch: &Latch) {
-    if latch.fire() {
-        queue_driver_event(control, DriverEvent::Removal(membership));
+fn signal_fused_cancel_impl(control: &DynamicControl, slot: &Arc<SlotCell>, latch: &Latch) {
+    if !latch.fire() {
+        return;
+    }
+    let removal = {
+        let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
+        state
+            .entries
+            .get_mut(slot.member.id())
+            .filter(|entry| entry.slot.member.membership() == slot.member.membership())
+            .and_then(DynamicEntry::mark_removing)
+            .map(|key| RemovalRequest {
+                membership: slot.member.membership(),
+                key,
+            })
+    };
+    if let Some(removal) = removal {
+        queue_driver_event(control, DriverEvent::Removal(removal));
     }
 }
 
@@ -358,7 +449,7 @@ fn remove_dynamic_impl(
         return completed_removal(RemoveOutcome::AlreadyAbsent);
     }
     let response = entry.removal.payload_mut().subscribe();
-    if !entry.admitted {
+    if entry.is_reserved() {
         let entry = state.entries.remove(id).expect("entry was just resolved");
         drop(state);
         let definition = entry.slot.take_never_started();
@@ -370,6 +461,9 @@ fn remove_dynamic_impl(
     // registration is reclaimed before the removal response completes.
     let member = Arc::clone(&entry.slot.member);
     let membership = member.membership();
+    let key = entry
+        .mark_removing()
+        .expect("a non-reservation has a resident child key");
     // Dynamic-state protects admission/removal bookkeeping; the observation
     // gate protects the public projection. Release the former before entering
     // the latter. No path takes the two in the opposite order, so this is not
@@ -378,9 +472,14 @@ fn remove_dynamic_impl(
     // observation work, and blocking there while holding dynamic state would
     // stall every concurrent reservation, removal, and driver admission.
     drop(state);
-    scope.transition_child(&member, |record| record.removing = true, None);
+    if !member.record().removing {
+        scope.transition_child(&member, |record| record.removing = true, None);
+    }
     if member.removal.fire() {
-        queue_driver_event(control, DriverEvent::Removal(membership));
+        queue_driver_event(
+            control,
+            DriverEvent::Removal(RemovalRequest { membership, key }),
+        );
     }
     response
 }
@@ -407,8 +506,8 @@ impl DynamicRoute for DynamicControl {
         cancel_dynamic_reservation_impl(self, slot);
     }
 
-    fn signal_fused_cancel(&self, membership: Membership, latch: &Latch) {
-        signal_fused_cancel_impl(self, membership, latch);
+    fn signal_fused_cancel(&self, slot: &Arc<SlotCell>, latch: &Latch) {
+        signal_fused_cancel_impl(self, slot, latch);
     }
 
     fn remove(

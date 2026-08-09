@@ -38,7 +38,7 @@ use crate::{
 };
 
 use admission_control::{
-    AdmissionRequest, DynamicControl, cancel_dynamic_reservation_parts,
+    AdmissionRequest, DynamicControl, DynamicEntry, cancel_dynamic_reservation_parts,
     reject_admission_after_disposal,
 };
 pub(crate) use admission_control::{
@@ -49,7 +49,7 @@ pub(crate) use admission_control::{
 #[cfg(test)]
 use crate::cells::{GateCapture, MemberCell, RuntimeStorage};
 #[cfg(test)]
-use admission_control::{DynamicEntry, RemovalResponses, complete_removals};
+use admission_control::RemovalResponses;
 
 /// An exactly-once synchronous completion.
 ///
@@ -185,7 +185,13 @@ fn resident_projection(slot: &SlotCell) -> ResidentProjection {
 enum DriverEvent {
     Child(ChildEvent),
     Admission(AdmissionRequest),
-    Removal(Membership),
+    Removal(RemovalRequest),
+}
+
+#[derive(Clone, Copy)]
+struct RemovalRequest {
+    membership: Membership,
+    key: ChildKey,
 }
 
 impl SystemRun {
@@ -1040,6 +1046,36 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
 }
 
 impl ScopeRuntime {
+    fn dynamic_membership_is_removing(&self, key: ChildKey) -> bool {
+        let Some(child) = self.children.get(key) else {
+            return false;
+        };
+        self.dynamic.as_ref().is_some_and(|control| {
+            control
+                .state
+                .lock()
+                .expect("dynamic-state mutex poisoned")
+                .entries
+                .get(child.slot.member.id())
+                .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
+                .is_some_and(|entry| entry.is_removing() && entry.matches_key(key))
+        })
+    }
+
+    fn publish_dynamic_removal(&self, key: ChildKey) {
+        let Some(member) = self
+            .children
+            .get(key)
+            .map(|child| Arc::clone(&child.slot.member))
+        else {
+            return;
+        };
+        if !member.record().removing {
+            self.root
+                .transition_child(&member, |record| record.removing = true, None);
+        }
+    }
+
     fn restart_is_suppressed(&self, key: ChildKey) -> bool {
         if self.lifecycle.is_draining()
             || self.hard_forced
@@ -1054,10 +1090,6 @@ impl ScopeRuntime {
         let Some(child) = self.children.get(key) else {
             return true;
         };
-        let record = child.slot.member.record();
-        if record.removing || child.slot.member.removal.is_fired() {
-            return true;
-        }
         self.dynamic.as_ref().is_some_and(|control| {
             control
                 .state
@@ -1066,10 +1098,7 @@ impl ScopeRuntime {
                 .entries
                 .get(child.slot.member.id())
                 .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
-                .is_some_and(|entry| {
-                    entry.removal_started
-                        || entry.fused_cancel.as_ref().is_some_and(Latch::is_fired)
-                })
+                .is_some_and(|entry| entry.restart_is_suppressed(key))
         })
     }
 
@@ -1852,8 +1881,12 @@ impl ScopeRuntime {
             terminal.exited_incarnation,
             startup,
         );
-        let removing = self.children[key].slot.member.record().removing;
-        if removing {
+        if self.dynamic_membership_is_removing(key) {
+            // A foreign remover may have committed the control-plane state
+            // and be waiting for this thread's observation gate. Publish the
+            // Removing projection before pruning so the public lifecycle
+            // cannot skip directly from resident to Removed.
+            self.publish_dynamic_removal(key);
             self.finalize_removal(key);
         } else if terminal.startup == StartupDisposition::Aborted && !self.lifecycle.is_draining() {
             self.fail_startup(key, exit);
@@ -2046,12 +2079,12 @@ impl ScopeRuntime {
             }
         };
         let plan = ChildPlan::with_options(Arc::clone(&request.slot), definition, resolved);
-        {
+        let key = {
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
             let id = request.slot.member.id();
             let matches_reservation = state.entries.get(id).is_some_and(|entry| {
                 entry.slot.member.membership() == request.slot.member.membership()
-                    && !entry.admitted
+                    && entry.is_reserved()
             });
             if !matches_reservation || request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
                 let removed = matches_reservation
@@ -2072,41 +2105,36 @@ impl ScopeRuntime {
                 );
                 return;
             }
+            // The control-plane lock makes arena insertion and promotion one
+            // state transition: an exact remover sees either the reservation
+            // or a resident carrying its live arena key, never an unindexed
+            // admitted intermediate.
+            let mut child = ChildRuntime::from_plan(plan, &self.root);
+            child.initial = false;
+            let key = match self.children.insert(child) {
+                Ok(key) => key,
+                Err(child) => {
+                    let removed = state.entries.remove(id);
+                    drop(state);
+                    let mut child = *child;
+                    request.slot.terminalize_never_started();
+                    child.complete_terminality();
+                    let ChildRuntime { construction, .. } = child;
+                    reject_admission_after_disposal(
+                        request,
+                        Some(construction),
+                        removed,
+                        ReserveError::IdentityExhausted,
+                    );
+                    return;
+                }
+            };
             let entry = state
                 .entries
                 .get_mut(id)
                 .expect("the matching reservation was just resolved");
-            entry.admitted = true;
-            entry.fused_cancel = request.fused_cancel.take();
-        }
-        let mut child = ChildRuntime::from_plan(plan, &self.root);
-        child.initial = false;
-        let key = match self.children.insert(child) {
-            Ok(key) => key,
-            Err(child) => {
-                let mut child = *child;
-                let removed = {
-                    let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-                    let id = request.slot.member.id();
-                    let matches_admission = state.entries.get(id).is_some_and(|entry| {
-                        entry.slot.member.membership() == request.slot.member.membership()
-                            && entry.admitted
-                    });
-                    matches_admission
-                        .then(|| state.entries.remove(id))
-                        .flatten()
-                };
-                request.slot.terminalize_never_started();
-                child.complete_terminality();
-                let ChildRuntime { construction, .. } = child;
-                reject_admission_after_disposal(
-                    request,
-                    Some(construction),
-                    removed,
-                    ReserveError::IdentityExhausted,
-                );
-                return;
-            }
+            entry.promote(key, request.fused_cancel.take());
+            key
         };
         self.root.admit_child(resident_projection(&request.slot));
         #[cfg(test)]
@@ -2115,32 +2143,32 @@ impl ScopeRuntime {
         self.spawn_child(key);
     }
 
-    fn handle_removal(&mut self, membership: Membership) {
-        if let Some(control) = &self.dynamic {
-            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-            if let Some(entry) = state
-                .entries
-                .values_mut()
-                .find(|entry| entry.slot.member.membership() == membership)
-            {
-                if entry.removal_started {
-                    return;
-                }
-                entry.removal_started = true;
-            }
-        }
-        let Some(key) = self
+    fn handle_removal(&mut self, removal: RemovalRequest) {
+        let RemovalRequest { membership, key } = removal;
+        let Some(member) = self
             .children
-            .keys()
-            .find(|key| self.children[*key].slot.member.membership() == membership)
+            .get(key)
+            .map(|child| Arc::clone(&child.slot.member))
+            .filter(|member| member.membership() == membership)
         else {
             return;
         };
-        self.root.transition_child(
-            &self.children[key].slot.member,
-            |record| record.removing = true,
-            None,
-        );
+        let Some(control) = &self.dynamic else {
+            return;
+        };
+        let tracked = {
+            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
+            state
+                .entries
+                .get_mut(member.id())
+                .filter(|entry| entry.slot.member.membership() == membership)
+                .and_then(DynamicEntry::mark_removing)
+                .is_some_and(|tracked| tracked == key)
+        };
+        if !tracked {
+            return;
+        }
+        self.publish_dynamic_removal(key);
         if self.children[key].is_terminal() {
             self.finalize_removal(key);
         } else {
@@ -2158,11 +2186,11 @@ impl ScopeRuntime {
         let member = Arc::clone(&self.children[key].slot.member);
         let id = member.id().clone();
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-        if state
-            .entries
-            .get(&id)
-            .is_some_and(|entry| entry.slot.member.membership() == member.membership())
-        {
+        if state.entries.get(&id).is_some_and(|entry| {
+            entry.slot.member.membership() == member.membership()
+                && entry.matches_key(key)
+                && entry.is_removing()
+        }) {
             let entry = state.entries.remove(&id).expect("entry was just resolved");
             drop(state);
             self.root.prune_child(&member);
@@ -2177,11 +2205,9 @@ impl ScopeRuntime {
         if let Some(control) = &self.dynamic {
             let id = member.id().clone();
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-            if state
-                .entries
-                .get(&id)
-                .is_some_and(|entry| entry.slot.member.membership() == member.membership())
-            {
+            if state.entries.get(&id).is_some_and(|entry| {
+                entry.slot.member.membership() == member.membership() && entry.matches_key(key)
+            }) {
                 removed = state.entries.remove(&id);
             }
         }
@@ -2338,10 +2364,6 @@ async fn run_scope_incarnation(
     let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
     let dynamic =
         (plan.root.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(events.clone()));
-    if let Some(control) = &dynamic {
-        control.register_initial(plan.children.iter().map(|child| &child.slot));
-        root.set_dynamic_route(Some(control.clone()));
-    }
     root.set_admitted_children(
         plan.children
             .iter()
@@ -2359,6 +2381,15 @@ async fn run_scope_incarnation(
         if children.insert(child).is_err() {
             unreachable!("a fresh child-key domain accommodates an in-memory child collection");
         }
+    }
+    if let Some(control) = &dynamic {
+        control.register_initial(
+            children
+                .children
+                .iter()
+                .map(|(key, child)| (&child.slot, *key)),
+        );
+        root.set_dynamic_route(Some(control.clone()));
     }
     let next_ordered_start = children.keys().next();
     let mut scope = ScopeRuntime {
@@ -2534,9 +2565,7 @@ async fn run_scope_incarnation(
                 Pending::Force => {
                     scope.force_all();
                 }
-                Pending::Driver(DriverEvent::Removal(membership)) => {
-                    scope.handle_removal(membership)
-                }
+                Pending::Driver(DriverEvent::Removal(removal)) => scope.handle_removal(removal),
                 Pending::Driver(DriverEvent::Admission(request)) => {
                     scope.handle_admission(request);
                 }
@@ -2683,10 +2712,9 @@ mod tests {
     use super::{
         AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
         DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
-        Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
-        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, complete_removals,
-        report_channel, resident_projection, restart_shutdown_work, run_nested_tree,
-        run_scope_incarnation,
+        Pending, RemovalRequest, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
+        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, report_channel,
+        resident_projection, restart_shutdown_work, run_nested_tree, run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -4027,13 +4055,7 @@ mod tests {
             .entries
             .insert(
                 ChildId::from("worker"),
-                DynamicEntry {
-                    slot,
-                    admitted: true,
-                    fused_cancel: None,
-                    removal: Obligation::new(responses, complete_removals),
-                    removal_started: true,
-                },
+                DynamicEntry::removing(slot, ChildKey(1), responses),
             );
 
         let entries = control.close();
@@ -4106,21 +4128,13 @@ mod tests {
         root.set_admitted_children(vec![resident_projection(&slot)]);
         let (events, _receiver) = crate::runtime::bounded_mpsc(1);
         let control = DynamicControl::new(events);
+        let key = ChildKey(1);
         control
             .state
             .lock()
             .expect("dynamic-state mutex poisoned")
             .entries
-            .insert(
-                child_id.clone(),
-                DynamicEntry {
-                    slot,
-                    admitted: true,
-                    fused_cancel: None,
-                    removal: Obligation::new(RemovalResponses::default(), complete_removals),
-                    removal_started: false,
-                },
-            );
+            .insert(child_id.clone(), DynamicEntry::resident(slot, key, None));
         root.set_dynamic_route(Some(control.clone()));
 
         let captures = root.probe_gate_captures();
@@ -4141,12 +4155,25 @@ mod tests {
                 .expect("removal reports its gate capture within the bound"),
             GateCapture::Observation
         );
-        drop(
-            control
-                .state
-                .try_lock()
-                .expect("a removal waiting on observation must release dynamic state"),
-        );
+        let state = control
+            .state
+            .try_lock()
+            .expect("a removal waiting on observation must release dynamic state");
+        let entry = state
+            .entries
+            .get(&child_id)
+            .expect("the removal keeps its resident registration");
+        assert!(entry.is_removing());
+        assert!(entry.matches_key(key));
+        drop(state);
+
+        let route = root
+            .dynamic_route()
+            .expect("the fixture exposes its dynamic route");
+        assert!(matches!(
+            route.reserve(&root, child_id.clone(), None),
+            Err(crate::ReserveError::RemovalInProgress(id)) if id == child_id
+        ));
 
         drop(held_gate);
         let response = worker.join().expect("removal transition completes");
@@ -4164,19 +4191,37 @@ mod tests {
         let second = identity
             .mint_membership(&second_id)
             .expect("second membership available");
+        let member = MemberCell::new(second_id.clone(), second);
+        let slot = SlotCell::new(Arc::clone(&member), None);
+        let second_key = ChildKey(2);
         let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
         assert!(
-            events.try_send(DriverEvent::Removal(first)).is_ok(),
+            events
+                .try_send(DriverEvent::Removal(RemovalRequest {
+                    membership: first,
+                    key: ChildKey(1),
+                }))
+                .is_ok(),
             "the fixture saturates the bounded driver lane"
         );
         let control = DynamicControl::new(events);
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entries
+            .insert(
+                second_id,
+                DynamicEntry::resident(Arc::clone(&slot), second_key, Some(Latch::default())),
+            );
         let foreign_control = Arc::clone(&control);
+        let foreign_slot = Arc::clone(&slot);
         std::thread::spawn(move || {
             assert!(
                 !crate::runtime::is_available(),
                 "Tokio context is not inherited by a foreign thread"
             );
-            super::signal_fused_cancel(foreign_control.as_ref(), second, &Latch::default());
+            super::signal_fused_cancel(foreign_control.as_ref(), &foreign_slot, &Latch::default());
         })
         .join()
         .expect("foreign-thread removal signaling succeeds");
@@ -4184,7 +4229,7 @@ mod tests {
         let Some(DriverEvent::Removal(observed_first)) = event_receiver.recv().await else {
             panic!("the saturated event remains first");
         };
-        assert_eq!(observed_first, first);
+        assert_eq!(observed_first.membership, first);
         let second_event =
             match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
                 crate::runtime::Timeout::Completed(event) => {
@@ -4197,7 +4242,8 @@ mod tests {
         let DriverEvent::Removal(observed_second) = second_event else {
             panic!("the forwarded event is the requested removal");
         };
-        assert_eq!(observed_second, second);
+        assert_eq!(observed_second.membership, second);
+        assert_eq!(observed_second.key, second_key);
     }
 
     pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
@@ -4303,7 +4349,10 @@ mod tests {
         assert!(
             scope
                 .events
-                .try_send(DriverEvent::Removal(root.member.membership()))
+                .try_send(DriverEvent::Removal(RemovalRequest {
+                    membership: root.member.membership(),
+                    key: ChildKey(u64::MAX - 1),
+                }))
                 .is_ok(),
             "the fixture saturates the bounded driver lane"
         );
@@ -4315,9 +4364,8 @@ mod tests {
                 .expect("dynamic-state mutex poisoned")
                 .entries
                 .get(member.id())
-                .and_then(|entry| entry.fused_cancel.as_ref())
-                .is_some_and(Latch::is_fired),
-            "fused drop latches cancellation before its queued edge can advance"
+                .is_some_and(|entry| entry.is_removing() && entry.matches_key(key)),
+            "fused drop marks the indexed membership removing before its queued edge advances"
         );
 
         scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4);
@@ -4338,7 +4386,8 @@ mod tests {
 
         assert!(matches!(
             event_receiver.recv().await,
-            Some(DriverEvent::Removal(queued)) if queued == root.member.membership()
+            Some(DriverEvent::Removal(queued))
+                if queued.membership == root.member.membership()
         ));
         let forwarded =
             match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
@@ -4346,8 +4395,12 @@ mod tests {
                 crate::runtime::Timeout::Completed(None) => panic!("the driver lane remains open"),
                 crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
             };
-        assert!(matches!(forwarded, DriverEvent::Removal(removed) if removed == membership));
-        scope.handle_removal(membership);
+        let DriverEvent::Removal(removal) = forwarded else {
+            panic!("the forwarded event is the fused removal")
+        };
+        assert_eq!(removal.membership, membership);
+        assert_eq!(removal.key, key);
+        scope.handle_removal(removal);
         let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
             crate::runtime::unbounded_mpsc_recv(&mut disposal_event_receiver).await
         else {

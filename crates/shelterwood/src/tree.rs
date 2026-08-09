@@ -864,13 +864,21 @@ impl<H> Drop for Admission<H> {
                 // scope's control-plane wake and the cancellation evidence in
                 // the same order the in-flight path uses.
                 if let Some(cancel) = &pending.fused_cancel {
-                    crate::driver::signal_fused_cancel(&pending.reservation.control, cancel);
+                    crate::driver::signal_fused_cancel(
+                        &pending.reservation.control,
+                        pending.reservation.slot.member.membership(),
+                        cancel,
+                    );
                 }
                 pending.cancel_reservation();
             }
             AdmissionState::InFlight { pending, .. } => {
                 if let Some(cancel) = &pending.fused_cancel {
-                    crate::driver::signal_fused_cancel(&pending.reservation.control, cancel);
+                    crate::driver::signal_fused_cancel(
+                        &pending.reservation.control,
+                        pending.reservation.slot.member.membership(),
+                        cancel,
+                    );
                     pending.cancel_reservation();
                 }
             }

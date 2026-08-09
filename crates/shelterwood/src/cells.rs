@@ -9,7 +9,7 @@ use std::{
     any::Any,
     fmt,
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, RwLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
@@ -19,7 +19,7 @@ use crate::{
     ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, ScopeState, Strategy,
     engine::{Epoch, RequestTarget, ScopeEpochs},
     exit::{StartupError, StopReason},
-    identity::{FenceCounter, ScopeIdentity},
+    identity::ScopeIdentity,
     observe::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
         LifecycleHub, MembershipStatus, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
@@ -93,11 +93,12 @@ pub(crate) struct MemberRecord {
 #[derive(Debug)]
 pub(crate) struct MemberCell {
     id: ChildId,
-    membership: Mutex<Membership>,
+    membership: Membership,
+    rebased_membership: OnceLock<Membership>,
     record: runtime::WatchSender<MemberRecord>,
     terminal_disposal_pending: AtomicBool,
     mailbox: Mutex<MemberMailbox>,
-    options: Mutex<Option<ResolvedCommonOptions>>,
+    options: OnceLock<ResolvedCommonOptions>,
     pub(crate) removal: Latch,
 }
 
@@ -133,11 +134,12 @@ impl MemberCell {
         });
         Arc::new(Self {
             id,
-            membership: Mutex::new(membership),
+            membership,
+            rebased_membership: OnceLock::new(),
             record,
             terminal_disposal_pending: AtomicBool::new(false),
             mailbox: Mutex::new(MemberMailbox::default()),
-            options: Mutex::new(None),
+            options: OnceLock::new(),
             removal: Latch::default(),
         })
     }
@@ -147,10 +149,10 @@ impl MemberCell {
     }
 
     pub(crate) fn membership(&self) -> Membership {
-        *self
-            .membership
-            .lock()
-            .expect("member identity mutex poisoned")
+        self.rebased_membership
+            .get()
+            .copied()
+            .unwrap_or(self.membership)
     }
 
     pub(crate) fn rebase_membership(&self, membership: Membership) {
@@ -161,10 +163,9 @@ impl MemberCell {
                 && record.last_incarnation.is_none(),
             "only an unstarted reservation can be rebased"
         );
-        *self
-            .membership
-            .lock()
-            .expect("member identity mutex poisoned") = membership;
+        self.rebased_membership
+            .set(membership)
+            .expect("a reservation can be rebased at most once");
     }
 
     pub(crate) fn record(&self) -> MemberRecord {
@@ -206,23 +207,21 @@ impl MemberCell {
     }
 
     pub(crate) fn set_options(&self, options: ResolvedCommonOptions) {
-        *self.options.lock().expect("member options mutex poisoned") = Some(options);
+        self.options
+            .set(options)
+            .expect("member options are resolved exactly once");
     }
 
     fn options(&self) -> ResolvedCommonOptions {
-        self.options
-            .lock()
-            .expect("member options mutex poisoned")
-            .clone()
-            .unwrap_or_else(|| {
-                crate::policy::resolve_common(
-                    &crate::policy::CommonOptions::default(),
-                    &crate::policy::ResolvedDefaults::default(),
-                    false,
-                    Readiness::Immediate,
-                )
-                .expect("library defaults must be valid")
-            })
+        self.options.get().cloned().unwrap_or_else(|| {
+            crate::policy::resolve_common(
+                &crate::policy::CommonOptions::default(),
+                &crate::policy::ResolvedDefaults::default(),
+                false,
+                Readiness::Immediate,
+            )
+            .expect("library defaults must be valid")
+        })
     }
 
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
@@ -430,8 +429,7 @@ pub(crate) struct ScopeCell {
     dynamic_route: Mutex<Option<DynamicRoute>>,
     current_children: runtime::WatchSender<Vec<ResidentChild>>,
     parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
-    observation_gate: Mutex<Arc<Mutex<()>>>,
-    lifecycle_sequence: Mutex<FenceCounter>,
+    observation_gate: RwLock<Arc<Mutex<()>>>,
     lifecycle_seq: AtomicU64,
     lifecycle: LifecycleHub,
     snapshots: SnapshotHub,
@@ -491,8 +489,7 @@ impl ScopeCell {
             dynamic_route: Mutex::new(None),
             current_children,
             parent,
-            observation_gate: Mutex::new(Arc::new(Mutex::new(()))),
-            lifecycle_sequence: Mutex::new(FenceCounter::new(0)),
+            observation_gate: RwLock::new(Arc::new(Mutex::new(()))),
             lifecycle_seq: AtomicU64::new(0),
             lifecycle: LifecycleHub::default(),
             snapshots: SnapshotHub::default(),
@@ -571,7 +568,7 @@ impl ScopeCell {
         Arc::clone(
             &self
                 .observation_gate
-                .lock()
+                .read()
                 .expect("observation gate handoff mutex poisoned"),
         )
     }
@@ -595,7 +592,7 @@ impl ScopeCell {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut installed = self
                 .observation_gate
-                .lock()
+                .write()
                 .expect("observation gate handoff mutex poisoned");
             if Arc::ptr_eq(&current, &installed) {
                 *installed = Arc::clone(gate);
@@ -626,7 +623,7 @@ impl ScopeCell {
         for descendant in descendants {
             let mut installed = descendant
                 .observation_gate
-                .lock()
+                .write()
                 .expect("observation gate handoff mutex poisoned");
             if Arc::ptr_eq(&installed, previous) {
                 *installed = Arc::clone(gate);
@@ -918,11 +915,14 @@ impl ScopeCell {
     }
 
     fn emit_locked(&self, kind: LifecycleEventKind) {
+        // The resident-tree observation gate serializes every mint. The
+        // atomic is the published watermark as well as the counter, avoiding
+        // a second, provably uncontended lock on every lifecycle edge.
         let seq = self
-            .lifecycle_sequence
-            .lock()
-            .expect("lifecycle sequence mutex poisoned")
-            .mint_sequence();
+            .lifecycle_seq
+            .load(Ordering::Relaxed)
+            .checked_add(1)
+            .filter(|seq| *seq != u64::MAX);
         let Some(seq) = seq else {
             self.lifecycle_seq.store(u64::MAX, Ordering::Release);
             self.publish_snapshot_chain_locked();
@@ -965,16 +965,13 @@ impl ScopeCell {
     pub(crate) fn replace_observation_gate(&self, gate: Arc<Mutex<()>>) {
         *self
             .observation_gate
-            .lock()
+            .write()
             .expect("observation gate handoff mutex remains healthy") = gate;
     }
 
     #[cfg(test)]
-    pub(crate) fn set_lifecycle_sequence(&self, counter: FenceCounter) {
-        *self
-            .lifecycle_sequence
-            .lock()
-            .expect("lifecycle sequence mutex poisoned") = counter;
+    pub(crate) fn set_lifecycle_sequence(&self, current: u64) {
+        self.lifecycle_seq.store(current, Ordering::Relaxed);
     }
 
     pub(crate) fn set_startup(&self, startup: Result<(), StartupError>) {

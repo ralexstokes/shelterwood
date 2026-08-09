@@ -2,7 +2,10 @@
 
 use std::{
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -303,22 +306,32 @@ pub struct SnapshotClosed;
 /// Conflating receiver for recursive scope snapshots.
 #[derive(Clone)]
 pub struct SnapshotReceiver {
-    inner: runtime::WatchReceiver<Arc<ScopeSnapshot>>,
+    inner: runtime::WatchReceiver<SnapshotHubState>,
+    seen_generation: u64,
 }
 
 impl SnapshotReceiver {
     /// Borrows the newest snapshot without marking it observed.
     #[must_use]
     pub fn borrow_latest(&self) -> Arc<ScopeSnapshot> {
-        self.inner.borrow_cloned()
+        self.inner.borrow_cloned().snapshot
     }
 
     /// Waits for and returns a newer snapshot.
     pub async fn changed(&mut self) -> Result<Arc<ScopeSnapshot>, SnapshotClosed> {
-        if self.inner.changed_or_closed().await {
-            Ok(self.inner.borrow_and_update_cloned())
-        } else {
-            Err(SnapshotClosed)
+        loop {
+            let state = self.inner.borrow_cloned();
+            if state.generation != self.seen_generation {
+                let state = self.inner.borrow_and_update_cloned();
+                self.seen_generation = state.generation;
+                return Ok(state.snapshot);
+            }
+            if state.closed {
+                return Err(SnapshotClosed);
+            }
+            if !self.inner.changed_or_closed().await {
+                return Err(SnapshotClosed);
+            }
         }
     }
 }
@@ -334,67 +347,90 @@ impl fmt::Debug for SnapshotReceiver {
 
 #[derive(Default)]
 pub(crate) struct SnapshotHub {
-    state: Mutex<SnapshotHubState>,
+    sender: OnceLock<runtime::WatchSender<SnapshotHubState>>,
+    closed: AtomicBool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug)]
 struct SnapshotHubState {
-    sender: Option<runtime::WatchSender<Arc<ScopeSnapshot>>>,
+    snapshot: Arc<ScopeSnapshot>,
+    generation: u64,
     closed: bool,
 }
 
 impl SnapshotHub {
     pub(crate) fn subscribe(&self, initial: Arc<ScopeSnapshot>) -> SnapshotReceiver {
-        let mut state = self.state.lock().expect("snapshot hub mutex poisoned");
-        if state.closed {
-            let (sender, inner) = runtime::watch(initial);
+        if self.closed.load(Ordering::Acquire) {
+            let (sender, inner) = runtime::watch(SnapshotHubState {
+                snapshot: initial,
+                generation: 0,
+                closed: true,
+            });
             drop(sender);
-            return SnapshotReceiver { inner };
-        }
-        if let Some(sender) = &state.sender
-            && sender.receiver_count() > 0
-        {
             return SnapshotReceiver {
-                inner: sender.watcher(),
+                inner,
+                seen_generation: 0,
             };
         }
-        let (sender, inner) = runtime::watch(initial);
-        state.sender = Some(sender);
-        SnapshotReceiver { inner }
+        let sender = self.sender.get_or_init(|| {
+            runtime::watch(SnapshotHubState {
+                snapshot: Arc::clone(&initial),
+                generation: 0,
+                closed: false,
+            })
+            .0
+        });
+        if sender.receiver_count() == 0 {
+            sender.send_modify(|state| {
+                state.snapshot = initial;
+                state.generation = state.generation.saturating_add(1);
+            });
+        }
+        let inner = sender.watcher();
+        let seen_generation = inner.borrow_cloned().generation;
+        SnapshotReceiver {
+            inner,
+            seen_generation,
+        }
     }
 
     pub(crate) fn publish(&self, snapshot: impl FnOnce() -> Arc<ScopeSnapshot>) {
-        let mut state = self.state.lock().expect("snapshot hub mutex poisoned");
-        let Some(sender) = &state.sender else {
-            return;
-        };
-        if sender.receiver_count() == 0 {
-            state.sender = None;
+        if self.closed.load(Ordering::Acquire) {
             return;
         }
-        sender.replace(snapshot());
+        let Some(sender) = self.sender.get() else {
+            return;
+        };
+        if sender.receiver_count() > 0 {
+            sender.send_modify(|state| {
+                state.snapshot = snapshot();
+                state.generation = state.generation.saturating_add(1);
+            });
+        }
     }
 
     pub(crate) fn close(&self) {
-        let mut state = self.state.lock().expect("snapshot hub mutex poisoned");
-        state.closed = true;
-        state.sender = None;
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(sender) = self.sender.get() {
+            sender.send_modify(|state| state.closed = true);
+        }
     }
 }
 
 impl fmt::Debug for SnapshotHub {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let state = self.state.lock().expect("snapshot hub mutex poisoned");
         formatter
             .debug_struct("SnapshotHub")
             .field(
                 "receivers",
-                &state
+                &self
                     .sender
-                    .as_ref()
+                    .get()
                     .map_or(0, |sender| sender.receiver_count()),
             )
-            .field("closed", &state.closed)
+            .field("closed", &self.closed.load(Ordering::Acquire))
             .finish()
     }
 }
@@ -414,7 +450,7 @@ pub enum LifecycleTryRecvError {
 /// One membership-owned lifecycle subscription.
 pub struct LifecycleEvents {
     events: runtime::BroadcastReceiver<LifecycleEvent>,
-    explicit_lag: runtime::WatchReceiver<u64>,
+    signal: runtime::WatchReceiver<LifecycleSignal>,
     seen_explicit_lag: u64,
 }
 
@@ -427,7 +463,7 @@ impl LifecycleEvents {
                 Err(LifecycleTryRecvError::Closed) => return None,
                 Err(LifecycleTryRecvError::Empty) => {}
             }
-            let _ = self.explicit_lag.changed_or_closed().await;
+            let _ = self.signal.changed_or_closed().await;
         }
     }
 
@@ -436,7 +472,8 @@ impl LifecycleEvents {
         // The marker leads the overflow episode deliberately. A consumer
         // snapshots here, then discards retained events at or below that
         // watermark before applying the newer suffix.
-        let current_explicit_lag = self.explicit_lag.borrow_cloned();
+        let signal = self.signal.borrow_cloned();
+        let current_explicit_lag = signal.explicit_lag;
         if current_explicit_lag != self.seen_explicit_lag {
             let mut dropped = current_explicit_lag.saturating_sub(self.seen_explicit_lag);
             self.seen_explicit_lag = current_explicit_lag;
@@ -462,6 +499,7 @@ impl LifecycleEvents {
         match self.events.try_receive() {
             runtime::BroadcastReceive::Item(event) => Ok(LifecycleItem::Event(event)),
             runtime::BroadcastReceive::Lagged(dropped) => Ok(LifecycleItem::Lagged { dropped }),
+            runtime::BroadcastReceive::Empty if signal.closed => Err(LifecycleTryRecvError::Closed),
             runtime::BroadcastReceive::Empty => Err(LifecycleTryRecvError::Empty),
             runtime::BroadcastReceive::Closed => Err(LifecycleTryRecvError::Closed),
         }
@@ -478,47 +516,40 @@ impl fmt::Debug for LifecycleEvents {
 }
 
 pub(crate) struct LifecycleHub {
-    channels: Mutex<Option<LifecycleChannels>>,
+    channels: LifecycleChannels,
+    closed: AtomicBool,
 }
 
 struct LifecycleChannels {
     events: runtime::BroadcastSender<LifecycleEvent>,
-    explicit_lag: runtime::WatchSender<u64>,
+    signal: runtime::WatchSender<LifecycleSignal>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct LifecycleSignal {
+    explicit_lag: u64,
+    closed: bool,
 }
 
 impl Default for LifecycleHub {
     fn default() -> Self {
         let (events, _) = runtime::broadcast(LIFECYCLE_EVENT_CAPACITY);
-        let (explicit_lag, _) = runtime::watch(0);
+        let (signal, _) = runtime::watch(LifecycleSignal::default());
         Self {
-            channels: Mutex::new(Some(LifecycleChannels {
-                events,
-                explicit_lag,
-            })),
+            channels: LifecycleChannels { events, signal },
+            closed: AtomicBool::new(false),
         }
     }
 }
 
 impl LifecycleHub {
     pub(crate) fn subscribe(&self) -> LifecycleEvents {
-        let channels = self.channels.lock().expect("lifecycle hub mutex poisoned");
-        if let Some(channels) = channels.as_ref() {
-            let explicit_lag = channels.explicit_lag.watcher();
-            let seen_explicit_lag = explicit_lag.borrow_cloned();
-            return LifecycleEvents {
-                events: channels.events.subscribe(),
-                explicit_lag,
-                seen_explicit_lag,
-            };
-        }
-        let (events_sender, events) = runtime::broadcast(LIFECYCLE_EVENT_CAPACITY);
-        let (lag_sender, explicit_lag) = runtime::watch(0);
-        drop(events_sender);
-        drop(lag_sender);
+        let signal = self.channels.signal.watcher();
+        let seen_explicit_lag = signal.borrow_cloned().explicit_lag;
         LifecycleEvents {
-            events,
-            explicit_lag,
-            seen_explicit_lag: 0,
+            events: self.channels.events.subscribe(),
+            signal,
+            seen_explicit_lag,
         }
     }
 
@@ -530,52 +561,37 @@ impl LifecycleHub {
             kind = ?event.kind,
             "scope lifecycle event"
         );
-        if let Some(channels) = self
-            .channels
-            .lock()
-            .expect("lifecycle hub mutex poisoned")
-            .as_ref()
-        {
-            let _ = channels.events.send(event);
+        if !self.closed.load(Ordering::Acquire) {
+            let _ = self.channels.events.send(event);
             // The watch version is also the no-loss activity notification for
             // async receivers. Its value changes only for explicit lag.
-            channels.explicit_lag.pulse();
+            self.channels.signal.pulse();
         }
     }
 
     pub(crate) fn publish_lagged(&self, dropped: u64) {
-        if let Some(channels) = self
-            .channels
-            .lock()
-            .expect("lifecycle hub mutex poisoned")
-            .as_ref()
-        {
-            channels
-                .explicit_lag
-                .send_modify(|total| *total = total.saturating_add(dropped));
+        if !self.closed.load(Ordering::Acquire) {
+            self.channels.signal.send_modify(|signal| {
+                signal.explicit_lag = signal.explicit_lag.saturating_add(dropped);
+            });
         }
     }
 
     pub(crate) fn close(&self) {
-        self.channels
-            .lock()
-            .expect("lifecycle hub mutex poisoned")
-            .take();
+        if !self.closed.swap(true, Ordering::AcqRel) {
+            self.channels
+                .signal
+                .send_modify(|signal| signal.closed = true);
+        }
     }
 }
 
 impl fmt::Debug for LifecycleHub {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let channels = self.channels.lock().expect("lifecycle hub mutex poisoned");
         formatter
             .debug_struct("LifecycleHub")
-            .field(
-                "receivers",
-                &channels
-                    .as_ref()
-                    .map_or(0, |channels| channels.events.receiver_count()),
-            )
-            .field("closed", &channels.is_none())
+            .field("receivers", &self.channels.events.receiver_count())
+            .field("closed", &self.closed.load(Ordering::Acquire))
             .finish()
     }
 }

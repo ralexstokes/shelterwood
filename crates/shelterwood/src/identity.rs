@@ -185,6 +185,7 @@ impl FenceCounter {
     ///
     /// Observation uses the same saturating, poison-never-minted primitive as
     /// membership and incarnation fencing.
+    #[cfg(test)]
     pub(crate) fn mint_sequence(&mut self) -> Option<u64> {
         self.mint().map(|fence| fence.generation.get())
     }

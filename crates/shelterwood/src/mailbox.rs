@@ -7,7 +7,10 @@ use std::{
     hash::{Hash, Hasher},
     num::NonZeroUsize,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -535,7 +538,15 @@ struct MailboxState<M> {
     queue: VecDeque<Envelope<M>>,
     latest: Option<Envelope<M>>,
     waiters: WaiterQueue<M>,
-    accepted: u64,
+}
+
+enum Submission<M> {
+    Accepted(Incarnation),
+    Parked(Arc<SendOperation<M>>),
+    Terminated {
+        message: M,
+        final_incarnation: Option<Incarnation>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -759,6 +770,7 @@ impl<M: Send + 'static> Drop for MailboxTeardown<M> {
 pub(crate) struct MailboxCell<M> {
     actor_id: ChildId,
     state: Mutex<MailboxState<M>>,
+    accepted: AtomicU64,
     changed: Signal,
 }
 
@@ -782,21 +794,20 @@ impl<M: Send + 'static> MailboxCell<M> {
                 queue: VecDeque::new(),
                 latest: None,
                 waiters: WaiterQueue::default(),
-                accepted: 0,
             }),
+            accepted: AtomicU64::new(0),
             changed: Signal::default(),
         })
     }
 
-    fn submit(&self, operation: &Arc<SendOperation<M>>) {
+    fn submit(&self, message: M) -> Submission<M> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         match state.status {
-            BindingStatus::Terminal(final_incarnation) => {
-                drop(state);
-                operation.terminate(final_incarnation);
-            }
+            BindingStatus::Terminal(final_incarnation) => Submission::Terminated {
+                message,
+                final_incarnation,
+            },
             BindingStatus::Bound(incarnation) => {
-                operation.observe(incarnation);
                 let can_accept = match state.kind {
                     Some(MailboxKind::Queue(capacity)) => {
                         state.waiters.is_empty() && state.queue.len() < capacity.get()
@@ -805,11 +816,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                     None => false,
                 };
                 if can_accept {
-                    let (message, wake) = operation
-                        .accept(incarnation)
-                        .expect("a newly submitted operation still owns its message");
-                    state.accepted = state.accepted.saturating_add(1);
-                    let accepted_sequence = state.accepted;
+                    let accepted_sequence = self.mint_accepted_sequence();
                     let displaced = match state.kind {
                         Some(MailboxKind::Queue(_)) => {
                             state.queue.push_back(Envelope {
@@ -826,20 +833,31 @@ impl<M: Send + 'static> MailboxCell<M> {
                     };
                     drop(state);
                     self.changed.pulse();
-                    if let Some(waker) = wake {
-                        waker.wake();
-                    }
                     drop(displaced);
+                    Submission::Accepted(incarnation)
                 } else {
-                    state.waiters.park(operation);
+                    let operation = SendOperation::new(message);
+                    operation.observe(incarnation);
+                    state.waiters.park(&operation);
+                    Submission::Parked(operation)
                 }
             }
             BindingStatus::Frozen(incarnation) => {
+                let operation = SendOperation::new(message);
                 operation.observe(incarnation);
-                state.waiters.park(operation);
+                state.waiters.park(&operation);
+                Submission::Parked(operation)
             }
-            BindingStatus::Unbound => state.waiters.park(operation),
+            BindingStatus::Unbound => {
+                let operation = SendOperation::new(message);
+                state.waiters.park(&operation);
+                Submission::Parked(operation)
+            }
         }
+    }
+
+    fn mint_accepted_sequence(&self) -> u64 {
+        mint_accepted_sequence(&self.accepted)
     }
 
     fn try_send(&self, message: M) -> Result<Incarnation, SendError<M>> {
@@ -875,8 +893,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                     })
                 }
                 Some(MailboxKind::Queue(_)) => {
-                    state.accepted = state.accepted.saturating_add(1);
-                    let accepted_sequence = state.accepted;
+                    let accepted_sequence = self.mint_accepted_sequence();
                     state.queue.push_back(Envelope {
                         message,
                         accepted_sequence,
@@ -886,8 +903,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                     Ok(incarnation)
                 }
                 Some(MailboxKind::Latest) => {
-                    state.accepted = state.accepted.saturating_add(1);
-                    let accepted_sequence = state.accepted;
+                    let accepted_sequence = self.mint_accepted_sequence();
                     let displaced = state.latest.replace(Envelope {
                         message,
                         accepted_sequence,
@@ -944,7 +960,7 @@ impl<M: Send + 'static> MailboxCell<M> {
             None => None,
         };
         let promotion = if message.is_some() && matches!(state.status, BindingStatus::Bound(_)) {
-            promote_waiters(&mut state)
+            promote_waiters(&mut state, &self.accepted)
         } else {
             Promotion::default()
         };
@@ -970,7 +986,7 @@ impl<M: Send + 'static> MailboxCell<M> {
     }
 
     fn accepted_sequence(&self) -> u64 {
-        self.state.lock().expect("mailbox mutex poisoned").accepted
+        self.accepted.load(Ordering::Acquire)
     }
 }
 
@@ -1079,7 +1095,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         // the operation lock, so a concurrent timeout sees either the prior
         // evidence or this incarnation consistently with which edge won.
         state.waiters.observe_all(incarnation);
-        let promotion = promote_waiters(&mut state);
+        let promotion = promote_waiters(&mut state, &self.accepted);
         drop(state);
         self.changed.pulse();
         promotion.finish_isolated();
@@ -1152,7 +1168,19 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
     }
 }
 
-fn promote_waiters<M: Send + 'static>(state: &mut MailboxState<M>) -> Promotion<M> {
+fn mint_accepted_sequence(accepted: &AtomicU64) -> u64 {
+    accepted
+        .try_update(Ordering::Release, Ordering::Relaxed, |accepted| {
+            Some(accepted.saturating_add(1))
+        })
+        .expect("accepted sequence updates never reject")
+        .saturating_add(1)
+}
+
+fn promote_waiters<M: Send + 'static>(
+    state: &mut MailboxState<M>,
+    accepted_sequence: &AtomicU64,
+) -> Promotion<M> {
     let mut promotion = Promotion::default();
     let Some(kind) = state.kind else {
         return promotion;
@@ -1177,8 +1205,7 @@ fn promote_waiters<M: Send + 'static>(state: &mut MailboxState<M>) -> Promotion<
         if let Some(waker) = wake {
             promotion.wakers.push(waker);
         }
-        state.accepted = state.accepted.saturating_add(1);
-        let accepted_sequence = state.accepted;
+        let accepted_sequence = mint_accepted_sequence(accepted_sequence);
         match kind {
             MailboxKind::Queue(_) => state.queue.push_back(Envelope {
                 message,
@@ -1237,7 +1264,7 @@ impl<M> ActorRef<M> {
 impl<M: Send + 'static> ActorRef<M> {
     /// Sends with backpressure and transparently waits through rebind windows.
     pub fn send(&self, message: M) -> SendFuture<M> {
-        SendFuture::new(self.clone(), message)
+        SendFuture::new(Arc::clone(&self.mailbox), message)
     }
 
     /// Attempts immediate acceptance without parking.
@@ -1331,30 +1358,43 @@ impl<M> Hash for ActorRef<M> {
 /// Cancellation-safe future returned by [`ActorRef::send`].
 #[must_use]
 pub struct SendFuture<M> {
-    actor: ActorRef<M>,
-    operation: Arc<SendOperation<M>>,
+    mailbox: Arc<MailboxCell<M>>,
+    state: SendFutureState<M>,
     // Captured where `M: Send + 'static` holds so the unbounded `Drop` impl
     // can route a withdrawn message through isolated disposal.
     dispose: fn(M),
-    submitted: bool,
-    done: bool,
 }
 
+enum SendFutureState<M> {
+    Immediate(Option<M>),
+    Parked(Arc<SendOperation<M>>),
+    Done,
+}
+
+// No field is structurally pinned. In particular, the immediate message may
+// move when first poll hands it to the mailbox.
+impl<M> Unpin for SendFuture<M> {}
+
 impl<M: Send + 'static> SendFuture<M> {
-    fn new(actor: ActorRef<M>, message: M) -> Self {
+    fn new(mailbox: Arc<MailboxCell<M>>, message: M) -> Self {
         Self {
-            actor,
-            operation: SendOperation::new(message),
+            mailbox,
+            state: SendFutureState::Immediate(Some(message)),
             dispose: dispose_detached::<M>,
-            submitted: false,
-            done: false,
         }
     }
 
     fn withdraw(&mut self) -> Withdrawal<M> {
-        let result = self.actor.mailbox.withdraw(&self.operation);
-        self.done = true;
-        result
+        match std::mem::replace(&mut self.state, SendFutureState::Done) {
+            SendFutureState::Immediate(mut message) => Withdrawal::Withdrawn {
+                message: message
+                    .take()
+                    .expect("an unsubmitted send retains its message"),
+                observed: self.mailbox.current_observation(),
+            },
+            SendFutureState::Parked(operation) => self.mailbox.withdraw(&operation),
+            SendFutureState::Done => panic!("a completed send was withdrawn"),
+        }
     }
 }
 
@@ -1362,8 +1402,11 @@ impl<M> fmt::Debug for SendFuture<M> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SendFuture")
-            .field("submitted", &self.submitted)
-            .field("done", &self.done)
+            .field(
+                "submitted",
+                &!matches!(self.state, SendFutureState::Immediate(_)),
+            )
+            .field("done", &matches!(self.state, SendFutureState::Done))
             .finish_non_exhaustive()
     }
 }
@@ -1372,20 +1415,46 @@ impl<M: Send + 'static> Future for SendFuture<M> {
     type Output = Result<Incarnation, SendError<M>>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.submitted {
-            self.submitted = true;
-            self.actor.mailbox.submit(&self.operation);
+        let this = self.as_mut().get_mut();
+        if let SendFutureState::Immediate(message) = &mut this.state {
+            let message = message
+                .take()
+                .expect("an unsubmitted send retains its message");
+            match this.mailbox.submit(message) {
+                Submission::Accepted(incarnation) => {
+                    this.state = SendFutureState::Done;
+                    return Poll::Ready(Ok(incarnation));
+                }
+                Submission::Parked(operation) => {
+                    this.state = SendFutureState::Parked(operation);
+                }
+                Submission::Terminated {
+                    message,
+                    final_incarnation,
+                } => {
+                    this.state = SendFutureState::Done;
+                    return Poll::Ready(Err(SendError {
+                        actor_id: this.mailbox.actor_id.clone(),
+                        incarnation_observed: final_incarnation,
+                        message,
+                        kind: SendErrorKind::Terminated,
+                    }));
+                }
+            }
         }
-        let mut state = self
-            .operation
+
+        let SendFutureState::Parked(operation) = &this.state else {
+            panic!("a completed send future was polled")
+        };
+        let mut operation_state = operation
             .state
             .lock()
             .expect("send operation mutex poisoned");
-        match &mut state.outcome {
+        match &mut operation_state.outcome {
             OperationOutcome::Accepted(incarnation) => {
                 let incarnation = *incarnation;
-                drop(state);
-                self.done = true;
+                drop(operation_state);
+                this.state = SendFutureState::Done;
                 Poll::Ready(Ok(incarnation))
             }
             OperationOutcome::Terminated {
@@ -1393,19 +1462,19 @@ impl<M: Send + 'static> Future for SendFuture<M> {
                 final_incarnation,
             } => {
                 let error = SendError {
-                    actor_id: self.actor.id().clone(),
+                    actor_id: this.mailbox.actor_id.clone(),
                     incarnation_observed: *final_incarnation,
                     message: message
                         .take()
                         .expect("a terminal operation retains its message until observed"),
                     kind: SendErrorKind::Terminated,
                 };
-                drop(state);
-                self.done = true;
+                drop(operation_state);
+                this.state = SendFutureState::Done;
                 Poll::Ready(Err(error))
             }
             OperationOutcome::Waiting { .. } => {
-                state.waker = Some(context.waker().clone());
+                operation_state.waker = Some(context.waker().clone());
                 Poll::Pending
             }
             OperationOutcome::Withdrawn => panic!("a withdrawn send future was polled"),
@@ -1415,17 +1484,23 @@ impl<M: Send + 'static> Future for SendFuture<M> {
 
 impl<M> Drop for SendFuture<M> {
     fn drop(&mut self) {
-        if !self.done {
-            // Cancellation recovers the unaccepted message with no caller
-            // left to hand it to. Destroying it inline would run a possibly
-            // blocking or panicking user destructor in this drop glue, so
-            // route the payload through isolated disposal.
-            match self.actor.mailbox.withdraw(&self.operation) {
+        // Cancellation recovers the unaccepted message with no caller left to
+        // hand it to. Destroying it inline would run a possibly blocking or
+        // panicking user destructor in this drop glue, so route the payload
+        // through isolated disposal.
+        match std::mem::replace(&mut self.state, SendFutureState::Done) {
+            SendFutureState::Immediate(mut message) => {
+                if let Some(message) = message.take() {
+                    (self.dispose)(message);
+                }
+            }
+            SendFutureState::Parked(operation) => match self.mailbox.withdraw(&operation) {
                 Withdrawal::Withdrawn { message, .. } | Withdrawal::Terminated { message, .. } => {
                     (self.dispose)(message);
                 }
                 Withdrawal::Accepted(_) => {}
-            }
+            },
+            SendFutureState::Done => {}
         }
     }
 }
@@ -1451,7 +1526,7 @@ impl<M> fmt::Debug for SendTimeout<M> {
 }
 
 fn withdraw_send<M: Send + 'static>(send: &mut SendFuture<M>) -> Result<Incarnation, SendError<M>> {
-    let actor_id = send.actor.id().clone();
+    let actor_id = send.mailbox.actor_id.clone();
     match send.withdraw() {
         Withdrawal::Withdrawn { message, observed } => Err(SendError {
             actor_id,

@@ -1134,12 +1134,20 @@ pub(crate) async fn mpsc_send<T>(sender: &MpscSender<T>, value: T) -> Result<(),
     sender.send(value).await.map_err(|error| error.0)
 }
 
+pub(crate) fn mpsc_try_send<T>(sender: &MpscSender<T>, value: T) -> Result<(), T> {
+    sender.try_send(value).map_err(|error| error.into_inner())
+}
+
 pub(crate) fn mpsc_try_recv<T>(receiver: &mut MpscReceiver<T>) -> Option<T> {
     receiver.try_recv().ok()
 }
 
 pub(crate) fn unbounded_mpsc_send<T>(sender: &UnboundedMpscSender<T>, value: T) -> Result<(), T> {
     sender.send(value).map_err(|error| error.0)
+}
+
+pub(crate) async fn unbounded_mpsc_recv<T>(receiver: &mut UnboundedMpscReceiver<T>) -> Option<T> {
+    receiver.recv().await
 }
 
 pub(crate) fn unbounded_mpsc_try_recv<T>(receiver: &mut UnboundedMpscReceiver<T>) -> Option<T> {

@@ -790,8 +790,19 @@ mod tests {
     use super::{
         Backoff, BackoffFactor, Intensity, InvalidPolicy, Jitter, Mailbox, PolicyError,
         PolicyField, ReadinessDeadline, ResolvedDefaults, RestartAttempt, RestartCondition,
-        RestartPolicy, ScopeDefaults, Shutdown, tidy_abort_beat,
+        RestartCount, RestartPolicy, ScopeDefaults, Shutdown, TotalRestarts, tidy_abort_beat,
     };
+
+    #[test]
+    fn restart_counters_saturate_at_the_numeric_limit() {
+        let attempt = RestartAttempt(u64::MAX);
+        let count = RestartCount(u64::MAX);
+        let total = TotalRestarts(u64::MAX);
+
+        assert_eq!(attempt.bump(), attempt);
+        assert_eq!(count.bump(), count);
+        assert_eq!(total.bump(), total);
+    }
 
     #[test]
     fn shipped_defaults_match_the_normative_policy() {

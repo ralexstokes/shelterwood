@@ -208,8 +208,15 @@ impl Error for StartupFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.cause {
             StartupFailureCause::InvalidPolicy(invalid) => Some(invalid),
-            StartupFailureCause::Child { .. }
-            | StartupFailureCause::Lowering { .. }
+            StartupFailureCause::Child { exit, .. } => match exit.kind() {
+                ExitKind::Failed(error) => Some(error.as_error()),
+                ExitKind::Completed
+                | ExitKind::Panicked { .. }
+                | ExitKind::ReadinessTimedOut { .. }
+                | ExitKind::Aborted { .. }
+                | ExitKind::NeverStarted => None,
+            },
+            StartupFailureCause::Lowering { .. }
             | StartupFailureCause::IdentityExhausted { .. } => None,
         }
     }
@@ -251,7 +258,11 @@ impl fmt::Display for StructuredStartupFailure {
     }
 }
 
-impl Error for StructuredStartupFailure {}
+impl Error for StructuredStartupFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.0.source()
+    }
+}
 
 /// Whether an incarnation observed supervisor cancellation before exiting.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

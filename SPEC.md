@@ -1945,7 +1945,9 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   freeze itself is unconditional and engine-enforced — new sends are
   rejected under either policy — so there is no separate "reject-new"
   variant. `Drain` delivers the frozen prefix before `on_stop`;
-  `Discard` drops it. The blanket handler loop honors the policy itself;
+  `Discard` drops it — where and on what task per §5.1's destruction-venue
+  clause, with disposal faults outside the exit verdict (§7). The blanket
+  handler loop honors the policy itself;
   for a raw actor the framework enforces only the freeze — the loop owns
   delivery, so honoring the policy is the raw loop's documented
   obligation, using `RawContext`'s resolved-policy accessor and the
@@ -2916,7 +2918,7 @@ marked *(II)* ship with the named Part II feature.
 | Bounded mailbox capacity | **64** messages | Scope-overridable; per-child overridable; zero rejected at construction |
 | `latest()` slot | **1** | Structural, not configurable |
 | `latest_by_key` capacity *(II §16)* | defers to scope/library mailbox default | Full key set evicts oldest key |
-| Mailbox shutdown policy | **Drain** | Two variants: `Drain` delivers the frozen prefix, `Discard` drops it; the intake freeze is unconditional either way (§5.2, §10) |
+| Mailbox shutdown policy | **Drain** | Two variants: `Drain` delivers the frozen prefix, `Discard` drops it (destruction venue per §5.1; disposal faults per §7); the intake freeze is unconditional either way (§5.2, §10) |
 | Child shutdown policy | **`Graceful { grace: 5 s }`** | `Abort` opt-in |
 | Tidy-abort beat | **`grace / 10`, clamped to [1 ms, 10 ms]** | §10 |
 | Restart condition | **`OnFailure`** | Failure = any non-`Completed` exit (§7) |

@@ -1833,8 +1833,9 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
     }
 
     fn short_circuit(&mut self) -> Self::Output {
-        // No message was ever constructed, so there is nothing to withdraw
-        // and no accepting incarnation to report.
+        // No message was submitted to the mailbox (any constructed message
+        // was already routed to isolated disposal), so there is nothing to
+        // withdraw and no accepting incarnation to report.
         Err(CallError {
             actor_id: self.actor.id().clone(),
             incarnation_observed: self.actor.mailbox.current_observation(),

@@ -16,8 +16,8 @@ use shelterwood::{
     Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicScopeRef,
     DynamicTree, ExitError, ExitKind, ExitResult, NotAdmittingCause, RawActor, RawContext, RawDef,
     RawOnceDef, Readiness, RemoveOutcome, ReserveError, RestartCondition, RestartPolicy, Retention,
-    ScopeRef, SendErrorKind, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, System, TaskDef,
-    TaskOnceDef, Tree,
+    ScopeRef, ScopeState, SendErrorKind, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, System,
+    TaskDef, TaskOnceDef, Tree,
 };
 
 /// Waits until a fused drop has finished releasing its id.
@@ -1680,5 +1680,97 @@ async fn ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal()
     assert!(matches!(
         queued.wait().await.kind(),
         ExitKind::Aborted { .. } | ExitKind::NeverStarted
+    ));
+}
+
+#[tokio::test]
+async fn admission_receipts_expose_membership_and_borrowed_handles() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+
+    let receipt = scope
+        .add_task("worker", waiting_task())
+        .await
+        .expect("task is admitted");
+    let membership = receipt.membership();
+    assert_eq!(receipt.handles().membership(), membership);
+    assert_eq!(receipt.handles().id().as_str(), "worker");
+    let task = receipt.into_handles();
+    assert_eq!(task.membership(), membership);
+
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+/// A root whose initial child fails before its readiness edge publishes
+/// `StartupFailed` and keeps the started prefix supervised (§6); reservation
+/// and admission on that scope both surface the dedicated cause.
+#[tokio::test]
+async fn startup_failed_roots_reject_reservation_and_admission_with_startup_failed() {
+    let mut tree = DynamicTree::new();
+    tree.add_task(
+        "failing-readiness",
+        TaskDef::new(|_| async { Err(ExitError::message("fails before ready")) })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .restart(never()),
+    )
+    .expect("valid failing task");
+    tree.add_task("survivor", waiting_task())
+        .expect("valid surviving task");
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    system
+        .wait_started()
+        .await
+        .expect_err("pre-ready terminal exit aborts startup");
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            matches!(scope.snapshot().state, ScopeState::StartupFailed)
+        })
+        .await,
+        "the root publishes StartupFailed while the started prefix remains supervised"
+    );
+
+    assert!(matches!(
+        scope.reserve_task("late"),
+        Err(ReserveError::NotAdmitting(NotAdmittingCause::StartupFailed))
+    ));
+    assert!(matches!(
+        scope.add_task("late", waiting_task()).await,
+        Err(ReserveError::NotAdmitting(NotAdmittingCause::StartupFailed))
+    ));
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed startup rolls back");
+}
+
+/// After the owner completes shutdown the scope membership is terminal;
+/// reservation and admission both surface `Terminal` rather than a
+/// live-incarnation cause.
+#[tokio::test]
+async fn terminal_scopes_reject_reservation_and_admission_with_terminal() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+    assert_eq!(scope.wait_stopped().await, StopReason::ShutdownRequested);
+
+    assert!(matches!(
+        scope.reserve_task("late"),
+        Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal))
+    ));
+    assert!(matches!(
+        scope.add_task("late", waiting_task()).await,
+        Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal))
     ));
 }

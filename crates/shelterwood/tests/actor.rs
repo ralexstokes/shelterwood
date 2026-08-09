@@ -626,3 +626,92 @@ async fn typed_context_handles_preserve_identity_and_self_send_capacity() {
     assert_eq!(stopping_myself, actor);
     assert_eq!(stopping_scope, scope);
 }
+
+struct HandlerScopeQuitter;
+
+impl Actor for HandlerScopeQuitter {
+    type Msg = ();
+    type Args = ();
+
+    async fn init((): (), _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), context: &mut Context<'_, Self>) -> ExitResult {
+        context.request_scope_shutdown();
+        Ok(())
+    }
+}
+
+/// `Context::request_scope_shutdown` from a live handler drains the
+/// supervising scope as `ShutdownRequested`. The parked sibling only exits
+/// under the shutdown token, so the recorded stop reason proves the
+/// request — not natural completion — ended the tree.
+#[tokio::test]
+async fn handler_context_scope_shutdown_request_stops_the_tree() {
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once("quitter", ActorOnceDef::<HandlerScopeQuitter>::new(()))
+        .expect("valid actor");
+    tree.add_task(
+        "parked",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        }),
+    )
+    .expect("valid parked task");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    actor.send(()).await.expect("quitter is live");
+    assert_eq!(
+        system.wait().await,
+        shelterwood::StopReason::ShutdownRequested
+    );
+}
+
+struct StopEscalatingActor;
+
+impl Actor for StopEscalatingActor {
+    type Msg = ();
+    type Args = ();
+
+    async fn init((): (), _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), context: &mut Context<'_, Self>) -> ExitResult {
+        context.stop();
+        Ok(())
+    }
+
+    async fn on_stop(&mut self, context: &mut StopContext<'_, Self>) {
+        context.request_scope_shutdown();
+    }
+}
+
+/// `StopContext::request_scope_shutdown` still reaches the supervising
+/// scope: a clean local stop escalates from teardown into a whole-scope
+/// shutdown that also releases the parked sibling.
+#[tokio::test]
+async fn stop_context_scope_shutdown_request_escalates_a_local_stop() {
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once("escalating", ActorOnceDef::<StopEscalatingActor>::new(()))
+        .expect("valid actor");
+    tree.add_task(
+        "parked",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        }),
+    )
+    .expect("valid parked task");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    actor.send(()).await.expect("escalating actor is live");
+    assert_eq!(
+        system.wait().await,
+        shelterwood::StopReason::ShutdownRequested
+    );
+}

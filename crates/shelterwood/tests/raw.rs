@@ -6,11 +6,13 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
+use crate::common::{
+    POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until, waiting::task as waiting_task,
+};
 use shelterwood::{
     DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
     RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ScopeDefaults,
-    SendErrorKind, Shutdown, Tree,
+    SendErrorKind, Shutdown, SubtreeOnceDef, Tree,
 };
 
 struct FactoryTaskActor {
@@ -589,4 +591,141 @@ async fn hard_abort_offload_panic_with_panicking_raw_destructor_is_contained() {
         }
     }
     assert_eq!(panic_message.as_deref(), Some("injected offload panic"));
+}
+
+struct ScopeQuitterRaw;
+
+impl RawActor for ScopeQuitterRaw {
+    type Msg = ();
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        context
+            .recv()
+            .await
+            .expect("quit trigger arrives before shutdown");
+        context.request_scope_shutdown();
+        assert!(
+            context.recv().await.is_none(),
+            "the requested scope shutdown reaches the requester's own token"
+        );
+        Ok(())
+    }
+}
+
+/// `RawContext::request_scope_shutdown` targets the supervising scope
+/// (§7): the nested scope drains as `ShutdownRequested` while the parent
+/// and its other children keep running.
+#[tokio::test]
+async fn raw_context_scope_shutdown_request_stops_only_the_supervising_scope() {
+    let mut nested = Tree::new();
+    let quitter = nested
+        .add_raw_once("quitter", RawOnceDef::new(ScopeQuitterRaw))
+        .expect("valid raw actor");
+    let mut root = Tree::new();
+    root.add_task("outer-parked", waiting_task())
+        .expect("valid parked task");
+    let sub = root
+        .add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+
+    quitter.send(()).await.expect("quitter is live");
+    assert_eq!(
+        sub.wait_stopped().await,
+        shelterwood::StopReason::ShutdownRequested
+    );
+    // The parent scope survives its child's requested shutdown: the parked
+    // sibling is still supervised, and the root still answers its own
+    // shutdown cleanly.
+    assert!(matches!(
+        system
+            .scope()
+            .snapshot()
+            .child("outer-parked")
+            .map(|child| child.state.clone()),
+        Some(shelterwood::ChildState::Running)
+    ));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root shuts down after the nested scope stopped");
+}
+
+struct StoppingRejectionRaw {
+    checked: Arc<AtomicBool>,
+}
+
+impl RawActor for StoppingRejectionRaw {
+    type Msg = u8;
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        // Live edge cases first: an absent key has nothing to retract, an
+        // armed interval is retractable, and a zero-period arm clears its
+        // key outright.
+        assert!(
+            !context.clear_timer(&"absent"),
+            "a never-armed key reports no retraction"
+        );
+        context
+            .set_interval("interval", 7u8, Duration::from_secs(600))
+            .expect("live interval arms");
+        assert!(
+            context.clear_timer(&"interval"),
+            "an armed interval is retractable"
+        );
+        context
+            .set_interval("cleared-by-zero", 8u8, Duration::from_secs(600))
+            .expect("live interval arms");
+        context
+            .set_interval("cleared-by-zero", 9u8, Duration::ZERO)
+            .expect("a zero period clears the key");
+        assert!(
+            !context.clear_timer(&"cleared-by-zero"),
+            "the zero-period arm already cleared the key"
+        );
+
+        context.stop();
+
+        // A stopping incarnation rejects new local work and returns every
+        // payload whole.
+        let timer = context
+            .set_timeout("timeout", 1u8, Duration::from_secs(1))
+            .expect_err("a stopping context rejects timers");
+        assert_eq!(timer.into_inner(), ("timeout", 1u8));
+        let interval = context
+            .set_interval("interval", 2u8, Duration::from_secs(1))
+            .expect_err("a stopping context rejects intervals");
+        assert_eq!(interval.into_inner(), ("interval", 2u8));
+        let offload = context
+            .offload_scoped(
+                async { 3u8 },
+                |result| result.expect("recovered continuation sees its value"),
+                Duration::from_secs(1),
+            )
+            .expect_err("a stopping context rejects scoped offloads");
+        // Recovery is total: the caller still owns the work future and the
+        // continuation, and both remain usable outside the offload path.
+        let (work, continuation) = offload.into_inner();
+        assert_eq!(continuation(Ok(work.await)), 3);
+
+        self.checked.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn stopping_raw_context_rejects_timers_and_offloads_with_payload_recovery() {
+    let checked = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "stopping-surface",
+        RawOnceDef::new(StoppingRejectionRaw {
+            checked: Arc::clone(&checked),
+        }),
+    )
+    .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert!(checked.load(Ordering::SeqCst));
 }

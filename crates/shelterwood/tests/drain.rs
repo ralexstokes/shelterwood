@@ -64,6 +64,17 @@ impl Actor for DrainActor {
                         .expect_err("drain rejects timers");
                     assert!(matches!(timer.into_inner().1, Message::Timer));
 
+                    let interval = context
+                        .set_interval("interval", Message::Timer, Duration::from_secs(1))
+                        .expect_err("drain rejects intervals");
+                    let (interval_key, interval_message) = interval.into_inner();
+                    assert_eq!(interval_key, "interval");
+                    assert!(matches!(interval_message, Message::Timer));
+
+                    context
+                        .clear_timer(&"timer")
+                        .expect_err("drain rejects timer retraction");
+
                     let ran = Arc::clone(&self.0.deferred_ran);
                     let offload = context
                         .offload(
@@ -75,6 +86,24 @@ impl Actor for DrainActor {
                         )
                         .expect_err("drain rejects offloads");
                     drop(offload);
+
+                    let scoped_ran = Arc::clone(&self.0.deferred_ran);
+                    let scoped = context
+                        .offload_scoped(
+                            async move {
+                                scoped_ran.store(true, Ordering::SeqCst);
+                            },
+                            |_| Message::Offload,
+                            Duration::from_secs(1),
+                        )
+                        .expect_err("drain rejects scoped offloads");
+                    // The rejected payload is recovered whole: the work
+                    // future is discarded without running and the
+                    // continuation still produces its message.
+                    let (scoped_work, scoped_continuation) = scoped.into_inner();
+                    drop(scoped_work);
+                    assert!(matches!(scoped_continuation(Ok(())), Message::Offload));
+
                     self.0.allow_drain.wait().await;
                 }
             }

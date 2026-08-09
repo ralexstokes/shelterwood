@@ -363,6 +363,106 @@ async fn intervals_start_after_one_period_and_skip_missed_ticks() {
     assert_eq!(ticks.load(Ordering::SeqCst), 2);
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ClearedIntervalMessage {
+    Arm,
+    Tick,
+    Probe,
+}
+
+struct ClearedIntervalActor {
+    ticks: Arc<AtomicUsize>,
+    armed: ReleaseGate,
+}
+
+impl Actor for ClearedIntervalActor {
+    type Msg = ClearedIntervalMessage;
+    type Args = (Arc<AtomicUsize>, ReleaseGate);
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            ticks: args.0,
+            armed: args.1,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            ClearedIntervalMessage::Arm => {
+                assert_eq!(
+                    context.clear_timer(&"interval"),
+                    Ok(false),
+                    "a never-armed key has nothing to retract"
+                );
+                context
+                    .set_interval(
+                        "interval",
+                        ClearedIntervalMessage::Tick,
+                        Duration::from_secs(10),
+                    )
+                    .expect("interval accepted");
+                self.armed.release();
+            }
+            ClearedIntervalMessage::Tick => {
+                self.ticks.fetch_add(1, Ordering::SeqCst);
+                context
+                    .set_interval("interval", ClearedIntervalMessage::Tick, Duration::ZERO)
+                    .expect("a zero period clears the key");
+                assert_eq!(
+                    context.clear_timer(&"interval"),
+                    Ok(false),
+                    "the zero-period arm already cleared the key"
+                );
+                // The probe fires long after every deadline the cleared
+                // interval would have had, so a surviving interval must
+                // deliver again before the probe stops the actor.
+                context
+                    .set_timeout(
+                        "probe",
+                        ClearedIntervalMessage::Probe,
+                        Duration::from_secs(120),
+                    )
+                    .expect("probe timeout accepted");
+            }
+            ClearedIntervalMessage::Probe => context.stop(),
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_zero_period_interval_arming_clears_the_key_and_stops_ticks() {
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let armed = ReleaseGate::default();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "cleared-interval",
+            ActorOnceDef::<ClearedIntervalActor>::new((Arc::clone(&ticks), armed.clone())),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor
+        .send(ClearedIntervalMessage::Arm)
+        .await
+        .expect("actor live");
+    armed.wait().await;
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    // A surviving interval would tick again inside this window, strictly
+    // before the probe deadline arrives.
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::advance(Duration::from_secs(100)).await;
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    // The complete post-stop history is exact: one tick, then silence.
+    assert_eq!(
+        ticks.load(Ordering::SeqCst),
+        1,
+        "a cleared interval must never tick again"
+    );
+}
+
 #[derive(Clone)]
 enum OverflowMessage {
     Fired,
@@ -421,5 +521,12 @@ async fn overflowing_timer_deadlines_never_fire() {
             .shutdown(Duration::from_secs(1))
             .await
             .expect("tree shuts down");
+        // The complete post-shutdown history seals the negative: the
+        // overflowed deadline never fired at all.
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "an overflowed timer deadline must never fire"
+        );
     }
 }

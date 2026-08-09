@@ -12,10 +12,11 @@ use crate::common::{
     waiting::{task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
-    Backoff, ChildState, DynamicScopeRef, DynamicTree, Jitter, LIFECYCLE_EVENT_CAPACITY,
+    Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LIFECYCLE_EVENT_CAPACITY,
     LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleTryRecvError,
-    RemoveOutcome, RestartCondition, RestartPolicy, Retention, ScopeRef, ScopeState, StopReason,
-    SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, Tree, WaitError,
+    MembershipStatus, RemoveOutcome, RestartCondition, RestartPolicy, Retention, ScopeKind,
+    ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef,
+    TaskRef, Tree, WaitError,
 };
 
 async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
@@ -597,6 +598,17 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     assert_eq!(restart_window.total_restarts, 1);
     assert_eq!(child.scope_seq, Some(stopped_seq));
     assert_eq!(nested.snapshot().total_restarts, 1);
+    assert_eq!(
+        restart_window
+            .descendant(["nested"])
+            .map(|child| child.id.as_str()),
+        Some("nested"),
+        "a path may end at a scope child inside its restart window"
+    );
+    assert!(
+        restart_window.descendant(["nested", "worker"]).is_none(),
+        "a restart window has no nested snapshot to advance past"
+    );
 
     tokio::time::advance(Duration::from_secs(10)).await;
     let starting = loop {
@@ -1199,4 +1211,226 @@ async fn lifecycle_subscriptions_start_now_without_replaying_prior_history() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
+}
+
+/// One representative tree exercises the full projected snapshot shape at
+/// once: dynamic and ordered scope kinds, strategy, intensity budgets,
+/// per-child restart policy and retention, active versus removing membership,
+/// a child held mid-stop, and recursive scope rows with their watermarks.
+#[tokio::test]
+async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopping() {
+    let worker_policy = RestartPolicy::new(
+        RestartCondition::Always,
+        Backoff::fixed(Duration::from_secs(5), Jitter::None).expect("valid backoff"),
+    );
+    let mut nested = Tree::new();
+    nested.strategy(Strategy::OneForOne);
+    nested.intensity(Intensity::new(3, Duration::from_secs(45)).expect("valid intensity"));
+    nested
+        .add_task(
+            "worker",
+            waiting_task()
+                .restart(worker_policy)
+                .retention(Retention::Retain),
+        )
+        .expect("valid nested task");
+    let mut root = DynamicTree::new();
+    root.intensity(Intensity::new(7, Duration::from_secs(90)).expect("valid intensity"));
+    let nested_scope = root
+        .add_subtree_once(
+            "nested",
+            SubtreeOnceDef::new(nested).retention(Retention::Retain),
+        )
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+
+    let stop_entered = ReleaseGate::default();
+    let release_stop = ReleaseGate::default();
+    let departing = scope
+        .add_task(
+            "departing",
+            TaskDef::new({
+                let stop_entered = stop_entered.clone();
+                let release_stop = release_stop.clone();
+                move |context| {
+                    let stop_entered = stop_entered.clone();
+                    let release_stop = release_stop.clone();
+                    async move {
+                        context.shutdown_token().cancelled().await;
+                        stop_entered.release();
+                        release_stop.wait().await;
+                        Ok(())
+                    }
+                }
+            })
+            .restart(RestartPolicy::new(
+                RestartCondition::Never,
+                Backoff::Immediate,
+            ))
+            .retention(Retention::Remove)
+            .shutdown(shelterwood::Shutdown::Graceful {
+                grace: Duration::from_secs(30),
+            }),
+        )
+        .await
+        .expect("departing task is admitted")
+        .into_handles();
+    scope
+        .wait_for_child(
+            "departing",
+            |child| matches!(child.state, ChildState::Running),
+            POLL_TIMEOUT,
+        )
+        .await
+        .expect("departing child runs");
+
+    let running = scope.snapshot();
+    assert_eq!(running.state, ScopeState::Running);
+    assert_eq!(running.kind, ScopeKind::Dynamic);
+    assert_eq!(
+        running.strategy, None,
+        "dynamic scopes have no fate-sharing strategy"
+    );
+    assert_eq!(
+        running.intensity,
+        Intensity::new(7, Duration::from_secs(90)).expect("valid intensity")
+    );
+    assert_eq!(running.total_restarts, 0);
+    assert_eq!(
+        running
+            .children
+            .iter()
+            .map(|child| child.id.as_str())
+            .collect::<Vec<_>>(),
+        ["nested", "departing"],
+        "children project in admission order"
+    );
+
+    let nested_row = running.child("nested").expect("nested scope is resident");
+    assert_eq!(nested_row.membership, nested_scope.membership());
+    assert!(nested_row.incarnation.is_some());
+    assert!(matches!(nested_row.state, ChildState::Running));
+    assert_eq!(nested_row.last_exit, None);
+    assert_eq!(nested_row.membership_status, MembershipStatus::Active);
+    assert_eq!(nested_row.restart_count, 0);
+    assert!(
+        nested_row.restart_policy.is_never(),
+        "a one-shot subtree cannot restart"
+    );
+    assert_eq!(nested_row.retention, Retention::Retain);
+    assert_eq!(nested_row.restart_at, None);
+
+    let recursive = nested_row.nested.as_ref().expect("nested scope is live");
+    assert_eq!(nested_row.scope_seq, Some(recursive.lifecycle_seq));
+    assert_eq!(recursive.state, ScopeState::Running);
+    assert_eq!(recursive.kind, ScopeKind::Ordered);
+    assert_eq!(recursive.strategy, Some(Strategy::OneForOne));
+    assert_eq!(
+        recursive.intensity,
+        Intensity::new(3, Duration::from_secs(45)).expect("valid intensity")
+    );
+    let worker_row = running
+        .descendant(["nested", "worker"])
+        .expect("recursion reaches the nested worker");
+    assert_eq!(worker_row.restart_policy, worker_policy);
+    assert_eq!(worker_row.retention, Retention::Retain);
+    assert_eq!(worker_row.membership_status, MembershipStatus::Active);
+
+    let departing_row = running
+        .child("departing")
+        .expect("departing task is resident");
+    assert_eq!(departing_row.membership, departing.membership());
+    assert!(matches!(departing_row.state, ChildState::Running));
+    assert_eq!(
+        departing_row.restart_policy,
+        RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
+    );
+    assert_eq!(departing_row.retention, Retention::Remove);
+    assert_eq!(departing_row.membership_status, MembershipStatus::Active);
+    assert!(departing_row.nested.is_none());
+    assert!(departing_row.scope_seq.is_none());
+
+    let removal = scope.remove_task(&departing);
+    stop_entered.wait().await;
+    let removing = scope
+        .wait_for_child(
+            "departing",
+            |child| {
+                child.membership_status == MembershipStatus::Removing
+                    && matches!(child.state, ChildState::Stopping)
+            },
+            POLL_TIMEOUT,
+        )
+        .await
+        .expect("planned removal projects a removing, stopping child");
+    assert_eq!(removing.membership_status, MembershipStatus::Removing);
+    assert!(matches!(removing.state, ChildState::Stopping));
+    assert!(
+        removing.incarnation.is_some(),
+        "a stopping child still has its live incarnation"
+    );
+
+    release_stop.release();
+    assert_eq!(removal.await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+    assert!(nested_scope.snapshot().state.is_stopped());
+}
+
+/// `ScopeState::is_stopped` and `ChildState::is_terminal` are true exactly
+/// for terminal projections, across unstarted, running, and stopped values.
+#[tokio::test]
+async fn state_predicates_hold_only_for_terminal_projections() {
+    let mut declaration = Tree::new();
+    let unstarted = declaration
+        .add_subtree_once("nested", SubtreeOnceDef::new(Tree::new()))
+        .expect("valid subtree");
+    assert_eq!(unstarted.snapshot().state, ScopeState::Unstarted);
+    assert!(!unstarted.snapshot().state.is_stopped());
+    drop(declaration);
+    assert_eq!(unstarted.wait_stopped().await, StopReason::NeverStarted);
+    assert!(unstarted.snapshot().state.is_stopped());
+
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+    assert!(!scope.snapshot().state.is_stopped());
+
+    let runner = scope
+        .add_task("runner", waiting_task())
+        .await
+        .expect("waiting task admitted")
+        .into_handles();
+    let (done, completion) = scope
+        .add_task_once(
+            "done",
+            TaskOnceDef::new(|_| async { Ok(()) }).retention(Retention::Retain),
+        )
+        .await
+        .expect("one-shot task admitted")
+        .into_handles();
+    drop(completion);
+    done.wait().await;
+    let terminal = scope
+        .wait_for_child("done", |child| child.state.is_terminal(), POLL_TIMEOUT)
+        .await
+        .expect("finished child projects terminal state");
+    assert!(matches!(terminal.state, ChildState::Stopped { .. }));
+
+    let running = scope.child("runner").expect("waiting child is resident");
+    assert!(matches!(running.state, ChildState::Running));
+    assert!(!running.state.is_terminal());
+
+    assert_eq!(scope.remove_task(&runner).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+    let stopped = scope.snapshot().state.clone();
+    assert!(matches!(stopped, ScopeState::Stopped { .. }));
+    assert!(stopped.is_stopped());
 }

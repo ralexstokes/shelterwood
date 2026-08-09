@@ -1854,11 +1854,6 @@ impl<M: Send + 'static> MailboxReceiver<M> {
             .receive(self.incarnation, ReceiveMode::IncludeFrozen, None)
     }
 
-    pub(crate) fn try_recv_live(&self) -> Option<M> {
-        self.mailbox
-            .receive(self.incarnation, ReceiveMode::LiveOnly, None)
-    }
-
     pub(crate) fn try_recv_live_through(&self, accepted_sequence: AcceptedSequence) -> Option<M> {
         self.mailbox.receive(
             self.incarnation,

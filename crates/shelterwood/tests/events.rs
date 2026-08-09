@@ -84,6 +84,210 @@ async fn continuations_are_fifo_and_yield_one_turn_to_ready_external_input() {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum BatchMessage {
+    Start,
+    FirstContinuation,
+    SecondContinuation,
+    Mailbox,
+    Offload,
+    Timer,
+}
+
+struct BatchTraceActor {
+    fire_timer: bool,
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Actor for BatchTraceActor {
+    type Msg = BatchMessage;
+    type Args = (ReleaseGate, bool, Arc<Mutex<Vec<&'static str>>>);
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        args.0.wait().await;
+        Ok(Self {
+            fire_timer: args.1,
+            log: args.2,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        let entry = match message {
+            BatchMessage::Start => {
+                context
+                    .continue_with(BatchMessage::FirstContinuation)
+                    .expect("first continuation accepted");
+                context
+                    .continue_with(BatchMessage::SecondContinuation)
+                    .expect("second continuation accepted");
+                context
+                    .offload(
+                        async {},
+                        |result| {
+                            assert!(result.is_err(), "zero-budget work reports its deadline");
+                            BatchMessage::Offload
+                        },
+                        Duration::ZERO,
+                    )
+                    .expect("offload accepted");
+                if self.fire_timer {
+                    context
+                        .set_timeout("batch", BatchMessage::Timer, Duration::ZERO)
+                        .expect("timer accepted");
+                }
+                "start"
+            }
+            BatchMessage::FirstContinuation => "continuation-1",
+            BatchMessage::SecondContinuation => "continuation-2",
+            BatchMessage::Mailbox => "mailbox",
+            BatchMessage::Offload => {
+                if !self.fire_timer {
+                    context.stop();
+                }
+                "offload"
+            }
+            BatchMessage::Timer => {
+                context.stop();
+                "timer"
+            }
+        };
+        self.log.lock().expect("log mutex poisoned").push(entry);
+        Ok(())
+    }
+}
+
+async fn assert_batch_trace(fire_timer: bool, expected: &[&str]) {
+    let gate = ReleaseGate::default();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "batch-trace",
+            ActorOnceDef::<BatchTraceActor>::new((gate.clone(), fire_timer, Arc::clone(&log))),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    actor
+        .send(BatchMessage::Start)
+        .await
+        .expect("start accepted during init");
+    actor
+        .send(BatchMessage::Mailbox)
+        .await
+        .expect("mailbox message accepted during init");
+    gate.release();
+
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(log.lock().expect("log mutex poisoned").as_slice(), expected);
+}
+
+#[tokio::test]
+async fn steady_state_uses_the_shared_bounded_batch_trace() {
+    assert_batch_trace(
+        false,
+        &[
+            "start",
+            "continuation-1",
+            "mailbox",
+            "continuation-2",
+            "offload",
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn due_timer_promotes_the_steady_batch_without_changing_source_priority() {
+    assert_batch_trace(
+        true,
+        &[
+            "start",
+            "continuation-1",
+            "mailbox",
+            "continuation-2",
+            "offload",
+            "timer",
+        ],
+    )
+    .await;
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NestedTimerMessage {
+    Start,
+    First,
+    Second,
+    AddedDuringBatch,
+}
+
+struct NestedTimerActor {
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Actor for NestedTimerActor {
+    type Msg = NestedTimerMessage;
+    type Args = Arc<Mutex<Vec<&'static str>>>;
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self { log: args })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        let entry = match message {
+            NestedTimerMessage::Start => {
+                context
+                    .set_timeout("first", NestedTimerMessage::First, Duration::ZERO)
+                    .expect("first timer accepted");
+                context
+                    .set_timeout("second", NestedTimerMessage::Second, Duration::ZERO)
+                    .expect("second timer accepted");
+                "start"
+            }
+            NestedTimerMessage::First => {
+                context
+                    .set_timeout(
+                        "added",
+                        NestedTimerMessage::AddedDuringBatch,
+                        Duration::ZERO,
+                    )
+                    .expect("later timer accepted");
+                "first"
+            }
+            NestedTimerMessage::Second => "second",
+            NestedTimerMessage::AddedDuringBatch => {
+                context.stop();
+                "added"
+            }
+        };
+        self.log.lock().expect("log mutex poisoned").push(entry);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_newly_due_timer_cannot_replace_remaining_fired_batch_armings() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "nested-timer",
+            ActorOnceDef::<NestedTimerActor>::new(Arc::clone(&log)),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor
+        .send(NestedTimerMessage::Start)
+        .await
+        .expect("actor accepts start");
+
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(
+        *log.lock().expect("log mutex poisoned"),
+        ["start", "first", "second", "added"]
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
 enum RetractionMessage {
     Arm,
     Cancel,

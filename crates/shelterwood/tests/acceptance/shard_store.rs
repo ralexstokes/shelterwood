@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use crate::common::ReleaseGate;
 use shelterwood::{
     Actor, ActorDef, ActorRef, CallErrorKind, Context, DynamicScopeRef, DynamicTree, ExitError,
     ExitResult, Membership, RemoveOutcome, Reply, ScopeRef, SubtreeOnceDef, Tree,
@@ -560,7 +561,7 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
 struct GatedShardActor {
     durable: DurableShard,
     entered: tokio::sync::mpsc::UnboundedSender<()>,
-    gate: Arc<tokio::sync::Notify>,
+    gate: ReleaseGate,
 }
 
 impl Actor for GatedShardActor {
@@ -568,7 +569,7 @@ impl Actor for GatedShardActor {
     type Args = (
         DurableShard,
         tokio::sync::mpsc::UnboundedSender<()>,
-        Arc<tokio::sync::Notify>,
+        ReleaseGate,
     );
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
@@ -583,7 +584,7 @@ impl Actor for GatedShardActor {
     async fn handle(&mut self, message: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
         let ShardMessage::Put { key, value, reply } = message;
         let _ = self.entered.send(());
-        self.gate.notified().await;
+        self.gate.wait().await;
         self.durable
             .0
             .lock()
@@ -601,7 +602,7 @@ impl Actor for GatedShardActor {
 async fn shard_store_retire_waits_for_accepted_requests() {
     let durable = DurableShard::default();
     let (entered, mut entered_log) = tokio::sync::mpsc::unbounded_channel();
-    let gate = Arc::new(tokio::sync::Notify::new());
+    let gate = ReleaseGate::default();
     let mut root = Tree::new();
     let ranges = root
         .add_subtree_once("ranges", SubtreeOnceDef::new(DynamicTree::new()))
@@ -613,7 +614,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
     let actor = mount
         .add_actor(
             "shard",
-            ActorDef::<GatedShardActor>::cloned((durable.clone(), entered, Arc::clone(&gate))),
+            ActorDef::<GatedShardActor>::cloned((durable.clone(), entered, gate.clone())),
         )
         .expect("valid shard");
     let scope = ranges
@@ -663,7 +664,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
         .await
         .expect("removal is underway");
 
-    gate.notify_one();
+    gate.release();
     write
         .await
         .expect("write task joins")

@@ -2973,6 +2973,12 @@ mod tests {
         resident_projection, restart_shutdown_work, run_nested_tree, run_scope_incarnation,
     };
 
+    /// Bounds every gate-capture probe wait. The probe sender lives inside
+    /// the scope cell for the whole test, so the channel can never
+    /// disconnect: a regression that keeps a thread from reaching its gate
+    /// must time out with a diagnostic rather than hang the test on `recv`.
+    const CAPTURE_PROBE_WAIT: Duration = Duration::from_secs(10);
+
     fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from(id);
@@ -3160,7 +3166,9 @@ mod tests {
         // The capture report proves the observer committed to the
         // pre-admission gate, which the held guard keeps it from acquiring.
         assert_eq!(
-            captures.recv().expect("the observer reports its capture"),
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("the observer reports its capture within the bound"),
             GateCapture::Observation
         );
 
@@ -3172,7 +3180,9 @@ mod tests {
         worker.join().expect("observer follows the gate handoff");
 
         assert_eq!(
-            captures.recv().expect("the observer reports its retry"),
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("the observer reports its retry within the bound"),
             GateCapture::Observation,
             "the handoff forces one retry capture on the root gate"
         );
@@ -3472,8 +3482,8 @@ mod tests {
             .expect("observer enters the pre-admission edge");
         assert_eq!(
             captures
-                .recv()
-                .expect("the observation edge reports its capture"),
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("the observation edge reports its capture within the bound"),
             GateCapture::Observation
         );
 
@@ -3489,7 +3499,9 @@ mod tests {
         // is blocked behind the complete observation edge rather than
         // replacing it concurrently, so adoption cannot yet have completed.
         assert_eq!(
-            captures.recv().expect("adoption reports its capture"),
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("adoption reports its capture within the bound"),
             GateCapture::Adoption
         );
         assert!(matches!(
@@ -4370,7 +4382,9 @@ mod tests {
         // until that gate is released, so a single acquisition attempt decides
         // whether removal reached the gate while still holding the state.
         assert_eq!(
-            captures.recv().expect("removal reports its gate capture"),
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("removal reports its gate capture within the bound"),
             GateCapture::Observation
         );
         drop(

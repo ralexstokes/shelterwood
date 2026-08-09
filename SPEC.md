@@ -1829,9 +1829,11 @@ Resolution and mechanics:
   declaration named no kind); kind-matched deferral governs a
   *declaration's* unfinished capacity. The exact policy case, decided:
   a child declaring `queue` with deferred capacity under a scope
-  default of `latest()` gets `queue` at the library default capacity —
-  the scope default neither converts the declared kind nor supplies a
-  capacity across kinds. For the full outward walk, suppose the root
+  default of `latest()`, with no enclosing `queue` default beyond it,
+  gets `queue` at the library default capacity — the scope default
+  neither converts the declared kind nor supplies a capacity across
+  kinds, and with no outer `queue` default the outward walk ends at
+  the library default. For the full outward walk, suppose the root
   defaults to `queue(10)`, an inheriting child scope defaults to
   `latest()`, and an inheriting grandchild scope contains an actor declared
   with `queue_inherit()`: that actor resolves to `queue(10)`, because the

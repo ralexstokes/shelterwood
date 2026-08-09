@@ -218,7 +218,6 @@ struct DynamicState {
 }
 
 pub(crate) struct DynamicControl {
-    root: Weak<ScopeCell>,
     events: runtime::MpscSender<DriverEvent>,
     state: Mutex<DynamicState>,
     requests: runtime::UnboundedMpscSender<DriverEvent>,
@@ -228,7 +227,7 @@ pub(crate) struct DynamicControl {
 }
 
 impl DynamicControl {
-    fn new(root: &Arc<ScopeCell>, events: runtime::MpscSender<DriverEvent>) -> Arc<Self> {
+    fn new(events: runtime::MpscSender<DriverEvent>) -> Arc<Self> {
         let (requests, mut request_receiver) = runtime::unbounded_mpsc();
         let forward_events = events.clone();
         let request_forwarder_close = Latch::default();
@@ -238,7 +237,6 @@ impl DynamicControl {
         #[cfg(test)]
         let forwarder_ended = request_forwarder_ended.clone();
         let control = Arc::new(Self {
-            root: Arc::downgrade(root),
             events,
             state: Mutex::new(DynamicState {
                 accepting: true,
@@ -460,28 +458,6 @@ pub(crate) fn signal_fused_cancel(
 
 fn signal_fused_cancel_impl(control: &DynamicControl, membership: Membership, latch: &Latch) {
     if latch.fire() {
-        let member = control
-            .state
-            .lock()
-            .expect("dynamic-state mutex poisoned")
-            .entries
-            .values()
-            .find(|entry| entry.slot.member.membership() == membership)
-            .map(|entry| Arc::clone(&entry.slot.member));
-        if let Some(member) = member {
-            // Cancellation is level-triggered state, not merely a queued
-            // command. Publish it before attempting the bounded driver lane
-            // so an exit or already-due backoff cannot start another
-            // incarnation while the removal event waits in the forwarder.
-            if let Some(root) = control.root.upgrade() {
-                root.transition_child(&member, |record| record.removing = true, None);
-            } else {
-                // Teardown can outlive the root's dynamic-route ownership.
-                // Keep the member-local suppression state monotonic even
-                // though no containing snapshot remains to publish.
-                member.update(|record| record.removing = true);
-            }
-        }
         queue_driver_event(control, DriverEvent::Removal(membership));
     }
 }
@@ -1527,8 +1503,8 @@ impl ScopeRuntime {
                 .lock()
                 .expect("dynamic-state mutex poisoned")
                 .entries
-                .values()
-                .find(|entry| entry.slot.member.membership() == child.slot.member.membership())
+                .get(child.slot.member.id())
+                .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
                 .is_some_and(|entry| {
                     entry.removal_started
                         || entry.fused_cancel.as_ref().is_some_and(Latch::is_fired)
@@ -1543,8 +1519,7 @@ impl ScopeRuntime {
                 let child = &self.children[*key];
                 // Only a nested scope can hold a pending-incarnation stop, and
                 // only its own control plane can answer whether one exists.
-                // Both are cheap, so they gate the suppression sweep, which
-                // takes the dynamic-state lock and scans every entry.
+                // Both are cheap, so they gate the dynamic-state lookup.
                 child.active.is_none()
                     && matches!(child.slot.member.record().stage, MemberStage::Restarting)
                     && child
@@ -2129,12 +2104,22 @@ impl ScopeRuntime {
             self.intensity_policy.within,
         );
 
+        // Fused cancellation is a level-triggered source. It can linearize
+        // before the forwarded Removal event or its public `removing`
+        // projection reaches this driver, so exit dispatch must consult the
+        // source directly before charging or publishing a restart.
+        let restart_suppressed = self.restart_is_suppressed(key);
+        let child = self
+            .children
+            .get_mut(key)
+            .expect("the exiting child remains registered");
+
         let mode = if self.lifecycle.is_draining() {
             ScopeMode::Draining
         } else {
             ScopeMode::Running
         };
-        let member_mode = if child.slot.member.record().removing {
+        let member_mode = if restart_suppressed {
             MembershipMode::Removing
         } else {
             MembershipMode::Active
@@ -2790,8 +2775,8 @@ async fn run_scope_incarnation(
     let capacity = plan.children.len().saturating_mul(3).max(64);
     let (events, mut event_receiver) = runtime::bounded_mpsc(capacity);
     let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
-    let dynamic = (plan.root.flavor == ScopeFlavor::Dynamic)
-        .then(|| DynamicControl::new(&root, events.clone()));
+    let dynamic =
+        (plan.root.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(events.clone()));
     if let Some(control) = &dynamic {
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
         for child in &plan.children {
@@ -3118,7 +3103,7 @@ fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
 }
 
 #[cfg(test)]
-pub(crate) use tests::exercise_saturated_fused_drop_racing_due_restart;
+pub(crate) use tests::exercise_saturated_fused_drop_before_exit;
 
 #[cfg(test)]
 mod tests {
@@ -4499,7 +4484,7 @@ mod tests {
         let slot = SlotCell::new(Arc::clone(&member), None);
         root.set_admitted_children(vec![resident_projection(&slot)]);
         let (events, _receiver) = crate::runtime::bounded_mpsc(1);
-        let control = DynamicControl::new(&root, events);
+        let control = DynamicControl::new(events);
         let (sender, mut response) = crate::runtime::oneshot();
         let mut responses = RemovalResponses::default();
         responses.0.push(sender);
@@ -4588,7 +4573,7 @@ mod tests {
         let slot = SlotCell::new(Arc::clone(&member), None);
         root.set_admitted_children(vec![resident_projection(&slot)]);
         let (events, _receiver) = crate::runtime::bounded_mpsc(1);
-        let control = DynamicControl::new(&root, events);
+        let control = DynamicControl::new(events);
         control
             .state
             .lock()
@@ -4638,7 +4623,6 @@ mod tests {
 
     #[crate::runtime::test]
     async fn saturated_removal_from_a_foreign_thread_reaches_the_driver() {
-        let root = isolated_scope("root", ScopeFlavor::Dynamic);
         let mut identity = ScopeIdentity::new();
         let first_id = ChildId::from("first");
         let second_id = ChildId::from("second");
@@ -4653,7 +4637,7 @@ mod tests {
             events.try_send(DriverEvent::Removal(first)).is_ok(),
             "the fixture saturates the bounded driver lane"
         );
-        let control = DynamicControl::new(&root, events);
+        let control = DynamicControl::new(events);
         let foreign_control = Arc::clone(&control);
         std::thread::spawn(move || {
             assert!(
@@ -4684,7 +4668,7 @@ mod tests {
         assert_eq!(observed_second, second);
     }
 
-    pub(crate) async fn exercise_saturated_fused_drop_racing_due_restart<A>(
+    pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
         make_admission: impl FnOnce(super::DynamicReservation) -> A,
     ) where
         A: Future,
@@ -4700,7 +4684,7 @@ mod tests {
 
         let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
         let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
-        let control = DynamicControl::new(&root, events.clone());
+        let control = DynamicControl::new(events.clone());
         root.set_dynamic_route(Some(control.clone()));
         root.set_admitted_children(Vec::new());
         let mut scope = ScopeRuntime {
@@ -4784,12 +4768,6 @@ mod tests {
             crate::runtime::Timeout::Elapsed => panic!("the first incarnation exit must arrive"),
         };
         let key = exit.0;
-        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4);
-        assert!(
-            scope.children[key].restart_deadline.is_some(),
-            "the immediate restart is scheduled before cancellation"
-        );
-
         assert!(
             scope
                 .events
@@ -4799,24 +4777,31 @@ mod tests {
         );
         drop(admission);
         assert!(
-            member.record().removing,
-            "fused drop publishes removal state before its queued edge can advance"
+            control
+                .state
+                .lock()
+                .expect("dynamic-state mutex poisoned")
+                .entries
+                .get(member.id())
+                .and_then(|entry| entry.fused_cancel.as_ref())
+                .is_some_and(Latch::is_fired),
+            "fused drop latches cancellation before its queued edge can advance"
         );
 
-        let restart = scope
-            .deadlines
-            .pop_due(crate::runtime::now())
-            .expect("immediate backoff is already due");
-        assert!(matches!(restart, super::DeadlineKind::Restart { child } if child == key));
-        scope.handle_deadline(restart);
+        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4);
         assert!(scope.children[key].restart_deadline.is_none());
+        assert_eq!(
+            root.snapshot().total_restarts,
+            crate::TotalRestarts::ZERO,
+            "cancellation that linearized before exit incurs no restart charge"
+        );
         for _ in 0..16 {
             crate::runtime::yield_now().await;
         }
         assert_eq!(
             starts.load(Ordering::SeqCst),
             1,
-            "a due restart rechecks the fused cancellation before construction"
+            "exit dispatch consults fused cancellation before restart construction"
         );
 
         assert!(matches!(
@@ -4849,7 +4834,7 @@ mod tests {
 
         let root = isolated_scope("root", ScopeFlavor::Dynamic);
         let (events, event_receiver) = crate::runtime::bounded_mpsc(1);
-        let control = DynamicControl::new(&root, events);
+        let control = DynamicControl::new(events);
         let child_id = ChildId::from("worker");
         let member = MemberCell::new(
             child_id.clone(),

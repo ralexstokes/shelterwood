@@ -1364,13 +1364,20 @@ impl ScopeCell {
 
     pub(crate) async fn wait_stopped(&self) -> StopReason {
         self.member.wait_terminal().await;
-        match self.record().state {
-            ScopeState::Stopped { reason } => reason,
-            ScopeState::Unstarted
-            | ScopeState::Starting
-            | ScopeState::Running
-            | ScopeState::StartupFailed
-            | ScopeState::Draining => StopReason::NeverStarted,
+        // Parent-driver destruction can terminalize a nested membership
+        // synchronously before the aborted nested driver runs its own scope
+        // epilogue. Membership terminality is therefore the finality fence,
+        // not proof that the scope record has already reached `Stopped`.
+        let mut watcher = self.record.watcher();
+        loop {
+            match watcher.borrow_and_update_cloned().state {
+                ScopeState::Stopped { reason } => return reason,
+                ScopeState::Unstarted => return StopReason::NeverStarted,
+                ScopeState::Starting
+                | ScopeState::Running
+                | ScopeState::StartupFailed
+                | ScopeState::Draining => watcher.changed().await,
+            }
         }
     }
 

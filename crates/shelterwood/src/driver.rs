@@ -3209,6 +3209,49 @@ mod tests {
         assert!(scope.incarnation_finished(second));
     }
 
+    #[crate::runtime::test]
+    async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
+        let parent = isolated_scope("parent", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+        let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        parent.set_admitted_children(vec![resident_projection(&slot)]);
+
+        let epoch = nested
+            .begin_incarnation()
+            .expect("nested scope epoch is available");
+        let mut incarnations = ScopeIdentity::new().incarnation_counter(nested.member.membership());
+        let incarnation = incarnations.mint().expect("child incarnation is available");
+        nested.member.update(|record| {
+            record.stage = MemberStage::Running;
+            record.incarnation = Some(incarnation);
+            record.last_incarnation = Some(incarnation);
+        });
+        nested.set_state(ScopeState::Running);
+
+        assert!(parent.terminalize_child(
+            &nested.member,
+            Exit::new(
+                ExitKind::Aborted {
+                    phase: GracePhase::WithinGrace,
+                },
+                Cancellation::Observed,
+            ),
+            Some(incarnation),
+            StartupDisposition::NotAborted,
+        ));
+
+        let mut waiter = Box::pin(nested.wait_stopped());
+        let first_poll =
+            std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
+        assert!(
+            first_poll.is_pending(),
+            "membership terminality does not imply that its live scope incarnation stopped"
+        );
+
+        nested.finish_incarnation(epoch, StopReason::ShutdownRequested);
+        assert_eq!(waiter.await, StopReason::ShutdownRequested);
+    }
+
     #[test]
     fn pre_driver_epoch_guard_releases_on_cancellation_and_unwind() {
         let cancelled = isolated_scope("cancelled", ScopeFlavor::Ordered);

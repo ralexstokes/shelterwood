@@ -9,7 +9,7 @@ use std::{
 use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
-    Guard, LifecycleEventKind, LifecycleItem, Readiness, Shutdown, StartupError,
+    Guard, LifecycleEventKind, LifecycleItem, Mailbox, Readiness, Shutdown, StartupError,
     StartupFailureCause, Tree,
 };
 
@@ -1426,6 +1426,93 @@ async fn sequential_offload_cycles_deliver_every_completion() {
     system.wait_started().await.expect("actor starts");
     actor.send(CycleMessage::Start).await.expect("actor live");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+const SATURATE: usize = 64;
+
+enum SaturateMessage {
+    Ping,
+    Completed,
+}
+
+struct SaturatedActor {
+    issued: usize,
+    delivered: usize,
+    peak_backlog: Arc<AtomicUsize>,
+}
+
+impl Actor for SaturatedActor {
+    type Msg = SaturateMessage;
+    type Args = (ReleaseGate, Arc<AtomicUsize>);
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        args.0.wait().await;
+        Ok(Self {
+            issued: 0,
+            delivered: 0,
+            peak_backlog: args.1,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            SaturateMessage::Ping => {
+                self.peak_backlog
+                    .fetch_max(self.issued - self.delivered, Ordering::SeqCst);
+                self.issued += 1;
+                context
+                    .offload(
+                        async {},
+                        |result| {
+                            assert_eq!(result, Err(DeadlineElapsed));
+                            SaturateMessage::Completed
+                        },
+                        Duration::ZERO,
+                    )
+                    .expect("live offload accepted");
+            }
+            SaturateMessage::Completed => {
+                self.delivered += 1;
+                if self.delivered == SATURATE {
+                    context.stop();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A continuously nonempty mailbox cannot starve queued offload completions:
+/// the completions queued at each mailbox delivery are consumed ahead of
+/// later mailbox input, so the completion backlog stays proportional to the
+/// actor's own in-flight issuance instead of growing with mailbox history.
+#[tokio::test]
+async fn saturated_mailbox_does_not_grow_the_completion_backlog() {
+    let gate = ReleaseGate::default();
+    let peak_backlog = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "saturated",
+            ActorOnceDef::<SaturatedActor>::new((gate.clone(), Arc::clone(&peak_backlog)))
+                .mailbox(Mailbox::queue(SATURATE).expect("non-zero capacity")),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    for _ in 0..SATURATE {
+        actor
+            .send(SaturateMessage::Ping)
+            .await
+            .expect("mailbox accepts during init");
+    }
+    gate.release();
+    system.wait_started().await.expect("actor starts");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert!(
+        peak_backlog.load(Ordering::SeqCst) <= 2,
+        "queued completions drain ahead of later mailbox input instead of \
+         accumulating while the mailbox stays nonempty"
+    );
 }
 
 /// §5.5's teardown order holds on the error path too: a handler `Err` joins

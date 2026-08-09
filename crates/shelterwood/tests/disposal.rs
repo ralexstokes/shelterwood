@@ -465,13 +465,13 @@ async fn non_runtime_reservation_cancellation_contains_destructor_panic() {
         .expect("dynamic root shuts down");
 }
 
-struct HostileCapture {
+struct HostileFallbackCapture {
     dropped: tokio::sync::mpsc::UnboundedSender<ThreadId>,
     blocker: Option<DestructorBlocker>,
     panic: Option<&'static str>,
 }
 
-impl Drop for HostileCapture {
+impl Drop for HostileFallbackCapture {
     fn drop(&mut self) {
         let _ = self.dropped.send(thread::current().id());
         drop(self.blocker.take());
@@ -501,7 +501,7 @@ async fn non_runtime_disposals_share_one_thread_and_contain_panics() {
             .expect("task reservation");
         tasks.push(slot.task_ref());
         admissions.push(slot.define(TaskDef::new({
-            let capture = HostileCapture {
+            let capture = HostileFallbackCapture {
                 dropped: dropped.clone(),
                 // The first destructor blocks so every later job queues
                 // behind it on the shared fallback disposal thread.
@@ -553,7 +553,7 @@ async fn non_runtime_disposals_share_one_thread_and_contain_panics() {
         .reserve_task("after-panic")
         .expect("task reservation after a contained panic");
     let admission = slot.define(TaskDef::new({
-        let capture = HostileCapture {
+        let capture = HostileFallbackCapture {
             dropped,
             blocker: None,
             panic: None,

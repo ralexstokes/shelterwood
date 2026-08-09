@@ -247,11 +247,14 @@ impl PanicSlot {
 
 /// Incarnation-internal completion storage for offload continuations.
 ///
-/// The queue is deliberately unbounded. Every entry is produced by work this
-/// incarnation itself started — exactly one completion per offload — so its
-/// population is bounded by the actor's own in-flight offload count plus
-/// completions accepted but not yet consumed; no external sender can reach
-/// it. Bounded-mailbox policy governs external input only (SPEC §5.5:
+/// The queue is deliberately unbounded, but sustained traffic cannot grow it
+/// without bound. Every entry is produced by work this incarnation itself
+/// started — exactly one completion per offload, no external sender can
+/// reach it — and `next_ready` snapshots the queued completions at each
+/// mailbox delivery (timer batches snapshot likewise) and drains that prefix
+/// ahead of later mailbox input, so the population stays bounded by the
+/// actor's own in-flight offload count plus the completions arriving within
+/// one such window. Bounded-mailbox policy governs external input only (SPEC §5.5:
 /// offload completions do not consume mailbox capacity), and imposing a
 /// bound here would either block the offload task or drop a completion the
 /// total-continuation contract promises to deliver. Freezing at stop clears
@@ -693,6 +696,13 @@ struct RawResources<M> {
     // mailbox/offload/timer item. `next_ready` uses it to prohibit two local
     // continuations from leading while an external source remains eligible.
     continuation_needs_external: bool,
+    // Queued offload completions granted the lead over the mailbox, captured
+    // as the event-queue watermark at the previous steady-state mailbox
+    // delivery. `next_ready` drains this many completion entries before
+    // consulting the mailbox again, so an always-readable mailbox cannot
+    // starve the completion queue, while completions pushed after the
+    // capture wait behind the next mailbox message and cannot starve it.
+    offloads_lead: usize,
     timers: TimerStore<M>,
     next_timer_order: u64,
     fired_batch: Option<FiredTimerBatch>,
@@ -710,6 +720,7 @@ impl<M> Default for RawResources<M> {
             accepting: true,
             continuations: VecDeque::new(),
             continuation_needs_external: false,
+            offloads_lead: 0,
             timers: TimerStore::default(),
             next_timer_order: 0,
             fired_batch: None,
@@ -736,6 +747,7 @@ impl<M> RawResources<M> {
         self.continuations.clear();
         self.timers.clear();
         self.fired_batch = None;
+        self.offloads_lead = 0;
         self.events.clear();
         dropped_continuations
     }
@@ -1008,11 +1020,13 @@ impl<M: Send + 'static> RawContext<M> {
     ///
     /// Completions re-enter the loop through incarnation-internal storage
     /// that does not consume mailbox capacity (SPEC §5.5). That storage is
-    /// unbounded but self-limiting: it holds at most one entry per offload
-    /// this incarnation has started and not yet consumed, and only the actor
-    /// itself can start offloads, so its population is bounded by the
-    /// caller's own in-flight count. Bookkeeping for finished offloads is
-    /// reclaimed when a new offload starts and when the loop goes idle.
+    /// unbounded but cannot accumulate a backlog: it holds at most one entry
+    /// per offload the actor itself started, and completions already queued
+    /// when a mailbox message is delivered are consumed ahead of later
+    /// mailbox input, so its population stays proportional to the caller's
+    /// in-flight count even under sustained mailbox traffic. Bookkeeping for
+    /// finished offloads is reclaimed when a new offload starts and when the
+    /// loop goes idle.
     pub fn offload<F, T, C>(
         &mut self,
         work: F,
@@ -1030,8 +1044,9 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Starts guarded incarnation-owned async work with one deadline budget.
     ///
-    /// Completion storage follows [`offload`](Self::offload): unbounded but
-    /// limited to one entry per unconsumed offload the actor itself started.
+    /// Completion storage follows [`offload`](Self::offload): unbounded, but
+    /// one entry per offload the actor itself started, drained ahead of
+    /// later mailbox input so no backlog accumulates.
     pub fn offload_scoped<F, T, C>(
         &mut self,
         work: F,
@@ -1219,6 +1234,14 @@ impl<M: Send + 'static> RawContext<M> {
     /// timers. This prevents both an always-readable mailbox and a self-feeding
     /// continuation queue from starving the other.
     ///
+    /// Outside a timer batch, each mailbox delivery snapshots the queued
+    /// offload completions, and that prefix leads the mailbox on later
+    /// calls. An always-readable mailbox therefore cannot starve the
+    /// completion queue — the backlog never grows across mailbox deliveries
+    /// — while completions pushed after the snapshot wait behind the next
+    /// mailbox message, so a self-feeding offload chain cannot starve
+    /// external input either.
+    ///
     /// Frozen mailbox input is deliberately absent. Once stopping begins,
     /// [`try_recv`](Self::try_recv) bypasses this selector and drains the
     /// accepted prefix directly according to the caller's shutdown policy.
@@ -1290,8 +1313,26 @@ impl<M: Send + 'static> RawContext<M> {
                 return Some(message);
             }
 
+            while self.resources.offloads_lead > 0 {
+                let Some(event) = self.resources.events.pop() else {
+                    self.resources.offloads_lead = 0;
+                    break;
+                };
+                self.resources.offloads_lead -= 1;
+                if let Some(message) = Self::materialize_event(event) {
+                    self.resources.continuation_needs_external = false;
+                    return Some(message);
+                }
+            }
+
             let mailbox = self.receiver.try_recv_live();
             if let Some(message) = mailbox {
+                // Completions already queued at this delivery lead the
+                // mailbox on later calls, so the completion backlog cannot
+                // grow across mailbox deliveries, while completions pushed
+                // after this snapshot wait their turn and cannot starve the
+                // mailbox.
+                self.resources.offloads_lead = self.resources.events.watermark();
                 self.resources.continuation_needs_external = false;
                 return Some(message);
             }

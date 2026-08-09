@@ -2079,6 +2079,11 @@ impl ScopeRuntime {
             }
         };
         let plan = ChildPlan::with_options(Arc::clone(&request.slot), definition, resolved);
+        // Conversion can unwind while acquiring child identity or configuring
+        // the mailbox. Keep that fallible work outside the control-plane lock
+        // so driver teardown can still close reservations and removals.
+        let mut child = ChildRuntime::from_plan(plan, &self.root);
+        child.initial = false;
         let key = {
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
             let id = request.slot.member.id();
@@ -2096,7 +2101,8 @@ impl ScopeRuntime {
                 // the same terminality-before-completion ordering as every
                 // other reservation-cancellation path. Definition disposal
                 // is also complete before either waiter regains ownership.
-                let ChildPlan { construction, .. } = plan;
+                child.complete_terminality();
+                let ChildRuntime { construction, .. } = child;
                 reject_admission_after_disposal(
                     request,
                     Some(construction),
@@ -2109,8 +2115,6 @@ impl ScopeRuntime {
             // state transition: an exact remover sees either the reservation
             // or a resident carrying its live arena key, never an unindexed
             // admitted intermediate.
-            let mut child = ChildRuntime::from_plan(plan, &self.root);
-            child.initial = false;
             let key = match self.children.insert(child) {
                 Ok(key) => key,
                 Err(child) => {
@@ -4339,6 +4343,97 @@ mod tests {
         };
         assert_eq!(observed_second.membership, second);
         assert_eq!(observed_second.key, second_key);
+    }
+
+    #[crate::runtime::test]
+    async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.member
+            .update(|record| record.stage = MemberStage::Running);
+        root.set_state(ScopeState::Running);
+        root.set_startup(Ok(()));
+
+        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+        let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let control = DynamicControl::new(events.clone());
+        root.set_dynamic_route(Some(control.clone()));
+        root.set_admitted_children(Vec::new());
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: ResolvedDefaults::default(),
+            intensity_policy: Intensity::default(),
+            intensity: super::IntensityState::default(),
+            children: ChildArena::default(),
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::running(),
+            next_ordered_start: None,
+            role: ScopeRole::Root,
+            dynamic: Some(control.clone()),
+            epoch,
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+
+        let reservation = super::reserve_dynamic(&root, ChildId::from("worker"), None)
+            .expect("running dynamic scope reserves the child");
+        let member = Arc::clone(&reservation.slot.member);
+        reservation
+            .slot
+            .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+        let response = super::start_admission(
+            Arc::clone(&reservation.control),
+            Arc::clone(&reservation.slot),
+            None,
+        )
+        .expect("admission starts inside the runtime");
+        let Some(DriverEvent::Admission(request)) = event_receiver.recv().await else {
+            panic!("the admission forwarder submits the request")
+        };
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _identity = root
+                    .child_identity
+                    .lock()
+                    .expect("scope identity mutex starts healthy");
+                panic!("inject admission conversion failure");
+            }))
+            .is_err()
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request))).is_err(),
+            "the poisoned child identity injects the conversion panic"
+        );
+        assert!(matches!(
+            response.receive().await,
+            Some(Err(ReserveError::NotAdmitting(
+                crate::NotAdmittingCause::Terminal
+            )))
+        ));
+        assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
+
+        let cleanup = catch_unwind(AssertUnwindSafe(|| drop(scope)));
+        assert!(
+            cleanup.is_ok(),
+            "conversion failure must not poison dynamic cleanup"
+        );
+        assert!(
+            control
+                .state
+                .lock()
+                .expect("dynamic-state mutex remains healthy")
+                .entries
+                .is_empty(),
+            "cleanup discharges the stranded reservation"
+        );
     }
 
     pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(

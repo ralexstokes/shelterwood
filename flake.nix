@@ -3,62 +3,39 @@
 
   inputs = {
     rust-env.url = "github:ralexstokes/rust-nix-template";
-    crane.follows = "rust-env/crane";
     nixpkgs.follows = "rust-env/nixpkgs";
     rust-overlay.follows = "rust-env/rust-overlay";
   };
 
   outputs =
-    {
-      crane,
-      rust-env,
-      ...
-    }:
+    { rust-env, ... }:
     rust-env.lib.mkRustProject {
       src = ./.;
       # Repository docs and their packaged doctest copies are compared in the
-      # clean build sandbox, so keep Markdown alongside Cargo sources.
+      # clean build sandbox, so keep Markdown alongside Cargo sources; the
+      # enforcement scripts under tools/ run there too (.sh), and nextest
+      # reads its timeout config.
       extraSourceFilter =
         path: type:
         type == "regular"
         && (
           builtins.match ".*\\.md" (toString path) != null
+          || builtins.match ".*\\.sh" (toString path) != null
           || builtins.match ".*/\\.config/nextest\\.toml" (toString path) != null
         );
       extraChecks =
-        pkgs:
-        let
-          nightlyToolchain = pkgs.rust-bin.selectLatestNightlyWith (
-            toolchain:
-            toolchain.default.override {
-              extensions = [ "rustfmt" ];
-            }
-          );
-          craneLib = crane.mkLib pkgs;
-          craneLibNightly = craneLib.overrideToolchain nightlyToolchain;
-          source = pkgs.lib.cleanSourceWith {
-            src = pkgs.lib.cleanSource ./.;
-            filter =
-              path: type:
-              type == "directory"
-              || craneLib.filterCargoSources path type
-              || pkgs.lib.hasSuffix ".sh" (toString path)
-              || pkgs.lib.hasSuffix ".md" (toString path);
-          };
-          commonArgs = {
-            pname = "shelterwood-part0-enforcement";
-            version = "0.1.0";
-            src = source;
-            strictDeps = true;
-            cargoExtraArgs = "--locked --workspace --all-features";
-          };
-          cargoArtifacts = craneLibNightly.buildDepsOnly commonArgs;
-        in
         {
-          part0-enforcement = craneLibNightly.mkCargoDerivation (
+          pkgs,
+          craneLibNightly,
+          commonArgs,
+          cargoArtifactsNightly,
+          ...
+        }:
+        {
+          api-enforcement = craneLibNightly.mkCargoDerivation (
             commonArgs
             // {
-              inherit cargoArtifacts;
+              cargoArtifacts = cargoArtifactsNightly;
               nativeBuildInputs = [ pkgs.ripgrep ];
               buildPhaseCargoCommand = ''
                 RUSTDOCFLAGS="-Z unstable-options --output-format json" \

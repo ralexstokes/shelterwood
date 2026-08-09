@@ -14,13 +14,13 @@ the core API yet.
 
 ## Getting started
 
-The repository toolchain comes from Nix. `scripts/dev` enters the dev shell for
+The repository toolchain comes from Nix. `tools/dev` enters the dev shell for
 the current checkout, including when invoked from a worktree:
 
 ```sh
-./scripts/dev just test
-./scripts/dev just ci
-./scripts/dev just ci-nix
+./tools/dev just test
+./tools/dev just ci
+./tools/dev just ci-nix
 ```
 
 A task-first application needs no actor merely to obtain supervision:

@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 # Run a command inside this checkout's Nix devshell.
 #
-#     ./scripts/dev just ci
-#     ./scripts/dev cargo nextest run --workspace
+#     ./tools/dev just ci
+#     ./tools/dev cargo nextest run --workspace
 #
 # .envrc loads the devshell through direnv, but `direnv allow` is keyed on the
 # absolute path of .envrc, so every new git worktree starts blocked — and the
@@ -17,7 +17,7 @@
 set -eu
 
 if [ "$#" -eq 0 ]; then
-    echo "usage: ./scripts/dev <command> [args...]" >&2
+    echo "usage: ./tools/dev <command> [args...]" >&2
     exit 2
 fi
 

@@ -157,7 +157,7 @@ impl Fence {
 /// `u64::MAX` is poison and is never returned. Once the last usable value has
 /// been minted, no successor can be minted.
 #[derive(Debug)]
-pub(crate) struct FenceCounter {
+struct FenceCounter {
     lineage: Lineage,
     current: Generation,
 }
@@ -182,7 +182,7 @@ impl FenceCounter {
     }
 
     #[cfg(test)]
-    pub(crate) fn near_exhaustion(lineage: u64) -> Self {
+    fn near_exhaustion(lineage: u64) -> Self {
         Self {
             lineage: Lineage(lineage),
             current: Generation(u64::MAX - 2),
@@ -207,7 +207,7 @@ impl FenceCounter {
     /// Observation uses the same saturating, poison-never-minted primitive as
     /// membership and incarnation fencing.
     #[cfg(test)]
-    pub(crate) fn mint_sequence(&mut self) -> Option<u64> {
+    fn mint_sequence(&mut self) -> Option<u64> {
         self.mint().map(|fence| fence.generation.get())
     }
 }
@@ -270,9 +270,9 @@ impl ScopeIdentity {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_counter(id: ChildId, memberships: FenceCounter) -> Self {
+    pub(crate) fn near_exhaustion(id: ChildId, lineage: u64) -> Self {
         Self {
-            memberships: HashMap::from([(id, memberships)]),
+            memberships: HashMap::from([(id, FenceCounter::near_exhaustion(lineage))]),
         }
     }
 
@@ -413,8 +413,7 @@ mod tests {
         let id = ChildId::from("worker");
         // A fixture lineage this test does not otherwise allocate, so it
         // cannot collide with an unrelated identity created below.
-        let counter = FenceCounter::near_exhaustion(TEST_LINEAGE);
-        let mut scope = ScopeIdentity::with_counter(id.clone(), counter);
+        let mut scope = ScopeIdentity::near_exhaustion(id.clone(), TEST_LINEAGE);
         let last = scope
             .mint_membership(&id)
             .expect("last usable membership is minted");
@@ -436,7 +435,7 @@ mod tests {
     #[test]
     fn exhausted_stable_domain_rejects_a_rebuilt_declaration() {
         let id = ChildId::from("worker");
-        let mut stable = ScopeIdentity::with_counter(id.clone(), FenceCounter::near_exhaustion(7));
+        let mut stable = ScopeIdentity::near_exhaustion(id.clone(), 7);
         stable
             .mint_membership(&id)
             .expect("last usable stable membership is minted");

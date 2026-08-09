@@ -3026,7 +3026,7 @@ mod tests {
         StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
         engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
-        identity::{FenceCounter, IncarnationCounter, ScopeIdentity},
+        identity::{IncarnationCounter, ScopeIdentity},
         mailbox::MailboxCell,
         plan::SlotCell,
         runtime::Latch,
@@ -4890,8 +4890,7 @@ mod tests {
         let nested_member = MemberCell::new(nested_id, nested_membership);
 
         let worker_id = ChildId::from("worker");
-        let mut child_identity =
-            ScopeIdentity::with_counter(worker_id.clone(), FenceCounter::near_exhaustion(7));
+        let mut child_identity = ScopeIdentity::near_exhaustion(worker_id.clone(), 7);
         child_identity
             .mint_membership(&worker_id)
             .expect("last usable membership is minted before the rebuild");

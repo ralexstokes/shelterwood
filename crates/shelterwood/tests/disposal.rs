@@ -1226,6 +1226,7 @@ async fn cancelled_send_contains_message_destructor_panic() {
 struct ReplyThenPark {
     gate: DestructorGate,
     dropped: tokio::sync::mpsc::UnboundedSender<ThreadId>,
+    allow_reply: ReleaseGate,
     replied: ReleaseGate,
 }
 
@@ -1234,6 +1235,7 @@ impl RawActor for ReplyThenPark {
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
         if let Some(reply) = context.recv().await {
+            self.allow_reply.wait().await;
             reply.send(BlockingDropProbe::new(&self.gate, self.dropped.clone()));
             self.replied.release();
         }
@@ -1245,6 +1247,7 @@ impl RawActor for ReplyThenPark {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_call_disposes_stored_reply_off_the_caller() {
     let gate = DestructorGate::default();
+    let allow_reply = ReleaseGate::default();
     let replied = ReleaseGate::default();
     let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
     let mut tree = Tree::new();
@@ -1254,6 +1257,7 @@ async fn cancelled_call_disposes_stored_reply_off_the_caller() {
             RawOnceDef::new(ReplyThenPark {
                 gate: gate.clone(),
                 dropped,
+                allow_reply: allow_reply.clone(),
                 replied: replied.clone(),
             }),
         )
@@ -1263,6 +1267,10 @@ async fn cancelled_call_disposes_stored_reply_off_the_caller() {
 
     let mut call = Box::pin(actor.call(|reply| reply, Duration::from_secs(5)));
     poll_pending(&mut call).await;
+    // The first poll must establish the cancellation window before the actor
+    // can publish a reply; otherwise a fast second worker can complete the
+    // call in that poll and drop the blocking probe on the test task.
+    allow_reply.release();
     replied.wait().await;
     drop(call);
     wait_for_destructor(&gate).await;

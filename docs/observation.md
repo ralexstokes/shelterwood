@@ -25,6 +25,10 @@ temporarily absent. For an event emitted by the subscribed scope itself, compare
 `snapshot.watermark(event.scope)` finds the matching watermark. An event is
 already reflected when `event.seq <= watermark`.
 
+These values use `LifecycleSeq`. `LifecycleSeq::EXHAUSTED` is the permanent
+watermark after the sequence space is exhausted and is never emitted on an
+event; `get()` exposes the underlying `u64` when numeric integration requires it.
+
 A child in `Restarting` normally exposes its absolute backoff deadline through
 `restart_at`. If the requested delay is too large for the platform clock to
 represent, `restart_at` is `None`; the child remains in `Restarting` until

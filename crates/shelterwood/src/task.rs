@@ -22,6 +22,12 @@ use crate::{
 pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
 pub(crate) type TaskFactory = Arc<dyn Fn(TaskContext) -> TaskFuture + Send + Sync + 'static>;
 
+pub(crate) struct TaskContextLatches {
+    pub(crate) shutdown: Latch,
+    pub(crate) abort: Latch,
+    pub(crate) ready: Latch,
+}
+
 /// Per-incarnation capabilities supplied to a supervised task.
 #[derive(Clone, Debug)]
 pub struct TaskContext {
@@ -33,19 +39,13 @@ pub struct TaskContext {
 }
 
 impl TaskContext {
-    pub(crate) fn new(
-        id: ChildId,
-        incarnation: Incarnation,
-        shutdown: Latch,
-        abort: Latch,
-        ready: Latch,
-    ) -> Self {
+    pub(crate) fn new(id: ChildId, incarnation: Incarnation, latches: TaskContextLatches) -> Self {
         Self {
             id,
             incarnation,
-            shutdown: CancellationToken::from_latch(shutdown),
-            abort: CancellationToken::from_latch(abort),
-            ready,
+            shutdown: CancellationToken::from_latch(latches.shutdown),
+            abort: CancellationToken::from_latch(latches.abort),
+            ready: latches.ready,
         }
     }
 
@@ -320,30 +320,31 @@ mod tests {
     };
 
     use crate::{
-        ChildId, Exit, ExitKind,
+        Cancellation, ChildId, Exit, ExitKind, GracePhase,
         cells::MemberCell,
         identity::ScopeIdentity,
         runtime::{self, Latch},
     };
 
-    use super::{OneShotTaskRef, TaskContext, TaskRef};
+    use super::{OneShotTaskRef, TaskContext, TaskContextLatches, TaskRef};
 
     fn task_context() -> (TaskContext, Latch, Latch, Latch) {
         let id = ChildId::from("task");
         let mut identity = ScopeIdentity::new();
         let membership = identity.mint_membership(&id).expect("membership available");
         let mut incarnations = identity.incarnation_counter(membership);
-        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
-            .expect("incarnation available");
+        let incarnation = incarnations.mint().expect("incarnation available");
         let shutdown = Latch::default();
         let abort = Latch::default();
         let ready = Latch::default();
         let context = TaskContext::new(
             id,
             incarnation,
-            shutdown.clone(),
-            abort.clone(),
-            ready.clone(),
+            TaskContextLatches {
+                shutdown: shutdown.clone(),
+                abort: abort.clone(),
+                ready: ready.clone(),
+            },
         );
         (context, shutdown, abort, ready)
     }
@@ -406,7 +407,7 @@ mod tests {
         let mut context = Context::from_waker(Waker::noop());
 
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
-        member.terminalize(Exit::new(ExitKind::Completed, false));
+        member.terminalize(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
         assert_eq!(waiting.await, Ok(42));
     }
 
@@ -416,7 +417,12 @@ mod tests {
         sender.send(42_u8).expect("claim remains open");
         let mut waiting = Box::pin(claim.wait());
         let mut context = Context::from_waker(Waker::noop());
-        let exit = Exit::new(ExitKind::Aborted { after_grace: false }, true);
+        let exit = Exit::new(
+            ExitKind::Aborted {
+                phase: GracePhase::WithinGrace,
+            },
+            Cancellation::Observed,
+        );
 
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
         member.terminalize(exit.clone());
@@ -428,7 +434,7 @@ mod tests {
     async fn completed_terminal_publication_requires_a_typed_value() {
         let (sender, claim, member) = one_shot_claim::<u8>();
         drop(sender);
-        member.terminalize(Exit::new(ExitKind::Completed, false));
+        member.terminalize(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
 
         let _ = claim.wait().await;
     }

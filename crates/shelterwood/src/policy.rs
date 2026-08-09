@@ -74,6 +74,13 @@ impl TotalRestarts {
     }
 }
 
+/// Whether a child construction can be recreated after its first incarnation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ChildMode {
+    Restartable,
+    OneShot,
+}
+
 /// The default bounded FIFO mailbox capacity.
 pub const DEFAULT_MAILBOX_CAPACITY: usize = 64;
 /// The default child shutdown grace.
@@ -735,7 +742,7 @@ pub(crate) struct ResolvedCommonOptions {
 pub(crate) fn resolve_common(
     options: &CommonOptions,
     defaults: &ResolvedDefaults,
-    one_shot: bool,
+    mode: ChildMode,
     default_readiness: Readiness,
 ) -> Result<ResolvedCommonOptions, InvalidPolicy> {
     defaults.validate()?;
@@ -753,7 +760,7 @@ pub(crate) fn resolve_common(
         value => value,
     };
     let resolved = ResolvedCommonOptions {
-        restart: if one_shot {
+        restart: if mode == ChildMode::OneShot {
             RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
         } else {
             options.restart.unwrap_or(defaults.child_restart)
@@ -766,7 +773,7 @@ pub(crate) fn resolve_common(
         readiness: options.readiness.unwrap_or(default_readiness),
         readiness_override: options.readiness,
         readiness_deadline,
-        retention: options.retention.unwrap_or(if one_shot {
+        retention: options.retention.unwrap_or(if mode == ChildMode::OneShot {
             Retention::Remove
         } else {
             Retention::Retain

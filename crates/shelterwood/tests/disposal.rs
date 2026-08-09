@@ -15,8 +15,8 @@ use crate::common::{
     poll_until,
 };
 use shelterwood::{
-    Backoff, CallErrorKind, ChildState, DynamicTree, ExitError, ExitKind, ExitResult, Jitter,
-    LifecycleEventKind, LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef,
+    Backoff, CallErrorKind, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult,
+    Jitter, LifecycleEventKind, LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef,
     Readiness, ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition,
     RestartPolicy, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
@@ -115,6 +115,14 @@ struct PanicAnyOnDrop;
 impl Drop for PanicAnyOnDrop {
     fn drop(&mut self) {
         std::panic::panic_any(PanickingPanicPayload);
+    }
+}
+
+struct NonStringPanicOnDrop;
+
+impl Drop for NonStringPanicOnDrop {
+    fn drop(&mut self) {
+        std::panic::panic_any(17_u8);
     }
 }
 
@@ -245,7 +253,7 @@ async fn panicking_unread_messages_are_all_disposed_without_reclassifying_the_ac
         }
     };
     assert!(matches!(exit.kind(), ExitKind::Completed));
-    assert!(exit.cancelled());
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -293,6 +301,32 @@ async fn factory_capture_destructor_panics_are_isolated_classified_and_independe
     assert!(matches!(
         second_exit.kind(),
         ExitKind::Panicked { message } if message.as_deref() == Some("second factory destructor")
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_string_factory_destructor_panic_remains_a_panic_exit() {
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "non-string",
+            TaskDef::new({
+                let capture = NonStringPanicOnDrop;
+                move |_| {
+                    let _ = &capture;
+                    async { Ok(()) }
+                }
+            })
+            .restart(never()),
+        )
+        .expect("valid task");
+
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("task starts");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert!(matches!(
+        task.wait().await.kind(),
+        ExitKind::Panicked { message: None }
     ));
 }
 
@@ -819,7 +853,7 @@ async fn hard_shutdown_detaches_a_blocking_factory_disposal() {
     result.expect("post-exit disposal is not an actor straggler");
     let exit = task.wait().await;
     assert!(matches!(exit.kind(), ExitKind::Completed));
-    assert!(exit.cancelled());
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
 #[tokio::test]

@@ -87,6 +87,8 @@ expect_case layering-scope-driver-below check-layering-paths.sh \
   "upward driver or tree references found below the driver layer:"
 expect_case layering-scope-tree-alias-below check-layering-paths.sh \
   "upward driver or tree references found below the driver layer:"
+expect_case layering-scope-crate-root-alias-below check-layering-paths.sh \
+  "upward tree root re-exports found in the scope layer:"
 expect_case layering-scope-tree-grouped-reexport-below check-layering-paths.sh \
   "upward tree root re-exports found in the scope layer:"
 expect_case layering-scope-tree-root-reexport-below check-layering-paths.sh \

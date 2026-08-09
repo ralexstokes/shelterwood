@@ -65,6 +65,25 @@ check_forbidden() {
   esac
 }
 
+collect_scope_root_aliases() {
+  local pattern="$1"
+  local aliases
+  local status
+  set +e
+  aliases="$({ rg --multiline --no-filename --only-matching --replace '$2' "$pattern" "$scope_path"; } 2>&1)"
+  status=$?
+  set -e
+
+  case "$status" in
+    0) printf '%s\n' "$aliases" ;;
+    1) ;;
+    *)
+      echo "$aliases" >&2
+      exit "$status"
+      ;;
+  esac
+}
+
 check_forbidden \
   "upward driver or tree references found below the driver layer:" \
   "$upward_module_pattern" \
@@ -74,6 +93,21 @@ check_forbidden \
   "upward tree root re-exports found in the scope layer:" \
   "\\b(crate|super)::($tree_root_export_pattern)\\b|\\buse[[:space:]]+(crate|super)::\\{[^;]*\\b($tree_root_export_pattern)\\b" \
   "$scope_path"
+
+# A crate-root alias can hide both direct root exports and the module names
+# checked above. Extract direct and grouped `self` aliases, then scan uses of
+# each exact identifier so unrelated aliases remain permitted.
+scope_root_aliases="$(
+  collect_scope_root_aliases '\buse[[:space:]]+(crate|super)[[:space:]]+as[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*;'
+  collect_scope_root_aliases '\buse[[:space:]]+(crate|super)::\{[^;]*\bself[[:space:]]+as[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*(,|})'
+)"
+while IFS= read -r scope_root_alias; do
+  [[ -z "$scope_root_alias" ]] && continue
+  check_forbidden \
+    "upward tree root re-exports found in the scope layer:" \
+    "\\b${scope_root_alias}::($tree_root_export_pattern|driver|tree)\\b" \
+    "$scope_path"
+done <<< "$scope_root_aliases"
 
 check_forbidden \
   "upward tree references found in the driver layer:" \

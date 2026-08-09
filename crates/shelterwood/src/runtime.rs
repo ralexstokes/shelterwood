@@ -876,8 +876,15 @@ impl<T> Clone for WatchReceiver<T> {
 }
 
 impl<T> WatchReceiver<T> {
+    /// Waits for a new value without treating publisher closure as a change.
+    ///
+    /// Callers that need to observe publisher closure must use
+    /// [`Self::changed_or_closed`] instead. Parking here prevents a loop that
+    /// intentionally ignores closure from becoming permanently always-ready.
     pub(crate) async fn changed(&mut self) {
-        let _ = self.0.changed().await;
+        if self.0.changed().await.is_err() {
+            std::future::pending().await
+        }
     }
 
     pub(crate) async fn changed_or_closed(&mut self) -> bool {
@@ -1374,6 +1381,27 @@ mod tests {
             drop(changed);
             assert_eq!(signal.watcher_count(), 1);
         }
+    }
+
+    #[test]
+    fn closed_watch_change_parks_on_its_first_poll() {
+        let (sender, mut receiver) = super::watch(());
+        drop(sender);
+
+        let mut changed = Box::pin(receiver.changed());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(changed.as_mut().poll(&mut context).is_pending());
+        assert!(changed.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[test]
+    fn closed_watch_remains_observable_when_requested() {
+        let (sender, mut receiver) = super::watch(());
+        drop(sender);
+
+        let mut changed = Box::pin(receiver.changed_or_closed());
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(changed.as_mut().poll(&mut context), Poll::Ready(false));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

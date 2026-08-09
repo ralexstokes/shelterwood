@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The fixture harness re-points this scan at a mirrored source tree; the
+# default scans the repository from the invoking directory as before.
+cd "${SHELTERWOOD_ENFORCEMENT_ROOT:-.}"
+
 readonly forbidden='[.]downcast(_ref|_mut)?([[:space:]]*)?(::)?[<(]'
 readonly exit_path=(
   crates/shelterwood/src/driver.rs

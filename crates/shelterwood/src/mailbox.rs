@@ -173,6 +173,13 @@ impl fmt::Display for ReplyError {
 
 impl std::error::Error for ReplyError {}
 
+/// Whether an operation is being polled before or after its deadline expires.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeadlinePhase {
+    BeforeExpiry,
+    Elapsed,
+}
+
 trait DeadlineOperation {
     type Output;
 
@@ -187,7 +194,7 @@ trait DeadlineOperation {
         &mut self,
         context: &mut Context<'_>,
         budget: crate::deadline::Deadline,
-        elapsed: bool,
+        phase: DeadlinePhase,
     ) -> Poll<Self::Output>;
 
     /// Resolves a zero-width budget without ever attempting the operation.
@@ -205,7 +212,7 @@ struct Deadlined<F> {
     budget: Option<crate::deadline::Deadline>,
     timer: Option<crate::runtime::BoxedSleep>,
     started: bool,
-    elapsed: bool,
+    phase: DeadlinePhase,
     done: bool,
 }
 
@@ -217,7 +224,7 @@ impl<F> Deadlined<F> {
             budget: None,
             timer: None,
             started: false,
-            elapsed: false,
+            phase: DeadlinePhase::BeforeExpiry,
             done: false,
         }
     }
@@ -247,11 +254,14 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
         let budget = this
             .budget
             .expect("a started deadline future retains its captured budget");
-        if let Poll::Ready(result) = this.operation.poll_deadlined(context, budget, false) {
+        if let Poll::Ready(result) =
+            this.operation
+                .poll_deadlined(context, budget, DeadlinePhase::BeforeExpiry)
+        {
             this.done = true;
             return Poll::Ready(result);
         }
-        if !this.elapsed {
+        if this.phase == DeadlinePhase::BeforeExpiry {
             if this
                 .timer
                 .as_mut()
@@ -265,10 +275,12 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             // The timer is a one-shot future: polling it again after it
             // resolves panics. Latch the transition and release it, so an
             // elapsed poll that stays pending re-polls only the operation.
-            this.elapsed = true;
+            this.phase = DeadlinePhase::Elapsed;
             this.timer = None;
         }
-        let result = this.operation.poll_deadlined(context, budget, true);
+        let result = this
+            .operation
+            .poll_deadlined(context, budget, DeadlinePhase::Elapsed);
         this.done = result.is_ready();
         result
     }
@@ -364,17 +376,19 @@ impl<T> DeadlineOperation for ReplyOperation<T> {
         &mut self,
         context: &mut Context<'_>,
         _budget: crate::deadline::Deadline,
-        elapsed: bool,
+        phase: DeadlinePhase,
     ) -> Poll<Self::Output> {
         match self.receiver.inner.poll_receive(context) {
             Poll::Ready(Some(value)) => Poll::Ready(Ok(value)),
             Poll::Ready(None) => Poll::Ready(Err(ReplyError::Dropped)),
-            Poll::Pending if elapsed => match self.receiver.inner.close_and_poll_receive(context) {
-                OneShotClose::Value(value) => Poll::Ready(Ok(value)),
-                OneShotClose::SenderClosed => Poll::Ready(Err(ReplyError::Dropped)),
-                OneShotClose::Empty => Poll::Ready(Err(ReplyError::Timeout)),
-                OneShotClose::Pending => Poll::Pending,
-            },
+            Poll::Pending if phase == DeadlinePhase::Elapsed => {
+                match self.receiver.inner.close_and_poll_receive(context) {
+                    OneShotClose::Value(value) => Poll::Ready(Ok(value)),
+                    OneShotClose::SenderClosed => Poll::Ready(Err(ReplyError::Dropped)),
+                    OneShotClose::Empty => Poll::Ready(Err(ReplyError::Timeout)),
+                    OneShotClose::Pending => Poll::Pending,
+                }
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -415,6 +429,13 @@ enum BindingStatus {
     Bound(Incarnation),
     Frozen(Incarnation),
     Terminal(Option<Incarnation>),
+}
+
+/// Which mailbox binding states may yield accepted messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiveMode {
+    LiveOnly,
+    IncludeFrozen,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -935,13 +956,15 @@ impl<M: Send + 'static> MailboxCell<M> {
     fn receive(
         &self,
         incarnation: Incarnation,
-        allow_frozen: bool,
+        mode: ReceiveMode,
         accepted_through: Option<AcceptedSequence>,
     ) -> Option<M> {
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         let eligible = match state.status {
             BindingStatus::Bound(current) => current == incarnation,
-            BindingStatus::Frozen(current) => allow_frozen && current == incarnation,
+            BindingStatus::Frozen(current) => {
+                mode == ReceiveMode::IncludeFrozen && current == incarnation
+            }
             BindingStatus::Unbound | BindingStatus::Terminal(_) => false,
         };
         if !eligible {
@@ -1573,12 +1596,12 @@ impl<M: Send + 'static> DeadlineOperation for TimedSend<M> {
         &mut self,
         context: &mut Context<'_>,
         _budget: crate::deadline::Deadline,
-        elapsed: bool,
+        phase: DeadlinePhase,
     ) -> Poll<Self::Output> {
         if let Poll::Ready(result) = Pin::new(&mut self.send).poll(context) {
             return Poll::Ready(result);
         }
-        if !elapsed {
+        if phase == DeadlinePhase::BeforeExpiry {
             Poll::Pending
         } else {
             Poll::Ready(withdraw_send(&mut self.send))
@@ -1649,7 +1672,7 @@ impl<M, T> CallOperation<M, T> {
         &mut self,
         context: &mut Context<'_>,
         incarnation: Incarnation,
-        deadline_elapsed: bool,
+        phase: DeadlinePhase,
     ) -> Poll<Result<Replied<T>, CallError>> {
         let reply = self
             .reply
@@ -1662,7 +1685,7 @@ impl<M, T> CallOperation<M, T> {
                 incarnation_observed: Some(incarnation),
                 kind: CallErrorKind::ReplyDropped,
             })),
-            Poll::Pending if deadline_elapsed => {
+            Poll::Pending if phase == DeadlinePhase::Elapsed => {
                 match reply.inner.close_and_poll_receive(context) {
                     OneShotClose::Value(value) => Poll::Ready(Ok(Replied { value, incarnation })),
                     OneShotClose::SenderClosed => Poll::Ready(Err(CallError {
@@ -1696,10 +1719,10 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
         &mut self,
         context: &mut Context<'_>,
         budget: crate::deadline::Deadline,
-        elapsed: bool,
+        phase: DeadlinePhase,
     ) -> Poll<Self::Output> {
         if self.make_msg.is_some() {
-            if elapsed {
+            if phase == DeadlinePhase::Elapsed {
                 return Poll::Ready(self.short_circuit());
             }
             // Capture the one overall budget before invoking user code. A
@@ -1753,10 +1776,10 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
         // payload yet; that transition wakes the registered waker, so waiting
         // is the answer rather than reaching for a send that no longer exists.
         if let Some(accepted) = self.accepted {
-            return self.poll_reply(context, accepted, elapsed);
+            return self.poll_reply(context, accepted, phase);
         }
 
-        if !elapsed {
+        if phase == DeadlinePhase::BeforeExpiry {
             return Poll::Pending;
         }
 
@@ -1769,7 +1792,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
         match result {
             Ok(incarnation) => {
                 self.accepted = Some(incarnation);
-                self.poll_reply(context, incarnation, true)
+                self.poll_reply(context, incarnation, DeadlinePhase::Elapsed)
             }
             Err(error) => {
                 self.close_reply();
@@ -1827,16 +1850,21 @@ impl<M: Send + 'static> MailboxReceiver<M> {
     }
 
     pub(crate) fn try_recv(&self) -> Option<M> {
-        self.mailbox.receive(self.incarnation, true, None)
+        self.mailbox
+            .receive(self.incarnation, ReceiveMode::IncludeFrozen, None)
     }
 
     pub(crate) fn try_recv_live(&self) -> Option<M> {
-        self.mailbox.receive(self.incarnation, false, None)
+        self.mailbox
+            .receive(self.incarnation, ReceiveMode::LiveOnly, None)
     }
 
     pub(crate) fn try_recv_live_through(&self, accepted_sequence: AcceptedSequence) -> Option<M> {
-        self.mailbox
-            .receive(self.incarnation, false, Some(accepted_sequence))
+        self.mailbox.receive(
+            self.incarnation,
+            ReceiveMode::LiveOnly,
+            Some(accepted_sequence),
+        )
     }
 
     pub(crate) fn accepted_sequence(&self) -> AcceptedSequence {
@@ -2168,9 +2196,9 @@ mod tests {
             &mut self,
             _context: &mut Context<'_>,
             _budget: crate::deadline::Deadline,
-            elapsed: bool,
+            phase: super::DeadlinePhase,
         ) -> Poll<usize> {
-            if !elapsed {
+            if phase == super::DeadlinePhase::BeforeExpiry {
                 return Poll::Pending;
             }
             self.elapsed_polls += 1;

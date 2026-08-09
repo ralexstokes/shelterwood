@@ -143,10 +143,17 @@ macro_rules! actor_context_forwarders {
     };
 }
 
+/// Which mailbox delivery stage owns the current callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeliveryStage {
+    Live,
+    DrainingFrozenPrefix,
+}
+
 /// Callback context used by both live and frozen-prefix handler deliveries.
 pub struct Context<'a, A: Actor> {
     core: ActorContextCore<'a, A::Msg>,
-    draining: bool,
+    stage: DeliveryStage,
     actor: PhantomData<fn() -> A>,
 }
 
@@ -156,16 +163,16 @@ impl<A: Actor> fmt::Debug for Context<'_, A> {
             .debug_struct("Context")
             .field("id", self.core.id())
             .field("incarnation", &self.core.incarnation())
-            .field("draining", &self.draining)
+            .field("stage", &self.stage)
             .finish_non_exhaustive()
     }
 }
 
 impl<'a, A: Actor> Context<'a, A> {
-    fn new(raw: &'a mut RawContext<A::Msg>, draining: bool) -> Self {
+    fn new(raw: &'a mut RawContext<A::Msg>, stage: DeliveryStage) -> Self {
         Self {
             core: ActorContextCore::new(raw),
-            draining,
+            stage,
             actor: PhantomData,
         }
     }
@@ -174,14 +181,14 @@ impl<'a, A: Actor> Context<'a, A> {
 
     /// Releases this incarnation's readiness gate while live.
     pub fn mark_ready(&self) {
-        if !self.draining {
+        if self.stage == DeliveryStage::Live {
             self.core.raw.mark_ready();
         }
     }
 
     /// Requests a clean local stop after the current callback.
     pub fn stop(&mut self) {
-        if !self.draining {
+        if self.stage == DeliveryStage::Live {
             self.core.raw.stop();
         }
     }
@@ -189,12 +196,12 @@ impl<'a, A: Actor> Context<'a, A> {
     /// Reports whether this callback is draining the frozen mailbox prefix.
     #[must_use]
     pub fn is_draining(&self) -> bool {
-        self.draining
+        self.stage == DeliveryStage::DrainingFrozenPrefix
     }
 
     /// Queues an actor-local continuation ahead of external input.
     pub fn continue_with(&mut self, message: A::Msg) -> Result<(), Rejected<A::Msg>> {
-        if self.draining {
+        if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new(message))
         } else {
             self.core.raw.continue_with(message)
@@ -211,7 +218,7 @@ impl<'a, A: Actor> Context<'a, A> {
     where
         K: Hash + Eq + Send + 'static,
     {
-        if self.draining {
+        if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new((key, message)))
         } else {
             self.core.raw.set_timeout(key, message, after)
@@ -229,7 +236,7 @@ impl<'a, A: Actor> Context<'a, A> {
         K: Hash + Eq + Send + 'static,
         A::Msg: Clone,
     {
-        if self.draining {
+        if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new((key, message)))
         } else {
             self.core.raw.set_interval(key, message, period)
@@ -241,7 +248,7 @@ impl<'a, A: Actor> Context<'a, A> {
     where
         K: Hash + Eq + Send + 'static,
     {
-        if self.draining {
+        if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new(()))
         } else {
             Ok(self.core.raw.clear_timer(key))
@@ -260,7 +267,7 @@ impl<'a, A: Actor> Context<'a, A> {
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> A::Msg + Send + 'static,
     {
-        if self.draining {
+        if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new((work, continuation)))
         } else {
             self.core.raw.offload(work, continuation, deadline)
@@ -279,7 +286,7 @@ impl<'a, A: Actor> Context<'a, A> {
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> A::Msg + Send + 'static,
     {
-        if self.draining {
+        if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new((work, continuation)))
         } else {
             self.core.raw.offload_scoped(work, continuation, deadline)
@@ -288,10 +295,10 @@ impl<'a, A: Actor> Context<'a, A> {
 
     /// Re-enters a same-message actor with this exact context and stage.
     pub fn for_actor<B: Actor<Msg = A::Msg>>(&mut self) -> Context<'_, B> {
-        let draining = self.draining;
+        let stage = self.stage;
         Context {
             core: self.core.reborrow(),
-            draining,
+            stage,
             actor: PhantomData,
         }
     }
@@ -382,7 +389,7 @@ impl<A: Actor> RawActor for Handler<A> {
             .take()
             .expect("handler actor initialization invoked more than once");
         let initialized = {
-            let mut context = Context::<A>::new(raw, false);
+            let mut context = Context::<A>::new(raw, DeliveryStage::Live);
             A::init(args, &mut context).await
         };
         let actor = match initialized {
@@ -395,7 +402,7 @@ impl<A: Actor> RawActor for Handler<A> {
 
         while let Some(message) = raw.recv().await {
             let handled = {
-                let mut context = Context::<A>::new(raw, false);
+                let mut context = Context::<A>::new(raw, DeliveryStage::Live);
                 actor.handle(message, &mut context).await
             };
             if let Err(error) = handled {
@@ -407,7 +414,8 @@ impl<A: Actor> RawActor for Handler<A> {
             MailboxShutdown::Drain => {
                 while let Some(message) = raw.try_recv() {
                     let handled = {
-                        let mut context = Context::<A>::new(raw, true);
+                        let mut context =
+                            Context::<A>::new(raw, DeliveryStage::DrainingFrozenPrefix);
                         actor.handle(message, &mut context).await
                     };
                     if let Err(error) = handled {

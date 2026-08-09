@@ -12,8 +12,8 @@ use crate::{
     definition::DefinitionSource,
     identity::{IdError, ScopeIdentity},
     policy::{
-        CommonOptions, InvalidPolicy, PolicyField, ResolvedCommonOptions, ResolvedDefaults,
-        ScopeFlavor, resolve_common,
+        ChildMode, CommonOptions, InvalidPolicy, PolicyField, ResolvedCommonOptions,
+        ResolvedDefaults, ScopeFlavor, resolve_common,
     },
     raw::RawConstruction,
     runtime::{self, Isolated, Latch},
@@ -176,10 +176,10 @@ impl SlotCell {
         definition: &Isolated<ChildConstruction>,
         defaults: &ResolvedDefaults,
     ) -> Result<ResolvedCommonOptions, InvalidPolicy> {
-        let (options, one_shot) = match definition.get() {
-            ChildConstruction::Raw(definition) => (&definition.options, definition.one_shot()),
-            ChildConstruction::Task(definition) => (&definition.options, false),
-            ChildConstruction::TaskOnce(definition) => (&definition.options, true),
+        let (options, mode) = match definition.get() {
+            ChildConstruction::Raw(definition) => (&definition.options, definition.mode()),
+            ChildConstruction::Task(definition) => (&definition.options, ChildMode::Restartable),
+            ChildConstruction::TaskOnce(definition) => (&definition.options, ChildMode::OneShot),
             ChildConstruction::Scope(definition) => {
                 if let DefinitionSource::OneShot(tree) = &definition.source {
                     let inherited = match definition.defaults {
@@ -189,10 +189,10 @@ impl SlotCell {
                     tree.validate_policies(&inherited)
                         .map_err(|invalid| invalid.prepend(self.member.id()))?;
                 }
-                (&definition.options, definition.one_shot())
+                (&definition.options, definition.mode())
             }
         };
-        resolve_common(options, defaults, one_shot, Readiness::Immediate)
+        resolve_common(options, defaults, mode, Readiness::Immediate)
             .map_err(|invalid| invalid.prepend(self.member.id()))
     }
 }
@@ -430,8 +430,12 @@ pub(crate) struct ScopeConstruction {
 pub(crate) type ScopeFactory = Arc<dyn Fn() -> BuilderCore + Send + Sync + 'static>;
 
 impl ScopeConstruction {
-    pub(crate) fn one_shot(&self) -> bool {
-        self.source.is_one_shot()
+    pub(crate) fn mode(&self) -> ChildMode {
+        if self.source.is_one_shot() {
+            ChildMode::OneShot
+        } else {
+            ChildMode::Restartable
+        }
     }
 
     pub(crate) fn restartable(&self) -> Option<&ScopeFactory> {

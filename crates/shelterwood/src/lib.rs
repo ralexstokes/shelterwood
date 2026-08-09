@@ -26,8 +26,9 @@ pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use admission::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use cancellation::CancellationToken;
 pub use exit::{
-    Exit, ExitError, ExitKind, ExitResult, IntensityTrip, ShutdownStraggler, ShutdownTimeout,
-    StartupError, StartupFailure, StartupFailureCause, StopReason,
+    Cancellation, Exit, ExitError, ExitKind, ExitResult, GracePhase, IntensityTrip,
+    ShutdownStraggler, ShutdownTimeout, StartupError, StartupFailure, StartupFailureCause,
+    StopReason,
 };
 pub use identity::{ChildId, Incarnation, Membership};
 pub use mailbox::{
@@ -36,13 +37,14 @@ pub use mailbox::{
 };
 pub use observe::{
     ChildSnapshot, ChildState, LIFECYCLE_EVENT_CAPACITY, LifecycleEvent, LifecycleEventKind,
-    LifecycleEvents, LifecycleItem, LifecycleTryRecvError, MembershipStatus, ScopeKind,
-    ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
+    LifecycleEvents, LifecycleItem, LifecycleSeq, LifecycleTryRecvError, MembershipStatus,
+    ScopeKind, ScopeSnapshot, ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
 };
 pub use policy::{
-    Backoff, BackoffFactor, DefaultsInheritance, Intensity, InvalidPolicy, Jitter, Mailbox,
-    MailboxShutdown, PolicyError, PolicyField, Readiness, ReadinessDeadline, RestartCondition,
-    RestartPolicy, Retention, ScopeDefaults, Shutdown, Strategy,
+    Backoff, BackoffFactor, DefaultsInheritance, Intensity, InvalidPolicy, Jitter, JitterSample,
+    Mailbox, MailboxShutdown, PolicyError, PolicyField, Readiness, ReadinessDeadline,
+    RestartAttempt, RestartCondition, RestartCount, RestartPolicy, Retention, ScopeDefaults,
+    Shutdown, Strategy, TotalRestarts,
 };
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,

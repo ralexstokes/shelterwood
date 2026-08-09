@@ -327,10 +327,15 @@ impl<T: Send + 'static> Drop for Isolated<T> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DisposalPanic {
+    pub(crate) message: Option<String>,
+}
+
 struct DisposalJob<T, C>
 where
     T: Send + 'static,
-    C: FnOnce(Option<Option<String>>) + Send + 'static,
+    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
     state: Mutex<Option<(T, C)>>,
 }
@@ -338,7 +343,7 @@ where
 impl<T, C> DisposalJob<T, C>
 where
     T: Send + 'static,
-    C: FnOnce(Option<Option<String>>) + Send + 'static,
+    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
     fn new(value: T, completion: C) -> Arc<Self> {
         Arc::new(Self {
@@ -355,7 +360,12 @@ where
         else {
             return;
         };
-        let panic = catch_panic(|| drop(value)).err().map(contain_panic_payload);
+        let panic = match catch_panic(|| drop(value)) {
+            Ok(()) => None,
+            Err(payload) => Some(DisposalPanic {
+                message: contain_panic_payload(payload),
+            }),
+        };
         // Completion is framework bookkeeping. Contain it as well so a
         // hostile waker or a runtime teardown race cannot unwind a blocking
         // worker or double-panic while the job is being dropped.
@@ -366,7 +376,7 @@ where
 impl<T, C> Drop for DisposalJob<T, C>
 where
     T: Send + 'static,
-    C: FnOnce(Option<Option<String>>) + Send + 'static,
+    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
     fn drop(&mut self) {
         self.finish();
@@ -381,7 +391,7 @@ trait QueuedDisposal: Send + Sync {
 impl<T, C> QueuedDisposal for DisposalJob<T, C>
 where
     T: Send + 'static,
-    C: FnOnce(Option<Option<String>>) + Send + 'static,
+    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
     fn run(&self) {
         self.finish();
@@ -457,7 +467,7 @@ fn run_fallback_disposals() {
 fn dispatch_disposal<T, C>(job: Arc<DisposalJob<T, C>>)
 where
     T: Send + 'static,
-    C: FnOnce(Option<Option<String>>) + Send + 'static,
+    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
     if is_available() {
         let worker = Arc::clone(&job);
@@ -497,7 +507,7 @@ where
 pub(crate) fn dispose_then<T, C>(value: T, completion: C)
 where
     T: Send + 'static,
-    C: FnOnce(Option<Option<String>>) + Send + 'static,
+    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
     dispatch_disposal(DisposalJob::new(value, completion));
 }
@@ -1235,8 +1245,8 @@ mod tests {
     };
 
     use super::{
-        Deadline, DisposalJob, JoinOutcome, Latch, OneShotClose, Signal, Timeout, discard_panic,
-        join, oneshot, spawn, timeout, yield_now,
+        Deadline, DisposalJob, DisposalPanic, JoinOutcome, Latch, OneShotClose, Signal, Timeout,
+        discard_panic, join, oneshot, spawn, timeout, yield_now,
     };
 
     #[tokio::test(start_paused = true)]
@@ -1320,7 +1330,9 @@ mod tests {
         let diagnostic = diagnostic.lock().expect("diagnostic mutex poisoned");
         assert!(matches!(
             diagnostic.as_ref(),
-            Some(Some(Some(message))) if message == "cancelled disposal job payload"
+            Some(Some(DisposalPanic {
+                message: Some(message)
+            })) if message == "cancelled disposal job payload"
         ));
     }
 

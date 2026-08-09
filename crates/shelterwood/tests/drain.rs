@@ -8,9 +8,9 @@ use std::{
 
 use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
 use shelterwood::{
-    Actor, ActorOnceDef, Context, Exit, ExitError, ExitKind, ExitResult, LifecycleEventKind,
-    LifecycleEvents, LifecycleItem, Mailbox, MailboxShutdown, SendErrorKind, Shutdown, StopContext,
-    Tree,
+    Actor, ActorOnceDef, Cancellation, Context, Exit, ExitError, ExitKind, ExitResult, GracePhase,
+    LifecycleEventKind, LifecycleEvents, LifecycleItem, Mailbox, MailboxShutdown, SendErrorKind,
+    Shutdown, StopContext, Tree,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -397,7 +397,7 @@ async fn handler_discard_skips_the_prefix_and_still_runs_on_stop() {
     assert_eq!(outcome.drained, 0);
     assert!(outcome.stop_entered);
     assert!(matches!(outcome.exit.kind(), ExitKind::Completed));
-    assert!(outcome.exit.cancelled());
+    assert_eq!(outcome.exit.cancellation(), Cancellation::Observed);
 }
 
 #[tokio::test(start_paused = true)]
@@ -457,7 +457,9 @@ async fn handler_drain_and_on_stop_share_one_grace_budget() {
     assert!(outcome.stop_entered);
     assert!(matches!(
         outcome.exit.kind(),
-        ExitKind::Aborted { after_grace: true }
+        ExitKind::Aborted {
+            phase: GracePhase::AfterGrace
+        }
     ));
     assert!(outcome.elapsed >= Duration::from_secs(10));
     assert!(

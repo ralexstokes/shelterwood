@@ -62,12 +62,6 @@ enum AdmissionOwnership {
     Fused,
 }
 
-impl AdmissionOwnership {
-    fn is_fused(self) -> bool {
-        matches!(self, Self::Fused)
-    }
-}
-
 trait SlotEndpoint: Sized {
     type Output<H>;
 
@@ -124,7 +118,7 @@ impl SlotEndpoint for DynamicSlotEndpoint {
             .take()
             .expect("dynamic slot reservation was already consumed");
         reservation.slot.define(construction);
-        Admission::new(reservation, handles, ownership.is_fused())
+        Admission::new(reservation, handles, ownership)
     }
 }
 
@@ -802,7 +796,7 @@ impl<H> Admission<H> {
         }
     }
 
-    fn new(reservation: DynamicReservation, handles: H, fused: bool) -> Self {
+    fn new(reservation: DynamicReservation, handles: H, ownership: AdmissionOwnership) -> Self {
         let membership = reservation.slot.member.membership();
         Self {
             state: AdmissionState::Unpolled(PendingAdmission {
@@ -811,7 +805,10 @@ impl<H> Admission<H> {
                     membership,
                     handles,
                 },
-                fused_cancel: fused.then(Latch::default),
+                fused_cancel: match ownership {
+                    AdmissionOwnership::Split => None,
+                    AdmissionOwnership::Fused => Some(Latch::default()),
+                },
             }),
         }
     }

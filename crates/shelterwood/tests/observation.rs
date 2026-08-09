@@ -13,10 +13,10 @@ use crate::common::{
 };
 use shelterwood::{
     Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LIFECYCLE_EVENT_CAPACITY,
-    LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleTryRecvError,
-    MembershipStatus, RemoveOutcome, RestartCondition, RestartPolicy, Retention, ScopeKind,
-    ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef,
-    TaskRef, Tree, WaitError,
+    LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleSeq,
+    LifecycleTryRecvError, MembershipStatus, RemoveOutcome, RestartCondition, RestartCount,
+    RestartPolicy, Retention, ScopeKind, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef,
+    SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, TotalRestarts, Tree, WaitError,
 };
 
 async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
@@ -34,7 +34,7 @@ async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
     }
 }
 
-fn event_watermark(scope: &ScopeRef, event: &LifecycleEvent) -> Option<u64> {
+fn event_watermark(scope: &ScopeRef, event: &LifecycleEvent) -> Option<LifecycleSeq> {
     let snapshot = scope.snapshot();
     if event.scope == scope.membership() {
         Some(snapshot.lifecycle_seq)
@@ -51,7 +51,7 @@ async fn event_woken_pull_snapshots_are_consistent_at_first_start_and_final_stop
         .expect("valid subtree");
     let initial = nested.snapshot();
     assert_eq!(initial.state, ScopeState::Unstarted);
-    assert_eq!(initial.lifecycle_seq, 0);
+    assert_eq!(initial.lifecycle_seq.get(), 0);
 
     // Deliberately create no snapshot receiver: the pull path must not depend
     // on watch publication having any subscribers.
@@ -468,7 +468,11 @@ async fn descendant_events_forward_with_origin_identity_path_and_causal_order() 
     let mut last_by_origin = HashMap::new();
     for event in &seen {
         if let Some(previous) = last_by_origin.insert(event.scope, event.seq) {
-            assert_eq!(event.seq, previous + 1, "origin sequences stay gap-free");
+            assert_eq!(
+                event.seq.get(),
+                previous.get() + 1,
+                "origin sequences stay gap-free"
+            );
         }
     }
     let snapshot = root.snapshot();
@@ -594,10 +598,10 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     assert!(child.incarnation.is_none());
     assert!(child.nested.is_none());
     assert!(child.restart_at.is_some());
-    assert_eq!(child.restart_count, 1);
-    assert_eq!(restart_window.total_restarts, 1);
+    assert_eq!(child.restart_count, RestartCount::ZERO.bump());
+    assert_eq!(restart_window.total_restarts, TotalRestarts::ZERO.bump());
     assert_eq!(child.scope_seq, Some(stopped_seq));
-    assert_eq!(nested.snapshot().total_restarts, 1);
+    assert_eq!(nested.snapshot().total_restarts, TotalRestarts::ZERO.bump());
     assert_eq!(
         restart_window
             .descendant(["nested"])
@@ -622,7 +626,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
             break event;
         }
     };
-    assert_eq!(starting.seq, stopped_seq + 1);
+    assert_eq!(starting.seq.get(), stopped_seq.get() + 1);
     assert_eq!(starting.scope, scope_membership);
 
     let second_child = loop {
@@ -637,7 +641,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
         "corresponding descendants retain ordering across a scope restart"
     );
     assert_eq!(nested.membership(), scope_membership);
-    assert_eq!(nested.snapshot().total_restarts, 0);
+    assert_eq!(nested.snapshot().total_restarts, TotalRestarts::ZERO);
     assert!(nested.snapshot().lifecycle_seq >= starting.seq);
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
@@ -655,7 +659,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
 }
 
 #[tokio::test]
-async fn rebased_declared_handles_keep_their_map_identity() {
+async fn rebased_declared_handles_and_incarnations_keep_identity() {
     fn hashed(value: &impl std::hash::Hash) -> u64 {
         use std::hash::Hasher;
         let mut hasher = std::hash::DefaultHasher::new();
@@ -702,9 +706,16 @@ async fn rebased_declared_handles_keep_their_map_identity() {
     let system = outer.spawn().expect("runtime is available");
 
     let mut admissions = Vec::new();
-    while admissions.len() < 2 {
-        if let LifecycleEventKind::Added { membership, .. } = next_event(&mut events).await.kind {
-            admissions.push(membership);
+    let mut starts = Vec::new();
+    while admissions.len() < 2 || starts.len() < 2 {
+        match next_event(&mut events).await.kind {
+            LifecycleEventKind::Added { membership, .. } => admissions.push(membership),
+            LifecycleEventKind::Started {
+                membership,
+                incarnation,
+                ..
+            } => starts.push((membership, incarnation)),
+            _ => {}
         }
     }
 
@@ -729,6 +740,8 @@ async fn rebased_declared_handles_keep_their_map_identity() {
         "handle identity survives the rebase that refreshed its membership"
     );
     assert_eq!(second.membership(), admissions[1]);
+    assert_eq!(starts[1].0, second.membership());
+    assert_eq!(starts[1].1.membership(), second.membership());
 
     system
         .shutdown(Duration::from_secs(1))
@@ -1297,7 +1310,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
         running.intensity,
         Intensity::new(7, Duration::from_secs(90)).expect("valid intensity")
     );
-    assert_eq!(running.total_restarts, 0);
+    assert_eq!(running.total_restarts, TotalRestarts::ZERO);
     assert_eq!(
         running
             .children
@@ -1314,7 +1327,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     assert!(matches!(nested_row.state, ChildState::Running));
     assert_eq!(nested_row.last_exit, None);
     assert_eq!(nested_row.membership_status, MembershipStatus::Active);
-    assert_eq!(nested_row.restart_count, 0);
+    assert_eq!(nested_row.restart_count, RestartCount::ZERO);
     assert!(
         nested_row.restart_policy.is_never(),
         "a one-shot subtree cannot restart"

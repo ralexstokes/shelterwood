@@ -2,9 +2,9 @@ use std::{future, time::Duration};
 
 use crate::common::{POLL_TIMEOUT, ReleaseGate, policy::never, poll_until};
 use shelterwood::{
-    Actor, ActorOnceDef, ChildState, Context, ExitError, ExitKind, ExitResult, Readiness,
-    ReadinessDeadline, Shutdown, StartOrShutdownError, StopContext, SubtreeOnceDef, TaskDef,
-    TaskRef, Tree,
+    Actor, ActorOnceDef, ChildState, Context, ExitError, ExitKind, ExitResult, GracePhase,
+    Readiness, ReadinessDeadline, Shutdown, StartOrShutdownError, StopContext, SubtreeOnceDef,
+    TaskDef, TaskRef, Tree,
 };
 
 type JournalEvent = (usize, &'static str, &'static str);
@@ -229,11 +229,15 @@ async fn sidecar_runs_two_host_owned_cycles_with_readiness_and_policy_exact_shut
         let graceful_exit = fixture.graceful_task.wait().await;
         assert!(matches!(
             abort_exit.kind(),
-            ExitKind::Aborted { after_grace: false }
+            ExitKind::Aborted {
+                phase: GracePhase::WithinGrace
+            }
         ));
         assert!(matches!(
             graceful_exit.kind(),
-            ExitKind::Aborted { after_grace: true }
+            ExitKind::Aborted {
+                phase: GracePhase::AfterGrace
+            }
         ));
         assert_eq!(
             log.events(cycle, "abort-worker"),

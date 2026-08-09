@@ -123,11 +123,11 @@ pub enum LifecycleEventKind {
         /// Sampled restart delay.
         delay: Duration,
     },
-    /// A child membership became terminal.
+    /// A child membership was pruned from the scope's resident child set.
     Removed {
         /// Child label in the emitting scope.
         id: ChildId,
-        /// Terminal membership identity.
+        /// Pruned membership identity.
         membership: Membership,
         /// Last incarnation, or `None` when the membership never ran.
         last_incarnation: Option<Incarnation>,

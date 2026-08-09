@@ -164,6 +164,11 @@ impl<T> Drop for Blocking<T> {
     }
 }
 
+/// Future panic boundary that owns and destroys its inner future.
+///
+/// Once the inner future returns `Ready`, it is destroyed before the output is
+/// released. If that destruction panics, the already-produced output is
+/// discarded and the destructor panic becomes this future's error.
 pub(crate) struct CatchUnwindFuture<F> {
     future: Option<Pin<Box<F>>>,
 }
@@ -830,6 +835,10 @@ pub trait RawActor: Send + 'static {
 
     /// Runs one incarnation using the membership-owned mailbox binding.
     ///
+    /// The framework calls this method exactly once on the raw actor value
+    /// installed as an incarnation's root; it never re-enters `run` on that
+    /// value. A restart constructs a fresh root value.
+    ///
     /// [`RawContext::recv`] freezes external intake and returns `None` when
     /// shutdown begins. A raw loop must then honor
     /// [`RawContext::mailbox_shutdown`]: for
@@ -929,6 +938,9 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     /// Requests shutdown of the supervising scope without waiting.
+    ///
+    /// Do not await that scope's shutdown from this actor: the scope cannot
+    /// finish until this actor's `run` future returns.
     pub fn request_scope_shutdown(&self) {
         self.scope.request_shutdown();
     }
@@ -1103,10 +1115,19 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     /// Receives the next accepted message, biased toward shutdown.
+    ///
+    /// While the incarnation is running, a panic retained from an offload
+    /// future or continuation resumes from this receive path before another
+    /// event is delivered.
     pub async fn recv(&mut self) -> Option<M> {
         loop {
             if self.local_stop.is_fired() {
                 self.freeze_and_report();
+                // `stop()` originates on this task, but the configured
+                // shutdown ladder is owned by the driver. Wait for its helper
+                // to observe the local-stop latch and fire the shared shutdown
+                // token before ending the raw loop; removing this await would
+                // let a local stop bypass that cross-task handshake.
                 self.shutdown.cancelled().await;
                 return None;
             }
@@ -1122,6 +1143,10 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     /// Receives one ready event without awaiting or consulting shutdown.
+    ///
+    /// Outside shutdown drain, this resumes any panic retained from an offload
+    /// future or continuation before returning another event. During drain it
+    /// reads the frozen accepted mailbox prefix directly.
     pub fn try_recv(&mut self) -> Option<M> {
         if self.is_stopping() {
             self.freeze_and_report();

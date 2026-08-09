@@ -1,4 +1,5 @@
-//! Callback-oriented actors layered entirely on the public raw-actor surface.
+//! Callback-oriented actors composed through the public [`Handler`] raw-actor
+//! wrapper, which encapsulates the callback loop's internal teardown discipline.
 
 use std::{fmt, future::Future, hash::Hash, marker::PhantomData, sync::Arc, time::Duration};
 
@@ -101,6 +102,9 @@ macro_rules! actor_context_forwarders {
         }
 
         /// Returns a membership-addressed handle to this actor.
+        ///
+        /// During [`Actor::on_stop`], do not post work to this handle: no
+        /// callback remains to receive it.
         #[must_use]
         pub fn myself(&self) -> ActorRef<$actor::Msg> {
             self.core.myself()
@@ -125,6 +129,9 @@ macro_rules! actor_context_forwarders {
         }
 
         /// Requests shutdown of the supervising scope without waiting.
+        ///
+        /// Do not await that scope's shutdown from this actor: the scope cannot
+        /// finish until the current actor callback returns.
         pub fn request_scope_shutdown(&self) {
             self.core.request_scope_shutdown();
         }
@@ -342,7 +349,9 @@ impl<'a, A: Actor> StopContext<'a, A> {
 /// Raw-actor wrapper that owns the `Uninit(args) -> Running(actor)` transition.
 ///
 /// This is the composition point for raw decorators around callback-oriented
-/// actors. Its declared readiness is read before [`RawActor::run`] is polled.
+/// actors. It also encapsulates the callback loop's error-path resource
+/// teardown, so decorators need no framework-internal teardown operations.
+/// Its declared readiness is read before [`RawActor::run`] is polled.
 pub struct Handler<A: Actor> {
     args: Option<A::Args>,
     actor: Option<A>,

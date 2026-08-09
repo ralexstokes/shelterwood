@@ -125,8 +125,10 @@ below is a reachable escape hatch:
   the send flavors, `call`. The escape hatch — per principle 5 it ships with
   core, not after it.
 - **L3 — handler actor**: `Actor`/`init`/`handle`, keyed timers,
-  continuations, offloads. The "simple things easy" layer, implemented
-  entirely on L2's public surface.
+  continuations, offloads. The "simple things easy" layer. Its public
+  `Handler<A>` wrapper is the composition point for raw decorators and
+  encapsulates the callback loop's error-path resource discipline; decorators
+  need no framework-internal teardown surface.
 - **L4 — observation**: snapshots and lifecycle events over L1's single
   publication path.
 
@@ -655,7 +657,14 @@ trait RawActor: Send + 'static {
   on the same context and share its readiness, stop state, timers, offloads,
   watches, and identity; the context cannot escape into work that outlives
   the run.
-- Everything the blanket loop uses is public (§1 principle 5).
+- The framework invokes `run` exactly once on the root raw-actor value
+  installed for each incarnation; it never re-enters `run` on that value. A
+  restart obtains a fresh root value from the definition's construction source.
+- `Handler<A>` is the public composition point that encapsulates the generated
+  callback loop, including its error-path freeze-and-join discipline.
+  Decorators wrap `Handler<A>` through the public raw-actor surface; they do
+  not perform that discipline themselves and need no access to the
+  framework-internal resource operations that implement it.
 - Raw actors have their own construction path — §8's `define_raw` /
   `define_once_raw` on `ActorSlot`, with fused `add_raw` / `add_raw_once`
   entry points on both scope flavors. There is no `init`/`Args` phase at
@@ -802,6 +811,13 @@ per-declaration configuration, invisible in `ActorRef<M>`'s type — so the
 decided semantics are: `call` is allowed, conflation-away surfaces as
 `ReplyDropped`, and the documentation teaches this next to the §3.3 retry
 discipline.
+
+Where this specification calls for **isolated** or **detached** disposal, the
+guarantee is that user destruction runs off the submitting caller's thread and
+that each value has its own panic-containment boundary. The worker's identity,
+the number of disposal workers, and whether distinct disposal jobs share a
+thread are implementation details, not observable ordering or affinity
+contracts.
 
 ### 5.2 The handler event loop
 
@@ -1723,8 +1739,14 @@ Two separated concerns:
   exact configured `max` (never an overflow panic); jitter maps the
   pre-drawn `JitterSample` as `delay = d/2 + sample × d/2`,
   rounded the same way — a zero sample yields the exact half,
-  half-nanosecond remainders rounding up with no float round-trip. The
-  attempt counter is per
+  half-nanosecond remainders rounding up with no float round-trip. This exact
+  exponentiation contract covers attempts operationally reachable by a
+  running membership; the opaque counter's full `u64` domain exists for
+  totality, not as a promise that synthetic multi-billion-attempt inputs use
+  an unbounded exponent representation. Beyond the implementation's supported
+  exponent domain, `next_delay` remains total, nondecreasing for a fixed
+  sample, and bounded by `max`; it may saturate the exponent and plateau rather
+  than evaluate `factor^(n-1)` exactly. The attempt counter is per
   membership: `n = 1` on the first scheduled restart, incremented per
   scheduled restart — a restart scheduled and then cancelled by teardown
   still advanced it, mirroring the intensity charge below — and reset by
@@ -2912,7 +2934,7 @@ marked *(II)* ship with the named Part II feature.
 | Snapshot channel | conflating watch, capacity 1 | Structural |
 | `call` / `send_timeout` deadline | **none — always explicit** | One budget per call (§5.1); zero deadline fails immediately |
 | Identity counters | `u64`, saturating | Fail-closed overflow, decided once in the fencing primitive (§3.1); lifecycle `seq`/`lifecycle_seq` mint through the same primitive (B.4's exhaustion rule) |
-| Far-future clamp | timer arithmetic saturates to a far-future instant | Instead of panicking on `Instant + Duration` overflow |
+| Far-future deadline | `restart_at` clamps to the largest safely armable instant; surfaces that permit an absent deadline treat unarmable budgets as never arriving | Never substitute the budget's start instant or panic on `Instant + Duration` overflow |
 
 ---
 
@@ -2963,6 +2985,14 @@ No runtime time type is public (D.3 clause 1 checks this during initial
 development): the `runtime` module converts at the boundary, and under
 virtual time its clock mints the instants — still `std` values, mutually
 coherent, which is all any contract here compares.
+
+An absolute deadline that cannot be represented or safely armed MUST NOT be
+replaced with its budget's start instant. Operations whose surface permits an
+absent deadline treat that budget as never arriving. A `ChildSnapshot` in
+`Restarting` instead requires a present `restart_at`: the exact point is
+clamped to the largest safely armable far-future instant, and that same clamped
+instant drives the restart wake. An overflowing backoff therefore never turns
+into an immediate restart.
 
 Rows marked *(II)* ship with the named Part II feature.
 
@@ -3286,8 +3316,11 @@ ChildSnapshot   { id, membership,                       // §3 identity types
                   restart_at: Option<Instant>,          // present exactly in Restarting: the
                                                         //   backoff deadline as an absolute
                                                         //   runtime-clock instant (D.3) — a retained
-                                                        //   snapshot stays interpretable; render
-                                                        //   relative by subtracting now
+                                                        //   snapshot stays interpretable; an exact
+                                                        //   point too distant for the clock is
+                                                        //   clamped to the largest safely armable
+                                                        //   far-future instant; render relative by
+                                                        //   subtracting now
                   nested: Option<ScopeSnapshot>,         // recursive for scope children; None while
                                                          //   no incarnation is live and the membership
                                                          //   is non-terminal (restart window); a

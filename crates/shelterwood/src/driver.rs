@@ -85,7 +85,7 @@ impl<T> Drop for Obligation<T> {
 
 struct RecordedReport {
     outcome: Option<RecordedOutcome>,
-    cancelled: bool,
+    cancellation: Cancellation,
 }
 
 struct ReportCompletion {
@@ -133,10 +133,15 @@ pub(crate) fn report_channel(
 
 impl ReportCompletion {
     fn send(self, outcome: Option<RecordedOutcome>) {
+        let cancellation =
+            if self.shutdown.is_fired() || self.local_stop.as_ref().is_some_and(Latch::is_fired) {
+                Cancellation::Observed
+            } else {
+                Cancellation::NotObserved
+            };
         let _ = self.sender.send(RecordedReport {
             outcome,
-            cancelled: self.shutdown.is_fired()
-                || self.local_stop.as_ref().is_some_and(Latch::is_fired),
+            cancellation,
         });
     }
 }
@@ -788,7 +793,7 @@ enum ChildEvent {
         incarnation: Incarnation,
         recorded: Option<RecordedOutcome>,
         join: JoinVerdict,
-        cancelled: bool,
+        cancellation: Cancellation,
     },
     ConstructionDisposed {
         child: ChildKey,
@@ -1405,7 +1410,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 incarnation,
                 recorded: report.outcome,
                 join,
-                cancelled: report.cancelled,
+                cancellation: report.cancellation,
             }),
         )
         .await;
@@ -2034,7 +2039,7 @@ impl ScopeRuntime {
         incarnation: Incarnation,
         recorded: Option<RecordedOutcome>,
         mut join: JoinVerdict,
-        cancelled: bool,
+        cancellation: Cancellation,
     ) {
         let Some(child) = self.children.get_mut(key) else {
             return;
@@ -2062,11 +2067,6 @@ impl ScopeRuntime {
             join = JoinVerdict::Cancelled { phase };
         }
         let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
-        let cancellation = if cancelled {
-            Cancellation::Observed
-        } else {
-            Cancellation::NotObserved
-        };
         let exit = classify_exit(recorded, join, cancellation);
         child.restarts.settle_if_stable(
             active.started_at,
@@ -2962,8 +2962,8 @@ async fn run_scope_incarnation(
                     incarnation,
                     recorded,
                     join,
-                    cancelled,
-                })) => scope.handle_exit(child, incarnation, recorded, join, cancelled),
+                    cancellation,
+                })) => scope.handle_exit(child, incarnation, recorded, join, cancellation),
                 Pending::Driver(DriverEvent::Child(ChildEvent::ConstructionDisposed {
                     child,
                     panic,
@@ -3531,7 +3531,7 @@ mod tests {
                 "trip intensity",
             )))),
             join: JoinVerdict::Completed,
-            cancelled: false,
+            cancellation: Cancellation::NotObserved,
         });
         let mut pending = [
             restart_shutdown_work(nested),
@@ -3546,8 +3546,8 @@ mod tests {
                     incarnation,
                     recorded,
                     join,
-                    cancelled,
-                })) => scope.handle_exit(child, incarnation, recorded, join, cancelled),
+                    cancellation,
+                })) => scope.handle_exit(child, incarnation, recorded, join, cancellation),
                 _ => unreachable!("the fixture queues only exit and restart work"),
             }
         }
@@ -3759,7 +3759,7 @@ mod tests {
             report.outcome,
             Some(RecordedOutcome::Returned(Ok(())))
         ));
-        assert!(!report.cancelled);
+        assert_eq!(report.cancellation, Cancellation::NotObserved);
 
         let shutdown = Latch::default();
         let (token, receiver) = report_channel(shutdown.clone(), None);
@@ -3767,7 +3767,7 @@ mod tests {
         drop(token);
         let report = receiver.receive();
         assert!(report.outcome.is_none());
-        assert!(report.cancelled);
+        assert_eq!(report.cancellation, Cancellation::Observed);
     }
 
     #[test]
@@ -3781,7 +3781,7 @@ mod tests {
             report.outcome,
             Some(RecordedOutcome::Returned(Ok(())))
         ));
-        assert!(report.cancelled);
+        assert_eq!(report.cancellation, Cancellation::Observed);
     }
 
     #[test]
@@ -3791,7 +3791,7 @@ mod tests {
         let (token, receiver) = report_channel(shutdown, Some(local_stop.clone()));
         local_stop.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
-        assert!(receiver.receive().cancelled);
+        assert_eq!(receiver.receive().cancellation, Cancellation::Observed);
     }
 
     #[test]

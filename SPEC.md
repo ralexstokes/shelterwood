@@ -1229,23 +1229,25 @@ One classification, produced at one point, used by every consumer.
   never input to restart or intensity accounting (both consume
   incarnation exits), and counts as a failure for `is_failure()` —
   awaiting a child that never ran is not success.
-- **`cancelled` is one state-machine fact**, not a narrative judgment:
-  the flag is true iff the incarnation's own shutdown token (B.1/B.2)
-  had fired before its outcome was recorded (the record phase below).
+- **Cancellation observation is one state-machine fact**, not a narrative
+  judgment: the value is `Cancellation::Observed` iff the incarnation's own
+  shutdown token (B.1/B.2) had fired before its outcome was recorded (the
+  record phase below), and `Cancellation::NotObserved` otherwise.
   The token fires for every engine-initiated stop — scope teardown,
   dynamic removal, readiness-timeout teardown, `shutdown(0)`'s immediate
   escalation — and for local `ctx.stop()`, which arms the same ladder
   (§10), so a self-stopped actor's exit reads `Cancellation::Observed`. A stop
   racing natural completion needs no third rule: whichever of token-fire
-  and outcome-record happened first decides the flag. `NeverStarted`
+  and outcome-record happened first decides the value. `NeverStarted`
   sits outside the rule — no incarnation, no token — and carries
   `Cancellation::NotObserved` uniformly, whether the membership ended by
   tree-drop, withdrawal, rejection, or startup abort: the variant itself
   already says nothing ran.
 - **Verdict precedence.** When one incarnation's end admits several
   readings, classification picks the highest of: `Panicked` >
-  `ReadinessTimedOut` > `Failed` > `Aborted` > `Completed`; `cancelled` is
-  orthogonal and never competes. Concretely: a panic is never masked,
+  `ReadinessTimedOut` > `Failed` > `Aborted` > `Completed`; cancellation
+  observation is orthogonal and never competes. Concretely: a panic is
+  never masked,
   wherever it lands (`run`, `on_stop` — superseding the run's outcome,
   §4.1 — or a destructor, via the fallback report token); and a
   readiness-deadline expiry names the *cause* even when the teardown it
@@ -1277,7 +1279,7 @@ One classification, produced at one point, used by every consumer.
 - **Failure classification (feeds §9.2):** an exit is a *failure* iff it is
   not `Completed`. So `Failed`, `Panicked`, `ReadinessTimedOut`, and
   `Aborted` all restart under `OnFailure`; `Always` restarts even clean
-  completions. The `cancelled` flag is **never** consulted by restart
+  completions. The cancellation observation is **never** consulted by restart
   classification — restart suppression comes solely from teardown
   *state*, never from the exit's shape: a draining scope schedules no
   restarts (§10), and a membership whose removal is in progress
@@ -3220,7 +3222,7 @@ convention — so a retained exit stays interpretable; the configured
 *span* is the child's resolved `readiness_deadline` option (§8), not
 this field.
 Helpers:
-`is_failure()` (= not `Completed`), `cancelled()`, accessors per variant,
+`is_failure()` (= not `Completed`), `cancellation()`, accessors per variant,
 and two named cross-variant accessors:
 `intensity_trip() -> Option<&IntensityTrip>` (§9.2's structured trip
 data) and `startup_failure() -> Option<&StartupFailure>` (§11's

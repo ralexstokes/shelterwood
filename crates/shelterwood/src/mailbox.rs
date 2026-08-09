@@ -1900,8 +1900,7 @@ mod tests {
             .mint_membership(&ChildId::from("actor"))
             .expect("membership available");
         let mut incarnations = identity.incarnation_counter(membership);
-        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
-            .expect("incarnation available");
+        let incarnation = incarnations.mint().expect("incarnation available");
 
         MailboxControl::bind(&*mailbox, incarnation);
     }
@@ -1917,10 +1916,8 @@ mod tests {
             .mint_membership(&ChildId::from("actor"))
             .expect("membership available");
         let mut incarnations = identity.incarnation_counter(membership);
-        let first = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
-            .expect("first incarnation available");
-        let second = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
-            .expect("second incarnation available");
+        let first = incarnations.mint().expect("first incarnation available");
+        let second = incarnations.mint().expect("second incarnation available");
 
         MailboxControl::bind(&*mailbox, first);
         MailboxControl::bind(&*mailbox, second);
@@ -1989,10 +1986,9 @@ mod tests {
             let membership = identity
                 .mint_membership(&ChildId::from("actor"))
                 .expect("membership available");
-            (membership, identity.incarnation_counter(membership))
+            identity.incarnation_counter(membership)
         };
-        let incarnation = ScopeIdentity::mint_incarnation(generations.0, &mut generations.1)
-            .expect("incarnation available");
+        let incarnation = generations.mint().expect("incarnation available");
 
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -2223,8 +2219,7 @@ mod tests {
             .mint_membership(&ChildId::from("actor"))
             .expect("membership available");
         let mut incarnations = identity.incarnation_counter(membership);
-        let incarnation = ScopeIdentity::mint_incarnation(membership, &mut incarnations)
-            .expect("incarnation available");
+        let incarnation = incarnations.mint().expect("incarnation available");
         MailboxControl::bind(&*mailbox, incarnation);
 
         let mut send = Box::pin(actor.send(1));

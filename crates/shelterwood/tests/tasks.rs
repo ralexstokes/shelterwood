@@ -2,14 +2,15 @@ use std::time::Duration;
 
 use crate::common::LiveFlag;
 use shelterwood::{
-    BuildError, DynamicTree, Exit, ExitError, ExitKind, Readiness, ReadinessDeadline,
-    RemoveOutcome, ReserveError, Shutdown, StopReason, TaskDef, TaskOnceDef, Tree,
+    BuildError, Cancellation, DynamicTree, Exit, ExitError, ExitKind, GracePhase, Readiness,
+    ReadinessDeadline, RemoveOutcome, ReserveError, Shutdown, StopReason, TaskDef, TaskOnceDef,
+    Tree,
 };
 
 #[test]
 fn public_exit_constructor_preserves_evidence_and_classifies_failures() {
-    let completed = Exit::new(ExitKind::Completed, true);
-    assert!(completed.cancelled());
+    let completed = Exit::new(ExitKind::Completed, Cancellation::Observed);
+    assert_eq!(completed.cancellation(), Cancellation::Observed);
     assert!(matches!(completed.kind(), ExitKind::Completed));
     assert!(!completed.is_failure());
 
@@ -21,11 +22,13 @@ fn public_exit_constructor_preserves_evidence_and_classifies_failures() {
         ExitKind::ReadinessTimedOut {
             deadline: std::time::Instant::now(),
         },
-        ExitKind::Aborted { after_grace: true },
+        ExitKind::Aborted {
+            phase: GracePhase::AfterGrace,
+        },
         ExitKind::NeverStarted,
     ] {
-        let exit = Exit::new(kind, false);
-        assert!(!exit.cancelled());
+        let exit = Exit::new(kind, Cancellation::NotObserved);
+        assert_eq!(exit.cancellation(), Cancellation::NotObserved);
         assert!(exit.is_failure(), "non-completed exit: {:?}", exit.kind());
     }
 }
@@ -306,7 +309,7 @@ async fn dropping_the_owner_requests_cooperative_shutdown() {
     system.wait_started().await.expect("tree starts");
     drop(system);
     let exit = task.wait().await;
-    assert!(exit.cancelled());
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
     assert!(matches!(exit.kind(), ExitKind::Completed));
     assert_eq!(completion.wait().await, Ok(()));
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -348,5 +351,5 @@ async fn cancelling_system_wait_keeps_drop_shutdown_armed() {
             .expect("dropping the cancelled wait requests shutdown"),
         StopReason::ShutdownRequested
     );
-    assert!(task.wait().await.cancelled());
+    assert_eq!(task.wait().await.cancellation(), Cancellation::Observed);
 }

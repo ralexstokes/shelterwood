@@ -8,8 +8,9 @@ use std::{
 };
 
 use crate::{
-    ChildId, Exit, ExitKind, Incarnation, IntensityTrip, Membership, Readiness, ReadinessDeadline,
-    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    Cancellation, ChildId, Exit, ExitKind, GracePhase, Incarnation, IntensityTrip, Membership,
+    Readiness, ReadinessDeadline, ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure,
+    StartupFailureCause,
     admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
     cells::{
         DynamicRoute, MailboxControl, MemberStage, ResidentProjection, ScopeCell,
@@ -26,7 +27,7 @@ use crate::{
         JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit,
         reconcile_recorded_outcomes,
     },
-    identity::{FenceCounter, ScopeIdentity},
+    identity::IncarnationCounter,
     observe::LifecycleEventKind,
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
@@ -35,7 +36,7 @@ use crate::{
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
     runtime::{self, Latch},
-    task::{TaskContext, TaskFactory},
+    task::{TaskContext, TaskContextLatches, TaskFactory},
 };
 
 #[cfg(test)]
@@ -87,7 +88,7 @@ impl<T> Drop for Obligation<T> {
 
 struct RecordedReport {
     outcome: Option<RecordedOutcome>,
-    cancelled: bool,
+    cancellation: Cancellation,
 }
 
 struct ReportCompletion {
@@ -135,10 +136,15 @@ pub(crate) fn report_channel(
 
 impl ReportCompletion {
     fn send(self, outcome: Option<RecordedOutcome>) {
+        let cancellation =
+            if self.shutdown.is_fired() || self.local_stop.as_ref().is_some_and(Latch::is_fired) {
+                Cancellation::Observed
+            } else {
+                Cancellation::NotObserved
+            };
         let _ = self.sender.send(RecordedReport {
             outcome,
-            cancelled: self.shutdown.is_fired()
-                || self.local_stop.as_ref().is_some_and(Latch::is_fired),
+            cancellation,
         });
     }
 }
@@ -645,14 +651,19 @@ impl SystemRun {
         match runtime::join(driver).await {
             runtime::JoinOutcome::Ok { .. } => {}
             runtime::JoinOutcome::Panic { message, .. } => {
-                let exit = Exit::new(ExitKind::Panicked { message }, false);
+                let exit = Exit::new(ExitKind::Panicked { message }, Cancellation::NotObserved);
                 self.root
                     .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
             }
             runtime::JoinOutcome::Cancelled => {
                 self.root.finish_live_root_incarnation(
                     StopReason::ShutdownRequested,
-                    Exit::new(ExitKind::Aborted { after_grace: false }, true),
+                    Exit::new(
+                        ExitKind::Aborted {
+                            phase: GracePhase::WithinGrace,
+                        },
+                        Cancellation::Observed,
+                    ),
                 );
             }
         }
@@ -737,19 +748,24 @@ pub(crate) async fn shutdown_scope(
 pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
     let root = Arc::clone(&plan.root);
     let monitor_root = Arc::clone(&root);
-    let driver = runtime::spawn(async move { run_scope(plan, true, None).await });
+    let driver = runtime::spawn(async move { run_scope(plan, ScopeRole::Root).await });
     let lifecycle = runtime::spawn(async move {
         match runtime::join(driver).await {
             runtime::JoinOutcome::Ok { value, .. } => value,
             runtime::JoinOutcome::Panic { message, .. } => {
-                let exit = Exit::new(ExitKind::Panicked { message }, false);
+                let exit = Exit::new(ExitKind::Panicked { message }, Cancellation::NotObserved);
                 monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
                 StopReason::ShutdownRequested
             }
             runtime::JoinOutcome::Cancelled => {
                 monitor_root.finish_live_root_incarnation(
                     StopReason::ShutdownRequested,
-                    Exit::new(ExitKind::Aborted { after_grace: false }, true),
+                    Exit::new(
+                        ExitKind::Aborted {
+                            phase: GracePhase::WithinGrace,
+                        },
+                        Cancellation::Observed,
+                    ),
                 );
                 StopReason::ShutdownRequested
             }
@@ -780,11 +796,11 @@ enum ChildEvent {
         incarnation: Incarnation,
         recorded: Option<RecordedOutcome>,
         join: JoinVerdict,
-        cancelled: bool,
+        cancellation: Cancellation,
     },
     ConstructionDisposed {
         child: ChildKey,
-        panic: Option<Option<String>>,
+        panic: Option<runtime::DisposalPanic>,
     },
 }
 
@@ -810,7 +826,7 @@ struct ActiveChild {
     abort_handle: runtime::AbortHandle,
     ladder: Option<StopLadder>,
     forced_outcome: Option<RecordedOutcome>,
-    hard_abort_after_grace: Option<bool>,
+    hard_abort_phase: Option<GracePhase>,
     readiness: ReadinessGate,
     readiness_deadline: Option<DeadlineHandle>,
     ready_signal: Latch,
@@ -832,7 +848,12 @@ fn discharge_child_terminality(completion: ChildTerminality) {
     }
     let (exit, exited_incarnation) = if record.last_incarnation.is_some() {
         (
-            Exit::new(ExitKind::Aborted { after_grace: false }, true),
+            Exit::new(
+                ExitKind::Aborted {
+                    phase: GracePhase::WithinGrace,
+                },
+                Cancellation::Observed,
+            ),
             record.incarnation,
         )
     } else {
@@ -858,7 +879,7 @@ struct ChildRuntime {
     construction: runtime::Isolated<ChildConstruction>,
     pending_terminal: Option<PendingTerminal>,
     options: crate::policy::ResolvedCommonOptions,
-    incarnations: FenceCounter,
+    incarnations: IncarnationCounter,
     restarts: RestartState,
     restart_deadline: Option<DeadlineHandle>,
     active: Option<ActiveChild>,
@@ -1035,6 +1056,42 @@ impl IndexMut<ChildKey> for ChildArena {
     }
 }
 
+struct AncestorCommandLatches {
+    shutdown: Latch,
+    abort: Latch,
+    abort_ack: Latch,
+}
+
+struct NestedScopeLatches {
+    parent_ready: Latch,
+    ancestor: AncestorCommandLatches,
+}
+
+enum ScopeRole {
+    Root,
+    Nested(NestedScopeLatches),
+}
+
+impl ScopeRole {
+    fn is_root(&self) -> bool {
+        matches!(self, Self::Root)
+    }
+
+    fn parent_ready(&self) -> Option<&Latch> {
+        match self {
+            Self::Root => None,
+            Self::Nested(latches) => Some(&latches.parent_ready),
+        }
+    }
+
+    fn ancestor(&self) -> Option<&AncestorCommandLatches> {
+        match self {
+            Self::Root => None,
+            Self::Nested(latches) => Some(&latches.ancestor),
+        }
+    }
+}
+
 struct ScopeRuntime {
     root: Arc<ScopeCell>,
     defaults: ResolvedDefaults,
@@ -1047,14 +1104,10 @@ struct ScopeRuntime {
     jitter: runtime::JitterRng,
     lifecycle: ScopeLifecycle,
     next_ordered_start: Option<ChildKey>,
-    is_root: bool,
-    parent_ready: Option<Latch>,
+    role: ScopeRole,
     dynamic: Option<Arc<DynamicControl>>,
     epoch: Epoch,
-    ancestor_shutdown: Option<Latch>,
     ancestor_shutdown_seen: bool,
-    ancestor_abort: Option<Latch>,
-    ancestor_abort_ack: Option<Latch>,
     ancestor_abort_seen: bool,
     hard_forced: bool,
     completion: Option<ScopeCompletion>,
@@ -1131,19 +1184,13 @@ enum SpawnBody {
         factory: ScopeFactory,
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
-        ready: Latch,
-        cancel: Latch,
-        abort: Latch,
-        abort_ack: Latch,
+        latches: NestedScopeLatches,
     },
     ScopeOnce {
         tree: Box<BuilderCore>,
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
-        ready: Latch,
-        cancel: Latch,
-        abort: Latch,
-        abort_ack: Latch,
+        latches: NestedScopeLatches,
     },
 }
 
@@ -1171,6 +1218,27 @@ struct SpawnLatches {
     local_stop: Latch,
     framework_abort: Latch,
     framework_abort_ack: Latch,
+}
+
+impl SpawnLatches {
+    fn task_context(&self) -> TaskContextLatches {
+        TaskContextLatches {
+            shutdown: self.shutdown.clone(),
+            abort: self.abort.clone(),
+            ready: self.ready.clone(),
+        }
+    }
+
+    fn nested_scope(&self) -> NestedScopeLatches {
+        NestedScopeLatches {
+            parent_ready: self.ready.clone(),
+            ancestor: AncestorCommandLatches {
+                shutdown: self.shutdown.clone(),
+                abort: self.framework_abort.clone(),
+                abort_ack: self.framework_abort_ack.clone(),
+            },
+        }
+    }
 }
 
 struct ChildTaskLaunch {
@@ -1224,13 +1292,7 @@ fn dispatch_child_construction(
         ChildConstruction::Task(definition) => SpawnDispatch {
             body: SpawnBody::TaskRestartable {
                 factory: Arc::clone(&definition.factory),
-                context: TaskContext::new(
-                    id,
-                    incarnation,
-                    latches.shutdown.clone(),
-                    latches.abort.clone(),
-                    latches.ready.clone(),
-                ),
+                context: TaskContext::new(id, incarnation, latches.task_context()),
             },
             declared_readiness: Some(child.options.readiness),
             construction_spent: false,
@@ -1239,13 +1301,7 @@ fn dispatch_child_construction(
         ChildConstruction::TaskOnce(definition) => SpawnDispatch {
             body: SpawnBody::TaskOnce {
                 body: definition.take_body(),
-                context: TaskContext::new(
-                    id,
-                    incarnation,
-                    latches.shutdown.clone(),
-                    latches.abort.clone(),
-                    latches.ready.clone(),
-                ),
+                context: TaskContext::new(id, incarnation, latches.task_context()),
             },
             declared_readiness: Some(child.options.readiness),
             construction_spent: true,
@@ -1269,10 +1325,7 @@ fn dispatch_child_construction(
                         factory: Arc::clone(factory),
                         scope,
                         inherited,
-                        ready: latches.ready.clone(),
-                        cancel: latches.shutdown.clone(),
-                        abort: latches.framework_abort.clone(),
-                        abort_ack: latches.framework_abort_ack.clone(),
+                        latches: latches.nested_scope(),
                     },
                     false,
                 )
@@ -1284,10 +1337,7 @@ fn dispatch_child_construction(
                             .expect("one-shot subtree construction invoked more than once"),
                         scope,
                         inherited,
-                        ready: latches.ready.clone(),
-                        cancel: latches.shutdown.clone(),
-                        abort: latches.framework_abort.clone(),
-                        abort_ack: latches.framework_abort_ack.clone(),
+                        latches: latches.nested_scope(),
                     },
                     true,
                 )
@@ -1342,25 +1392,14 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                     factory,
                     scope,
                     inherited,
-                    ready,
-                    cancel,
-                    abort,
-                    abort_ack,
-                } => {
-                    run_nested_tree(factory(), scope, inherited, ready, cancel, abort, abort_ack)
-                        .await
-                }
+                    latches,
+                } => run_nested_tree(factory(), scope, inherited, latches).await,
                 SpawnBody::ScopeOnce {
                     tree,
                     scope,
                     inherited,
-                    ready,
-                    cancel,
-                    abort,
-                    abort_ack,
-                } => {
-                    run_nested_tree(*tree, scope, inherited, ready, cancel, abort, abort_ack).await
-                }
+                    latches,
+                } => run_nested_tree(*tree, scope, inherited, latches).await,
             }
         };
         let outcome = CatchUnwindFuture::new(body).await;
@@ -1378,7 +1417,9 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         let join = match runtime::join(handle).await {
             runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
             runtime::JoinOutcome::Panic { message, .. } => JoinVerdict::Panicked { message },
-            runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled { after_grace: false },
+            runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled {
+                phase: GracePhase::WithinGrace,
+            },
         };
         exit_ended.fire();
         // The task owns `report`, whose explicit record or Drop fallback runs
@@ -1392,7 +1433,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 incarnation,
                 recorded: report.outcome,
                 join,
-                cancelled: report.cancelled,
+                cancellation: report.cancellation,
             }),
         )
         .await;
@@ -1442,8 +1483,10 @@ impl ScopeRuntime {
         if self.lifecycle.is_draining()
             || self.hard_forced
             || self.root.has_stop_request(self.epoch)
-            || self.ancestor_shutdown.as_ref().is_some_and(Latch::is_fired)
-            || self.ancestor_abort.as_ref().is_some_and(Latch::is_fired)
+            || self
+                .role
+                .ancestor()
+                .is_some_and(|latches| latches.shutdown.is_fired() || latches.abort.is_fired())
         {
             return true;
         }
@@ -1524,7 +1567,7 @@ impl ScopeRuntime {
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);
         }
-        let Some(incarnation) = mint_child_incarnation(&child.slot, &mut child.incarnations) else {
+        let Some(incarnation) = child.incarnations.mint() else {
             let exit = child
                 .slot
                 .member
@@ -1636,7 +1679,7 @@ impl ScopeRuntime {
             abort_handle,
             ladder: None,
             forced_outcome: None,
-            hard_abort_after_grace: None,
+            hard_abort_phase: None,
             readiness,
             readiness_deadline: None,
             ready_signal: latches.ready,
@@ -1761,7 +1804,7 @@ impl ScopeRuntime {
         }
         self.root.set_state(ScopeState::Running);
         self.root.set_startup(Ok(()));
-        if let Some(parent_ready) = &self.parent_ready {
+        if let Some(parent_ready) = self.role.parent_ready() {
             parent_ready.fire();
         }
     }
@@ -1842,10 +1885,10 @@ impl ScopeRuntime {
                 StopAction::Escalate => {
                     active.abort.fire();
                 }
-                StopAction::AbortFramework { after_grace } => {
-                    active.hard_abort_after_grace = Some(after_grace);
+                StopAction::AbortFramework { phase } => {
+                    active.hard_abort_phase = Some(phase);
                     if active.forced_outcome.is_none() {
-                        active.forced_outcome = Some(RecordedOutcome::Aborted { after_grace });
+                        active.forced_outcome = Some(RecordedOutcome::Aborted { phase });
                     }
                     active
                         .framework_abort
@@ -1853,8 +1896,8 @@ impl ScopeRuntime {
                         .expect("framework action belongs only to a framework driver")
                         .fire();
                 }
-                StopAction::HardAbort { after_grace } => {
-                    active.hard_abort_after_grace = Some(after_grace);
+                StopAction::HardAbort { phase } => {
+                    active.hard_abort_phase = Some(phase);
                     active.abort_handle.abort();
                 }
             }
@@ -2025,7 +2068,7 @@ impl ScopeRuntime {
         incarnation: Incarnation,
         recorded: Option<RecordedOutcome>,
         mut join: JoinVerdict,
-        cancelled: bool,
+        cancellation: Cancellation,
     ) {
         let Some(child) = self.children.get_mut(key) else {
             return;
@@ -2049,13 +2092,11 @@ impl ScopeRuntime {
             runtime::dispose_detached(teardown);
         }
         active.readiness.step(ReadinessEvent::Exit);
-        if let (JoinVerdict::Cancelled { .. }, Some(after_grace)) =
-            (&join, active.hard_abort_after_grace)
-        {
-            join = JoinVerdict::Cancelled { after_grace };
+        if let (JoinVerdict::Cancelled { .. }, Some(phase)) = (&join, active.hard_abort_phase) {
+            join = JoinVerdict::Cancelled { phase };
         }
         let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
-        let exit = classify_exit(recorded, join, cancelled);
+        let exit = classify_exit(recorded, join, cancellation);
         child.restarts.settle_if_stable(
             active.started_at,
             runtime::now(),
@@ -2200,7 +2241,11 @@ impl ScopeRuntime {
         });
     }
 
-    fn handle_construction_disposed(&mut self, key: ChildKey, panic: Option<Option<String>>) {
+    fn handle_construction_disposed(
+        &mut self,
+        key: ChildKey,
+        panic: Option<runtime::DisposalPanic>,
+    ) {
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
@@ -2209,14 +2254,14 @@ impl ScopeRuntime {
         };
         child.slot.member.set_terminal_disposal_pending(false);
         if terminal.exited_incarnation.is_some()
-            && let Some(message) = panic
+            && let Some(runtime::DisposalPanic { message }) = panic
             && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
         {
             // Only an exited incarnation can own a destructor failure. A
             // never-started child or a child between restart incarnations
             // keeps its already-authoritative verdict while disposal remains
             // ordered ahead of terminal routing.
-            terminal.exit = Exit::new(ExitKind::Panicked { message }, terminal.exit.cancelled());
+            terminal.exit = Exit::new(ExitKind::Panicked { message }, terminal.exit.cancellation());
         }
 
         let exit = terminal.exit;
@@ -2291,7 +2336,7 @@ impl ScopeRuntime {
                 }
             }
         }
-        if self.is_root {
+        if self.role.is_root() {
             self.root.set_state(ScopeState::StartupFailed);
         } else {
             self.begin_drain(StopReason::StartupFailed(failure));
@@ -2589,10 +2634,6 @@ impl ScopeRuntime {
     }
 }
 
-fn mint_child_incarnation(slot: &Arc<SlotCell>, counter: &mut FenceCounter) -> Option<Incarnation> {
-    ScopeIdentity::mint_incarnation(slot.member.membership(), counter)
-}
-
 /// Owns a scope epoch until a `ScopeRuntime` has taken over its teardown.
 ///
 /// Nested lowering can await isolated disposal before a driver exists. If
@@ -2641,10 +2682,7 @@ async fn run_nested_tree(
     tree: BuilderCore,
     scope: Arc<ScopeCell>,
     inherited: ResolvedDefaults,
-    ready: Latch,
-    cancel: Latch,
-    abort: Latch,
-    abort_ack: Latch,
+    latches: NestedScopeLatches,
 ) -> crate::ExitResult {
     let Some(epoch) = ScopeEpochGuard::begin(&scope) else {
         let failure = StartupFailure {
@@ -2685,17 +2723,7 @@ async fn run_nested_tree(
             return Err(crate::ExitError::from_startup_failure(failure));
         }
     };
-    match run_scope_incarnation(
-        plan,
-        false,
-        Some(ready),
-        Some(cancel),
-        Some(abort),
-        Some(abort_ack),
-        epoch,
-    )
-    .await
-    {
+    match run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch).await {
         StopReason::Finished | StopReason::ShutdownRequested => Ok(()),
         StopReason::IntensityTripped(trip) => Err(crate::ExitError::from_intensity_trip(trip)),
         StopReason::StartupFailed(failure) => Err(crate::ExitError::from_startup_failure(failure)),
@@ -2703,7 +2731,7 @@ async fn run_nested_tree(
     }
 }
 
-async fn run_scope(plan: ScopePlan, is_root: bool, parent_ready: Option<Latch>) -> StopReason {
+async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
     let root = Arc::clone(&plan.root);
     let Some(epoch) = ScopeEpochGuard::begin(&root) else {
         // Dropping the still-armed plan terminalizes every never-started
@@ -2711,20 +2739,16 @@ async fn run_scope(plan: ScopePlan, is_root: bool, parent_ready: Option<Latch>) 
         drop(plan);
         return StopReason::NeverStarted;
     };
-    run_scope_incarnation(plan, is_root, parent_ready, None, None, None, epoch).await
+    run_scope_incarnation(plan, role, epoch).await
 }
 
 async fn run_scope_incarnation(
     mut plan: ScopePlan,
-    is_root: bool,
-    parent_ready: Option<Latch>,
-    incarnation_cancel: Option<Latch>,
-    incarnation_abort: Option<Latch>,
-    incarnation_abort_ack: Option<Latch>,
+    role: ScopeRole,
     epoch: ScopeEpochGuard,
 ) -> StopReason {
     let root = Arc::clone(&plan.root);
-    if is_root {
+    if role.is_root() {
         root.member
             .update(|record| record.stage = MemberStage::Running);
     }
@@ -2781,13 +2805,9 @@ async fn run_scope_incarnation(
         jitter: runtime::JitterRng::from_system_entropy(),
         lifecycle: ScopeLifecycle::starting(),
         next_ordered_start,
-        is_root,
-        parent_ready,
+        role,
         dynamic,
-        ancestor_shutdown: incarnation_cancel,
         ancestor_shutdown_seen: false,
-        ancestor_abort: incarnation_abort,
-        ancestor_abort_ack: incarnation_abort_ack,
         ancestor_abort_seen: false,
         hard_forced: false,
         completion: None,
@@ -2823,14 +2843,18 @@ async fn run_scope_incarnation(
         }
         if !scope.ancestor_shutdown_seen
             && scope
-                .ancestor_shutdown
-                .as_ref()
-                .is_some_and(Latch::is_fired)
+                .role
+                .ancestor()
+                .is_some_and(|latches| latches.shutdown.is_fired())
         {
             scope.ancestor_shutdown_seen = true;
             pending.push((ArbitrationClass::ScopeShutdown, Pending::AncestorShutdown));
         }
-        if !scope.ancestor_abort_seen && scope.ancestor_abort.as_ref().is_some_and(Latch::is_fired)
+        if !scope.ancestor_abort_seen
+            && scope
+                .role
+                .ancestor()
+                .is_some_and(|latches| latches.abort.is_fired())
         {
             scope.ancestor_abort_seen = true;
             pending.push((ArbitrationClass::ScopeShutdown, Pending::AncestorAbort));
@@ -2869,12 +2893,16 @@ async fn run_scope_incarnation(
         }
 
         if pending.is_empty() {
-            let ancestor_shutdown = (!scope.ancestor_shutdown_seen)
-                .then(|| scope.ancestor_shutdown.clone())
-                .flatten();
-            let ancestor_abort = (!scope.ancestor_abort_seen)
-                .then(|| scope.ancestor_abort.clone())
-                .flatten();
+            let ancestor_shutdown = scope
+                .role
+                .ancestor()
+                .filter(|_| !scope.ancestor_shutdown_seen)
+                .map(|latches| latches.shutdown.clone());
+            let ancestor_abort = scope
+                .role
+                .ancestor()
+                .filter(|_| !scope.ancestor_abort_seen)
+                .map(|latches| latches.abort.clone());
             let ancestor_command = async move {
                 let shutdown = async move {
                     if let Some(shutdown) = ancestor_shutdown {
@@ -2921,8 +2949,8 @@ async fn run_scope_incarnation(
         for (_, event) in pending {
             match event {
                 Pending::Shutdown => {
-                    if let Some(cancel) = &scope.ancestor_shutdown {
-                        cancel.fire();
+                    if let Some(latches) = scope.role.ancestor() {
+                        latches.shutdown.fire();
                         scope.ancestor_shutdown_seen = true;
                     }
                     scope.begin_drain(StopReason::ShutdownRequested);
@@ -2932,8 +2960,8 @@ async fn run_scope_incarnation(
                     scope.begin_drain(StopReason::ShutdownRequested);
                 }
                 Pending::AncestorAbort => {
-                    if let Some(ack) = &scope.ancestor_abort_ack {
-                        ack.fire();
+                    if let Some(latches) = scope.role.ancestor() {
+                        latches.abort_ack.fire();
                     }
                     // A scheduled framework driver recursively hard-drains
                     // and joins its children. Its parent only task-aborts it
@@ -2967,8 +2995,8 @@ async fn run_scope_incarnation(
                     incarnation,
                     recorded,
                     join,
-                    cancelled,
-                })) => scope.handle_exit(child, incarnation, recorded, join, cancelled),
+                    cancellation,
+                })) => scope.handle_exit(child, incarnation, recorded, join, cancellation),
                 Pending::Driver(DriverEvent::Child(ChildEvent::ConstructionDisposed {
                     child,
                     panic,
@@ -2978,17 +3006,22 @@ async fn run_scope_incarnation(
         }
 
         if let Some(reason) = scope.finish_if_ready() {
-            let root_exit = is_root.then(|| match &reason {
+            let root_exit = scope.role.is_root().then(|| match &reason {
                 StopReason::Finished | StopReason::ShutdownRequested => {
-                    Exit::new(ExitKind::Completed, reason == StopReason::ShutdownRequested)
+                    let cancellation = if reason == StopReason::ShutdownRequested {
+                        Cancellation::Observed
+                    } else {
+                        Cancellation::NotObserved
+                    };
+                    Exit::new(ExitKind::Completed, cancellation)
                 }
                 StopReason::IntensityTripped(trip) => Exit::new(
                     ExitKind::Failed(crate::ExitError::from_intensity_trip(trip.clone())),
-                    false,
+                    Cancellation::NotObserved,
                 ),
                 StopReason::StartupFailed(failure) => Exit::new(
                     ExitKind::Failed(crate::ExitError::from_startup_failure(failure.clone())),
-                    false,
+                    Cancellation::NotObserved,
                 ),
                 StopReason::NeverStarted => Exit::never_started(),
             });
@@ -3050,24 +3083,25 @@ mod tests {
     };
 
     use crate::{
-        ActorRef, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind, Intensity,
-        LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness, ReadinessDeadline,
-        RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError, StartupFailureCause,
-        StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+        ActorRef, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
+        GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness,
+        ReadinessDeadline, RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError,
+        StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
         engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
-        identity::{FenceCounter, ScopeIdentity},
+        identity::{IncarnationCounter, ScopeIdentity},
         mailbox::MailboxCell,
         plan::SlotCell,
         runtime::Latch,
     };
 
     use super::{
-        ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent, DynamicControl, DynamicEntry,
-        GateCapture, MemberCell, MemberStage, Obligation, Pending, RemovalResponses,
-        RuntimeStorage, ScopeCell, ScopeEpochGuard, ScopeFlavor, ScopeRuntime, StartupDisposition,
-        complete_removals, driver_event_class, mint_child_incarnation, report_channel,
-        resident_projection, restart_shutdown_work, run_nested_tree, run_scope_incarnation,
+        AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
+        DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
+        Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
+        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, complete_removals,
+        driver_event_class, report_channel, resident_projection, restart_shutdown_work,
+        run_nested_tree, run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -3106,11 +3140,9 @@ mod tests {
         let second = isolated_scope("second", ScopeFlavor::Ordered);
         let first_gate = first.observation_gate();
         let second_gate = second.observation_gate();
-        assert!(!Arc::ptr_eq(&first_gate, &second_gate));
+        assert!(!first_gate.same_gate(&second_gate));
 
-        let held = first_gate
-            .lock()
-            .expect("first observation gate starts healthy");
+        let held = first_gate.lock();
         let (completed, receiver) = std::sync::mpsc::sync_channel(0);
         let worker = std::thread::spawn(move || {
             second.set_state(ScopeState::Starting);
@@ -3124,6 +3156,22 @@ mod tests {
             Ok(()),
             "holding one system's gate must not stall another system"
         );
+    }
+
+    #[test]
+    fn observation_gate_poison_does_not_wedge_later_observation() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let gate = scope.observation_gate();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _held = gate.lock();
+                panic!("inject observation failure");
+            }))
+            .is_err()
+        );
+
+        scope.set_state(ScopeState::Starting);
+        assert_eq!(scope.record().state, ScopeState::Starting);
     }
 
     #[test]
@@ -3199,7 +3247,12 @@ mod tests {
         scope.finish_root_incarnation(
             epoch,
             StopReason::ShutdownRequested,
-            Exit::new(ExitKind::Aborted { after_grace: false }, true),
+            Exit::new(
+                ExitKind::Aborted {
+                    phase: GracePhase::WithinGrace,
+                },
+                Cancellation::Observed,
+            ),
         );
         assert!(matches!(
             scope.member.record().stage,
@@ -3222,10 +3275,10 @@ mod tests {
 
         root.set_admitted_children(vec![resident_projection(&slot)]);
 
-        assert!(Arc::ptr_eq(
-            &root.observation_gate(),
-            &nested.observation_gate()
-        ));
+        assert!(
+            root.observation_gate()
+                .same_gate(&nested.observation_gate())
+        );
     }
 
     #[test]
@@ -3235,17 +3288,18 @@ mod tests {
         let leaf = isolated_scope("leaf", ScopeFlavor::Ordered);
         let leaf_slot = SlotCell::new(Arc::clone(&leaf.member), Some(Arc::clone(&leaf)));
         nested.set_admitted_children(vec![resident_projection(&leaf_slot)]);
-        assert!(Arc::ptr_eq(
-            &nested.observation_gate(),
-            &leaf.observation_gate()
-        ));
+        assert!(
+            nested
+                .observation_gate()
+                .same_gate(&leaf.observation_gate())
+        );
 
         let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
         root.set_admitted_children(vec![resident_projection(&nested_slot)]);
 
         let root_gate = root.observation_gate();
-        assert!(Arc::ptr_eq(&root_gate, &nested.observation_gate()));
-        assert!(Arc::ptr_eq(&root_gate, &leaf.observation_gate()));
+        assert!(root_gate.same_gate(&nested.observation_gate()));
+        assert!(root_gate.same_gate(&leaf.observation_gate()));
     }
 
     #[test]
@@ -3254,9 +3308,7 @@ mod tests {
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
         let captures = nested.probe_gate_captures();
         let prior_gate = nested.observation_gate();
-        let held = prior_gate
-            .lock()
-            .expect("pre-admission observation gate starts healthy");
+        let held = prior_gate.lock();
         let observer = Arc::clone(&nested);
         let worker = std::thread::spawn(move || observer.set_state(ScopeState::Starting));
 
@@ -3284,10 +3336,10 @@ mod tests {
             "the handoff forces one retry capture on the root gate"
         );
         assert_eq!(nested.record().state, ScopeState::Starting);
-        assert!(Arc::ptr_eq(
-            &root.observation_gate(),
-            &nested.observation_gate()
-        ));
+        assert!(
+            root.observation_gate()
+                .same_gate(&nested.observation_gate())
+        );
     }
 
     #[crate::runtime::test]
@@ -3332,14 +3384,10 @@ mod tests {
             jitter: crate::runtime::JitterRng::from_system_entropy(),
             lifecycle: ScopeLifecycle::running(),
             next_ordered_start: None,
-            is_root: true,
-            parent_ready: None,
+            role: ScopeRole::Root,
             dynamic: None,
             epoch,
-            ancestor_shutdown: None,
             ancestor_shutdown_seen: false,
-            ancestor_abort: None,
-            ancestor_abort_ack: None,
             ancestor_abort_seen: false,
             hard_forced: false,
             completion: None,
@@ -3476,14 +3524,10 @@ mod tests {
             jitter: crate::runtime::JitterRng::from_system_entropy(),
             lifecycle: ScopeLifecycle::running(),
             next_ordered_start,
-            is_root: true,
-            parent_ready: None,
+            role: ScopeRole::Root,
             dynamic: None,
             epoch,
-            ancestor_shutdown: None,
             ancestor_shutdown_seen: false,
-            ancestor_abort: None,
-            ancestor_abort_ack: None,
             ancestor_abort_seen: false,
             hard_forced: false,
             completion: None,
@@ -3526,7 +3570,7 @@ mod tests {
                 "trip intensity",
             )))),
             join: JoinVerdict::Completed,
-            cancelled: false,
+            cancellation: Cancellation::NotObserved,
         });
         let mut pending = [
             restart_shutdown_work(nested),
@@ -3541,8 +3585,8 @@ mod tests {
                     incarnation,
                     recorded,
                     join,
-                    cancelled,
-                })) => scope.handle_exit(child, incarnation, recorded, join, cancelled),
+                    cancellation,
+                })) => scope.handle_exit(child, incarnation, recorded, join, cancellation),
                 _ => unreachable!("the fixture queues only exit and restart work"),
             }
         }
@@ -3614,10 +3658,10 @@ mod tests {
             .recv()
             .expect("adoption reports completion after the edge");
         adoption.join().expect("gate handoff completes");
-        assert!(Arc::ptr_eq(
-            &root.observation_gate(),
-            &nested.observation_gate()
-        ));
+        assert!(
+            root.observation_gate()
+                .same_gate(&nested.observation_gate())
+        );
     }
 
     #[test]
@@ -3754,7 +3798,7 @@ mod tests {
             report.outcome,
             Some(RecordedOutcome::Returned(Ok(())))
         ));
-        assert!(!report.cancelled);
+        assert_eq!(report.cancellation, Cancellation::NotObserved);
 
         let shutdown = Latch::default();
         let (token, receiver) = report_channel(shutdown.clone(), None);
@@ -3762,7 +3806,7 @@ mod tests {
         drop(token);
         let report = receiver.receive();
         assert!(report.outcome.is_none());
-        assert!(report.cancelled);
+        assert_eq!(report.cancellation, Cancellation::Observed);
     }
 
     #[test]
@@ -3776,7 +3820,7 @@ mod tests {
             report.outcome,
             Some(RecordedOutcome::Returned(Ok(())))
         ));
-        assert!(report.cancelled);
+        assert_eq!(report.cancellation, Cancellation::Observed);
     }
 
     #[test]
@@ -3786,7 +3830,7 @@ mod tests {
         let (token, receiver) = report_channel(shutdown, Some(local_stop.clone()));
         local_stop.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
-        assert!(receiver.receive().cancelled);
+        assert_eq!(receiver.receive().cancellation, Cancellation::Observed);
     }
 
     #[test]
@@ -3868,11 +3912,14 @@ mod tests {
         let epoch = ScopeEpochGuard::begin(&scope).expect("test scope epoch is available");
         let driver = crate::runtime::spawn(run_scope_incarnation(
             plan,
-            false,
-            Some(Latch::default()),
-            None,
-            None,
-            None,
+            ScopeRole::Nested(NestedScopeLatches {
+                parent_ready: Latch::default(),
+                ancestor: AncestorCommandLatches {
+                    shutdown: Latch::default(),
+                    abort: Latch::default(),
+                    abort_ack: Latch::default(),
+                },
+            }),
             epoch,
         ));
         let abort = driver.abort_handle();
@@ -3998,7 +4045,16 @@ mod tests {
         );
 
         let mut driver = Box::pin(run_scope_incarnation(
-            plan, false, None, None, None, None, epoch,
+            plan,
+            ScopeRole::Nested(NestedScopeLatches {
+                parent_ready: Latch::default(),
+                ancestor: AncestorCommandLatches {
+                    shutdown: Latch::default(),
+                    abort: Latch::default(),
+                    abort_ack: Latch::default(),
+                },
+            }),
+            epoch,
         ));
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -4161,7 +4217,7 @@ mod tests {
         let first_exit = Exit::never_started();
         let probe = Arc::new(ObserveMemberOnMailboxWake {
             member: Arc::clone(&member),
-            competing_exit: Exit::new(ExitKind::Completed, false),
+            competing_exit: Exit::new(ExitKind::Completed, Cancellation::NotObserved),
             observed: Mutex::new(None),
         });
         let waker = Waker::from(Arc::clone(&probe));
@@ -4202,7 +4258,7 @@ mod tests {
         member.stage_terminal_before_mailbox(first_exit.clone());
         let probe = Arc::new(ObserveMemberOnMailboxWake {
             member: Arc::clone(&member),
-            competing_exit: Exit::new(ExitKind::Completed, false),
+            competing_exit: Exit::new(ExitKind::Completed, Cancellation::NotObserved),
             observed: Mutex::new(None),
         });
         let waker = Waker::from(Arc::clone(&probe));
@@ -4238,18 +4294,21 @@ mod tests {
             identity.mint_membership(&id).expect("membership available"),
         );
         let start = Arc::new(Barrier::new(3));
-        let workers = [Exit::never_started(), Exit::new(ExitKind::Completed, false)]
-            .into_iter()
-            .map(|exit| {
-                let member = Arc::clone(&member);
-                let start = Arc::clone(&start);
-                std::thread::spawn(move || {
-                    start.wait();
-                    member.terminalize(exit);
-                    assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
-                })
+        let workers = [
+            Exit::never_started(),
+            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        ]
+        .into_iter()
+        .map(|exit| {
+            let member = Arc::clone(&member);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                member.terminalize(exit);
+                assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
             })
-            .collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
         start.wait();
         for worker in workers {
             worker.join().expect("terminalizer thread succeeds");
@@ -4497,7 +4556,7 @@ mod tests {
 
         let captures = root.probe_gate_captures();
         let gate = root.observation_gate();
-        let held_gate = gate.lock().expect("observation gate starts healthy");
+        let held_gate = gate.lock();
         let removal_root = Arc::clone(&root);
         let removal_id = child_id.clone();
         let worker =
@@ -4664,20 +4723,19 @@ mod tests {
         let member = MemberCell::new(id, membership);
         let previous = Exit::new(
             ExitKind::Failed(ExitError::message("last completed incarnation")),
-            false,
+            Cancellation::NotObserved,
         );
         member.update(|record| {
             record.stage = MemberStage::Restarting;
             record.last_exit = Some(previous.clone());
         });
-        let slot = SlotCell::new(Arc::clone(&member), None);
-        let mut counter = FenceCounter::near_exhaustion(71);
+        let mut counter = IncarnationCounter::near_exhaustion(membership);
 
-        assert!(mint_child_incarnation(&slot, &mut counter).is_some());
-        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(counter.mint().is_some());
+        assert!(counter.mint().is_none());
         assert!(matches!(member.record().stage, MemberStage::Restarting));
         assert_eq!(member.record().last_exit, Some(previous));
-        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(counter.mint().is_none());
     }
 
     #[crate::runtime::test]
@@ -4718,14 +4776,10 @@ mod tests {
             jitter: crate::runtime::JitterRng::from_system_entropy(),
             lifecycle: ScopeLifecycle::running(),
             next_ordered_start: Some(key),
-            is_root: true,
-            parent_ready: None,
+            role: ScopeRole::Root,
             dynamic: None,
             epoch,
-            ancestor_shutdown: None,
             ancestor_shutdown_seen: false,
-            ancestor_abort: None,
-            ancestor_abort_ack: None,
             ancestor_abort_seen: false,
             hard_forced: false,
             completion: None,
@@ -4733,15 +4787,15 @@ mod tests {
         plan.armed = false;
         drop(plan);
 
-        scope.children[key].incarnations = FenceCounter::near_exhaustion(71);
-        let first = {
-            let child = &mut scope.children[key];
-            mint_child_incarnation(&child.slot, &mut child.incarnations)
-                .expect("the last usable incarnation mints")
-        };
+        scope.children[key].incarnations =
+            IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
+        let first = scope.children[key]
+            .incarnations
+            .mint()
+            .expect("the last usable incarnation mints");
         let previous = Exit::new(
             ExitKind::Failed(ExitError::message("last completed incarnation")),
-            false,
+            Cancellation::NotObserved,
         );
         root.transition_child(
             &scope.children[key].slot.member,
@@ -4841,14 +4895,10 @@ mod tests {
             jitter: crate::runtime::JitterRng::from_system_entropy(),
             lifecycle: ScopeLifecycle::starting(),
             next_ordered_start: Some(key),
-            is_root: true,
-            parent_ready: None,
+            role: ScopeRole::Root,
             dynamic: None,
             epoch,
-            ancestor_shutdown: None,
             ancestor_shutdown_seen: false,
-            ancestor_abort: None,
-            ancestor_abort_ack: None,
             ancestor_abort_seen: false,
             hard_forced: false,
             completion: None,
@@ -4859,11 +4909,9 @@ mod tests {
         // Burn the counter's last usable generation without touching the
         // member record: the child is still an unspawned initial member, so
         // its very first `spawn_child` exhausts before any incarnation runs.
-        scope.children[key].incarnations = FenceCounter::near_exhaustion(73);
-        {
-            let child = &mut scope.children[key];
-            assert!(mint_child_incarnation(&child.slot, &mut child.incarnations).is_some());
-        }
+        scope.children[key].incarnations =
+            IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
+        assert!(scope.children[key].incarnations.mint().is_some());
         assert!(scope.children[key].initial);
         assert!(!scope.children[key].initial_ready);
         assert_eq!(
@@ -4923,8 +4971,7 @@ mod tests {
         let nested_member = MemberCell::new(nested_id, nested_membership);
 
         let worker_id = ChildId::from("worker");
-        let mut child_identity =
-            ScopeIdentity::with_counter(worker_id.clone(), FenceCounter::near_exhaustion(7));
+        let mut child_identity = ScopeIdentity::near_exhaustion(worker_id.clone(), 7);
         child_identity
             .mint_membership(&worker_id)
             .expect("last usable membership is minted before the rebuild");
@@ -4942,10 +4989,14 @@ mod tests {
             tree.into_core_for_test(),
             Arc::clone(&scope),
             crate::policy::ResolvedDefaults::default(),
-            ready.clone(),
-            Latch::default(),
-            Latch::default(),
-            Latch::default(),
+            NestedScopeLatches {
+                parent_ready: ready.clone(),
+                ancestor: AncestorCommandLatches {
+                    shutdown: Latch::default(),
+                    abort: Latch::default(),
+                    abort_ack: Latch::default(),
+                },
+            },
         )
         .await
         .expect_err("the stable child-id domain is exhausted");
@@ -4988,18 +5039,18 @@ mod tests {
         parent.set_admitted_children(vec![resident_projection(&slot)]);
         let mut snapshots = scope.subscribe_snapshots();
         let mut events = scope.subscribe_lifecycle();
-        let mut counter = FenceCounter::near_exhaustion(83);
-        let first = mint_child_incarnation(&slot, &mut counter).expect("last incarnation mints");
+        let mut counter = IncarnationCounter::near_exhaustion(membership);
+        let first = counter.mint().expect("last incarnation mints");
         member.update(|record| {
             record.stage = MemberStage::Restarting;
             record.last_incarnation = Some(first);
-            record.last_exit = Some(Exit::new(ExitKind::Completed, false));
+            record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
         });
         scope.set_state(ScopeState::Stopped {
             reason: StopReason::Finished,
         });
 
-        assert!(mint_child_incarnation(&slot, &mut counter).is_none());
+        assert!(counter.mint().is_none());
         assert!(matches!(member.record().stage, MemberStage::Restarting));
         assert!(matches!(
             events.try_recv(),
@@ -5015,7 +5066,7 @@ mod tests {
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
         assert!(parent.terminalize_child(
             &member,
-            Exit::new(ExitKind::Completed, false),
+            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
             None,
             StartupDisposition::NotAborted,
         ));
@@ -5093,7 +5144,10 @@ mod tests {
         else {
             panic!("expected the final mintable event");
         };
-        assert_eq!(event.seq, u64::MAX - 1);
-        assert_eq!(scope.snapshot().lifecycle_seq, u64::MAX);
+        assert_eq!(event.seq.get(), u64::MAX - 1);
+        assert_eq!(
+            scope.snapshot().lifecycle_seq,
+            crate::LifecycleSeq::EXHAUSTED
+        );
     }
 }

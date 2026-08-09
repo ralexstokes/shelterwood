@@ -218,6 +218,7 @@ struct DynamicState {
 }
 
 pub(crate) struct DynamicControl {
+    root: Weak<ScopeCell>,
     events: runtime::MpscSender<DriverEvent>,
     state: Mutex<DynamicState>,
     requests: runtime::UnboundedMpscSender<DriverEvent>,
@@ -227,7 +228,7 @@ pub(crate) struct DynamicControl {
 }
 
 impl DynamicControl {
-    fn new(events: runtime::MpscSender<DriverEvent>) -> Arc<Self> {
+    fn new(root: &Arc<ScopeCell>, events: runtime::MpscSender<DriverEvent>) -> Arc<Self> {
         let (requests, mut request_receiver) = runtime::unbounded_mpsc();
         let forward_events = events.clone();
         let request_forwarder_close = Latch::default();
@@ -237,6 +238,7 @@ impl DynamicControl {
         #[cfg(test)]
         let forwarder_ended = request_forwarder_ended.clone();
         let control = Arc::new(Self {
+            root: Arc::downgrade(root),
             events,
             state: Mutex::new(DynamicState {
                 accepting: true,
@@ -458,6 +460,28 @@ pub(crate) fn signal_fused_cancel(
 
 fn signal_fused_cancel_impl(control: &DynamicControl, membership: Membership, latch: &Latch) {
     if latch.fire() {
+        let member = control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entries
+            .values()
+            .find(|entry| entry.slot.member.membership() == membership)
+            .map(|entry| Arc::clone(&entry.slot.member));
+        if let Some(member) = member {
+            // Cancellation is level-triggered state, not merely a queued
+            // command. Publish it before attempting the bounded driver lane
+            // so an exit or already-due backoff cannot start another
+            // incarnation while the removal event waits in the forwarder.
+            if let Some(root) = control.root.upgrade() {
+                root.transition_child(&member, |record| record.removing = true, None);
+            } else {
+                // Teardown can outlive the root's dynamic-route ownership.
+                // Keep the member-local suppression state monotonic even
+                // though no containing snapshot remains to publish.
+                member.update(|record| record.removing = true);
+            }
+        }
         queue_driver_event(control, DriverEvent::Removal(membership));
     }
 }
@@ -2372,7 +2396,19 @@ impl ScopeRuntime {
                     self.progress_startup();
                 }
             }
-            DeadlineKind::Restart { child } => self.spawn_child(child),
+            DeadlineKind::Restart { child } => {
+                // A removal or scope stop can latch after the exit scheduled
+                // this deadline but before the deadline's batch runs. Recheck
+                // the level-triggered sources at execution time so a stale
+                // backoff edge never invokes user construction.
+                if self.restart_is_suppressed(child) {
+                    if let Some(child) = self.children.get_mut(child) {
+                        child.restart_deadline.take();
+                    }
+                } else {
+                    self.spawn_child(child);
+                }
+            }
             DeadlineKind::Stop { child, incarnation } => {
                 if self
                     .children
@@ -2754,8 +2790,8 @@ async fn run_scope_incarnation(
     let capacity = plan.children.len().saturating_mul(3).max(64);
     let (events, mut event_receiver) = runtime::bounded_mpsc(capacity);
     let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
-    let dynamic =
-        (plan.root.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(events.clone()));
+    let dynamic = (plan.root.flavor == ScopeFlavor::Dynamic)
+        .then(|| DynamicControl::new(&root, events.clone()));
     if let Some(control) = &dynamic {
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
         for child in &plan.children {
@@ -3082,11 +3118,17 @@ fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
 }
 
 #[cfg(test)]
+pub(crate) use tests::exercise_saturated_fused_drop_racing_due_restart;
+
+#[cfg(test)]
 mod tests {
     use std::{
         future::{self, Future},
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::{Arc, Barrier, Mutex},
+        sync::{
+            Arc, Barrier, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
@@ -3100,7 +3142,8 @@ mod tests {
         exit::{JoinVerdict, RecordedOutcome},
         identity::{IncarnationCounter, ScopeIdentity},
         mailbox::MailboxCell,
-        plan::SlotCell,
+        plan::{ChildConstruction, SlotCell},
+        policy::ResolvedDefaults,
         runtime::Latch,
     };
 
@@ -4456,7 +4499,7 @@ mod tests {
         let slot = SlotCell::new(Arc::clone(&member), None);
         root.set_admitted_children(vec![resident_projection(&slot)]);
         let (events, _receiver) = crate::runtime::bounded_mpsc(1);
-        let control = DynamicControl::new(events);
+        let control = DynamicControl::new(&root, events);
         let (sender, mut response) = crate::runtime::oneshot();
         let mut responses = RemovalResponses::default();
         responses.0.push(sender);
@@ -4545,7 +4588,7 @@ mod tests {
         let slot = SlotCell::new(Arc::clone(&member), None);
         root.set_admitted_children(vec![resident_projection(&slot)]);
         let (events, _receiver) = crate::runtime::bounded_mpsc(1);
-        let control = DynamicControl::new(events);
+        let control = DynamicControl::new(&root, events);
         control
             .state
             .lock()
@@ -4595,6 +4638,7 @@ mod tests {
 
     #[crate::runtime::test]
     async fn saturated_removal_from_a_foreign_thread_reaches_the_driver() {
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
         let mut identity = ScopeIdentity::new();
         let first_id = ChildId::from("first");
         let second_id = ChildId::from("second");
@@ -4609,7 +4653,7 @@ mod tests {
             events.try_send(DriverEvent::Removal(first)).is_ok(),
             "the fixture saturates the bounded driver lane"
         );
-        let control = DynamicControl::new(events);
+        let control = DynamicControl::new(&root, events);
         let foreign_control = Arc::clone(&control);
         std::thread::spawn(move || {
             assert!(
@@ -4640,13 +4684,172 @@ mod tests {
         assert_eq!(observed_second, second);
     }
 
+    pub(crate) async fn exercise_saturated_fused_drop_racing_due_restart<A>(
+        make_admission: impl FnOnce(super::DynamicReservation) -> A,
+    ) where
+        A: Future,
+    {
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.member
+            .update(|record| record.stage = MemberStage::Running);
+        root.set_state(ScopeState::Running);
+        root.set_startup(Ok(()));
+
+        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+        let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let control = DynamicControl::new(&root, events.clone());
+        root.set_dynamic_route(Some(control.clone()));
+        root.set_admitted_children(Vec::new());
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: ResolvedDefaults::default(),
+            intensity_policy: Intensity::default(),
+            intensity: super::IntensityState::default(),
+            children: ChildArena::default(),
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::running(),
+            next_ordered_start: None,
+            role: ScopeRole::Root,
+            dynamic: Some(control.clone()),
+            epoch,
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+
+        let release_failure = Latch::default();
+        let starts = Arc::new(AtomicUsize::new(0));
+        let reservation = super::reserve_dynamic(&root, ChildId::from("worker"), None)
+            .expect("running dynamic scope reserves the child");
+        let member = Arc::clone(&reservation.slot.member);
+        reservation
+            .slot
+            .define(ChildConstruction::Task(TaskDef::new({
+                let release_failure = release_failure.clone();
+                let starts = Arc::clone(&starts);
+                move |_| {
+                    let release_failure = release_failure.clone();
+                    let invocation = starts.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        if invocation == 1 {
+                            release_failure.fired().await;
+                            Err(ExitError::message("first incarnation failed"))
+                        } else {
+                            future::pending().await
+                        }
+                    }
+                }
+            })));
+        let membership = member.membership();
+        let mut admission = Box::pin(make_admission(reservation));
+        assert!(
+            admission
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "first poll submits the fused admission"
+        );
+        let Some(DriverEvent::Admission(request)) = event_receiver.recv().await else {
+            panic!("the admission forwarder submits the request")
+        };
+        scope.handle_admission(request);
+
+        for _ in 0..64 {
+            if starts.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            crate::runtime::yield_now().await;
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        release_failure.fire();
+        let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv())
+            .await
+        {
+            crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
+                child,
+                incarnation,
+                recorded,
+                join,
+                cancellation,
+            }))) => (child, incarnation, recorded, join, cancellation),
+            crate::runtime::Timeout::Completed(_) => panic!("the first incarnation reports exit"),
+            crate::runtime::Timeout::Elapsed => panic!("the first incarnation exit must arrive"),
+        };
+        let key = exit.0;
+        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4);
+        assert!(
+            scope.children[key].restart_deadline.is_some(),
+            "the immediate restart is scheduled before cancellation"
+        );
+
+        assert!(
+            scope
+                .events
+                .try_send(DriverEvent::Removal(root.member.membership()))
+                .is_ok(),
+            "the fixture saturates the bounded driver lane"
+        );
+        drop(admission);
+        assert!(
+            member.record().removing,
+            "fused drop publishes removal state before its queued edge can advance"
+        );
+
+        let restart = scope
+            .deadlines
+            .pop_due(crate::runtime::now())
+            .expect("immediate backoff is already due");
+        assert!(matches!(restart, super::DeadlineKind::Restart { child } if child == key));
+        scope.handle_deadline(restart);
+        assert!(scope.children[key].restart_deadline.is_none());
+        for _ in 0..16 {
+            crate::runtime::yield_now().await;
+        }
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "a due restart rechecks the fused cancellation before construction"
+        );
+
+        assert!(matches!(
+            event_receiver.recv().await,
+            Some(DriverEvent::Removal(queued)) if queued == root.member.membership()
+        ));
+        let forwarded =
+            match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+                crate::runtime::Timeout::Completed(Some(event)) => event,
+                crate::runtime::Timeout::Completed(None) => panic!("the driver lane remains open"),
+                crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
+            };
+        assert!(matches!(forwarded, DriverEvent::Removal(removed) if removed == membership));
+        scope.handle_removal(membership);
+        let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
+            crate::runtime::unbounded_mpsc_recv(&mut disposal_event_receiver).await
+        else {
+            panic!("removal joins retained construction disposal")
+        };
+        scope.handle_construction_disposed(child, panic);
+        assert!(scope.children.get(key).is_none());
+
+        control.request_forwarder_close.fire();
+        control.request_forwarder_ended.fired().await;
+    }
+
     #[crate::runtime::test]
     async fn saturated_admissions_share_one_forwarder_task_and_all_resolve() {
         const ADMISSIONS: usize = 64;
 
         let root = isolated_scope("root", ScopeFlavor::Dynamic);
         let (events, event_receiver) = crate::runtime::bounded_mpsc(1);
-        let control = DynamicControl::new(events);
+        let control = DynamicControl::new(&root, events);
         let child_id = ChildId::from("worker");
         let member = MemberCell::new(
             child_id.clone(),

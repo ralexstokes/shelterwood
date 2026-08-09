@@ -1601,7 +1601,13 @@ Rules (normative):
   **level-triggered cancellation latch** owned by the fused future and
   registered on the cell: dropping the future flips the latch
   synchronously (a token edge that always succeeds, like §10's shutdown
-  latch), and the driver converts the edge into an engine event that
+  latch). For an admitted cell that same synchronous edge publishes its
+  membership as `Removing` before attempting the bounded command channel;
+  both exit-time restart scheduling and execution of an already-due restart
+  deadline MUST recheck that level-triggered suppression. Queue saturation
+  therefore cannot run user construction for a cancelled membership while
+  its removal event waits for forwarding. The driver converts the edge into
+  an engine event that
   resolves the race by stage — a not-yet-admitted operation, whether
   its command is unsent, still queued, or dequeued-but-unprocessed, is
   annulled at the admission check (reservation released, cell

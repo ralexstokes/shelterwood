@@ -1192,7 +1192,7 @@ impl Subtree for DynamicTree {}
 
 #[cfg(test)]
 mod tests {
-    use super::{DynamicTree, Tree, sealed::Sealed};
+    use super::{Admission, AdmissionOwnership, DynamicTree, Tree, sealed::Sealed};
     use crate::identity::ScopeIdentity;
 
     #[test]
@@ -1208,6 +1208,14 @@ mod tests {
         let core = <DynamicTree as Sealed>::into_core(tree);
         assert_eq!(ScopeIdentity::current_thread_creations(), after_tree);
         drop(core);
+    }
+
+    #[crate::runtime::test]
+    async fn saturated_fused_drop_suppresses_an_already_due_restart() {
+        crate::driver::exercise_saturated_fused_drop_racing_due_restart(|reservation| {
+            Admission::new(reservation, (), AdmissionOwnership::Fused)
+        })
+        .await;
     }
 }
 

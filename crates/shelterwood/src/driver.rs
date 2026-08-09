@@ -781,7 +781,7 @@ enum ChildEvent {
     },
     ConstructionDisposed {
         child: ChildKey,
-        panic: Option<Option<String>>,
+        panic: Option<runtime::DisposalPanic>,
     },
 }
 
@@ -2185,7 +2185,11 @@ impl ScopeRuntime {
         });
     }
 
-    fn handle_construction_disposed(&mut self, key: ChildKey, panic: Option<Option<String>>) {
+    fn handle_construction_disposed(
+        &mut self,
+        key: ChildKey,
+        panic: Option<runtime::DisposalPanic>,
+    ) {
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
@@ -2194,7 +2198,7 @@ impl ScopeRuntime {
         };
         child.slot.member.set_terminal_disposal_pending(false);
         if terminal.exited_incarnation.is_some()
-            && let Some(message) = panic
+            && let Some(runtime::DisposalPanic { message }) = panic
             && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
         {
             // Only an exited incarnation can own a destructor failure. A

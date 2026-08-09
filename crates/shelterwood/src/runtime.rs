@@ -2,6 +2,7 @@
 
 use std::{
     any::Any,
+    collections::VecDeque,
     fmt,
     future::Future,
     ops::RangeBounds,
@@ -28,6 +29,15 @@ pub(crate) use tokio::test;
 #[cfg(test)]
 pub(crate) async fn advance(duration: Duration) {
     time::advance(duration).await;
+}
+
+/// Counts the runtime's currently alive spawned tasks, keeping runtime
+/// metrics access in this module.
+#[cfg(test)]
+pub(crate) fn alive_task_count() -> usize {
+    tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks()
 }
 
 /// Runtime-owned spelling for an unwind payload crossing a framework boundary.
@@ -355,6 +365,87 @@ where
     }
 }
 
+/// Erased view of a queued disposal job for the shared fallback thread.
+trait QueuedDisposal: Send + Sync {
+    fn run(&self);
+}
+
+impl<T, C> QueuedDisposal for DisposalJob<T, C>
+where
+    T: Send + 'static,
+    C: FnOnce(Option<Option<String>>) + Send + 'static,
+{
+    fn run(&self) {
+        self.finish();
+    }
+}
+
+/// Jobs awaiting the shared non-runtime disposal thread.
+///
+/// `worker_live` is only cleared by the worker after observing an empty queue
+/// under this lock, and submitters push and consult it under the same lock, so
+/// a queued job always has a live worker destined to drain it.
+struct FallbackDisposals {
+    queue: VecDeque<Arc<dyn QueuedDisposal>>,
+    worker_live: bool,
+}
+
+static FALLBACK_DISPOSALS: Mutex<FallbackDisposals> = Mutex::new(FallbackDisposals {
+    queue: VecDeque::new(),
+    worker_live: false,
+});
+
+/// Queues a disposal job for the shared fallback thread, lazily starting it.
+/// Returns `false` when no worker exists and none could be started; the
+/// caller must then finish the job itself.
+fn enqueue_fallback_disposal(job: Arc<dyn QueuedDisposal>) -> bool {
+    let mut state = FALLBACK_DISPOSALS
+        .lock()
+        .expect("fallback disposal queue mutex poisoned");
+    state.queue.push_back(job);
+    if state.worker_live {
+        return true;
+    }
+    // Spawning under the lock makes queueing and worker liveness one atomic
+    // decision: no submitter can observe a queued job without a worker.
+    match std::thread::Builder::new()
+        .name("shelterwood-disposal".to_owned())
+        .spawn(run_fallback_disposals)
+    {
+        Ok(worker) => {
+            drop(worker);
+            state.worker_live = true;
+            true
+        }
+        Err(_) => {
+            // The queue was empty before this push (no live worker implies an
+            // empty queue), so the popped entry is exactly the failed job.
+            let rejected = state.queue.pop_back();
+            debug_assert!(rejected.is_some());
+            false
+        }
+    }
+}
+
+fn run_fallback_disposals() {
+    loop {
+        let job = {
+            let mut state = FALLBACK_DISPOSALS
+                .lock()
+                .expect("fallback disposal queue mutex poisoned");
+            let Some(job) = state.queue.pop_front() else {
+                state.worker_live = false;
+                return;
+            };
+            job
+        };
+        // `DisposalJob::finish` contains destructor and completion panics
+        // internally; this outer boundary keeps even an unforeseen framework
+        // panic from stranding `worker_live` and the queued jobs behind it.
+        discard_panic(catch_panic(|| job.run()).err());
+    }
+}
+
 fn dispatch_disposal<T, C>(job: Arc<DisposalJob<T, C>>)
 where
     T: Send + 'static,
@@ -371,12 +462,15 @@ where
         }
     }
 
-    let worker = Arc::clone(&job);
-    if std::thread::Builder::new()
-        .name("shelterwood-disposal".to_owned())
-        .spawn(move || worker.finish())
-        .is_ok()
-    {
+    // Outside a runtime, one shared lazily started thread drains a queue of
+    // disposal jobs, so dropping N values costs at most one thread rather
+    // than one thread per value, while a blocking or panicking destructor
+    // still never runs on (or unwinds into) the submitting thread. The queue
+    // is unbounded on purpose: applying a bound would block the submitter on
+    // user destructors, exactly what isolation must prevent. Serialization is
+    // the accepted trade: one blocking destructor delays later fallback
+    // disposals instead of consuming another native thread.
+    if enqueue_fallback_disposal(Arc::clone(&job) as Arc<dyn QueuedDisposal>) {
         return;
     }
 
@@ -387,6 +481,11 @@ where
 
 /// Runs potentially blocking user destruction away from the caller and then
 /// invokes framework completion with the contained panic diagnostic.
+///
+/// Inside a Tokio runtime this uses the blocking pool. Outside one, jobs are
+/// funneled through a single shared disposal thread, so destroying many
+/// values (for example dropping a large unspawned tree) never creates one
+/// native thread per value.
 pub(crate) fn dispose_then<T, C>(value: T, completion: C)
 where
     T: Send + 'static,

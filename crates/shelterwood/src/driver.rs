@@ -4368,6 +4368,74 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum TerminalStopPath {
+        LiveEpoch,
+        NoLiveEpoch,
+        NeverStarted,
+    }
+
+    #[crate::runtime::test]
+    async fn terminal_stop_paths_share_one_complete_observation_transition() {
+        for (path, reason) in [
+            (TerminalStopPath::LiveEpoch, StopReason::ShutdownRequested),
+            (TerminalStopPath::NoLiveEpoch, StopReason::ShutdownRequested),
+            (TerminalStopPath::NeverStarted, StopReason::NeverStarted),
+        ] {
+            let scope = isolated_scope("root", ScopeFlavor::Ordered);
+            let epoch = matches!(path, TerminalStopPath::LiveEpoch).then(|| {
+                scope
+                    .begin_incarnation()
+                    .expect("test scope epoch is available")
+            });
+            let handle = ScopeRef {
+                cell: Arc::clone(&scope),
+            };
+            let mut snapshots = handle.subscribe_snapshots();
+            let mut events = handle.subscribe_lifecycle();
+
+            match path {
+                TerminalStopPath::LiveEpoch => scope.finish_root_incarnation(
+                    epoch.expect("live path owns an epoch"),
+                    reason.clone(),
+                    Exit::never_started(),
+                ),
+                TerminalStopPath::NoLiveEpoch => {
+                    scope.finish_live_root_incarnation(reason.clone(), Exit::never_started())
+                }
+                TerminalStopPath::NeverStarted => scope.terminalize_never_started(),
+            }
+
+            let expected_state = ScopeState::Stopped {
+                reason: reason.clone(),
+            };
+            assert!(matches!(
+                scope.member.record().stage,
+                MemberStage::Terminal(_)
+            ));
+            assert_eq!(scope.record().state, expected_state);
+            assert_eq!(
+                epoch.map(|epoch| scope.incarnation_finished(epoch)),
+                epoch.map(|_| true)
+            );
+            assert_eq!(snapshots.borrow_latest().state, expected_state);
+            assert!(matches!(
+                events.try_recv(),
+                Ok(LifecycleItem::Event(crate::LifecycleEvent {
+                    kind: LifecycleEventKind::ScopeState { state },
+                    ..
+                })) if state == expected_state
+            ));
+            assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+
+            snapshots
+                .changed()
+                .await
+                .expect("the final snapshot precedes observation closure");
+            assert!(snapshots.changed().await.is_err());
+        }
+    }
+
     impl Wake for ObserveScopeOnStartupWake {
         fn wake(self: Arc<Self>) {
             self.observe();
@@ -4376,6 +4444,88 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.observe();
         }
+    }
+
+    #[test]
+    fn stopped_publication_keeps_mailbox_panic_primary_and_finishes_observation() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let epoch = scope
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        let handle = ScopeRef {
+            cell: Arc::clone(&scope),
+        };
+        let mut events = handle.subscribe_lifecycle();
+        let mailbox = MailboxCell::new(scope.member.id().clone());
+        let actor: ActorRef<u8> = ActorRef::new(Arc::clone(&scope.member), Arc::clone(&mailbox));
+        scope.member.attach_mailbox(mailbox);
+
+        let mailbox_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let mailbox_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &mailbox_payload_dropped,
+        ))));
+        let mut parked_send = Box::pin(actor.send(1));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&mailbox_waker))
+                .is_pending()
+        );
+
+        let terminal_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let terminal_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &terminal_payload_dropped,
+        ))));
+        let mut terminal = Box::pin(scope.member.wait_terminal());
+        assert!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&terminal_waker))
+                .is_pending()
+        );
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            scope.finish_root_incarnation(
+                epoch,
+                StopReason::ShutdownRequested,
+                Exit::never_started(),
+            );
+        }))
+        .expect_err("the primary mailbox panic still surfaces");
+        assert_eq!(
+            mailbox_payload_dropped.load(Ordering::SeqCst),
+            0,
+            "the mailbox panic payload remains owned by the caller"
+        );
+        assert!(
+            terminal_payload_dropped.load(Ordering::SeqCst) > 0,
+            "later member-pulse panics are contained as cleanup"
+        );
+        assert!(matches!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::ShutdownRequested
+            }
+        ));
+        assert!(scope.incarnation_finished(epoch));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(LifecycleItem::Event(crate::LifecycleEvent {
+                kind: LifecycleEventKind::ScopeState {
+                    state: ScopeState::Stopped {
+                        reason: StopReason::ShutdownRequested
+                    }
+                },
+                ..
+            }))
+        ));
+        assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+        assert!(matches!(
+            scope.member.record().stage,
+            MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        drop(payload);
+        assert_eq!(mailbox_payload_dropped.load(Ordering::SeqCst), 1);
     }
 
     #[test]

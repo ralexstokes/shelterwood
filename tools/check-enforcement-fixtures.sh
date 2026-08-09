@@ -79,6 +79,8 @@ expect_case exit-downcast-ref check-exit-paths.sh \
   "runtime type recovery found on the exit path:"
 expect_case exit-downcast-mut check-exit-paths.sh \
   "runtime type recovery found on the exit path:"
+expect_case exit-downcast-in-driver-module check-exit-paths.sh \
+  "runtime type recovery found on the exit path:"
 expect_case layering-driver-below check-layering-paths.sh \
   "upward driver or tree references found below the driver layer:"
 expect_case layering-cancellation-driver-below check-layering-paths.sh \

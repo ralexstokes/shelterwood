@@ -1,9 +1,11 @@
 use std::time::Duration;
 
-use crate::common::{ConsumeCount, ConsumeGuard, ReleaseGate, policy::never};
+use crate::common::{
+    ConsumeCount, ConsumeGuard, POLL_TIMEOUT, ReleaseGate, policy::never, poll_once, poll_until,
+};
 use shelterwood::{
-    Actor, ActorOnceDef, Context, ExitError, ExitResult, RawActor, RawContext, RawOnceDef,
-    Readiness, ReadinessDeadline, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    Actor, ActorOnceDef, Context, DynamicTree, ExitError, ExitResult, RawActor, RawContext,
+    RawOnceDef, Readiness, ReadinessDeadline, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 #[derive(Clone, Copy)]
@@ -379,6 +381,74 @@ fn one_shot_subtree_with_guard(count: &ConsumeCount, mode: &'static str) -> Tree
         .add_task_once("resource", definition)
         .expect("valid task");
     tree
+}
+
+#[tokio::test]
+async fn cancelling_inflight_one_shot_adds_drops_every_kind_resource_once() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+
+    let task_count = ConsumeCount::default();
+    let task_guard = task_count.guard();
+    let mut task = Box::pin(scope.add_task_once(
+        "task",
+        TaskOnceDef::new(move |_| async move {
+            let _guard = task_guard;
+            std::future::pending::<Result<(), ExitError>>().await
+        }),
+    ));
+    assert!(poll_once(task.as_mut()).is_pending());
+    drop(task);
+
+    let actor_count = ConsumeCount::default();
+    let mut actor = Box::pin(scope.add_actor_once(
+        "actor",
+        ActorOnceDef::<ResourceActor>::new(ResourceArgs {
+            guard: actor_count.guard(),
+            mode: ActorResourceMode::Normal,
+        }),
+    ));
+    assert!(poll_once(actor.as_mut()).is_pending());
+    drop(actor);
+
+    let raw_count = ConsumeCount::default();
+    let mut raw = Box::pin(scope.add_raw_once(
+        "raw",
+        RawOnceDef::new(resource_raw_actor(&raw_count, RawResourceMode::Normal)),
+    ));
+    assert!(poll_once(raw.as_mut()).is_pending());
+    drop(raw);
+
+    let subtree_count = ConsumeCount::default();
+    let mut subtree = Box::pin(scope.add_subtree_once(
+        "subtree",
+        SubtreeOnceDef::new(one_shot_subtree_with_guard(&subtree_count, "normal")),
+    ));
+    assert!(poll_once(subtree.as_mut()).is_pending());
+    drop(subtree);
+
+    for (kind, count) in [
+        ("task", &task_count),
+        ("actor", &actor_count),
+        ("raw actor", &raw_count),
+        ("subtree", &subtree_count),
+    ] {
+        assert!(
+            poll_until(POLL_TIMEOUT, Duration::from_millis(1), || count.get() == 1).await,
+            "cancelled {kind} admission disposes its resource"
+        );
+        count.assert_once();
+    }
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("cancelled admissions leave no stragglers");
+    task_count.assert_once();
+    actor_count.assert_once();
+    raw_count.assert_once();
+    subtree_count.assert_once();
 }
 
 #[tokio::test]

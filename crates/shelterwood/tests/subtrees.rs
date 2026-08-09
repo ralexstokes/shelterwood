@@ -141,24 +141,35 @@ async fn one_shot_subtree_lowering_failure_retains_structured_provenance() {
 #[tokio::test]
 async fn over_budget_restart_is_charged_but_never_spawned() {
     let starts = Arc::new(AtomicUsize::new(0));
+    let release_first = ReleaseGate::default();
     let mut root = Tree::new();
     root.intensity(Intensity::new(2, Duration::from_secs(10)).expect("valid intensity"));
     root.add_task(
         "failing",
         TaskDef::new({
             let starts = Arc::clone(&starts);
+            let release_first = release_first.clone();
             move |_| {
-                starts.fetch_add(1, Ordering::SeqCst);
-                async { Err(ExitError::message("retry")) }
+                let incarnation = starts.fetch_add(1, Ordering::SeqCst);
+                let release_first = release_first.clone();
+                async move {
+                    if incarnation == 0 {
+                        release_first.wait().await;
+                    }
+                    Err(ExitError::message("retry"))
+                }
             }
         }),
     )
     .expect("valid task");
     let system = root.spawn().expect("runtime is available");
+    let scope = system.scope();
+    let mut events = scope.subscribe_lifecycle();
     system
         .wait_started()
         .await
         .expect("immediate readiness starts root");
+    release_first.release();
     let reason = system.wait().await;
     let StopReason::IntensityTripped(trip) = reason else {
         panic!("expected intensity trip");
@@ -168,6 +179,39 @@ async fn over_budget_restart_is_charged_but_never_spawned() {
         starts.load(Ordering::SeqCst),
         3,
         "fourth spawn is suppressed"
+    );
+
+    assert_eq!(
+        scope.snapshot().total_restarts,
+        shelterwood::TotalRestarts::ZERO.bump().bump().bump(),
+        "the tripping scheduling charge advances the public scope counter"
+    );
+    let mut trace = Vec::new();
+    while let Some(item) = events.recv().await {
+        let LifecycleItem::Event(event) = item else {
+            panic!("the short restart trace cannot lag");
+        };
+        match event.kind {
+            LifecycleEventKind::Exited { .. } => trace.push("exited"),
+            LifecycleEventKind::RestartScheduled { .. } => trace.push("scheduled"),
+            LifecycleEventKind::ScopeState {
+                state: shelterwood::ScopeState::Draining,
+            } => trace.push("draining"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        trace,
+        [
+            "exited",
+            "scheduled",
+            "exited",
+            "scheduled",
+            "exited",
+            "scheduled",
+            "draining"
+        ],
+        "the tripping charge is emitted before the scope failure"
     );
 }
 

@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc, Barrier, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -147,6 +147,151 @@ async fn timers_and_offload_completions_never_cross_an_incarnation_boundary() {
         .send(RestartMessage::Fresh)
         .await
         .expect("replacement live");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert!(!stale_seen.load(Ordering::SeqCst));
+}
+
+enum DetachedBlockingMessage {
+    Poison,
+    Fresh,
+    StaleCompletion,
+}
+
+struct DetachedBlockingActor {
+    generation: usize,
+    thread_started: Arc<Barrier>,
+    thread_release: Arc<(Mutex<bool>, Condvar)>,
+    thread_done: Arc<AtomicBool>,
+    stale_seen: Arc<AtomicBool>,
+}
+
+impl Actor for DetachedBlockingActor {
+    type Msg = DetachedBlockingMessage;
+    type Args = (
+        usize,
+        Arc<Barrier>,
+        Arc<(Mutex<bool>, Condvar)>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    );
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            generation: args.0,
+            thread_started: args.1,
+            thread_release: args.2,
+            thread_done: args.3,
+            stale_seen: args.4,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            DetachedBlockingMessage::Poison => {
+                assert_eq!(self.generation, 1);
+                let thread_started = Arc::clone(&self.thread_started);
+                let thread_release = Arc::clone(&self.thread_release);
+                let thread_done = Arc::clone(&self.thread_done);
+                let work = context.run_blocking(move |cancellation| {
+                    thread_started.wait();
+                    let (released, changed) = &*thread_release;
+                    let mut released = released.lock().expect("release mutex poisoned");
+                    while !*released {
+                        released = changed
+                            .wait(released)
+                            .expect("release mutex poisoned while waiting");
+                    }
+                    assert!(
+                        cancellation.is_cancelled(),
+                        "the old incarnation cancels detached blocking work"
+                    );
+                    thread_done.store(true, Ordering::SeqCst);
+                });
+                self.thread_started.wait();
+                context
+                    .offload(
+                        work,
+                        |_| DetachedBlockingMessage::StaleCompletion,
+                        Duration::MAX,
+                    )
+                    .expect("blocking future is accepted before failure");
+                Err(ExitError::message("poisoned incarnation"))
+            }
+            DetachedBlockingMessage::Fresh => {
+                assert_eq!(self.generation, 2);
+                context.stop();
+                Ok(())
+            }
+            DetachedBlockingMessage::StaleCompletion => {
+                self.stale_seen.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
+    let generations = Arc::new(AtomicUsize::new(0));
+    let thread_started = Arc::new(Barrier::new(2));
+    let thread_release = Arc::new((Mutex::new(false), Condvar::new()));
+    let thread_done = Arc::new(AtomicBool::new(false));
+    let stale_seen = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor(
+            "actor",
+            ActorDef::<DetachedBlockingActor>::factory({
+                let generations = Arc::clone(&generations);
+                let thread_started = Arc::clone(&thread_started);
+                let thread_release = Arc::clone(&thread_release);
+                let thread_done = Arc::clone(&thread_done);
+                let stale_seen = Arc::clone(&stale_seen);
+                move || {
+                    (
+                        generations.fetch_add(1, Ordering::SeqCst) + 1,
+                        Arc::clone(&thread_started),
+                        Arc::clone(&thread_release),
+                        Arc::clone(&thread_done),
+                        Arc::clone(&stale_seen),
+                    )
+                }
+            }),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("first actor starts");
+    actor
+        .send(DetachedBlockingMessage::Poison)
+        .await
+        .expect("actor accepts poison");
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            generations.load(Ordering::SeqCst) >= 2
+        })
+        .await,
+        "replacement starts while the old blocking thread remains detached"
+    );
+
+    let (released, changed) = &*thread_release;
+    *released.lock().expect("release mutex poisoned") = true;
+    changed.notify_one();
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            thread_done.load(Ordering::SeqCst)
+        })
+        .await,
+        "detached old-incarnation thread completes"
+    );
+    assert_quiet(Duration::from_millis(20), || {
+        stale_seen.load(Ordering::SeqCst)
+    })
+    .await;
+
+    actor
+        .send(DetachedBlockingMessage::Fresh)
+        .await
+        .expect("replacement remains live");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert!(!stale_seen.load(Ordering::SeqCst));
 }

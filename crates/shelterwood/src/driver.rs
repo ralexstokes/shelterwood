@@ -1415,7 +1415,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                     scope,
                     inherited,
                     latches,
-                } => run_nested_tree(factory(), scope, inherited, latches).await,
+                } => run_nested_factory(factory, scope, inherited, latches).await,
                 SpawnBody::ScopeOnce {
                     tree,
                     scope,
@@ -2780,15 +2780,44 @@ async fn run_nested_tree(
     inherited: ResolvedDefaults,
     latches: NestedScopeLatches,
 ) -> crate::ExitResult {
-    let Some(epoch) = ScopeEpochGuard::begin(&scope) else {
+    let epoch = begin_nested_incarnation(&scope)?;
+    run_nested_tree_with_epoch(tree, scope, inherited, latches, epoch).await
+}
+
+/// Begins the nested epoch before invoking its synchronous restartable
+/// factory. Tokio cancellation cannot interrupt one in-progress poll, so a
+/// factory that overlaps parent-driver destruction must already own the
+/// epilogue that makes `wait_stopped` final.
+async fn run_nested_factory(
+    factory: ScopeFactory,
+    scope: Arc<ScopeCell>,
+    inherited: ResolvedDefaults,
+    latches: NestedScopeLatches,
+) -> crate::ExitResult {
+    let epoch = begin_nested_incarnation(&scope)?;
+    let tree = factory();
+    run_nested_tree_with_epoch(tree, scope, inherited, latches, epoch).await
+}
+
+fn begin_nested_incarnation(scope: &Arc<ScopeCell>) -> Result<ScopeEpochGuard, crate::ExitError> {
+    ScopeEpochGuard::begin(scope).ok_or_else(|| {
         let failure = StartupFailure {
             cause: StartupFailureCause::IdentityExhausted {
                 id: scope.member.id().clone(),
             },
         };
         scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
-        return Err(crate::ExitError::from_startup_failure(failure));
-    };
+        crate::ExitError::from_startup_failure(failure)
+    })
+}
+
+async fn run_nested_tree_with_epoch(
+    tree: BuilderCore,
+    scope: Arc<ScopeCell>,
+    inherited: ResolvedDefaults,
+    latches: NestedScopeLatches,
+    epoch: ScopeEpochGuard,
+) -> crate::ExitResult {
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
         Err(error) => {
@@ -3197,19 +3226,19 @@ mod tests {
         future::{self, Future},
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
-            Arc, Barrier, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier, Condvar, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
 
     use crate::{
-        ActorRef, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
-        GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox,
-        RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, Retention, ScopeRef, ScopeState,
-        SendErrorKind, StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef,
-        TaskDef, Tree,
+        ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError,
+        ExitKind, GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
+        Mailbox, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, RestartCondition,
+        RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind, StartupError,
+        StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
         engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
         identity::{IncarnationCounter, ScopeIdentity},
@@ -3224,7 +3253,7 @@ mod tests {
         Obligation, Pending, RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell,
         ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
         complete_removals, report_channel, resident_projection, restart_shutdown_work,
-        run_nested_tree, run_scope_incarnation,
+        run_nested_factory, run_nested_tree, run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -3241,6 +3270,62 @@ mod tests {
             identity.mint_membership(&id).expect("membership available"),
         );
         ScopeCell::new(member, flavor, ScopeIdentity::new())
+    }
+
+    #[derive(Debug, Default)]
+    struct FactoryGate {
+        entered: AtomicBool,
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl FactoryGate {
+        fn block(&self) {
+            self.entered.store(true, Ordering::Release);
+            let mut released = self
+                .released
+                .lock()
+                .expect("factory gate mutex remains healthy");
+            self.changed.notify_all();
+            while !*released {
+                released = self
+                    .changed
+                    .wait(released)
+                    .expect("factory gate mutex remains healthy while blocked");
+            }
+        }
+
+        async fn wait_entered(&self) {
+            while !self.entered.load(Ordering::Acquire) {
+                crate::runtime::yield_now().await;
+            }
+        }
+
+        fn release(&self) {
+            let mut released = self
+                .released
+                .lock()
+                .expect("factory gate mutex remains healthy");
+            *released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    fn pending_tree() -> Tree {
+        let mut tree = Tree::new();
+        tree.add_task("pending", TaskDef::new(|_| future::pending()))
+            .expect("pending child is valid");
+        tree
+    }
+
+    fn finished_tree() -> Tree {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "finished",
+            TaskDef::new(|_| async { Ok::<_, ExitError>(()) }),
+        )
+        .expect("finished child is valid");
+        tree
     }
 
     struct SnapshotReentryWake {
@@ -3509,6 +3594,202 @@ mod tests {
             }
         );
         assert!(scope.incarnation_finished(second));
+    }
+
+    #[crate::runtime::test]
+    async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
+        let parent = isolated_scope("parent", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+        let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        parent.set_admitted_children(vec![resident_projection(&slot)]);
+
+        let epoch = nested
+            .begin_incarnation()
+            .expect("nested scope epoch is available");
+        let mut incarnations = ScopeIdentity::new().incarnation_counter(nested.member.membership());
+        let incarnation = incarnations.mint().expect("child incarnation is available");
+        nested.member.update(|record| {
+            record.stage = MemberStage::Running;
+            record.incarnation = Some(incarnation);
+            record.last_incarnation = Some(incarnation);
+        });
+        nested.set_state(ScopeState::Running);
+
+        assert!(parent.terminalize_child(
+            &nested.member,
+            Exit::new(
+                ExitKind::Aborted {
+                    phase: GracePhase::WithinGrace,
+                },
+                Cancellation::Observed,
+            ),
+            Some(incarnation),
+            StartupDisposition::NotAborted,
+        ));
+
+        let mut waiter = Box::pin(nested.wait_stopped());
+        let first_poll =
+            std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
+        assert!(
+            first_poll.is_pending(),
+            "membership terminality does not imply that its live scope incarnation stopped"
+        );
+
+        nested.finish_incarnation(epoch, StopReason::ShutdownRequested);
+        assert_eq!(waiter.await, StopReason::ShutdownRequested);
+    }
+
+    #[crate::runtime::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_initial_scope_factory_owns_its_stop_epilogue() {
+        let gate = Arc::new(FactoryGate::default());
+        let mut tree = Tree::new();
+        let nested = tree
+            .add_subtree(
+                "nested",
+                SubtreeDef::factory({
+                    let gate = Arc::clone(&gate);
+                    move || {
+                        gate.block();
+                        pending_tree()
+                    }
+                }),
+            )
+            .expect("nested scope is valid");
+        let plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = ScopeEpochGuard::begin(&root).expect("parent epoch is available");
+        let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
+        let abort = driver.abort_handle();
+
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(2), gate.wait_entered()).await,
+            crate::runtime::Timeout::Completed(())
+        ));
+        let factory_state = nested.snapshot().state.clone();
+
+        abort.abort();
+        let parent_join = crate::runtime::join(driver).await;
+        let mut waiter = Box::pin(nested.wait_stopped());
+        let before_release =
+            std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
+        gate.release();
+        assert_eq!(factory_state, ScopeState::Starting);
+        assert!(matches!(
+            parent_join,
+            crate::runtime::JoinOutcome::Cancelled
+        ));
+        assert!(
+            before_release.is_pending(),
+            "an executing initial factory still owns the final scope epilogue"
+        );
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(2), waiter).await,
+            crate::runtime::Timeout::Completed(StopReason::ShutdownRequested)
+        ));
+    }
+
+    #[crate::runtime::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_restart_scope_factory_supersedes_the_stale_stopped_projection() {
+        let gate = Arc::new(FactoryGate::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tree = Tree::new();
+        let nested = tree
+            .add_subtree(
+                "nested",
+                SubtreeDef::factory({
+                    let gate = Arc::clone(&gate);
+                    let calls = Arc::clone(&calls);
+                    move || {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            finished_tree()
+                        } else {
+                            gate.block();
+                            pending_tree()
+                        }
+                    }
+                })
+                .restart(RestartPolicy::new(
+                    RestartCondition::Always,
+                    Backoff::Immediate,
+                )),
+            )
+            .expect("restartable nested scope is valid");
+        let plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = ScopeEpochGuard::begin(&root).expect("parent epoch is available");
+        let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
+        let abort = driver.abort_handle();
+
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(2), gate.wait_entered()).await,
+            crate::runtime::Timeout::Completed(())
+        ));
+        let factory_calls = calls.load(Ordering::SeqCst);
+        let factory_state = nested.snapshot().state.clone();
+
+        abort.abort();
+        let parent_join = crate::runtime::join(driver).await;
+        let mut waiter = Box::pin(nested.wait_stopped());
+        let before_release =
+            std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
+        gate.release();
+        assert_eq!(factory_calls, 2);
+        assert_eq!(
+            factory_state,
+            ScopeState::Starting,
+            "the second epoch supersedes the first incarnation's Stopped projection before its factory runs"
+        );
+        assert!(matches!(
+            parent_join,
+            crate::runtime::JoinOutcome::Cancelled
+        ));
+        assert!(
+            before_release.is_pending(),
+            "an executing restart factory still owns the final scope epilogue"
+        );
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(2), waiter).await,
+            crate::runtime::Timeout::Completed(StopReason::ShutdownRequested)
+        ));
+    }
+
+    #[crate::runtime::test]
+    async fn panicking_nested_factory_releases_its_pre_driver_epoch() {
+        let scope = isolated_scope("nested", ScopeFlavor::Ordered);
+        let driver_scope = Arc::clone(&scope);
+        let driver = crate::runtime::spawn(async move {
+            let factory = Arc::new(|| -> crate::plan::BuilderCore {
+                panic!("injected nested factory panic");
+            });
+            run_nested_factory(
+                factory,
+                driver_scope,
+                crate::policy::ResolvedDefaults::default(),
+                NestedScopeLatches {
+                    parent_ready: CompletionGatedLatch::default(),
+                    ancestor: AncestorCommandLatches {
+                        shutdown: Latch::default(),
+                        abort: Latch::default(),
+                        abort_ack: Latch::default(),
+                    },
+                },
+            )
+            .await
+        });
+
+        assert!(matches!(
+            crate::runtime::join(driver).await,
+            crate::runtime::JoinOutcome::Panic { .. }
+        ));
+        assert_eq!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::ShutdownRequested,
+            }
+        );
+        let successor = ScopeEpochGuard::begin(&scope)
+            .expect("factory unwind retires the reserved scope epoch");
+        successor.finish(StopReason::NeverStarted);
     }
 
     #[test]

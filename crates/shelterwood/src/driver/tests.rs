@@ -430,6 +430,31 @@ fn stale_scope_driver_cannot_stop_a_newer_live_incarnation_projection() {
     assert!(scope.incarnation_finished(second));
 }
 
+#[test]
+fn a_new_incarnation_owns_an_unpublished_startup_verdict() {
+    let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+    let first = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("first scope epoch is available");
+    scope.set_startup(Ok(()));
+    assert!(matches!(scope.record().startup, Some(Ok(()))));
+    scope.finish_incarnation(first, StopReason::Finished);
+
+    let second = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("second scope epoch is available");
+    assert!(
+        scope.record().startup.is_none(),
+        "the first incarnation's verdict does not outlive its epoch"
+    );
+    scope.set_startup(Err(StartupError::ShutdownRequested));
+    assert!(
+        matches!(scope.record().startup, Some(Err(_))),
+        "the write-once startup latch reopens per incarnation"
+    );
+    scope.finish_incarnation(second, StopReason::Finished);
+}
+
 #[crate::runtime::test]
 async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
     let parent = isolated_scope("parent", ScopeFlavor::Ordered);

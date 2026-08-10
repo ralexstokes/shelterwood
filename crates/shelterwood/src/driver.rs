@@ -2165,7 +2165,7 @@ impl ScopeRuntime {
 struct ScopeEpochGuard {
     scope: Arc<ScopeCell>,
     epoch: Option<Epoch>,
-    lifecycle: Option<ScopeLifecycle>,
+    lifecycle: ScopeLifecycle,
 }
 
 impl ScopeEpochGuard {
@@ -2175,14 +2175,12 @@ impl ScopeEpochGuard {
         Some(Self {
             scope: Arc::clone(scope),
             epoch: Some(epoch),
-            lifecycle: Some(lifecycle),
+            lifecycle,
         })
     }
 
-    fn take_lifecycle(&mut self) -> ScopeLifecycle {
-        self.lifecycle
-            .take()
-            .expect("an owned scope lifecycle transfers at most once")
+    fn lifecycle(&self) -> ScopeLifecycle {
+        self.lifecycle.clone()
     }
 
     fn finish(mut self, reason: StopReason) {
@@ -2302,7 +2300,7 @@ async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
 async fn run_scope_incarnation(
     mut plan: ScopePlan,
     role: ScopeRole,
-    mut epoch: ScopeEpochGuard,
+    epoch: ScopeEpochGuard,
 ) -> StopReason {
     let root = Arc::clone(&plan.root);
     if role.is_root() {
@@ -2358,7 +2356,7 @@ async fn run_scope_incarnation(
         disposal_events,
         deadlines: DeadlineQueue::default(),
         jitter: runtime::JitterRng::from_system_entropy(),
-        lifecycle: epoch.take_lifecycle(),
+        lifecycle: epoch.lifecycle(),
         next_ordered_start,
         role,
         dynamic,

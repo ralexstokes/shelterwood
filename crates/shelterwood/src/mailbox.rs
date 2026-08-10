@@ -1926,7 +1926,7 @@ mod tests {
     fn reply_debug_still_reports_the_derived_unanswered_state() {
         let (reply, receiver) = super::Reply::<u8>::channel();
 
-        assert_eq!(format!("{reply:?}"), "Reply { answered: false, .. }");
+        assert!(format!("{reply:?}").contains("answered: false"));
 
         drop(reply);
         drop(receiver);

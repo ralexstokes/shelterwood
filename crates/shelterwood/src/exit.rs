@@ -209,8 +209,26 @@ pub struct StartupFailure {
 impl fmt::Display for StartupFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
-            StartupFailureCause::Child { id, .. } => {
-                write!(formatter, "child `{id}` failed during startup")
+            StartupFailureCause::Child { id, exit, .. } => {
+                write!(formatter, "child `{id}` failed during startup: ")?;
+                match exit.kind() {
+                    ExitKind::Completed => formatter.write_str("completed before readiness"),
+                    ExitKind::Failed(error) => error.fmt(formatter),
+                    ExitKind::Panicked {
+                        message: Some(message),
+                    } => write!(formatter, "panicked: {message}"),
+                    ExitKind::Panicked { message: None } => formatter.write_str("panicked"),
+                    ExitKind::ReadinessTimedOut { deadline } => {
+                        write!(formatter, "readiness deadline expired at {deadline:?}")
+                    }
+                    ExitKind::Aborted {
+                        phase: GracePhase::WithinGrace,
+                    } => formatter.write_str("aborted within shutdown grace"),
+                    ExitKind::Aborted {
+                        phase: GracePhase::AfterGrace,
+                    } => formatter.write_str("aborted after shutdown grace"),
+                    ExitKind::NeverStarted => formatter.write_str("never started"),
+                }
             }
             StartupFailureCause::Lowering { undefined } => {
                 write!(formatter, "subtree has {} undefined slots", undefined.len())

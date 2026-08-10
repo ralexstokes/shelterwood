@@ -197,7 +197,7 @@ struct PendingRaw;
 impl crate::RawActor for PendingRaw {
     type Msg = u8;
 
-    fn readiness(&self) -> Readiness {
+    fn readiness() -> Readiness {
         Readiness::Manual
     }
 

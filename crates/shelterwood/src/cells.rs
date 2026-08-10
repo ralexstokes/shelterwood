@@ -342,7 +342,7 @@ impl MemberCell {
                 &crate::policy::CommonOptions::default(),
                 &crate::policy::ResolvedDefaults::default(),
                 crate::policy::ChildMode::Restartable,
-                Some(Readiness::Immediate),
+                Readiness::Immediate,
             )
             .expect("library defaults must be valid")
         })

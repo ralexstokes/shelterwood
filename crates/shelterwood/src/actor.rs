@@ -306,20 +306,14 @@ impl<'a, A: Actor> StopContext<'a, A> {
 pub struct Handler<A: Actor> {
     args: Option<A::Args>,
     actor: Option<A>,
-    readiness: Readiness,
 }
 
 impl<A: Actor> Handler<A> {
     /// Wraps owned args using the callback-actor default `AfterInit` readiness.
     pub fn new(args: A::Args) -> Self {
-        Self::with_readiness(args, Readiness::AfterInit)
-    }
-
-    fn with_readiness(args: A::Args, readiness: Readiness) -> Self {
         Self {
             args: Some(args),
             actor: None,
-            readiness,
         }
     }
 }
@@ -327,8 +321,8 @@ impl<A: Actor> Handler<A> {
 impl<A: Actor> RawActor for Handler<A> {
     type Msg = A::Msg;
 
-    fn readiness(&self) -> Readiness {
-        self.readiness
+    fn readiness() -> Readiness {
+        Readiness::AfterInit
     }
 
     /// Runs one incarnation, leaning on the raw incarnation boundary for the
@@ -457,10 +451,9 @@ impl<A: Actor> ActorDef<A> {
 
     pub(crate) fn into_raw(self) -> RawDef<Handler<A>> {
         let factory = self.factory;
-        let readiness = self.options.readiness.unwrap_or(Readiness::AfterInit);
         let mut raw = RawDef::factory(move || {
             let args = factory();
-            Handler::with_readiness(args, readiness)
+            Handler::new(args)
         });
         raw.options = self.options;
         raw
@@ -505,8 +498,7 @@ impl<A: Actor> ActorOnceDef<A> {
     );
 
     pub(crate) fn into_raw(self) -> RawOnceDef<Handler<A>> {
-        let readiness = self.options.readiness.unwrap_or(Readiness::AfterInit);
-        let mut raw = RawOnceDef::new(Handler::with_readiness(self.args, readiness));
+        let mut raw = RawOnceDef::new(Handler::new(self.args));
         raw.options = self.options;
         raw
     }

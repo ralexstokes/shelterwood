@@ -196,16 +196,21 @@ impl SlotCell {
         defaults: &ResolvedDefaults,
     ) -> Result<ResolvedCommonOptions, InvalidPolicy> {
         let (options, mode, default_readiness) = match definition.get() {
-            ChildConstruction::Raw(definition) => (&definition.options, definition.mode(), None),
+            // A raw definition resolved its effective mode at erasure, where
+            // the actor type's `RawActor::readiness` metadata was still
+            // nameable, so it arrives here as the kind default.
+            ChildConstruction::Raw(definition) => {
+                (&definition.options, definition.mode(), definition.readiness)
+            }
             ChildConstruction::Task(definition) => (
                 &definition.options,
                 ChildMode::Restartable,
-                Some(Readiness::Immediate),
+                Readiness::Immediate,
             ),
             ChildConstruction::TaskOnce(definition) => (
                 &definition.options,
                 ChildMode::OneShot,
-                Some(Readiness::Immediate),
+                Readiness::Immediate,
             ),
             ChildConstruction::Scope(definition) => {
                 if let DefinitionSource::OneShot(tree) = &definition.source {
@@ -216,11 +221,7 @@ impl SlotCell {
                     tree.validate_policies(&inherited)
                         .map_err(|invalid| invalid.prepend(self.member.id()))?;
                 }
-                (
-                    &definition.options,
-                    definition.mode(),
-                    Some(Readiness::Manual),
-                )
+                (&definition.options, definition.mode(), Readiness::Manual)
             }
         };
         resolve_common(options, defaults, mode, default_readiness)
@@ -566,10 +567,10 @@ mod tests {
             ChildPlan::with_options(dynamic_slot, dynamic_definition, dynamic_options);
 
         assert_eq!(static_plan.children[0].options, dynamic_plan.options);
-        assert_eq!(dynamic_plan.options.readiness, Some(Readiness::Manual));
+        assert_eq!(dynamic_plan.options.readiness, Readiness::Manual);
     }
 
-    fn resolved_readiness(construction: ChildConstruction) -> Option<Readiness> {
+    fn resolved_readiness(construction: ChildConstruction) -> Readiness {
         let declaration = BuilderCore::new(ScopeFlavor::Dynamic);
         let slot = SlotCell::new(Arc::clone(&declaration.root.member), None);
         slot.define(construction);
@@ -580,11 +581,17 @@ mod tests {
     }
 
     fn raw_construction(options: CommonOptions) -> ChildConstruction {
+        // Mirrors `RawDef::erase`: the effective mode is resolved against the
+        // actor type's `RawActor::readiness` metadata (`Manual` here, distinct
+        // from every plan-level kind default) before the construction is
+        // erased.
+        let readiness = options.readiness.unwrap_or(Readiness::Manual);
         ChildConstruction::Raw(RawConstruction {
             source: DefinitionSource::Restartable(Arc::new(|| {
                 unreachable!("policy resolution never constructs the actor")
             })),
             options,
+            readiness,
         })
     }
 
@@ -602,26 +609,26 @@ mod tests {
     fn resolution_applies_per_kind_readiness_defaults() {
         // Undeclared readiness resolves per construction kind: tasks gate
         // immediately, scopes wait for their startup barrier, and a raw
-        // actor's mode arrives with its construction report, so resolution
-        // declares none.
+        // definition carries the mode already resolved from its actor type's
+        // metadata at erasure.
         assert_eq!(
             resolved_readiness(ChildConstruction::Task(TaskDef::new(|_| async { Ok(()) }))),
-            Some(Readiness::Immediate)
+            Readiness::Immediate
         );
         let (completion, _claim) = runtime::oneshot();
         assert_eq!(
             resolved_readiness(ChildConstruction::TaskOnce(
                 TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }).erase(completion)
             )),
-            Some(Readiness::Immediate)
+            Readiness::Immediate
         );
         assert_eq!(
             resolved_readiness(scope_construction(CommonOptions::default())),
-            Some(Readiness::Manual)
+            Readiness::Manual
         );
         assert_eq!(
             resolved_readiness(raw_construction(CommonOptions::default())),
-            None
+            Readiness::Manual
         );
 
         // A declared override wins over every per-kind default.
@@ -631,7 +638,7 @@ mod tests {
                     .readiness(Readiness::Manual)
                     .expect("manual task readiness is valid")
             )),
-            Some(Readiness::Manual)
+            Readiness::Manual
         );
         let (completion, _claim) = runtime::oneshot();
         assert_eq!(
@@ -641,21 +648,21 @@ mod tests {
                     .expect("manual task readiness is valid")
                     .erase(completion)
             )),
-            Some(Readiness::Manual)
+            Readiness::Manual
         );
         assert_eq!(
             resolved_readiness(scope_construction(CommonOptions {
                 readiness: Some(Readiness::Immediate),
                 ..CommonOptions::default()
             })),
-            Some(Readiness::Immediate)
+            Readiness::Immediate
         );
         assert_eq!(
             resolved_readiness(raw_construction(CommonOptions {
-                readiness: Some(Readiness::Manual),
+                readiness: Some(Readiness::Immediate),
                 ..CommonOptions::default()
             })),
-            Some(Readiness::Manual)
+            Readiness::Immediate
         );
     }
 

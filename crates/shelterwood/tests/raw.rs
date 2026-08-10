@@ -60,19 +60,16 @@ fn raw_readiness_override_rejects_after_init_eagerly() {
     assert_eq!(error, PolicyError::UnsupportedReadiness);
 }
 
-struct StatefulReadiness {
-    calls: Arc<AtomicUsize>,
-}
+static STATEFUL_READINESS_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+struct StatefulReadiness;
 
 impl RawActor for StatefulReadiness {
     type Msg = ();
 
-    fn readiness(&self) -> Readiness {
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-            Readiness::Immediate
-        } else {
-            Readiness::Manual
-        }
+    fn readiness() -> Readiness {
+        STATEFUL_READINESS_CALLS.fetch_add(1, Ordering::SeqCst);
+        Readiness::Immediate
     }
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
@@ -82,49 +79,34 @@ impl RawActor for StatefulReadiness {
 }
 
 #[tokio::test]
-async fn raw_readiness_is_resolved_once_per_incarnation() {
-    let calls = Arc::new(AtomicUsize::new(0));
+async fn raw_readiness_is_definition_metadata_evaluated_once() {
+    STATEFUL_READINESS_CALLS.store(0, Ordering::SeqCst);
     let mut tree = Tree::new();
-    tree.add_raw_once(
-        "stateful-readiness",
-        RawOnceDef::new(StatefulReadiness {
-            calls: Arc::clone(&calls),
-        }),
-    )
-    .expect("valid actor");
+    tree.add_raw_once("stateful-readiness", RawOnceDef::new(StatefulReadiness))
+        .expect("valid actor");
+    assert_eq!(STATEFUL_READINESS_CALLS.load(Ordering::SeqCst), 1);
 
     let system = tree.spawn().expect("runtime is available");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(STATEFUL_READINESS_CALLS.load(Ordering::SeqCst), 1);
 }
+
+static RESTARTING_READINESS_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 struct RestartingReadiness {
     generation: usize,
-    calls: Arc<AtomicUsize>,
 }
 
 impl RawActor for RestartingReadiness {
     type Msg = ();
 
-    fn readiness(&self) -> Readiness {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        if self.generation == 0 {
-            Readiness::Immediate
-        } else {
-            Readiness::Manual
-        }
+    fn readiness() -> Readiness {
+        RESTARTING_READINESS_CALLS.fetch_add(1, Ordering::SeqCst);
+        Readiness::Immediate
     }
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
-        let expected = if self.generation == 0 {
-            Readiness::Immediate
-        } else {
-            Readiness::Manual
-        };
-        assert_eq!(context.readiness(), expected);
-        if expected == Readiness::Manual {
-            context.mark_ready();
-        }
+        assert_eq!(context.readiness(), Readiness::Immediate);
         if self.generation == 0 {
             Err(ExitError::message("restart once"))
         } else {
@@ -134,18 +116,16 @@ impl RawActor for RestartingReadiness {
 }
 
 #[tokio::test]
-async fn raw_readiness_is_resolved_once_for_each_restartable_incarnation() {
+async fn restartable_raw_readiness_is_resolved_once_for_the_definition() {
+    RESTARTING_READINESS_CALLS.store(0, Ordering::SeqCst);
     let generations = Arc::new(AtomicUsize::new(0));
-    let calls = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
     tree.add_raw(
         "restartable-readiness",
         RawDef::factory({
             let generations = Arc::clone(&generations);
-            let calls = Arc::clone(&calls);
             move || RestartingReadiness {
                 generation: generations.fetch_add(1, Ordering::SeqCst),
-                calls: Arc::clone(&calls),
             }
         }),
     )
@@ -154,18 +134,18 @@ async fn raw_readiness_is_resolved_once_for_each_restartable_incarnation() {
     let system = tree.spawn().expect("runtime is available");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(generations.load(Ordering::SeqCst), 2);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(RESTARTING_READINESS_CALLS.load(Ordering::SeqCst), 1);
 }
 
-struct OverrideReadiness {
-    calls: Arc<AtomicUsize>,
-}
+static OVERRIDE_READINESS_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+struct OverrideReadiness;
 
 impl RawActor for OverrideReadiness {
     type Msg = ();
 
-    fn readiness(&self) -> Readiness {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+    fn readiness() -> Readiness {
+        OVERRIDE_READINESS_CALLS.fetch_add(1, Ordering::SeqCst);
         panic!("an effective definition override must bypass actor readiness")
     }
 
@@ -179,21 +159,19 @@ impl RawActor for OverrideReadiness {
 
 #[tokio::test]
 async fn raw_readiness_override_does_not_evaluate_actor_readiness() {
-    let calls = Arc::new(AtomicUsize::new(0));
+    OVERRIDE_READINESS_CALLS.store(0, Ordering::SeqCst);
     let mut tree = Tree::new();
     tree.add_raw_once(
         "overridden-readiness",
-        RawOnceDef::new(OverrideReadiness {
-            calls: Arc::clone(&calls),
-        })
-        .readiness(Readiness::Manual)
-        .expect("manual readiness override"),
+        RawOnceDef::new(OverrideReadiness)
+            .readiness(Readiness::Manual)
+            .expect("manual readiness override"),
     )
     .expect("valid actor");
 
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor becomes ready");
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(OVERRIDE_READINESS_CALLS.load(Ordering::SeqCst), 0);
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -209,7 +187,7 @@ struct ManualActor {
 impl RawActor for ManualActor {
     type Msg = usize;
 
-    fn readiness(&self) -> Readiness {
+    fn readiness() -> Readiness {
         Readiness::Manual
     }
 
@@ -476,7 +454,7 @@ struct DoublePanicActor;
 impl RawActor for DoublePanicActor {
     type Msg = ();
 
-    fn readiness(&self) -> Readiness {
+    fn readiness() -> Readiness {
         Readiness::Manual
     }
 

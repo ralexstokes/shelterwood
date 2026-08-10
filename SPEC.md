@@ -655,7 +655,8 @@ established in the construction-path types, before erasure:
 ```rust
 trait RawActor: Send + 'static {
     type Msg: Send + 'static;
-    fn readiness(&self) -> Readiness { Readiness::Immediate }   // §6
+    // Type-level definition metadata, read before incarnation construction.
+    fn readiness() -> Readiness { Readiness::Immediate }        // §6
     // Desugared per §4.1's Send-bound rule; implementors write `async fn`.
     fn run(&mut self, ctx: &mut RawContext<Self::Msg>)
         -> impl Future<Output = ExitResult> + Send;
@@ -694,10 +695,12 @@ trait RawActor: Send + 'static {
   raw-actor wrapper, which owns the `Uninit(Args) → Running(A)` transition;
   `ActorDef` and `ActorOnceDef` construct that wrapper rather than relying on
   a blanket `impl<A: Actor> RawActor for A` (which cannot exist before
-  `init` produces `A`). The wrapper stores its declared readiness mode, the
-  engine reads it before `run` is first polled, and only `AfterInit` performs
-  the automatic post-init `mark_ready`; `Immediate` and `Manual` retain their
-  declared meanings. Raw decorators can wrap `Handler<A>` directly and may
+  `init` produces `A`). The wrapper supplies `AfterInit` as its type-level
+  readiness default; the engine resolves that default with any child-definition
+  override before constructing an incarnation, and only an effective
+  `AfterInit` mode performs the automatic post-init `mark_ready`. `Immediate`
+  and `Manual` retain their declared meanings. Raw decorators can wrap
+  `Handler<A>` directly and may
   await before delegation without changing readiness. Handler decorators use
   the zero-cost same-message `Context::for_actor` / `StopContext::for_actor`
   reborrow, sharing identity and incarnation-owned resources. Executable
@@ -1099,8 +1102,8 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
 
 - `Actor` (blanket) children default to `AfterInit`: ready when `init`
   returns `Ok`.
-- Raw actors declare via `RawActor::readiness()`; decorators propagate with
-  a visible `self.inner.readiness()`. The trait default is `Immediate`, so
+- Raw actor types declare via `RawActor::readiness()`; decorators propagate
+  with a visible `R::readiness()`. The trait default is `Immediate`, so
   a decorator that omits propagation reports immediate readiness — an
   ordinary, testable bug (the sibling starts unblocked and ordered-startup
   tests see it), not the origin's silent mid-`init` gate release; §13.6's
@@ -1115,10 +1118,10 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   boundary. A decorator that awaited anything before delegating silently
   released the ordered-startup gate before the inner actor's init ran.)
 - Per-declaration override lives on the child options (§8) uniformly for
-  actor and task children — readiness is per instance, not per type [#368]
-  (e.g. "not ready
-  until an external handshake completes" must be declarable on one instance
-  of an ordinary handler actor). Subtree children are the stated
+  actor and task children. A raw actor type supplies the fallback mode, but
+  each child definition resolves its own effective mode [#368] (e.g. "not
+  ready until an external handshake completes" must be declarable for one
+  ordinary handler child without changing the handler type). Subtree children are the stated
   exception: their readiness is structural (below), so the subtree veneer
   carries no mode override — only the deadline.
 - The deadline is not part of the mode: it lives on the shared options
@@ -1136,6 +1139,16 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   startup-failure exit cause (§7) — one type, for tasks and actors alike,
   produced by one engine-side timeout (not re-implemented per child kind
   and reunited by downcast).
+- An effective `Immediate` mode publishes readiness **at spawn**: the
+  engine marks the child ready when it launches the incarnation, before
+  the child's future is first polled — for a raw child, before its
+  factory has constructed the actor. Uniformly for tasks and raw actors,
+  a failure inside an effectively-immediate child — including a raw
+  construction panic — is therefore a **post-ready** exit for startup
+  classification (§7): an ordered sequence has already advanced past the
+  child, later siblings still start, and `wait_started()` does not
+  report a startup abort for it. A definition that wants construction
+  observed pre-ready declares a gated mode instead.
 - Ordered scopes start children sequentially; a gated child blocks the
   sequence until ready. A pre-ready exit follows the child's restart policy
   like any other exit (§7): while restarts remain eligible the sequence

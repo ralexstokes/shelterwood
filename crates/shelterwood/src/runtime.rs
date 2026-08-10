@@ -159,6 +159,25 @@ pub(crate) fn now() -> std::time::Instant {
     time::Instant::now().into_std()
 }
 
+// Keep each timer registration comfortably inside tokio's millisecond tick
+// range. Tokio caps instants beyond its private `MAX_SAFE_MILLIS_DURATION`
+// (`u64::MAX - 2` milliseconds in tokio 1.53),
+// which would otherwise make a valid but very distant std Instant fire early.
+// Rechecking the original absolute point after bounded slices preserves exact
+// never-early semantics without coupling this crate to that private constant.
+const MAX_TIMER_SLICE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+fn next_timer_deadline(
+    current: std::time::Instant,
+    requested: std::time::Instant,
+) -> Option<std::time::Instant> {
+    if requested <= current {
+        return None;
+    }
+    let slice = requested.duration_since(current).min(MAX_TIMER_SLICE);
+    current.checked_add(slice)
+}
+
 pub(crate) fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
@@ -600,6 +619,91 @@ impl Latch {
         }
         notified.await;
         debug_assert!(self.is_fired());
+    }
+}
+
+const COMPLETION_GATE_OPEN: u8 = 0;
+const COMPLETION_GATE_FIRED: u8 = 1;
+const COMPLETION_GATE_CLOSED: u8 = 2;
+const COMPLETION_GATE_CLOSED_FIRED: u8 = 3;
+
+/// A one-shot signal whose publication is linearized with a completion edge.
+///
+/// `fire` wins only while the gate is open. `complete` atomically closes the
+/// gate and reports whether the signal won first, so a capability retained by
+/// another task cannot publish after completion or disappear between a sample
+/// and the completion notification.
+#[derive(Clone, Debug)]
+pub(crate) struct CompletionGatedLatch {
+    state: Arc<AtomicU8>,
+    fired: Latch,
+    completed: Latch,
+}
+
+impl Default for CompletionGatedLatch {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(COMPLETION_GATE_OPEN)),
+            fired: Latch::default(),
+            completed: Latch::default(),
+        }
+    }
+}
+
+impl CompletionGatedLatch {
+    pub(crate) fn fire(&self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                COMPLETION_GATE_OPEN,
+                COMPLETION_GATE_FIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let transitioned = self.fired.fire();
+        debug_assert!(transitioned);
+        true
+    }
+
+    pub(crate) fn is_fired(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            COMPLETION_GATE_FIRED | COMPLETION_GATE_CLOSED_FIRED
+        )
+    }
+
+    pub(crate) async fn fired(&self) {
+        self.fired.fired().await;
+    }
+
+    pub(crate) fn complete(&self) -> bool {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (next, fired) = match current {
+                COMPLETION_GATE_OPEN => (COMPLETION_GATE_CLOSED, false),
+                COMPLETION_GATE_FIRED => (COMPLETION_GATE_CLOSED_FIRED, true),
+                COMPLETION_GATE_CLOSED => return false,
+                COMPLETION_GATE_CLOSED_FIRED => return true,
+                _ => unreachable!("completion-gated latch state is valid"),
+            };
+            if self
+                .state
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let transitioned = self.completed.fire();
+                debug_assert!(transitioned);
+                return fired;
+            }
+        }
+    }
+
+    pub(crate) async fn completed(&self) {
+        self.completed.fired().await;
     }
 }
 
@@ -1112,11 +1216,19 @@ pub(crate) async fn sleep_until_std(deadline: std::time::Instant) {
     // tokio rounds the deadline up to the next whole millisecond with a
     // panicking add before tick conversion, so a deadline flush against
     // the clock limit would panic at arming time rather than when it was
-    // computed. Deadline::after already withholds such deadlines, making
-    // this clamp a pass-through for them; it guards instants that arrive
-    // by any other route.
-    let deadline = Deadline::clamp_armable(deadline);
-    time::sleep_until(time::Instant::from_std(deadline)).await;
+    // computed. Absolute instants that arrive by another route obey the same
+    // never-substitute rule as relative budgets: if this exact point cannot
+    // be armed, it never arrives.
+    loop {
+        let current = now();
+        let Some(next) = next_timer_deadline(current, deadline) else {
+            return;
+        };
+        match Deadline::at(next).instant() {
+            Some(next) => time::sleep_until(time::Instant::from_std(next)).await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 pub(crate) enum Timeout<T> {
@@ -1133,12 +1245,43 @@ where
     // against the clock limit would still panic at arming. Route the
     // budget through Deadline so an unarmable timeout never elapses,
     // matching sleep_deadline's overflow semantics.
-    if deadline(duration).instant().is_none() {
+    let Some(deadline) = deadline(duration).instant() else {
         return Timeout::Completed(future.await);
+    };
+    // Deadline's zero-budget carve-out keeps an exact zero budget
+    // representable even when its clock value is too close to Instant's
+    // ceiling for the timer to arm safely. Handing that instant to tokio's
+    // timeout would still arm it — the tick conversion rounds the deadline
+    // up with a panicking add — so apply the carve-out's own due-check here
+    // instead of arming: the budget is already due, and exact-boundary
+    // arbitration gives an immediately ready operation its one poll before
+    // the elapse. Every other zero budget stays on tokio's timeout below,
+    // keeping the normal regime's semantics untouched.
+    if duration.is_zero() && Deadline::at(deadline).instant().is_none() {
+        tokio::pin!(future);
+        return std::future::poll_fn(|context| {
+            std::task::Poll::Ready(match future.as_mut().poll(context) {
+                std::task::Poll::Ready(value) => Timeout::Completed(value),
+                std::task::Poll::Pending => Timeout::Elapsed,
+            })
+        })
+        .await;
     }
-    match time::timeout(duration, future).await {
-        Ok(value) => Timeout::Completed(value),
-        Err(_) => Timeout::Elapsed,
+    if duration <= MAX_TIMER_SLICE {
+        return match time::timeout(duration, future).await {
+            Ok(value) => Timeout::Completed(value),
+            Err(_) => Timeout::Elapsed,
+        };
+    }
+    let sleep = sleep_until_std(deadline);
+    tokio::pin!(future);
+    tokio::pin!(sleep);
+    tokio::select! {
+        // Match tokio::time::timeout's boundary rule: the operation receives
+        // the first poll when it and a zero-duration timer are both ready.
+        biased;
+        value = &mut future => Timeout::Completed(value),
+        () = &mut sleep => Timeout::Elapsed,
     }
 }
 
@@ -1252,25 +1395,85 @@ mod tests {
     };
 
     use super::{
-        Deadline, DisposalJob, DisposalPanic, JoinOutcome, Latch, OneShotClose, Signal, Timeout,
-        discard_panic, join, oneshot, spawn, timeout, yield_now,
+        CompletionGatedLatch, DisposalJob, DisposalPanic, JoinOutcome, Latch, MAX_TIMER_SLICE,
+        OneShotClose, Signal, Timeout, discard_panic, join, next_timer_deadline, oneshot, spawn,
+        timeout, yield_now,
     };
 
+    fn latest_representable(started_at: std::time::Instant) -> std::time::Instant {
+        let mut low = Duration::ZERO;
+        let mut high = Duration::MAX;
+        assert!(started_at.checked_add(high).is_none());
+        while high - low > Duration::from_nanos(1) {
+            let mid = low + (high - low) / 2;
+            if started_at.checked_add(mid).is_some() {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        started_at + low
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn arming_a_deadline_flush_against_the_clock_limit_stays_pending() {
+    async fn unarmable_absolute_deadline_stays_pending_without_substitution() {
         let now = std::time::Instant::now();
-        let flush = Deadline::saturating_after(now, Duration::MAX) + Deadline::ARMING_HEADROOM;
+        let flush = latest_representable(now);
         let mut sleep = std::pin::pin!(super::sleep_until_std(flush));
         let mut context = Context::from_waker(Waker::noop());
-        // The timer registers on first poll: without the arming clamp this
-        // panicked inside tokio's millisecond round-up rather than parking.
+        // The timer registers on first poll: passing this instant to tokio
+        // would panic during its millisecond round-up rather than parking.
         assert!(sleep.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[test]
+    fn deadline_beyond_tokios_tick_range_is_armed_in_a_bounded_slice() {
+        // Tokio 1.53 reserves the top three u64 millisecond ticks. The exact
+        // value is test evidence only: production uses a small stable slice
+        // rather than depending on tokio's private sentinel.
+        let beyond_tokio_ticks = Duration::from_millis(u64::MAX - 2);
+        let current = std::time::Instant::now();
+        let Some(requested) = current.checked_add(beyond_tokio_ticks) else {
+            // Some platforms have a narrower Instant domain than Tokio's
+            // u64 millisecond tick range, so this boundary cannot be tested.
+            return;
+        };
+
+        assert_eq!(
+            next_timer_deadline(current, requested),
+            current.checked_add(MAX_TIMER_SLICE)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_beyond_tokios_tick_range_does_not_fire_at_the_first_slice() {
+        let current = super::now();
+        let Some(requested) = current.checked_add(Duration::from_millis(u64::MAX - 2)) else {
+            // See `deadline_beyond_tokios_tick_range_is_armed_in_a_bounded_slice`.
+            return;
+        };
+        let mut sleep = std::pin::pin!(super::sleep_until_std(requested));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(sleep.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(MAX_TIMER_SLICE).await;
+        assert!(
+            sleep.as_mut().poll(&mut context).is_pending(),
+            "finishing an internal slice must not finish the requested sleep"
+        );
+    }
+
+    #[test]
+    fn already_due_clock_limit_needs_no_timer_arm() {
+        let edge = latest_representable(std::time::Instant::now());
+
+        assert_eq!(next_timer_deadline(edge, edge), None);
     }
 
     #[tokio::test(start_paused = true)]
     async fn timeout_with_an_unarmable_budget_never_elapses() {
         let now = super::now();
-        let flush = Deadline::saturating_after(now, Duration::MAX) + Deadline::ARMING_HEADROOM;
+        let flush = latest_representable(now);
         // The paused clock is frozen, so the budget reconstructs the flush
         // deadline exactly and the unarmable-budget guard must engage.
         let budget = flush - now;
@@ -1434,6 +1637,49 @@ mod tests {
         assert_eq!(transitions, 1);
         assert!(latch.is_fired());
         assert!(!latch.fire());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completion_gated_fire_and_completion_choose_one_order() {
+        for _ in 0..256 {
+            let latch = CompletionGatedLatch::default();
+            let started = Arc::new(AtomicUsize::new(0));
+            let fire = spawn({
+                let latch = latch.clone();
+                let started = Arc::clone(&started);
+                async move {
+                    started.fetch_add(1, Ordering::AcqRel);
+                    while started.load(Ordering::Acquire) != 2 {
+                        yield_now().await;
+                    }
+                    latch.fire()
+                }
+            });
+            let complete = spawn({
+                let latch = latch.clone();
+                let started = Arc::clone(&started);
+                async move {
+                    started.fetch_add(1, Ordering::AcqRel);
+                    while started.load(Ordering::Acquire) != 2 {
+                        yield_now().await;
+                    }
+                    latch.complete()
+                }
+            });
+
+            let JoinOutcome::Ok { value: fired } = join(fire).await else {
+                panic!("signal task must complete normally");
+            };
+            let JoinOutcome::Ok {
+                value: completion_saw_fire,
+            } = join(complete).await
+            else {
+                panic!("completion task must complete normally");
+            };
+            assert_eq!(fired, completion_saw_fire);
+            assert_eq!(latch.is_fired(), completion_saw_fire);
+            assert!(!latch.fire(), "completion closes later publication");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

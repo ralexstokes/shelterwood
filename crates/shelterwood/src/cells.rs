@@ -277,7 +277,7 @@ impl MemberCell {
             }
         };
         if let Some(terminal_exit) = terminal_exit {
-            self.publish_terminal(terminal_exit);
+            runtime::resume_preferred_panic(self.publish_terminal(terminal_exit));
         }
     }
 
@@ -290,6 +290,51 @@ impl MemberCell {
     }
 
     pub(crate) fn terminalize(&self, exit: Exit) {
+        runtime::resume_preferred_panic(self.terminalize_for_scope(exit));
+    }
+
+    fn publish_terminal(&self, terminal_exit: Exit) -> runtime::UnwindPanics {
+        let mut published = false;
+        self.record.modify_silently(|record| {
+            if !matches!(record.stage, MemberStage::Terminal(_)) {
+                record.incarnation = None;
+                record.restart_at = None;
+                record.last_exit = Some(terminal_exit.clone());
+                record.stage = MemberStage::Terminal(terminal_exit);
+                published = true;
+            }
+        });
+        // The terminal record is stored before mailbox discharge so reentrant
+        // mailbox wakers observe the winning exit. The ordering guarantee for
+        // notification-driven readers is discharge-before-pulse, not
+        // discharge-before-store: a direct borrow can see `Terminal` while
+        // teardown is still running. A hostile mailbox waker may panic, but
+        // that panic is resumed only after the pulse so it cannot strand a
+        // waiter parked on membership terminality.
+        let teardown = match &mut *self.mailbox.lock().expect("member mailbox mutex poisoned") {
+            MemberMailbox::Terminal { teardown, .. } => teardown.take(),
+            MemberMailbox::Unattached | MemberMailbox::Attached(_) => {
+                unreachable!("terminal publication requires terminal mailbox state")
+            }
+        };
+        let mut teardown_panic = None;
+        if let Some(teardown) = teardown {
+            match runtime::catch_panic(|| teardown.finish()) {
+                Ok(Some(payload)) => runtime::dispose_detached(payload),
+                Ok(None) => {}
+                Err(payload) => teardown_panic = Some(payload),
+            }
+        }
+        let pulse_panic = published
+            .then(|| runtime::catch_panic(|| self.record.pulse()).err())
+            .flatten();
+        runtime::UnwindPanics {
+            primary: teardown_panic,
+            cleanup: pulse_panic,
+        }
+    }
+
+    fn terminalize_for_scope(&self, exit: Exit) -> runtime::UnwindPanics {
         let terminal_exit = {
             let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
             match &*state {
@@ -317,38 +362,7 @@ impl MemberCell {
                 }
             }
         };
-        self.publish_terminal(terminal_exit);
-    }
-
-    fn publish_terminal(&self, terminal_exit: Exit) {
-        let mut published = false;
-        self.record.modify_silently(|record| {
-            if !matches!(record.stage, MemberStage::Terminal(_)) {
-                record.incarnation = None;
-                record.restart_at = None;
-                record.last_exit = Some(terminal_exit.clone());
-                record.stage = MemberStage::Terminal(terminal_exit);
-                published = true;
-            }
-        });
-        // Mailbox terminality and waiter completion must become visible before
-        // member terminality. The watch pulse is deliberately delayed until
-        // teardown has synchronously finished and unread payload ownership has
-        // moved to detached disposal.
-        let teardown = match &mut *self.mailbox.lock().expect("member mailbox mutex poisoned") {
-            MemberMailbox::Terminal { teardown, .. } => teardown.take(),
-            MemberMailbox::Unattached | MemberMailbox::Attached(_) => {
-                unreachable!("terminal publication requires terminal mailbox state")
-            }
-        };
-        if let Some(teardown) = teardown
-            && let Some(payload) = teardown.finish()
-        {
-            runtime::dispose_detached(payload);
-        }
-        if published {
-            self.record.pulse();
-        }
+        self.publish_terminal(terminal_exit)
     }
 
     pub(crate) async fn wait_terminal(&self) -> Exit {
@@ -853,7 +867,7 @@ impl ScopeCell {
             member.update_locked(|record| {
                 record.startup_aborted = startup == StartupDisposition::Aborted;
             });
-            member.terminalize(exit.clone());
+            let terminal_panics = member.terminalize_for_scope(exit.clone());
             if record.last_incarnation.is_none()
                 && let Some(scope) = &nested
             {
@@ -876,6 +890,11 @@ impl ScopeCell {
             if let Some(scope) = nested {
                 scope.close_observation_locked();
             }
+            // A hostile mailbox waker may panic while discharge makes this
+            // terminal record observable. Keep that panic authoritative, but
+            // defer it until the parent snapshot/lifecycle transaction and
+            // nested observation closure are complete.
+            runtime::resume_preferred_panic(terminal_panics);
             true
         })
     }

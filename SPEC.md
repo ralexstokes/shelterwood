@@ -1609,10 +1609,11 @@ Rules (normative):
   `ActorRef<M>` for the four actor forms; `TaskRef` for tasks, joined by
   the owned `OneShotTaskRef<T>` on the one-shot form; `T::Ref` for
   subtrees. On a dynamic scope the admission future returns that same
-  per-kind handle set directly (B.8). Every returned handle exposes the
-  membership token through `membership()` (§3.2); the slot's pre-admission
-  handles and the returned handles resolve through the same cell — one
-  identity, no reconciling.
+  per-kind handle set directly (B.8). Every returned set contains a
+  membership-addressed component: `ActorRef`, `TaskRef`, or `T::Ref` exposes
+  the membership token through `membership()` (§3.2). The slot's pre-admission
+  handles and the returned handles resolve through the same cell — one identity,
+  no reconciling.
 - **Definition is consuming**, so double-definition is unrepresentable
   (§4.2's owned-`FnOnce` shape at the declaration layer). On a
   declaration builder, `define` completes the declaration synchronously
@@ -3513,8 +3514,9 @@ instead, carried as the startup-failure payload's lowering cause
 (§11's lowering rule, B.5). The `add_*`
 future resolves **at admission** and returns, per kind, the same handles the
 builder forms return (§3.2): `ActorRef<M>`; `TaskRef`, plus
-`OneShotTaskRef<T>` on one-shot task forms; or the subtree's `T::Ref`. Each
-handle exposes the membership token through `membership()`. Startup is never
+`OneShotTaskRef<T>` on one-shot task forms; or the subtree's `T::Ref`. Every
+set contains a membership-addressed component: `ActorRef`, `TaskRef`, or
+`T::Ref` exposes the membership token through `membership()`. Startup is never
 awaited by the call; observe it through the returned handles (the
 `wait_for_child` helper — B.9, snapshots, events). A caller
 that abandons its own startup wait therefore still holds identity, and

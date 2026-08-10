@@ -347,6 +347,11 @@ impl MemberCell {
             .clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn observation_gate(&self) -> ObservationGate {
+        self.current_observation_gate()
+    }
+
     fn install_observation_gate_locked(&self, previous: &ObservationGate, gate: &ObservationGate) {
         let mut installed = self
             .observation_gate
@@ -1062,26 +1067,32 @@ impl ScopeCell {
         let descendants = self
             .current_children()
             .iter()
-            .filter_map(|resident| resident.projection.scope.as_ref().cloned())
+            .map(|resident| resident.projection.clone())
             .collect::<Vec<_>>();
         for descendant in descendants {
-            let mut installed = descendant
-                .observation_gate
-                .write()
-                .expect("observation gate handoff mutex poisoned");
-            if installed.same_gate(previous) {
-                *installed = gate.clone();
+            if let Some(scope) = descendant.scope {
+                let mut installed = scope
+                    .observation_gate
+                    .write()
+                    .expect("observation gate handoff mutex poisoned");
+                if installed.same_gate(previous) {
+                    *installed = gate.clone();
+                    descendant
+                        .member
+                        .install_observation_gate_locked(previous, gate);
+                } else {
+                    assert!(
+                        installed.same_gate(gate),
+                        "one resident tree must share one observation gate"
+                    );
+                }
+                drop(installed);
+                scope.adopt_descendant_observation_gates_locked(previous, gate, _txn);
+            } else {
                 descendant
                     .member
                     .install_observation_gate_locked(previous, gate);
-            } else {
-                assert!(
-                    installed.same_gate(gate),
-                    "one resident tree must share one observation gate"
-                );
             }
-            drop(installed);
-            descendant.adopt_descendant_observation_gates_locked(previous, gate, _txn);
         }
     }
 
@@ -1273,7 +1284,14 @@ impl ScopeCell {
                 // closes.
                 self.publish_snapshot_chain_locked(wakes);
             }
-            if let Some(scope) = nested {
+            if let Some(scope) = nested
+                && matches!(scope.record().state, ScopeState::Stopped { .. })
+            {
+                // A parent fallback can terminalize a live nested membership
+                // before cancellation drops the nested driver. Keep that
+                // scope's stream open until its own epilogue publishes the
+                // final Stopped record; otherwise waiters would receive a
+                // terminal stream carrying Starting/Running as its payload.
                 scope.close_observation_locked(wakes);
             }
             true
@@ -1561,8 +1579,14 @@ impl ScopeCell {
                 control.force = None;
             }
             let terminal = terminal_exit.is_some();
+            let membership_terminal =
+                matches!(self.member.record().stage, MemberStage::Terminal(_));
             self.publish_stopped_locked(wakes, reason, terminal_exit, Some(control));
-            if terminal {
+            if terminal || membership_terminal {
+                // A parent-driver fallback may have terminalized this nested
+                // membership while its live scope epilogue was still
+                // pending. The epilogue owns the final Stopped projection and
+                // closes observation only after publishing it.
                 self.close_observation_locked(wakes);
             }
         });

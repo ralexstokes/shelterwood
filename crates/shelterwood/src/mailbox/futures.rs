@@ -699,6 +699,6 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let state = mailbox.state.lock().expect("mailbox mutex poisoned");
         assert!(state.queue.is_empty());
-        assert!(state.waiters.is_empty());
+        assert!(state.waiters().is_some_and(|waiters| waiters.is_empty()));
     }
 }

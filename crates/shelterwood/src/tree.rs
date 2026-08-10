@@ -288,19 +288,14 @@ fn attach_actor_slot<M: Send + 'static>(slot: Arc<SlotCell>) -> ActorSlot<M> {
 }
 
 macro_rules! impl_common_builder_surface {
-    (
-        reserve_actor: $reserve_actor_doc:literal,
-        add_actor: $add_actor_doc:literal,
-        add_actor_once: $add_actor_once_doc:literal,
-        add_raw: $add_raw_doc:literal,
-        add_raw_once: $add_raw_once_doc:literal,
-        reserve_task: $reserve_task_doc:literal,
-        add_task: $add_task_doc:literal,
-        add_task_once: $add_task_once_doc:literal,
-        reserve_subtree: $reserve_subtree_doc:literal,
-        add_subtree: $add_subtree_doc:literal,
-        add_subtree_once: $add_subtree_once_doc:literal $(,)?
-    ) => {
+    ($($builder:ty => $member_note:literal),+ $(,)?) => {
+        $(
+            impl $builder {
+                impl_common_builder_surface!(@methods $member_note);
+            }
+        )+
+    };
+    (@methods $member_note:literal) => {
         /// Sets the scope restart-intensity budget.
         pub fn intensity(&mut self, intensity: Intensity) -> &mut Self {
             self.core.config.intensity = intensity;
@@ -313,7 +308,8 @@ macro_rules! impl_common_builder_surface {
             self
         }
 
-        #[doc = $reserve_actor_doc]
+        /// Reserves an actor membership and returns its pre-spawn handle slot.
+        #[doc = $member_note]
         pub fn reserve_actor<M: Send + 'static>(
             &mut self,
             id: impl Into<ChildId>,
@@ -321,7 +317,8 @@ macro_rules! impl_common_builder_surface {
             self.core.reserve(id, None).map(attach_actor_slot)
         }
 
-        #[doc = $add_actor_doc]
+        /// Adds a restartable callback-oriented actor.
+        #[doc = $member_note]
         pub fn add_actor<A: crate::Actor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -333,7 +330,8 @@ macro_rules! impl_common_builder_surface {
             }
         }
 
-        #[doc = $add_actor_once_doc]
+        /// Adds a consuming one-shot callback-oriented actor.
+        #[doc = $member_note]
         pub fn add_actor_once<A: crate::Actor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -345,7 +343,8 @@ macro_rules! impl_common_builder_surface {
             }
         }
 
-        #[doc = $add_raw_doc]
+        /// Adds a restartable raw actor.
+        #[doc = $member_note]
         pub fn add_raw<R: crate::RawActor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -357,7 +356,8 @@ macro_rules! impl_common_builder_surface {
             }
         }
 
-        #[doc = $add_raw_once_doc]
+        /// Adds a consuming one-shot raw actor.
+        #[doc = $member_note]
         pub fn add_raw_once<R: crate::RawActor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -369,14 +369,16 @@ macro_rules! impl_common_builder_surface {
             }
         }
 
-        #[doc = $reserve_task_doc]
+        /// Reserves a task membership and returns its pre-spawn handle slot.
+        #[doc = $member_note]
         pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
             self.core.reserve(id, None).map(|slot| TaskSlot {
                 core: TaskSlotCore::new(StaticSlotEndpoint(slot)),
             })
         }
 
-        #[doc = $add_task_doc]
+        /// Adds a restartable task.
+        #[doc = $member_note]
         pub fn add_task(
             &mut self,
             id: impl Into<ChildId>,
@@ -388,7 +390,8 @@ macro_rules! impl_common_builder_surface {
             }
         }
 
-        #[doc = $add_task_once_doc]
+        /// Adds a consuming one-shot task and its typed completion claim.
+        #[doc = $member_note]
         pub fn add_task_once<T: Send + 'static>(
             &mut self,
             id: impl Into<ChildId>,
@@ -400,7 +403,8 @@ macro_rules! impl_common_builder_surface {
             }
         }
 
-        #[doc = $reserve_subtree_doc]
+        /// Reserves a typed subtree membership.
+        #[doc = $member_note]
         pub fn reserve_subtree<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
@@ -412,7 +416,8 @@ macro_rules! impl_common_builder_surface {
                 })
         }
 
-        #[doc = $add_subtree_doc]
+        /// Adds a restartable subtree.
+        #[doc = $member_note]
         pub fn add_subtree<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
@@ -424,7 +429,8 @@ macro_rules! impl_common_builder_surface {
             }
         }
 
-        #[doc = $add_subtree_once_doc]
+        /// Adds a consuming one-shot subtree.
+        #[doc = $member_note]
         pub fn add_subtree_once<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
@@ -474,20 +480,6 @@ impl Tree {
         self
     }
 
-    impl_common_builder_surface! {
-        reserve_actor: "Reserves an actor membership and returns its pre-spawn handle slot.",
-        add_actor: "Adds a restartable callback-oriented actor.",
-        add_actor_once: "Adds a consuming one-shot callback-oriented actor.",
-        add_raw: "Adds a restartable raw actor.",
-        add_raw_once: "Adds a consuming one-shot raw actor.",
-        reserve_task: "Reserves a task membership and returns its pre-spawn handle slot.",
-        add_task: "Adds a restartable task.",
-        add_task_once: "Adds a consuming one-shot task and its typed completion claim.",
-        reserve_subtree: "Reserves a typed subtree membership.",
-        add_subtree: "Adds a restartable subtree.",
-        add_subtree_once: "Adds a consuming one-shot subtree.",
-    }
-
     /// Lowers and starts this tree synchronously.
     pub fn spawn(self) -> Result<System<ScopeRef>, BuildError> {
         spawn_builder(self.core, |scope| scope)
@@ -524,25 +516,18 @@ impl DynamicTree {
         }
     }
 
-    impl_common_builder_surface! {
-        reserve_actor: "Reserves an initial actor membership.",
-        add_actor: "Adds an initial restartable callback-oriented actor.",
-        add_actor_once: "Adds an initial consuming one-shot callback-oriented actor.",
-        add_raw: "Adds an initial restartable raw actor.",
-        add_raw_once: "Adds an initial consuming one-shot raw actor.",
-        reserve_task: "Reserves an initial task membership.",
-        add_task: "Adds an initial restartable task.",
-        add_task_once: "Adds an initial one-shot task.",
-        reserve_subtree: "Reserves an initial typed subtree membership.",
-        add_subtree: "Adds an initial restartable subtree.",
-        add_subtree_once: "Adds an initial one-shot subtree.",
-    }
-
     /// Lowers and starts this tree synchronously.
     pub fn spawn(self) -> Result<System<DynamicScopeRef>, BuildError> {
         spawn_builder(self.core, DynamicScopeRef)
     }
 }
+
+impl_common_builder_surface!(
+    Tree => "",
+    DynamicTree => "\nThe membership minted here belongs to this scope's *initial* set: \
+        aggregate readiness counts initial members only, and children added at runtime \
+        through [`DynamicScopeRef`] never join the aggregate.",
+);
 
 fn spawn_builder<R>(
     core: BuilderCore,

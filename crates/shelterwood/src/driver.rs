@@ -550,7 +550,7 @@ struct ScopeRuntime {
     intensity_policy: crate::Intensity,
     intensity: IntensityState,
     children: ChildArena<ChildRuntime>,
-    events: runtime::MpscSender<DriverEvent>,
+    events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
@@ -699,7 +699,7 @@ impl SpawnLatches {
 }
 
 struct ChildTaskLaunch {
-    events: runtime::MpscSender<DriverEvent>,
+    events: runtime::UnboundedMpscSender<DriverEvent>,
     key: ChildKey,
     incarnation: Incarnation,
     body: SpawnBody,
@@ -829,15 +829,14 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 SpawnBody::Raw { spawn, context } => {
                     let instance = spawn.construct();
                     let readiness = readiness_override.unwrap_or_else(|| instance.readiness());
-                    let _ = runtime::mpsc_send(
+                    let _ = runtime::unbounded_mpsc_send(
                         &constructed_sender,
                         DriverEvent::Child(ChildEvent::Constructed {
                             child: key,
                             incarnation,
                             readiness,
                         }),
-                    )
-                    .await;
+                    );
                     construction_release.fired().await;
                     instance.run(context, readiness).await
                 }
@@ -880,7 +879,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         // ownership and immediate post-join availability without ever
         // blocking this runtime worker.
         let report = report_claim.receive();
-        let _ = runtime::mpsc_send(
+        let _ = runtime::unbounded_mpsc_send(
             &exit_sender,
             DriverEvent::Child(ChildEvent::Exited {
                 child: key,
@@ -890,8 +889,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 cancellation: report.cancellation,
                 readiness_signal_seen: report.readiness_signal_seen,
             }),
-        )
-        .await;
+        );
     });
 
     let completion = ready.clone();
@@ -903,14 +901,13 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 runtime::select_two(ready.fired(), ready_completion.completed()).await,
                 runtime::Either::Left(())
             ) {
-                let _ = runtime::mpsc_send(
+                let _ = runtime::unbounded_mpsc_send(
                     &ready_sender,
                     DriverEvent::Child(ChildEvent::Ready {
                         child: key,
                         incarnation,
                     }),
-                )
-                .await;
+                );
             }
         });
     }
@@ -920,14 +917,13 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
             runtime::select_two(local_stop.fired(), completion.completed()).await,
             runtime::Either::Left(())
         ) {
-            let _ = runtime::mpsc_send(
+            let _ = runtime::unbounded_mpsc_send(
                 &events,
                 DriverEvent::Child(ChildEvent::SelfStop {
                     child: key,
                     incarnation,
                 }),
-            )
-            .await;
+            );
         }
     });
 
@@ -2383,8 +2379,12 @@ async fn run_scope_incarnation(
         root.member
             .update(|record| record.stage = MemberStage::Running);
     }
-    let capacity = plan.children.len().saturating_mul(3).max(64);
-    let (events, mut event_receiver) = runtime::bounded_mpsc(capacity);
+    // The queue is unbounded so every producer can publish synchronously,
+    // including foreign-thread removal and detached admission. Preserve the
+    // old bounded lane's per-wake collection ceiling so a producer flood
+    // cannot defer shutdown signals or deadlines indefinitely.
+    let event_batch_limit = plan.children.len().saturating_mul(3).max(64);
+    let (events, mut event_receiver) = runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
     let dynamic =
         (plan.root.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(events.clone()));
@@ -2496,10 +2496,13 @@ async fn run_scope_incarnation(
             // cannot publish Running after the stop boundary.
             pending.push(Pending::Force.classified());
         }
-        while let Some(event) = runtime::mpsc_try_recv(&mut event_receiver) {
+        for _ in 0..event_batch_limit {
+            let Some(event) = runtime::unbounded_mpsc_try_recv(&mut event_receiver) else {
+                break;
+            };
             pending.push(Pending::Driver(event).classified());
         }
-        // Disposal completions drain after the bounded lane, and `arbitrate`
+        // Disposal completions drain after the main lane, and `arbitrate`
         // sorts stably, so a `ConstructionDisposed` always trails every
         // same-class `Exited` collected in the same wake — even one produced
         // later. A disposal is therefore a batch-tail event: the exit it

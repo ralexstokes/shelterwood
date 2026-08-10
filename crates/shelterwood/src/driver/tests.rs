@@ -1,3 +1,4 @@
+
 use std::{
     future::{self, Future},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -818,7 +819,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
@@ -947,7 +948,7 @@ fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
@@ -1030,7 +1031,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
@@ -1180,7 +1181,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
@@ -2716,7 +2717,7 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
     );
     let slot = SlotCell::new(Arc::clone(&member), None);
     root.set_admitted_children(vec![resident_projection(&slot)]);
-    let (events, _receiver) = crate::runtime::bounded_mpsc(1);
+    let (events, _receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
     let (sender, mut response) = crate::runtime::oneshot();
     let mut responses = RemovalResponses::default();
@@ -2747,32 +2748,19 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
 }
 
 #[crate::runtime::test]
-async fn retained_unadmitted_slot_does_not_retain_the_request_forwarder() {
+async fn retained_unadmitted_slot_does_not_block_driver_teardown() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
     let slot = scope
         .reserve_task("retained")
         .expect("unadmitted reservation is retained");
-    let control = scope
-        .as_scope()
-        .cell
-        .dynamic_route()
-        .expect("the live dynamic scope exposes its control");
-    let (forwarder_close, forwarder_ended) = control.request_forwarder_probe();
-
     system
         .shutdown(Duration::from_secs(1))
         .await
         .expect("driver teardown completes");
 
-    assert!(forwarder_close.is_fired());
-    assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(1), forwarder_ended.fired()).await,
-        crate::runtime::Timeout::Completed(())
-    ));
     drop(slot);
-    drop(control);
 }
 
 #[test]
@@ -2799,7 +2787,7 @@ fn dynamic_removal_releases_state_before_waiting_for_the_observation_gate() {
     );
     let slot = SlotCell::new(Arc::clone(&member), None);
     root.set_admitted_children(vec![resident_projection(&slot)]);
-    let (events, _receiver) = crate::runtime::bounded_mpsc(1);
+    let (events, _receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
     let key = ChildKey(1);
     control
@@ -2854,29 +2842,16 @@ fn dynamic_removal_releases_state_before_waiting_for_the_observation_gate() {
 }
 
 #[crate::runtime::test]
-async fn saturated_removal_from_a_foreign_thread_reaches_the_driver() {
+async fn removal_from_a_foreign_thread_reaches_the_driver() {
     let mut identity = ScopeIdentity::new();
-    let first_id = ChildId::from("first");
-    let second_id = ChildId::from("second");
-    let first = identity
-        .mint_membership(&first_id)
-        .expect("first membership available");
-    let second = identity
-        .mint_membership(&second_id)
-        .expect("second membership available");
-    let member = MemberCell::new(second_id.clone(), second);
+    let child_id = ChildId::from("worker");
+    let membership = identity
+        .mint_membership(&child_id)
+        .expect("membership available");
+    let member = MemberCell::new(child_id.clone(), membership);
     let slot = SlotCell::new(Arc::clone(&member), None);
-    let second_key = ChildKey(2);
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
-    assert!(
-        events
-            .try_send(DriverEvent::Removal(RemovalRequest {
-                membership: first,
-                key: ChildKey(1),
-            }))
-            .is_ok(),
-        "the fixture saturates the bounded driver lane"
-    );
+    let key = ChildKey(1);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
     control
         .state
@@ -2884,8 +2859,8 @@ async fn saturated_removal_from_a_foreign_thread_reaches_the_driver() {
         .expect("dynamic-state mutex poisoned")
         .entries
         .insert(
-            second_id,
-            DynamicEntry::resident(Arc::clone(&slot), second_key, Some(Latch::default())),
+            child_id,
+            DynamicEntry::resident(Arc::clone(&slot), key, Some(Latch::default())),
         );
     let foreign_control = Arc::clone(&control);
     let foreign_slot = Arc::clone(&slot);
@@ -2899,24 +2874,17 @@ async fn saturated_removal_from_a_foreign_thread_reaches_the_driver() {
     .join()
     .expect("foreign-thread removal signaling succeeds");
 
-    let Some(DriverEvent::Removal(observed_first)) = event_receiver.recv().await else {
-        panic!("the saturated event remains first");
+    let event = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+        crate::runtime::Timeout::Completed(event) => event.expect("the driver lane remains open"),
+        crate::runtime::Timeout::Elapsed => {
+            panic!("the off-runtime removal edge must not be lost")
+        }
     };
-    assert_eq!(observed_first.membership, first);
-    let second_event =
-        match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
-            crate::runtime::Timeout::Completed(event) => {
-                event.expect("the control forwarder remains open")
-            }
-            crate::runtime::Timeout::Elapsed => {
-                panic!("the off-runtime removal edge must not be lost")
-            }
-        };
-    let DriverEvent::Removal(observed_second) = second_event else {
-        panic!("the forwarded event is the requested removal");
+    let DriverEvent::Removal(observed) = event else {
+        panic!("the queued event is the requested removal");
     };
-    assert_eq!(observed_second.membership, second);
-    assert_eq!(observed_second.key, second_key);
+    assert_eq!(observed.membership, membership);
+    assert_eq!(observed.key, key);
 }
 
 #[crate::runtime::test]
@@ -2930,7 +2898,7 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     root.set_state(ScopeState::Running);
     root.set_startup(Ok(()));
 
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
     root.set_dynamic_route(Some(control.clone()));
@@ -2973,7 +2941,7 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     )
     .expect("admission starts inside the runtime");
     let Some(DriverEvent::Admission(request)) = event_receiver.recv().await else {
-        panic!("the admission forwarder submits the request")
+        panic!("admission enqueueing submits the request")
     };
 
     assert!(
@@ -3028,7 +2996,7 @@ pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
     root.set_state(ScopeState::Running);
     root.set_startup(Ok(()));
 
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
     root.set_dynamic_route(Some(control.clone()));
@@ -3091,7 +3059,7 @@ pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
         "first poll submits the fused admission"
     );
     let Some(DriverEvent::Admission(request)) = event_receiver.recv().await else {
-        panic!("the admission forwarder submits the request")
+        panic!("admission enqueueing submits the request")
     };
     scope.handle_admission(request);
 
@@ -3125,14 +3093,15 @@ pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
     };
     let key = exit.0;
     assert!(
-        scope
-            .events
-            .try_send(DriverEvent::Removal(RemovalRequest {
+        crate::runtime::unbounded_mpsc_send(
+            &scope.events,
+            DriverEvent::Removal(RemovalRequest {
                 membership: root.member.membership(),
                 key: ChildKey(u64::MAX - 1),
-            }))
-            .is_ok(),
-        "the fixture saturates the bounded driver lane"
+            }),
+        )
+        .is_ok(),
+        "the driver lane remains open"
     );
     drop(admission);
     assert!(
@@ -3174,21 +3143,18 @@ pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
             crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
         };
     let DriverEvent::Removal(removal) = forwarded else {
-        panic!("the forwarded event is the fused removal")
+        panic!("the queued event is the fused removal")
     };
     assert_eq!(removal.membership, membership);
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        crate::runtime::unbounded_mpsc_recv(&mut disposal_event_receiver).await
+        disposal_event_receiver.recv().await
     else {
         panic!("removal joins retained construction disposal")
     };
     scope.handle_construction_disposed(child, panic);
     assert!(scope.children.get(key).is_none());
-
-    control.request_forwarder_close.fire();
-    control.request_forwarder_ended.fired().await;
 }
 
 /// Exercises the `DeadlineKind::Restart` suppression gate on its own:
@@ -3207,7 +3173,7 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     root.set_state(ScopeState::Running);
     root.set_startup(Ok(()));
 
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
     root.set_dynamic_route(Some(control.clone()));
@@ -3265,7 +3231,7 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     )
     .expect("the running scope accepts the admission");
     let Some(DriverEvent::Admission(request)) = event_receiver.recv().await else {
-        panic!("the admission forwarder submits the request")
+        panic!("admission enqueueing submits the request")
     };
     scope.handle_admission(request);
     assert!(matches!(response.try_receive(), Some(Ok(()))));
@@ -3334,30 +3300,28 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
             crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
         };
     let DriverEvent::Removal(removal) = forwarded else {
-        panic!("the forwarded event is the fused removal");
+        panic!("the queued event is the fused removal");
     };
     assert_eq!(removal.membership, membership);
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        crate::runtime::unbounded_mpsc_recv(&mut disposal_event_receiver).await
+        disposal_event_receiver.recv().await
     else {
         panic!("removal joins retained construction disposal")
     };
     scope.handle_construction_disposed(child, panic);
     assert!(scope.children.get(key).is_none());
-
-    control.request_forwarder_close.fire();
-    control.request_forwarder_ended.fired().await;
 }
 
 #[crate::runtime::test]
-async fn saturated_admissions_share_one_forwarder_task_and_all_resolve() {
-    const ADMISSIONS: usize = 64;
+async fn queued_admissions_spawn_no_forwarder_tasks_and_all_resolve() {
+    const ADMISSIONS: usize = super::MIN_EVENT_BATCH_LIMIT + 1;
 
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
-    let (events, event_receiver) = crate::runtime::bounded_mpsc(1);
-    let control = DynamicControl::new(events);
+    let (control_events, mut control_receiver) = crate::runtime::unbounded_mpsc();
+    let (critical_events, mut critical_receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(control_events);
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
         child_id.clone(),
@@ -3378,19 +3342,62 @@ async fn saturated_admissions_share_one_forwarder_task_and_all_resolve() {
         );
     }
 
-    // Let the forwarder run until it parks on the saturated driver
-    // channel; pending admissions must not each hold a live sender task.
-    for _ in 0..64 {
-        crate::runtime::yield_now().await;
-    }
-    assert!(
-        crate::runtime::alive_task_count() <= baseline + 1,
-        "saturated admissions share one forwarder task instead of spawning one each"
+    assert_eq!(
+        crate::runtime::alive_task_count(),
+        baseline,
+        "synchronous admission enqueueing spawns no transport tasks"
     );
 
-    // Ending the driver channel answers every queued admission through
-    // its response obligation.
-    drop(event_receiver);
+    let incarnation = root
+        .child_identity
+        .lock()
+        .expect("scope identity mutex poisoned")
+        .incarnation_counter(member.membership())
+        .mint()
+        .expect("incarnation available");
+    assert!(
+        crate::runtime::unbounded_mpsc_send(
+            &critical_events,
+            DriverEvent::Child(ChildEvent::Exited {
+                child: ChildKey(1),
+                incarnation,
+                recorded: Some(RecordedOutcome::returned(Ok(()))),
+                join: JoinVerdict::Completed,
+                cancellation: Cancellation::NotObserved,
+                readiness_signal_seen: false,
+            }),
+        )
+        .is_ok()
+    );
+
+    let mut pending = Vec::new();
+    super::collect_driver_events(
+        &mut critical_receiver,
+        super::MIN_EVENT_BATCH_LIMIT,
+        &mut pending,
+    );
+    super::collect_driver_events(
+        &mut control_receiver,
+        super::MIN_EVENT_BATCH_LIMIT,
+        &mut pending,
+    );
+    arbitrate(&mut pending);
+    assert!(matches!(
+        pending.first(),
+        Some((
+            _,
+            Pending::Driver(DriverEvent::Child(ChildEvent::Exited { .. }))
+        ))
+    ));
+    assert!(matches!(
+        control_receiver.try_recv(),
+        Ok(DriverEvent::Admission(_))
+    ));
+
+    // Ending both the collected batch and queued suffix answers every
+    // admission through its response obligation.
+    drop(pending);
+    drop(control_receiver);
     for response in responses {
         assert!(matches!(
             response.receive().await,
@@ -3399,16 +3406,6 @@ async fn saturated_admissions_share_one_forwarder_task_and_all_resolve() {
             )))
         ));
     }
-
-    let mut alive = crate::runtime::alive_task_count();
-    for _ in 0..1_024 {
-        if alive == baseline {
-            break;
-        }
-        crate::runtime::yield_now().await;
-        alive = crate::runtime::alive_task_count();
-    }
-    assert_eq!(alive, baseline, "the forwarder exits once its queue drains");
 }
 
 #[crate::runtime::test]
@@ -3477,7 +3474,7 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
@@ -3533,14 +3530,15 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
     );
 
     assert!(
-        scope
-            .events
-            .try_send(DriverEvent::Child(ChildEvent::Ready {
+        crate::runtime::unbounded_mpsc_send(
+            &scope.events,
+            DriverEvent::Child(ChildEvent::Ready {
                 child: key,
                 incarnation: first,
-            }))
-            .is_ok(),
-        "the bounded driver queue is deliberately saturated"
+            }),
+        )
+        .is_ok(),
+        "the driver lane remains open"
     );
 
     scope.spawn_child(key);
@@ -3600,7 +3598,7 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
@@ -3717,7 +3715,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
@@ -3810,7 +3808,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
     assert!(scope.children[key].restart_deadline.is_none());
 
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        crate::runtime::unbounded_mpsc_recv(&mut disposal_event_receiver).await
+        disposal_event_receiver.recv().await
     else {
         panic!("only construction disposal was armed")
     };

@@ -755,8 +755,9 @@ pub(crate) struct ResolvedCommonOptions {
     pub(crate) shutdown: Shutdown,
     pub(crate) mailbox: Mailbox,
     pub(crate) mailbox_shutdown: MailboxShutdown,
-    pub(crate) readiness: Readiness,
-    pub(crate) readiness_override: Option<Readiness>,
+    /// Effective definition readiness, or `None` when a raw actor declares it
+    /// from the constructed incarnation.
+    pub(crate) readiness: Option<Readiness>,
     pub(crate) readiness_deadline: ReadinessDeadline,
     pub(crate) retention: Retention,
 }
@@ -765,7 +766,7 @@ pub(crate) fn resolve_common(
     options: &CommonOptions,
     defaults: &ResolvedDefaults,
     mode: ChildMode,
-    default_readiness: Readiness,
+    default_readiness: Option<Readiness>,
 ) -> Result<ResolvedCommonOptions, InvalidPolicy> {
     defaults.validate()?;
     if let Some(restart) = options.restart {
@@ -786,8 +787,7 @@ pub(crate) fn resolve_common(
         shutdown: resolve(options.shutdown, defaults.child_shutdown),
         mailbox: resolve_mailbox(options.mailbox, defaults.mailbox, defaults.queue_capacity),
         mailbox_shutdown: resolve(options.mailbox_shutdown, defaults.mailbox_shutdown),
-        readiness: resolve(options.readiness, default_readiness),
-        readiness_override: options.readiness,
+        readiness: options.readiness.or(default_readiness),
         readiness_deadline: resolve_readiness_deadline(
             options.readiness_deadline,
             defaults.readiness_deadline,
@@ -1340,15 +1340,14 @@ mod tests {
             &CommonOptions::default(),
             &inherited,
             ChildMode::Restartable,
-            Readiness::Manual,
+            Some(Readiness::Manual),
         )
         .expect("default child options are valid");
         assert_eq!(child.restart, inherited.child_restart);
         assert_eq!(child.shutdown, inherited.child_shutdown);
         assert_eq!(child.mailbox, inherited.mailbox);
         assert_eq!(child.mailbox_shutdown, inherited.mailbox_shutdown);
-        assert_eq!(child.readiness, Readiness::Manual);
-        assert_eq!(child.readiness_override, None);
+        assert_eq!(child.readiness, Some(Readiness::Manual));
         assert_eq!(child.readiness_deadline, inherited.readiness_deadline);
         assert_eq!(child.retention, Retention::Retain);
 
@@ -1364,15 +1363,14 @@ mod tests {
             },
             &inherited,
             ChildMode::Restartable,
-            Readiness::Manual,
+            Some(Readiness::Manual),
         )
         .expect("explicit child options are valid");
         assert_eq!(overridden.restart, RestartPolicy::default());
         assert_eq!(overridden.shutdown, Shutdown::default());
         assert_eq!(overridden.mailbox, inherited.mailbox);
         assert_eq!(overridden.mailbox_shutdown, MailboxShutdown::Drain);
-        assert_eq!(overridden.readiness, Readiness::Immediate);
-        assert_eq!(overridden.readiness_override, Some(Readiness::Immediate));
+        assert_eq!(overridden.readiness, Some(Readiness::Immediate));
         assert_eq!(
             overridden.readiness_deadline,
             ReadinessDeadline::Bounded(Duration::from_nanos(1))
@@ -1400,7 +1398,7 @@ mod tests {
                 },
                 &ResolvedDefaults::default(),
                 ChildMode::OneShot,
-                Readiness::Immediate,
+                Some(Readiness::Immediate),
             ),
             Err(restart_error.clone()),
             "a one-shot child still rejects its ignored restart literal"
@@ -1418,7 +1416,7 @@ mod tests {
                 },
                 &invalid_inherited,
                 ChildMode::Restartable,
-                Readiness::Immediate,
+                Some(Readiness::Immediate),
             ),
             Err(restart_error),
             "an override cannot hide an invalid inherited value"

@@ -195,10 +195,18 @@ impl SlotCell {
         definition: &Isolated<ChildConstruction>,
         defaults: &ResolvedDefaults,
     ) -> Result<ResolvedCommonOptions, InvalidPolicy> {
-        let (options, mode) = match definition.get() {
-            ChildConstruction::Raw(definition) => (&definition.options, definition.mode()),
-            ChildConstruction::Task(definition) => (&definition.options, ChildMode::Restartable),
-            ChildConstruction::TaskOnce(definition) => (&definition.options, ChildMode::OneShot),
+        let (options, mode, default_readiness) = match definition.get() {
+            ChildConstruction::Raw(definition) => (&definition.options, definition.mode(), None),
+            ChildConstruction::Task(definition) => (
+                &definition.options,
+                ChildMode::Restartable,
+                Some(Readiness::Immediate),
+            ),
+            ChildConstruction::TaskOnce(definition) => (
+                &definition.options,
+                ChildMode::OneShot,
+                Some(Readiness::Immediate),
+            ),
             ChildConstruction::Scope(definition) => {
                 if let DefinitionSource::OneShot(tree) = &definition.source {
                     let inherited = match definition.defaults {
@@ -208,10 +216,14 @@ impl SlotCell {
                     tree.validate_policies(&inherited)
                         .map_err(|invalid| invalid.prepend(self.member.id()))?;
                 }
-                (&definition.options, definition.mode())
+                (
+                    &definition.options,
+                    definition.mode(),
+                    Some(Readiness::Manual),
+                )
             }
         };
-        resolve_common(options, defaults, mode, Readiness::Immediate)
+        resolve_common(options, defaults, mode, default_readiness)
             .map_err(|invalid| invalid.prepend(self.member.id()))
     }
 }
@@ -484,16 +496,18 @@ mod tests {
     };
 
     use crate::{
-        Backoff, ExitError, Readiness, RestartCondition, RestartPolicy, Retention, Shutdown,
-        TaskOnceDef,
-        policy::{ResolvedDefaults, ScopeFlavor},
+        Backoff, DefaultsInheritance, ExitError, Readiness, RestartCondition, RestartPolicy,
+        Retention, Shutdown, TaskOnceDef,
+        definition::DefinitionSource,
+        policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
+        raw::RawConstruction,
         runtime::{self, Timeout},
         task::TaskDef,
     };
 
     use super::{
-        BuilderCore, ChildConstruction, ChildPlan, SlotCell, concrete_dynamic_slot,
-        concrete_dynamic_slot_ref, erase_dynamic_slot,
+        BuilderCore, ChildConstruction, ChildPlan, ScopeConstruction, SlotCell,
+        concrete_dynamic_slot, concrete_dynamic_slot_ref, erase_dynamic_slot,
     };
 
     fn configured_task() -> TaskDef {
@@ -552,6 +566,97 @@ mod tests {
             ChildPlan::with_options(dynamic_slot, dynamic_definition, dynamic_options);
 
         assert_eq!(static_plan.children[0].options, dynamic_plan.options);
+        assert_eq!(dynamic_plan.options.readiness, Some(Readiness::Manual));
+    }
+
+    fn resolved_readiness(construction: ChildConstruction) -> Option<Readiness> {
+        let declaration = BuilderCore::new(ScopeFlavor::Dynamic);
+        let slot = SlotCell::new(Arc::clone(&declaration.root.member), None);
+        slot.define(construction);
+        slot.resolve_policy(&ResolvedDefaults::default())
+            .expect("policy is valid")
+            .expect("slot is defined")
+            .readiness
+    }
+
+    fn raw_construction(options: CommonOptions) -> ChildConstruction {
+        ChildConstruction::Raw(RawConstruction {
+            source: DefinitionSource::Restartable(Arc::new(|| {
+                unreachable!("policy resolution never constructs the actor")
+            })),
+            options,
+        })
+    }
+
+    fn scope_construction(options: CommonOptions) -> ChildConstruction {
+        ChildConstruction::Scope(Box::new(ScopeConstruction {
+            source: DefinitionSource::Restartable(Arc::new(|| {
+                BuilderCore::new(ScopeFlavor::Ordered)
+            })),
+            options,
+            defaults: DefaultsInheritance::Inherit,
+        }))
+    }
+
+    #[test]
+    fn resolution_applies_per_kind_readiness_defaults() {
+        // Undeclared readiness resolves per construction kind: tasks gate
+        // immediately, scopes wait for their startup barrier, and a raw
+        // actor's mode arrives with its construction report, so resolution
+        // declares none.
+        assert_eq!(
+            resolved_readiness(ChildConstruction::Task(TaskDef::new(|_| async { Ok(()) }))),
+            Some(Readiness::Immediate)
+        );
+        let (completion, _claim) = runtime::oneshot();
+        assert_eq!(
+            resolved_readiness(ChildConstruction::TaskOnce(
+                TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }).erase(completion)
+            )),
+            Some(Readiness::Immediate)
+        );
+        assert_eq!(
+            resolved_readiness(scope_construction(CommonOptions::default())),
+            Some(Readiness::Manual)
+        );
+        assert_eq!(
+            resolved_readiness(raw_construction(CommonOptions::default())),
+            None
+        );
+
+        // A declared override wins over every per-kind default.
+        assert_eq!(
+            resolved_readiness(ChildConstruction::Task(
+                TaskDef::new(|_| async { Ok(()) })
+                    .readiness(Readiness::Manual)
+                    .expect("manual task readiness is valid")
+            )),
+            Some(Readiness::Manual)
+        );
+        let (completion, _claim) = runtime::oneshot();
+        assert_eq!(
+            resolved_readiness(ChildConstruction::TaskOnce(
+                TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) })
+                    .readiness(Readiness::Manual)
+                    .expect("manual task readiness is valid")
+                    .erase(completion)
+            )),
+            Some(Readiness::Manual)
+        );
+        assert_eq!(
+            resolved_readiness(scope_construction(CommonOptions {
+                readiness: Some(Readiness::Immediate),
+                ..CommonOptions::default()
+            })),
+            Some(Readiness::Immediate)
+        );
+        assert_eq!(
+            resolved_readiness(raw_construction(CommonOptions {
+                readiness: Some(Readiness::Manual),
+                ..CommonOptions::default()
+            })),
+            Some(Readiness::Manual)
+        );
     }
 
     #[test]

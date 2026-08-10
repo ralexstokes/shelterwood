@@ -38,68 +38,18 @@ pub trait Actor: Sized + Send + 'static {
     }
 }
 
-struct ActorContextCore<'a, M> {
-    raw: &'a mut RawContext<M>,
-}
-
-impl<'a, M: Send + 'static> ActorContextCore<'a, M> {
-    fn new(raw: &'a mut RawContext<M>) -> Self {
-        Self { raw }
-    }
-
-    fn reborrow(&mut self) -> ActorContextCore<'_, M> {
-        ActorContextCore::new(&mut *self.raw)
-    }
-
-    fn id(&self) -> &ChildId {
-        self.raw.id()
-    }
-
-    fn incarnation(&self) -> Incarnation {
-        self.raw.incarnation()
-    }
-
-    fn myself(&self) -> ActorRef<M> {
-        self.raw.myself()
-    }
-
-    fn scope(&self) -> ScopeRef {
-        self.raw.scope()
-    }
-
-    fn shutdown_token(&self) -> CancellationToken {
-        self.raw.shutdown_token()
-    }
-
-    fn abort_token(&self) -> CancellationToken {
-        self.raw.abort_token()
-    }
-
-    fn request_scope_shutdown(&self) {
-        self.raw.request_scope_shutdown();
-    }
-
-    fn run_blocking<F, T>(&self, operation: F) -> Blocking<T>
-    where
-        F: FnOnce(CancellationToken) -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        self.raw.run_blocking(operation)
-    }
-}
-
 macro_rules! actor_context_forwarders {
     ($actor:ident) => {
         /// Returns this actor's child id.
         #[must_use]
         pub fn id(&self) -> &ChildId {
-            self.core.id()
+            self.raw.id()
         }
 
         /// Returns this actor's current incarnation.
         #[must_use]
         pub fn incarnation(&self) -> Incarnation {
-            self.core.incarnation()
+            self.raw.incarnation()
         }
 
         /// Returns a membership-addressed handle to this actor.
@@ -108,25 +58,25 @@ macro_rules! actor_context_forwarders {
         /// callback remains to receive it.
         #[must_use]
         pub fn myself(&self) -> ActorRef<$actor::Msg> {
-            self.core.myself()
+            self.raw.myself()
         }
 
         /// Returns this actor's supervising scope.
         #[must_use]
         pub fn scope(&self) -> ScopeRef {
-            self.core.scope()
+            self.raw.scope()
         }
 
         /// Returns the cooperative shutdown token.
         #[must_use]
         pub fn shutdown_token(&self) -> CancellationToken {
-            self.core.shutdown_token()
+            self.raw.shutdown_token()
         }
 
         /// Returns the escalation token.
         #[must_use]
         pub fn abort_token(&self) -> CancellationToken {
-            self.core.abort_token()
+            self.raw.abort_token()
         }
 
         /// Requests shutdown of the supervising scope without waiting.
@@ -134,7 +84,7 @@ macro_rules! actor_context_forwarders {
         /// Do not await that scope's shutdown from this actor: the scope cannot
         /// finish until the current actor callback returns.
         pub fn request_scope_shutdown(&self) {
-            self.core.request_scope_shutdown();
+            self.raw.request_scope_shutdown();
         }
 
         /// Starts blocking work tied to actor shutdown and returned-future drop.
@@ -146,7 +96,7 @@ macro_rules! actor_context_forwarders {
             F: FnOnce(CancellationToken) -> T + Send + 'static,
             T: Send + 'static,
         {
-            self.core.run_blocking(operation)
+            self.raw.run_blocking(operation)
         }
     };
 }
@@ -160,7 +110,7 @@ enum DeliveryStage {
 
 /// Callback context used by both live and frozen-prefix handler deliveries.
 pub struct Context<'a, A: Actor> {
-    core: ActorContextCore<'a, A::Msg>,
+    raw: &'a mut RawContext<A::Msg>,
     stage: DeliveryStage,
     actor: PhantomData<fn() -> A>,
 }
@@ -169,8 +119,8 @@ impl<A: Actor> fmt::Debug for Context<'_, A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Context")
-            .field("id", self.core.id())
-            .field("incarnation", &self.core.incarnation())
+            .field("id", self.raw.id())
+            .field("incarnation", &self.raw.incarnation())
             .field("stage", &self.stage)
             .finish_non_exhaustive()
     }
@@ -179,7 +129,7 @@ impl<A: Actor> fmt::Debug for Context<'_, A> {
 impl<'a, A: Actor> Context<'a, A> {
     fn new(raw: &'a mut RawContext<A::Msg>, stage: DeliveryStage) -> Self {
         Self {
-            core: ActorContextCore::new(raw),
+            raw,
             stage,
             actor: PhantomData,
         }
@@ -190,14 +140,14 @@ impl<'a, A: Actor> Context<'a, A> {
     /// Releases this incarnation's readiness gate while live.
     pub fn mark_ready(&self) {
         if self.stage == DeliveryStage::Live {
-            self.core.raw.mark_ready();
+            self.raw.mark_ready();
         }
     }
 
     /// Requests a clean local stop after the current callback.
     pub fn stop(&mut self) {
         if self.stage == DeliveryStage::Live {
-            self.core.raw.stop();
+            self.raw.stop();
         }
     }
 
@@ -212,7 +162,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new(message))
         } else {
-            self.core.raw.continue_with(message)
+            self.raw.continue_with(message)
         }
     }
 
@@ -229,7 +179,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new((key, message)))
         } else {
-            self.core.raw.set_timeout(key, message, after)
+            self.raw.set_timeout(key, message, after)
         }
     }
 
@@ -247,7 +197,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new((key, message)))
         } else {
-            self.core.raw.set_interval(key, message, period)
+            self.raw.set_interval(key, message, period)
         }
     }
 
@@ -259,7 +209,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new(()))
         } else {
-            Ok(self.core.raw.clear_timer(key))
+            Ok(self.raw.clear_timer(key))
         }
     }
 
@@ -278,7 +228,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new((work, continuation)))
         } else {
-            self.core.raw.offload(work, continuation, deadline)
+            self.raw.offload(work, continuation, deadline)
         }
     }
 
@@ -297,7 +247,7 @@ impl<'a, A: Actor> Context<'a, A> {
         if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new((work, continuation)))
         } else {
-            self.core.raw.offload_scoped(work, continuation, deadline)
+            self.raw.offload_scoped(work, continuation, deadline)
         }
     }
 
@@ -305,7 +255,7 @@ impl<'a, A: Actor> Context<'a, A> {
     pub fn for_actor<B: Actor<Msg = A::Msg>>(&mut self) -> Context<'_, B> {
         let stage = self.stage;
         Context {
-            core: self.core.reborrow(),
+            raw: &mut *self.raw,
             stage,
             actor: PhantomData,
         }
@@ -314,7 +264,7 @@ impl<'a, A: Actor> Context<'a, A> {
 
 /// Narrowed context supplied only to [`Actor::on_stop`].
 pub struct StopContext<'a, A: Actor> {
-    core: ActorContextCore<'a, A::Msg>,
+    raw: &'a mut RawContext<A::Msg>,
     actor: PhantomData<fn() -> A>,
 }
 
@@ -322,8 +272,8 @@ impl<A: Actor> fmt::Debug for StopContext<'_, A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("StopContext")
-            .field("id", self.core.id())
-            .field("incarnation", &self.core.incarnation())
+            .field("id", self.raw.id())
+            .field("incarnation", &self.raw.incarnation())
             .finish_non_exhaustive()
     }
 }
@@ -331,7 +281,7 @@ impl<A: Actor> fmt::Debug for StopContext<'_, A> {
 impl<'a, A: Actor> StopContext<'a, A> {
     fn new(raw: &'a mut RawContext<A::Msg>) -> Self {
         Self {
-            core: ActorContextCore::new(raw),
+            raw,
             actor: PhantomData,
         }
     }
@@ -341,7 +291,7 @@ impl<'a, A: Actor> StopContext<'a, A> {
     /// Re-enters a same-message actor with the same narrowed stop context.
     pub fn for_actor<B: Actor<Msg = A::Msg>>(&mut self) -> StopContext<'_, B> {
         StopContext {
-            core: self.core.reborrow(),
+            raw: &mut *self.raw,
             actor: PhantomData,
         }
     }
@@ -433,11 +383,10 @@ impl<A: Actor> RawActor for Handler<A> {
                     }
                 }
             }
-            MailboxShutdown::Discard => {
-                while let Some(message) = raw.try_recv() {
-                    drop(message);
-                }
-            }
+            // The raw-loop contract assigns disposal of the frozen prefix to
+            // the framework. Returning without draining keeps hostile message
+            // destructors off the actor task and out of its exit verdict.
+            MailboxShutdown::Discard => {}
         }
 
         let mut context = StopContext::<A>::new(raw);

@@ -213,7 +213,6 @@ struct Deadlined<F> {
     timer: Option<crate::runtime::BoxedSleep>,
     started: bool,
     phase: DeadlinePhase,
-    done: bool,
 }
 
 impl<F> Deadlined<F> {
@@ -225,7 +224,6 @@ impl<F> Deadlined<F> {
             timer: None,
             started: false,
             phase: DeadlinePhase::BeforeExpiry,
-            done: false,
         }
     }
 }
@@ -248,7 +246,6 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
         // boundary below governs only non-zero budgets, and the two rules
         // therefore never compete.
         if this.duration.is_zero() {
-            this.done = true;
             return Poll::Ready(this.operation.short_circuit());
         }
         let budget = this
@@ -258,7 +255,6 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             this.operation
                 .poll_deadlined(context, budget, DeadlinePhase::BeforeExpiry)
         {
-            this.done = true;
             return Poll::Ready(result);
         }
         if this.phase == DeadlinePhase::BeforeExpiry {
@@ -278,11 +274,8 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             this.phase = DeadlinePhase::Elapsed;
             this.timer = None;
         }
-        let result = this
-            .operation
-            .poll_deadlined(context, budget, DeadlinePhase::Elapsed);
-        this.done = result.is_ready();
-        result
+        this.operation
+            .poll_deadlined(context, budget, DeadlinePhase::Elapsed)
     }
 }
 
@@ -410,7 +403,6 @@ impl<T> fmt::Debug for ReplyReceive<T> {
         formatter
             .debug_struct("ReplyReceive")
             .field("started", &self.deadlined.started)
-            .field("done", &self.deadlined.done)
             .finish_non_exhaustive()
     }
 }
@@ -1579,7 +1571,6 @@ impl<M> fmt::Debug for SendTimeout<M> {
         formatter
             .debug_struct("SendTimeout")
             .field("started", &self.deadlined.started)
-            .field("done", &self.deadlined.done)
             .finish_non_exhaustive()
     }
 }
@@ -1676,7 +1667,6 @@ impl<M, T> fmt::Debug for CallFuture<M, T> {
             .debug_struct("CallFuture")
             .field("started", &self.deadlined.started)
             .field("accepted", &self.deadlined.operation.accepted)
-            .field("done", &self.deadlined.done)
             .finish_non_exhaustive()
     }
 }

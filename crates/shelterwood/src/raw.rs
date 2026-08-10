@@ -1321,7 +1321,12 @@ impl<M: Send + 'static> RawContext<M> {
     /// before timers; arrivals after a fired batch's cutoffs cannot jump its
     /// timers. The one-mailbox steady-state bound prevents an always-readable
     /// mailbox from starving completions, while the completion cutoff prevents
-    /// a self-feeding offload chain from starving the mailbox.
+    /// a self-feeding offload chain from starving the mailbox. One steady-batch
+    /// consequence: a mailbox message arriving mid-drain waits behind the
+    /// batch's captured completion prefix (bounded by the in-flight offload
+    /// count) — a cross-source ordering the spec leaves unspecified (SPEC §5.2:
+    /// no global linearization point across source cutoffs), so tests must not
+    /// pin any particular interleaving.
     ///
     /// Frozen mailbox input is deliberately absent. Once stopping begins,
     /// [`try_recv`](Self::try_recv) bypasses this selector and drains the

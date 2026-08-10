@@ -400,7 +400,7 @@ async fn dynamic_scope_admits_uses_and_exactly_removes_a_raw_actor() {
         .await
         .expect("empty dynamic root starts");
     let scope = system.scope();
-    let receipt = scope
+    let actor = scope
         .add_raw_once(
             "runtime-raw",
             RawOnceDef::new(DynamicActor {
@@ -409,7 +409,6 @@ async fn dynamic_scope_admits_uses_and_exactly_removes_a_raw_actor() {
         )
         .await
         .expect("raw actor is admitted");
-    let actor = receipt.into_handles();
     actor.send(9).await.expect("dynamic actor accepts");
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
@@ -512,6 +511,15 @@ async fn raw_run_panic_with_panicking_destructor_publishes_one_report() {
     let shelterwood::StartupFailureCause::Child { exit, .. } = &failure.cause else {
         panic!("unexpected failure cause: {:?}", failure.cause);
     };
+    let rendered = failure.to_string();
+    assert!(
+        rendered.contains("child `double-panic` failed during startup: panicked"),
+        "startup failure identifies the child's panic: {rendered}"
+    );
+    assert!(
+        rendered.contains("injected run panic"),
+        "startup failure preserves the panic payload: {rendered}"
+    );
     assert!(
         matches!(
             exit.kind(),

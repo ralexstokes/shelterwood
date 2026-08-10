@@ -31,10 +31,10 @@ pub enum StopReason {
 pub enum StartupError {
     /// A child or nested lowering failed terminally during startup.
     #[error("tree startup failed")]
-    StartupFailed(StartupFailure),
+    StartupFailed(#[source] StartupFailure),
     /// Restart intensity tripped during startup.
     #[error("restart intensity tripped during startup")]
-    IntensityTripped(IntensityTrip),
+    IntensityTripped(#[source] IntensityTrip),
     /// Shutdown began before startup completed.
     #[error("shutdown was requested during startup")]
     ShutdownRequested,
@@ -106,6 +106,13 @@ impl ExitError {
     }
 }
 
+/// Wraps any error as an application-classified [`ExitError`].
+///
+/// The classification is unconditional: converting an [`IntensityTrip`] or a
+/// [`StartupFailure`] through this impl yields an unauthenticated application
+/// error for which [`ExitError::intensity_trip`] and
+/// [`ExitError::startup_failure`] return `None`. The structured,
+/// framework-authenticated variants cannot be produced by user code.
 impl<E> From<E> for ExitError
 where
     E: Error + Send + Sync + 'static,
@@ -142,6 +149,13 @@ impl fmt::Display for MessageError {
 impl Error for MessageError {}
 
 /// A scope restart-budget failure.
+///
+/// This type implements [`std::error::Error`], so `ExitError::from(trip)` or
+/// `?` compiles via the blanket application-error conversion — but that path
+/// produces an ordinary, *unauthenticated* application error for which
+/// [`ExitError::intensity_trip`] returns `None`. Only the framework mints the
+/// structured variant; observe trips through [`ExitError::intensity_trip`]
+/// rather than round-tripping the payload through a user conversion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct IntensityTrip {
@@ -153,27 +167,81 @@ pub struct IntensityTrip {
     pub within: Duration,
 }
 
+impl fmt::Display for IntensityTrip {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "restart intensity exceeded: {} restarts exceeds {} within {:?}",
+            self.observed_restarts, self.max_restarts, self.within
+        )
+    }
+}
+
+impl Error for IntensityTrip {}
+
 #[derive(Debug)]
 struct StructuredIntensityTrip(IntensityTrip);
 
 impl fmt::Display for StructuredIntensityTrip {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "restart intensity exceeded: {} restarts exceeds {} within {:?}",
-            self.0.observed_restarts, self.0.max_restarts, self.0.within
-        )
+        fmt::Display::fmt(&self.0, formatter)
     }
 }
 
 impl Error for StructuredIntensityTrip {}
 
 /// A structured nested-scope startup failure.
+///
+/// This type implements [`std::error::Error`], so `ExitError::from(failure)`
+/// or `?` compiles via the blanket application-error conversion — but that
+/// path produces an ordinary, *unauthenticated* application error for which
+/// [`ExitError::startup_failure`] returns `None`. Only the framework mints
+/// the structured variant; observe startup failures through
+/// [`ExitError::startup_failure`] rather than round-tripping the payload
+/// through a user conversion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct StartupFailure {
     /// The startup failure's exact cause.
     pub cause: StartupFailureCause,
+}
+
+impl fmt::Display for StartupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.cause {
+            StartupFailureCause::Child { id, .. } => {
+                write!(formatter, "child `{id}` failed during startup")
+            }
+            StartupFailureCause::Lowering { undefined } => {
+                write!(formatter, "subtree has {} undefined slots", undefined.len())
+            }
+            StartupFailureCause::IdentityExhausted { id } => {
+                write!(
+                    formatter,
+                    "membership identity space is exhausted for child `{id}`"
+                )
+            }
+            StartupFailureCause::InvalidPolicy(invalid) => invalid.fmt(formatter),
+        }
+    }
+}
+
+impl Error for StartupFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.cause {
+            StartupFailureCause::InvalidPolicy(invalid) => Some(invalid),
+            StartupFailureCause::Child { exit, .. } => match exit.kind() {
+                ExitKind::Failed(error) => Some(error.as_error()),
+                ExitKind::Completed
+                | ExitKind::Panicked { .. }
+                | ExitKind::ReadinessTimedOut { .. }
+                | ExitKind::Aborted { .. }
+                | ExitKind::NeverStarted => None,
+            },
+            StartupFailureCause::Lowering { .. }
+            | StartupFailureCause::IdentityExhausted { .. } => None,
+        }
+    }
 }
 
 /// The cause of a nested-scope startup failure.
@@ -208,25 +276,15 @@ struct StructuredStartupFailure(StartupFailure);
 
 impl fmt::Display for StructuredStartupFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0.cause {
-            StartupFailureCause::Child { id, .. } => {
-                write!(formatter, "child `{id}` failed during startup")
-            }
-            StartupFailureCause::Lowering { undefined } => {
-                write!(formatter, "subtree has {} undefined slots", undefined.len())
-            }
-            StartupFailureCause::IdentityExhausted { id } => {
-                write!(
-                    formatter,
-                    "membership identity space is exhausted for child `{id}`"
-                )
-            }
-            StartupFailureCause::InvalidPolicy(invalid) => invalid.fmt(formatter),
-        }
+        fmt::Display::fmt(&self.0, formatter)
     }
 }
 
-impl Error for StructuredStartupFailure {}
+impl Error for StructuredStartupFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.0.source()
+    }
+}
 
 /// Whether an incarnation observed supervisor cancellation before exiting.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -505,9 +563,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, JoinVerdict, RecordedOutcome,
-        StartupFailure, StartupFailureCause, classify_exit, exit_kind_eq, prefer_earlier,
-        reconcile_recorded_outcomes,
+        Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, IntensityTrip, JoinVerdict,
+        RecordedOutcome, StartupError, StartupFailure, StartupFailureCause, classify_exit,
+        exit_kind_eq, prefer_earlier, reconcile_recorded_outcomes,
     };
 
     #[test]
@@ -841,5 +899,78 @@ mod tests {
         let error = ExitError::from(ForgedTrip);
         assert!(error.intensity_trip().is_none());
         assert!(error.startup_failure().is_none());
+
+        let error = ExitError::from(IntensityTrip {
+            max_restarts: 2,
+            observed_restarts: 3,
+            within: Duration::from_secs(10),
+        });
+        assert!(error.intensity_trip().is_none());
+
+        let error = ExitError::from(StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: ChildId::from("nested"),
+            },
+        });
+        assert!(error.startup_failure().is_none());
+    }
+
+    #[test]
+    fn framework_errors_expose_structured_provenance_and_erased_views() {
+        let trip = IntensityTrip {
+            max_restarts: 2,
+            observed_restarts: 3,
+            within: Duration::from_secs(10),
+        };
+        let error = ExitError::from_intensity_trip(trip.clone());
+        assert_eq!(error.intensity_trip(), Some(&trip));
+        assert_eq!(
+            error.as_error().to_string(),
+            "restart intensity exceeded: 3 restarts exceeds 2 within 10s"
+        );
+
+        let failure = StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: ChildId::from("nested"),
+            },
+        };
+        let error = ExitError::from_startup_failure(failure.clone());
+        assert_eq!(error.startup_failure(), Some(&failure));
+        assert_eq!(
+            error.as_error().to_string(),
+            "membership identity space is exhausted for child `nested`"
+        );
+    }
+
+    #[test]
+    fn startup_errors_chain_their_structured_detail() {
+        let error = StartupError::StartupFailed(StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: ChildId::from("nested"),
+            },
+        });
+        assert_eq!(error.to_string(), "tree startup failed");
+        assert_eq!(
+            std::error::Error::source(&error)
+                .expect("startup failure is the source")
+                .to_string(),
+            "membership identity space is exhausted for child `nested`"
+        );
+
+        let error = StartupError::IntensityTripped(IntensityTrip {
+            max_restarts: 2,
+            observed_restarts: 3,
+            within: Duration::from_secs(10),
+        });
+        assert_eq!(
+            error.to_string(),
+            "restart intensity tripped during startup"
+        );
+        assert_eq!(
+            std::error::Error::source(&error)
+                .expect("intensity trip is the source")
+                .to_string(),
+            "restart intensity exceeded: 3 restarts exceeds 2 within 10s"
+        );
     }
 }

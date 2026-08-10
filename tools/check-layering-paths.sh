@@ -6,10 +6,10 @@ set -euo pipefail
 cd "${SHELTERWOOD_ENFORCEMENT_ROOT:-.}"
 
 readonly source_root="crates/shelterwood/src"
+readonly lib_path="$source_root/lib.rs"
 readonly driver_path="$source_root/driver.rs"
 readonly tree_path="$source_root/tree.rs"
 readonly cells_path="$source_root/cells.rs"
-readonly scope_path="$source_root/scope.rs"
 
 # Every Rust source except the two orchestration modules and their submodules
 # belongs below the driver. Derive all four sets recursively so either a flat
@@ -42,10 +42,93 @@ readonly -a cells_layers
 # rustfmt-normalized lines of a `use crate::{ ... };` statement.
 readonly upward_module_pattern='\b(driver|tree)::|\b(crate|super)::(driver|tree)\b|\b(crate|super)::\{[^;]*\b(driver|tree)\b[[:space:]]*(,|}|as\b)'
 
-# `lib.rs` re-exports these tree-layer types at the crate root. Naming one via
-# `crate::System`, for example, is still an upward dependency even though the
-# source contains no `tree::` token.
-readonly tree_root_export_pattern='ActorSlot|Admission|AdmissionReceipt|BuildError|DynamicActorSlot|DynamicSubtreeSlot|DynamicTaskSlot|DynamicTree|Removal|StartOrShutdownError|Subtree|SubtreeDef|SubtreeOnceDef|SubtreeSlot|System|TaskSlot|Tree'
+# Derive the tree-layer names visible at the crate root from the source of
+# truth. The parser accepts rustfmt's grouped form plus a single-item re-export
+# and honors `as` aliases, which are the identifiers lower layers can name.
+set +e
+tree_root_exports="$(
+  awk '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+
+    function emit(item, parts, count) {
+      sub(/\/\/.*/, "", item)
+      item = trim(item)
+      if (item == "") {
+        return
+      }
+      count = split(item, parts, /[[:space:]]+as[[:space:]]+/)
+      item = trim(parts[count])
+      if (item !~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
+        print "unsupported tree re-export item in lib.rs: " item > "/dev/stderr"
+        invalid = 1
+        return
+      }
+      print item
+    }
+
+    BEGIN {
+      prefix = "^[[:space:]]*pub[[:space:]]+use[[:space:]]+((crate|self)::)?tree::"
+      group_prefix = prefix "[{]"
+    }
+
+    {
+      line = $0
+      if (!in_group) {
+        if (line ~ group_prefix) {
+          sub(group_prefix, "", line)
+          in_group = 1
+        } else if (line ~ prefix) {
+          sub(prefix, "", line)
+          sub(/[[:space:]]*;.*/, "", line)
+          emit(line)
+          next
+        } else {
+          next
+        }
+      }
+
+      if (line ~ /[}][[:space:]]*;/) {
+        sub(/[}][[:space:]]*;.*/, "", line)
+        in_group = 0
+      }
+      item_count = split(line, items, ",")
+      for (item_index = 1; item_index <= item_count; item_index++) {
+        emit(items[item_index])
+      }
+    }
+
+    END {
+      if (in_group) {
+        print "unterminated pub use tree group in lib.rs" > "/dev/stderr"
+        invalid = 1
+      }
+      if (invalid) {
+        exit 2
+      }
+    }
+  ' "$lib_path"
+)"
+tree_root_export_status=$?
+set -e
+if [[ "$tree_root_export_status" -ne 0 ]]; then
+  exit "$tree_root_export_status"
+fi
+readonly tree_root_exports
+
+tree_root_export_pattern=""
+while IFS= read -r tree_root_export; do
+  [[ -z "$tree_root_export" ]] && continue
+  tree_root_export_pattern+="${tree_root_export_pattern:+|}${tree_root_export}"
+done <<< "$tree_root_exports"
+if [[ -z "$tree_root_export_pattern" ]]; then
+  echo "no pub use tree re-exports derived from $lib_path" >&2
+  exit 1
+fi
+readonly tree_root_export_pattern
 
 check_forbidden() {
   local message="$1"
@@ -81,12 +164,13 @@ check_forbidden() {
   esac
 }
 
-collect_scope_root_aliases() {
+collect_root_aliases() {
   local pattern="$1"
+  local layer_file="$2"
   local aliases
   local status
   set +e
-  aliases="$({ rg --multiline --no-filename --only-matching --replace '$2' "$pattern" "$scope_path"; } 2>&1)"
+  aliases="$({ rg --multiline --no-filename --only-matching --replace '$2' "$pattern" "$layer_file"; } 2>&1)"
   status=$?
   set -e
 
@@ -106,33 +190,36 @@ check_forbidden \
   "${below_driver_layers[@]}"
 
 check_forbidden \
-  "upward tree root re-exports found in the scope layer:" \
+  "upward tree root re-exports found below the driver layer:" \
   "\\b(crate|super)::($tree_root_export_pattern)\\b|\\buse[[:space:]]+(crate|super)::\\{[^;]*\\b($tree_root_export_pattern)\\b" \
-  "$scope_path"
+  "${below_driver_layers[@]}"
 
 # A glob import of the crate root pulls in every tree-layer re-export without
 # naming any of them, so neither pattern above can see it. The grouped
 # alternative covers a `*` anywhere inside a `use (crate|super)::{ ... };`
 # tree, which `--multiline` lets span rustfmt-normalized lines.
 check_forbidden \
-  "glob imports of the crate root found in the scope layer:" \
+  "glob imports of the crate root found below the driver layer:" \
   '\buse[[:space:]]+(crate|super)::(\*|\{[^;]*\*)' \
-  "$scope_path"
+  "${below_driver_layers[@]}"
 
 # A crate-root alias can hide both direct root exports and the module names
 # checked above. Extract direct and grouped `self` aliases, then scan uses of
-# each exact identifier so unrelated aliases remain permitted.
-scope_root_aliases="$(
-  collect_scope_root_aliases '\buse[[:space:]]+(crate|super)[[:space:]]+as[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*;'
-  collect_scope_root_aliases '\buse[[:space:]]+(crate|super)::\{[^;]*\bself[[:space:]]+as[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*(,|})'
-)"
-while IFS= read -r scope_root_alias; do
-  [[ -z "$scope_root_alias" ]] && continue
-  check_forbidden \
-    "upward tree root re-exports found in the scope layer:" \
-    "\\b${scope_root_alias}::($tree_root_export_pattern|driver|tree)\\b" \
-    "$scope_path"
-done <<< "$scope_root_aliases"
+# each exact identifier in the file that declared it so unrelated aliases in
+# another module remain permitted.
+for layer_file in "${below_driver_layers[@]}"; do
+  root_aliases="$(
+    collect_root_aliases '\buse[[:space:]]+(crate|super)[[:space:]]+as[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*;' "$layer_file"
+    collect_root_aliases '\buse[[:space:]]+(crate|super)::\{[^;]*\bself[[:space:]]+as[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*(,|})' "$layer_file"
+  )"
+  while IFS= read -r root_alias; do
+    [[ -z "$root_alias" ]] && continue
+    check_forbidden \
+      "upward tree root re-exports found below the driver layer:" \
+      "\\b${root_alias}::($tree_root_export_pattern|driver|tree)\\b" \
+      "$layer_file"
+  done <<< "$root_aliases"
+done
 
 check_forbidden \
   "upward tree references found in the driver layer:" \

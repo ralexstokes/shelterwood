@@ -1697,9 +1697,10 @@ impl Actor for SaturatedActor {
 }
 
 /// A continuously nonempty mailbox cannot starve queued offload completions:
-/// the completions queued at each mailbox delivery are consumed ahead of
-/// later mailbox input, so the completion backlog stays proportional to the
-/// actor's own in-flight issuance instead of growing with mailbox history.
+/// every bounded arbitration turn admits at most one mailbox delivery before
+/// its captured completion prefix, so the completion backlog stays
+/// proportional to the actor's own in-flight issuance instead of growing with
+/// mailbox history.
 #[tokio::test]
 async fn saturated_mailbox_does_not_grow_the_completion_backlog() {
     let gate = ReleaseGate::default();
@@ -1724,8 +1725,8 @@ async fn saturated_mailbox_does_not_grow_the_completion_backlog() {
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert!(
         peak_backlog.load(Ordering::SeqCst) <= 2,
-        "queued completions drain ahead of later mailbox input instead of \
-         accumulating while the mailbox stays nonempty"
+        "bounded arbitration turns drain completions instead of accumulating \
+         them while the mailbox stays nonempty"
     );
 }
 

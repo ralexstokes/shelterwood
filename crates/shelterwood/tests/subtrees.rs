@@ -1012,6 +1012,99 @@ async fn subtree_defaults_inherit_or_reset_end_to_end() {
 }
 
 #[tokio::test]
+async fn three_level_mailbox_capacity_walk_honors_inherit_and_reset() {
+    let inherited_entered = ReleaseGate::default();
+    let inherited_release = ReleaseGate::default();
+    let reset_entered = ReleaseGate::default();
+    let reset_release = ReleaseGate::default();
+
+    let mut inherited_leaf = Tree::new();
+    let inherited_actor = inherited_leaf
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<CapacityActor>::new((
+                inherited_entered.clone(),
+                inherited_release.clone(),
+            ))
+            .mailbox(Mailbox::queue_inherit()),
+        )
+        .expect("valid inherited actor");
+    let mut reset_leaf = Tree::new();
+    let reset_actor = reset_leaf
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<CapacityActor>::new((reset_entered.clone(), reset_release.clone()))
+                .mailbox(Mailbox::queue_inherit()),
+        )
+        .expect("valid reset actor");
+
+    let mut middle = Tree::new();
+    middle.defaults(ScopeDefaults {
+        mailbox: Some(Mailbox::latest()),
+        ..ScopeDefaults::default()
+    });
+    middle
+        .add_subtree_once(
+            "inherited",
+            SubtreeOnceDef::new(inherited_leaf).defaults(DefaultsInheritance::Inherit),
+        )
+        .expect("valid inherited leaf");
+    middle
+        .add_subtree_once(
+            "reset",
+            SubtreeOnceDef::new(reset_leaf).defaults(DefaultsInheritance::Reset),
+        )
+        .expect("valid reset leaf");
+
+    let mut root = Tree::new();
+    root.defaults(ScopeDefaults {
+        mailbox: Some(Mailbox::queue(1).expect("valid outer capacity")),
+        ..ScopeDefaults::default()
+    });
+    root.add_subtree_once(
+        "middle",
+        SubtreeOnceDef::new(middle).defaults(DefaultsInheritance::Inherit),
+    )
+    .expect("valid middle subtree");
+
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("all scopes start");
+
+    inherited_actor
+        .send(CapacityMessage::Hold)
+        .await
+        .expect("inherited actor accepts hold");
+    reset_actor
+        .send(CapacityMessage::Hold)
+        .await
+        .expect("reset actor accepts hold");
+    inherited_entered.wait().await;
+    reset_entered.wait().await;
+
+    inherited_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("the inherited outer capacity accepts one pending message");
+    let inherited_full = inherited_actor
+        .try_send(CapacityMessage::Queued)
+        .expect_err("latest is passed over and the outer one-slot queue is full");
+    assert_eq!(inherited_full.kind, SendErrorKind::Full);
+
+    reset_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("reset uses the library queue capacity");
+    reset_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("reset severs the outer one-slot queue capacity");
+
+    inherited_release.release();
+    reset_release.release();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
 async fn subtree_restart_defaults_inherit_or_reset_end_to_end() {
     let inherited_starts = Arc::new(AtomicUsize::new(0));
     let inherited_fail = ReleaseGate::default();

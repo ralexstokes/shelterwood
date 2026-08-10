@@ -1107,9 +1107,14 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   a **nested** scope, the scope rolls itself back and exits as an
   ordinary child failure carrying the structured startup-failure payload
   (§11's nested rule). Readiness reported exactly at the deadline wins
-  over the timeout. Nested scopes report ready recursively once their
-  initial children are up. `spawn()` stays synchronous; `wait_started()`
-  is the readiness barrier.
+  over the timeout. A readiness signal fired before an exit or clean
+  self-stop is observed MUST count for startup accounting even when event
+  arbitration processes the terminal edge first. In particular,
+  ready-then-failed is a post-ready failure: restart policy applies and
+  startup advances exactly as it would if the readiness event had been
+  delivered first. Nested scopes report ready recursively once their initial
+  children are up. `spawn()` stays synchronous; `wait_started()` is the
+  readiness barrier.
 - **Dynamic scopes start their initial members concurrently**, and their
   pre-ready failure rules are the concurrent restatement of the ordered
   ones, not a separate regime. A non-terminal pre-ready exit restarts
@@ -2364,9 +2369,11 @@ integration toolkit for the driver shell and the end-to-end invariants.
    and a shared order log; assert the later sibling never appears until
    release. Deadline expiry under virtual time yields the *typed* readiness
    verdict carrying the deadline. Edge tests: ready-at-deadline beats
-   timeout; shutdown disarms a pending deadline; a *terminal* pre-ready
-   exit aborts startup while an eligible restart re-runs the gate with a
-   fresh per-incarnation deadline (§6) — on abort the never-started
+   timeout; readiness fired before an immediate clean exit, failure, or
+   self-stop counts before that terminal edge; shutdown disarms a pending
+   deadline; a *terminal* pre-ready exit aborts startup while an eligible
+   restart re-runs the gate with a fresh per-incarnation deadline (§6) — on
+   abort the never-started
    siblings terminalize `NeverStarted`; at the root the started prefix
    stays running, while in a nested scope assert the automatic rollback
    and the structured startup-failure exit at the parent (§11).
@@ -2564,7 +2571,10 @@ Both questions are resolved:
    and its intensity charge. A readiness signal precedes its deadline, so
    ready-at-deadline wins. Child exits precede both, making an incarnation
    that has already ended in the same wake an exit rather than a spurious
-   readiness edge. Backoff work follows all newly observed terminal facts,
+   readiness edge. Exit handling nevertheless consults the incarnation's
+   retained readiness latch: a signal causally fired before that exit is
+   accounted before the exit is classified, without reordering the event
+   classes themselves. Backoff work follows all newly observed terminal facts,
    and ladder deadlines follow because the earlier facts can complete or
    disarm them. Queued admissions run after all already-observed terminal and
    temporal facts, so they cannot enter a scope that the same wake has made

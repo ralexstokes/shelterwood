@@ -35,7 +35,7 @@ use crate::{
     },
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
-    runtime::{self, Latch},
+    runtime::{self, CompletionGatedLatch, Latch},
     task::{TaskContext, TaskContextLatches, TaskFactory},
 };
 
@@ -89,12 +89,14 @@ impl<T> Drop for Obligation<T> {
 struct RecordedReport {
     outcome: Option<RecordedOutcome>,
     cancellation: Cancellation,
+    readiness_signal_seen: bool,
 }
 
 struct ReportCompletion {
     sender: mpsc::Sender<RecordedReport>,
     shutdown: Latch,
     local_stop: Option<Latch>,
+    readiness: CompletionGatedLatch,
 }
 
 pub(crate) struct ReportToken {
@@ -112,11 +114,13 @@ pub(crate) struct ReportReceiver(mpsc::Receiver<RecordedReport>);
 /// language one — any replacement executor behind `runtime` must preserve it),
 /// so the exit joiner may require an immediately available report: one has
 /// already been sent on every return, panic, and cancellation edge. The
-/// shutdown/local-stop latches are sampled by that same send, making the
-/// report and its cancellation evidence one ordered observation.
+/// shutdown/local-stop and readiness latches are sampled by that same send,
+/// making the report and its completion-boundary evidence one ordered
+/// observation.
 pub(crate) fn report_channel(
     shutdown: Latch,
     local_stop: Option<Latch>,
+    readiness: CompletionGatedLatch,
 ) -> (ReportToken, ReportReceiver) {
     let (sender, receiver) = mpsc::channel();
     (
@@ -126,6 +130,7 @@ pub(crate) fn report_channel(
                     sender,
                     shutdown,
                     local_stop,
+                    readiness,
                 },
                 |completion| completion.send(None),
             ),
@@ -142,10 +147,13 @@ impl ReportCompletion {
             } else {
                 Cancellation::NotObserved
             };
-        let _ = self.sender.send(RecordedReport {
+        let readiness_signal_seen = self.readiness.complete();
+        let report = RecordedReport {
             outcome,
             cancellation,
-        });
+            readiness_signal_seen,
+        };
+        let _ = self.sender.send(report);
     }
 }
 
@@ -797,6 +805,7 @@ enum ChildEvent {
         recorded: Option<RecordedOutcome>,
         join: JoinVerdict,
         cancellation: Cancellation,
+        readiness_signal_seen: bool,
     },
     ConstructionDisposed {
         child: ChildKey,
@@ -829,7 +838,7 @@ struct ActiveChild {
     hard_abort_phase: Option<GracePhase>,
     readiness: ReadinessGate,
     readiness_deadline: Option<DeadlineHandle>,
-    ready_signal: Latch,
+    ready_signal: CompletionGatedLatch,
     construction_release: Latch,
     framework_abort: Option<Latch>,
     framework_abort_ack: Option<Latch>,
@@ -1063,7 +1072,7 @@ struct AncestorCommandLatches {
 }
 
 struct NestedScopeLatches {
-    parent_ready: Latch,
+    parent_ready: CompletionGatedLatch,
     ancestor: AncestorCommandLatches,
 }
 
@@ -1077,7 +1086,7 @@ impl ScopeRole {
         matches!(self, Self::Root)
     }
 
-    fn parent_ready(&self) -> Option<&Latch> {
+    fn parent_ready(&self) -> Option<&CompletionGatedLatch> {
         match self {
             Self::Root => None,
             Self::Nested(latches) => Some(&latches.parent_ready),
@@ -1208,12 +1217,12 @@ struct SpawnDispatch {
 ///   recursive drain before its task is aborted;
 /// - `construction_release` prevents a raw actor from running before the
 ///   driver has installed the readiness mode reported by construction;
-/// - `ended` makes readiness and self-stop watcher tasks finite.
+/// - `ready` also carries the completion edge that makes readiness and
+///   self-stop watcher tasks finite.
 struct SpawnLatches {
     shutdown: Latch,
     abort: Latch,
-    ready: Latch,
-    ended: Latch,
+    ready: CompletionGatedLatch,
     construction_release: Latch,
     local_stop: Latch,
     framework_abort: Latch,
@@ -1249,8 +1258,7 @@ struct ChildTaskLaunch {
     readiness_override: Option<Readiness>,
     watch_readiness: bool,
     shutdown: Latch,
-    ready: Latch,
-    ended: Latch,
+    ready: CompletionGatedLatch,
     construction_release: Latch,
     local_stop: Latch,
 }
@@ -1362,11 +1370,11 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         watch_readiness,
         shutdown,
         ready,
-        ended,
         construction_release,
         local_stop,
     } = launch;
-    let (report, report_receiver) = report_channel(shutdown, Some(local_stop.clone()));
+    let (report, report_receiver) =
+        report_channel(shutdown, Some(local_stop.clone()), ready.clone());
     let constructed_sender = events.clone();
     let handle = runtime::spawn(async move {
         let body = async move {
@@ -1412,7 +1420,6 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
     let abort_handle = handle.abort_handle();
 
     let exit_sender = events.clone();
-    let exit_ended = ended.clone();
     runtime::spawn(async move {
         let join = match runtime::join(handle).await {
             runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
@@ -1421,7 +1428,6 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 phase: GracePhase::WithinGrace,
             },
         };
-        exit_ended.fire();
         // The task owns `report`, whose explicit record or Drop fallback runs
         // before the join completes. `receive` therefore asserts immediate
         // post-join availability without ever blocking this runtime worker.
@@ -1434,17 +1440,19 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 recorded: report.outcome,
                 join,
                 cancellation: report.cancellation,
+                readiness_signal_seen: report.readiness_signal_seen,
             }),
         )
         .await;
     });
 
+    let completion = ready.clone();
     if watch_readiness {
         let ready_sender = events.clone();
-        let ready_ended = ended.clone();
+        let ready_completion = ready.clone();
         runtime::spawn(async move {
             if matches!(
-                runtime::select_two(ready.fired(), ready_ended.fired()).await,
+                runtime::select_two(ready.fired(), ready_completion.completed()).await,
                 runtime::Either::Left(())
             ) {
                 let _ = runtime::mpsc_send(
@@ -1461,7 +1469,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
 
     runtime::spawn(async move {
         if matches!(
-            runtime::select_two(local_stop.fired(), ended.fired()).await,
+            runtime::select_two(local_stop.fired(), completion.completed()).await,
             runtime::Either::Left(())
         ) {
             let _ = runtime::mpsc_send(
@@ -1590,7 +1598,8 @@ impl ScopeRuntime {
         // Per-incarnation latch topology:
         // - shutdown/abort flow from the ladder into application code;
         // - ready and local_stop flow from application code back to helpers;
-        // - ended terminates those helpers when the child exits first;
+        // - ready's completion edge terminates those helpers when the child
+        //   exits first and orders late retained readiness capabilities;
         // - construction_release keeps a raw actor behind the driver-owned
         //   readiness transition after its construction report is accepted;
         // - framework_abort/ack join nested-scope escalation before exit.
@@ -1598,8 +1607,7 @@ impl ScopeRuntime {
         let latches = SpawnLatches {
             shutdown: Latch::default(),
             abort: Latch::default(),
-            ready: Latch::default(),
-            ended: Latch::default(),
+            ready: CompletionGatedLatch::default(),
             construction_release: Latch::default(),
             local_stop: Latch::default(),
             framework_abort: Latch::default(),
@@ -1666,7 +1674,6 @@ impl ScopeRuntime {
             watch_readiness: gated,
             shutdown: latches.shutdown.clone(),
             ready: latches.ready.clone(),
-            ended: latches.ended.clone(),
             construction_release: latches.construction_release.clone(),
             local_stop: latches.local_stop.clone(),
         });
@@ -2052,6 +2059,23 @@ impl ScopeRuntime {
     }
 
     fn handle_self_stop(&mut self, key: ChildKey, incarnation: Incarnation) {
+        let ready_before_stop = self
+            .children
+            .get(key)
+            .and_then(|child| child.active.as_ref())
+            .is_some_and(|active| {
+                active.incarnation == incarnation && active.ready_signal.is_fired()
+            });
+        if ready_before_stop {
+            // A local stop is reported on a separate helper task. Preserve
+            // the application task's mark-ready-before-stop order even when
+            // arbitration observes the stop before the readiness event.
+            // An inverted `stop(); mark_ready()` sequence may also count as
+            // ready here when its latch fires before the driver observes the
+            // stop — licensed by the spec's "fired before ... a clean
+            // self-stop is observed" wording (§6).
+            self.handle_ready(key, incarnation);
+        }
         if self
             .children
             .get(key)
@@ -2069,7 +2093,28 @@ impl ScopeRuntime {
         recorded: Option<RecordedOutcome>,
         mut join: JoinVerdict,
         cancellation: Cancellation,
+        readiness_signal_seen: bool,
     ) {
+        let readiness_effect = self
+            .children
+            .get_mut(key)
+            .and_then(|child| child.active.as_mut())
+            .filter(|active| active.incarnation == incarnation)
+            .and_then(|active| {
+                active.readiness.step(ReadinessEvent::Exit {
+                    signal_seen: readiness_signal_seen,
+                })
+            });
+        let became_ready = readiness_effect
+            .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
+            .unwrap_or(false);
+        if became_ready {
+            // Match the natural signal-before-exit order: ordered startup may
+            // advance, and a sole ready child completes aggregate startup
+            // before its post-ready exit is classified.
+            self.progress_startup();
+        }
+
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
@@ -2091,7 +2136,6 @@ impl ScopeRuntime {
         {
             runtime::dispose_detached(teardown);
         }
-        active.readiness.step(ReadinessEvent::Exit);
         if let (JoinVerdict::Cancelled { .. }, Some(phase)) = (&join, active.hard_abort_phase) {
             join = JoinVerdict::Cancelled { phase };
         }
@@ -2372,7 +2416,13 @@ impl ScopeRuntime {
                     self.progress_startup();
                 }
             }
-            DeadlineKind::Restart { child } => self.spawn_child(child),
+            DeadlineKind::Restart { child } => {
+                self.spawn_child(child);
+                // A restart-deadline caller is outside `progress_startup`'s
+                // ordered loop. Revisit the aggregate in case this spawn's
+                // immediate-readiness effect released its last gate.
+                self.progress_startup();
+            }
             DeadlineKind::Stop { child, incarnation } => {
                 if self
                     .children
@@ -2989,7 +3039,15 @@ async fn run_scope_incarnation(
                     recorded,
                     join,
                     cancellation,
-                })) => scope.handle_exit(child, incarnation, recorded, join, cancellation),
+                    readiness_signal_seen,
+                })) => scope.handle_exit(
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                ),
                 Pending::Driver(DriverEvent::Child(ChildEvent::ConstructionDisposed {
                     child,
                     panic,
@@ -3101,7 +3159,7 @@ mod tests {
         identity::{IncarnationCounter, ScopeIdentity},
         mailbox::MailboxCell,
         plan::SlotCell,
-        runtime::Latch,
+        runtime::{CompletionGatedLatch, Latch},
     };
 
     use super::{
@@ -3580,6 +3638,7 @@ mod tests {
             )))),
             join: JoinVerdict::Completed,
             cancellation: Cancellation::NotObserved,
+            readiness_signal_seen: false,
         });
         let mut pending = [
             restart_shutdown_work(nested),
@@ -3595,7 +3654,15 @@ mod tests {
                     recorded,
                     join,
                     cancellation,
-                })) => scope.handle_exit(child, incarnation, recorded, join, cancellation),
+                    readiness_signal_seen,
+                })) => scope.handle_exit(
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                ),
                 _ => unreachable!("the fixture queues only exit and restart work"),
             }
         }
@@ -3608,6 +3675,155 @@ mod tests {
             factories.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the production guard must suppress the expedited factory after intensity drain"
+        );
+    }
+
+    /// A `mark_ready(); stop()` child reports its local stop and exit on
+    /// helper tasks, so one driver wake can collect both while the fired
+    /// readiness latch's Ready event is still undrained — and arbitration
+    /// orders the stop ahead of the readiness signal. `handle_self_stop`
+    /// must consult the fired latch before `begin_stop_child`'s Shutdown
+    /// step disarms the gate, or the clean post-ready exit is misread as a
+    /// pre-ready stop and spuriously aborts startup.
+    #[crate::runtime::test]
+    async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "ready-then-stop",
+            TaskDef::new(|_| future::pending::<crate::ExitResult>())
+                .readiness(Readiness::Manual)
+                .expect("manual readiness is valid")
+                .readiness_deadline(ReadinessDeadline::Unbounded),
+        )
+        .expect("valid task");
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+        let mut children = ChildArena::default();
+        let key = children
+            .insert(child)
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::starting(),
+            next_ordered_start: Some(key),
+            role: ScopeRole::Root,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        scope.spawn_child(key);
+        let active = scope.children[key]
+            .active
+            .as_ref()
+            .expect("spawned child is active");
+        let incarnation = active.incarnation;
+        // The application task fired its readiness latch before stopping;
+        // the driver has not yet drained the corresponding Ready event.
+        assert!(active.ready_signal.fire());
+        active.abort_handle.abort();
+
+        let mut pending = [
+            Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+                child: key,
+                incarnation,
+                recorded: Some(RecordedOutcome::Returned(Ok(()))),
+                join: JoinVerdict::Completed,
+                cancellation: Cancellation::NotObserved,
+                readiness_signal_seen: true,
+            }))
+            .classified(),
+            Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop {
+                child: key,
+                incarnation,
+            }))
+            .classified(),
+        ];
+        arbitrate(&mut pending);
+        assert!(
+            matches!(
+                pending[0].1,
+                Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop { .. }))
+            ),
+            "the regression premise: arbitration orders the stop ahead of the exit"
+        );
+        for (_, event) in pending {
+            match event {
+                Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop {
+                    child,
+                    incarnation,
+                })) => scope.handle_self_stop(child, incarnation),
+                Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                })) => scope.handle_exit(
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                ),
+                _ => unreachable!("the fixture queues only the stop and the exit"),
+            }
+        }
+
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
+            disposal_event_receiver
+                .recv()
+                .await
+                .expect("disposal reports completion")
+        else {
+            panic!("only construction disposal was armed")
+        };
+        scope.handle_construction_disposed(child, panic);
+
+        assert!(
+            scope.lifecycle.startup_complete(),
+            "the ready-before-stop child completes startup"
+        );
+        assert!(
+            matches!(root.record().startup, Some(Ok(()))),
+            "a fired readiness latch must survive a same-batch local stop: {:?}",
+            root.record().startup
+        );
+        assert_eq!(root.record().state, ScopeState::Running);
+        assert!(matches!(
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::Completed)
+        ));
+        assert!(
+            !scope.children[key].slot.member.record().startup_aborted,
+            "a post-ready clean self-stop is not a startup abort"
         );
     }
 
@@ -3799,18 +4015,22 @@ mod tests {
     #[test]
     fn owned_report_token_consumes_or_falls_back_once() {
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let readiness = CompletionGatedLatch::default();
+        let (token, receiver) = report_channel(shutdown.clone(), None, readiness.clone());
         token.record(RecordedOutcome::Returned(Ok(())));
         shutdown.fire();
+        readiness.fire();
         let report = receiver.receive();
         assert!(matches!(
             report.outcome,
             Some(RecordedOutcome::Returned(Ok(())))
         ));
         assert_eq!(report.cancellation, Cancellation::NotObserved);
+        assert!(!report.readiness_signal_seen);
 
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let (token, receiver) =
+            report_channel(shutdown.clone(), None, CompletionGatedLatch::default());
         shutdown.fire();
         drop(token);
         let report = receiver.receive();
@@ -3821,7 +4041,8 @@ mod tests {
     #[test]
     fn owned_report_token_records_prior_cancellation() {
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let (token, receiver) =
+            report_channel(shutdown.clone(), None, CompletionGatedLatch::default());
         shutdown.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
         let report = receiver.receive();
@@ -3836,10 +4057,24 @@ mod tests {
     fn owned_report_token_records_prior_local_stop() {
         let shutdown = Latch::default();
         let local_stop = Latch::default();
-        let (token, receiver) = report_channel(shutdown, Some(local_stop.clone()));
+        let (token, receiver) = report_channel(
+            shutdown,
+            Some(local_stop.clone()),
+            CompletionGatedLatch::default(),
+        );
         local_stop.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
         assert_eq!(receiver.receive().cancellation, Cancellation::Observed);
+    }
+
+    #[test]
+    fn owned_report_token_records_readiness_at_completion() {
+        let readiness = CompletionGatedLatch::default();
+        let (token, receiver) = report_channel(Latch::default(), None, readiness.clone());
+        readiness.fire();
+        token.record(RecordedOutcome::Returned(Ok(())));
+        assert!(!readiness.fire(), "completion closes retained capabilities");
+        assert!(receiver.receive().readiness_signal_seen);
     }
 
     #[test]
@@ -3922,7 +4157,7 @@ mod tests {
         let driver = crate::runtime::spawn(run_scope_incarnation(
             plan,
             ScopeRole::Nested(NestedScopeLatches {
-                parent_ready: Latch::default(),
+                parent_ready: CompletionGatedLatch::default(),
                 ancestor: AncestorCommandLatches {
                     shutdown: Latch::default(),
                     abort: Latch::default(),
@@ -4056,7 +4291,7 @@ mod tests {
         let mut driver = Box::pin(run_scope_incarnation(
             plan,
             ScopeRole::Nested(NestedScopeLatches {
-                parent_ready: Latch::default(),
+                parent_ready: CompletionGatedLatch::default(),
                 ancestor: AncestorCommandLatches {
                     shutdown: Latch::default(),
                     abort: Latch::default(),
@@ -4993,7 +5228,7 @@ mod tests {
                 TaskDef::new(|_| future::pending::<crate::ExitResult>()),
             )
             .expect("provisional declaration succeeds");
-        let ready = Latch::default();
+        let ready = CompletionGatedLatch::default();
         let error = run_nested_tree(
             tree.into_core_for_test(),
             Arc::clone(&scope),

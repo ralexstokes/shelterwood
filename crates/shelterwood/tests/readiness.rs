@@ -10,9 +10,232 @@ use crate::common::{
     POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, policy::never, poll_until,
 };
 use shelterwood::{
-    Cancellation, ChildState, DynamicTree, ExitError, ExitKind, Readiness, ReadinessDeadline,
-    ScopeState, Shutdown, StartupError, StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
+    Backoff, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult, Jitter,
+    RawActor, RawContext, RawOnceDef, Readiness, ReadinessDeadline, RestartCondition,
+    RestartPolicy, ScopeState, Shutdown, StartupError, StartupFailureCause, SubtreeOnceDef,
+    TaskDef, Tree,
 };
+
+struct ReadyThenStop;
+
+impl RawActor for ReadyThenStop {
+    type Msg = ();
+
+    fn readiness(&self) -> Readiness {
+        Readiness::Manual
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        context.mark_ready();
+        context.stop();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn readiness_fired_before_clean_exit_counts_for_startup() {
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "ready-then-complete",
+            TaskDef::new(|context| async move {
+                context.mark_ready();
+                Ok(())
+            })
+            .restart(never())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+        )
+        .expect("valid task");
+
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("ready-before-exit completes startup");
+    assert!(matches!(task.wait().await.kind(), ExitKind::Completed));
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_fired_before_failure_makes_the_failure_post_ready() {
+    let backoff = Duration::from_secs(30);
+    let mut tree = Tree::new();
+    tree.add_task(
+        "ready-then-fail",
+        TaskDef::new(|context| async move {
+            context.mark_ready();
+            Err(ExitError::message("post-ready failure"))
+        })
+        .restart(RestartPolicy::new(
+            RestartCondition::OnFailure,
+            Backoff::fixed(backoff, Jitter::None).expect("non-zero backoff"),
+        ))
+        .shutdown(Shutdown::Abort)
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid task");
+
+    let system = tree.spawn().expect("runtime is available");
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            system
+                .scope()
+                .child("ready-then-fail")
+                .is_some_and(|child| matches!(child.state, ChildState::Restarting))
+        })
+        .await
+    );
+    assert_eq!(
+        system.scope().snapshot().state,
+        ScopeState::Running,
+        "the ready edge must complete startup before restart backoff"
+    );
+    system
+        .wait_started()
+        .await
+        .expect("post-ready failure does not abort or re-gate startup");
+    system
+        .shutdown(Duration::ZERO)
+        .await
+        .expect("a child in backoff has no straggler");
+}
+
+#[tokio::test]
+async fn readiness_fired_before_clean_self_stop_counts_for_startup() {
+    let mut tree = Tree::new();
+    tree.add_raw_once("ready-then-stop", RawOnceDef::new(ReadyThenStop))
+        .expect("valid raw actor");
+
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("ready-before-stop completes startup");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+#[tokio::test]
+async fn readiness_fired_after_task_completion_cannot_reclassify_the_exit() {
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "late-readiness",
+            TaskDef::new(|context| async move {
+                let late_context = context.clone();
+                tokio::spawn(async move {
+                    late_context.mark_ready();
+                });
+                Ok(())
+            })
+            .restart(never())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+        )
+        .expect("valid task");
+
+    let system = tree.spawn().expect("runtime is available");
+    let startup = system
+        .wait_started()
+        .await
+        .expect_err("readiness after future completion is stale");
+    assert!(matches!(
+        startup,
+        StartupError::StartupFailed(ref failure)
+            if matches!(failure.cause, StartupFailureCause::Child { ref id, .. } if id.as_str() == "late-readiness")
+    ));
+    assert!(matches!(task.wait().await.kind(), ExitKind::Completed));
+    system
+        .shutdown(Duration::ZERO)
+        .await
+        .expect("the completed child has no straggler");
+}
+
+#[tokio::test(start_paused = true)]
+async fn immediate_restart_deadline_rechecks_aggregate_startup() {
+    let backoff = Duration::from_secs(30);
+    let incarnations = Arc::new(AtomicUsize::new(0));
+    let release_manual = ReleaseGate::default();
+    let manual_ready = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "restarting-immediate",
+        TaskDef::new({
+            let incarnations = Arc::clone(&incarnations);
+            move |context| {
+                let incarnation = incarnations.fetch_add(1, Ordering::SeqCst) + 1;
+                async move {
+                    if incarnation == 1 {
+                        return Err(ExitError::message("restart after sibling starts"));
+                    }
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        })
+        .restart(RestartPolicy::new(
+            RestartCondition::OnFailure,
+            Backoff::fixed(backoff, Jitter::None).expect("non-zero backoff"),
+        )),
+    )
+    .expect("valid immediate task");
+    tree.add_task(
+        "manual-sibling",
+        TaskDef::new({
+            let release_manual = release_manual.clone();
+            let manual_ready = manual_ready.clone();
+            move |context| {
+                let release_manual = release_manual.clone();
+                let manual_ready = manual_ready.clone();
+                async move {
+                    release_manual.wait().await;
+                    context.mark_ready();
+                    manual_ready.release();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid manual sibling");
+
+    let system = tree.spawn().expect("runtime is available");
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            system
+                .scope()
+                .child("restarting-immediate")
+                .is_some_and(|child| matches!(child.state, ChildState::Restarting))
+        })
+        .await
+    );
+    release_manual.release();
+    manual_ready.wait().await;
+    assert_eq!(system.scope().snapshot().state, ScopeState::Starting);
+
+    advance_time(backoff).await;
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            incarnations.load(Ordering::SeqCst) == 2
+        })
+        .await
+    );
+    system
+        .wait_started()
+        .await
+        .expect("immediate restart releases the last aggregate gate");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("restarted task cooperates");
+}
 
 #[tokio::test]
 async fn ordered_startup_waits_for_manual_readiness() {

@@ -375,7 +375,9 @@ pub(crate) enum ReadinessEvent {
         signal_seen: bool,
     },
     Shutdown,
-    Exit,
+    Exit {
+        signal_seen: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -429,7 +431,8 @@ impl ReadinessGate {
                 ReadinessEvent::Deadline {
                     signal_seen: true, ..
                 },
-            ) => {
+            )
+            | (ReadinessState::Waiting { .. }, ReadinessEvent::Exit { signal_seen: true }) => {
                 self.state = ReadinessState::Ready;
                 Some(ReadinessEffect::BecameReady)
             }
@@ -446,8 +449,12 @@ impl ReadinessGate {
                 Some(ReadinessEffect::TimedOut { deadline })
             }
             (
-                ReadinessState::Unconfigured | ReadinessState::Waiting { .. },
-                ReadinessEvent::Shutdown | ReadinessEvent::Exit,
+                ReadinessState::Unconfigured,
+                ReadinessEvent::Shutdown | ReadinessEvent::Exit { .. },
+            )
+            | (
+                ReadinessState::Waiting { .. },
+                ReadinessEvent::Shutdown | ReadinessEvent::Exit { signal_seen: false },
             ) => {
                 self.state = ReadinessState::Disarmed;
                 Some(ReadinessEffect::Disarmed)
@@ -1232,6 +1239,19 @@ mod tests {
                 signal_seen: false,
             }),
             None
+        );
+
+        let mut exited = ReadinessGate::new();
+        assert_eq!(
+            exited.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::Manual,
+                deadline: None,
+            }),
+            None
+        );
+        assert_eq!(
+            exited.step(ReadinessEvent::Exit { signal_seen: true }),
+            Some(ReadinessEffect::BecameReady)
         );
 
         let mut timed_out = ReadinessGate::new();

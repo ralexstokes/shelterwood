@@ -288,14 +288,14 @@ fn attach_actor_slot<M: Send + 'static>(slot: Arc<SlotCell>) -> ActorSlot<M> {
 }
 
 macro_rules! impl_common_builder_surface {
-    ($($builder:ty),+ $(,)?) => {
+    ($($builder:ty => $member_note:literal),+ $(,)?) => {
         $(
             impl $builder {
-                impl_common_builder_surface!(@methods);
+                impl_common_builder_surface!(@methods $member_note);
             }
         )+
     };
-    (@methods) => {
+    (@methods $member_note:literal) => {
         /// Sets the scope restart-intensity budget.
         pub fn intensity(&mut self, intensity: Intensity) -> &mut Self {
             self.core.config.intensity = intensity;
@@ -309,6 +309,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Reserves an actor membership and returns its pre-spawn handle slot.
+        #[doc = $member_note]
         pub fn reserve_actor<M: Send + 'static>(
             &mut self,
             id: impl Into<ChildId>,
@@ -317,6 +318,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Adds a restartable callback-oriented actor.
+        #[doc = $member_note]
         pub fn add_actor<A: crate::Actor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -329,6 +331,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Adds a consuming one-shot callback-oriented actor.
+        #[doc = $member_note]
         pub fn add_actor_once<A: crate::Actor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -341,6 +344,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Adds a restartable raw actor.
+        #[doc = $member_note]
         pub fn add_raw<R: crate::RawActor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -353,6 +357,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Adds a consuming one-shot raw actor.
+        #[doc = $member_note]
         pub fn add_raw_once<R: crate::RawActor>(
             &mut self,
             id: impl Into<ChildId>,
@@ -365,6 +370,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Reserves a task membership and returns its pre-spawn handle slot.
+        #[doc = $member_note]
         pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
             self.core.reserve(id, None).map(|slot| TaskSlot {
                 core: TaskSlotCore::new(StaticSlotEndpoint(slot)),
@@ -372,6 +378,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Adds a restartable task.
+        #[doc = $member_note]
         pub fn add_task(
             &mut self,
             id: impl Into<ChildId>,
@@ -384,6 +391,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Adds a consuming one-shot task and its typed completion claim.
+        #[doc = $member_note]
         pub fn add_task_once<T: Send + 'static>(
             &mut self,
             id: impl Into<ChildId>,
@@ -396,6 +404,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Reserves a typed subtree membership.
+        #[doc = $member_note]
         pub fn reserve_subtree<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
@@ -408,6 +417,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Adds a restartable subtree.
+        #[doc = $member_note]
         pub fn add_subtree<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
@@ -420,6 +430,7 @@ macro_rules! impl_common_builder_surface {
         }
 
         /// Adds a consuming one-shot subtree.
+        #[doc = $member_note]
         pub fn add_subtree_once<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
@@ -511,7 +522,12 @@ impl DynamicTree {
     }
 }
 
-impl_common_builder_surface!(Tree, DynamicTree);
+impl_common_builder_surface!(
+    Tree => "",
+    DynamicTree => "\nThe membership minted here belongs to this scope's *initial* set: \
+        aggregate readiness counts initial members only, and children added at runtime \
+        through [`DynamicScopeRef`] never join the aggregate.",
+);
 
 fn spawn_builder<R>(
     core: BuilderCore,

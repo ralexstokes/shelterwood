@@ -6,7 +6,7 @@ fn member_transitions_own_their_complete_record_projection() {
     let id = ChildId::from("worker");
     let membership = identity.mint_membership(&id).expect("membership available");
     let member = MemberCell::new(id, membership);
-    let mut incarnations = identity.incarnation_counter(membership);
+    let mut incarnations = member.take_incarnation_counter();
     let incarnation = incarnations.mint().expect("incarnation available");
 
     member.transition(MemberTransition::Admitted);
@@ -68,7 +68,7 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
     );
     // Walk the record along the production path so the transition-source
     // assertions in `apply_transition` cover this setup too.
-    let mut setup_incarnations = identity.incarnation_counter(membership);
+    let mut setup_incarnations = member.take_incarnation_counter();
     let spent = setup_incarnations
         .mint()
         .expect("setup incarnation available");
@@ -79,7 +79,7 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
         restart_count: RestartCount::ZERO,
         restart_at: None,
     });
-    let mut counter = IncarnationCounter::near_exhaustion(membership);
+    let mut counter = IncarnationCounter::near_exhaustion(member.membership());
 
     assert!(counter.mint().is_some());
     assert!(counter.mint().is_none());
@@ -121,8 +121,7 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
         .with_lifecycle(ScopeLifecycle::running())
         .with_next_ordered_start(Some(key))
         .build();
-    plan.armed = false;
-    drop(plan);
+    plan.take_for_runtime().finish_transfer();
 
     scope.children[key].incarnations =
         IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
@@ -227,8 +226,7 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
         .with_children(children)
         .with_next_ordered_start(Some(key))
         .build();
-    plan.armed = false;
-    drop(plan);
+    plan.take_for_runtime().finish_transfer();
 
     // Burn the counter's last usable generation without touching the
     // member record: the child is still an unspawned initial member, so
@@ -326,8 +324,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
         .with_children(children)
         .with_next_ordered_start(Some(key))
         .build();
-    plan.armed = false;
-    drop(plan);
+    plan.take_for_runtime().finish_transfer();
 
     assert!(scope.children[key].initial);
     scope.spawn_child(key);
@@ -485,7 +482,7 @@ async fn scope_incarnation_exhaustion_closes_nested_observation() {
     parent.set_admitted_children(vec![resident_projection(&slot)]);
     let mut snapshots = scope.subscribe_snapshots();
     let mut events = scope.subscribe_lifecycle();
-    let mut counter = IncarnationCounter::near_exhaustion(membership);
+    let mut counter = IncarnationCounter::near_exhaustion(member.membership());
     let first = counter.mint().expect("last incarnation mints");
     member.update(|record| {
         record.stage = MemberStage::Restarting;

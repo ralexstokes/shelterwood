@@ -15,9 +15,10 @@ use std::{
 use crate::{
     ActorRef, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
-    cancellation::CancellationToken,
+    cancellation::{CancellationToken, ParentCancellationToken},
     cells::{MailboxControl, MemberCell},
     definition::DefinitionSource,
+    identity::PoisonedCounter,
     mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
     policy::{ChildMode, CommonOptions},
     runtime::{
@@ -449,12 +450,7 @@ enum TimerMessage<M> {
 struct ArmingOrder(u64);
 
 impl ArmingOrder {
-    const ZERO: Self = Self(0);
     const MAX: Self = Self(u64::MAX);
-
-    fn saturating_next(self) -> Self {
-        Self(self.0.saturating_add(1))
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -881,7 +877,7 @@ struct RawResources<M> {
     // continuations from leading while an external source remains eligible.
     continuation_needs_external: bool,
     timers: TimerStore<M>,
-    next_timer_order: ArmingOrder,
+    timer_orders: PoisonedCounter,
     ready_batch: Option<ReadyBatch>,
     events: Arc<EventQueue<M>>,
     panic: Arc<PanicSlot>,
@@ -905,7 +901,7 @@ impl<M> Default for RawResources<M> {
             continuations: VecDeque::new(),
             continuation_needs_external: false,
             timers: TimerStore::new(disposal.clone()),
-            next_timer_order: ArmingOrder::ZERO,
+            timer_orders: PoisonedCounter::new(),
             ready_batch: None,
             events,
             panic,
@@ -1019,7 +1015,7 @@ pub struct RawContext<M> {
     incarnation: Incarnation,
     myself: ActorRef<M>,
     scope: ScopeRef,
-    shutdown: CancellationToken,
+    shutdown: ParentCancellationToken,
     abort: CancellationToken,
     ready: CompletionGatedLatch,
     local_stop: Latch,
@@ -1051,7 +1047,7 @@ impl<M: Send + 'static> RawContext<M> {
             incarnation: run.incarnation,
             myself,
             scope: run.scope,
-            shutdown: CancellationToken::from_latch(run.shutdown),
+            shutdown: ParentCancellationToken::from_latch(run.shutdown),
             abort: CancellationToken::from_latch(run.abort),
             ready: run.ready,
             local_stop: run.local_stop,
@@ -1089,7 +1085,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// Returns the cooperative shutdown token.
     #[must_use]
     pub fn shutdown_token(&self) -> CancellationToken {
-        self.shutdown.clone()
+        self.shutdown.token()
     }
 
     /// Returns the escalation token.
@@ -1340,16 +1336,17 @@ impl<M: Send + 'static> RawContext<M> {
     ) where
         K: Hash + Eq + Send + 'static,
     {
-        self.resources.next_timer_order = self.resources.next_timer_order.saturating_next();
+        let arming_order = ArmingOrder(
+            self.resources
+                .timer_orders
+                .mint()
+                .expect("timer arming-order space exhausted"),
+        );
         let now = runtime::now();
         let deadline = crate::deadline::Deadline::after(now, after).instant();
-        self.resources.timers.replace(
-            key,
-            deadline,
-            self.resources.next_timer_order,
-            message,
-            period,
-        );
+        self.resources
+            .timers
+            .replace(key, deadline, arming_order, message, period);
     }
 
     fn start_offload<F, T, C>(

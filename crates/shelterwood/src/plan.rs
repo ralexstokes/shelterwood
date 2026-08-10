@@ -320,7 +320,7 @@ impl BuilderCore {
                 .lock()
                 .expect("scope identity mutex poisoned");
             for slot in &self.slots {
-                let Some(membership) =
+                let Some(rebased) =
                     identity.adopt_or_mint_membership(slot.member.id(), slot.member.membership())
                 else {
                     let id = slot.member.id().clone();
@@ -328,8 +328,8 @@ impl BuilderCore {
                     let disposal = self.begin_failed_disposal();
                     return Err(LowerError::IdentityExhausted { id, disposal });
                 };
-                if membership != slot.member.membership() {
-                    slot.member.rebase_membership(membership);
+                if let Some(identity) = rebased {
+                    slot.member.rebase_membership(identity);
                 }
             }
         }
@@ -358,7 +358,7 @@ impl BuilderCore {
             config: self.config.clone(),
             defaults,
             children,
-            armed: true,
+            terminality: Some(ScopePlanTerminality),
         })
     }
 
@@ -384,6 +384,7 @@ impl BuilderCore {
     fn terminalize(&self) {
         for slot in &self.slots {
             slot.terminalize_never_started();
+            self.root.evict_child_identity(&slot.member);
         }
         self.root.terminalize_never_started();
     }
@@ -403,24 +404,78 @@ pub(crate) struct ScopePlan {
     pub(crate) config: ScopeConfig,
     pub(crate) defaults: ResolvedDefaults,
     pub(crate) children: Vec<ChildPlan>,
-    pub(crate) armed: bool,
+    terminality: Option<ScopePlanTerminality>,
+}
+
+struct ScopePlanTerminality;
+
+pub(crate) struct RuntimeScopePlan {
+    pub(crate) root: Arc<ScopeCell>,
+    pub(crate) config: ScopeConfig,
+    pub(crate) defaults: ResolvedDefaults,
+    pub(crate) children: Vec<ChildPlan>,
+    terminality: Option<ScopePlanTerminality>,
+}
+
+fn terminalize_plan(
+    root: &ScopeCell,
+    children: &[ChildPlan],
+    terminality: &mut Option<ScopePlanTerminality>,
+) {
+    if terminality.take().is_some() {
+        for child in children {
+            child.slot.terminalize_never_started();
+            root.evict_child_identity(&child.slot.member);
+        }
+        root.with_observation_gate(|txn| {
+            // Lowering can publish the planned children before ScopeRuntime
+            // takes ownership. The plan fallback commits residency withdrawal
+            // and root closure as one root-scope observation.
+            root.clear_residents_locked(txn);
+            root.terminalize_never_started_locked(txn);
+        });
+    }
+}
+
+impl ScopePlan {
+    /// Consumes declaration ownership and transfers its terminality obligation
+    /// to the runtime plan. There is no independently mutable disarm bit: a
+    /// caller either owns the declaration plan or has consumed it here.
+    pub(crate) fn take_for_runtime(mut self) -> RuntimeScopePlan {
+        RuntimeScopePlan {
+            root: Arc::clone(&self.root),
+            config: self.config.clone(),
+            defaults: self.defaults.clone(),
+            children: std::mem::take(&mut self.children),
+            terminality: self.terminality.take(),
+        }
+    }
 }
 
 impl Drop for ScopePlan {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        for child in &self.children {
-            child.slot.terminalize_never_started();
-        }
-        self.root.with_observation_gate(|txn| {
-            // Lowering can publish the planned children before ScopeRuntime
-            // takes ownership. The plan fallback commits residency withdrawal
-            // and root closure as one root-scope observation.
-            self.root.clear_residents_locked(txn);
-            self.root.terminalize_never_started_locked(txn);
-        });
+        terminalize_plan(&self.root, &self.children, &mut self.terminality);
+    }
+}
+
+impl RuntimeScopePlan {
+    /// Finishes the transfer after every child has installed its own
+    /// terminality obligation. Consuming `self` makes a partial handoff
+    /// impossible to mistake for a completed one.
+    pub(crate) fn finish_transfer(mut self) {
+        assert!(
+            self.children.is_empty(),
+            "runtime transfer completes only after every child owns terminality"
+        );
+        self.terminality
+            .take()
+            .expect("runtime plan transfer completes exactly once");
+    }
+}
+
+impl Drop for RuntimeScopePlan {
+    fn drop(&mut self) {
+        terminalize_plan(&self.root, &self.children, &mut self.terminality);
     }
 }
 

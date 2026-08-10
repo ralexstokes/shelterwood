@@ -333,8 +333,10 @@ mod tests {
     fn task_context() -> (TaskContext, Latch, Latch, CompletionGatedLatch) {
         let id = ChildId::from("task");
         let mut identity = ScopeIdentity::new();
-        let membership = identity.mint_membership(&id).expect("membership available");
-        let mut incarnations = identity.incarnation_counter(membership);
+        let (_, mut incarnations) = identity
+            .mint_membership(&id)
+            .expect("membership available")
+            .into_pair();
         let incarnation = incarnations.mint().expect("incarnation available");
         let shutdown = Latch::default();
         let abort = Latch::default();

@@ -11,6 +11,7 @@ use crate::{
     RestartCount, RestartPolicy, Shutdown, TotalRestarts,
     deadline::Deadline,
     exit::StopReason,
+    identity::PoisonedCounter,
     policy::{ScopeFlavor, tidy_abort_beat},
 };
 
@@ -715,99 +716,95 @@ pub(crate) struct ChildCompletionState {
 /// requests use [`ScopeEpochs`] and do not encode this phase a second time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScopeLifecycle {
-    state: ScopeState,
-    drain: Option<ScopeDrain>,
+    state: ScopeLifecycleState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ScopeLifecycleState {
+    Starting,
+    Running,
+    StartupFailed,
+    Draining(ScopeDrain),
 }
 
 impl ScopeLifecycle {
     pub(crate) fn starting() -> Self {
         Self {
-            state: ScopeState::Starting,
-            drain: None,
+            state: ScopeLifecycleState::Starting,
         }
     }
 
     pub(crate) fn state(&self) -> ScopeState {
-        self.state.clone()
+        match &self.state {
+            ScopeLifecycleState::Starting => ScopeState::Starting,
+            ScopeLifecycleState::Running => ScopeState::Running,
+            ScopeLifecycleState::StartupFailed => ScopeState::StartupFailed,
+            ScopeLifecycleState::Draining(_) => ScopeState::Draining,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn running() -> Self {
         Self {
-            state: ScopeState::Running,
-            drain: None,
+            state: ScopeLifecycleState::Running,
         }
     }
 
-    /// The old `ScopePhase` enum made "draining without a reason"
-    /// unrepresentable; with split fields the equivalence is checked after
-    /// every transition instead.
-    fn assert_drain_invariant(&self) {
-        debug_assert_eq!(
-            self.state == ScopeState::Draining,
-            self.drain.is_some(),
-            "a scope is draining iff a drain reason is recorded"
-        );
-    }
-
     pub(crate) fn is_starting(&self) -> bool {
-        self.state == ScopeState::Starting
+        matches!(self.state, ScopeLifecycleState::Starting)
     }
 
     pub(crate) fn startup_complete(&self) -> bool {
         matches!(
-            (&self.state, &self.drain),
-            (ScopeState::Running, None)
-                | (
-                    ScopeState::Draining,
-                    Some(ScopeDrain {
-                        startup: StartupPhase::Complete,
-                        ..
-                    })
-                )
+            &self.state,
+            ScopeLifecycleState::Running
+                | ScopeLifecycleState::Draining(ScopeDrain {
+                    startup: StartupPhase::Complete,
+                    ..
+                })
         )
     }
 
     pub(crate) fn startup_failed(&self) -> bool {
         matches!(
-            (&self.state, &self.drain),
-            (ScopeState::StartupFailed, None)
-                | (
-                    ScopeState::Draining,
-                    Some(ScopeDrain {
-                        startup: StartupPhase::Failed,
-                        ..
-                    })
-                )
+            &self.state,
+            ScopeLifecycleState::StartupFailed
+                | ScopeLifecycleState::Draining(ScopeDrain {
+                    startup: StartupPhase::Failed,
+                    ..
+                })
         )
     }
 
     pub(crate) fn is_draining(&self) -> bool {
-        self.state == ScopeState::Draining
+        matches!(self.state, ScopeLifecycleState::Draining(_))
     }
 
     pub(crate) fn draining_reason(&self) -> Option<&StopReason> {
-        self.drain.as_ref().map(|drain| &drain.reason)
+        match &self.state {
+            ScopeLifecycleState::Draining(drain) => Some(&drain.reason),
+            ScopeLifecycleState::Starting
+            | ScopeLifecycleState::Running
+            | ScopeLifecycleState::StartupFailed => None,
+        }
     }
 
     pub(crate) fn complete_startup(&mut self) -> Option<ScopeState> {
-        if self.state != ScopeState::Starting {
+        if !matches!(self.state, ScopeLifecycleState::Starting) {
             return None;
         }
-        self.state = ScopeState::Running;
-        self.assert_drain_invariant();
-        Some(self.state.clone())
+        self.state = ScopeLifecycleState::Running;
+        Some(self.state())
     }
 
     /// Records only the first startup failure, so simultaneous failing
     /// initial children cannot publish the transition twice.
     pub(crate) fn fail_startup(&mut self) -> Option<ScopeState> {
-        if self.state != ScopeState::Starting {
+        if !matches!(self.state, ScopeLifecycleState::Starting) {
             return None;
         }
-        self.state = ScopeState::StartupFailed;
-        self.assert_drain_invariant();
-        Some(self.state.clone())
+        self.state = ScopeLifecycleState::StartupFailed;
+        Some(self.state())
     }
 
     /// Begins draining or monotonically upgrades an in-progress drain.
@@ -816,32 +813,22 @@ impl ScopeLifecycle {
     /// change the eventual verdict without repeating teardown side effects.
     pub(crate) fn begin_drain(&mut self, reason: StopReason) -> Option<DrainEffect> {
         let incoming_precedence = DrainReasonPrecedence::of(&reason);
-        let startup = match self.state {
-            ScopeState::Starting => StartupPhase::Pending,
-            ScopeState::Running => StartupPhase::Complete,
-            ScopeState::StartupFailed => StartupPhase::Failed,
-            ScopeState::Draining => {
-                let drain = self
-                    .drain
-                    .as_mut()
-                    .expect("the drain invariant supplies a reason while draining");
+        let startup = match &mut self.state {
+            ScopeLifecycleState::Starting => StartupPhase::Pending,
+            ScopeLifecycleState::Running => StartupPhase::Complete,
+            ScopeLifecycleState::StartupFailed => StartupPhase::Failed,
+            ScopeLifecycleState::Draining(drain) => {
                 if incoming_precedence > DrainReasonPrecedence::of(&drain.reason) {
                     drain.reason = reason;
                 }
-                self.assert_drain_invariant();
                 return None;
-            }
-            ScopeState::Unstarted | ScopeState::Stopped { .. } => {
-                unreachable!("a scope incarnation owns only live lifecycle states")
             }
         };
         let startup_pending = startup == StartupPhase::Pending;
-        self.state = ScopeState::Draining;
-        self.drain = Some(ScopeDrain { reason, startup });
-        self.assert_drain_invariant();
+        self.state = ScopeLifecycleState::Draining(ScopeDrain { reason, startup });
         Some(DrainEffect {
             startup_pending,
-            state: self.state.clone(),
+            state: self.state(),
         })
     }
 
@@ -889,7 +876,7 @@ impl Ord for DeadlineEntry {
 pub(crate) struct DeadlineQueue<K> {
     // Keys are both registration identity and equal-deadline arming order.
     // They are never reused, so a stale handle can only miss.
-    next_key: u64,
+    registration_ids: PoisonedCounter,
     entries: BinaryHeap<DeadlineEntry>,
     registrations: BTreeMap<DeadlineHandle, K>,
 }
@@ -907,7 +894,7 @@ struct DeadlineEntry {
 impl<K> Default for DeadlineQueue<K> {
     fn default() -> Self {
         Self {
-            next_key: 0,
+            registration_ids: PoisonedCounter::new(),
             entries: BinaryHeap::new(),
             registrations: BTreeMap::new(),
         }
@@ -950,16 +937,10 @@ impl<K> DeadlineQueue<K> {
     }
 
     fn next_handle(&mut self) -> DeadlineHandle {
-        let Some(next) = self.next_key.checked_add(1) else {
-            panic!("deadline key space exhausted");
-        };
-        // Reserve the maximum value as poison. Once reached, the counter stays
-        // poisoned and every later push fails instead of wrapping or reusing.
-        if next == u64::MAX {
-            self.next_key = u64::MAX;
-            panic!("deadline key space exhausted");
-        }
-        self.next_key = next;
+        let next = self
+            .registration_ids
+            .mint()
+            .expect("deadline key space exhausted");
         DeadlineHandle(next)
     }
 
@@ -1014,6 +995,7 @@ mod tests {
     use crate::{
         Cancellation, Exit, ExitKind, GracePhase, Intensity, JitterSample, RestartAttempt,
         RestartCondition, RestartCount, RestartPolicy, Shutdown, TotalRestarts,
+        identity::PoisonedCounter,
         policy::{Backoff, ScopeFlavor},
     };
 
@@ -1675,7 +1657,7 @@ mod tests {
     fn deadline_key_exhaustion_never_mints_poison_or_reuses_a_key() {
         let now = Instant::now();
         let mut deadlines = DeadlineQueue {
-            next_key: u64::MAX - 2,
+            registration_ids: PoisonedCounter::near_exhaustion(),
             ..DeadlineQueue::default()
         };
         let last = deadlines.push(now, "last usable");
@@ -1684,7 +1666,7 @@ mod tests {
 
         let first_exhausted = catch_unwind(AssertUnwindSafe(|| deadlines.push(now, "poison")));
         assert!(first_exhausted.is_err(), "the poison key is never minted");
-        assert_eq!(deadlines.next_key, u64::MAX);
+        assert!(deadlines.registration_ids.is_poisoned());
         assert!(
             !deadlines
                 .registrations

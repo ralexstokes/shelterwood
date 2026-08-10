@@ -489,9 +489,15 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
 
     let first = replace_with_retry(&root_scope, &router, 1).await;
     assert!(
-        first
+        !first
             .membership
             .supersedes(failed_candidate.route.membership)
+    );
+    assert!(
+        !failed_candidate
+            .route
+            .membership
+            .supersedes(first.membership)
     );
     assert_eq!(
         lookup(&directory)

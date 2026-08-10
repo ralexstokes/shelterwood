@@ -634,7 +634,7 @@ mod tests {
     };
 
     use crate::{
-        ChildId, Mailbox,
+        ChildId,
         cells::{MailboxControl, MemberCell},
         identity::ScopeIdentity,
     };
@@ -644,12 +644,15 @@ mod tests {
     #[test]
     fn an_accepted_send_reports_acceptance_on_every_poll() {
         let (mailbox, actor) = actor();
-        MailboxControl::configure(&*mailbox, Mailbox::default());
+        MailboxControl::configure(
+            &*mailbox,
+            crate::policy::ResolvedDefaults::default().mailbox,
+        );
         let mut identity = ScopeIdentity::new();
-        let membership = identity
+        let (_, mut incarnations) = identity
             .mint_membership(&ChildId::from("actor"))
-            .expect("membership available");
-        let mut incarnations = identity.incarnation_counter(membership);
+            .expect("membership available")
+            .into_pair();
         let incarnation = incarnations.mint().expect("incarnation available");
         MailboxControl::bind(&*mailbox, incarnation);
 

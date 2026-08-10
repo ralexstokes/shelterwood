@@ -190,11 +190,7 @@ impl ChildRuntime {
             },
             discharge_child_terminality,
         );
-        let incarnations = scope
-            .child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .incarnation_counter(slot.member.membership());
+        let incarnations = slot.member.take_incarnation_counter();
         let mailbox = slot.member.mailbox();
         if let Some(mailbox) = &mailbox {
             mailbox.configure(options.mailbox);
@@ -643,8 +639,10 @@ impl ScopeRuntime {
 
         let mut readiness = ReadinessGate::new();
         let deadline = match child.options.readiness_deadline {
-            ReadinessDeadline::Bounded(duration) => Deadline::after(now, duration).instant(),
-            ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
+            crate::policy::ResolvedReadinessDeadline::Bounded(duration) => {
+                Deadline::after(now, duration).instant()
+            }
+            crate::policy::ResolvedReadinessDeadline::Unbounded => None,
         };
         let readiness_effect = readiness.step(ReadinessEvent::Configure {
             readiness: declared_readiness,

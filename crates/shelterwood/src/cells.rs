@@ -12,23 +12,23 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     time::Instant,
 };
 
 use crate::{
-    ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, RestartCount, Strategy,
+    ChildId, Exit, Incarnation, Intensity, Membership, Readiness, RestartCount, Strategy,
     TotalRestarts,
     admission::{RemoveOutcome, ReserveError},
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason},
-    identity::ScopeIdentity,
+    identity::{AtomicPoisonedCounter, IncarnationCounter, MintedMembership, ScopeIdentity},
     observe::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
         LifecycleHub, LifecycleSeq, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
     },
-    policy::{ResolvedCommonOptions, ScopeFlavor},
+    policy::{ResolvedCommonOptions, ResolvedMailbox, ScopeFlavor},
     runtime::{self, Latch},
 };
 
@@ -52,7 +52,7 @@ pub(crate) trait MailboxTermination: Send {
 pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
     /// Installs the declaration-time mailbox policy before the first bind.
     /// Reconfiguration may only repeat the same resolved policy.
-    fn configure(&self, mailbox: Mailbox);
+    fn configure(&self, mailbox: ResolvedMailbox);
     /// Makes one incarnation live after configuration and prior-close cleanup.
     /// A bind after terminal preparation is deliberately ignored because
     /// terminality wins that race permanently.
@@ -188,6 +188,7 @@ pub(crate) struct MemberCell {
     id: ChildId,
     membership: Membership,
     rebased_membership: OnceLock<Membership>,
+    incarnations: Mutex<Option<IncarnationCounter>>,
     record: runtime::WatchSender<MemberRecord>,
     // Guards only a gate-pointer swap, so no torn state is possible; every
     // access deliberately tolerates poisoning (mirroring
@@ -232,7 +233,8 @@ impl fmt::Debug for MemberMailbox {
 }
 
 impl MemberCell {
-    pub(crate) fn new(id: ChildId, membership: Membership) -> Arc<Self> {
+    pub(crate) fn new(id: ChildId, identity: MintedMembership) -> Arc<Self> {
+        let (membership, incarnations) = identity.into_pair();
         let (record, _) = runtime::watch(MemberRecord {
             stage: MemberStage::Reserved,
             incarnation: None,
@@ -247,6 +249,7 @@ impl MemberCell {
             id,
             membership,
             rebased_membership: OnceLock::new(),
+            incarnations: Mutex::new(Some(incarnations)),
             record,
             observation_gate: RwLock::new(ObservationGate::new()),
             terminal_disposal_pending: AtomicBool::new(false),
@@ -267,7 +270,8 @@ impl MemberCell {
             .unwrap_or(self.membership)
     }
 
-    pub(crate) fn rebase_membership(&self, membership: Membership) {
+    pub(crate) fn rebase_membership(&self, identity: MintedMembership) {
+        let (membership, incarnations) = identity.into_pair();
         let record = self.record();
         assert!(
             matches!(record.stage, MemberStage::Reserved)
@@ -278,6 +282,27 @@ impl MemberCell {
         self.rebased_membership
             .set(membership)
             .expect("a reservation can be rebased at most once");
+        *self
+            .incarnations
+            .lock()
+            .expect("incarnation counter mutex poisoned") = Some(incarnations);
+    }
+
+    pub(crate) fn take_incarnation_counter(&self) -> IncarnationCounter {
+        self.incarnations
+            .lock()
+            .expect("incarnation counter mutex poisoned")
+            .take()
+            .expect("a membership's incarnation counter is issued to one runtime")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_incarnation_counter(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<IncarnationCounter>> {
+        self.incarnations
+            .lock()
+            .expect("incarnation counter mutex starts healthy")
     }
 
     pub(crate) fn record(&self) -> MemberRecord {
@@ -608,7 +633,12 @@ pub(crate) trait DynamicRoute: Send + Sync {
         fused_cancel: Option<Latch>,
     ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError>;
 
-    fn cancel_reservation(&self, slot: &Self::Slot, txn: &mut ObservationTxn<'_>);
+    fn cancel_reservation(
+        &self,
+        scope: &Arc<ScopeCell>,
+        slot: &Self::Slot,
+        txn: &mut ObservationTxn<'_>,
+    );
 
     fn signal_fused_cancel(
         &self,
@@ -858,7 +888,7 @@ pub(crate) struct ScopeCell {
     // `ObservationGate::lock`) so drop-path shutdown after a panicked assert
     // cannot itself panic.
     observation_gate: RwLock<ObservationGate>,
-    lifecycle_seq: AtomicU64,
+    lifecycle_seq: AtomicPoisonedCounter,
     lifecycle: LifecycleHub,
     snapshots: SnapshotHub,
     observation_closed: AtomicBool,
@@ -894,6 +924,13 @@ pub(crate) struct RuntimeStorage {
 }
 
 impl ScopeCell {
+    pub(crate) fn evict_child_identity(&self, member: &MemberCell) {
+        self.child_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .evict(member.id(), member.membership());
+    }
+
     pub(crate) fn new(
         member: Arc<MemberCell>,
         flavor: ScopeFlavor,
@@ -916,7 +953,7 @@ impl ScopeCell {
             current_children: Mutex::new(Vec::new()),
             parent: Mutex::new(None),
             observation_gate: RwLock::new(observation_gate),
-            lifecycle_seq: AtomicU64::new(0),
+            lifecycle_seq: AtomicPoisonedCounter::new(),
             lifecycle: LifecycleHub::default(),
             snapshots: SnapshotHub::default(),
             observation_closed: AtomicBool::new(false),
@@ -1305,6 +1342,7 @@ impl ScopeCell {
                 .and_then(|resident| resident.projection.scope.as_ref())
                 .cloned();
             let terminal_exit = member.terminalize_child_locked(exit, startup, wakes);
+            self.evict_child_identity(member);
             if record.last_incarnation.is_none()
                 && let Some(scope) = &nested
             {
@@ -1484,13 +1522,8 @@ impl ScopeCell {
         // gate could reorder events but never duplicate a sequence value.
         let seq = self
             .lifecycle_seq
-            .try_update(Ordering::Release, Ordering::Relaxed, |current| {
-                current.checked_add(1).filter(|seq| *seq != u64::MAX)
-            })
-            .ok()
-            .map(|previous| previous.saturating_add(1));
+            .mint(Ordering::Release, Ordering::Relaxed);
         let Some(seq) = seq.map(LifecycleSeq::new) else {
-            self.lifecycle_seq.store(u64::MAX, Ordering::Release);
             self.publish_snapshot_chain_locked(wakes);
             self.lifecycle.publish_lagged_deferred(wakes, 1);
             for ancestor in self.ancestors_locked() {
@@ -1536,7 +1569,7 @@ impl ScopeCell {
 
     #[cfg(test)]
     pub(crate) fn set_lifecycle_sequence(&self, current: u64) {
-        self.lifecycle_seq.store(current, Ordering::Relaxed);
+        self.lifecycle_seq.set(current, Ordering::Relaxed);
     }
 
     pub(crate) fn set_startup(&self, startup: Result<(), StartupError>) {

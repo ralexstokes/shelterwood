@@ -5,6 +5,8 @@ use std::{
     ops::{Bound, Index, IndexMut},
 };
 
+use crate::identity::PoisonedCounter;
+
 /// An exactly-once synchronous completion.
 ///
 /// The orderly path consumes the payload with [`Self::complete`]. If that
@@ -58,28 +60,23 @@ pub(super) struct ChildArena<T> {
     children: BTreeMap<ChildKey, T>,
     // `u64::MAX` is poison and is never minted. Once exhausted, every later
     // insertion fails closed instead of wrapping into the live key domain.
-    next_key: u64,
+    keys: PoisonedCounter,
 }
 
 impl<T> Default for ChildArena<T> {
     fn default() -> Self {
         Self {
             children: BTreeMap::new(),
-            next_key: 0,
+            keys: PoisonedCounter::new(),
         }
     }
 }
 
 impl<T> ChildArena<T> {
     pub(super) fn insert(&mut self, child: T) -> Result<ChildKey, Box<T>> {
-        let Some(next) = self.next_key.checked_add(1) else {
+        let Some(next) = self.keys.mint() else {
             return Err(Box::new(child));
         };
-        if next == u64::MAX {
-            self.next_key = u64::MAX;
-            return Err(Box::new(child));
-        }
-        self.next_key = next;
         let key = ChildKey(next);
         let replaced = self.children.insert(key, child);
         debug_assert!(replaced.is_none(), "monotonic child keys are never reused");
@@ -171,6 +168,8 @@ mod tests {
         },
     };
 
+    use crate::identity::PoisonedCounter;
+
     use super::{ChildArena, ChildKey, Obligation};
 
     fn count_fallback(fallbacks: Arc<AtomicUsize>) {
@@ -229,7 +228,7 @@ mod tests {
     fn child_key_exhaustion_poison_is_never_minted() {
         let mut arena = ChildArena {
             children: BTreeMap::new(),
-            next_key: u64::MAX - 2,
+            keys: PoisonedCounter::near_exhaustion(),
         };
         let last = arena.insert("worker").expect("the last usable key mints");
         assert_eq!(last, ChildKey(u64::MAX - 1));
@@ -238,7 +237,7 @@ mod tests {
         let child = *arena
             .insert(child)
             .expect_err("the poison key is never minted");
-        assert_eq!(arena.next_key, u64::MAX);
+        assert!(arena.keys.is_poisoned());
         assert!(arena.get(ChildKey(u64::MAX)).is_none());
         assert!(
             arena.insert(child).is_err(),

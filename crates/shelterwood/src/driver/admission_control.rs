@@ -377,6 +377,7 @@ fn start_dynamic_admission(
 }
 
 pub(super) fn cancel_dynamic_reservation_parts(
+    scope: &ScopeCell,
     control: &DynamicControl,
     slot: &SlotCell,
     txn: &mut ObservationTxn<'_>,
@@ -396,6 +397,9 @@ pub(super) fn cancel_dynamic_reservation_parts(
     } else {
         None
     };
+    if cancelled {
+        scope.evict_child_identity(&slot.member);
+    }
     (definition, removed)
 }
 
@@ -404,15 +408,16 @@ pub(crate) fn cancel_dynamic_reservation(
     control: &ErasedDynamicRoute,
     slot: &Arc<SlotCell>,
 ) {
-    scope.with_observation_gate(|txn| control.cancel_reservation(slot.as_ref(), txn));
+    scope.with_observation_gate(|txn| control.cancel_reservation(scope, slot.as_ref(), txn));
 }
 
 fn cancel_dynamic_reservation_impl(
+    scope: &ScopeCell,
     control: &DynamicControl,
     slot: &SlotCell,
     txn: &mut ObservationTxn<'_>,
 ) {
-    let (definition, removed) = cancel_dynamic_reservation_parts(control, slot, txn);
+    let (definition, removed) = cancel_dynamic_reservation_parts(scope, control, slot, txn);
     // The entry's drop completes its removal response; it must follow the
     // member's terminal publication and isolated definition disposal.
     txn.defer(move || dispose_definition_then(definition, move || drop(removed)));
@@ -564,8 +569,13 @@ impl DynamicRoute for DynamicControl {
         start_dynamic_admission(self, concrete_dynamic_slot(slot), fused_cancel)
     }
 
-    fn cancel_reservation(&self, slot: &Self::Slot, txn: &mut ObservationTxn<'_>) {
-        cancel_dynamic_reservation_impl(self, concrete_dynamic_slot_ref(slot), txn);
+    fn cancel_reservation(
+        &self,
+        scope: &Arc<ScopeCell>,
+        slot: &Self::Slot,
+        txn: &mut ObservationTxn<'_>,
+    ) {
+        cancel_dynamic_reservation_impl(scope, self, concrete_dynamic_slot_ref(slot), txn);
     }
 
     fn signal_fused_cancel(

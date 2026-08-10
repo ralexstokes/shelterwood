@@ -381,6 +381,7 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
         .mint_membership(&child_id)
         .expect("membership available");
     let member = MemberCell::new(child_id.clone(), membership);
+    let membership = member.membership();
     let slot = SlotCell::new(Arc::clone(&member), None);
     let key = ChildKey(1);
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
@@ -464,17 +465,14 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
 
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
-            let _identity = root
-                .child_identity
-                .lock()
-                .expect("scope identity mutex starts healthy");
+            let _incarnations = member.lock_incarnation_counter();
             panic!("inject admission conversion failure");
         }))
         .is_err()
     );
     assert!(
         catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request))).is_err(),
-        "the poisoned child identity injects the conversion panic"
+        "the poisoned issued counter injects the conversion panic"
     );
     assert!(matches!(
         response.receive().await,
@@ -906,10 +904,7 @@ async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_rech
     let defaults = ResolvedDefaults::default();
     let mut definition_claimed = false;
     std::thread::scope(|threads| {
-        let identity = root
-            .child_identity
-            .lock()
-            .expect("scope identity mutex starts healthy");
+        let incarnations = member.lock_incarnation_counter();
         let driver_scope = &mut scope;
         let driver = threads.spawn(move || driver_scope.handle_admission(request));
         // The definition leaves the slot after the pre-conversion latch
@@ -932,7 +927,7 @@ async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_rech
         );
         // Release without unwinding: conversion must proceed into the
         // under-lock re-check, not observe a poisoned identity mutex.
-        drop(identity);
+        drop(incarnations);
         driver
             .join()
             .expect("conversion proceeds after the identity mutex is released");

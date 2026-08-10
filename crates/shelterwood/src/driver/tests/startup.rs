@@ -78,8 +78,7 @@ async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnat
         .with_lifecycle(ScopeLifecycle::running())
         .with_children(children)
         .build();
-    plan.armed = false;
-    drop(plan);
+    plan.take_for_runtime().finish_transfer();
 
     scope.spawn_child(key);
     let first = scope.children[key]
@@ -284,8 +283,7 @@ async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_become
         .with_lifecycle(ScopeLifecycle::running())
         .with_children(children)
         .build();
-    plan.armed = false;
-    drop(plan);
+    plan.take_for_runtime().finish_transfer();
 
     let target = scope.children[key]
         .slot
@@ -396,8 +394,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         .with_lifecycle(ScopeLifecycle::running())
         .with_next_ordered_start(next_ordered_start)
         .build();
-    plan.armed = false;
-    drop(plan);
+    plan.take_for_runtime().finish_transfer();
 
     root.transition_child(
         &scope.children[nested].slot.member,
@@ -710,8 +707,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
         .with_children(children)
         .with_next_ordered_start(Some(key))
         .build();
-    plan.armed = false;
-    drop(plan);
+    plan.take_for_runtime().finish_transfer();
 
     scope.spawn_child(key);
     let active = scope.children[key]

@@ -186,7 +186,7 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
     let epoch = nested
         .begin_incarnation(ScopeState::Starting)
         .expect("nested scope epoch is available");
-    let mut incarnations = ScopeIdentity::new().incarnation_counter(nested.member.membership());
+    let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
     let incarnation = incarnations.mint().expect("child incarnation is available");
     nested.member.update(|record| {
         record.stage = MemberStage::Running;
@@ -296,7 +296,7 @@ async fn terminality_fallback_preserves_restart_window_scope_reason() {
     let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
     parent.set_admitted_children(vec![resident_projection(&slot)]);
 
-    let mut incarnations = ScopeIdentity::new().incarnation_counter(nested.member.membership());
+    let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
     let last_incarnation = incarnations.mint().expect("child incarnation is available");
     nested.member.update(|record| {
         record.stage = MemberStage::Restarting;
@@ -360,7 +360,11 @@ async fn blocked_initial_scope_factory_owns_its_stop_epilogue() {
     let plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = ScopeEpochGuard::begin(&root).expect("parent epoch is available");
-    let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
+    let driver = crate::runtime::spawn(run_scope_incarnation(
+        plan.take_for_runtime(),
+        ScopeRole::Root,
+        epoch,
+    ));
     let abort = driver.abort_handle();
 
     assert!(matches!(
@@ -419,7 +423,11 @@ async fn blocked_restart_scope_factory_supersedes_the_stale_stopped_projection()
     let plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = ScopeEpochGuard::begin(&root).expect("parent epoch is available");
-    let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
+    let driver = crate::runtime::spawn(run_scope_incarnation(
+        plan.take_for_runtime(),
+        ScopeRole::Root,
+        epoch,
+    ));
     let abort = driver.abort_handle();
 
     assert!(matches!(

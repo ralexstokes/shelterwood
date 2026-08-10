@@ -48,15 +48,11 @@ pub(super) struct DynamicSlotEndpoint {
 }
 
 impl DynamicSlotEndpoint {
-    pub(super) fn split(reservation: DynamicReservation) -> Self {
+    pub(super) fn new(reservation: DynamicReservation, ownership: AdmissionOwnership) -> Self {
         Self {
             reservation: Some(reservation),
-            ownership: AdmissionOwnership::Split,
+            ownership,
         }
-    }
-
-    pub(super) fn fuse(&mut self) {
-        self.ownership = AdmissionOwnership::Fused;
     }
 
     fn reservation(&self) -> &DynamicReservation {

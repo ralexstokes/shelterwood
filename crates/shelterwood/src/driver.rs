@@ -29,8 +29,7 @@ pub(crate) use shutdown::shutdown_scope;
 
 use crate::{
     Cancellation, ChildId, Exit, GracePhase, Incarnation, IntensityTrip, JitterSample, Membership,
-    Readiness, ReadinessDeadline, ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure,
-    StartupFailureCause,
+    Readiness, ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
         MailboxControl, MemberStage, MemberTransition, ResidentProjection, ScopeCell,
@@ -50,7 +49,8 @@ use crate::{
     identity::IncarnationCounter,
     observe::LifecycleEventKind,
     plan::{
-        BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
+        BuilderCore, ChildConstruction, ChildPlan, LowerError, RuntimeScopePlan, ScopeFactory,
+        ScopePlan, SlotCell,
     },
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
@@ -340,7 +340,7 @@ impl ScopeRuntime {
                 NotAdmittingCause::NoLiveIncarnation
             };
             let (definition, removed) = self.root.with_observation_gate(|txn| {
-                cancel_dynamic_reservation_parts(&control, &request.slot, txn)
+                cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
             });
             reject_admission_after_disposal(
                 request,
@@ -352,7 +352,7 @@ impl ScopeRuntime {
         }
         if request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
             let (definition, removed) = self.root.with_observation_gate(|txn| {
-                cancel_dynamic_reservation_parts(&control, &request.slot, txn)
+                cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
             });
             reject_admission_after_disposal(
                 request,
@@ -367,7 +367,7 @@ impl ScopeRuntime {
             Ok(Some(claimed)) => claimed,
             Ok(None) => {
                 let (_, removed) = self.root.with_observation_gate(|txn| {
-                    cancel_dynamic_reservation_parts(&control, &request.slot, txn)
+                    cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
                 });
                 reject_admission_after_disposal(
                     request,
@@ -379,7 +379,7 @@ impl ScopeRuntime {
             }
             Err(invalid) => {
                 let (definition, removed) = self.root.with_observation_gate(|txn| {
-                    cancel_dynamic_reservation_parts(&control, &request.slot, txn)
+                    cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
                 });
                 reject_admission_after_disposal(
                     request,
@@ -416,6 +416,7 @@ impl ScopeRuntime {
                 let removed = matches_reservation.then(|| state.remove(id, txn)).flatten();
                 drop(state);
                 request.slot.terminalize_never_started_locked(txn);
+                root.evict_child_identity(&request.slot.member);
                 return AdmissionInstall::Rejected {
                     child: Box::new(child),
                     removed,
@@ -432,6 +433,7 @@ impl ScopeRuntime {
                     let removed = state.remove(id, txn);
                     drop(state);
                     request.slot.terminalize_never_started_locked(txn);
+                    root.evict_child_identity(&request.slot.member);
                     return AdmissionInstall::Rejected {
                         child,
                         removed,
@@ -596,7 +598,7 @@ async fn run_nested_tree_with_epoch(
             return Err(crate::ExitError::from_startup_failure(failure));
         }
     };
-    run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch)
+    run_scope_incarnation(plan.take_for_runtime(), ScopeRole::Nested(latches), epoch)
         .await
         .into_nested_result()
 }
@@ -604,12 +606,12 @@ async fn run_nested_tree_with_epoch(
 async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
     let root = Arc::clone(&plan.root);
     let Some(epoch) = ScopeEpochGuard::begin(&root) else {
-        // Dropping the still-armed plan terminalizes every never-started
+        // Dropping the still-owned plan terminalizes every never-started
         // declaration and the root; no aliased driver epoch is created.
         drop(plan);
         return StopReason::NeverStarted;
     };
-    run_scope_incarnation(plan, role, epoch).await
+    run_scope_incarnation(plan.take_for_runtime(), role, epoch).await
 }
 
 /// Derives the membership index and incompleteness count for a freshly
@@ -628,7 +630,7 @@ fn index_children(children: &ChildArena<ChildRuntime>) -> (HashMap<Membership, C
 }
 
 async fn run_scope_incarnation(
-    mut plan: ScopePlan,
+    mut plan: RuntimeScopePlan,
     role: ScopeRole,
     epoch: ScopeEpochGuard,
 ) -> StopReason {
@@ -713,8 +715,7 @@ async fn run_scope_incarnation(
         // the raw epoch directly into ScopeRuntime's synchronous epilogue.
         epoch: epoch.transfer(),
     };
-    plan.armed = false;
-    drop(plan);
+    plan.finish_transfer();
 
     // ScopeRuntime owns teardown before the route becomes public. If either
     // route notification or initial-child publication unwinds, its epilogue

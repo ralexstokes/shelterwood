@@ -3,7 +3,7 @@
 use crate::runtime::{self, Latch};
 
 /// A library-owned cancellation token.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CancellationToken {
     primary: Latch,
     secondary: Option<Latch>,
@@ -14,14 +14,6 @@ impl CancellationToken {
         Self {
             primary: latch,
             secondary: None,
-        }
-    }
-
-    pub(crate) fn child(&self, cancellation: Latch) -> Self {
-        debug_assert!(self.secondary.is_none());
-        Self {
-            primary: self.primary.clone(),
-            secondary: Some(cancellation),
         }
     }
 
@@ -41,19 +33,50 @@ impl CancellationToken {
     }
 }
 
+/// Internal capability that alone may derive a locally cancellable token.
+#[derive(Clone, Debug)]
+pub(crate) struct ParentCancellationToken {
+    primary: Latch,
+}
+
+impl ParentCancellationToken {
+    pub(crate) fn from_latch(primary: Latch) -> Self {
+        Self { primary }
+    }
+
+    pub(crate) fn token(&self) -> CancellationToken {
+        CancellationToken::from_latch(self.primary.clone())
+    }
+
+    pub(crate) fn child(&self, cancellation: Latch) -> CancellationToken {
+        CancellationToken {
+            primary: self.primary.clone(),
+            secondary: Some(cancellation),
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.primary.is_fired()
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        self.primary.fired().await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use crate::runtime::{self, JoinOutcome, Latch, Timeout};
 
-    use super::CancellationToken;
+    use super::ParentCancellationToken;
 
     #[crate::runtime::test]
     async fn local_cancellation_cancels_only_the_derived_token() {
         let primary = Latch::default();
         let local = Latch::default();
-        let supervisor = CancellationToken::from_latch(primary.clone());
+        let supervisor = ParentCancellationToken::from_latch(primary.clone());
         let operation = supervisor.child(local.clone());
 
         assert!(local.fire());
@@ -70,7 +93,7 @@ mod tests {
     async fn supervisor_cancellation_cancels_the_derived_token() {
         let primary = Latch::default();
         let local = Latch::default();
-        let supervisor = CancellationToken::from_latch(primary.clone());
+        let supervisor = ParentCancellationToken::from_latch(primary.clone());
         let operation = supervisor.child(local.clone());
 
         assert!(primary.fire());
@@ -88,7 +111,8 @@ mod tests {
         for _ in 0..128 {
             let primary = Latch::default();
             let local = Latch::default();
-            let operation = CancellationToken::from_latch(primary.clone()).child(local.clone());
+            let operation =
+                ParentCancellationToken::from_latch(primary.clone()).child(local.clone());
             let waiter = runtime::spawn(async move {
                 operation.cancelled().await;
             });

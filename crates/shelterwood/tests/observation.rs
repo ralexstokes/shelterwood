@@ -631,10 +631,8 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
         }
     };
     let first_child = first_child.expect("first incarnation admits its child");
-    assert!(
-        second_child.supersedes(first_child),
-        "corresponding descendants retain ordering across a scope restart"
-    );
+    assert!(!second_child.supersedes(first_child));
+    assert!(!first_child.supersedes(second_child));
     assert_eq!(nested.membership(), scope_membership);
     assert_eq!(nested.snapshot().total_restarts, TotalRestarts::ZERO);
     assert!(nested.snapshot().lifecycle_seq >= starting.seq);
@@ -654,7 +652,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
 }
 
 #[tokio::test]
-async fn rebased_declared_handles_and_incarnations_keep_identity() {
+async fn rebuilt_declared_handles_and_incarnations_keep_identity() {
     fn hashed(value: &impl std::hash::Hash) -> u64 {
         use std::hash::Hasher;
         let mut hasher = std::hash::DefaultHasher::new();
@@ -724,15 +722,13 @@ async fn rebased_declared_handles_and_incarnations_keep_identity() {
 
     assert_eq!(first.membership(), first_declared);
     assert_eq!(hashed(&first), first_hash);
-    assert!(
-        second.membership().supersedes(first.membership()),
-        "the rebuilt declaration is rebased onto the stable scope"
-    );
-    assert_ne!(second.membership(), second_declared);
+    assert!(!second.membership().supersedes(first.membership()));
+    assert!(!first.membership().supersedes(second.membership()));
+    assert_eq!(second.membership(), second_declared);
     assert_eq!(
         hashed(&second),
         second_hash,
-        "handle identity survives the rebase that refreshed its membership"
+        "handle identity survives declaration lowering"
     );
     assert_eq!(second.membership(), admissions[1]);
     assert_eq!(starts[1].0, second.membership());

@@ -106,6 +106,15 @@ function tokenize(source, number, offset, length_, character, pair, rest, found,
       continue
     }
 
+    # Raw identifiers have the same semantic name as the identifier after
+    # `r#`. Normalize them to one token so paths and `mod` declarations cannot
+    # bypass name or depth checks.
+    if (match(rest, /^r#[A-Za-z_][A-Za-z0-9_]*/)) {
+      add_token(substr(rest, 3, RLENGTH - 2), number)
+      offset += RLENGTH
+      continue
+    }
+
     character = substr(source, offset, 1)
     if (character == "\"") {
       in_string = 1
@@ -417,6 +426,11 @@ function find_lower_violations(index_, names_count, names) {
   }
 
   for (index_ = 1; index_ <= token_count; index_++) {
+    if (tokens[index_] == "extern" && tokens[index_ + 1] == "crate" \
+        && tokens[index_ + 2] == "self" && tokens[index_ + 3] == "as" \
+        && is_identifier(tokens[index_ + 4])) {
+      emit_finding("alias", index_, "extern crate self alias")
+    }
     if (root_path_at(index_, module_depth_at[index_])) {
       inspect_root_path(index_)
     }

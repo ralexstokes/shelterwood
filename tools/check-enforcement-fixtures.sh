@@ -117,6 +117,12 @@ expect_case layering-crate-root-grouped-alias-below check-layering-paths.sh \
   "crate-root aliases found below the driver layer:"
 expect_case layering-crate-root-glob-alias-below check-layering-paths.sh \
   "crate-root aliases found below the driver layer:"
+expect_case layering-extern-crate-self-alias-below check-layering-paths.sh \
+  "crate-root aliases found below the driver layer:"
+expect_case layering-raw-tree-root-reexport-below check-layering-paths.sh \
+  "upward tree root re-exports found below the driver layer:"
+expect_case layering-raw-inline-module-tree-root-reexport-below check-layering-paths.sh \
+  "upward tree root re-exports found below the driver layer:"
 expect_case layering-lib-alternate-tree-group-reexport-below check-layering-paths.sh \
   "upward tree root re-exports found below the driver layer:"
 expect_case layering-lib-restricted-tree-reexport-below check-layering-paths.sh \

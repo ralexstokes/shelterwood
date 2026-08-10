@@ -6,7 +6,7 @@ pub fn sample() {
     not_fastrand::seed();
 }
 
-mod nested {
+mod r#nested {
     // One `super` reaches only the containing policy module here, not the
     // crate root, even though the imported name shadows a tree export.
     use super::{System, *};

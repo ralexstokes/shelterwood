@@ -705,6 +705,10 @@ impl ScopeLifecycle {
         }
     }
 
+    pub(crate) fn state(&self) -> ScopeState {
+        self.state.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn running() -> Self {
         Self {

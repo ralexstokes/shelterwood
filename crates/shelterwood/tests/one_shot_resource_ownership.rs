@@ -93,6 +93,35 @@ fn one_shot_raw_resource_drops_once_on_readiness_definition_panic() {
 }
 
 #[tokio::test]
+async fn dynamic_one_shot_raw_resource_drops_once_on_readiness_definition_panic() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+    let count = ConsumeCount::default();
+
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        drop(scope.add_raw_once(
+            "raw",
+            RawOnceDef::new(ReadinessPanicRawActor {
+                _guard: count.guard(),
+            }),
+        ));
+    }));
+
+    assert!(result.is_err());
+    count.assert_once();
+    drop(
+        scope
+            .reserve_task("raw")
+            .expect("the panicking dynamic definition releases its id"),
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root stops");
+}
+
+#[tokio::test]
 async fn one_shot_raw_resource_drops_once_on_startup_failure() {
     let count = ConsumeCount::default();
     let mut tree = Tree::new();

@@ -96,7 +96,7 @@ pub(crate) struct MemberRecord {
     pub(crate) last_exit: Option<Exit>,
     pub(crate) restart_count: RestartCount,
     pub(crate) restart_at: Option<Instant>,
-    pub(crate) removing: bool,
+    pub(crate) membership_status: MembershipStatus,
     pub(crate) startup_aborted: bool,
 }
 
@@ -152,7 +152,7 @@ impl MemberCell {
             last_exit: None,
             restart_count: RestartCount::ZERO,
             restart_at: None,
-            removing: false,
+            membership_status: MembershipStatus::Active,
             startup_aborted: false,
         });
         Arc::new(Self {
@@ -1151,11 +1151,7 @@ impl ScopeCell {
                 MemberStage::Terminal(exit) => ChildState::Stopped { exit },
             },
             last_exit: record.last_exit,
-            membership_status: if record.removing {
-                MembershipStatus::Removing
-            } else {
-                MembershipStatus::Active
-            },
+            membership_status: record.membership_status,
             restart_count: record.restart_count,
             restart_policy: options.restart,
             retention: options.retention,
@@ -1351,7 +1347,24 @@ impl ScopeCell {
     }
 
     pub(crate) fn request_shutdown(&self) -> Option<Epoch> {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
+        let control = self.control.lock().expect("scope control mutex poisoned");
+        self.request_shutdown_locked(control)
+    }
+
+    /// [`Self::request_shutdown`] for destructors: tolerates a poisoned
+    /// control mutex so a drop-path request cannot panic — and abort — on a
+    /// thread that is already unwinding. Control holds plain request state,
+    /// so overwriting a poisoner's partial update is no worse than any other
+    /// racing request.
+    pub(crate) fn request_shutdown_ignoring_poison(&self) -> Option<Epoch> {
+        let control = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.request_shutdown_locked(control)
+    }
+
+    fn request_shutdown_locked(&self, mut control: MutexGuard<'_, ScopeControl>) -> Option<Epoch> {
         let RequestTarget {
             epoch: target,
             pending_incarnation,

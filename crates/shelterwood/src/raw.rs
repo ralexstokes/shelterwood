@@ -14,7 +14,7 @@ use std::{
 
 use crate::{
     ActorRef, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown, PolicyError, Readiness,
-    ReadinessDeadline, RestartPolicy, Retention, ScopeRef, Shutdown,
+    ReadinessDeadline, RestartPolicy, Retention, Shutdown,
     cancellation::CancellationToken,
     cells::{MailboxControl, MemberCell},
     definition::DefinitionSource,
@@ -25,6 +25,7 @@ use crate::{
         SignalWatcher, UnwindPanics, catch_panic, discard_panic, keep_first_panic,
         resume_preferred_panic, resume_preferred_panic_outside_unwind,
     },
+    scope::ScopeRef,
 };
 
 type DeferredMessage<M> = Box<dyn FnOnce() -> M + Send + 'static>;

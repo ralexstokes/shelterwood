@@ -789,14 +789,14 @@ async fn nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause() {
         std::error::Error::source(&startup).expect("startup error exposes its outer child failure");
     assert_eq!(
         outer_source.to_string(),
-        "child `nested` failed during startup"
+        "child `nested` failed during startup: child `inner-failure` failed during startup: startup failure"
     );
     let inner_source = outer_source
         .source()
         .expect("the child exit exposes the nested structured failure");
     assert_eq!(
         inner_source.to_string(),
-        "child `inner-failure` failed during startup"
+        "child `inner-failure` failed during startup: startup failure"
     );
     assert_eq!(
         inner_source

@@ -511,6 +511,15 @@ async fn raw_run_panic_with_panicking_destructor_publishes_one_report() {
     let shelterwood::StartupFailureCause::Child { exit, .. } = &failure.cause else {
         panic!("unexpected failure cause: {:?}", failure.cause);
     };
+    let rendered = failure.to_string();
+    assert!(
+        rendered.contains("child `double-panic` failed during startup: panicked"),
+        "startup failure identifies the child's panic: {rendered}"
+    );
+    assert!(
+        rendered.contains("injected run panic"),
+        "startup failure preserves the panic payload: {rendered}"
+    );
     assert!(
         matches!(
             exit.kind(),

@@ -159,6 +159,8 @@ enum DriverEvent {
     Removal(RemovalRequest),
 }
 
+const MIN_EVENT_BATCH_LIMIT: usize = 64;
+
 #[derive(Clone, Copy)]
 struct RemovalRequest {
     membership: Membership,
@@ -2379,15 +2381,24 @@ async fn run_scope_incarnation(
         root.member
             .update(|record| record.stage = MemberStage::Running);
     }
-    // The queue is unbounded so every producer can publish synchronously,
-    // including foreign-thread removal and detached admission. Preserve the
-    // old bounded lane's per-wake collection ceiling so a producer flood
-    // cannot defer shutdown signals or deadlines indefinitely.
-    let event_batch_limit = plan.children.len().saturating_mul(3).max(64);
+    // Both lanes are unbounded so their producers can publish synchronously.
+    // Keep child lifecycle events separate from externally generated dynamic
+    // control traffic: a large admission prefix must not strand the exit that
+    // completes shutdown. Bound each lane's per-wake collection so traffic
+    // cannot defer signals or deadlines indefinitely.
+    let event_batch_limit = plan
+        .children
+        .len()
+        .saturating_mul(3)
+        .max(MIN_EVENT_BATCH_LIMIT);
     let (events, mut event_receiver) = runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
-    let dynamic =
-        (plan.root.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(events.clone()));
+    let (dynamic, mut dynamic_event_receiver) = if plan.root.flavor == ScopeFlavor::Dynamic {
+        let (dynamic_events, receiver) = runtime::unbounded_mpsc();
+        (Some(DynamicControl::new(dynamic_events)), Some(receiver))
+    } else {
+        (None, None)
+    };
     // Transfer children one at a time. The not-yet-converted suffix remains
     // owned by ScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
@@ -2496,13 +2507,11 @@ async fn run_scope_incarnation(
             // cannot publish Running after the stop boundary.
             pending.push(Pending::Force.classified());
         }
-        for _ in 0..event_batch_limit {
-            let Some(event) = runtime::unbounded_mpsc_try_recv(&mut event_receiver) else {
-                break;
-            };
-            pending.push(Pending::Driver(event).classified());
+        collect_driver_events(&mut event_receiver, event_batch_limit, &mut pending);
+        if let Some(receiver) = dynamic_event_receiver.as_mut() {
+            collect_driver_events(receiver, event_batch_limit, &mut pending);
         }
-        // Disposal completions drain after the main lane, and `arbitrate`
+        // Disposal completions drain after the primary and dynamic lanes, and `arbitrate`
         // sorts stably, so a `ConstructionDisposed` always trails every
         // same-class `Exited` collected in the same wake — even one produced
         // later. A disposal is therefore a batch-tail event: the exit it
@@ -2554,6 +2563,7 @@ async fn run_scope_incarnation(
                     parent_shutdown: ancestor_command,
                 },
                 &mut event_receiver,
+                dynamic_event_receiver.as_mut(),
                 scope.deadlines.next(),
             )
             .await
@@ -2570,7 +2580,12 @@ async fn run_scope_incarnation(
                 runtime::ScopeWake::Message(Some(event)) => {
                     pending.push(Pending::Driver(event).classified());
                 }
-                runtime::ScopeWake::Message(None) => continue,
+                runtime::ScopeWake::ControlMessage(Some(event)) => {
+                    pending.push(Pending::Driver(event).classified());
+                }
+                runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
+                    continue;
+                }
             }
         }
 
@@ -2698,6 +2713,19 @@ impl Pending {
 
     fn classified(self) -> (ArbitrationClass, Self) {
         (self.class(), self)
+    }
+}
+
+fn collect_driver_events(
+    receiver: &mut runtime::UnboundedMpscReceiver<DriverEvent>,
+    limit: usize,
+    pending: &mut Vec<(ArbitrationClass, Pending)>,
+) {
+    for _ in 0..limit {
+        let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
+            break;
+        };
+        pending.push(Pending::Driver(event).classified());
     }
 }
 

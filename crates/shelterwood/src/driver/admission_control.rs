@@ -164,14 +164,14 @@ pub(super) struct DynamicState {
 }
 
 pub(crate) struct DynamicControl {
-    events: runtime::UnboundedMpscSender<DriverEvent>,
+    requests: runtime::UnboundedMpscSender<DriverEvent>,
     pub(super) state: Mutex<DynamicState>,
 }
 
 impl DynamicControl {
-    pub(super) fn new(events: runtime::UnboundedMpscSender<DriverEvent>) -> Arc<Self> {
+    pub(super) fn new(requests: runtime::UnboundedMpscSender<DriverEvent>) -> Arc<Self> {
         Arc::new(Self {
-            events,
+            requests,
             state: Mutex::new(DynamicState {
                 accepting: true,
                 entries: HashMap::new(),
@@ -485,7 +485,7 @@ impl DynamicRoute for DynamicControl {
 fn queue_driver_event(control: &DynamicControl, event: DriverEvent) {
     // Synchronous and runtime-independent: admission detaches at its first
     // poll, and removal may be signalled from a foreign thread.
-    let _ = runtime::unbounded_mpsc_send(&control.events, event);
+    let _ = runtime::unbounded_mpsc_send(&control.requests, event);
 }
 
 pub(super) struct AdmissionRequest {

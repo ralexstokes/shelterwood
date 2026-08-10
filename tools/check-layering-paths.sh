@@ -24,7 +24,14 @@ readonly below_driver_layers=(
   crates/shelterwood/src/task.rs
 )
 readonly driver_path="crates/shelterwood/src/driver.rs"
+readonly driver_module_root="crates/shelterwood/src/driver"
 readonly tree_path="crates/shelterwood/src/tree.rs"
+
+shopt -s globstar nullglob
+readonly driver_paths=(
+  "$driver_path"
+  "$driver_module_root"/**/*.rs
+)
 
 check_forbidden() {
   local message="$1"
@@ -60,12 +67,12 @@ check_forbidden \
 check_forbidden \
   "upward tree references found in the driver layer:" \
   '\btree::' \
-  "$driver_path"
+  "${driver_paths[@]}"
 
 check_forbidden \
   "child option resolution escaped the shared plan funnel:" \
   '\bresolve_common\b' \
-  "$driver_path"
+  "${driver_paths[@]}"
 
 check_forbidden \
   "dynamic child-id validation escaped the reservation boundary:" \

@@ -21,9 +21,9 @@ use crate::{
     mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
     policy::{ChildMode, CommonOptions},
     runtime::{
-        self, ActorWork, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher,
-        UnwindPanics, catch_panic, discard_panic, keep_first_panic, resume_preferred_panic,
-        resume_preferred_panic_outside_unwind,
+        self, ActorWork, CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, Signal,
+        SignalWatcher, UnwindPanics, catch_panic, discard_panic, keep_first_panic,
+        resume_preferred_panic, resume_preferred_panic_outside_unwind,
     },
     scope::ScopeRef,
 };
@@ -252,19 +252,21 @@ impl PanicSlot {
 /// The queue is deliberately unbounded, but sustained traffic cannot grow it
 /// without bound. Every entry is produced by work this incarnation itself
 /// started — exactly one completion per offload, no external sender can
-/// reach it — and `next_ready` snapshots the queued completions at each
-/// mailbox delivery (timer batches snapshot likewise) and drains that prefix
-/// ahead of later mailbox input, so the population stays bounded by the
-/// actor's own in-flight offload count plus the completions arriving within
-/// one such window. Bounded-mailbox policy governs external input only (SPEC §5.5:
-/// offload completions do not consume mailbox capacity), and imposing a
-/// bound here would either block the offload task or drop a completion the
-/// total-continuation contract promises to deliver. Freezing at stop clears
-/// the queue, and dropped `RawResources` clear it on every exit path.
+/// reach it — and `next_ready` snapshots queued completions into bounded
+/// arbitration turns. A turn admits at most one mailbox delivery before its
+/// captured completion prefix, with continuation fairness interleaved, so the
+/// population stays bounded by the actor's own in-flight offload count plus
+/// the completions arriving within one such window. Bounded-mailbox policy
+/// governs external input only (SPEC §5.5: offload completions do not consume
+/// mailbox capacity), and imposing a bound here would either block the offload
+/// task or drop a completion the total-continuation contract promises to
+/// deliver. Freezing at stop clears the queue, and dropped `RawResources`
+/// clear it on every exit path.
 struct EventQueue<M> {
-    // Timer batches snapshot the number of currently queued events. Insertion
-    // and the snapshot share this lock, so FIFO order itself is the sequence
-    // and there is no integer counter whose saturation could blur a boundary.
+    // Arbitration batches snapshot the number of currently queued events.
+    // Insertion and the snapshot share this lock, so FIFO order itself is the
+    // sequence and there is no integer counter whose saturation could blur a
+    // boundary.
     queue: Mutex<VecDeque<QueuedEvent<M>>>,
     signal: Signal,
 }
@@ -313,6 +315,7 @@ impl<M> EventQueue<M> {
             .len()
     }
 
+    #[cfg(test)]
     fn pop(&self) -> Option<QueuedEvent<M>> {
         self.queue
             .lock()
@@ -538,13 +541,81 @@ impl<M> TimerStore<M> {
     }
 }
 
-struct FiredTimerBatch {
+struct ReadyBatch {
     armings: VecDeque<ArmingOrder>,
+    // Only fired batches constrain continuations to a captured prefix.
+    // Steady-state continuations stay live so one queued by an external
+    // handler retains `continue_with`'s next-message priority.
     continuations_remaining: usize,
     mailbox_through: AcceptedSequence,
+    // Steady state takes one mailbox delivery before its captured offload
+    // prefix. A timer promotion removes that budget and drains the entire
+    // pre-fire mailbox prefix before delivering the timer armings.
+    mailbox_remaining: Option<usize>,
     mailbox_complete: bool,
     offloads_remaining: usize,
     offloads_complete: bool,
+}
+
+impl ReadyBatch {
+    fn steady(mailbox_through: AcceptedSequence, offloads_remaining: usize) -> Self {
+        Self {
+            armings: VecDeque::new(),
+            continuations_remaining: 0,
+            mailbox_through,
+            mailbox_remaining: Some(1),
+            mailbox_complete: false,
+            offloads_remaining,
+            offloads_complete: false,
+        }
+    }
+
+    fn promote_to_fired(
+        &mut self,
+        armings: VecDeque<ArmingOrder>,
+        continuations_remaining: usize,
+        mailbox_through: AcceptedSequence,
+        offloads_remaining: usize,
+    ) {
+        debug_assert!(!armings.is_empty());
+        debug_assert!(self.mailbox_remaining.is_some());
+        self.armings = armings;
+        self.continuations_remaining = continuations_remaining;
+        self.mailbox_through = mailbox_through;
+        self.mailbox_remaining = None;
+        self.mailbox_complete = false;
+        self.offloads_remaining = offloads_remaining;
+        self.offloads_complete = false;
+    }
+
+    fn mailbox_budget_exhausted(&self) -> bool {
+        self.mailbox_remaining == Some(0)
+    }
+
+    fn is_fired(&self) -> bool {
+        self.mailbox_remaining.is_none()
+    }
+
+    fn continuation_is_eligible(&self) -> bool {
+        !self.is_fired() || self.continuations_remaining > 0
+    }
+
+    fn record_continuation_delivery(&mut self) {
+        if self.is_fired() {
+            debug_assert!(self.continuations_remaining > 0);
+            self.continuations_remaining -= 1;
+        }
+    }
+
+    fn record_mailbox_delivery(&mut self) {
+        if let Some(remaining) = &mut self.mailbox_remaining {
+            debug_assert!(*remaining > 0);
+            *remaining -= 1;
+            if *remaining == 0 {
+                self.mailbox_complete = true;
+            }
+        }
+    }
 }
 
 struct OffloadFutureState {
@@ -718,16 +789,9 @@ struct RawResources<M> {
     // mailbox/offload/timer item. `next_ready` uses it to prohibit two local
     // continuations from leading while an external source remains eligible.
     continuation_needs_external: bool,
-    // Queued offload completions granted the lead over the mailbox, captured
-    // as the event-queue watermark at the previous steady-state mailbox
-    // delivery. `next_ready` drains this many completion entries before
-    // consulting the mailbox again, so an always-readable mailbox cannot
-    // starve the completion queue, while completions pushed after the
-    // capture wait behind the next mailbox message and cannot starve it.
-    offloads_lead: usize,
     timers: TimerStore<M>,
     next_timer_order: ArmingOrder,
-    fired_batch: Option<FiredTimerBatch>,
+    ready_batch: Option<ReadyBatch>,
     events: Arc<EventQueue<M>>,
     panic: Arc<PanicSlot>,
     event_watcher: SignalWatcher,
@@ -742,10 +806,9 @@ impl<M> Default for RawResources<M> {
             accepting: true,
             continuations: VecDeque::new(),
             continuation_needs_external: false,
-            offloads_lead: 0,
             timers: TimerStore::default(),
             next_timer_order: ArmingOrder::ZERO,
-            fired_batch: None,
+            ready_batch: None,
             events,
             panic: Arc::new(PanicSlot::default()),
             event_watcher,
@@ -768,8 +831,7 @@ impl<M> RawResources<M> {
         }
         self.continuations.clear();
         self.timers.clear();
-        self.fired_batch = None;
-        self.offloads_lead = 0;
+        self.ready_batch = None;
         self.events.clear();
         dropped_continuations
     }
@@ -852,7 +914,7 @@ pub struct RawContext<M> {
     scope: ScopeRef,
     shutdown: CancellationToken,
     abort: CancellationToken,
-    ready: Latch,
+    ready: CompletionGatedLatch,
     local_stop: Latch,
     readiness: Readiness,
     mailbox_shutdown: MailboxShutdown,
@@ -1043,9 +1105,9 @@ impl<M: Send + 'static> RawContext<M> {
     /// Completions re-enter the loop through incarnation-internal storage
     /// that does not consume mailbox capacity (SPEC §5.5). That storage is
     /// unbounded but cannot accumulate a backlog: it holds at most one entry
-    /// per offload the actor itself started, and completions already queued
-    /// when a mailbox message is delivered are consumed ahead of later
-    /// mailbox input, so its population stays proportional to the caller's
+    /// per offload the actor itself started, and each bounded arbitration turn
+    /// admits at most one mailbox delivery before its captured completion
+    /// prefix. Its population therefore stays proportional to the caller's
     /// in-flight count even under sustained mailbox traffic. Bookkeeping for
     /// finished offloads is reclaimed when a new offload starts and when the
     /// loop goes idle.
@@ -1067,8 +1129,8 @@ impl<M: Send + 'static> RawContext<M> {
     /// Starts guarded incarnation-owned async work with one deadline budget.
     ///
     /// Completion storage follows [`offload`](Self::offload): unbounded, but
-    /// one entry per offload the actor itself started, drained ahead of
-    /// later mailbox input so no backlog accumulates.
+    /// one entry per offload the actor itself started and drained in bounded
+    /// arbitration turns alongside mailbox input so no backlog accumulates.
     pub fn offload_scoped<F, T, C>(
         &mut self,
         work: F,
@@ -1244,25 +1306,28 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Selects one live-incarnation input without awaiting.
     ///
-    /// A due timer snapshots continuations, accepted live-mailbox messages,
-    /// queued offload completions, and timer armings before any timer message
-    /// is emitted. Stage priority is: at most one fairness continuation,
-    /// mailbox prefix, offload prefix, remaining snapshotted continuations,
-    /// then timer armings. Each external delivery permits one continuation to
-    /// lead the next call, so continuations can interleave with the mailbox and
-    /// offload stages without repeatedly cutting ahead of them. Once those
-    /// external prefixes are exhausted, the captured continuation remainder
-    /// drains before timers; arrivals after any watermark cannot jump the due
-    /// timers. This prevents both an always-readable mailbox and a self-feeding
-    /// continuation queue from starving the other.
+    /// Every selection runs through one bounded arbitration batch. Steady
+    /// state captures at most one mailbox delivery together with the queued
+    /// offload prefix, while continuations remain live across handler calls.
+    /// If a timer is due, that same batch is promoted by widening the mailbox
+    /// cutoff to everything accepted at the fire observation and capturing
+    /// the continuation and offload prefixes at that point.
     ///
-    /// Outside a timer batch, each mailbox delivery snapshots the queued
-    /// offload completions, and that prefix leads the mailbox on later
-    /// calls. An always-readable mailbox therefore cannot starve the
-    /// completion queue — the backlog never grows across mailbox deliveries
-    /// — while completions pushed after the snapshot wait behind the next
-    /// mailbox message, so a self-feeding offload chain cannot starve
-    /// external input either.
+    /// Stage priority is: at most one fairness continuation, mailbox prefix,
+    /// offload prefix, remaining snapshotted continuations, then timer
+    /// armings. Each external delivery permits one continuation to lead the
+    /// next call, so continuations can interleave with the mailbox and offload
+    /// stages without repeatedly cutting ahead of them. Once those external
+    /// prefixes are exhausted, the captured continuation remainder drains
+    /// before timers; arrivals after a fired batch's cutoffs cannot jump its
+    /// timers. The one-mailbox steady-state bound prevents an always-readable
+    /// mailbox from starving completions, while the completion cutoff prevents
+    /// a self-feeding offload chain from starving the mailbox. One steady-batch
+    /// consequence: a mailbox message arriving mid-drain waits behind the
+    /// batch's captured completion prefix (bounded by the in-flight offload
+    /// count) — a cross-source ordering the spec leaves unspecified (SPEC §5.2:
+    /// no global linearization point across source cutoffs), so tests must not
+    /// pin any particular interleaving.
     ///
     /// Frozen mailbox input is deliberately absent. Once stopping begins,
     /// [`try_recv`](Self::try_recv) bypasses this selector and drains the
@@ -1270,105 +1335,95 @@ impl<M: Send + 'static> RawContext<M> {
     fn next_ready(&mut self) -> Option<M> {
         loop {
             self.resources.resume_pending_panic();
-            self.begin_fired_batch();
-            if let Some(mut batch) = self.resources.fired_batch.take() {
-                if !self.resources.continuation_needs_external
-                    && batch.continuations_remaining > 0
-                    && let Some(message) = self.resources.continuations.pop_front()
-                {
-                    batch.continuations_remaining -= 1;
-                    self.resources.continuation_needs_external = true;
-                    self.resources.fired_batch = Some(batch);
+            self.begin_ready_batch();
+            let mut batch = self
+                .resources
+                .ready_batch
+                .take()
+                .expect("ready selection always owns an arbitration batch");
+            if !self.resources.continuation_needs_external
+                && batch.continuation_is_eligible()
+                && let Some(message) = self.resources.continuations.pop_front()
+            {
+                batch.record_continuation_delivery();
+                self.resources.continuation_needs_external = true;
+                self.resources.ready_batch = Some(batch);
+                return Some(message);
+            }
+
+            if !batch.mailbox_complete {
+                let message = self.receiver.try_recv_live_through(batch.mailbox_through);
+                if let Some(message) = message {
+                    batch.record_mailbox_delivery();
+                    self.resources.continuation_needs_external = false;
+                    self.resources.ready_batch = Some(batch);
                     return Some(message);
                 }
+                batch.mailbox_complete = true;
+            }
 
-                if !batch.mailbox_complete {
-                    let message = self.receiver.try_recv_live_through(batch.mailbox_through);
-                    if let Some(message) = message {
-                        self.resources.continuation_needs_external = false;
-                        self.resources.fired_batch = Some(batch);
-                        return Some(message);
-                    }
-                    batch.mailbox_complete = true;
-                }
-
-                if !batch.offloads_complete {
-                    while let Some(event) = self
-                        .resources
-                        .events
-                        .pop_through(&mut batch.offloads_remaining)
-                    {
-                        if let Some(message) = Self::materialize_event(event) {
-                            self.resources.continuation_needs_external = false;
-                            self.resources.fired_batch = Some(batch);
-                            return Some(message);
-                        }
-                    }
-                    batch.offloads_complete = true;
-                }
-
-                if batch.continuations_remaining > 0
-                    && let Some(message) = self.resources.continuations.pop_front()
+            if !batch.offloads_complete {
+                while let Some(event) = self
+                    .resources
+                    .events
+                    .pop_through(&mut batch.offloads_remaining)
                 {
-                    batch.continuations_remaining -= 1;
-                    self.resources.continuation_needs_external = true;
-                    self.resources.fired_batch = Some(batch);
-                    return Some(message);
-                }
-                batch.continuations_remaining = 0;
-
-                while let Some(arming) = batch.armings.pop_front() {
-                    if let Some(message) = self.deliver_timer(arming) {
+                    if let Some(message) = Self::materialize_event(event) {
                         self.resources.continuation_needs_external = false;
-                        self.resources.fired_batch = Some(batch);
+                        self.resources.ready_batch = Some(batch);
                         return Some(message);
                     }
                 }
-                self.resources.fired_batch = None;
+                batch.offloads_complete = true;
+            }
+
+            // A steady batch may have exhausted its captured external turn
+            // while a continuation handler made later external work ready.
+            // Start a fresh bounded turn before allowing another continuation
+            // so that work receives §5.2's mandatory fairness opportunity.
+            // Fired batches deliberately retain their immutable cutoffs:
+            // post-fire arrivals must not jump the already-fired timers.
+            if !batch.is_fired()
+                && self.resources.continuation_needs_external
+                && (batch.mailbox_budget_exhausted()
+                    || self.receiver.accepted_sequence() > batch.mailbox_through
+                    || self.resources.events.watermark() > 0)
+            {
+                self.resources.ready_batch = None;
                 continue;
             }
 
-            if !self.resources.continuation_needs_external
+            if batch.continuation_is_eligible()
                 && let Some(message) = self.resources.continuations.pop_front()
             {
+                batch.record_continuation_delivery();
                 self.resources.continuation_needs_external = true;
+                self.resources.ready_batch = Some(batch);
                 return Some(message);
             }
+            batch.continuations_remaining = 0;
 
-            while self.resources.offloads_lead > 0 {
-                let Some(event) = self.resources.events.pop() else {
-                    self.resources.offloads_lead = 0;
-                    break;
-                };
-                self.resources.offloads_lead -= 1;
-                if let Some(message) = Self::materialize_event(event) {
+            while let Some(arming) = batch.armings.pop_front() {
+                if let Some(message) = self.deliver_timer(arming) {
                     self.resources.continuation_needs_external = false;
+                    self.resources.ready_batch = Some(batch);
                     return Some(message);
                 }
             }
 
-            let mailbox = self.receiver.try_recv_live();
-            if let Some(message) = mailbox {
-                // Completions already queued at this delivery lead the
-                // mailbox on later calls, so the completion backlog cannot
-                // grow across mailbox deliveries, while completions pushed
-                // after this snapshot wait their turn and cannot starve the
-                // mailbox.
-                self.resources.offloads_lead = self.resources.events.watermark();
-                self.resources.continuation_needs_external = false;
-                return Some(message);
-            }
-
-            while let Some(event) = self.resources.events.pop() {
-                if let Some(message) = Self::materialize_event(event) {
-                    self.resources.continuation_needs_external = false;
-                    return Some(message);
-                }
-            }
-
-            if let Some(message) = self.resources.continuations.pop_front() {
-                self.resources.continuation_needs_external = true;
-                return Some(message);
+            let mailbox_may_remain = batch.mailbox_budget_exhausted();
+            let mailbox_cutoff = batch.mailbox_through;
+            self.resources.ready_batch = None;
+            let timer_is_due = self
+                .next_timer_deadline()
+                .is_some_and(|deadline| deadline <= runtime::now());
+            if mailbox_may_remain
+                || self.receiver.accepted_sequence() > mailbox_cutoff
+                || self.resources.events.watermark() > 0
+                || !self.resources.continuations.is_empty()
+                || timer_is_due
+            {
+                continue;
             }
             return None;
         }
@@ -1378,23 +1433,38 @@ impl<M: Send + 'static> RawContext<M> {
         (!event.cancellation.is_fired()).then(event.make_message)
     }
 
-    fn begin_fired_batch(&mut self) {
-        if self.resources.fired_batch.is_some() || self.resources.timers.is_empty() {
+    fn begin_ready_batch(&mut self) {
+        if self.resources.ready_batch.is_none() {
+            self.resources.ready_batch = Some(ReadyBatch::steady(
+                self.receiver.accepted_sequence(),
+                self.resources.events.watermark(),
+            ));
+        }
+        if self
+            .resources
+            .ready_batch
+            .as_ref()
+            .is_some_and(ReadyBatch::is_fired)
+            || self.resources.timers.is_empty()
+        {
             return;
         }
+
         let now = runtime::now();
         let armings = self.resources.timers.take_due(now);
         if armings.is_empty() {
             return;
         }
-        self.resources.fired_batch = Some(FiredTimerBatch {
-            armings,
-            continuations_remaining: self.resources.continuations.len(),
-            mailbox_through: self.receiver.accepted_sequence(),
-            mailbox_complete: false,
-            offloads_remaining: self.resources.events.watermark(),
-            offloads_complete: false,
-        });
+        self.resources
+            .ready_batch
+            .as_mut()
+            .expect("steady batch was initialized")
+            .promote_to_fired(
+                armings,
+                self.resources.continuations.len(),
+                self.receiver.accepted_sequence(),
+                self.resources.events.watermark(),
+            );
     }
 
     fn deliver_timer(&mut self, arming: ArmingOrder) -> Option<M> {
@@ -1756,7 +1826,7 @@ pub(crate) struct RawRunContext {
     pub(crate) scope: ScopeRef,
     pub(crate) shutdown: Latch,
     pub(crate) abort: Latch,
-    pub(crate) ready: Latch,
+    pub(crate) ready: CompletionGatedLatch,
     pub(crate) local_stop: Latch,
     pub(crate) mailbox_shutdown: MailboxShutdown,
 }

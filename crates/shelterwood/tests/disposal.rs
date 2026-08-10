@@ -516,10 +516,9 @@ impl Drop for HostileFallbackCapture {
 }
 
 #[tokio::test]
-async fn non_runtime_disposals_share_one_thread_and_contain_panics() {
+async fn non_runtime_disposals_run_off_callers_and_contain_panics() {
     const VALUES: usize = 8;
 
-    let test_thread = thread::current().id();
     let tree = DynamicTree::new();
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("dynamic root starts");
@@ -537,8 +536,8 @@ async fn non_runtime_disposals_share_one_thread_and_contain_panics() {
         admissions.push(slot.define(TaskDef::new({
             let capture = HostileFallbackCapture {
                 dropped: dropped.clone(),
-                // The first destructor blocks so every later job queues
-                // behind it on the shared fallback disposal thread.
+                // Include a blocking destructor to exercise isolation without
+                // requiring any particular disposal-worker topology.
                 blocker: (index == 0).then(|| gate.blocker()),
                 panic: (index == VALUES - 1).then_some("hostile fallback destructor"),
             };
@@ -567,15 +566,12 @@ async fn non_runtime_disposals_share_one_thread_and_contain_panics() {
         disposal_threads.push(drops.recv().await.expect("every capture is disposed"));
     }
     assert!(drops.recv().await.is_none());
-    let disposal_thread = disposal_threads[0];
     assert!(
         disposal_threads
             .iter()
-            .all(|thread| *thread == disposal_thread),
-        "queued fallback disposals share one disposal thread instead of one thread per value"
+            .all(|thread| *thread != dropper_thread),
+        "every disposal runs off the thread that submitted it"
     );
-    assert_ne!(disposal_thread, dropper_thread);
-    assert_ne!(disposal_thread, test_thread);
     for task in tasks {
         assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     }
@@ -1474,6 +1470,52 @@ async fn acceptance_timed_out_call_disposes_recovered_message_off_the_caller() {
         .expect("recovered message reports its disposal thread");
     gate.release();
     assert_ne!(disposal_thread, thread::current().id());
+    drop(tree);
+}
+
+#[tokio::test]
+async fn overdue_call_construction_disposes_message_off_constructor_task_and_contains_panic() {
+    let (constructed, mut construction_threads) = tokio::sync::mpsc::unbounded_channel();
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "unread",
+            RawOnceDef::new(Unread::<ProbedCall<DropProbe>>::default()),
+        )
+        .expect("valid actor");
+
+    let probe = DropProbe::panicking(dropped, "overdue call message destructor");
+    let error = actor
+        .call(
+            move |reply| {
+                constructed
+                    .send(thread::current().id())
+                    .expect("construction thread is observed");
+                // The deadline is captured immediately before invoking this
+                // synchronous constructor, so sleeping here deterministically
+                // finishes construction outside the call's total budget.
+                thread::sleep(Duration::from_millis(25));
+                ProbedCall {
+                    _reply: reply,
+                    _probe: probe,
+                }
+            },
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("overdue construction times out before mailbox submission");
+    assert!(matches!(error.kind, CallErrorKind::AcceptanceTimedOut));
+
+    let construction_thread = construction_threads
+        .recv()
+        .await
+        .expect("constructor reports its thread");
+    let disposal_thread = drops
+        .recv()
+        .await
+        .expect("overdue message destructor runs despite its contained panic");
+    assert_ne!(disposal_thread, construction_thread);
     drop(tree);
 }
 

@@ -695,10 +695,12 @@ trait RawActor: Send + 'static {
   raw-actor wrapper, which owns the `Uninit(Args) → Running(A)` transition;
   `ActorDef` and `ActorOnceDef` construct that wrapper rather than relying on
   a blanket `impl<A: Actor> RawActor for A` (which cannot exist before
-  `init` produces `A`). The wrapper stores its declared readiness mode, the
-  engine reads it before `run` is first polled, and only `AfterInit` performs
-  the automatic post-init `mark_ready`; `Immediate` and `Manual` retain their
-  declared meanings. Raw decorators can wrap `Handler<A>` directly and may
+  `init` produces `A`). The wrapper supplies `AfterInit` as its type-level
+  readiness default; the engine resolves that default with any child-definition
+  override before constructing an incarnation, and only an effective
+  `AfterInit` mode performs the automatic post-init `mark_ready`. `Immediate`
+  and `Manual` retain their declared meanings. Raw decorators can wrap
+  `Handler<A>` directly and may
   await before delegation without changing readiness. Handler decorators use
   the zero-cost same-message `Context::for_actor` / `StopContext::for_actor`
   reborrow, sharing identity and incarnation-owned resources. Executable
@@ -1116,10 +1118,10 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   boundary. A decorator that awaited anything before delegating silently
   released the ordered-startup gate before the inner actor's init ran.)
 - Per-declaration override lives on the child options (§8) uniformly for
-  actor and task children — readiness is per instance, not per type [#368]
-  (e.g. "not ready
-  until an external handshake completes" must be declarable on one instance
-  of an ordinary handler actor). Subtree children are the stated
+  actor and task children. A raw actor type supplies the fallback mode, but
+  each child definition resolves its own effective mode [#368] (e.g. "not
+  ready until an external handshake completes" must be declarable for one
+  ordinary handler child without changing the handler type). Subtree children are the stated
   exception: their readiness is structural (below), so the subtree veneer
   carries no mode override — only the deadline.
 - The deadline is not part of the mode: it lives on the shared options

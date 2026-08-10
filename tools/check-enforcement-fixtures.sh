@@ -94,7 +94,7 @@ expect_case layering-scope-driver-below check-layering-paths.sh \
 expect_case layering-scope-tree-alias-below check-layering-paths.sh \
   "upward driver or tree references found below the driver layer:"
 expect_case layering-scope-crate-root-alias-below check-layering-paths.sh \
-  "upward tree root re-exports found below the driver layer:"
+  "crate-root aliases found below the driver layer:"
 expect_case layering-scope-crate-root-glob-below check-layering-paths.sh \
   "glob imports of the crate root found below the driver layer:"
 expect_case layering-scope-tree-grouped-reexport-below check-layering-paths.sh \
@@ -104,9 +104,27 @@ expect_case layering-scope-tree-root-reexport-below check-layering-paths.sh \
 expect_case layering-policy-tree-root-reexport-below check-layering-paths.sh \
   "upward tree root re-exports found below the driver layer:"
 expect_case layering-observe-crate-root-alias-below check-layering-paths.sh \
-  "upward tree root re-exports found below the driver layer:"
+  "crate-root aliases found below the driver layer:"
 expect_case layering-mailbox-crate-root-glob-below check-layering-paths.sh \
   "glob imports of the crate root found below the driver layer:"
+expect_case layering-nested-tree-root-reexport-below check-layering-paths.sh \
+  "upward tree root re-exports found below the driver layer:"
+expect_case layering-nested-crate-root-glob-below check-layering-paths.sh \
+  "glob imports of the crate root found below the driver layer:"
+expect_case layering-nested-crate-root-alias-below check-layering-paths.sh \
+  "crate-root aliases found below the driver layer:"
+expect_case layering-crate-root-grouped-alias-below check-layering-paths.sh \
+  "crate-root aliases found below the driver layer:"
+expect_case layering-crate-root-glob-alias-below check-layering-paths.sh \
+  "crate-root aliases found below the driver layer:"
+expect_case layering-lib-alternate-tree-group-reexport-below check-layering-paths.sh \
+  "upward tree root re-exports found below the driver layer:"
+expect_case layering-lib-restricted-tree-reexport-below check-layering-paths.sh \
+  "upward tree root re-exports found below the driver layer:"
+expect_case layering-lib-commented-tree-group-reexport-below check-layering-paths.sh \
+  "upward tree root re-exports found below the driver layer:"
+expect_case layering-lib-tree-glob-fails-closed check-layering-paths.sh \
+  "tree glob imports cannot be derived safely"
 expect_case layering-tree-below check-layering-paths.sh \
   "upward driver or tree references found below the driver layer:"
 expect_case layering-tree-in-driver check-layering-paths.sh \

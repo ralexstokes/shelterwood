@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly script_dir
+
 # The fixture harness re-points this scan at a mirrored source tree; the
 # default scans the repository from the invoking directory as before.
 cd "${SHELTERWOOD_ENFORCEMENT_ROOT:-.}"
@@ -10,6 +13,7 @@ readonly lib_path="$source_root/lib.rs"
 readonly driver_path="$source_root/driver.rs"
 readonly tree_path="$source_root/tree.rs"
 readonly cells_path="$source_root/cells.rs"
+readonly use_parser_path="$script_dir/check-layering-uses.awk"
 
 # Every Rust source except the two orchestration modules and their submodules
 # belongs below the driver. Derive all four sets recursively so either a flat
@@ -36,82 +40,17 @@ readonly -a driver_layers
 readonly -a tree_layers
 readonly -a cells_layers
 
-# A direct `tree::`/`driver::` reference is the usual spelling, while the
-# longer alternatives cover aliases imported from either the crate root or a
-# grouped root import. `--multiline` below lets the grouped form span the
-# rustfmt-normalized lines of a `use crate::{ ... };` statement.
-readonly upward_module_pattern='\b(driver|tree)::|\b(crate|super)::(driver|tree)\b|\b(crate|super)::\{[^;]*\b(driver|tree)\b[[:space:]]*(,|}|as\b)'
+# Direct `tree::`/`driver::` references are independent of how a source file is
+# nested. Crate-root paths and use trees need module-depth-aware parsing and
+# are checked below by `check-layering-uses.awk`.
+readonly upward_module_pattern='\b(driver|tree)::'
 
 # Derive the tree-layer names visible at the crate root from the source of
-# truth. The parser accepts rustfmt's grouped form plus a single-item re-export
-# and honors `as` aliases, which are the identifiers lower layers can name.
+# truth. The token parser handles visibility modifiers, alternate/nested use
+# trees, aliases, and comments. It fails closed on tree globs or unsupported
+# syntax instead of silently returning an incomplete pattern.
 set +e
-tree_root_exports="$(
-  awk '
-    function trim(value) {
-      sub(/^[[:space:]]+/, "", value)
-      sub(/[[:space:]]+$/, "", value)
-      return value
-    }
-
-    function emit(item, parts, count) {
-      sub(/\/\/.*/, "", item)
-      item = trim(item)
-      if (item == "") {
-        return
-      }
-      count = split(item, parts, /[[:space:]]+as[[:space:]]+/)
-      item = trim(parts[count])
-      if (item !~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
-        print "unsupported tree re-export item in lib.rs: " item > "/dev/stderr"
-        invalid = 1
-        return
-      }
-      print item
-    }
-
-    BEGIN {
-      prefix = "^[[:space:]]*pub[[:space:]]+use[[:space:]]+((crate|self)::)?tree::"
-      group_prefix = prefix "[{]"
-    }
-
-    {
-      line = $0
-      if (!in_group) {
-        if (line ~ group_prefix) {
-          sub(group_prefix, "", line)
-          in_group = 1
-        } else if (line ~ prefix) {
-          sub(prefix, "", line)
-          sub(/[[:space:]]*;.*/, "", line)
-          emit(line)
-          next
-        } else {
-          next
-        }
-      }
-
-      if (line ~ /[}][[:space:]]*;/) {
-        sub(/[}][[:space:]]*;.*/, "", line)
-        in_group = 0
-      }
-      item_count = split(line, items, ",")
-      for (item_index = 1; item_index <= item_count; item_index++) {
-        emit(items[item_index])
-      }
-    }
-
-    END {
-      if (in_group) {
-        print "unterminated pub use tree group in lib.rs" > "/dev/stderr"
-        invalid = 1
-      }
-      if (invalid) {
-        exit 2
-      }
-    }
-  ' "$lib_path"
-)"
+tree_root_exports="$(awk -v mode=lib -v base_module_depth=0 -f "$use_parser_path" "$lib_path")"
 tree_root_export_status=$?
 set -e
 if [[ "$tree_root_export_status" -ne 0 ]]; then
@@ -164,24 +103,73 @@ check_forbidden() {
   esac
 }
 
-collect_root_aliases() {
-  local pattern="$1"
-  local layer_file="$2"
-  local aliases
-  local status
-  set +e
-  aliases="$({ rg --multiline --no-filename --only-matching --replace '$2' "$pattern" "$layer_file"; } 2>&1)"
-  status=$?
-  set -e
+module_depth_for_file() {
+  local layer_file="$1"
+  local relative="${layer_file#"$source_root/"}"
+  local -a components
+  IFS=/ read -r -a components <<< "$relative"
 
-  case "$status" in
-    0) printf '%s\n' "$aliases" ;;
-    1) ;;
-    *)
-      echo "$aliases" >&2
-      exit "$status"
-      ;;
-  esac
+  local depth="${#components[@]}"
+  if [[ "${components[-1]}" == "mod.rs" ]]; then
+    ((depth--))
+  fi
+  printf '%s\n' "$depth"
+}
+
+collect_layer_findings() {
+  local layer_file
+  for layer_file in "${below_driver_layers[@]}"; do
+    local module_depth
+    module_depth="$(module_depth_for_file "$layer_file")"
+
+    local analysis
+    local status
+    set +e
+    analysis="$(
+      awk \
+        -v mode=lower \
+        -v base_module_depth="$module_depth" \
+        -v forbidden_exports="$tree_root_export_pattern" \
+        -f "$use_parser_path" \
+        "$layer_file" 2>&1
+    )"
+    status=$?
+    set -e
+    if [[ "$status" -ne 0 ]]; then
+      printf '%s\n' "$analysis"
+      return "$status"
+    fi
+
+    local kind
+    local line
+    local detail
+    while IFS=$'\t' read -r kind line detail; do
+      [[ -z "$kind" ]] && continue
+      printf '%s\t%s:%s\t%s\n' "$kind" "$layer_file" "$line" "$detail"
+    done <<< "$analysis"
+  done
+}
+
+check_layer_findings() {
+  local message="$1"
+  local expected_kind="$2"
+  local findings="$3"
+  local matches=""
+
+  local kind
+  local location
+  local detail
+  while IFS=$'\t' read -r kind location detail; do
+    if [[ "$kind" == "$expected_kind" ]]; then
+      matches+="${matches:+$'\n'}$location: $detail"
+    fi
+  done <<< "$findings"
+
+  if [[ -n "$matches" ]]; then
+    echo "$message" >&2
+    echo "$matches" >&2
+    exit 1
+  fi
 }
 
 check_forbidden \
@@ -189,37 +177,36 @@ check_forbidden \
   "$upward_module_pattern" \
   "${below_driver_layers[@]}"
 
-check_forbidden \
+set +e
+layer_findings="$(collect_layer_findings)"
+layer_findings_status=$?
+set -e
+if [[ "$layer_findings_status" -ne 0 ]]; then
+  echo "$layer_findings" >&2
+  exit "$layer_findings_status"
+fi
+readonly layer_findings
+
+check_layer_findings \
+  "upward driver or tree references found below the driver layer:" \
+  module \
+  "$layer_findings"
+check_layer_findings \
   "upward tree root re-exports found below the driver layer:" \
-  "\\b(crate|super)::($tree_root_export_pattern)\\b|\\buse[[:space:]]+(crate|super)::\\{[^;]*\\b($tree_root_export_pattern)\\b" \
-  "${below_driver_layers[@]}"
-
-# A glob import of the crate root pulls in every tree-layer re-export without
-# naming any of them, so neither pattern above can see it. The grouped
-# alternative covers a `*` anywhere inside a `use (crate|super)::{ ... };`
-# tree, which `--multiline` lets span rustfmt-normalized lines.
-check_forbidden \
+  export \
+  "$layer_findings"
+check_layer_findings \
   "glob imports of the crate root found below the driver layer:" \
-  '\buse[[:space:]]+(crate|super)::(\*|\{[^;]*\*)' \
-  "${below_driver_layers[@]}"
+  glob \
+  "$layer_findings"
 
-# A crate-root alias can hide both direct root exports and the module names
-# checked above. Extract direct and grouped `self` aliases, then scan uses of
-# each exact identifier in the file that declared it so unrelated aliases in
-# another module remain permitted.
-for layer_file in "${below_driver_layers[@]}"; do
-  root_aliases="$(
-    collect_root_aliases '\buse[[:space:]]+(crate|super)[[:space:]]+as[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*;' "$layer_file"
-    collect_root_aliases '\buse[[:space:]]+(crate|super)::\{[^;]*\bself[[:space:]]+as[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*(,|})' "$layer_file"
-  )"
-  while IFS= read -r root_alias; do
-    [[ -z "$root_alias" ]] && continue
-    check_forbidden \
-      "upward tree root re-exports found below the driver layer:" \
-      "\\b${root_alias}::($tree_root_export_pattern|driver|tree)\\b" \
-      "$layer_file"
-  done <<< "$root_aliases"
-done
+# A crate-root alias can hide a forbidden name across files and nested modules.
+# There is no useful lower-layer spelling that requires one, so reject the
+# alias at its declaration instead of trying to reconstruct Rust name lookup.
+check_layer_findings \
+  "crate-root aliases found below the driver layer:" \
+  alias \
+  "$layer_findings"
 
 check_forbidden \
   "upward tree references found in the driver layer:" \

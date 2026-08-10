@@ -1026,9 +1026,6 @@ impl ScopeCell {
     pub(crate) fn set_state(&self, state: ScopeState) {
         self.with_observation_gate(|wakes| {
             self.record.modify_silently(|record| {
-                if state == ScopeState::Starting {
-                    record.total_restarts = TotalRestarts::ZERO;
-                }
                 record.state = state.clone();
             });
             wakes.pulse(&self.record);
@@ -1383,13 +1380,17 @@ impl ScopeCell {
         }
     }
 
-    pub(crate) fn begin_incarnation(&self) -> Option<Epoch> {
+    pub(crate) fn begin_incarnation(&self, state: ScopeState) -> Option<Epoch> {
+        debug_assert!(
+            matches!(state, ScopeState::Starting),
+            "a fresh incarnation publishes its lifecycle machine's initial state"
+        );
         self.with_observation_gate(|wakes| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             let epoch = control.epochs.begin()?;
-            let state = ScopeState::Starting;
             self.record.modify_silently(|record| {
                 record.total_restarts = TotalRestarts::ZERO;
+                record.startup = None;
                 record.state = state.clone();
             });
             // Hold epoch ownership through its observation projection. A

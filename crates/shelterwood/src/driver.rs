@@ -12,9 +12,9 @@ mod storage;
 use storage::{ChildArena, ChildKey, Obligation};
 
 use crate::{
-    Cancellation, ChildId, Exit, ExitKind, GracePhase, Incarnation, IntensityTrip, JitterSample,
-    Membership, Readiness, ReadinessDeadline, ScopeState, ShutdownStraggler, ShutdownTimeout,
-    StartupFailure, StartupFailureCause,
+    Cancellation, ChildId, Exit, GracePhase, Incarnation, IntensityTrip, JitterSample, Membership,
+    Readiness, ReadinessDeadline, ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure,
+    StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
         MailboxControl, MemberStage, MemberTransition, ResidentProjection, ScopeCell,
@@ -392,10 +392,10 @@ fn discharge_child_terminality(completion: ChildTerminality) {
         (Exit::never_started(), None)
     } else {
         (
-            Exit::new(
-                ExitKind::Aborted {
-                    phase: GracePhase::WithinGrace,
-                },
+            classify_exit(
+                None,
+                runtime::JoinOutcome::Cancelled,
+                None,
                 Cancellation::Observed,
             ),
             record.incarnation,
@@ -2155,7 +2155,8 @@ impl ScopeRuntime {
     }
 }
 
-/// Owns a scope epoch until a `ScopeRuntime` has taken over its teardown.
+/// Owns a scope epoch and its matching initial lifecycle until a
+/// `ScopeRuntime` has taken over teardown.
 ///
 /// Nested lowering can await isolated disposal before a driver exists. If
 /// that setup future is cancelled or unwinds, dropping this guard retires the
@@ -2164,15 +2165,22 @@ impl ScopeRuntime {
 struct ScopeEpochGuard {
     scope: Arc<ScopeCell>,
     epoch: Option<Epoch>,
+    lifecycle: ScopeLifecycle,
 }
 
 impl ScopeEpochGuard {
     fn begin(scope: &Arc<ScopeCell>) -> Option<Self> {
-        let epoch = scope.begin_incarnation()?;
+        let lifecycle = ScopeLifecycle::starting();
+        let epoch = scope.begin_incarnation(lifecycle.state())?;
         Some(Self {
             scope: Arc::clone(scope),
             epoch: Some(epoch),
+            lifecycle,
         })
+    }
+
+    fn lifecycle(&self) -> ScopeLifecycle {
+        self.lifecycle.clone()
     }
 
     fn finish(mut self, reason: StopReason) {
@@ -2348,7 +2356,7 @@ async fn run_scope_incarnation(
         disposal_events,
         deadlines: DeadlineQueue::default(),
         jitter: runtime::JitterRng::from_system_entropy(),
-        lifecycle: ScopeLifecycle::starting(),
+        lifecycle: epoch.lifecycle(),
         next_ordered_start,
         role,
         dynamic,

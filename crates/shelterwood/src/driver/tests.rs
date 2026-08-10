@@ -60,7 +60,7 @@ fn running_dynamic_fixture() -> (
 ) {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
@@ -408,11 +408,11 @@ fn observation_gate_poison_does_not_wedge_later_observation() {
 fn stale_scope_driver_cannot_stop_a_newer_live_incarnation_projection() {
     let scope = isolated_scope("scope", ScopeFlavor::Ordered);
     let first = scope
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("first scope epoch is available");
     scope.finish_incarnation(first, StopReason::Finished);
     let second = scope
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("second scope epoch is available");
     scope.set_state(ScopeState::Running);
 
@@ -430,6 +430,31 @@ fn stale_scope_driver_cannot_stop_a_newer_live_incarnation_projection() {
     assert!(scope.incarnation_finished(second));
 }
 
+#[test]
+fn a_new_incarnation_owns_an_unpublished_startup_verdict() {
+    let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+    let first = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("first scope epoch is available");
+    scope.set_startup(Ok(()));
+    assert!(matches!(scope.record().startup, Some(Ok(()))));
+    scope.finish_incarnation(first, StopReason::Finished);
+
+    let second = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("second scope epoch is available");
+    assert!(
+        scope.record().startup.is_none(),
+        "the first incarnation's verdict does not outlive its epoch"
+    );
+    scope.set_startup(Err(StartupError::ShutdownRequested));
+    assert!(
+        matches!(scope.record().startup, Some(Err(_))),
+        "the write-once startup latch reopens per incarnation"
+    );
+    scope.finish_incarnation(second, StopReason::Finished);
+}
+
 #[crate::runtime::test]
 async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
     let parent = isolated_scope("parent", ScopeFlavor::Ordered);
@@ -438,7 +463,7 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
     parent.set_admitted_children(vec![resident_projection(&slot)]);
 
     let epoch = nested
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("nested scope epoch is available");
     let mut incarnations = ScopeIdentity::new().incarnation_counter(nested.member.membership());
     let incarnation = incarnations.mint().expect("child incarnation is available");
@@ -713,7 +738,9 @@ fn pre_driver_epoch_guard_releases_on_cancellation_and_unwind() {
 #[test]
 fn a_declined_epoch_still_publishes_its_owned_terminal_exit() {
     let scope = isolated_scope("scope", ScopeFlavor::Ordered);
-    let epoch = scope.begin_incarnation().expect("scope epoch is available");
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("scope epoch is available");
     // The orderly finisher retires the epoch without a terminal exit, so
     // a second owner still holds the only membership verdict.
     scope.finish_incarnation(epoch, StopReason::Finished);
@@ -920,7 +947,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.set_admitted_children(
         plan.children
@@ -1049,7 +1076,7 @@ fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.set_admitted_children(
         plan.children
@@ -1132,7 +1159,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.set_admitted_children(
         plan.children
@@ -1282,7 +1309,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.set_admitted_children(
         plan.children
@@ -2078,7 +2105,7 @@ async fn terminal_stop_paths_share_one_complete_observation_transition() {
         let scope = isolated_scope("root", ScopeFlavor::Ordered);
         let epoch = matches!(path, TerminalStopPath::LiveEpoch).then(|| {
             scope
-                .begin_incarnation()
+                .begin_incarnation(ScopeState::Starting)
                 .expect("test scope epoch is available")
         });
         let handle = ScopeRef {
@@ -2143,7 +2170,7 @@ impl Wake for ObserveScopeOnStartupWake {
 fn stopped_publication_keeps_mailbox_panic_primary_and_finishes_observation() {
     let scope = isolated_scope("root", ScopeFlavor::Ordered);
     let epoch = scope
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     let handle = ScopeRef {
         cell: Arc::clone(&scope),
@@ -2725,7 +2752,7 @@ fn terminal_startup_wake_follows_member_and_incarnation_publication() {
     );
     let scope = ScopeCell::new(member, ScopeFlavor::Ordered, ScopeIdentity::new());
     let epoch = scope
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     let probe = Arc::new(ObserveScopeOnStartupWake {
         scope: Arc::clone(&scope),
@@ -2998,7 +3025,7 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
 async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
@@ -3622,7 +3649,7 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
 {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
@@ -3747,6 +3774,17 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
             .is_some_and(|entry| entry.is_removing() && entry.matches_key(key)),
         "fused drop marks the indexed membership removing before its queued edge advances"
     );
+    assert!(matches!(
+        root.snapshot()
+            .child("worker")
+            .map(|child| child.membership_status),
+        Some(MembershipStatus::Active)
+    ));
+    assert_eq!(
+        scope.dispatch_membership_status(key),
+        MembershipStatus::Removing,
+        "exit dispatch follows the fused-cancel control plane before the public projection"
+    );
 
     scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);
     assert!(scope.children[key].restart_deadline.is_none());
@@ -3799,7 +3837,7 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
 async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_scheduling() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
@@ -4181,7 +4219,7 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.set_admitted_children(
         plan.children
@@ -4305,7 +4343,7 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.set_admitted_children(
         plan.children
@@ -4422,7 +4460,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = root
-        .begin_incarnation()
+        .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
     root.set_admitted_children(
         plan.children

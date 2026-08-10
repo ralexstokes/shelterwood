@@ -647,12 +647,14 @@ pub(crate) struct ScopeCell {
     record: runtime::WatchSender<ScopeRecord>,
     control: Mutex<ScopeControl>,
     dynamic_route: Mutex<Option<Arc<dyn DynamicRoute>>>,
-    // Dropping a resident emits `Removed` and recursively reads this watch.
-    // Every removal path must therefore release the watch guard first:
-    // mutation callbacks move removed residents into outer storage, while a
-    // wholesale clear uses `take`/replacement, whose old collection emerges
-    // only after the channel's internal guard is released. Dropping a resident
-    // inside a mutation callback would self-deadlock; adding one there is safe.
+    // `ResidentChild::drop` emits `Removed` by taking the observation gate
+    // itself, so dropping a resident anywhere the gate is already held
+    // self-deadlocks — not just inside a mutation callback. In-gate removal
+    // paths must instead consume the resident through
+    // `complete_removal(wakes)`, which emits under the already-held gate.
+    // Letting the bare destructor run is reserved for the orphaned path,
+    // where the parent `Weak` is dead and the drop emits nothing. Adding a
+    // resident inside a mutation callback remains safe.
     current_children: runtime::WatchSender<Vec<ResidentChild>>,
     parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
     observation_gate: RwLock<ObservationGate>,

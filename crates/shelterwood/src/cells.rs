@@ -116,22 +116,62 @@ pub(crate) struct MemberRecord {
 }
 
 impl MemberRecord {
+    /// Applies one driver-requested transition.
+    ///
+    /// Every watch-channel writer routes stage changes through here (see
+    /// [`MemberCell::transition`] for the wake-bus contract), so each arm
+    /// asserts the source stages its driver call sites can actually present.
     fn apply_transition(&mut self, transition: MemberTransition) {
         match transition {
-            MemberTransition::Admitted => self.stage = MemberStage::Admitted,
+            MemberTransition::Admitted => {
+                debug_assert!(
+                    matches!(self.stage, MemberStage::Reserved),
+                    "admission must consume a fresh reservation, not {:?}",
+                    self.stage
+                );
+                self.stage = MemberStage::Admitted;
+            }
             MemberTransition::Starting { incarnation } => {
+                debug_assert!(
+                    matches!(self.stage, MemberStage::Admitted | MemberStage::Restarting),
+                    "a spawn must start an admitted or restarting member, not {:?}",
+                    self.stage
+                );
                 self.stage = MemberStage::Starting;
                 self.incarnation = Some(incarnation);
                 self.last_incarnation = Some(incarnation);
                 self.restart_at = None;
             }
-            MemberTransition::Running => self.stage = MemberStage::Running,
-            MemberTransition::Stopping => self.stage = MemberStage::Stopping,
+            MemberTransition::Running => {
+                debug_assert!(
+                    matches!(self.stage, MemberStage::Starting | MemberStage::Reserved),
+                    "readiness must promote a starting member (or the root scope's own \
+                     never-admitted reservation), not {:?}",
+                    self.stage
+                );
+                self.stage = MemberStage::Running;
+            }
+            MemberTransition::Stopping => {
+                debug_assert!(
+                    matches!(self.stage, MemberStage::Starting | MemberStage::Running),
+                    "a stop ladder must begin on a starting or running member, not {:?}",
+                    self.stage
+                );
+                self.stage = MemberStage::Stopping;
+            }
             MemberTransition::RestartScheduled {
                 exit,
                 restart_count,
                 restart_at,
             } => {
+                debug_assert!(
+                    matches!(
+                        self.stage,
+                        MemberStage::Starting | MemberStage::Running | MemberStage::Stopping
+                    ),
+                    "a restart must be scheduled from an active incarnation's exit, not {:?}",
+                    self.stage
+                );
                 self.stage = MemberStage::Restarting;
                 self.incarnation = None;
                 self.last_exit = Some(exit);
@@ -264,14 +304,18 @@ impl MemberCell {
 
     /// Mutates a member record and pulses the watch channel.
     ///
-    /// The driver also treats this channel as its control-plane wake bus: any
-    /// field read by a loop precondition must be changed through a pulsing path
-    /// like this one, never by a silent write outside an observation gate.
+    /// Test-only escape hatch around [`Self::transition`]; the wake-bus
+    /// contract documented there binds this path too.
     #[cfg(test)]
     pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
         self.record.send_modify(update);
     }
 
+    /// Applies a member transition and pulses the watch channel.
+    ///
+    /// The driver also treats this channel as its control-plane wake bus: any
+    /// field read by a loop precondition must be changed through a pulsing path
+    /// like this one, never by a silent write outside an observation gate.
     pub(crate) fn transition(&self, transition: MemberTransition) {
         self.record
             .send_modify(|record| record.apply_transition(transition));

@@ -738,12 +738,13 @@ fn plain_parent_state_preserves_nested_snapshot_propagation() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
     let mut incarnations = IncarnationCounter::near_exhaustion(nested.member.membership());
-    nested.member.update(|record| {
-        record.incarnation = incarnations.mint();
-        record.stage = MemberStage::Starting;
-    });
     let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
     root.set_admitted_children(vec![resident_projection(&nested_slot)]);
+    // Start the nested member along the production admit-then-spawn order so
+    // the transition-source assertions in `apply_transition` hold here too.
+    nested.member.transition(MemberTransition::Starting {
+        incarnation: incarnations.mint().expect("incarnation available"),
+    });
     let snapshots = root.subscribe_snapshots();
     let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
 
@@ -3502,6 +3503,14 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
         ExitKind::Failed(ExitError::message("last completed incarnation")),
         Cancellation::NotObserved,
     );
+    // Walk the record along the production path so the transition-source
+    // assertions in `apply_transition` cover this setup too.
+    let mut setup_incarnations = identity.incarnation_counter(membership);
+    let spent = setup_incarnations
+        .mint()
+        .expect("setup incarnation available");
+    member.transition(MemberTransition::Admitted);
+    member.transition(MemberTransition::Starting { incarnation: spent });
     member.transition(MemberTransition::RestartScheduled {
         exit: previous.clone(),
         restart_count: RestartCount::ZERO,

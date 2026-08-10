@@ -3447,7 +3447,13 @@ it fires no `Removed` event and leaves no tombstone, §3.2's
 minting/admission split) — §11's idempotency, made concrete. `remove`
 futures are observation only: removal latches synchronously at the
 call (§11's remove rule), so dropping the future — polled or not —
-detaches, and a latched removal still completes. The public
+detaches, and a latched removal still completes. The owned-completion
+invariant makes an internal response loss unreachable on a conforming
+path. If that invariant regresses, release builds nevertheless fail
+closed: admission observes `NotAdmitting(Terminal)` and a latched removal
+observes `Removed`, since its route becoming terminal satisfies the
+removal goal. Debug builds MAY instead assert and panic at that boundary
+to expose the internal regression instead of returning an outcome. The public
 `ReserveError` enum is non-exhaustive and includes `NoRuntime`: it names
 the absent ambient runtime at dynamic reservation or first poll, with
 the cleanup and precedence pinned in §8. Dynamic `add_*`

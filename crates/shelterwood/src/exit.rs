@@ -580,11 +580,75 @@ pub struct ShutdownTimeout {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use crate::identity::ScopeIdentity;
+
     use super::{
         Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, IntensityTrip, JoinVerdict,
         RecordedOutcome, StartupError, StartupFailure, StartupFailureCause, classify_exit,
         exit_kind_eq, prefer_earlier, reconcile_recorded_outcomes,
     };
+
+    #[test]
+    fn child_startup_failure_display_summarizes_every_exit_kind() {
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let membership = identity.mint_membership(&id).expect("membership available");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let cases = [
+            (
+                ExitKind::Completed,
+                "child `worker` failed during startup: completed before readiness".to_owned(),
+            ),
+            (
+                ExitKind::Failed(ExitError::message("application failure")),
+                "child `worker` failed during startup: application failure".to_owned(),
+            ),
+            (
+                ExitKind::Panicked {
+                    message: Some("panic payload".to_owned()),
+                },
+                "child `worker` failed during startup: panicked: panic payload".to_owned(),
+            ),
+            (
+                ExitKind::Panicked { message: None },
+                "child `worker` failed during startup: panicked".to_owned(),
+            ),
+            (
+                ExitKind::ReadinessTimedOut { deadline },
+                format!(
+                    "child `worker` failed during startup: readiness deadline expired at {deadline:?}"
+                ),
+            ),
+            (
+                ExitKind::Aborted {
+                    phase: GracePhase::WithinGrace,
+                },
+                "child `worker` failed during startup: aborted within shutdown grace".to_owned(),
+            ),
+            (
+                ExitKind::Aborted {
+                    phase: GracePhase::AfterGrace,
+                },
+                "child `worker` failed during startup: aborted after shutdown grace".to_owned(),
+            ),
+            (
+                ExitKind::NeverStarted,
+                "child `worker` failed during startup: never started".to_owned(),
+            ),
+        ];
+
+        for (kind, expected) in cases {
+            let failure = StartupFailure {
+                cause: StartupFailureCause::Child {
+                    id: id.clone(),
+                    membership,
+                    exit: Exit::new(kind, Cancellation::NotObserved),
+                },
+            };
+
+            assert_eq!(failure.to_string(), expected);
+        }
+    }
 
     #[test]
     fn recorded_outcomes_are_canonical_exit_kinds() {

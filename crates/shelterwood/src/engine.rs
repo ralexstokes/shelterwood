@@ -14,6 +14,39 @@ use crate::{
     policy::{ScopeFlavor, tidy_abort_beat},
 };
 
+/// Current state of a scope membership or incarnation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ScopeState {
+    /// Membership exists but no incarnation has spawned.
+    Unstarted,
+    /// The current incarnation is starting its initial children.
+    Starting,
+    /// Aggregate readiness completed.
+    Running,
+    /// Root startup failed while the started prefix remains supervised.
+    StartupFailed,
+    /// The current incarnation is tearing down.
+    Draining,
+    /// One incarnation stopped.
+    Stopped {
+        /// Structured stop reason.
+        reason: StopReason,
+    },
+}
+
+impl ScopeState {
+    /// Returns whether this is a membership-terminal state.
+    ///
+    /// A nested scope can transiently publish `Stopped` before its parent
+    /// restarts the same membership, so callers that need membership
+    /// terminality should prefer stream closure or `wait_stopped()`.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        matches!(self, Self::Stopped { .. })
+    }
+}
+
 /// Deterministic priority when one driver wake exposes several events.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum ArbitrationClass {
@@ -626,19 +659,15 @@ enum StartupPhase {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ScopePhase {
-    Starting,
-    Running,
-    StartupFailed,
-    Draining {
-        reason: StopReason,
-        startup: StartupPhase,
-    },
+struct ScopeDrain {
+    reason: StopReason,
+    startup: StartupPhase,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DrainEffect {
     pub(crate) startup_pending: bool,
+    pub(crate) state: ScopeState,
 }
 
 /// The child state relevant to deciding whether a scope can finish.
@@ -654,88 +683,101 @@ pub(crate) struct ChildCompletionState {
 /// requests use [`ScopeEpochs`] and do not encode this phase a second time.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScopeLifecycle {
-    phase: ScopePhase,
+    state: ScopeState,
+    drain: Option<ScopeDrain>,
 }
 
 impl ScopeLifecycle {
     pub(crate) fn starting() -> Self {
         Self {
-            phase: ScopePhase::Starting,
+            state: ScopeState::Starting,
+            drain: None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn running() -> Self {
         Self {
-            phase: ScopePhase::Running,
+            state: ScopeState::Running,
+            drain: None,
         }
     }
 
     pub(crate) fn is_starting(&self) -> bool {
-        self.phase == ScopePhase::Starting
+        self.state == ScopeState::Starting
     }
 
     pub(crate) fn startup_complete(&self) -> bool {
         matches!(
-            self.phase,
-            ScopePhase::Running
-                | ScopePhase::Draining {
-                    startup: StartupPhase::Complete,
-                    ..
-                }
+            (&self.state, &self.drain),
+            (ScopeState::Running, None)
+                | (
+                    ScopeState::Draining,
+                    Some(ScopeDrain {
+                        startup: StartupPhase::Complete,
+                        ..
+                    })
+                )
         )
     }
 
     pub(crate) fn startup_failed(&self) -> bool {
         matches!(
-            self.phase,
-            ScopePhase::StartupFailed
-                | ScopePhase::Draining {
-                    startup: StartupPhase::Failed,
-                    ..
-                }
+            (&self.state, &self.drain),
+            (ScopeState::StartupFailed, None)
+                | (
+                    ScopeState::Draining,
+                    Some(ScopeDrain {
+                        startup: StartupPhase::Failed,
+                        ..
+                    })
+                )
         )
     }
 
     pub(crate) fn is_draining(&self) -> bool {
-        matches!(self.phase, ScopePhase::Draining { .. })
+        self.state == ScopeState::Draining
     }
 
     pub(crate) fn draining_reason(&self) -> Option<&StopReason> {
-        match &self.phase {
-            ScopePhase::Draining { reason, .. } => Some(reason),
-            ScopePhase::Starting | ScopePhase::Running | ScopePhase::StartupFailed => None,
-        }
+        self.drain.as_ref().map(|drain| &drain.reason)
     }
 
-    pub(crate) fn complete_startup(&mut self) -> bool {
-        if self.phase != ScopePhase::Starting {
-            return false;
+    pub(crate) fn complete_startup(&mut self) -> Option<ScopeState> {
+        if self.state != ScopeState::Starting {
+            return None;
         }
-        self.phase = ScopePhase::Running;
-        true
+        self.state = ScopeState::Running;
+        Some(self.state.clone())
     }
 
     /// Records only the first startup failure, so simultaneous failing
     /// initial children cannot publish the transition twice.
-    pub(crate) fn fail_startup(&mut self) -> bool {
-        if self.phase != ScopePhase::Starting {
-            return false;
+    pub(crate) fn fail_startup(&mut self) -> Option<ScopeState> {
+        if self.state != ScopeState::Starting {
+            return None;
         }
-        self.phase = ScopePhase::StartupFailed;
-        true
+        self.state = ScopeState::StartupFailed;
+        Some(self.state.clone())
     }
 
     pub(crate) fn begin_drain(&mut self, reason: StopReason) -> Option<DrainEffect> {
-        let startup = match self.phase {
-            ScopePhase::Starting => StartupPhase::Pending,
-            ScopePhase::Running => StartupPhase::Complete,
-            ScopePhase::StartupFailed => StartupPhase::Failed,
-            ScopePhase::Draining { .. } => return None,
+        let startup = match self.state {
+            ScopeState::Starting => StartupPhase::Pending,
+            ScopeState::Running => StartupPhase::Complete,
+            ScopeState::StartupFailed => StartupPhase::Failed,
+            ScopeState::Draining => return None,
+            ScopeState::Unstarted | ScopeState::Stopped { .. } => {
+                unreachable!("a scope incarnation owns only live lifecycle states")
+            }
         };
         let startup_pending = startup == StartupPhase::Pending;
-        self.phase = ScopePhase::Draining { reason, startup };
-        Some(DrainEffect { startup_pending })
+        self.state = ScopeState::Draining;
+        self.drain = Some(ScopeDrain { reason, startup });
+        Some(DrainEffect {
+            startup_pending,
+            state: self.state.clone(),
+        })
     }
 
     pub(crate) fn finish_if_ready(
@@ -914,7 +956,8 @@ mod tests {
         ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
         IncarnationRun, IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent,
         ReadinessGate, RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode,
-        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
+        ScopeState, StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
+        tidy_abort_beat,
     };
 
     #[test]
@@ -1286,9 +1329,10 @@ mod tests {
     #[test]
     fn scope_lifecycle_owns_first_failure_drain_status_and_finish_policy() {
         let mut lifecycle = ScopeLifecycle::starting();
-        assert!(lifecycle.fail_startup());
-        assert!(
-            !lifecycle.fail_startup(),
+        assert_eq!(lifecycle.fail_startup(), Some(ScopeState::StartupFailed));
+        assert_eq!(
+            lifecycle.fail_startup(),
+            None,
             "simultaneous initial failures publish one transition"
         );
         assert_eq!(
@@ -1305,6 +1349,7 @@ mod tests {
             .begin_drain(crate::exit::StopReason::ShutdownRequested)
             .expect("a failed startup can begin draining");
         assert!(!drain.startup_pending);
+        assert_eq!(drain.state, ScopeState::Draining);
         assert_eq!(
             lifecycle.finish_if_ready(
                 ScopeFlavor::Dynamic,
@@ -1317,7 +1362,7 @@ mod tests {
         );
 
         let mut running = ScopeLifecycle::starting();
-        assert!(running.complete_startup());
+        assert_eq!(running.complete_startup(), Some(ScopeState::Running));
         assert_eq!(
             running.finish_if_ready(
                 ScopeFlavor::Ordered,
@@ -1344,6 +1389,7 @@ mod tests {
             .begin_drain(crate::exit::StopReason::ShutdownRequested)
             .expect("starting can begin draining");
         assert!(drain.startup_pending);
+        assert_eq!(drain.state, ScopeState::Draining);
     }
 
     #[test]

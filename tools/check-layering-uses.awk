@@ -212,12 +212,8 @@ function last_path_segment(path, count, parts) {
   return parts[count]
 }
 
-function record_tree_binding(path, alias, index_, normalized, binding, parent) {
+function record_import_binding(path, alias, index_, normalized, binding, parent, key) {
   normalized = normalized_path(path)
-  if (normalized != "tree" && normalized !~ /^tree\//) {
-    return
-  }
-
   if (alias == "_") {
     return
   }
@@ -232,10 +228,60 @@ function record_tree_binding(path, alias, index_, normalized, binding, parent) {
   }
 
   if (!is_identifier(binding)) {
-    parse_error("unsupported tree import binding: " binding, index_)
+    parse_error("unsupported import binding: " binding, index_)
     return
   }
-  tree_bindings[binding] = 1
+
+  key = binding SUBSEP normalized
+  if (!import_bindings_seen[key]) {
+    import_bindings_seen[key] = 1
+    import_binding_count++
+    import_bindings[import_binding_count] = binding
+    import_paths[import_binding_count] = normalized
+  }
+}
+
+function record_import_glob(path, index_, normalized, key) {
+  normalized = normalized_path(path)
+  key = normalized SUBSEP index_
+  if (!import_globs_seen[key]) {
+    import_globs_seen[key] = 1
+    import_glob_count++
+    import_glob_paths[import_glob_count] = normalized
+    import_glob_indices[import_glob_count] = index_
+  }
+}
+
+function path_is_tree_derived(path, count, parts) {
+  count = split(path, parts, "/")
+  return parts[1] == "tree" || (parts[1] in tree_bindings)
+}
+
+function resolve_tree_bindings(index_, changed, binding) {
+  # Rust item order is irrelevant, so resolve aliases to a fixed point rather
+  # than depending on the order of the crate-root use statements. This covers
+  # chains such as `tree::System as First` followed by `First as Second`.
+  do {
+    changed = 0
+    for (index_ = 1; index_ <= import_binding_count; index_++) {
+      binding = import_bindings[index_]
+      if (!(binding in tree_bindings) \
+          && path_is_tree_derived(import_paths[index_])) {
+        tree_bindings[binding] = 1
+        changed = 1
+      }
+    }
+  } while (changed)
+
+  # A glob through a derived alias is just as opaque as `use tree::*`; fail
+  # closed once alias resolution has identified its tree-layer source.
+  for (index_ = 1; index_ <= import_glob_count; index_++) {
+    if (path_is_tree_derived(import_glob_paths[index_])) {
+      parse_error("tree glob imports cannot be derived safely", \
+        import_glob_indices[index_])
+      return
+    }
+  }
 }
 
 function parse_use_group(position, prefix) {
@@ -267,10 +313,7 @@ function parse_use_tree(position, prefix, segment, path, alias) {
     return parse_use_group(position, prefix)
   }
   if (tokens[position] == "*") {
-    if (normalized_path(prefix) == "tree" \
-        || normalized_path(prefix) ~ /^tree\//) {
-      parse_error("tree glob imports cannot be derived safely", position)
-    }
+    record_import_glob(prefix, position)
     return position + 1
   }
   if (!is_identifier(tokens[position])) {
@@ -288,14 +331,14 @@ function parse_use_tree(position, prefix, segment, path, alias) {
       parse_error("unsupported use-tree alias", position)
       return position + 1
     }
-    record_tree_binding(path, alias, position + 1)
+    record_import_binding(path, alias, position + 1)
     return position + 2
   }
   if (tokens[position] == "::") {
     return parse_use_tree(position + 1, path)
   }
 
-  record_tree_binding(path, "", position - 1)
+  record_import_binding(path, "", position - 1)
   return position
 }
 
@@ -313,6 +356,11 @@ function derive_lib_bindings(index_, position, count, names, name) {
       return
     }
     index_ = position
+  }
+
+  resolve_tree_bindings()
+  if (failed) {
+    return
   }
 
   count = asorti(tree_bindings, names)

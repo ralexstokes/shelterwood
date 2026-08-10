@@ -129,7 +129,11 @@ expect_case layering-lib-restricted-tree-reexport-below check-layering-paths.sh 
   "upward tree root re-exports found below the driver layer:"
 expect_case layering-lib-commented-tree-group-reexport-below check-layering-paths.sh \
   "upward tree root re-exports found below the driver layer:"
+expect_case layering-lib-chained-tree-reexport-below check-layering-paths.sh \
+  "upward tree root re-exports found below the driver layer:"
 expect_case layering-lib-tree-glob-fails-closed check-layering-paths.sh \
+  "tree glob imports cannot be derived safely"
+expect_case layering-lib-tree-alias-glob-fails-closed check-layering-paths.sh \
   "tree glob imports cannot be derived safely"
 expect_case layering-tree-below check-layering-paths.sh \
   "upward driver or tree references found below the driver layer:"

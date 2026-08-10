@@ -1,2 +1,3 @@
-// Placeholder mirroring crates/shelterwood/src/actor.rs so every path the
-// enforcement scripts scan exists in the fixture tree.
+// A non-tree root export keeps the derived pattern from widening to every
+// crate-root import while it follows aliases.
+pub struct Actor;

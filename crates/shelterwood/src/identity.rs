@@ -201,15 +201,6 @@ impl FenceCounter {
             generation,
         })
     }
-
-    /// Mints a generation for a non-identity monotone sequence.
-    ///
-    /// Observation uses the same saturating, poison-never-minted primitive as
-    /// membership and incarnation fencing.
-    #[cfg(test)]
-    fn mint_sequence(&mut self) -> Option<u64> {
-        self.mint().map(|fence| fence.generation.get())
-    }
 }
 
 /// A membership and the generation counter that can mint only its incarnations.
@@ -478,7 +469,7 @@ mod tests {
         assert!(!second.supersedes(Generation::POISON));
 
         let mut sequence = FenceCounter::sequence();
-        assert_eq!(sequence.mint_sequence(), Some(1));
+        assert_eq!(sequence.mint().map(|fence| fence.generation.get()), Some(1));
     }
 
     struct MembershipFixture;

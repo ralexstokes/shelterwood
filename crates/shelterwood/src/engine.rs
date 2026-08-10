@@ -667,6 +667,8 @@ struct ScopeDrain {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DrainEffect {
     pub(crate) startup_pending: bool,
+    /// Always [`ScopeState::Draining`] by construction; carried so the driver
+    /// publishes exactly the state the machine returned.
     pub(crate) state: ScopeState,
 }
 
@@ -701,6 +703,17 @@ impl ScopeLifecycle {
             state: ScopeState::Running,
             drain: None,
         }
+    }
+
+    /// The old `ScopePhase` enum made "draining without a reason"
+    /// unrepresentable; with split fields the equivalence is checked after
+    /// every transition instead.
+    fn assert_drain_invariant(&self) {
+        debug_assert_eq!(
+            self.state == ScopeState::Draining,
+            self.drain.is_some(),
+            "a scope is draining iff a drain reason is recorded"
+        );
     }
 
     pub(crate) fn is_starting(&self) -> bool {
@@ -748,6 +761,7 @@ impl ScopeLifecycle {
             return None;
         }
         self.state = ScopeState::Running;
+        self.assert_drain_invariant();
         Some(self.state.clone())
     }
 
@@ -758,6 +772,7 @@ impl ScopeLifecycle {
             return None;
         }
         self.state = ScopeState::StartupFailed;
+        self.assert_drain_invariant();
         Some(self.state.clone())
     }
 
@@ -774,6 +789,7 @@ impl ScopeLifecycle {
         let startup_pending = startup == StartupPhase::Pending;
         self.state = ScopeState::Draining;
         self.drain = Some(ScopeDrain { reason, startup });
+        self.assert_drain_invariant();
         Some(DrainEffect {
             startup_pending,
             state: self.state.clone(),

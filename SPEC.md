@@ -2189,7 +2189,14 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   at its parent as an ordinary child failure; the parent's restart
   policy applies as usual — each retry re-invokes the factory, so a
   stateful source can heal, while a deterministic factory bug churns
-  to the parent's intensity trip (§9.2), the designed containment. In
+  to the parent's intensity trip (§9.2), the designed containment.
+  Each such attempt occupies a scope incarnation claimed *before* its
+  factory runs: a factory invocation that panics or is torn down
+  mid-invocation still spent an ordinary incarnation — observable on
+  the scope's stream as that incarnation's own `ScopeState: Starting` →
+  `Stopped` pair (§13's restart-continuity rule) and advancing
+  incarnation identity (§3.1) exactly like an attempt whose factory
+  returned. In
   an ordered parent this is a pre-ready exit and §6's sequence rules
   apply unchanged.
 - Dynamic membership operations: `add_*` and their `_once` twins resolve

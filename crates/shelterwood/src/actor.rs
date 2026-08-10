@@ -373,11 +373,10 @@ impl<A: Actor> RawActor for Handler<A> {
                     }
                 }
             }
-            MailboxShutdown::Discard => {
-                while let Some(message) = raw.try_recv() {
-                    drop(message);
-                }
-            }
+            // The raw-loop contract assigns disposal of the frozen prefix to
+            // the framework. Returning without draining keeps hostile message
+            // destructors off the actor task and out of its exit verdict.
+            MailboxShutdown::Discard => {}
         }
 
         let mut context = StopContext::<A>::new(raw);

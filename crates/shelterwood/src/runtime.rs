@@ -1270,37 +1270,15 @@ where
     }
 }
 
-pub(crate) type MpscSender<T> = mpsc::Sender<T>;
-pub(crate) type MpscReceiver<T> = mpsc::Receiver<T>;
 pub(crate) type UnboundedMpscSender<T> = mpsc::UnboundedSender<T>;
 pub(crate) type UnboundedMpscReceiver<T> = mpsc::UnboundedReceiver<T>;
-
-pub(crate) fn bounded_mpsc<T>(capacity: usize) -> (MpscSender<T>, MpscReceiver<T>) {
-    mpsc::channel(capacity)
-}
 
 pub(crate) fn unbounded_mpsc<T>() -> (UnboundedMpscSender<T>, UnboundedMpscReceiver<T>) {
     mpsc::unbounded_channel()
 }
 
-pub(crate) async fn mpsc_send<T>(sender: &MpscSender<T>, value: T) -> Result<(), T> {
-    sender.send(value).await.map_err(|error| error.0)
-}
-
-pub(crate) fn mpsc_try_send<T>(sender: &MpscSender<T>, value: T) -> Result<(), T> {
-    sender.try_send(value).map_err(|error| error.into_inner())
-}
-
-pub(crate) fn mpsc_try_recv<T>(receiver: &mut MpscReceiver<T>) -> Option<T> {
-    receiver.try_recv().ok()
-}
-
 pub(crate) fn unbounded_mpsc_send<T>(sender: &UnboundedMpscSender<T>, value: T) -> Result<(), T> {
     sender.send(value).map_err(|error| error.0)
-}
-
-pub(crate) async fn unbounded_mpsc_recv<T>(receiver: &mut UnboundedMpscReceiver<T>) -> Option<T> {
-    receiver.recv().await
 }
 
 pub(crate) fn unbounded_mpsc_try_recv<T>(receiver: &mut UnboundedMpscReceiver<T>) -> Option<T> {
@@ -1311,6 +1289,7 @@ pub(crate) enum ScopeWake<T> {
     Signal,
     ParentShutdown,
     Message(Option<T>),
+    ControlMessage(Option<T>),
     Deadline,
 }
 
@@ -1321,7 +1300,8 @@ pub(crate) struct ScopeWait<S, C> {
 
 pub(crate) async fn wait_scope<S, C, T>(
     wait: ScopeWait<S, C>,
-    receiver: &mut MpscReceiver<T>,
+    receiver: &mut UnboundedMpscReceiver<T>,
+    control_receiver: Option<&mut UnboundedMpscReceiver<T>>,
     deadline: Option<std::time::Instant>,
 ) -> ScopeWake<T>
 where
@@ -1341,12 +1321,21 @@ where
             std::future::pending::<()>().await;
         }
     };
+    let control_message = async move {
+        if let Some(receiver) = control_receiver {
+            receiver.recv().await
+        } else {
+            std::future::pending().await
+        }
+    };
     tokio::pin!(deadline);
+    tokio::pin!(control_message);
     tokio::select! {
         biased;
         () = &mut signal => ScopeWake::Signal,
         () = &mut parent_shutdown => ScopeWake::ParentShutdown,
         message = receiver.recv() => ScopeWake::Message(message),
+        message = &mut control_message => ScopeWake::ControlMessage(message),
         () = &mut deadline => ScopeWake::Deadline,
     }
 }
@@ -1471,7 +1460,7 @@ mod tests {
 
     #[tokio::test]
     async fn scope_wait_prefers_signal_when_both_control_futures_are_ready() {
-        let (_sender, mut receiver) = super::bounded_mpsc::<()>(1);
+        let (_sender, mut receiver) = super::unbounded_mpsc::<()>();
 
         let wake = super::wait_scope(
             super::ScopeWait {
@@ -1480,10 +1469,35 @@ mod tests {
             },
             &mut receiver,
             None,
+            None,
         )
         .await;
 
         assert!(matches!(wake, super::ScopeWake::Signal));
+    }
+
+    #[tokio::test]
+    async fn scope_wait_prefers_a_primary_event_over_a_control_backlog() {
+        let (sender, mut receiver) = super::unbounded_mpsc();
+        let (control_sender, mut control_receiver) = super::unbounded_mpsc();
+        for value in 0..128 {
+            assert!(super::unbounded_mpsc_send(&control_sender, value).is_ok());
+        }
+        assert!(super::unbounded_mpsc_send(&sender, 999).is_ok());
+
+        let wake = super::wait_scope(
+            super::ScopeWait {
+                signal: std::future::pending(),
+                parent_shutdown: std::future::pending(),
+            },
+            &mut receiver,
+            Some(&mut control_receiver),
+            None,
+        )
+        .await;
+
+        assert!(matches!(wake, super::ScopeWake::Message(Some(999))));
+        assert_eq!(control_receiver.try_recv(), Ok(0));
     }
 
     struct RecursivelyPanickingPayload;

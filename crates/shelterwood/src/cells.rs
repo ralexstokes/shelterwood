@@ -567,9 +567,6 @@ pub(crate) trait DynamicRoute: Send + Sync {
         id: &ChildId,
         exact: Option<Membership>,
     ) -> runtime::OneShotReceiver<RemoveOutcome>;
-
-    #[cfg(test)]
-    fn request_forwarder_probe(&self) -> (Latch, Latch);
 }
 
 /// Shared critical section for one resident tree's observation projection.

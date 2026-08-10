@@ -162,6 +162,8 @@ enum DriverEvent {
     Removal(RemovalRequest),
 }
 
+const MIN_EVENT_BATCH_LIMIT: usize = 64;
+
 #[derive(Clone, Copy)]
 struct RemovalRequest {
     membership: Membership,
@@ -560,7 +562,7 @@ struct ScopeRuntime {
     intensity_policy: crate::Intensity,
     intensity: IntensityState,
     children: ChildArena<ChildRuntime>,
-    events: runtime::MpscSender<DriverEvent>,
+    events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
@@ -709,7 +711,7 @@ impl SpawnLatches {
 }
 
 struct ChildTaskLaunch {
-    events: runtime::MpscSender<DriverEvent>,
+    events: runtime::UnboundedMpscSender<DriverEvent>,
     key: ChildKey,
     incarnation: Incarnation,
     body: SpawnBody,
@@ -839,15 +841,14 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 SpawnBody::Raw { spawn, context } => {
                     let instance = spawn.construct();
                     let readiness = readiness_override.unwrap_or_else(|| instance.readiness());
-                    let _ = runtime::mpsc_send(
+                    let _ = runtime::unbounded_mpsc_send(
                         &constructed_sender,
                         DriverEvent::Child(ChildEvent::Constructed {
                             child: key,
                             incarnation,
                             readiness,
                         }),
-                    )
-                    .await;
+                    );
                     construction_release.fired().await;
                     instance.run(context, readiness).await
                 }
@@ -884,7 +885,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         // ownership and immediate post-join availability without ever
         // blocking this runtime worker.
         let report = report_claim.receive();
-        let _ = runtime::mpsc_send(
+        let _ = runtime::unbounded_mpsc_send(
             &exit_sender,
             DriverEvent::Child(ChildEvent::Exited {
                 child: key,
@@ -894,8 +895,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 cancellation: report.cancellation,
                 readiness_signal_seen: report.readiness_signal_seen,
             }),
-        )
-        .await;
+        );
     });
 
     let completion = ready.clone();
@@ -907,14 +907,13 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 runtime::select_two(ready.fired(), ready_completion.completed()).await,
                 runtime::Either::Left(())
             ) {
-                let _ = runtime::mpsc_send(
+                let _ = runtime::unbounded_mpsc_send(
                     &ready_sender,
                     DriverEvent::Child(ChildEvent::Ready {
                         child: key,
                         incarnation,
                     }),
-                )
-                .await;
+                );
             }
         });
     }
@@ -924,14 +923,13 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
             runtime::select_two(local_stop.fired(), completion.completed()).await,
             runtime::Either::Left(())
         ) {
-            let _ = runtime::mpsc_send(
+            let _ = runtime::unbounded_mpsc_send(
                 &events,
                 DriverEvent::Child(ChildEvent::SelfStop {
                     child: key,
                     incarnation,
                 }),
-            )
-            .await;
+            );
         }
     });
 
@@ -2375,11 +2373,30 @@ async fn run_scope_incarnation(
     if role.is_root() {
         root.member.transition(MemberTransition::Running);
     }
-    let capacity = plan.children.len().saturating_mul(3).max(64);
-    let (events, mut event_receiver) = runtime::bounded_mpsc(capacity);
+    // Both lanes are unbounded so their producers can publish synchronously.
+    // Keep child lifecycle events separate from externally generated dynamic
+    // control traffic: a large admission prefix must not strand the exit that
+    // completes shutdown. Bound each lane's per-wake collection so traffic
+    // cannot defer signals or deadlines indefinitely. The cap adds one
+    // ordering surface: when a wake finds more than a full batch of primary
+    // events, the deferred suffix (an intensity-tripping exit, say) is
+    // processed one wake after control-lane admissions enqueued earlier.
+    // `arbitrate` promises order only within a batch, and cross-pass
+    // wall-clock inversion was already reachable through the forwarder, so
+    // no promised order is violated.
+    let event_batch_limit = plan
+        .children
+        .len()
+        .saturating_mul(3)
+        .max(MIN_EVENT_BATCH_LIMIT);
+    let (events, mut event_receiver) = runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
-    let dynamic =
-        (plan.root.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(events.clone()));
+    let (dynamic, mut dynamic_event_receiver) = if plan.root.flavor == ScopeFlavor::Dynamic {
+        let (dynamic_events, receiver) = runtime::unbounded_mpsc();
+        (Some(DynamicControl::new(dynamic_events)), Some(receiver))
+    } else {
+        (None, None)
+    };
     // Transfer children one at a time. The not-yet-converted suffix remains
     // owned by ScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
@@ -2488,10 +2505,12 @@ async fn run_scope_incarnation(
             // cannot publish Running after the stop boundary.
             pending.push(Pending::Force.classified());
         }
-        while let Some(event) = runtime::mpsc_try_recv(&mut event_receiver) {
-            pending.push(Pending::Driver(event).classified());
-        }
-        // Disposal completions drain after the bounded lane, and `arbitrate`
+        let primary_batch_full =
+            collect_driver_events(&mut event_receiver, event_batch_limit, &mut pending);
+        let control_batch_full = dynamic_event_receiver.as_mut().is_some_and(|receiver| {
+            collect_driver_events(receiver, event_batch_limit, &mut pending)
+        });
+        // Disposal completions drain after the primary and dynamic lanes, and `arbitrate`
         // sorts stably, so a `ConstructionDisposed` always trails every
         // same-class `Exited` collected in the same wake — even one produced
         // later. A disposal is therefore a batch-tail event: the exit it
@@ -2543,6 +2562,7 @@ async fn run_scope_incarnation(
                     parent_shutdown: ancestor_command,
                 },
                 &mut event_receiver,
+                dynamic_event_receiver.as_mut(),
                 scope.deadlines.next(),
             )
             .await
@@ -2559,7 +2579,12 @@ async fn run_scope_incarnation(
                 runtime::ScopeWake::Message(Some(event)) => {
                     pending.push(Pending::Driver(event).classified());
                 }
-                runtime::ScopeWake::Message(None) => continue,
+                runtime::ScopeWake::ControlMessage(Some(event)) => {
+                    pending.push(Pending::Driver(event).classified());
+                }
+                runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
+                    continue;
+                }
             }
         }
 
@@ -2640,6 +2665,15 @@ async fn run_scope_incarnation(
             });
             return reason;
         }
+
+        // A full lane may still have a queued suffix. On a current-thread
+        // runtime, immediately collecting the next batch would prevent the
+        // child, timer, and helper tasks whose events this loop prioritizes
+        // from running at all. Give those producers one scheduler turn before
+        // returning to either saturated lane.
+        if primary_batch_full || control_batch_full {
+            runtime::yield_now().await;
+        }
     }
 }
 
@@ -2672,6 +2706,28 @@ impl Pending {
     }
 }
 
+fn collect_driver_events(
+    receiver: &mut runtime::UnboundedMpscReceiver<DriverEvent>,
+    limit: usize,
+    pending: &mut Vec<(ArbitrationClass, Pending)>,
+) -> bool {
+    for _ in 0..limit {
+        let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
+            return false;
+        };
+        pending.push(Pending::Driver(event).classified());
+    }
+    // Collecting exactly `limit` events does not by itself show a capped
+    // lane. Probe once more so a lane that drained right at the limit skips
+    // the full-batch yield; a probed event joins this batch rather than
+    // being deferred a wake.
+    let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
+        return false;
+    };
+    pending.push(Pending::Driver(event).classified());
+    true
+}
+
 fn restart_shutdown_work(child: ChildKey) -> (ArbitrationClass, Pending) {
     // This starts a pending incarnation, so it is restart work, not a
     // scope-shutdown transition. A child exit collected in the same wake must
@@ -2695,7 +2751,7 @@ fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
 }
 
 #[cfg(test)]
-pub(crate) use tests::exercise_saturated_fused_drop_before_exit;
+pub(crate) use tests::exercise_queued_fused_drop_before_exit_dispatch;
 
 #[cfg(test)]
 mod tests;

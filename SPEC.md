@@ -2008,6 +2008,18 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   Part II §19's group restarts a bounded change. The ladder and the funnel
   together are the decision layer of §1's implementation shape: they only
   compute; the driver shell awaits.
+- The drain reason is a verdict lattice, not a first-writer-wins latch:
+  reasons carry the total precedence order `ShutdownRequested` >
+  `StartupFailed` > `IntensityTripped` > `Finished`, and a drain already
+  in progress upgrades its reason monotonically when a higher-precedence
+  cause arrives; nothing downgrades. An explicit shutdown request
+  therefore cannot lose its verdict to a lower-precedence cause that
+  latched one wake earlier: a restartable exit that trips intensity in
+  the same batch as a shutdown request still yields `ShutdownRequested`
+  as the scope's terminal reason. Ladder deadlines share the posture: a
+  forced escalation only ever moves a deadline *earlier* (`min`), never
+  later. (`NeverStarted` sits outside the order — it is the terminal
+  reason of a membership that never had an incarnation to drain.)
 - Mailbox shutdown policy — `Drain` (the default) or `Discard` — is part
   of the actor options. It is a two-variant choice about exactly one
   thing: the fate of the frozen accepted prefix (§5.2). The intake
@@ -2369,6 +2381,23 @@ the same fencing — there is no second, separately-fenced view [#362]):
    reader always sees a consistent-or-newer snapshot (the conformance test
    reads the snapshot *synchronously inside the event arm*, §13.14).
    Cumulative counters distinguish crash restarts from planned remove/add.
+
+**The consistent-cut guarantee.** The single publication path is
+transactional: every control-plane transition — scope state changes
+(`Draining`, `StartupFailed`, `Stopped`), member terminalization, dynamic
+entry release, residency withdrawal and `Removed` publication — commits
+atomically with respect to observation. No observer can see a cut
+mid-transition: not a terminal membership whose enclosing scope record is
+still live, not a released dynamic id whose member is still
+snapshot-resident, not a reservation accepted after `Draining` was
+published. The wait/observe helpers (`wait_for_child`, exit-awaiting
+surfaces — B.9) are observers in this sense: they read the published
+view, never the engine's internals, so their outcomes agree with what
+snapshots and lifecycle events show at the same cut. Concretely for
+dynamic removal: the removed id becomes reusable (and a repeated `remove`
+reports `AlreadyAbsent`) only at the commit that withdraws the member
+from residency and publishes its `Removed` edge — §2's
+resident-membership uniqueness holds at every observable cut.
 
 `tracing` spans emit from one choke point (the optional `metrics` surface
 is Part II §20). Everything else observational — peer monitoring, actor

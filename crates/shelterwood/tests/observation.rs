@@ -679,8 +679,9 @@ async fn rebuilt_declared_handles_and_incarnations_keep_identity() {
                         tree.add_task("worker", waiting_task())
                             .expect("valid waiting task")
                     };
-                    // Capture identity before lowering rebases a rebuilt
-                    // declaration onto the stable scope.
+                    // Capture identity before lowering. The prior terminal
+                    // declaration's lineage was evicted, so this rebuild keeps
+                    // its fresh, incomparable identity.
                     stash.lock().expect("stash mutex intact").push((
                         handle.clone(),
                         hashed(&handle),

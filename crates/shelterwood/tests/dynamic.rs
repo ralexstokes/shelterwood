@@ -309,7 +309,7 @@ async fn exact_handles_reject_cross_scope_and_same_id_successors() {
 }
 
 #[tokio::test]
-async fn nested_declared_membership_is_superseded_by_its_runtime_replacement() {
+async fn nested_declared_membership_is_incomparable_with_its_runtime_replacement() {
     let mut nested = DynamicTree::new();
     let declared = nested
         .add_task("worker", waiting_task())

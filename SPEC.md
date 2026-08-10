@@ -327,13 +327,14 @@ structured error payloads. Both tokens are views of §3.1's one fencing primitiv
 `Incarnation::membership()` projects an incarnation's owning membership,
 and equality between an incarnation's projection and a held membership
 token is the "same slot?" question answered exactly. `supersedes` on
-`Membership` is replacement order for one child id under one stable owning
-scope: it answers whether `a` is a later membership for the same logical
-slot than `b` (§3.4). Different child ids and different owning scopes are
-incomparable and return `false` in both directions (fail closed, §3.1's
-rule; never a panic). Equality is exact identity; there is deliberately no
-total `Ord` — comparison outside one stable `(scope, child-id)` domain has no
-meaning.
+`Membership` orders tokens only while one stable owning scope retains the
+same child-id lineage, such as declaration reconciliation before the prior
+membership terminalizes. Terminalization evicts that lineage (§3.4), so a
+later remove-and-re-add is deliberately incomparable in both directions.
+Different child ids and different owning scopes are likewise incomparable and
+return `false` in both directions (fail closed, §3.1's rule; never a panic).
+Equality is exact identity; there is deliberately no total `Ord` — comparison
+outside one retained `(scope, child-id, lineage)` domain has no meaning.
 
 Consequences (normative):
 
@@ -461,14 +462,17 @@ An `ActorRef` follows incarnations of **its** membership, never a same-id
 replacement membership. This boundary is kept (it is what makes identity
 exact), but it MUST be discoverable: removal-then-re-add under the same id
 yields a fresh membership whose handles come from the new insertion, and the
-old handles report terminal. The replacement membership supersedes its
-removed predecessor. The ordering domain belongs to the stable scope cell,
-not to a temporary builder: an initially declared child and its later runtime
-replacement compare, as do corresponding descendants rebuilt across
-incarnations of one nested scope membership. Different ids and different
-owning scope memberships remain incomparable. A small routing/registry adapter
-for planned handoff (a `ServiceRef`/route-cell that the application repoints at
-cutover) is non-core (§24) — it must not weaken exact membership identity.
+old handles report terminal. Terminalization evicts the retained child-id
+lineage: the replacement and removed membership are deliberately incomparable
+in both directions. The same fail-closed rule applies to an initially declared
+child and its later runtime replacement, and to corresponding descendants
+rebuilt across incarnations of one nested scope membership. A stable scope may
+order a provisional declaration only while it still retains the same live
+lineage; a temporary builder never defines the ordering domain. Different ids
+and different owning scope memberships remain incomparable. A small
+routing/registry adapter for planned handoff (a `ServiceRef`/route-cell that the
+application repoints at cutover) is non-core (§24) — it must not weaken exact
+membership identity.
 
 ## 4. Construction and restart [#360]
 
@@ -2463,10 +2467,11 @@ integration toolkit for the driver shell and the end-to-end invariants.
    child with the same id (and, by construction, colliding internal
    coordinates), then present scope A's handle to scope B and require
    rejection. Replay remove→re-add under one id and assert the stale handle
-   fails while the replacement is untouched and supersedes it; assert that
-   different ids and different owning scopes are incomparable. Repeat the
-   ordering check for a declared child replaced at runtime and for a
-   corresponding descendant rebuilt after a nested-scope restart. Exhaustion
+   fails while the replacement is untouched and incomparable with it; assert
+   that different ids and different owning scopes are also incomparable.
+   Repeat the fail-closed comparison check for a declared child replaced at
+   runtime and for a corresponding descendant rebuilt after a nested-scope
+   restart. Exhaustion
    mints nothing (§3.1): drive a counter to saturation and assert no duplicate
    token is ever issued — an unmintable incarnation terminalizes the
    membership as under `Never`; an unmintable membership is the enumerated

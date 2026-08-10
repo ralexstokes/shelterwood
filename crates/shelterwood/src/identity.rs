@@ -171,6 +171,16 @@ impl PoisonedCounter {
         Self { current }
     }
 
+    /// Returns the next mintable value under the shared poison rule.
+    ///
+    /// State-owning callers install `u64::MAX` when this returns `None`; state
+    /// machines that represent poison out of band use the same decision and
+    /// retain their explicit exhausted variant.
+    pub(crate) fn minted_after(current: u64) -> Option<u64> {
+        let next = current.saturating_add(1);
+        (next != u64::MAX).then_some(next)
+    }
+
     #[cfg(test)]
     pub(crate) const fn near_exhaustion() -> Self {
         Self {
@@ -181,9 +191,9 @@ impl PoisonedCounter {
     pub(crate) fn mint(&mut self) -> Option<u64> {
         // Saturation is the poison transition itself: MAX is never returned,
         // and retaining it makes every later mint fail closed.
-        let next = self.current.saturating_add(1);
-        self.current = next;
-        (next != u64::MAX).then_some(next)
+        let minted = Self::minted_after(self.current);
+        self.current = minted.unwrap_or(u64::MAX);
+        minted
     }
 
     pub(crate) fn current(&self) -> u64 {
@@ -216,11 +226,10 @@ impl AtomicPoisonedCounter {
             .try_update(success, failure, |current| {
                 // Saturation atomically installs the permanent poison value;
                 // MAX is interpreted below and never returned to a caller.
-                Some(current.saturating_add(1))
+                Some(PoisonedCounter::minted_after(current).unwrap_or(u64::MAX))
             })
             .expect("a poisoned counter update never rejects");
-        let next = previous.saturating_add(1);
-        (next != u64::MAX).then_some(next)
+        PoisonedCounter::minted_after(previous)
     }
 
     pub(crate) fn load(&self, ordering: Ordering) -> u64 {
@@ -394,10 +403,12 @@ impl ScopeIdentity {
 
     /// Reconciles a declaration-time membership with this stable scope.
     ///
-    /// The first declaration of an id donates its already-minted lineage so
-    /// pre-spawn handles retain their identity. Later declarations of that id
-    /// (including declarations produced after a scope restart) mint from the
-    /// retained counter and therefore supersede their predecessors.
+    /// The first declaration of an untracked id donates its already-minted
+    /// lineage so pre-spawn handles retain their identity. If the scope still
+    /// tracks that lineage, a later provisional declaration mints its ordered
+    /// successor. Terminalization evicts the lineage, so an ordinary later
+    /// remove-and-re-add or post-restart rebuild donates a fresh, incomparable
+    /// identity instead.
     pub(crate) fn adopt_or_mint_membership(
         &mut self,
         id: &ChildId,
@@ -539,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_scope_adopts_the_first_declaration_then_orders_rebuilds() {
+    fn stable_scope_adopts_the_first_declaration_then_orders_a_retained_lineage() {
         let id = ChildId::from("worker");
         let other_id = ChildId::from("other");
         let mut first_builder = ScopeIdentity::new();

@@ -547,10 +547,7 @@ impl Epoch {
     /// The next mintable epoch. `None` reserves `u64::MAX` as the poison so
     /// no observable epoch can alias permanent exhaustion.
     fn successor(self) -> Option<Self> {
-        self.0
-            .checked_add(1)
-            .filter(|next| *next != u64::MAX)
-            .map(Self)
+        PoisonedCounter::minted_after(self.0).map(Self)
     }
 }
 

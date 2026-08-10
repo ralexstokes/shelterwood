@@ -158,9 +158,9 @@ impl<M> fmt::Debug for ActorRef<M> {
     }
 }
 
-// Handle identity is the slot cell, not the membership token: lowering a
-// rebuilt nested declaration rebases the token behind live pre-spawn handles,
-// and a token-value hash would strand entries keyed before the rebase.
+// Handle identity is the slot cell, not the membership token: declaration
+// lowering can rebase a provisional token behind live pre-spawn handles, and
+// a token-value hash would strand entries keyed before that rebase.
 impl<M> PartialEq for ActorRef<M> {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.member, &other.member)

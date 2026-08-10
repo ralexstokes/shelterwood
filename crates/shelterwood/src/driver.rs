@@ -666,7 +666,7 @@ async fn run_scope_incarnation(
         (None, None)
     };
     // Transfer children one at a time. The not-yet-converted suffix remains
-    // owned by ScopePlan, while ChildRuntime::from_plan arms the current
+    // owned by RuntimeScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
     // exactly one terminality owner for every child.
     let mut children = ChildArena::default();

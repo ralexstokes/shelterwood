@@ -95,8 +95,9 @@ For planned replacement, retain the exact handle returned by admission, remove
 that membership, await `RemoveOutcome::Removed`, then add the replacement. An
 add racing an in-progress same-id removal fails with `RemovalInProgress`; await
 the removal and retry. The replacement's membership is distinct rather than a
-new incarnation of the old one, and it supersedes the removed same-id
-membership. Different ids and different owning scopes remain incomparable.
+new incarnation of the old one. Terminalization evicts the old id lineage, so
+the replacement and removed membership are deliberately incomparable in both
+directions, just like different ids and different owning scopes.
 
 ## Pre-spawn observation
 

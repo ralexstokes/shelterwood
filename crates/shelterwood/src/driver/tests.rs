@@ -16,7 +16,7 @@ use crate::{
     RestartCondition, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind, StartupError,
     StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
     engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
-    exit::{JoinVerdict, RecordedOutcome},
+    exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
     mailbox::MailboxCell,
     plan::{ChildConstruction, SlotCell},
@@ -1211,7 +1211,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         recorded: Some(RecordedOutcome::returned(Err(ExitError::message(
             "trip intensity",
         )))),
-        join: JoinVerdict::Completed,
+        join: crate::runtime::JoinOutcome::Ok { value: () },
         cancellation: Cancellation::NotObserved,
         readiness_signal_seen: false,
     });
@@ -1332,7 +1332,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
             child: key,
             incarnation,
             recorded: Some(RecordedOutcome::returned(Ok(()))),
-            join: JoinVerdict::Completed,
+            join: crate::runtime::JoinOutcome::Ok { value: () },
             cancellation: Cancellation::NotObserved,
             readiness_signal_seen: true,
         }))

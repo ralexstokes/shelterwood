@@ -25,7 +25,7 @@ use crate::{
         dispatch_exit, schedule_restart,
     },
     exit::{
-        JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit,
+        RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
         reconcile_recorded_outcomes,
     },
     identity::IncarnationCounter,
@@ -182,25 +182,23 @@ impl SystemRun {
         let Some(driver) = self.driver.take() else {
             return;
         };
-        match runtime::join(driver).await {
-            runtime::JoinOutcome::Ok { .. } => {}
-            runtime::JoinOutcome::Panic { message, .. } => {
-                let exit = Exit::new(ExitKind::Panicked { message }, Cancellation::NotObserved);
-                self.root
-                    .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
-            }
+        // Only a crashed or cancelled driver leaves a live root incarnation to
+        // classify; cancellation of the driver itself is the one join verdict
+        // that proves the root observed cancellation.
+        let (join, cancellation) = match runtime::join(driver).await {
+            runtime::JoinOutcome::Ok { .. } => return,
+            runtime::JoinOutcome::Panic { message } => (
+                runtime::JoinOutcome::Panic { message },
+                Cancellation::NotObserved,
+            ),
             runtime::JoinOutcome::Cancelled => {
-                self.root.finish_live_root_incarnation(
-                    StopReason::ShutdownRequested,
-                    Exit::new(
-                        ExitKind::Aborted {
-                            phase: GracePhase::WithinGrace,
-                        },
-                        Cancellation::Observed,
-                    ),
-                );
+                (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
             }
-        }
+        };
+        self.root.finish_live_root_incarnation(
+            StopReason::ShutdownRequested,
+            classify_exit(None, join, None, cancellation),
+        );
     }
 }
 
@@ -298,26 +296,21 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
     let monitor_root = Arc::clone(&root);
     let driver = runtime::spawn(async move { run_scope(plan, ScopeRole::Root).await });
     let lifecycle = runtime::spawn(async move {
-        match runtime::join(driver).await {
-            runtime::JoinOutcome::Ok { value, .. } => value,
-            runtime::JoinOutcome::Panic { message, .. } => {
-                let exit = Exit::new(ExitKind::Panicked { message }, Cancellation::NotObserved);
-                monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
-                StopReason::ShutdownRequested
-            }
+        let (join, cancellation) = match runtime::join(driver).await {
+            runtime::JoinOutcome::Ok { value } => return value,
+            runtime::JoinOutcome::Panic { message } => (
+                runtime::JoinOutcome::Panic { message },
+                Cancellation::NotObserved,
+            ),
             runtime::JoinOutcome::Cancelled => {
-                monitor_root.finish_live_root_incarnation(
-                    StopReason::ShutdownRequested,
-                    Exit::new(
-                        ExitKind::Aborted {
-                            phase: GracePhase::WithinGrace,
-                        },
-                        Cancellation::Observed,
-                    ),
-                );
-                StopReason::ShutdownRequested
+                (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
             }
-        }
+        };
+        monitor_root.finish_live_root_incarnation(
+            StopReason::ShutdownRequested,
+            classify_exit(None, join, None, cancellation),
+        );
+        StopReason::ShutdownRequested
     });
     SystemRun {
         root,
@@ -343,7 +336,7 @@ enum ChildEvent {
         child: ChildKey,
         incarnation: Incarnation,
         recorded: Option<RecordedOutcome>,
-        join: JoinVerdict,
+        join: runtime::JoinOutcome<()>,
         cancellation: Cancellation,
         readiness_signal_seen: bool,
     },
@@ -882,13 +875,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
 
     let exit_sender = events.clone();
     runtime::spawn(async move {
-        let join = match runtime::join(handle).await {
-            runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
-            runtime::JoinOutcome::Panic { message, .. } => JoinVerdict::Panicked { message },
-            runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled {
-                phase: GracePhase::WithinGrace,
-            },
-        };
+        let join = runtime::join(handle).await;
         // The task owns `report`, whose explicit record or Drop fallback runs
         // before the join completes. `receive` therefore asserts sole
         // ownership and immediate post-join availability without ever
@@ -1638,7 +1625,7 @@ impl ScopeRuntime {
         key: ChildKey,
         incarnation: Incarnation,
         recorded: Option<RecordedOutcome>,
-        mut join: JoinVerdict,
+        join: runtime::JoinOutcome<()>,
         cancellation: Cancellation,
         readiness_signal_seen: bool,
     ) {
@@ -1683,11 +1670,8 @@ impl ScopeRuntime {
         {
             runtime::dispose_detached(teardown);
         }
-        if let (JoinVerdict::Cancelled { .. }, Some(phase)) = (&join, active.hard_abort_phase) {
-            join = JoinVerdict::Cancelled { phase };
-        }
         let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
-        let exit = classify_exit(recorded, join, cancellation);
+        let exit = classify_exit(recorded, join, active.hard_abort_phase, cancellation);
         child.restarts.settle_if_stable(
             IncarnationRun {
                 started_at: active.started_at,
@@ -1859,13 +1843,12 @@ impl ScopeRuntime {
         child.slot.member.set_terminal_disposal_pending(false);
         if terminal.exited_incarnation.is_some()
             && let Some(runtime::DisposalPanic { message }) = panic
-            && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
         {
             // Only an exited incarnation can own a destructor failure. A
             // never-started child or a child between restart incarnations
             // keeps its already-authoritative verdict while disposal remains
             // ordered ahead of terminal routing.
-            terminal.exit = Exit::new(ExitKind::Panicked { message }, terminal.exit.cancellation());
+            terminal.exit = classify_disposal_panic(terminal.exit, message);
         }
 
         let exit = terminal.exit;
@@ -2380,12 +2363,9 @@ async fn run_nested_tree_with_epoch(
             return Err(crate::ExitError::from_startup_failure(failure));
         }
     };
-    match run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch).await {
-        StopReason::Finished | StopReason::ShutdownRequested => Ok(()),
-        StopReason::IntensityTripped(trip) => Err(crate::ExitError::from_intensity_trip(trip)),
-        StopReason::StartupFailed(failure) => Err(crate::ExitError::from_startup_failure(failure)),
-        StopReason::NeverStarted => Err(crate::ExitError::message("nested scope never started")),
-    }
+    run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch)
+        .await
+        .into_nested_result()
 }
 
 async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
@@ -2664,25 +2644,7 @@ async fn run_scope_incarnation(
         }
 
         if let Some(reason) = scope.finish_if_ready() {
-            let root_exit = scope.role.is_root().then(|| match &reason {
-                StopReason::Finished | StopReason::ShutdownRequested => {
-                    let cancellation = if reason == StopReason::ShutdownRequested {
-                        Cancellation::Observed
-                    } else {
-                        Cancellation::NotObserved
-                    };
-                    Exit::new(ExitKind::Completed, cancellation)
-                }
-                StopReason::IntensityTripped(trip) => Exit::new(
-                    ExitKind::Failed(crate::ExitError::from_intensity_trip(trip.clone())),
-                    Cancellation::NotObserved,
-                ),
-                StopReason::StartupFailed(failure) => Exit::new(
-                    ExitKind::Failed(crate::ExitError::from_startup_failure(failure.clone())),
-                    Cancellation::NotObserved,
-                ),
-                StopReason::NeverStarted => Exit::never_started(),
-            });
+            let root_exit = scope.role.is_root().then(|| reason.root_exit());
             // ScopeRuntime's synchronous epilogue clears dynamic state,
             // discharges child obligations and residency, and only then
             // publishes the scope's terminal state.

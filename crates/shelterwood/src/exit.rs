@@ -7,7 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::identity::{ChildId, Membership};
+use crate::{
+    identity::{ChildId, Membership},
+    runtime,
+};
 
 /// The terminal reason for a scope incarnation or root system.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,6 +26,33 @@ pub enum StopReason {
     StartupFailed(StartupFailure),
     /// The membership terminalized without an incarnation.
     NeverStarted,
+}
+
+impl StopReason {
+    pub(crate) fn into_nested_result(self) -> ExitResult {
+        match self {
+            Self::Finished | Self::ShutdownRequested => Ok(()),
+            Self::IntensityTripped(trip) => Err(ExitError::from_intensity_trip(trip)),
+            Self::StartupFailed(failure) => Err(ExitError::from_startup_failure(failure)),
+            Self::NeverStarted => Err(ExitError::message("nested scope never started")),
+        }
+    }
+
+    pub(crate) fn root_exit(&self) -> Exit {
+        match self {
+            Self::Finished => Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+            Self::ShutdownRequested => Exit::new(ExitKind::Completed, Cancellation::Observed),
+            Self::IntensityTripped(trip) => Exit::new(
+                ExitKind::Failed(ExitError::from_intensity_trip(trip.clone())),
+                Cancellation::NotObserved,
+            ),
+            Self::StartupFailed(failure) => Exit::new(
+                ExitKind::Failed(ExitError::from_startup_failure(failure.clone())),
+                Cancellation::NotObserved,
+            ),
+            Self::NeverStarted => Exit::never_started(),
+        }
+    }
 }
 
 /// Failure of the root startup barrier.
@@ -464,13 +494,6 @@ impl RecordedOutcome {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum JoinVerdict {
-    Completed,
-    Panicked { message: Option<String> },
-    Cancelled { phase: GracePhase },
-}
-
 /// Reconciles task-produced evidence with a later supervisor-forced outcome.
 ///
 /// The same diagnostic precedence used for the final join applies here, and
@@ -502,17 +525,22 @@ pub(crate) fn reconcile_recorded_outcomes(
 /// cancellation reported while joining only proves that destruction ended the
 /// task; it must not erase an application error recorded before destruction.
 /// Equal-ranked outcomes keep the earlier recorded evidence, including its
-/// panic payload or abort provenance.
+/// panic payload or abort provenance. A cancelled join uses the supervisor's
+/// hard-abort phase when one was recorded and otherwise fails closed to
+/// [`GracePhase::WithinGrace`].
 pub(crate) fn classify_exit(
     recorded: Option<RecordedOutcome>,
-    join: JoinVerdict,
+    join: runtime::JoinOutcome<()>,
+    hard_abort_phase: Option<GracePhase>,
     cancellation: Cancellation,
 ) -> Exit {
     let recorded_kind = recorded.map(RecordedOutcome::into_kind);
     let join_kind = match join {
-        JoinVerdict::Completed => None,
-        JoinVerdict::Panicked { message } => Some(ExitKind::Panicked { message }),
-        JoinVerdict::Cancelled { phase } => Some(ExitKind::Aborted { phase }),
+        runtime::JoinOutcome::Ok { .. } => None,
+        runtime::JoinOutcome::Panic { message } => Some(ExitKind::Panicked { message }),
+        runtime::JoinOutcome::Cancelled => Some(ExitKind::Aborted {
+            phase: hard_abort_phase.unwrap_or(GracePhase::WithinGrace),
+        }),
     };
 
     let kind = match (recorded_kind, join_kind) {
@@ -523,6 +551,14 @@ pub(crate) fn classify_exit(
             phase: GracePhase::WithinGrace,
         },
     };
+    Exit::new(kind, cancellation)
+}
+
+/// Adds a destructor panic to an already-classified exit without erasing an
+/// earlier panic, which has equal diagnostic precedence and happened first.
+pub(crate) fn classify_disposal_panic(exit: Exit, message: Option<String>) -> Exit {
+    let Exit { kind, cancellation } = exit;
+    let kind = prefer_earlier(kind, ExitKind::Panicked { message });
     Exit::new(kind, cancellation)
 }
 
@@ -583,10 +619,12 @@ mod tests {
     use crate::identity::ScopeIdentity;
 
     use super::{
-        Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, IntensityTrip, JoinVerdict,
-        RecordedOutcome, StartupError, StartupFailure, StartupFailureCause, classify_exit,
-        exit_kind_eq, prefer_earlier, reconcile_recorded_outcomes,
+        Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, IntensityTrip,
+        RecordedOutcome, StartupError, StartupFailure, StartupFailureCause, StopReason,
+        classify_disposal_panic, classify_exit, exit_kind_eq, prefer_earlier,
+        reconcile_recorded_outcomes,
     };
+    use crate::runtime::JoinOutcome;
 
     #[test]
     fn child_startup_failure_display_summarizes_every_exit_kind() {
@@ -749,16 +787,16 @@ mod tests {
             (
                 "recorded completion",
                 Some(RecordedOutcome::returned(Ok(()))),
-                JoinVerdict::Completed,
+                JoinOutcome::Ok { value: () },
+                None,
                 Cancellation::NotObserved,
                 Exit::new(ExitKind::Completed, Cancellation::NotObserved),
             ),
             (
                 "cancellation overrides recorded completion",
                 Some(RecordedOutcome::returned(Ok(()))),
-                JoinVerdict::Cancelled {
-                    phase: GracePhase::AfterGrace,
-                },
+                JoinOutcome::Cancelled,
+                Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
                 Exit::new(
                     ExitKind::Aborted {
@@ -770,25 +808,26 @@ mod tests {
             (
                 "recorded failure",
                 Some(RecordedOutcome::returned(Err(failure.clone()))),
-                JoinVerdict::Completed,
+                JoinOutcome::Ok { value: () },
+                None,
                 Cancellation::NotObserved,
                 Exit::new(ExitKind::Failed(failure.clone()), Cancellation::NotObserved),
             ),
             (
                 "late cancellation preserves recorded failure",
                 Some(RecordedOutcome::returned(Err(failure.clone()))),
-                JoinVerdict::Cancelled {
-                    phase: GracePhase::AfterGrace,
-                },
+                JoinOutcome::Cancelled,
+                Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
                 Exit::new(ExitKind::Failed(failure.clone()), Cancellation::Observed),
             ),
             (
                 "join panic overrides recorded failure",
                 Some(RecordedOutcome::returned(Err(failure.clone()))),
-                JoinVerdict::Panicked {
+                JoinOutcome::Panic {
                     message: Some("drop panic".to_owned()),
                 },
+                None,
                 Cancellation::NotObserved,
                 Exit::new(
                     ExitKind::Panicked {
@@ -800,9 +839,8 @@ mod tests {
             (
                 "readiness timeout overrides cancellation",
                 Some(RecordedOutcome::readiness_timed_out(deadline)),
-                JoinVerdict::Cancelled {
-                    phase: GracePhase::AfterGrace,
-                },
+                JoinOutcome::Cancelled,
+                Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
                 Exit::new(
                     ExitKind::ReadinessTimedOut { deadline },
@@ -812,9 +850,10 @@ mod tests {
             (
                 "join panic overrides recorded completion",
                 Some(RecordedOutcome::returned(Ok(()))),
-                JoinVerdict::Panicked {
+                JoinOutcome::Panic {
                     message: Some("drop panic".to_owned()),
                 },
+                None,
                 Cancellation::NotObserved,
                 Exit::new(
                     ExitKind::Panicked {
@@ -828,9 +867,10 @@ mod tests {
                 Some(RecordedOutcome(ExitKind::Panicked {
                     message: Some("callback panic".to_owned()),
                 })),
-                JoinVerdict::Panicked {
+                JoinOutcome::Panic {
                     message: Some("drop panic".to_owned()),
                 },
+                None,
                 Cancellation::Observed,
                 Exit::new(
                     ExitKind::Panicked {
@@ -842,9 +882,8 @@ mod tests {
             (
                 "earlier recorded abort wins a tie",
                 Some(RecordedOutcome::aborted(GracePhase::WithinGrace)),
-                JoinVerdict::Cancelled {
-                    phase: GracePhase::AfterGrace,
-                },
+                JoinOutcome::Cancelled,
+                Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
                 Exit::new(
                     ExitKind::Aborted {
@@ -854,11 +893,31 @@ mod tests {
                 ),
             ),
             (
+                "cancelled join without a hard abort fails closed to within grace",
+                None,
+                JoinOutcome::Cancelled,
+                None,
+                Cancellation::Observed,
+                Exit::new(
+                    ExitKind::Aborted {
+                        phase: GracePhase::WithinGrace,
+                    },
+                    Cancellation::Observed,
+                ),
+            ),
+            (
+                "hard abort phase is ignored when the join completed normally",
+                Some(RecordedOutcome::returned(Ok(()))),
+                JoinOutcome::Ok { value: () },
+                Some(GracePhase::AfterGrace),
+                Cancellation::Observed,
+                Exit::new(ExitKind::Completed, Cancellation::Observed),
+            ),
+            (
                 "join cancellation supplies a missing outcome",
                 None,
-                JoinVerdict::Cancelled {
-                    phase: GracePhase::AfterGrace,
-                },
+                JoinOutcome::Cancelled,
+                Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
                 Exit::new(
                     ExitKind::Aborted {
@@ -870,7 +929,8 @@ mod tests {
             (
                 "missing outcome fails closed",
                 None,
-                JoinVerdict::Completed,
+                JoinOutcome::Ok { value: () },
+                None,
                 Cancellation::NotObserved,
                 Exit::new(
                     ExitKind::Aborted {
@@ -881,13 +941,109 @@ mod tests {
             ),
         ];
 
-        for (case, recorded, join, cancellation, expected) in cases {
+        for (case, recorded, join, hard_abort_phase, cancellation, expected) in cases {
             assert_eq!(
-                classify_exit(recorded, join, cancellation),
+                classify_exit(recorded, join, hard_abort_phase, cancellation),
                 expected,
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn disposal_panic_uses_exit_precedence_and_preserves_cancellation() {
+        let classified = classify_disposal_panic(
+            Exit::new(ExitKind::Completed, Cancellation::Observed),
+            Some("destructor".to_owned()),
+        );
+        assert_eq!(
+            classified,
+            Exit::new(
+                ExitKind::Panicked {
+                    message: Some("destructor".to_owned())
+                },
+                Cancellation::Observed
+            )
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        for weaker in [
+            ExitKind::Failed(ExitError::message("failed")),
+            ExitKind::ReadinessTimedOut { deadline },
+        ] {
+            assert_eq!(
+                classify_disposal_panic(
+                    Exit::new(weaker, Cancellation::NotObserved),
+                    Some("destructor".to_owned()),
+                ),
+                Exit::new(
+                    ExitKind::Panicked {
+                        message: Some("destructor".to_owned())
+                    },
+                    Cancellation::NotObserved
+                )
+            );
+        }
+
+        let earlier = Exit::new(
+            ExitKind::Panicked {
+                message: Some("task".to_owned()),
+            },
+            Cancellation::NotObserved,
+        );
+        assert_eq!(
+            classify_disposal_panic(earlier.clone(), Some("destructor".to_owned())),
+            earlier
+        );
+    }
+
+    #[test]
+    fn stop_reasons_own_nested_and_root_exit_projection() {
+        assert!(StopReason::Finished.into_nested_result().is_ok());
+        assert!(StopReason::ShutdownRequested.into_nested_result().is_ok());
+        assert_eq!(
+            StopReason::ShutdownRequested.root_exit(),
+            Exit::new(ExitKind::Completed, Cancellation::Observed)
+        );
+        assert_eq!(StopReason::NeverStarted.root_exit(), Exit::never_started());
+
+        let trip = IntensityTrip {
+            max_restarts: 2,
+            observed_restarts: 3,
+            within: Duration::from_secs(10),
+        };
+        let nested = StopReason::IntensityTripped(trip.clone())
+            .into_nested_result()
+            .expect_err("an intensity trip fails a nested scope");
+        assert_eq!(nested.intensity_trip(), Some(&trip));
+        let root = StopReason::IntensityTripped(trip.clone()).root_exit();
+        let ExitKind::Failed(error) = root.kind() else {
+            panic!("an intensity trip fails the root")
+        };
+        assert_eq!(error.intensity_trip(), Some(&trip));
+
+        let failure = StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: ChildId::from("nested"),
+            },
+        };
+        let nested = StopReason::StartupFailed(failure.clone())
+            .into_nested_result()
+            .expect_err("startup failure fails a nested scope");
+        assert_eq!(nested.startup_failure(), Some(&failure));
+        let root = StopReason::StartupFailed(failure.clone()).root_exit();
+        let ExitKind::Failed(error) = root.kind() else {
+            panic!("startup failure fails the root")
+        };
+        assert_eq!(error.startup_failure(), Some(&failure));
+
+        let never_started = StopReason::NeverStarted
+            .into_nested_result()
+            .expect_err("a never-started nested scope fails closed");
+        assert_eq!(
+            never_started.as_error().to_string(),
+            "nested scope never started"
+        );
     }
 
     #[test]
@@ -961,9 +1117,8 @@ mod tests {
             assert_eq!(
                 classify_exit(
                     reconciled,
-                    JoinVerdict::Cancelled {
-                        phase: GracePhase::AfterGrace
-                    },
+                    JoinOutcome::Cancelled,
+                    Some(GracePhase::AfterGrace),
                     Cancellation::Observed
                 ),
                 expected,

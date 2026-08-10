@@ -968,18 +968,19 @@ impl ScopeRuntime {
         }
     }
 
-    /// Reports whether a *removal* source has latched for this membership:
-    /// the dynamic entry's authoritative `Removing` control-plane state or a
-    /// fired fused-cancel latch on its `Resident` state. Scope-level stop
+    /// Projects the membership status from the *removal* sources alone:
+    /// `Removing` when one has latched for this membership — the dynamic
+    /// entry's authoritative `Removing` control-plane state or a fired
+    /// fused-cancel latch on its `Resident` state. Scope-level stop
     /// sources (drain, force, latched shutdown requests, ancestor latches)
     /// are deliberately excluded: each of those has a guaranteed follow-up
     /// event that owns the scope verdict, so exit dispatch must not
     /// reclassify the membership as `Removing` on their behalf.
-    fn membership_is_removing(&self, key: ChildKey) -> bool {
+    fn dispatch_membership_status(&self, key: ChildKey) -> MembershipStatus {
         let Some(child) = self.children.get(key) else {
-            return true;
+            return MembershipStatus::Removing;
         };
-        self.dynamic.as_ref().is_some_and(|control| {
+        let removing = self.dynamic.as_ref().is_some_and(|control| {
             control
                 .state
                 .lock()
@@ -988,7 +989,12 @@ impl ScopeRuntime {
                 .get(child.slot.member.id())
                 .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
                 .is_some_and(|entry| entry.restart_is_suppressed(key))
-        })
+        });
+        if removing {
+            MembershipStatus::Removing
+        } else {
+            MembershipStatus::Active
+        }
     }
 
     /// Reports whether any level-triggered stop source forbids constructing
@@ -1006,7 +1012,7 @@ impl ScopeRuntime {
                 .role
                 .ancestor()
                 .is_some_and(|latches| latches.shutdown.is_fired() || latches.abort.is_fired())
-            || self.membership_is_removing(key)
+            || self.dispatch_membership_status(key) == MembershipStatus::Removing
     }
 
     fn pending_restart_shutdowns(&self) -> Vec<ChildKey> {
@@ -1679,7 +1685,7 @@ impl ScopeRuntime {
         // own follow-up event owns the verdict. The broader
         // `restart_is_suppressed` still gates the restart deadline arm,
         // where every suppression source has a guaranteed follow-up event.
-        let membership_removing = self.membership_is_removing(key);
+        let membership_status = self.dispatch_membership_status(key);
         let child = self
             .children
             .get_mut(key)
@@ -1689,11 +1695,6 @@ impl ScopeRuntime {
             ScopeMode::Draining
         } else {
             ScopeMode::Running
-        };
-        let membership_status = if membership_removing {
-            MembershipStatus::Removing
-        } else {
-            MembershipStatus::Active
         };
         match dispatch_exit(&exit, child.options.restart, mode, membership_status) {
             ExitDispatch::Terminal => {

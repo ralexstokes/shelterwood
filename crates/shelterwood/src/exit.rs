@@ -811,6 +811,27 @@ mod tests {
                 ),
             ),
             (
+                "cancelled join without a hard abort fails closed to within grace",
+                None,
+                JoinOutcome::Cancelled,
+                None,
+                Cancellation::Observed,
+                Exit::new(
+                    ExitKind::Aborted {
+                        phase: GracePhase::WithinGrace,
+                    },
+                    Cancellation::Observed,
+                ),
+            ),
+            (
+                "hard abort phase is ignored when the join completed normally",
+                Some(RecordedOutcome::returned(Ok(()))),
+                JoinOutcome::Ok { value: () },
+                Some(GracePhase::AfterGrace),
+                Cancellation::Observed,
+                Exit::new(ExitKind::Completed, Cancellation::Observed),
+            ),
+            (
                 "join cancellation supplies a missing outcome",
                 None,
                 JoinOutcome::Cancelled,
@@ -862,6 +883,25 @@ mod tests {
                 Cancellation::Observed
             )
         );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        for weaker in [
+            ExitKind::Failed(ExitError::message("failed")),
+            ExitKind::ReadinessTimedOut { deadline },
+        ] {
+            assert_eq!(
+                classify_disposal_panic(
+                    Exit::new(weaker, Cancellation::NotObserved),
+                    Some("destructor".to_owned()),
+                ),
+                Exit::new(
+                    ExitKind::Panicked {
+                        message: Some("destructor".to_owned())
+                    },
+                    Cancellation::NotObserved
+                )
+            );
+        }
 
         let earlier = Exit::new(
             ExitKind::Panicked {

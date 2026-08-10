@@ -186,25 +186,23 @@ impl SystemRun {
         let Some(driver) = self.driver.take() else {
             return;
         };
-        match runtime::join(driver).await {
-            runtime::JoinOutcome::Ok { .. } => {}
-            runtime::JoinOutcome::Panic { message, .. } => {
-                let exit = Exit::new(ExitKind::Panicked { message }, Cancellation::NotObserved);
-                self.root
-                    .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
-            }
+        // Only a crashed or cancelled driver leaves a live root incarnation to
+        // classify; cancellation of the driver itself is the one join verdict
+        // that proves the root observed cancellation.
+        let (join, cancellation) = match runtime::join(driver).await {
+            runtime::JoinOutcome::Ok { .. } => return,
+            runtime::JoinOutcome::Panic { message } => (
+                runtime::JoinOutcome::Panic { message },
+                Cancellation::NotObserved,
+            ),
             runtime::JoinOutcome::Cancelled => {
-                self.root.finish_live_root_incarnation(
-                    StopReason::ShutdownRequested,
-                    Exit::new(
-                        ExitKind::Aborted {
-                            phase: GracePhase::WithinGrace,
-                        },
-                        Cancellation::Observed,
-                    ),
-                );
+                (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
             }
-        }
+        };
+        self.root.finish_live_root_incarnation(
+            StopReason::ShutdownRequested,
+            classify_exit(None, join, None, cancellation),
+        );
     }
 }
 
@@ -288,26 +286,21 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
     let monitor_root = Arc::clone(&root);
     let driver = runtime::spawn(async move { run_scope(plan, ScopeRole::Root).await });
     let lifecycle = runtime::spawn(async move {
-        match runtime::join(driver).await {
-            runtime::JoinOutcome::Ok { value, .. } => value,
-            runtime::JoinOutcome::Panic { message, .. } => {
-                let exit = Exit::new(ExitKind::Panicked { message }, Cancellation::NotObserved);
-                monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
-                StopReason::ShutdownRequested
-            }
+        let (join, cancellation) = match runtime::join(driver).await {
+            runtime::JoinOutcome::Ok { value } => return value,
+            runtime::JoinOutcome::Panic { message } => (
+                runtime::JoinOutcome::Panic { message },
+                Cancellation::NotObserved,
+            ),
             runtime::JoinOutcome::Cancelled => {
-                monitor_root.finish_live_root_incarnation(
-                    StopReason::ShutdownRequested,
-                    Exit::new(
-                        ExitKind::Aborted {
-                            phase: GracePhase::WithinGrace,
-                        },
-                        Cancellation::Observed,
-                    ),
-                );
-                StopReason::ShutdownRequested
+                (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
             }
-        }
+        };
+        monitor_root.finish_live_root_incarnation(
+            StopReason::ShutdownRequested,
+            classify_exit(None, join, None, cancellation),
+        );
+        StopReason::ShutdownRequested
     });
     SystemRun {
         root,

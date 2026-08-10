@@ -3106,13 +3106,13 @@ async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
                 .child_identity
                 .lock()
                 .expect("scope identity mutex starts healthy");
-            panic!("poison conversion after the overtaking removal");
+            panic!("poison conversion after the overtaking fused cancellation");
         }))
         .is_err()
     );
     assert!(
         catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request))).is_ok(),
-        "a fired fused latch rejects before fallible child conversion"
+        "overtaking fused cancellation rejects before fallible child conversion"
     );
     assert!(matches!(
         response.receive().await,

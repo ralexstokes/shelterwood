@@ -4116,8 +4116,7 @@ mod tests {
                         .shutdown(crate::Shutdown::Abort),
                 )
                 .await
-                .expect("task admission")
-                .into_handles();
+                .expect("task admission");
             assert_eq!(
                 cell.runtime_storage(),
                 RuntimeStorage {
@@ -4147,8 +4146,7 @@ mod tests {
                     TaskDef::new(|_| async { Ok(()) }).retention(Retention::Remove),
                 )
                 .await
-                .expect("auto-removing task admission")
-                .into_handles();
+                .expect("auto-removing task admission");
             automatic.wait().await;
             assert_eq!(
                 cell.runtime_storage(),

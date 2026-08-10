@@ -11,9 +11,8 @@ use std::{
 };
 
 use crate::{
-    ActorDef, ActorOnceDef, ActorRef, ChildId, DefaultsInheritance, Intensity, Membership,
-    ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults, Shutdown, ShutdownTimeout,
-    Strategy,
+    ActorDef, ActorOnceDef, ActorRef, ChildId, DefaultsInheritance, Intensity, ReadinessDeadline,
+    RestartPolicy, Retention, ScopeDefaults, Shutdown, ShutdownTimeout, Strategy,
     admission::{RemoveOutcome, ReserveError},
     definition::DefinitionSource,
     driver::DynamicReservation,
@@ -661,33 +660,6 @@ impl TaskSlot {
     }
 }
 
-/// A successful dynamic admission and its exact membership identity.
-#[derive(Debug)]
-pub struct AdmissionReceipt<H> {
-    membership: Membership,
-    handles: H,
-}
-
-impl<H> AdmissionReceipt<H> {
-    /// Returns the admitted membership identity.
-    #[must_use]
-    pub fn membership(&self) -> Membership {
-        self.membership
-    }
-
-    /// Borrows the kind-specific handles.
-    #[must_use]
-    pub fn handles(&self) -> &H {
-        &self.handles
-    }
-
-    /// Consumes the receipt and returns its kind-specific handles.
-    #[must_use]
-    pub fn into_handles(self) -> H {
-        self.handles
-    }
-}
-
 /// An admission future.
 ///
 /// Fused additions abort on drop; split definitions detach after their first
@@ -707,7 +679,7 @@ type AdmissionWait = Pin<Box<dyn Future<Output = Result<(), ReserveError>> + Sen
 
 struct PendingAdmission<H> {
     reservation: DynamicReservation,
-    receipt: AdmissionReceipt<H>,
+    handles: H,
     fused_cancel: Option<Latch>,
 }
 
@@ -779,14 +751,10 @@ impl<H> Admission<H> {
     }
 
     fn new(reservation: DynamicReservation, handles: H, ownership: AdmissionOwnership) -> Self {
-        let membership = reservation.slot.member.membership();
         Self {
             state: AdmissionState::Unpolled(PendingAdmission {
                 reservation,
-                receipt: AdmissionReceipt {
-                    membership,
-                    handles,
-                },
+                handles,
                 fused_cancel: match ownership {
                     AdmissionOwnership::Split => None,
                     AdmissionOwnership::Fused => Some(Latch::default()),
@@ -797,7 +765,7 @@ impl<H> Admission<H> {
 }
 
 impl<H: Unpin> Future for Admission<H> {
-    type Output = Result<AdmissionReceipt<H>, ReserveError>;
+    type Output = Result<H, ReserveError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
@@ -829,7 +797,7 @@ impl<H: Unpin> Future for Admission<H> {
                         let AdmissionState::InFlight { pending, .. } = previous else {
                             unreachable!("the matched admission state was replaced in place")
                         };
-                        return Poll::Ready(result.map(|()| pending.receipt));
+                        return Poll::Ready(result.map(|()| pending.handles));
                     }
                     Poll::Pending => return Poll::Pending,
                 },

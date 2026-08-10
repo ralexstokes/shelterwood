@@ -959,6 +959,14 @@ impl ScopeRuntime {
         else {
             return;
         };
+        // Idempotency hygiene rather than a load-bearing guard: an explicit
+        // removal publishes this projection before its request reaches the
+        // driver, and duplicate deliveries re-enter here after the first
+        // publication. Skipping the transition only avoids re-publishing an
+        // identical record under the observation gate; no public observable
+        // distinguishes that redundant publication, so tests pin the call
+        // sites (the fused-only removal path, where this write is the sole
+        // Removing-projection writer) rather than this check.
         if !member.record().removing {
             self.root
                 .transition_child(&member, |record| record.removing = true, None);

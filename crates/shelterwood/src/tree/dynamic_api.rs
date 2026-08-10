@@ -1,0 +1,227 @@
+use std::{sync::Arc, time::Duration};
+
+use crate::{
+    ActorDef, ActorOnceDef, ActorRef, ChildId, ShutdownTimeout,
+    admission::ReserveError,
+    mailbox::MailboxCell,
+    raw::{RawDef, RawOnceDef},
+    scope::{DynamicScopeRef, ScopeRef},
+    task::{OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
+};
+
+use super::{
+    Admission, DynamicActorSlot, DynamicSubtreeSlot, DynamicTaskSlot, Removal, Subtree, SubtreeDef,
+    SubtreeOnceDef,
+    builders::dispose_rejected,
+    slots::{ActorSlotCore, DynamicSlotEndpoint, SubtreeSlotCore, TaskSlotCore},
+    system::sealed,
+};
+
+impl ScopeRef {
+    /// Requests shutdown and waits for this scope to stop.
+    pub async fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
+        crate::driver::shutdown_scope(Arc::clone(&self.cell), timeout).await
+    }
+}
+
+impl DynamicScopeRef {
+    /// Requests shutdown and waits for this scope to stop.
+    pub async fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
+        self.0.shutdown_and_wait(timeout).await
+    }
+
+    /// Reserves an actor id synchronously and exposes its exact handle.
+    ///
+    /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
+    pub fn reserve_actor<M: Send + 'static>(
+        &self,
+        id: impl Into<ChildId>,
+    ) -> Result<DynamicActorSlot<M>, ReserveError> {
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
+            let mailbox = MailboxCell::new(reservation.slot.member.id().clone());
+            reservation.slot.member.attach_mailbox(mailbox.clone());
+            DynamicActorSlot {
+                core: ActorSlotCore::new(DynamicSlotEndpoint::split(reservation), mailbox),
+            }
+        })
+    }
+
+    /// Adds a restartable callback-oriented actor, resolving at admission.
+    pub fn add_actor<A: crate::Actor>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: ActorDef<A>,
+    ) -> Admission<ActorRef<A::Msg>> {
+        match self.reserve_actor(id) {
+            Ok(mut slot) => {
+                slot.core.endpoint.fuse();
+                slot.core.define_raw(definition.into_raw())
+            }
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
+        }
+    }
+
+    /// Adds a consuming one-shot callback-oriented actor, resolving at admission.
+    pub fn add_actor_once<A: crate::Actor>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: ActorOnceDef<A>,
+    ) -> Admission<ActorRef<A::Msg>> {
+        match self.reserve_actor(id) {
+            Ok(mut slot) => {
+                slot.core.endpoint.fuse();
+                slot.core.define_once_raw(definition.into_raw())
+            }
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
+        }
+    }
+
+    /// Adds a restartable raw actor, resolving at admission.
+    pub fn add_raw<R: crate::RawActor>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: RawDef<R>,
+    ) -> Admission<ActorRef<R::Msg>> {
+        match self.reserve_actor(id) {
+            Ok(mut slot) => {
+                slot.core.endpoint.fuse();
+                slot.core.define_raw(definition)
+            }
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
+        }
+    }
+
+    /// Adds a consuming one-shot raw actor, resolving at admission.
+    pub fn add_raw_once<R: crate::RawActor>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: RawOnceDef<R>,
+    ) -> Admission<ActorRef<R::Msg>> {
+        match self.reserve_actor(id) {
+            Ok(mut slot) => {
+                slot.core.endpoint.fuse();
+                slot.core.define_once_raw(definition)
+            }
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
+        }
+    }
+
+    /// Reserves a task id synchronously and exposes its exact handle.
+    ///
+    /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
+    pub fn reserve_task(&self, id: impl Into<ChildId>) -> Result<DynamicTaskSlot, ReserveError> {
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
+            DynamicTaskSlot {
+                core: TaskSlotCore::new(DynamicSlotEndpoint::split(reservation)),
+            }
+        })
+    }
+
+    /// Adds a restartable task, resolving at admission rather than startup.
+    pub fn add_task(&self, id: impl Into<ChildId>, definition: TaskDef) -> Admission<TaskRef> {
+        match self.reserve_task(id) {
+            Ok(mut slot) => {
+                slot.core.endpoint.fuse();
+                slot.core.define(definition)
+            }
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
+        }
+    }
+
+    /// Adds a consuming one-shot task, resolving at admission.
+    pub fn add_task_once<T: Send + 'static>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: TaskOnceDef<T>,
+    ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
+        match self.reserve_task(id) {
+            Ok(mut slot) => {
+                slot.core.endpoint.fuse();
+                slot.core.define_once(definition)
+            }
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
+        }
+    }
+
+    /// Reserves a typed subtree id synchronously.
+    ///
+    /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
+    pub fn reserve_subtree<T: Subtree>(
+        &self,
+        id: impl Into<ChildId>,
+    ) -> Result<DynamicSubtreeSlot<T>, ReserveError> {
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), Some(<T as sealed::Sealed>::FLAVOR))
+            .map(|reservation| DynamicSubtreeSlot {
+                core: SubtreeSlotCore::new(DynamicSlotEndpoint::split(reservation)),
+            })
+    }
+
+    /// Adds a restartable subtree, resolving at admission.
+    pub fn add_subtree<T: Subtree>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: SubtreeDef<T>,
+    ) -> Admission<T::Ref> {
+        match self.reserve_subtree::<T>(id) {
+            Ok(mut slot) => {
+                slot.core.endpoint.fuse();
+                slot.core.define(definition)
+            }
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
+        }
+    }
+
+    /// Adds a consuming one-shot subtree, resolving at admission.
+    pub fn add_subtree_once<T: Subtree>(
+        &self,
+        id: impl Into<ChildId>,
+        definition: SubtreeOnceDef<T>,
+    ) -> Admission<T::Ref> {
+        match self.reserve_subtree::<T>(id) {
+            Ok(mut slot) => {
+                slot.core.endpoint.fuse();
+                slot.core.define_once(definition)
+            }
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
+        }
+    }
+
+    /// Latches id-based removal synchronously; the returned future only
+    /// observes completion.
+    pub fn remove(&self, id: impl Into<ChildId>) -> Removal {
+        let id = id.into();
+        Removal::new(crate::driver::remove_dynamic(&self.0.cell, &id, None))
+    }
+
+    /// Removes exactly the held task membership, never a same-id successor.
+    pub fn remove_task(&self, task: &TaskRef) -> Removal {
+        Removal::new(crate::driver::remove_dynamic(
+            &self.0.cell,
+            task.id(),
+            Some(task.membership()),
+        ))
+    }
+
+    /// Removes exactly the held actor membership, never a same-id successor.
+    pub fn remove_actor<M>(&self, actor: &ActorRef<M>) -> Removal {
+        Removal::new(crate::driver::remove_dynamic(
+            &self.0.cell,
+            actor.id(),
+            Some(actor.membership()),
+        ))
+    }
+
+    /// Removes exactly the held ordered-scope membership.
+    pub fn remove_scope(&self, scope: &ScopeRef) -> Removal {
+        Removal::new(crate::driver::remove_dynamic(
+            &self.0.cell,
+            scope.id(),
+            Some(scope.membership()),
+        ))
+    }
+
+    /// Removes exactly the held dynamic-scope membership.
+    pub fn remove_dynamic_scope(&self, scope: &DynamicScopeRef) -> Removal {
+        self.remove_scope(scope.as_scope())
+    }
+}

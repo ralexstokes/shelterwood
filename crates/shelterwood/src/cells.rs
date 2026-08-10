@@ -452,7 +452,7 @@ pub(crate) trait DynamicRoute: Send + Sync {
 
     fn cancel_reservation(&self, slot: &Arc<SlotCell>);
 
-    fn signal_fused_cancel(&self, membership: Membership, latch: &Latch);
+    fn signal_fused_cancel(&self, slot: &Arc<SlotCell>, latch: &Latch);
 
     fn remove(
         &self,

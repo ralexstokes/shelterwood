@@ -584,6 +584,15 @@ impl Tree {
     }
 }
 
+#[cfg(test)]
+impl DynamicTree {
+    pub(crate) fn lower_for_test(self) -> crate::plan::ScopePlan {
+        self.core
+            .lower(ResolvedDefaults::default(), None)
+            .expect("test tree must be fully defined")
+    }
+}
+
 /// An owned pre-spawn actor slot with a stable mailbox binding.
 pub struct ActorSlot<M> {
     core: ActorSlotCore<StaticSlotEndpoint, M>,
@@ -867,7 +876,7 @@ impl<H> Drop for Admission<H> {
                     crate::runtime::catch_panic(|| {
                         crate::driver::signal_fused_cancel(
                             pending.reservation.control.as_ref(),
-                            pending.reservation.slot.member.membership(),
+                            &pending.reservation.slot,
                             cancel,
                         );
                     })
@@ -885,7 +894,7 @@ impl<H> Drop for Admission<H> {
                     let signal_panic = crate::runtime::catch_panic(|| {
                         crate::driver::signal_fused_cancel(
                             pending.reservation.control.as_ref(),
-                            pending.reservation.slot.member.membership(),
+                            &pending.reservation.slot,
                             cancel,
                         );
                     })

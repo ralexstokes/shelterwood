@@ -16,7 +16,7 @@ use crate::{
     cells::MemberCell,
     definition::DefinitionSource,
     policy::CommonOptions,
-    runtime::{self, Latch},
+    runtime::{self, CompletionGatedLatch, Latch},
 };
 
 pub(crate) type TaskFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
@@ -25,7 +25,7 @@ pub(crate) type TaskFactory = Arc<dyn Fn(TaskContext) -> TaskFuture + Send + Syn
 pub(crate) struct TaskContextLatches {
     pub(crate) shutdown: Latch,
     pub(crate) abort: Latch,
-    pub(crate) ready: Latch,
+    pub(crate) ready: CompletionGatedLatch,
 }
 
 /// Per-incarnation capabilities supplied to a supervised task.
@@ -35,7 +35,7 @@ pub struct TaskContext {
     incarnation: Incarnation,
     shutdown: CancellationToken,
     abort: CancellationToken,
-    ready: Latch,
+    ready: CompletionGatedLatch,
 }
 
 impl TaskContext {
@@ -323,12 +323,12 @@ mod tests {
         Cancellation, ChildId, Exit, ExitKind, GracePhase,
         cells::MemberCell,
         identity::ScopeIdentity,
-        runtime::{self, Latch},
+        runtime::{self, CompletionGatedLatch, Latch},
     };
 
     use super::{OneShotTaskRef, TaskContext, TaskContextLatches, TaskRef};
 
-    fn task_context() -> (TaskContext, Latch, Latch, Latch) {
+    fn task_context() -> (TaskContext, Latch, Latch, CompletionGatedLatch) {
         let id = ChildId::from("task");
         let mut identity = ScopeIdentity::new();
         let membership = identity.mint_membership(&id).expect("membership available");
@@ -336,7 +336,7 @@ mod tests {
         let incarnation = incarnations.mint().expect("incarnation available");
         let shutdown = Latch::default();
         let abort = Latch::default();
-        let ready = Latch::default();
+        let ready = CompletionGatedLatch::default();
         let context = TaskContext::new(
             id,
             incarnation,

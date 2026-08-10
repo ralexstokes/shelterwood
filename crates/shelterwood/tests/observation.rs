@@ -196,8 +196,7 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
     let nested = root
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
-        .expect("subtree admitted")
-        .into_handles();
+        .expect("subtree admitted");
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             root.snapshot()
@@ -247,8 +246,7 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
     let replacement = root
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
-        .expect("replacement admitted")
-        .into_handles();
+        .expect("replacement admitted");
     assert_ne!(replacement.membership(), nested.membership());
     let mut introduced = false;
     loop {
@@ -290,8 +288,7 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
             TaskOnceDef::new(|_| async { Ok(()) }).retention(Retention::Retain),
         )
         .await
-        .expect("retained task admitted")
-        .into_handles();
+        .expect("retained task admitted");
     drop(completion);
     let membership = task.membership();
     task.wait().await;
@@ -361,8 +358,7 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
             TaskOnceDef::new(|_| async { Ok(()) }).retention(Retention::Retain),
         )
         .await
-        .expect("teardown tombstone admitted")
-        .into_handles();
+        .expect("teardown tombstone admitted");
     drop(teardown_completion);
     let teardown_membership = teardown_task.membership();
     teardown_task.wait().await;
@@ -417,8 +413,7 @@ async fn descendant_events_forward_with_origin_identity_path_and_causal_order() 
     let nested = root
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
-        .expect("subtree admitted")
-        .into_handles();
+        .expect("subtree admitted");
     let nested_membership = nested.membership();
     let root_membership = root.membership();
 
@@ -768,8 +763,7 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
     let admitted = scope
         .add_task("later", waiting_task())
         .await
-        .expect("later id is admitted")
-        .into_handles();
+        .expect("later id is admitted");
     let running = waiter
         .await
         .expect("wait task joins")
@@ -796,7 +790,6 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
         )
         .await
         .expect("one-shot task admitted")
-        .into_handles()
         .0;
     let terminal_snapshot = scope
         .wait_for_child(
@@ -1161,8 +1154,7 @@ async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_va
                 .retention(Retention::Remove),
         )
         .await
-        .expect("ephemeral task is admitted")
-        .into_handles();
+        .expect("ephemeral task is admitted");
     task.wait().await;
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
@@ -1197,8 +1189,7 @@ async fn lifecycle_subscriptions_start_now_without_replaying_prior_history() {
     let old = scope
         .add_task("old", waiting_task())
         .await
-        .expect("old membership is admitted")
-        .into_handles();
+        .expect("old membership is admitted");
     assert_eq!(scope.remove_task(&old).await, RemoveOutcome::Removed);
 
     let mut events = scope.subscribe_lifecycle();
@@ -1210,8 +1201,7 @@ async fn lifecycle_subscriptions_start_now_without_replaying_prior_history() {
     let new = scope
         .add_task("new", waiting_task())
         .await
-        .expect("new membership is admitted")
-        .into_handles();
+        .expect("new membership is admitted");
     let event = next_event(&mut events).await;
     assert!(matches!(
         event.kind,
@@ -1288,8 +1278,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
             }),
         )
         .await
-        .expect("departing task is admitted")
-        .into_handles();
+        .expect("departing task is admitted");
     scope
         .wait_for_child(
             "departing",
@@ -1416,16 +1405,14 @@ async fn state_predicates_hold_only_for_terminal_projections() {
     let runner = scope
         .add_task("runner", waiting_task())
         .await
-        .expect("waiting task admitted")
-        .into_handles();
+        .expect("waiting task admitted");
     let (done, completion) = scope
         .add_task_once(
             "done",
             TaskOnceDef::new(|_| async { Ok(()) }).retention(Retention::Retain),
         )
         .await
-        .expect("one-shot task admitted")
-        .into_handles();
+        .expect("one-shot task admitted");
     drop(completion);
     done.wait().await;
     let terminal = scope

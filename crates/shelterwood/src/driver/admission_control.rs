@@ -9,6 +9,7 @@ use crate::{
     ChildId, Membership, ScopeState,
     admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
     cells::{DynamicRoute, ErasedDynamicRoute, ErasedDynamicSlot, MemberStage, ScopeCell},
+    engine::MembershipStatus,
     plan::{
         ChildConstruction, SlotCell, checked_id, concrete_dynamic_slot, concrete_dynamic_slot_ref,
         erase_dynamic_slot, mint_reserved_slot,
@@ -60,7 +61,7 @@ pub(super) struct DynamicEntry {
     pub(super) removal: Obligation<RemovalResponses>,
 }
 
-// The authoritative dynamic control-plane phase. `MemberRecord::removing`
+// The authoritative dynamic control-plane phase. `MemberRecord::membership_status`
 // is only its public observation projection; driver decisions use this enum.
 // A resident owns its arena key, so removal and restart paths never have to
 // rediscover the corresponding `ChildRuntime` with a linear scan.
@@ -164,70 +165,19 @@ pub(super) struct DynamicState {
 }
 
 pub(crate) struct DynamicControl {
-    events: runtime::MpscSender<DriverEvent>,
-    pub(super) state: Mutex<DynamicState>,
     requests: runtime::UnboundedMpscSender<DriverEvent>,
-    pub(super) request_forwarder_close: Latch,
-    #[cfg(test)]
-    pub(super) request_forwarder_ended: Latch,
+    pub(super) state: Mutex<DynamicState>,
 }
 
 impl DynamicControl {
-    pub(super) fn new(events: runtime::MpscSender<DriverEvent>) -> Arc<Self> {
-        let (requests, mut request_receiver) = runtime::unbounded_mpsc();
-        let forward_events = events.clone();
-        let request_forwarder_close = Latch::default();
-        let close_forwarder = request_forwarder_close.clone();
-        #[cfg(test)]
-        let request_forwarder_ended = Latch::default();
-        #[cfg(test)]
-        let forwarder_ended = request_forwarder_ended.clone();
-        let control = Arc::new(Self {
-            events,
+    pub(super) fn new(requests: runtime::UnboundedMpscSender<DriverEvent>) -> Arc<Self> {
+        Arc::new(Self {
+            requests,
             state: Mutex::new(DynamicState {
                 accepting: true,
                 entries: HashMap::new(),
             }),
-            requests,
-            request_forwarder_close,
-            #[cfg(test)]
-            request_forwarder_ended,
-        });
-        // Off-runtime construction (unit tests only) safely skips the
-        // forwarder: `reserve_dynamic`/`start_admission` fail closed with
-        // `NoRuntime` before anything can enqueue, and a live driver — the
-        // only other producer — exists only inside the runtime.
-        if runtime::is_available() {
-            runtime::spawn(async move {
-                loop {
-                    let request = match runtime::select_two(
-                        close_forwarder.fired(),
-                        runtime::unbounded_mpsc_recv(&mut request_receiver),
-                    )
-                    .await
-                    {
-                        runtime::Either::Left(()) | runtime::Either::Right(None) => break,
-                        runtime::Either::Right(Some(request)) => request,
-                    };
-                    // A failed admission send drops its response obligation,
-                    // completing it with `Terminal`. Explicit closure drops
-                    // this request and the queued suffix for the same result.
-                    if matches!(
-                        runtime::select_two(
-                            close_forwarder.fired(),
-                            runtime::mpsc_send(&forward_events, request),
-                        )
-                        .await,
-                        runtime::Either::Left(())
-                    ) {
-                        break;
-                    }
-                }
-                #[cfg(test)]
-                forwarder_ended.fire();
-            });
-        }
-        control
+        })
     }
 
     pub(super) fn register_initial<'a>(
@@ -248,10 +198,6 @@ impl DynamicControl {
         state.accepting = false;
         let entries = std::mem::take(&mut state.entries);
         drop(state);
-        // Reservation handles may retain this control after scope teardown.
-        // Stop the sole per-scope forwarder explicitly instead of waiting for
-        // every clone of its unbounded sender to disappear.
-        self.request_forwarder_close.fire();
         let mut retained = HashMap::new();
         for (id, entry) in entries {
             if entry.is_reserved() {
@@ -354,12 +300,9 @@ fn start_dynamic_admission(
             let _ = sender.send(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
         }),
     };
-    // The driver channel is bounded and a split admission may be dropped
-    // right after this first poll (drop detaches), so the send cannot live in
-    // the caller-held future. One persistent forwarder per scope drains this
-    // unbounded FIFO, keeping pending-admission memory proportional to the
-    // requests without a second mutex-protected channel implementation.
-    let _ = runtime::unbounded_mpsc_send(&control.requests, DriverEvent::Admission(request));
+    // Queue synchronously so dropping a split-admission future immediately
+    // after its first poll cannot cancel the admitted request.
+    queue_driver_event(&control, DriverEvent::Admission(request));
     Ok(response)
 }
 
@@ -413,7 +356,7 @@ fn signal_fused_cancel_impl(control: &DynamicControl, slot: &SlotCell, latch: &L
     // `mark_removing` also succeeds on an already-Removing entry, so the
     // same membership can queue one `RemovalRequest` per source. The
     // duplicate is benign by construction — `handle_removal` re-enters
-    // `publish_dynamic_removal` behind the record's `removing` guard and
+    // `publish_dynamic_removal` behind the record's status guard and
     // `begin_stop_child` behind its ladder/disposal idempotency guards.
     let removal = {
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
@@ -486,8 +429,8 @@ fn remove_dynamic_impl(
     // observation work, and blocking there while holding dynamic state would
     // stall every concurrent reservation, removal, and driver admission.
     drop(state);
-    if !member.record().removing {
-        scope.transition_child(&member, |record| record.removing = true, None);
+    if member.record().membership_status != MembershipStatus::Removing {
+        scope.set_child_removing(&member);
     }
     if member.removal.fire() {
         // This latch dedups repeated `remove` calls, but not a concurrent
@@ -538,24 +481,11 @@ impl DynamicRoute for DynamicControl {
     ) -> RemovalResponse {
         remove_dynamic_impl(self, scope, id, exact)
     }
-
-    #[cfg(test)]
-    fn request_forwarder_probe(&self) -> (Latch, Latch) {
-        (
-            self.request_forwarder_close.clone(),
-            self.request_forwarder_ended.clone(),
-        )
-    }
 }
 
 fn queue_driver_event(control: &DynamicControl, event: DriverEvent) {
-    let Err(event) = runtime::mpsc_try_send(&control.events, event) else {
-        return;
-    };
-    // The unbounded send is synchronous and runtime-independent, so a drop or
-    // removal from a foreign thread cannot lose the edge when the bounded
-    // driver lane is full. The per-scope forwarder applies backpressure only
-    // on that saturated fallback; the normal removal path stays allocation-free.
+    // Synchronous and runtime-independent: admission detaches at its first
+    // poll, and removal may be signalled from a foreign thread.
     let _ = runtime::unbounded_mpsc_send(&control.requests, event);
 }
 

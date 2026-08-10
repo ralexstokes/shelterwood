@@ -3927,6 +3927,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;

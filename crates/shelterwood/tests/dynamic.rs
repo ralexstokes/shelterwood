@@ -1414,14 +1414,14 @@ async fn assert_pending_restart_shutdown_is_expedited<R: Clone>(
         "shutdown must start exactly the pending incarnation without waiting for backoff"
     );
     if width == Duration::MAX {
-        // An unrepresentable deadline is clamped to a far-future instant
-        // that never arrives, so there is no later incarnation to reach.
+        // An unrepresentable deadline has no substitute and never arrives,
+        // so there is no later incarnation to reach.
         // Only the quiet window applies.
         advance_time(Duration::from_secs(1)).await;
         assert_eq!(
             starts.load(Ordering::SeqCst),
             2,
-            "a far-future-clamped deadline must not resurrect the stopped incarnation"
+            "an unrepresentable deadline must not resurrect the stopped incarnation"
         );
         system.shutdown(Duration::ZERO).await.expect("root stops");
         return;

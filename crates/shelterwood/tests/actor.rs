@@ -328,8 +328,7 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
             }),
         )
         .await
-        .expect("dynamic actor admitted")
-        .into_handles();
+        .expect("dynamic actor admitted");
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             dynamic_events

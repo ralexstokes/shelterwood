@@ -17,10 +17,10 @@ use std::{
 };
 
 use crate::{
-    ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, RestartCount,
-    ScopeState, Strategy, TotalRestarts,
+    ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, RestartCount, Strategy,
+    TotalRestarts,
     admission::{RemoveOutcome, ReserveError},
-    engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs},
+    engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason},
     identity::ScopeIdentity,
     observe::{
@@ -81,6 +81,21 @@ pub(crate) enum MemberStage {
     Terminal(Exit),
 }
 
+/// One non-terminal member-record transition owned by the cell layer.
+pub(crate) enum MemberTransition {
+    Admitted,
+    Starting {
+        incarnation: Incarnation,
+    },
+    Running,
+    Stopping,
+    RestartScheduled {
+        exit: Exit,
+        restart_count: RestartCount,
+        restart_at: Option<Instant>,
+    },
+}
+
 /// Whether a terminal child incarnation failed during aggregate startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartupDisposition {
@@ -96,8 +111,75 @@ pub(crate) struct MemberRecord {
     pub(crate) last_exit: Option<Exit>,
     pub(crate) restart_count: RestartCount,
     pub(crate) restart_at: Option<Instant>,
-    pub(crate) removing: bool,
+    pub(crate) membership_status: MembershipStatus,
     pub(crate) startup_aborted: bool,
+}
+
+impl MemberRecord {
+    /// Applies one driver-requested transition.
+    ///
+    /// Every watch-channel writer routes stage changes through here (see
+    /// [`MemberCell::transition`] for the wake-bus contract), so each arm
+    /// asserts the source stages its driver call sites can actually present.
+    fn apply_transition(&mut self, transition: MemberTransition) {
+        match transition {
+            MemberTransition::Admitted => {
+                debug_assert!(
+                    matches!(self.stage, MemberStage::Reserved),
+                    "admission must consume a fresh reservation, not {:?}",
+                    self.stage
+                );
+                self.stage = MemberStage::Admitted;
+            }
+            MemberTransition::Starting { incarnation } => {
+                debug_assert!(
+                    matches!(self.stage, MemberStage::Admitted | MemberStage::Restarting),
+                    "a spawn must start an admitted or restarting member, not {:?}",
+                    self.stage
+                );
+                self.stage = MemberStage::Starting;
+                self.incarnation = Some(incarnation);
+                self.last_incarnation = Some(incarnation);
+                self.restart_at = None;
+            }
+            MemberTransition::Running => {
+                debug_assert!(
+                    matches!(self.stage, MemberStage::Starting | MemberStage::Reserved),
+                    "readiness must promote a starting member (or the root scope's own \
+                     never-admitted reservation), not {:?}",
+                    self.stage
+                );
+                self.stage = MemberStage::Running;
+            }
+            MemberTransition::Stopping => {
+                debug_assert!(
+                    matches!(self.stage, MemberStage::Starting | MemberStage::Running),
+                    "a stop ladder must begin on a starting or running member, not {:?}",
+                    self.stage
+                );
+                self.stage = MemberStage::Stopping;
+            }
+            MemberTransition::RestartScheduled {
+                exit,
+                restart_count,
+                restart_at,
+            } => {
+                debug_assert!(
+                    matches!(
+                        self.stage,
+                        MemberStage::Starting | MemberStage::Running | MemberStage::Stopping
+                    ),
+                    "a restart must be scheduled from an active incarnation's exit, not {:?}",
+                    self.stage
+                );
+                self.stage = MemberStage::Restarting;
+                self.incarnation = None;
+                self.last_exit = Some(exit);
+                self.restart_count = restart_count;
+                self.restart_at = restart_at;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -152,7 +234,7 @@ impl MemberCell {
             last_exit: None,
             restart_count: RestartCount::ZERO,
             restart_at: None,
-            removing: false,
+            membership_status: MembershipStatus::Active,
             startup_aborted: false,
         });
         Arc::new(Self {
@@ -222,16 +304,30 @@ impl MemberCell {
 
     /// Mutates a member record and pulses the watch channel.
     ///
+    /// Test-only escape hatch around [`Self::transition`]; the wake-bus
+    /// contract documented there binds this path too.
+    #[cfg(test)]
+    pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
+        self.record.send_modify(update);
+    }
+
+    /// Applies a member transition and pulses the watch channel.
+    ///
     /// The driver also treats this channel as its control-plane wake bus: any
     /// field read by a loop precondition must be changed through a pulsing path
     /// like this one, never by a silent write outside an observation gate.
-    pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
-        self.record.send_modify(update);
+    pub(crate) fn transition(&self, transition: MemberTransition) {
+        self.record
+            .send_modify(|record| record.apply_transition(transition));
     }
 
     fn update_locked(&self, wakes: &mut ObservationWakes, update: impl FnOnce(&mut MemberRecord)) {
         self.record.modify_silently(update);
         wakes.pulse(&self.record);
+    }
+
+    fn transition_locked(&self, wakes: &mut ObservationWakes, transition: MemberTransition) {
+        self.update_locked(wakes, |record| record.apply_transition(transition));
     }
 
     pub(crate) fn set_options(&self, options: ResolvedCommonOptions) {
@@ -471,9 +567,6 @@ pub(crate) trait DynamicRoute: Send + Sync {
         id: &ChildId,
         exact: Option<Membership>,
     ) -> runtime::OneShotReceiver<RemoveOutcome>;
-
-    #[cfg(test)]
-    fn request_forwarder_probe(&self) -> (Latch, Latch);
 }
 
 /// Shared critical section for one resident tree's observation projection.
@@ -957,7 +1050,7 @@ impl ScopeCell {
         });
     }
 
-    pub(crate) fn transition_child(
+    fn update_child_record(
         &self,
         member: &MemberCell,
         update: impl FnOnce(&mut MemberRecord),
@@ -973,6 +1066,33 @@ impl ScopeCell {
         });
     }
 
+    pub(crate) fn set_child_removing(&self, member: &MemberCell) {
+        self.update_child_record(
+            member,
+            |record| record.membership_status = MembershipStatus::Removing,
+            None,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transition_child(
+        &self,
+        member: &MemberCell,
+        update: impl FnOnce(&mut MemberRecord),
+        event: Option<LifecycleEventKind>,
+    ) {
+        self.update_child_record(member, update, event);
+    }
+
+    pub(crate) fn transition_child_stage(
+        &self,
+        member: &MemberCell,
+        transition: MemberTransition,
+        event: Option<LifecycleEventKind>,
+    ) {
+        self.update_child_record(member, |record| record.apply_transition(transition), event);
+    }
+
     #[cfg(test)]
     pub(crate) fn emit(&self, event: LifecycleEventKind) {
         self.with_observation_gate(|wakes| self.emit_locked(wakes, event));
@@ -982,7 +1102,7 @@ impl ScopeCell {
         &self,
         member: &MemberCell,
         total_restarts: TotalRestarts,
-        update: impl FnOnce(&mut MemberRecord),
+        transition: MemberTransition,
         exited: LifecycleEventKind,
         scheduled: LifecycleEventKind,
     ) {
@@ -991,7 +1111,7 @@ impl ScopeCell {
                 scope.total_restarts = total_restarts;
             });
             wakes.pulse(&self.record);
-            member.update_locked(wakes, update);
+            member.transition_locked(wakes, transition);
             self.emit_locked(wakes, exited);
             self.emit_locked(wakes, scheduled);
         });
@@ -1151,11 +1271,7 @@ impl ScopeCell {
                 MemberStage::Terminal(exit) => ChildState::Stopped { exit },
             },
             last_exit: record.last_exit,
-            membership_status: if record.removing {
-                MembershipStatus::Removing
-            } else {
-                MembershipStatus::Active
-            },
+            membership_status: record.membership_status,
             restart_count: record.restart_count,
             restart_policy: options.restart,
             retention: options.retention,
@@ -1351,7 +1467,24 @@ impl ScopeCell {
     }
 
     pub(crate) fn request_shutdown(&self) -> Option<Epoch> {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
+        let control = self.control.lock().expect("scope control mutex poisoned");
+        self.request_shutdown_locked(control)
+    }
+
+    /// [`Self::request_shutdown`] for destructors: tolerates a poisoned
+    /// control mutex so a drop-path request cannot panic — and abort — on a
+    /// thread that is already unwinding. Control holds plain request state,
+    /// so overwriting a poisoner's partial update is no worse than any other
+    /// racing request.
+    pub(crate) fn request_shutdown_ignoring_poison(&self) -> Option<Epoch> {
+        let control = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.request_shutdown_locked(control)
+    }
+
+    fn request_shutdown_locked(&self, mut control: MutexGuard<'_, ScopeControl>) -> Option<Epoch> {
         let RequestTarget {
             epoch: target,
             pending_incarnation,
@@ -1438,7 +1571,7 @@ impl ScopeCell {
                 }
                 child
                     .member
-                    .update_locked(wakes, |record| record.stage = MemberStage::Admitted);
+                    .transition_locked(wakes, MemberTransition::Admitted);
                 let id = child.member.id().clone();
                 let membership = child.member.membership();
                 self.current_children()
@@ -1459,7 +1592,7 @@ impl ScopeCell {
             let membership = child.member.membership();
             child
                 .member
-                .update_locked(wakes, |record| record.stage = MemberStage::Admitted);
+                .transition_locked(wakes, MemberTransition::Admitted);
             self.current_children()
                 .push(ResidentChild::new(self, child));
             self.emit_locked(wakes, LifecycleEventKind::Added { id, membership });

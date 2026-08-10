@@ -91,7 +91,7 @@ successful exact-handle retirement, and containing-scope teardown also prune.
 The lifecycle `Removed` event describes that pruning edge; do not infer that a
 terminal snapshot must immediately disappear.
 
-For planned replacement, retain the admission receipt or exact handle, remove
+For planned replacement, retain the exact handle returned by admission, remove
 that membership, await `RemoveOutcome::Removed`, then add the replacement. An
 add racing an in-progress same-id removal fails with `RemovalInProgress`; await
 the removal and retry. The replacement's membership is distinct rather than a

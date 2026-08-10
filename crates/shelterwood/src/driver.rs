@@ -16,7 +16,10 @@ use crate::{
     Membership, Readiness, ReadinessDeadline, ScopeState, ShutdownStraggler, ShutdownTimeout,
     StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
-    cells::{MailboxControl, MemberStage, ResidentProjection, ScopeCell, StartupDisposition},
+    cells::{
+        MailboxControl, MemberStage, MemberTransition, ResidentProjection, ScopeCell,
+        StartupDisposition,
+    },
     deadline::Deadline,
     engine::{
         ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
@@ -25,7 +28,7 @@ use crate::{
         dispatch_exit, schedule_restart,
     },
     exit::{
-        JoinVerdict, RecordedOutcome, StartupError, StopReason, classify_exit,
+        RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
         reconcile_recorded_outcomes,
     },
     identity::IncarnationCounter,
@@ -159,6 +162,8 @@ enum DriverEvent {
     Removal(RemovalRequest),
 }
 
+const MIN_EVENT_BATCH_LIMIT: usize = 64;
+
 #[derive(Clone, Copy)]
 struct RemovalRequest {
     membership: Membership,
@@ -166,10 +171,6 @@ struct RemovalRequest {
 }
 
 impl SystemRun {
-    pub(crate) fn request_shutdown(&self) {
-        let _ = self.root.request_shutdown();
-    }
-
     pub(crate) async fn shutdown(&mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
         let result = shutdown_scope(Arc::clone(&self.root), timeout).await;
         self.join_driver().await;
@@ -186,25 +187,37 @@ impl SystemRun {
         let Some(driver) = self.driver.take() else {
             return;
         };
-        match runtime::join(driver).await {
-            runtime::JoinOutcome::Ok { .. } => {}
-            runtime::JoinOutcome::Panic { message, .. } => {
-                let exit = Exit::new(ExitKind::Panicked { message }, Cancellation::NotObserved);
-                self.root
-                    .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
-            }
+        // Only a crashed or cancelled driver leaves a live root incarnation to
+        // classify; cancellation of the driver itself is the one join verdict
+        // that proves the root observed cancellation.
+        let (join, cancellation) = match runtime::join(driver).await {
+            runtime::JoinOutcome::Ok { .. } => return,
+            runtime::JoinOutcome::Panic { message } => (
+                runtime::JoinOutcome::Panic { message },
+                Cancellation::NotObserved,
+            ),
             runtime::JoinOutcome::Cancelled => {
-                self.root.finish_live_root_incarnation(
-                    StopReason::ShutdownRequested,
-                    Exit::new(
-                        ExitKind::Aborted {
-                            phase: GracePhase::WithinGrace,
-                        },
-                        Cancellation::Observed,
-                    ),
-                );
+                (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
             }
-        }
+        };
+        self.root.finish_live_root_incarnation(
+            StopReason::ShutdownRequested,
+            classify_exit(None, join, None, cancellation),
+        );
+    }
+}
+
+impl Drop for SystemRun {
+    fn drop(&mut self) {
+        // After a clean shutdown the root epochs are `Idle`, not `Exhausted`,
+        // so this writes a real `ScopeRequest` — targeting the pending next
+        // incarnation — into dead control state and pulses the member record.
+        // That stays harmless only while watchers tolerate spurious wakes and
+        // the driver we already joined was the sole consumer of scope
+        // requests; nothing may come to treat a post-shutdown request as
+        // meaningful. The poison-tolerant entry point keeps this drop from
+        // panicking — and aborting — on an already-unwinding thread.
+        let _ = self.root.request_shutdown_ignoring_poison();
     }
 }
 
@@ -288,26 +301,21 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
     let monitor_root = Arc::clone(&root);
     let driver = runtime::spawn(async move { run_scope(plan, ScopeRole::Root).await });
     let lifecycle = runtime::spawn(async move {
-        match runtime::join(driver).await {
-            runtime::JoinOutcome::Ok { value, .. } => value,
-            runtime::JoinOutcome::Panic { message, .. } => {
-                let exit = Exit::new(ExitKind::Panicked { message }, Cancellation::NotObserved);
-                monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
-                StopReason::ShutdownRequested
-            }
+        let (join, cancellation) = match runtime::join(driver).await {
+            runtime::JoinOutcome::Ok { value } => return value,
+            runtime::JoinOutcome::Panic { message } => (
+                runtime::JoinOutcome::Panic { message },
+                Cancellation::NotObserved,
+            ),
             runtime::JoinOutcome::Cancelled => {
-                monitor_root.finish_live_root_incarnation(
-                    StopReason::ShutdownRequested,
-                    Exit::new(
-                        ExitKind::Aborted {
-                            phase: GracePhase::WithinGrace,
-                        },
-                        Cancellation::Observed,
-                    ),
-                );
-                StopReason::ShutdownRequested
+                (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
             }
-        }
+        };
+        monitor_root.finish_live_root_incarnation(
+            StopReason::ShutdownRequested,
+            classify_exit(None, join, None, cancellation),
+        );
+        StopReason::ShutdownRequested
     });
     SystemRun {
         root,
@@ -328,7 +336,7 @@ enum ChildEvent {
         child: ChildKey,
         incarnation: Incarnation,
         recorded: Option<RecordedOutcome>,
-        join: JoinVerdict,
+        join: runtime::JoinOutcome<()>,
         cancellation: Cancellation,
         readiness_signal_seen: bool,
     },
@@ -379,7 +387,10 @@ fn discharge_child_terminality(completion: ChildTerminality) {
     if matches!(record.stage, MemberStage::Terminal(_)) {
         return;
     }
-    let (exit, exited_incarnation) = if record.last_incarnation.is_some() {
+    let never_started = record.last_incarnation.is_none();
+    let (exit, exited_incarnation) = if never_started {
+        (Exit::never_started(), None)
+    } else {
         (
             Exit::new(
                 ExitKind::Aborted {
@@ -389,12 +400,13 @@ fn discharge_child_terminality(completion: ChildTerminality) {
             ),
             record.incarnation,
         )
-    } else {
-        (Exit::never_started(), None)
     };
-    if exited_incarnation.is_none()
-        && let Some(scope) = &completion.slot.scope
-    {
+    // `incarnation: None` also describes the gap between two incarnations.
+    // Only a membership that never ran needs a synthesized scope stop; a
+    // restarting scope already published its real reason in its last
+    // incarnation's epilogue, and replacing it here would make `wait_stopped`
+    // incorrectly report `NeverStarted`.
+    if never_started && let Some(scope) = &completion.slot.scope {
         scope.terminalize_never_started();
     }
     completion.root.terminalize_child(
@@ -544,7 +556,7 @@ struct ScopeRuntime {
     intensity_policy: crate::Intensity,
     intensity: IntensityState,
     children: ChildArena<ChildRuntime>,
-    events: runtime::MpscSender<DriverEvent>,
+    events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
@@ -692,7 +704,7 @@ impl SpawnLatches {
 }
 
 struct ChildTaskLaunch {
-    events: runtime::MpscSender<DriverEvent>,
+    events: runtime::UnboundedMpscSender<DriverEvent>,
     key: ChildKey,
     incarnation: Incarnation,
     body: SpawnBody,
@@ -850,19 +862,13 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
 
     let exit_sender = events.clone();
     runtime::spawn(async move {
-        let join = match runtime::join(handle).await {
-            runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
-            runtime::JoinOutcome::Panic { message, .. } => JoinVerdict::Panicked { message },
-            runtime::JoinOutcome::Cancelled => JoinVerdict::Cancelled {
-                phase: GracePhase::WithinGrace,
-            },
-        };
+        let join = runtime::join(handle).await;
         // The task owns `report`, whose explicit record or Drop fallback runs
         // before the join completes. `receive` therefore asserts sole
         // ownership and immediate post-join availability without ever
         // blocking this runtime worker.
         let report = report_claim.receive();
-        let _ = runtime::mpsc_send(
+        let _ = runtime::unbounded_mpsc_send(
             &exit_sender,
             DriverEvent::Child(ChildEvent::Exited {
                 child: key,
@@ -872,8 +878,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 cancellation: report.cancellation,
                 readiness_signal_seen: report.readiness_signal_seen,
             }),
-        )
-        .await;
+        );
     });
 
     let completion = ready.clone();
@@ -885,14 +890,13 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 runtime::select_two(ready.fired(), ready_completion.completed()).await,
                 runtime::Either::Left(())
             ) {
-                let _ = runtime::mpsc_send(
+                let _ = runtime::unbounded_mpsc_send(
                     &ready_sender,
                     DriverEvent::Child(ChildEvent::Ready {
                         child: key,
                         incarnation,
                     }),
-                )
-                .await;
+                );
             }
         });
     }
@@ -902,14 +906,13 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
             runtime::select_two(local_stop.fired(), completion.completed()).await,
             runtime::Either::Left(())
         ) {
-            let _ = runtime::mpsc_send(
+            let _ = runtime::unbounded_mpsc_send(
                 &events,
                 DriverEvent::Child(ChildEvent::SelfStop {
                     child: key,
                     incarnation,
                 }),
-            )
-            .await;
+            );
         }
     });
 
@@ -941,24 +944,32 @@ impl ScopeRuntime {
         else {
             return;
         };
-        if !member.record().removing {
-            self.root
-                .transition_child(&member, |record| record.removing = true, None);
+        // Idempotency hygiene rather than a load-bearing guard: an explicit
+        // removal publishes this projection before its request reaches the
+        // driver, and duplicate deliveries re-enter here after the first
+        // publication. Skipping the transition only avoids re-publishing an
+        // identical record under the observation gate; no public observable
+        // distinguishes that redundant publication, so tests pin the call
+        // sites (the fused-only removal path, where this write is the sole
+        // Removing-projection writer) rather than this check.
+        if member.record().membership_status != MembershipStatus::Removing {
+            self.root.set_child_removing(&member);
         }
     }
 
-    /// Reports whether a *removal* source has latched for this membership:
-    /// the dynamic entry's authoritative `Removing` control-plane state or a
-    /// fired fused-cancel latch on its `Resident` state. Scope-level stop
+    /// Projects the membership status from the *removal* sources alone:
+    /// `Removing` when one has latched for this membership — the dynamic
+    /// entry's authoritative `Removing` control-plane state or a fired
+    /// fused-cancel latch on its `Resident` state. Scope-level stop
     /// sources (drain, force, latched shutdown requests, ancestor latches)
     /// are deliberately excluded: each of those has a guaranteed follow-up
     /// event that owns the scope verdict, so exit dispatch must not
     /// reclassify the membership as `Removing` on their behalf.
-    fn membership_is_removing(&self, key: ChildKey) -> bool {
+    fn dispatch_membership_status(&self, key: ChildKey) -> MembershipStatus {
         let Some(child) = self.children.get(key) else {
-            return true;
+            return MembershipStatus::Removing;
         };
-        self.dynamic.as_ref().is_some_and(|control| {
+        let removing = self.dynamic.as_ref().is_some_and(|control| {
             control
                 .state
                 .lock()
@@ -967,7 +978,12 @@ impl ScopeRuntime {
                 .get(child.slot.member.id())
                 .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
                 .is_some_and(|entry| entry.restart_is_suppressed(key))
-        })
+        });
+        if removing {
+            MembershipStatus::Removing
+        } else {
+            MembershipStatus::Active
+        }
     }
 
     /// Reports whether any level-triggered stop source forbids constructing
@@ -985,7 +1001,7 @@ impl ScopeRuntime {
                 .role
                 .ancestor()
                 .is_some_and(|latches| latches.shutdown.is_fired() || latches.abort.is_fired())
-            || self.membership_is_removing(key)
+            || self.dispatch_membership_status(key) == MembershipStatus::Removing
     }
 
     fn pending_restart_shutdowns(&self) -> Vec<ChildKey> {
@@ -1093,14 +1109,9 @@ impl ScopeRuntime {
             );
             mailbox.bind(incarnation);
         }
-        self.root.transition_child(
+        self.root.transition_child_stage(
             &child.slot.member,
-            |record| {
-                record.stage = MemberStage::Starting;
-                record.incarnation = Some(incarnation);
-                record.last_incarnation = Some(incarnation);
-                record.restart_at = None;
-            },
+            MemberTransition::Starting { incarnation },
             Some(LifecycleEventKind::Started {
                 id: child.slot.member.id().clone(),
                 membership: child.slot.member.membership(),
@@ -1206,9 +1217,9 @@ impl ScopeRuntime {
                 if !self.lifecycle.startup_complete() {
                     child.initial_ready = true;
                 }
-                self.root.transition_child(
+                self.root.transition_child_stage(
                     &child.slot.member,
-                    |record| record.stage = MemberStage::Running,
+                    MemberTransition::Running,
                     Some(LifecycleEventKind::Ready {
                         id: child.slot.member.id().clone(),
                         membership: child.slot.member.membership(),
@@ -1264,10 +1275,10 @@ impl ScopeRuntime {
     }
 
     fn complete_startup(&mut self) {
-        if !self.lifecycle.complete_startup() {
+        let Some(state) = self.lifecycle.complete_startup() else {
             return;
-        }
-        self.root.set_state(ScopeState::Running);
+        };
+        self.root.set_state(state);
         self.root.set_startup(Ok(()));
         if let Some(parent_ready) = self.role.parent_ready() {
             parent_ready.fire();
@@ -1288,11 +1299,8 @@ impl ScopeRuntime {
                 }
                 return;
             }
-            self.root.transition_child(
-                &child.slot.member,
-                |record| record.stage = MemberStage::Stopping,
-                None,
-            );
+            self.root
+                .transition_child_stage(&child.slot.member, MemberTransition::Stopping, None);
             if let Some(mailbox) = &child.mailbox {
                 mailbox.freeze(active.incarnation);
             }
@@ -1386,7 +1394,7 @@ impl ScopeRuntime {
         if effect.startup_pending {
             self.root.set_startup(Err(StartupError::ShutdownRequested));
         }
-        self.root.set_state(ScopeState::Draining);
+        self.root.set_state(effect.state);
         match self.root.flavor {
             ScopeFlavor::Ordered => {
                 self.ordered_stop_cursor = self.children.keys().next_back();
@@ -1531,7 +1539,7 @@ impl ScopeRuntime {
         key: ChildKey,
         incarnation: Incarnation,
         recorded: Option<RecordedOutcome>,
-        mut join: JoinVerdict,
+        join: runtime::JoinOutcome<()>,
         cancellation: Cancellation,
         readiness_signal_seen: bool,
     ) {
@@ -1576,11 +1584,8 @@ impl ScopeRuntime {
         {
             runtime::dispose_detached(teardown);
         }
-        if let (JoinVerdict::Cancelled { .. }, Some(phase)) = (&join, active.hard_abort_phase) {
-            join = JoinVerdict::Cancelled { phase };
-        }
         let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
-        let exit = classify_exit(recorded, join, cancellation);
+        let exit = classify_exit(recorded, join, active.hard_abort_phase, cancellation);
         child.restarts.settle_if_stable(
             IncarnationRun {
                 started_at: active.started_at,
@@ -1590,8 +1595,8 @@ impl ScopeRuntime {
         );
 
         // Fused cancellation is a level-triggered source. It can linearize
-        // before the forwarded Removal event or its public `removing`
-        // projection reaches this driver, so exit dispatch must consult the
+        // before the forwarded Removal event or its public status projection
+        // reaches this driver, so exit dispatch must consult the
         // removal sources directly before charging or publishing a restart.
         // Only removal sources classify the membership here: a latched but
         // unprocessed scope stop (shutdown request or ancestor latch) must
@@ -1600,7 +1605,7 @@ impl ScopeRuntime {
         // own follow-up event owns the verdict. The broader
         // `restart_is_suppressed` still gates the restart deadline arm,
         // where every suppression source has a guaranteed follow-up event.
-        let membership_removing = self.membership_is_removing(key);
+        let membership_status = self.dispatch_membership_status(key);
         let child = self
             .children
             .get_mut(key)
@@ -1610,11 +1615,6 @@ impl ScopeRuntime {
             ScopeMode::Draining
         } else {
             ScopeMode::Running
-        };
-        let membership_status = if membership_removing {
-            MembershipStatus::Removing
-        } else {
-            MembershipStatus::Active
         };
         match dispatch_exit(&exit, child.options.restart, mode, membership_status) {
             ExitDispatch::Terminal => {
@@ -1650,16 +1650,13 @@ impl ScopeRuntime {
                 self.root.publish_child_restart(
                     &child.slot.member,
                     decision.charge.total_restarts,
-                    |record| {
-                        record.incarnation = None;
-                        record.last_exit = Some(exit.clone());
-                        record.restart_count = decision.restart_count;
-                        // Publish the derived schedule even when intensity
-                        // prevents spawning it. `None` means the exact clock
-                        // point cannot be represented and armed; no substitute
-                        // restart is scheduled.
-                        record.restart_at = decision.restart_at;
-                        record.stage = MemberStage::Restarting;
+                    MemberTransition::RestartScheduled {
+                        exit: exit.clone(),
+                        restart_count: decision.restart_count,
+                        // Publish the derived schedule even when intensity prevents spawning it.
+                        // `None` means the exact clock point cannot be represented and armed; no
+                        // substitute restart is scheduled.
+                        restart_at: decision.restart_at,
                     },
                     LifecycleEventKind::Exited {
                         id: child.slot.member.id().clone(),
@@ -1757,13 +1754,12 @@ impl ScopeRuntime {
         child.slot.member.set_terminal_disposal_pending(false);
         if terminal.exited_incarnation.is_some()
             && let Some(runtime::DisposalPanic { message }) = panic
-            && !matches!(terminal.exit.kind(), ExitKind::Panicked { .. })
         {
             // Only an exited incarnation can own a destructor failure. A
             // never-started child or a child between restart incarnations
             // keeps its already-authoritative verdict while disposal remains
             // ordered ahead of terminal routing.
-            terminal.exit = Exit::new(ExitKind::Panicked { message }, terminal.exit.cancellation());
+            terminal.exit = classify_disposal_panic(terminal.exit, message);
         }
 
         let exit = terminal.exit;
@@ -1820,10 +1816,9 @@ impl ScopeRuntime {
                 exit,
             },
         };
-        let first_failure = self.lifecycle.fail_startup();
-        if !first_failure {
+        let Some(state) = self.lifecycle.fail_startup() else {
             return;
-        }
+        };
         self.root
             .set_startup(Err(StartupError::StartupFailed(failure.clone())));
         if self.root.flavor == ScopeFlavor::Ordered {
@@ -1843,7 +1838,7 @@ impl ScopeRuntime {
             }
         }
         if self.role.is_root() {
-            self.root.set_state(ScopeState::StartupFailed);
+            self.root.set_state(state);
         } else {
             self.begin_drain(StopReason::StartupFailed(failure));
         }
@@ -2084,7 +2079,7 @@ impl ScopeRuntime {
         // `RemovalRequest` for the same membership, and `mark_removing`
         // deliberately re-succeeds on an already-Removing entry, so a second
         // delivery reaches this point. Every step below is idempotent:
-        // `publish_dynamic_removal` is guarded by the record's `removing`
+        // `publish_dynamic_removal` is guarded by the record's status
         // flag, `begin_stop_child` by its ladder/disposal guards, and
         // `finalize_removal` removes the entry it matched.
         self.publish_dynamic_removal(key);
@@ -2278,12 +2273,9 @@ async fn run_nested_tree_with_epoch(
             return Err(crate::ExitError::from_startup_failure(failure));
         }
     };
-    match run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch).await {
-        StopReason::Finished | StopReason::ShutdownRequested => Ok(()),
-        StopReason::IntensityTripped(trip) => Err(crate::ExitError::from_intensity_trip(trip)),
-        StopReason::StartupFailed(failure) => Err(crate::ExitError::from_startup_failure(failure)),
-        StopReason::NeverStarted => Err(crate::ExitError::message("nested scope never started")),
-    }
+    run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch)
+        .await
+        .into_nested_result()
 }
 
 async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
@@ -2304,14 +2296,32 @@ async fn run_scope_incarnation(
 ) -> StopReason {
     let root = Arc::clone(&plan.root);
     if role.is_root() {
-        root.member
-            .update(|record| record.stage = MemberStage::Running);
+        root.member.transition(MemberTransition::Running);
     }
-    let capacity = plan.children.len().saturating_mul(3).max(64);
-    let (events, mut event_receiver) = runtime::bounded_mpsc(capacity);
+    // Both lanes are unbounded so their producers can publish synchronously.
+    // Keep child lifecycle events separate from externally generated dynamic
+    // control traffic: a large admission prefix must not strand the exit that
+    // completes shutdown. Bound each lane's per-wake collection so traffic
+    // cannot defer signals or deadlines indefinitely. The cap adds one
+    // ordering surface: when a wake finds more than a full batch of primary
+    // events, the deferred suffix (an intensity-tripping exit, say) is
+    // processed one wake after control-lane admissions enqueued earlier.
+    // `arbitrate` promises order only within a batch, and cross-pass
+    // wall-clock inversion was already reachable through the forwarder, so
+    // no promised order is violated.
+    let event_batch_limit = plan
+        .children
+        .len()
+        .saturating_mul(3)
+        .max(MIN_EVENT_BATCH_LIMIT);
+    let (events, mut event_receiver) = runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
-    let dynamic =
-        (plan.root.flavor == ScopeFlavor::Dynamic).then(|| DynamicControl::new(events.clone()));
+    let (dynamic, mut dynamic_event_receiver) = if plan.root.flavor == ScopeFlavor::Dynamic {
+        let (dynamic_events, receiver) = runtime::unbounded_mpsc();
+        (Some(DynamicControl::new(dynamic_events)), Some(receiver))
+    } else {
+        (None, None)
+    };
     // Transfer children one at a time. The not-yet-converted suffix remains
     // owned by ScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
@@ -2420,10 +2430,12 @@ async fn run_scope_incarnation(
             // cannot publish Running after the stop boundary.
             pending.push(Pending::Force.classified());
         }
-        while let Some(event) = runtime::mpsc_try_recv(&mut event_receiver) {
-            pending.push(Pending::Driver(event).classified());
-        }
-        // Disposal completions drain after the bounded lane, and `arbitrate`
+        let primary_batch_full =
+            collect_driver_events(&mut event_receiver, event_batch_limit, &mut pending);
+        let control_batch_full = dynamic_event_receiver.as_mut().is_some_and(|receiver| {
+            collect_driver_events(receiver, event_batch_limit, &mut pending)
+        });
+        // Disposal completions drain after the primary and dynamic lanes, and `arbitrate`
         // sorts stably, so a `ConstructionDisposed` always trails every
         // same-class `Exited` collected in the same wake — even one produced
         // later. A disposal is therefore a batch-tail event: the exit it
@@ -2475,6 +2487,7 @@ async fn run_scope_incarnation(
                     parent_shutdown: ancestor_command,
                 },
                 &mut event_receiver,
+                dynamic_event_receiver.as_mut(),
                 scope.deadlines.next(),
             )
             .await
@@ -2491,7 +2504,12 @@ async fn run_scope_incarnation(
                 runtime::ScopeWake::Message(Some(event)) => {
                     pending.push(Pending::Driver(event).classified());
                 }
-                runtime::ScopeWake::Message(None) => continue,
+                runtime::ScopeWake::ControlMessage(Some(event)) => {
+                    pending.push(Pending::Driver(event).classified());
+                }
+                runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
+                    continue;
+                }
             }
         }
 
@@ -2557,25 +2575,7 @@ async fn run_scope_incarnation(
         }
 
         if let Some(reason) = scope.finish_if_ready() {
-            let root_exit = scope.role.is_root().then(|| match &reason {
-                StopReason::Finished | StopReason::ShutdownRequested => {
-                    let cancellation = if reason == StopReason::ShutdownRequested {
-                        Cancellation::Observed
-                    } else {
-                        Cancellation::NotObserved
-                    };
-                    Exit::new(ExitKind::Completed, cancellation)
-                }
-                StopReason::IntensityTripped(trip) => Exit::new(
-                    ExitKind::Failed(crate::ExitError::from_intensity_trip(trip.clone())),
-                    Cancellation::NotObserved,
-                ),
-                StopReason::StartupFailed(failure) => Exit::new(
-                    ExitKind::Failed(crate::ExitError::from_startup_failure(failure.clone())),
-                    Cancellation::NotObserved,
-                ),
-                StopReason::NeverStarted => Exit::never_started(),
-            });
+            let root_exit = scope.role.is_root().then(|| reason.root_exit());
             // ScopeRuntime's synchronous epilogue clears dynamic state,
             // discharges child obligations and residency, and only then
             // publishes the scope's terminal state.
@@ -2584,6 +2584,15 @@ async fn run_scope_incarnation(
                 root_exit,
             });
             return reason;
+        }
+
+        // A full lane may still have a queued suffix. On a current-thread
+        // runtime, immediately collecting the next batch would prevent the
+        // child, timer, and helper tasks whose events this loop prioritizes
+        // from running at all. Give those producers one scheduler turn before
+        // returning to either saturated lane.
+        if primary_batch_full || control_batch_full {
+            runtime::yield_now().await;
         }
     }
 }
@@ -2617,6 +2626,28 @@ impl Pending {
     }
 }
 
+fn collect_driver_events(
+    receiver: &mut runtime::UnboundedMpscReceiver<DriverEvent>,
+    limit: usize,
+    pending: &mut Vec<(ArbitrationClass, Pending)>,
+) -> bool {
+    for _ in 0..limit {
+        let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
+            return false;
+        };
+        pending.push(Pending::Driver(event).classified());
+    }
+    // Collecting exactly `limit` events does not by itself show a capped
+    // lane. Probe once more so a lane that drained right at the limit skips
+    // the full-batch yield; a probed event joins this batch rather than
+    // being deferred a wake.
+    let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
+        return false;
+    };
+    pending.push(Pending::Driver(event).classified());
+    true
+}
+
 fn restart_shutdown_work(child: ChildKey) -> (ArbitrationClass, Pending) {
     // This starts a pending incarnation, so it is restart work, not a
     // scope-shutdown transition. A child exit collected in the same wake must
@@ -2638,7 +2669,7 @@ fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
 }
 
 #[cfg(test)]
-pub(crate) use tests::exercise_saturated_fused_drop_before_exit;
+pub(crate) use tests::exercise_queued_fused_drop_before_exit_dispatch;
 
 #[cfg(test)]
 mod tests;

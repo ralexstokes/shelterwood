@@ -1,6 +1,7 @@
 use std::{
     future::{self, Future},
     panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
     sync::{
         Arc, Barrier, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -12,11 +13,11 @@ use std::{
 use crate::{
     ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
     GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox,
-    RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ReserveError, RestartCondition,
-    RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind, StartupError,
-    StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+    MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ReserveError,
+    RestartCondition, RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind,
+    StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
     engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
-    exit::{JoinVerdict, RecordedOutcome},
+    exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
     mailbox::MailboxCell,
     plan::{ChildConstruction, SlotCell},
@@ -25,12 +26,13 @@ use crate::{
 };
 
 use super::{
-    AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
-    DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
-    Pending, RemovalRequest, RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell,
-    ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
-    cancel_dynamic_reservation, report_slot, reserve_dynamic, resident_projection,
-    restart_shutdown_work, run_nested_factory, run_nested_tree, run_scope_incarnation,
+    AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, ChildTerminality,
+    DriverEvent, DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage,
+    MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
+    ResidentProjection, RuntimeStorage, ScopeCell, ScopeEpochGuard, ScopeFlavor, ScopeRole,
+    ScopeRuntime, StartupDisposition, cancel_dynamic_reservation, discharge_child_terminality,
+    report_slot, reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
+    run_nested_tree, run_scope_incarnation, storage::Obligation,
 };
 
 /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -47,6 +49,61 @@ fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
         identity.mint_membership(&id).expect("membership available"),
     );
     ScopeCell::new(member, flavor, ScopeIdentity::new())
+}
+
+fn running_dynamic_fixture() -> (
+    ScopeRuntime,
+    crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    Arc<DynamicControl>,
+) {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let epoch = root
+        .begin_incarnation()
+        .expect("test scope epoch is available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state(ScopeState::Running);
+    root.set_startup(Ok(()));
+
+    let (events, event_receiver) = crate::runtime::unbounded_mpsc();
+    let (dynamic_events, dynamic_event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(dynamic_events);
+    root.set_dynamic_route(Some(control.clone()));
+    root.set_admitted_children(Vec::new());
+    let scope = ScopeRuntime {
+        root,
+        defaults: ResolvedDefaults::default(),
+        intensity_policy: Intensity::default(),
+        intensity: super::IntensityState::default(),
+        children: ChildArena::default(),
+        events,
+        disposal_events,
+        deadlines: super::DeadlineQueue::default(),
+        jitter: crate::runtime::JitterRng::from_system_entropy(),
+        lifecycle: ScopeLifecycle::running(),
+        next_ordered_start: None,
+        role: ScopeRole::Root,
+        dynamic: Some(control.clone()),
+        epoch,
+        ancestor_shutdown_seen: false,
+        ancestor_abort_seen: false,
+        hard_forced: false,
+        ordered_stop_progressing: false,
+        ordered_stop_cursor: None,
+        ordered_stop_waiting: None,
+        ordered_stop_inspections: 0,
+        completion: None,
+    };
+    (
+        scope,
+        event_receiver,
+        dynamic_event_receiver,
+        disposal_event_receiver,
+        control,
+    )
 }
 
 #[derive(Debug, Default)]
@@ -416,6 +473,58 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
     assert_eq!(waiter.await, StopReason::ShutdownRequested);
 }
 
+#[crate::runtime::test]
+async fn terminality_fallback_preserves_restart_window_scope_reason() {
+    let parent = isolated_scope("parent", ScopeFlavor::Ordered);
+    let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+    let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+    parent.set_admitted_children(vec![resident_projection(&slot)]);
+
+    let mut incarnations = ScopeIdentity::new().incarnation_counter(nested.member.membership());
+    let last_incarnation = incarnations.mint().expect("child incarnation is available");
+    nested.member.update(|record| {
+        record.stage = MemberStage::Restarting;
+        record.incarnation = None;
+        record.last_incarnation = Some(last_incarnation);
+        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
+    });
+    nested.set_state(ScopeState::Stopped {
+        reason: StopReason::Finished,
+    });
+    let mut snapshots = nested.subscribe_snapshots();
+
+    let mut terminality = Obligation::new(
+        ChildTerminality {
+            root: Arc::clone(&parent),
+            slot,
+        },
+        discharge_child_terminality,
+    );
+    terminality.discharge();
+
+    assert_eq!(nested.wait_stopped().await, StopReason::Finished);
+    let MemberStage::Terminal(exit) = nested.member.record().stage else {
+        panic!("the fallback must terminalize the nested membership");
+    };
+    assert!(matches!(
+        exit.kind(),
+        ExitKind::Aborted {
+            phase: GracePhase::WithinGrace
+        }
+    ));
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
+    assert_eq!(
+        snapshots.borrow_latest().state,
+        ScopeState::Stopped {
+            reason: StopReason::Finished
+        }
+    );
+    assert!(
+        snapshots.changed().await.is_err(),
+        "the fallback closes observation after retaining the final stopped snapshot"
+    );
+}
+
 #[crate::runtime::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blocked_initial_scope_factory_owns_its_stop_epilogue() {
     let gate = Arc::new(FactoryGate::default());
@@ -737,12 +846,13 @@ fn plain_parent_state_preserves_nested_snapshot_propagation() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
     let mut incarnations = IncarnationCounter::near_exhaustion(nested.member.membership());
-    nested.member.update(|record| {
-        record.incarnation = incarnations.mint();
-        record.stage = MemberStage::Starting;
-    });
     let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
     root.set_admitted_children(vec![resident_projection(&nested_slot)]);
+    // Start the nested member along the production admit-then-spawn order so
+    // the transition-source assertions in `apply_transition` hold here too.
+    nested.member.transition(MemberTransition::Starting {
+        incarnation: incarnations.mint().expect("incarnation available"),
+    });
     let snapshots = root.subscribe_snapshots();
     let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
 
@@ -818,7 +928,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
@@ -947,7 +1057,7 @@ fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
@@ -1030,7 +1140,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
@@ -1109,7 +1219,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         recorded: Some(RecordedOutcome::returned(Err(ExitError::message(
             "trip intensity",
         )))),
-        join: JoinVerdict::Completed,
+        join: crate::runtime::JoinOutcome::Ok { value: () },
         cancellation: Cancellation::NotObserved,
         readiness_signal_seen: false,
     });
@@ -1180,7 +1290,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
@@ -1230,7 +1340,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
             child: key,
             incarnation,
             recorded: Some(RecordedOutcome::returned(Ok(()))),
-            join: JoinVerdict::Completed,
+            join: crate::runtime::JoinOutcome::Ok { value: () },
             cancellation: Cancellation::NotObserved,
             readiness_signal_seen: true,
         }))
@@ -1388,8 +1498,7 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
                     .shutdown(crate::Shutdown::Abort),
             )
             .await
-            .expect("task admission")
-            .into_handles();
+            .expect("task admission");
         assert_eq!(
             cell.runtime_storage(),
             RuntimeStorage {
@@ -1419,8 +1528,7 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
                 TaskDef::new(|_| async { Ok(()) }).retention(Retention::Remove),
             )
             .await
-            .expect("auto-removing task admission")
-            .into_handles();
+            .expect("auto-removing task admission");
         automatic.wait().await;
         assert_eq!(
             cell.runtime_storage(),
@@ -2716,7 +2824,7 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
     );
     let slot = SlotCell::new(Arc::clone(&member), None);
     root.set_admitted_children(vec![resident_projection(&slot)]);
-    let (events, _receiver) = crate::runtime::bounded_mpsc(1);
+    let (events, _receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
     let (sender, mut response) = crate::runtime::oneshot();
     let mut responses = RemovalResponses::default();
@@ -2747,32 +2855,19 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
 }
 
 #[crate::runtime::test]
-async fn retained_unadmitted_slot_does_not_retain_the_request_forwarder() {
+async fn retained_unadmitted_slot_does_not_block_driver_teardown() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
     let slot = scope
         .reserve_task("retained")
         .expect("unadmitted reservation is retained");
-    let control = scope
-        .as_scope()
-        .cell
-        .dynamic_route()
-        .expect("the live dynamic scope exposes its control");
-    let (forwarder_close, forwarder_ended) = control.request_forwarder_probe();
-
     system
         .shutdown(Duration::from_secs(1))
         .await
         .expect("driver teardown completes");
 
-    assert!(forwarder_close.is_fired());
-    assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(1), forwarder_ended.fired()).await,
-        crate::runtime::Timeout::Completed(())
-    ));
     drop(slot);
-    drop(control);
 }
 
 #[test]
@@ -2799,7 +2894,7 @@ fn dynamic_removal_releases_state_before_waiting_for_the_observation_gate() {
     );
     let slot = SlotCell::new(Arc::clone(&member), None);
     root.set_admitted_children(vec![resident_projection(&slot)]);
-    let (events, _receiver) = crate::runtime::bounded_mpsc(1);
+    let (events, _receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
     let key = ChildKey(1);
     control
@@ -2854,29 +2949,16 @@ fn dynamic_removal_releases_state_before_waiting_for_the_observation_gate() {
 }
 
 #[crate::runtime::test]
-async fn saturated_removal_from_a_foreign_thread_reaches_the_driver() {
+async fn removal_from_a_foreign_thread_reaches_the_driver() {
     let mut identity = ScopeIdentity::new();
-    let first_id = ChildId::from("first");
-    let second_id = ChildId::from("second");
-    let first = identity
-        .mint_membership(&first_id)
-        .expect("first membership available");
-    let second = identity
-        .mint_membership(&second_id)
-        .expect("second membership available");
-    let member = MemberCell::new(second_id.clone(), second);
+    let child_id = ChildId::from("worker");
+    let membership = identity
+        .mint_membership(&child_id)
+        .expect("membership available");
+    let member = MemberCell::new(child_id.clone(), membership);
     let slot = SlotCell::new(Arc::clone(&member), None);
-    let second_key = ChildKey(2);
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
-    assert!(
-        events
-            .try_send(DriverEvent::Removal(RemovalRequest {
-                membership: first,
-                key: ChildKey(1),
-            }))
-            .is_ok(),
-        "the fixture saturates the bounded driver lane"
-    );
+    let key = ChildKey(1);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
     control
         .state
@@ -2884,8 +2966,8 @@ async fn saturated_removal_from_a_foreign_thread_reaches_the_driver() {
         .expect("dynamic-state mutex poisoned")
         .entries
         .insert(
-            second_id,
-            DynamicEntry::resident(Arc::clone(&slot), second_key, Some(Latch::default())),
+            child_id,
+            DynamicEntry::resident(Arc::clone(&slot), key, Some(Latch::default())),
         );
     let foreign_control = Arc::clone(&control);
     let foreign_slot = Arc::clone(&slot);
@@ -2899,24 +2981,17 @@ async fn saturated_removal_from_a_foreign_thread_reaches_the_driver() {
     .join()
     .expect("foreign-thread removal signaling succeeds");
 
-    let Some(DriverEvent::Removal(observed_first)) = event_receiver.recv().await else {
-        panic!("the saturated event remains first");
+    let event = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+        crate::runtime::Timeout::Completed(event) => event.expect("the driver lane remains open"),
+        crate::runtime::Timeout::Elapsed => {
+            panic!("the off-runtime removal edge must not be lost")
+        }
     };
-    assert_eq!(observed_first.membership, first);
-    let second_event =
-        match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
-            crate::runtime::Timeout::Completed(event) => {
-                event.expect("the control forwarder remains open")
-            }
-            crate::runtime::Timeout::Elapsed => {
-                panic!("the off-runtime removal edge must not be lost")
-            }
-        };
-    let DriverEvent::Removal(observed_second) = second_event else {
-        panic!("the forwarded event is the requested removal");
+    let DriverEvent::Removal(observed) = event else {
+        panic!("the queued event is the requested removal");
     };
-    assert_eq!(observed_second.membership, second);
-    assert_eq!(observed_second.key, second_key);
+    assert_eq!(observed.membership, membership);
+    assert_eq!(observed.key, key);
 }
 
 #[crate::runtime::test]
@@ -2930,7 +3005,7 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     root.set_state(ScopeState::Running);
     root.set_startup(Ok(()));
 
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
     root.set_dynamic_route(Some(control.clone()));
@@ -2973,7 +3048,7 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     )
     .expect("admission starts inside the runtime");
     let Some(DriverEvent::Admission(request)) = event_receiver.recv().await else {
-        panic!("the admission forwarder submits the request")
+        panic!("admission enqueueing submits the request")
     };
 
     assert!(
@@ -3014,7 +3089,533 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     );
 }
 
-pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
+#[crate::runtime::test]
+async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
+    let (mut scope, _event_receiver, mut dynamic_event_receiver, _disposal_event_receiver, control) =
+        running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    let fused_cancel = Latch::default();
+    let response = super::start_admission(
+        Arc::clone(&reservation.control),
+        Arc::clone(&reservation.slot),
+        Some(fused_cancel.clone()),
+    )
+    .expect("admission starts inside the runtime");
+    let Some(DriverEvent::Admission(request)) = dynamic_event_receiver.recv().await else {
+        panic!("admission enqueueing submits the request")
+    };
+
+    // Fused cancellation linearizes after Admission is queued but before
+    // the driver handles it. A reserved entry has no arena key, so
+    // `signal_fused_cancel` cannot queue a Removal for this membership;
+    // the fired latch is the authoritative rejection evidence until the
+    // queued Admission reaches the driver.
+    super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
+    assert!(fused_cancel.is_fired());
+    assert!(
+        crate::runtime::unbounded_mpsc_try_recv(&mut dynamic_event_receiver).is_none(),
+        "a reserved membership cannot emit a key-addressed Removal"
+    );
+
+    // If handle_admission loses its first latch re-check, conversion now
+    // reaches this poisoned identity mutex and unwinds before the later
+    // under-lock check. The real guard rejects without touching it.
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _identity = root
+                .child_identity
+                .lock()
+                .expect("scope identity mutex starts healthy");
+            panic!("poison conversion after the overtaking fused cancellation");
+        }))
+        .is_err()
+    );
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request))).is_ok(),
+        "overtaking fused cancellation rejects before fallible child conversion"
+    );
+    assert!(matches!(
+        response.receive().await,
+        Some(Err(ReserveError::NotAdmitting(
+            crate::NotAdmittingCause::ReservationEnded
+        )))
+    ));
+    assert!(scope.children.is_empty());
+    assert!(
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex remains healthy")
+            .entries
+            .is_empty()
+    );
+    assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
+}
+
+#[crate::runtime::test]
+async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_recheck() {
+    let (mut scope, _event_receiver, mut dynamic_event_receiver, _disposal_event_receiver, control) =
+        running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    let fused_cancel = Latch::default();
+    let response = super::start_admission(
+        Arc::clone(&reservation.control),
+        Arc::clone(&reservation.slot),
+        Some(fused_cancel.clone()),
+    )
+    .expect("admission starts inside the runtime");
+    let Some(DriverEvent::Admission(request)) = dynamic_event_receiver.recv().await else {
+        panic!("admission enqueueing submits the request")
+    };
+
+    // Fused cancellation fires while the driver is already inside child
+    // conversion: past the pre-conversion latch check, parked on the child
+    // identity mutex held below. Only the re-check under the control-plane
+    // lock can observe this firing, so this interleaving pins that disjunct
+    // specifically. The entry stays Reserved throughout — a fired latch
+    // cannot mark a keyless reservation Removing — which keeps the
+    // stale-reservation disjunct of the same re-check false.
+    let defaults = ResolvedDefaults::default();
+    let mut definition_claimed = false;
+    std::thread::scope(|threads| {
+        let identity = root
+            .child_identity
+            .lock()
+            .expect("scope identity mutex starts healthy");
+        let driver_scope = &mut scope;
+        let driver = threads.spawn(move || driver_scope.handle_admission(request));
+        // The definition leaves the slot after the pre-conversion latch
+        // check and before conversion parks on the held identity mutex, so
+        // observing the claim proves the driver passed that first check
+        // while the latch was still unfired.
+        let deadline = std::time::Instant::now() + CAPTURE_PROBE_WAIT;
+        while std::time::Instant::now() < deadline {
+            if matches!(reservation.slot.resolve_policy(&defaults), Ok(None)) {
+                definition_claimed = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
+        // Release without unwinding: conversion must proceed into the
+        // under-lock re-check, not observe a poisoned identity mutex.
+        drop(identity);
+        driver
+            .join()
+            .expect("conversion proceeds after the identity mutex is released");
+    });
+    assert!(
+        definition_claimed,
+        "the parked admission claims its definition within the bound"
+    );
+
+    assert!(matches!(
+        response.receive().await,
+        Some(Err(ReserveError::NotAdmitting(
+            crate::NotAdmittingCause::ReservationEnded
+        )))
+    ));
+    assert!(
+        scope.children.is_empty(),
+        "the under-lock rejection admits no resident"
+    );
+    assert!(
+        crate::runtime::unbounded_mpsc_try_recv(&mut dynamic_event_receiver).is_none(),
+        "a reservation-time cancellation emits no key-addressed Removal"
+    );
+    assert!(
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex remains healthy")
+            .entries
+            .is_empty()
+    );
+    assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
+}
+
+#[derive(Clone, Copy)]
+enum DuplicateRemovalDelivery {
+    WhileActive,
+    DuringDisposal,
+}
+
+async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
+    let (
+        mut scope,
+        mut event_receiver,
+        mut dynamic_event_receiver,
+        mut disposal_event_receiver,
+        control,
+    ) = running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let mut lifecycle = root.subscribe_lifecycle();
+    let started = Latch::default();
+    let reservation = super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    let membership = member.membership();
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new({
+            let started = started.clone();
+            move |context| {
+                let started = started.clone();
+                async move {
+                    started.fire();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        })));
+    let fused_cancel = Latch::default();
+    let mut admission_response = super::start_admission(
+        Arc::clone(&reservation.control),
+        Arc::clone(&reservation.slot),
+        Some(fused_cancel.clone()),
+    )
+    .expect("admission starts inside the runtime");
+    let Some(DriverEvent::Admission(request)) = dynamic_event_receiver.recv().await else {
+        panic!("admission enqueueing submits the request")
+    };
+    scope.handle_admission(request);
+    assert!(matches!(admission_response.try_receive(), Some(Ok(()))));
+    assert!(matches!(
+        crate::runtime::timeout(Duration::from_secs(2), started.fired()).await,
+        crate::runtime::Timeout::Completed(())
+    ));
+
+    let key = control
+        .state
+        .lock()
+        .expect("dynamic-state mutex poisoned")
+        .entries
+        .get(member.id())
+        .and_then(DynamicEntry::key)
+        .expect("the admission installs its child key");
+    super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
+    let mut removal_response = super::remove_dynamic(&root, member.id(), Some(member.membership()));
+
+    let mut removals = Vec::new();
+    while removals.len() < 2 {
+        let event =
+            match crate::runtime::timeout(Duration::from_secs(2), dynamic_event_receiver.recv())
+                .await
+            {
+                crate::runtime::Timeout::Completed(Some(event)) => event,
+                crate::runtime::Timeout::Completed(None) => {
+                    panic!("the dynamic-control lane remains open")
+                }
+                crate::runtime::Timeout::Elapsed => {
+                    panic!("both removal sources reach the driver")
+                }
+            };
+        let DriverEvent::Removal(removal) = event else {
+            panic!("only removal requests reach the dynamic-control lane here")
+        };
+        removals.push(removal);
+    }
+    assert!(
+        removals
+            .iter()
+            .all(|removal| { removal.membership == membership && removal.key == key })
+    );
+
+    scope.handle_removal(removals.remove(0));
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the first removal begins the live stop ladder");
+    let ladder = active.ladder.expect("the stop ladder is armed");
+    let stop_deadline = active.stop_deadline;
+    let deadline_count = scope.deadlines.len();
+
+    if matches!(delivery, DuplicateRemovalDelivery::WhileActive) {
+        scope.handle_removal(removals.remove(0));
+        let active = scope.children[key]
+            .active
+            .as_ref()
+            .expect("the duplicate leaves the incarnation active");
+        assert_eq!(active.ladder, Some(ladder));
+        assert_eq!(active.stop_deadline, stop_deadline);
+        assert_eq!(scope.deadlines.len(), deadline_count);
+    }
+
+    let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+        crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
+            child,
+            incarnation,
+            recorded,
+            join,
+            cancellation,
+            readiness_signal_seen,
+        }))) => (
+            child,
+            incarnation,
+            recorded,
+            join,
+            cancellation,
+            readiness_signal_seen,
+        ),
+        crate::runtime::Timeout::Completed(_) => panic!("the stopped child reports exit"),
+        crate::runtime::Timeout::Elapsed => panic!("the stopped child exit must arrive"),
+    };
+    scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);
+    assert!(scope.children[key].pending_terminal.is_some());
+
+    if matches!(delivery, DuplicateRemovalDelivery::DuringDisposal) {
+        // Defense-in-depth, pinned jointly rather than individually: the
+        // duplicate is dropped by `begin_stop_child`'s terminal/disposing
+        // guard, and even without that guard `begin_terminal_disposal`'s
+        // pending-terminal guard returns before disturbing disposal. Either
+        // check alone suffices to protect this observable, so this test
+        // fails only when both are removed together.
+        scope.handle_removal(removals.remove(0));
+        assert!(
+            scope
+                .children
+                .get(key)
+                .is_some_and(|child| child.pending_terminal.is_some()),
+            "the duplicate cannot bypass retained-construction disposal"
+        );
+    }
+    assert!(removals.is_empty());
+    assert_eq!(
+        removal_response.try_receive(),
+        None,
+        "removal completion waits for terminality, disposal, and pruning"
+    );
+
+    let disposal =
+        match crate::runtime::timeout(Duration::from_secs(2), disposal_event_receiver.recv()).await
+        {
+            crate::runtime::Timeout::Completed(Some(event)) => event,
+            crate::runtime::Timeout::Completed(None) => {
+                panic!("the disposal lane remains open")
+            }
+            crate::runtime::Timeout::Elapsed => {
+                panic!("retained construction disposal completes")
+            }
+        };
+    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = disposal else {
+        panic!("the stop path reports retained construction disposal")
+    };
+    assert_eq!(child, key);
+    scope.handle_construction_disposed(child, panic);
+
+    assert!(scope.children.get(key).is_none());
+    assert!(root.snapshot().child("worker").is_none());
+    assert!(
+        !control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entries
+            .contains_key(member.id())
+    );
+    assert_eq!(
+        removal_response.receive().await,
+        Some(RemoveOutcome::Removed)
+    );
+    let mut added = 0;
+    let mut removed = 0;
+    while let Ok(LifecycleItem::Event(event)) = lifecycle.try_recv() {
+        match event.kind {
+            LifecycleEventKind::Added { .. } => added += 1,
+            LifecycleEventKind::Removed { .. } => removed += 1,
+            _ => {}
+        }
+    }
+    assert_eq!((added, removed), (1, 1));
+}
+
+#[crate::runtime::test]
+async fn double_removal_is_idempotent_while_the_child_is_active() {
+    exercise_double_removal(DuplicateRemovalDelivery::WhileActive).await;
+}
+
+#[crate::runtime::test]
+async fn double_removal_is_idempotent_during_construction_disposal() {
+    exercise_double_removal(DuplicateRemovalDelivery::DuringDisposal).await;
+}
+
+#[crate::runtime::test]
+async fn fused_only_removal_publishes_removing_from_the_driver() {
+    let (
+        mut scope,
+        mut event_receiver,
+        mut dynamic_event_receiver,
+        mut disposal_event_receiver,
+        control,
+    ) = running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let mut lifecycle = root.subscribe_lifecycle();
+    let started = Latch::default();
+    let reservation = super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    let membership = member.membership();
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new({
+            let started = started.clone();
+            move |context| {
+                let started = started.clone();
+                async move {
+                    started.fire();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        })));
+    let fused_cancel = Latch::default();
+    let mut admission_response = super::start_admission(
+        Arc::clone(&reservation.control),
+        Arc::clone(&reservation.slot),
+        Some(fused_cancel.clone()),
+    )
+    .expect("admission starts inside the runtime");
+    let Some(DriverEvent::Admission(request)) = dynamic_event_receiver.recv().await else {
+        panic!("admission enqueueing submits the request")
+    };
+    scope.handle_admission(request);
+    assert!(matches!(admission_response.try_receive(), Some(Ok(()))));
+    assert!(matches!(
+        crate::runtime::timeout(Duration::from_secs(2), started.fired()).await,
+        crate::runtime::Timeout::Completed(())
+    ));
+    let key = control
+        .state
+        .lock()
+        .expect("dynamic-state mutex poisoned")
+        .entries
+        .get(member.id())
+        .and_then(DynamicEntry::key)
+        .expect("the admission installs its child key");
+
+    // A fused drop is the only removal source in this variant. Unlike an
+    // explicit `remove`, `signal_fused_cancel` marks the control-plane entry
+    // Removing and queues the Removal without touching the member record,
+    // so the driver-side `publish_dynamic_removal` call in `handle_removal`
+    // is the only writer of the public Removing projection on this path.
+    // The projection asserts after `handle_removal` pin that call; the
+    // explicit-remove variants cannot, because `remove_dynamic_impl`
+    // publishes the projection before its request reaches the driver.
+    assert_eq!(member.record().membership_status, MembershipStatus::Active);
+    super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
+    assert_eq!(
+        member.record().membership_status,
+        MembershipStatus::Active,
+        "the fused source leaves the Removing projection to the driver"
+    );
+    assert!(matches!(
+        root.snapshot()
+            .child("worker")
+            .map(|child| child.membership_status),
+        Some(MembershipStatus::Active)
+    ));
+    let removal = match crate::runtime::timeout(
+        Duration::from_secs(2),
+        dynamic_event_receiver.recv(),
+    )
+    .await
+    {
+        crate::runtime::Timeout::Completed(Some(DriverEvent::Removal(removal))) => removal,
+        crate::runtime::Timeout::Completed(_) => {
+            panic!("the fused source queues exactly one removal")
+        }
+        crate::runtime::Timeout::Elapsed => panic!("the fused removal reaches the driver"),
+    };
+    assert_eq!(removal.membership, membership);
+    assert_eq!(removal.key, key);
+
+    scope.handle_removal(removal);
+    assert_eq!(
+        member.record().membership_status,
+        MembershipStatus::Removing,
+        "handle_removal publishes the Removing projection"
+    );
+    assert!(matches!(
+        root.snapshot()
+            .child("worker")
+            .map(|child| child.membership_status),
+        Some(MembershipStatus::Removing)
+    ));
+
+    let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+        crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
+            child,
+            incarnation,
+            recorded,
+            join,
+            cancellation,
+            readiness_signal_seen,
+        }))) => (
+            child,
+            incarnation,
+            recorded,
+            join,
+            cancellation,
+            readiness_signal_seen,
+        ),
+        crate::runtime::Timeout::Completed(_) => panic!("the stopped child reports exit"),
+        crate::runtime::Timeout::Elapsed => panic!("the stopped child exit must arrive"),
+    };
+    scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);
+    assert!(scope.children[key].pending_terminal.is_some());
+
+    let disposal =
+        match crate::runtime::timeout(Duration::from_secs(2), disposal_event_receiver.recv()).await
+        {
+            crate::runtime::Timeout::Completed(Some(event)) => event,
+            crate::runtime::Timeout::Completed(None) => {
+                panic!("the disposal lane remains open")
+            }
+            crate::runtime::Timeout::Elapsed => {
+                panic!("retained construction disposal completes")
+            }
+        };
+    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = disposal else {
+        panic!("the stop path reports retained construction disposal")
+    };
+    assert_eq!(child, key);
+    scope.handle_construction_disposed(child, panic);
+
+    assert!(scope.children.get(key).is_none());
+    assert!(root.snapshot().child("worker").is_none());
+    assert!(
+        !control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entries
+            .contains_key(member.id())
+    );
+    let mut added = 0;
+    let mut removed = 0;
+    while let Ok(LifecycleItem::Event(event)) = lifecycle.try_recv() {
+        match event.kind {
+            LifecycleEventKind::Added { .. } => added += 1,
+            LifecycleEventKind::Removed { .. } => removed += 1,
+            _ => {}
+        }
+    }
+    assert_eq!((added, removed), (1, 1));
+}
+
+pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     make_admission: impl FnOnce(super::DynamicReservation) -> A,
 ) where
     A: Future,
@@ -3028,7 +3629,7 @@ pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
     root.set_state(ScopeState::Running);
     root.set_startup(Ok(()));
 
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
     root.set_dynamic_route(Some(control.clone()));
@@ -3091,7 +3692,7 @@ pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
         "first poll submits the fused admission"
     );
     let Some(DriverEvent::Admission(request)) = event_receiver.recv().await else {
-        panic!("the admission forwarder submits the request")
+        panic!("admission enqueueing submits the request")
     };
     scope.handle_admission(request);
 
@@ -3125,14 +3726,15 @@ pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
     };
     let key = exit.0;
     assert!(
-        scope
-            .events
-            .try_send(DriverEvent::Removal(RemovalRequest {
+        crate::runtime::unbounded_mpsc_send(
+            &scope.events,
+            DriverEvent::Removal(RemovalRequest {
                 membership: root.member.membership(),
                 key: ChildKey(u64::MAX - 1),
-            }))
-            .is_ok(),
-        "the fixture saturates the bounded driver lane"
+            }),
+        )
+        .is_ok(),
+        "the open lane queues a predecessor edge ahead of the fused removal"
     );
     drop(admission);
     assert!(
@@ -3174,21 +3776,18 @@ pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
             crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
         };
     let DriverEvent::Removal(removal) = forwarded else {
-        panic!("the forwarded event is the fused removal")
+        panic!("the queued event is the fused removal")
     };
     assert_eq!(removal.membership, membership);
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        crate::runtime::unbounded_mpsc_recv(&mut disposal_event_receiver).await
+        disposal_event_receiver.recv().await
     else {
         panic!("removal joins retained construction disposal")
     };
     scope.handle_construction_disposed(child, panic);
     assert!(scope.children.get(key).is_none());
-
-    control.request_forwarder_close.fire();
-    control.request_forwarder_ended.fired().await;
 }
 
 /// Exercises the `DeadlineKind::Restart` suppression gate on its own:
@@ -3207,7 +3806,7 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     root.set_state(ScopeState::Running);
     root.set_startup(Ok(()));
 
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
     root.set_dynamic_route(Some(control.clone()));
@@ -3265,7 +3864,7 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     )
     .expect("the running scope accepts the admission");
     let Some(DriverEvent::Admission(request)) = event_receiver.recv().await else {
-        panic!("the admission forwarder submits the request")
+        panic!("admission enqueueing submits the request")
     };
     scope.handle_admission(request);
     assert!(matches!(response.try_receive(), Some(Ok(()))));
@@ -3334,81 +3933,129 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
             crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
         };
     let DriverEvent::Removal(removal) = forwarded else {
-        panic!("the forwarded event is the fused removal");
+        panic!("the queued event is the fused removal");
     };
     assert_eq!(removal.membership, membership);
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        crate::runtime::unbounded_mpsc_recv(&mut disposal_event_receiver).await
+        disposal_event_receiver.recv().await
     else {
         panic!("removal joins retained construction disposal")
     };
     scope.handle_construction_disposed(child, panic);
     assert!(scope.children.get(key).is_none());
-
-    control.request_forwarder_close.fire();
-    control.request_forwarder_ended.fired().await;
 }
 
 #[crate::runtime::test]
-async fn saturated_admissions_share_one_forwarder_task_and_all_resolve() {
-    const ADMISSIONS: usize = 64;
+async fn queued_admissions_yield_to_shutdown_without_forwarder_tasks() {
+    const ADMISSIONS: usize = super::MIN_EVENT_BATCH_LIMIT * 8 + 1;
 
-    let root = isolated_scope("root", ScopeFlavor::Dynamic);
-    let (events, event_receiver) = crate::runtime::bounded_mpsc(1);
-    let control = DynamicControl::new(events);
-    let child_id = ChildId::from("worker");
-    let member = MemberCell::new(
-        child_id.clone(),
-        root.child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .mint_membership(&child_id)
-            .expect("child membership available"),
-    );
-    let slot = SlotCell::new(Arc::clone(&member), None);
+    let release_holder = Latch::default();
+    let mut tree = DynamicTree::new();
+    let exiting = tree
+        .add_task(
+            "exiting",
+            TaskDef::new(|context| async move {
+                context.shutdown_token().cancelled().await;
+                Ok(())
+            }),
+        )
+        .expect("exiting task is valid");
+    tree.add_task(
+        "holder",
+        TaskDef::new({
+            let release_holder = release_holder.clone();
+            move |context| {
+                let release_holder = release_holder.clone();
+                async move {
+                    context.shutdown_token().cancelled().await;
+                    release_holder.fired().await;
+                    Ok(())
+                }
+            }
+        }),
+    )
+    .expect("holding task is valid");
 
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
     let baseline = crate::runtime::alive_task_count();
-    let mut responses = Vec::with_capacity(ADMISSIONS);
-    for _ in 0..ADMISSIONS {
-        responses.push(
-            super::start_admission(control.clone(), Arc::clone(&slot), None)
-                .expect("runtime is available"),
+    let mut admissions = Vec::with_capacity(ADMISSIONS);
+    for index in 0..ADMISSIONS {
+        let mut admission = scope.add_task(
+            format!("queued-{index}"),
+            TaskDef::new(|_| future::pending()),
+        );
+        assert!(
+            Pin::new(&mut admission)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "first poll synchronously queues admission {index}"
+        );
+        admissions.push(admission);
+    }
+    assert_eq!(
+        crate::runtime::alive_task_count(),
+        baseline,
+        "synchronous admission enqueueing spawns no transport tasks"
+    );
+
+    // Latch shutdown without yielding to the already-woken driver. Its first
+    // batch begins draining and rejects one control prefix; the full-batch
+    // yield must then let `exiting` run and publish its primary-lane exit.
+    let mut shutdown = Box::pin(scope.shutdown_and_wait(Duration::from_secs(2)));
+    assert!(
+        shutdown
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "shutdown waits for both declared children"
+    );
+    assert!(matches!(
+        crate::runtime::timeout(Duration::from_secs(1), exiting.wait()).await,
+        crate::runtime::Timeout::Completed(_)
+    ));
+    assert!(
+        Pin::new(admissions.last_mut().expect("an admission exists"))
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "the primary exit is handled before the control suffix is drained"
+    );
+
+    release_holder.fire();
+    assert!(matches!(
+        crate::runtime::timeout(Duration::from_secs(1), shutdown.as_mut()).await,
+        crate::runtime::Timeout::Completed(Ok(()))
+    ));
+    drop(shutdown);
+    assert_eq!(system.wait().await, StopReason::ShutdownRequested);
+
+    // The driver tore down with a control backlog still queued, so every
+    // stranded admission's completion obligation must resolve rather than
+    // hang its caller. Pin both ends of the queue: the head is rejected
+    // while the drain runs, the tail at latest by the obligation's
+    // receiver-drop fallback once the driver's lane closes.
+    let tail = admissions.pop().expect("the backlog has a tail");
+    let head = admissions.swap_remove(0);
+    for (position, admission) in [("head", head), ("tail", tail)] {
+        let outcome = match crate::runtime::timeout(Duration::from_secs(2), admission).await {
+            crate::runtime::Timeout::Completed(outcome) => outcome,
+            crate::runtime::Timeout::Elapsed => {
+                panic!("the {position}-of-queue admission obligation completes at teardown")
+            }
+        };
+        assert!(
+            matches!(
+                outcome,
+                Err(ReserveError::NotAdmitting(
+                    crate::NotAdmittingCause::Draining | crate::NotAdmittingCause::Terminal
+                ))
+            ),
+            "the {position}-of-queue admission reports the stopped scope"
         );
     }
-
-    // Let the forwarder run until it parks on the saturated driver
-    // channel; pending admissions must not each hold a live sender task.
-    for _ in 0..64 {
-        crate::runtime::yield_now().await;
-    }
-    assert!(
-        crate::runtime::alive_task_count() <= baseline + 1,
-        "saturated admissions share one forwarder task instead of spawning one each"
-    );
-
-    // Ending the driver channel answers every queued admission through
-    // its response obligation.
-    drop(event_receiver);
-    for response in responses {
-        assert!(matches!(
-            response.receive().await,
-            Some(Err(crate::ReserveError::NotAdmitting(
-                crate::NotAdmittingCause::Terminal
-            )))
-        ));
-    }
-
-    let mut alive = crate::runtime::alive_task_count();
-    for _ in 0..1_024 {
-        if alive == baseline {
-            break;
-        }
-        crate::runtime::yield_now().await;
-        alive = crate::runtime::alive_task_count();
-    }
-    assert_eq!(alive, baseline, "the forwarder exits once its queue drains");
 }
 
 #[crate::runtime::test]
@@ -3436,6 +4083,62 @@ async fn system_shutdown_joins_root_driver_teardown() {
 }
 
 #[test]
+fn member_transitions_own_their_complete_record_projection() {
+    let mut identity = ScopeIdentity::new();
+    let id = ChildId::from("worker");
+    let membership = identity.mint_membership(&id).expect("membership available");
+    let member = MemberCell::new(id, membership);
+    let mut incarnations = identity.incarnation_counter(membership);
+    let incarnation = incarnations.mint().expect("incarnation available");
+
+    member.transition(MemberTransition::Admitted);
+    assert_eq!(member.record().stage, MemberStage::Admitted);
+
+    member.transition(MemberTransition::Starting { incarnation });
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Starting);
+    assert_eq!(record.incarnation, Some(incarnation));
+    assert_eq!(record.last_incarnation, Some(incarnation));
+    assert_eq!(record.restart_at, None);
+
+    member.transition(MemberTransition::Running);
+    assert_eq!(member.record().stage, MemberStage::Running);
+    member.transition(MemberTransition::Stopping);
+    assert_eq!(member.record().stage, MemberStage::Stopping);
+
+    let exit = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+    let restart_count = RestartCount::ZERO.bump();
+    let restart_at = crate::runtime::now();
+    member.transition(MemberTransition::RestartScheduled {
+        exit: exit.clone(),
+        restart_count,
+        restart_at: Some(restart_at),
+    });
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Restarting);
+    assert_eq!(record.incarnation, None);
+    assert_eq!(record.last_incarnation, Some(incarnation));
+    assert_eq!(record.last_exit, Some(exit));
+    assert_eq!(record.restart_count, restart_count);
+    assert_eq!(record.restart_at, Some(restart_at));
+
+    let second = incarnations.mint().expect("restart incarnation available");
+    member.transition(MemberTransition::Starting {
+        incarnation: second,
+    });
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Starting);
+    assert_eq!(record.incarnation, Some(second));
+    assert_eq!(record.last_incarnation, Some(second));
+    assert_eq!(record.restart_at, None);
+    assert_eq!(
+        record.last_exit,
+        Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved))
+    );
+    assert_eq!(record.restart_count, restart_count);
+}
+
+#[test]
 fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
@@ -3445,9 +4148,18 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
         ExitKind::Failed(ExitError::message("last completed incarnation")),
         Cancellation::NotObserved,
     );
-    member.update(|record| {
-        record.stage = MemberStage::Restarting;
-        record.last_exit = Some(previous.clone());
+    // Walk the record along the production path so the transition-source
+    // assertions in `apply_transition` cover this setup too.
+    let mut setup_incarnations = identity.incarnation_counter(membership);
+    let spent = setup_incarnations
+        .mint()
+        .expect("setup incarnation available");
+    member.transition(MemberTransition::Admitted);
+    member.transition(MemberTransition::Starting { incarnation: spent });
+    member.transition(MemberTransition::RestartScheduled {
+        exit: previous.clone(),
+        restart_count: RestartCount::ZERO,
+        restart_at: None,
     });
     let mut counter = IncarnationCounter::near_exhaustion(membership);
 
@@ -3477,7 +4189,7 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(1);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
@@ -3533,14 +4245,15 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
     );
 
     assert!(
-        scope
-            .events
-            .try_send(DriverEvent::Child(ChildEvent::Ready {
+        crate::runtime::unbounded_mpsc_send(
+            &scope.events,
+            DriverEvent::Child(ChildEvent::Ready {
                 child: key,
                 incarnation: first,
-            }))
-            .is_ok(),
-        "the bounded driver queue is deliberately saturated"
+            }),
+        )
+        .is_ok(),
+        "the driver lane remains open"
     );
 
     scope.spawn_child(key);
@@ -3600,7 +4313,7 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
@@ -3717,7 +4430,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, mut event_receiver) = crate::runtime::bounded_mpsc(64);
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
@@ -3810,7 +4523,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
     assert!(scope.children[key].restart_deadline.is_none());
 
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        crate::runtime::unbounded_mpsc_recv(&mut disposal_event_receiver).await
+        disposal_event_receiver.recv().await
     else {
         panic!("only construction disposal was armed")
     };

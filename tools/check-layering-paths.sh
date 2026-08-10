@@ -45,7 +45,7 @@ readonly upward_module_pattern='\b(driver|tree)::|\b(crate|super)::(driver|tree)
 # `lib.rs` re-exports these tree-layer types at the crate root. Naming one via
 # `crate::System`, for example, is still an upward dependency even though the
 # source contains no `tree::` token.
-readonly tree_root_export_pattern='ActorSlot|Admission|AdmissionReceipt|BuildError|DynamicActorSlot|DynamicSubtreeSlot|DynamicTaskSlot|DynamicTree|Removal|StartOrShutdownError|Subtree|SubtreeDef|SubtreeOnceDef|SubtreeSlot|System|TaskSlot|Tree'
+readonly tree_root_export_pattern='ActorSlot|Admission|BuildError|DynamicActorSlot|DynamicSubtreeSlot|DynamicTaskSlot|DynamicTree|Removal|StartOrShutdownError|Subtree|SubtreeDef|SubtreeOnceDef|SubtreeSlot|System|TaskSlot|Tree'
 
 check_forbidden() {
   local message="$1"

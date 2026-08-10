@@ -3376,7 +3376,7 @@ path. If that invariant regresses, release builds nevertheless fail
 closed: admission observes `NotAdmitting(Terminal)` and a latched removal
 observes `Removed`, since its route becoming terminal satisfies the
 removal goal. Debug builds MAY instead assert and panic at that boundary
-to expose the internal regression before returning an outcome. The public
+to expose the internal regression instead of returning an outcome. The public
 `ReserveError` enum is non-exhaustive and includes `NoRuntime`: it names
 the absent ambient runtime at dynamic reservation or first poll, with
 the cleanup and precedence pinned in §8. Dynamic `add_*`

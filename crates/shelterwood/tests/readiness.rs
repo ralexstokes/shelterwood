@@ -786,6 +786,26 @@ async fn nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause() {
         .wait_started()
         .await
         .expect_err("nested startup fails");
+    let outer_source =
+        std::error::Error::source(&startup).expect("startup error exposes its outer child failure");
+    assert_eq!(
+        outer_source.to_string(),
+        "child `nested` failed during startup"
+    );
+    let inner_source = outer_source
+        .source()
+        .expect("the child exit exposes the nested structured failure");
+    assert_eq!(
+        inner_source.to_string(),
+        "child `inner-failure` failed during startup"
+    );
+    assert_eq!(
+        inner_source
+            .source()
+            .expect("the nested child failure exposes its application error")
+            .to_string(),
+        "startup failure"
+    );
     let outer_failure = match startup {
         StartupError::StartupFailed(failure) => failure,
         other => panic!("unexpected startup result: {other:?}"),

@@ -3,7 +3,7 @@
 mod admission_control;
 
 use std::{
-    sync::{Arc, mpsc},
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -20,7 +20,7 @@ use crate::{
     deadline::Deadline,
     engine::{
         ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
-        IncarnationRun, IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent,
+        IncarnationRun, IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent,
         ReadinessGate, RestartState, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate,
         dispatch_exit, schedule_restart,
     },
@@ -60,7 +60,7 @@ struct RecordedReport {
 }
 
 struct ReportCompletion {
-    sender: mpsc::Sender<RecordedReport>,
+    report: Arc<OnceLock<RecordedReport>>,
     shutdown: Latch,
     local_stop: Option<Latch>,
     readiness: CompletionGatedLatch,
@@ -70,44 +70,44 @@ pub(crate) struct ReportToken {
     completion: Obligation<ReportCompletion>,
 }
 
-pub(crate) struct ReportReceiver(mpsc::Receiver<RecordedReport>);
+pub(crate) struct ReportClaim(Arc<OnceLock<RecordedReport>>);
 
 /// Couples the child task's outcome report to its join verdict without an
 /// asynchronous handoff race.
 ///
-/// `ReportToken` is owned by the child task and its fail-closed `Drop` sends a
-/// fallback synchronously. The runtime resolves `runtime::join` only after the
-/// spawned future has been destroyed (a tokio `JoinHandle` guarantee, not a
-/// language one — any replacement executor behind `runtime` must preserve it),
-/// so the exit joiner may require an immediately available report: one has
-/// already been sent on every return, panic, and cancellation edge. The
-/// shutdown/local-stop and readiness latches are sampled by that same send,
-/// making the report and its completion-boundary evidence one ordered
-/// observation.
-pub(crate) fn report_channel(
+/// `ReportToken` is owned by the child task and its fail-closed `Drop` fills a
+/// shared cell synchronously. The runtime resolves `runtime::join` only after
+/// the spawned future has been destroyed (a tokio `JoinHandle` guarantee, not
+/// a language one — any replacement executor behind `runtime` must preserve
+/// it), so the exit joiner may consume the cell immediately: its claim is the
+/// sole surviving owner and the cell is initialized on every return, panic,
+/// and cancellation edge. The shutdown/local-stop and readiness latches are
+/// sampled by that same initialization, making the report and its
+/// completion-boundary evidence one ordered observation.
+pub(crate) fn report_slot(
     shutdown: Latch,
     local_stop: Option<Latch>,
     readiness: CompletionGatedLatch,
-) -> (ReportToken, ReportReceiver) {
-    let (sender, receiver) = mpsc::channel();
+) -> (ReportToken, ReportClaim) {
+    let report = Arc::new(OnceLock::new());
     (
         ReportToken {
             completion: Obligation::new(
                 ReportCompletion {
-                    sender,
+                    report: Arc::clone(&report),
                     shutdown,
                     local_stop,
                     readiness,
                 },
-                |completion| completion.send(None),
+                |completion| completion.fill(None),
             ),
         },
-        ReportReceiver(receiver),
+        ReportClaim(report),
     )
 }
 
 impl ReportCompletion {
-    fn send(self, outcome: Option<RecordedOutcome>) {
+    fn fill(self, outcome: Option<RecordedOutcome>) {
         let cancellation =
             if self.shutdown.is_fired() || self.local_stop.as_ref().is_some_and(Latch::is_fired) {
                 Cancellation::Observed
@@ -120,21 +120,26 @@ impl ReportCompletion {
             cancellation,
             readiness_signal_seen,
         };
-        let _ = self.sender.send(report);
+        // Ownership supplies exactly one `ReportCompletion`; ignoring the
+        // impossible occupied-cell result keeps the Drop fallback infallible.
+        let _ = self.report.set(report);
     }
 }
 
 impl ReportToken {
     pub(crate) fn record(mut self, outcome: RecordedOutcome) {
         self.completion
-            .complete(|completion| completion.send(Some(outcome)));
+            .complete(|completion| completion.fill(Some(outcome)));
     }
 }
 
-impl ReportReceiver {
+impl ReportClaim {
     fn receive(self) -> RecordedReport {
-        self.0
-            .try_recv()
+        Arc::try_unwrap(self.0)
+            .unwrap_or_else(|_| {
+                panic!("owned report token must be destroyed before its task joins")
+            })
+            .into_inner()
             .expect("owned report token must record or fall back before its task joins")
     }
 }
@@ -816,8 +821,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         construction_release,
         local_stop,
     } = launch;
-    let (report, report_receiver) =
-        report_channel(shutdown, Some(local_stop.clone()), ready.clone());
+    let (report, report_claim) = report_slot(shutdown, Some(local_stop.clone()), ready.clone());
     let constructed_sender = events.clone();
     let handle = runtime::spawn(async move {
         let body = async move {
@@ -872,9 +876,10 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
             },
         };
         // The task owns `report`, whose explicit record or Drop fallback runs
-        // before the join completes. `receive` therefore asserts immediate
-        // post-join availability without ever blocking this runtime worker.
-        let report = report_receiver.receive();
+        // before the join completes. `receive` therefore asserts sole
+        // ownership and immediate post-join availability without ever
+        // blocking this runtime worker.
+        let report = report_claim.receive();
         let _ = runtime::mpsc_send(
             &exit_sender,
             DriverEvent::Child(ChildEvent::Exited {
@@ -1682,12 +1687,12 @@ impl ScopeRuntime {
         } else {
             ScopeMode::Running
         };
-        let member_mode = if membership_removing {
-            MembershipMode::Removing
+        let membership_status = if membership_removing {
+            MembershipStatus::Removing
         } else {
-            MembershipMode::Active
+            MembershipStatus::Active
         };
-        match dispatch_exit(&exit, child.options.restart, mode, member_mode) {
+        match dispatch_exit(&exit, child.options.restart, mode, membership_status) {
             ExitDispatch::Terminal => {
                 // §6's startup abort is a startup-sequence property: the
                 // membership failed before its *initial* readiness edge. A
@@ -2751,7 +2756,7 @@ mod tests {
         DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
         Pending, RemovalRequest, RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell,
         ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
-        cancel_dynamic_reservation, report_channel, reserve_dynamic, resident_projection,
+        cancel_dynamic_reservation, report_slot, reserve_dynamic, resident_projection,
         restart_shutdown_work, run_nested_factory, run_nested_tree, run_scope_incarnation,
     };
 
@@ -3391,6 +3396,93 @@ mod tests {
         let root_gate = root.observation_gate();
         assert!(root_gate.same_gate(&nested.observation_gate()));
         assert!(root_gate.same_gate(&leaf.observation_gate()));
+    }
+
+    #[test]
+    fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
+        const UPDATES: usize = 2_000;
+
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let first = Intensity::new(1, Duration::from_secs(1)).expect("valid first intensity");
+        let second = Intensity::new(2, Duration::from_secs(2)).expect("valid second intensity");
+        scope.set_observation_config(Default::default(), first);
+
+        let start = Arc::new(Barrier::new(2));
+        let writer_scope = Arc::clone(&scope);
+        let writer_start = Arc::clone(&start);
+        let writer = std::thread::spawn(move || {
+            writer_start.wait();
+            for update in 0..UPDATES {
+                let intensity = if update % 2 == 0 { second } else { first };
+                writer_scope.set_observation_config(Default::default(), intensity);
+            }
+        });
+
+        start.wait();
+        for _ in 0..UPDATES {
+            let intensity = scope.snapshot().intensity;
+            assert!(
+                intensity == first || intensity == second,
+                "a snapshot observes one complete configuration update"
+            );
+        }
+        writer.join().expect("config writer completes");
+    }
+
+    #[test]
+    fn plain_resident_state_is_released_before_recursive_removed_publication() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let first = isolated_scope("first", ScopeFlavor::Dynamic);
+        let second = isolated_scope("second", ScopeFlavor::Dynamic);
+        let first_slot = SlotCell::new(Arc::clone(&first.member), Some(first));
+        let second_slot = SlotCell::new(Arc::clone(&second.member), Some(second));
+        let mut events = root.subscribe_lifecycle();
+        let snapshots = root.subscribe_snapshots();
+
+        root.set_admitted_children(vec![
+            resident_projection(&first_slot),
+            resident_projection(&second_slot),
+        ]);
+        root.clear_residents();
+
+        assert!(root.resident_projections().is_empty());
+        assert!(snapshots.borrow_latest().children.is_empty());
+        let mut added = 0;
+        let mut removed = 0;
+        while let Ok(LifecycleItem::Event(event)) = events.try_recv() {
+            match event.kind {
+                LifecycleEventKind::Added { .. } => added += 1,
+                LifecycleEventKind::Removed { .. } => removed += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((added, removed), (2, 2));
+    }
+
+    #[test]
+    fn plain_parent_state_preserves_nested_snapshot_propagation() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        let mut incarnations = IncarnationCounter::near_exhaustion(nested.member.membership());
+        nested.member.update(|record| {
+            record.incarnation = incarnations.mint();
+            record.stage = MemberStage::Starting;
+        });
+        let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        root.set_admitted_children(vec![resident_projection(&nested_slot)]);
+        let snapshots = root.subscribe_snapshots();
+        let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
+
+        nested.set_observation_config(Default::default(), intensity);
+
+        assert_eq!(
+            snapshots
+                .borrow_latest()
+                .child("nested")
+                .and_then(|child| child.nested.as_deref())
+                .map(|snapshot| snapshot.intensity),
+            Some(intensity)
+        );
     }
 
     #[test]
@@ -4080,11 +4172,11 @@ mod tests {
     fn owned_report_token_consumes_or_falls_back_once() {
         let shutdown = Latch::default();
         let readiness = CompletionGatedLatch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None, readiness.clone());
+        let (token, claim) = report_slot(shutdown.clone(), None, readiness.clone());
         token.record(RecordedOutcome::returned(Ok(())));
         shutdown.fire();
         readiness.fire();
-        let report = receiver.receive();
+        let report = claim.receive();
         assert!(matches!(
             report.outcome,
             Some(outcome) if matches!(outcome.kind(), ExitKind::Completed)
@@ -4093,11 +4185,10 @@ mod tests {
         assert!(!report.readiness_signal_seen);
 
         let shutdown = Latch::default();
-        let (token, receiver) =
-            report_channel(shutdown.clone(), None, CompletionGatedLatch::default());
+        let (token, claim) = report_slot(shutdown.clone(), None, CompletionGatedLatch::default());
         shutdown.fire();
         drop(token);
-        let report = receiver.receive();
+        let report = claim.receive();
         assert!(report.outcome.is_none());
         assert_eq!(report.cancellation, Cancellation::Observed);
     }
@@ -4105,11 +4196,10 @@ mod tests {
     #[test]
     fn owned_report_token_records_prior_cancellation() {
         let shutdown = Latch::default();
-        let (token, receiver) =
-            report_channel(shutdown.clone(), None, CompletionGatedLatch::default());
+        let (token, claim) = report_slot(shutdown.clone(), None, CompletionGatedLatch::default());
         shutdown.fire();
         token.record(RecordedOutcome::returned(Ok(())));
-        let report = receiver.receive();
+        let report = claim.receive();
         assert!(matches!(
             report.outcome,
             Some(outcome) if matches!(outcome.kind(), ExitKind::Completed)
@@ -4121,24 +4211,65 @@ mod tests {
     fn owned_report_token_records_prior_local_stop() {
         let shutdown = Latch::default();
         let local_stop = Latch::default();
-        let (token, receiver) = report_channel(
+        let (token, claim) = report_slot(
             shutdown,
             Some(local_stop.clone()),
             CompletionGatedLatch::default(),
         );
         local_stop.fire();
         token.record(RecordedOutcome::returned(Ok(())));
-        assert_eq!(receiver.receive().cancellation, Cancellation::Observed);
+        assert_eq!(claim.receive().cancellation, Cancellation::Observed);
+    }
+
+    #[test]
+    fn report_cell_falls_back_while_its_owner_thread_unwinds() {
+        let shutdown = Latch::default();
+        let (token, claim) = report_slot(shutdown.clone(), None, CompletionGatedLatch::default());
+        let worker = std::thread::spawn(move || {
+            let _token = token;
+            shutdown.fire();
+            panic!("inject child-task panic");
+        });
+
+        assert!(worker.join().is_err());
+        let report = claim.receive();
+        assert!(report.outcome.is_none());
+        assert_eq!(report.cancellation, Cancellation::Observed);
+    }
+
+    #[crate::runtime::test]
+    async fn cancelled_task_report_cell_is_ready_after_join() {
+        let shutdown = Latch::default();
+        let entered = Latch::default();
+        let (token, claim) = report_slot(shutdown.clone(), None, CompletionGatedLatch::default());
+        let task_entered = entered.clone();
+        let task = crate::runtime::spawn(async move {
+            let _token = token;
+            task_entered.fire();
+            future::pending::<()>().await;
+        });
+        entered.fired().await;
+
+        shutdown.fire();
+        task.abort_handle().abort();
+        assert!(matches!(
+            crate::runtime::join(task).await,
+            crate::runtime::JoinOutcome::Cancelled
+        ));
+
+        let report = claim.receive();
+        assert!(report.outcome.is_none());
+        assert_eq!(report.cancellation, Cancellation::Observed);
     }
 
     #[test]
     fn owned_report_token_records_readiness_at_completion() {
         let readiness = CompletionGatedLatch::default();
-        let (token, receiver) = report_channel(Latch::default(), None, readiness.clone());
+        let (token, claim) = report_slot(Latch::default(), None, readiness.clone());
         readiness.fire();
         token.record(RecordedOutcome::returned(Ok(())));
         assert!(!readiness.fire(), "completion closes retained capabilities");
-        assert!(receiver.receive().readiness_signal_seen);
+        assert!(claim.receive().readiness_signal_seen);
     }
 
     #[test]

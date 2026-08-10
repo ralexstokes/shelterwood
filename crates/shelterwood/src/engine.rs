@@ -189,9 +189,12 @@ pub(crate) enum ScopeMode {
     Draining,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MembershipMode {
+/// Whether a child membership is active or undergoing planned removal.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum MembershipStatus {
+    /// The membership remains resident normally.
     Active,
+    /// A planned removal has begun.
     Removing,
 }
 
@@ -205,9 +208,9 @@ pub(crate) fn dispatch_exit(
     exit: &Exit,
     restart: RestartPolicy,
     scope: ScopeMode,
-    membership: MembershipMode,
+    membership: MembershipStatus,
 ) -> ExitDispatch {
-    if scope == ScopeMode::Draining || membership == MembershipMode::Removing {
+    if scope == ScopeMode::Draining || membership == MembershipStatus::Removing {
         return ExitDispatch::Terminal;
     }
     if restart.should_restart(exit) {
@@ -909,7 +912,7 @@ mod tests {
 
     use super::{
         ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
-        IncarnationRun, IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent,
+        IncarnationRun, IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent,
         ReadinessGate, RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode,
         StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
     };
@@ -1076,7 +1079,7 @@ mod tests {
                 &failure,
                 restart,
                 ScopeMode::Running,
-                MembershipMode::Active
+                MembershipStatus::Active
             ),
             ExitDispatch::ScheduleRestart
         );
@@ -1085,7 +1088,7 @@ mod tests {
                 &failure,
                 restart,
                 ScopeMode::Draining,
-                MembershipMode::Active
+                MembershipStatus::Active
             ),
             ExitDispatch::Terminal
         );
@@ -1094,7 +1097,7 @@ mod tests {
                 &failure,
                 restart,
                 ScopeMode::Running,
-                MembershipMode::Removing
+                MembershipStatus::Removing
             ),
             ExitDispatch::Terminal
         );

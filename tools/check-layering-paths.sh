@@ -5,38 +5,41 @@ set -euo pipefail
 # default scans the repository from the invoking directory as before.
 cd "${SHELTERWOOD_ENFORCEMENT_ROOT:-.}"
 
-readonly below_driver_layers=(
-  crates/shelterwood/src/admission.rs
-  crates/shelterwood/src/actor.rs
-  crates/shelterwood/src/cancellation.rs
-  crates/shelterwood/src/cells.rs
-  crates/shelterwood/src/deadline.rs
-  crates/shelterwood/src/definition.rs
-  crates/shelterwood/src/engine.rs
-  crates/shelterwood/src/exit.rs
-  crates/shelterwood/src/identity.rs
-  crates/shelterwood/src/mailbox.rs
-  crates/shelterwood/src/observe.rs
-  crates/shelterwood/src/plan.rs
-  crates/shelterwood/src/policy.rs
-  crates/shelterwood/src/raw.rs
-  crates/shelterwood/src/runtime.rs
-  crates/shelterwood/src/task.rs
-)
-readonly driver_path="crates/shelterwood/src/driver.rs"
-readonly driver_module_root="crates/shelterwood/src/driver"
-readonly tree_path="crates/shelterwood/src/tree.rs"
+readonly source_root="crates/shelterwood/src"
+readonly driver_path="$source_root/driver.rs"
+readonly tree_path="$source_root/tree.rs"
 
-shopt -s globstar nullglob
-readonly driver_paths=(
-  "$driver_path"
-  "$driver_module_root"/**/*.rs
-)
+# Every Rust source except the two orchestration modules and their submodules
+# belongs below the driver. Derive all three sets recursively so either a flat
+# module or the conventional `module/mod.rs` layout cannot silently bypass the
+# check; lib.rs is the crate root and may wire every layer together.
+below_driver_layers=()
+driver_layers=()
+tree_layers=()
+while IFS= read -r -d '' path; do
+  case "$path" in
+    "$source_root/lib.rs") ;;
+    "$driver_path"|"$source_root/driver/"*) driver_layers+=("$path") ;;
+    "$tree_path"|"$source_root/tree/"*) tree_layers+=("$path") ;;
+    *) below_driver_layers+=("$path") ;;
+  esac
+done < <(find "$source_root" -type f -name '*.rs' -print0)
+readonly -a below_driver_layers
+readonly -a driver_layers
+readonly -a tree_layers
 
 check_forbidden() {
   local message="$1"
   local forbidden="$2"
   shift 2
+
+  # With no paths `rg` falls back to scanning the working directory
+  # recursively, so an empty derived set would silently widen the check
+  # instead of failing it.
+  if (($# == 0)); then
+    echo "no files derived for check: $message" >&2
+    exit 1
+  fi
 
   local matches
   local status
@@ -67,16 +70,16 @@ check_forbidden \
 check_forbidden \
   "upward tree references found in the driver layer:" \
   '\btree::' \
-  "${driver_paths[@]}"
+  "${driver_layers[@]}"
 
 check_forbidden \
   "child option resolution escaped the shared plan funnel:" \
   '\bresolve_common\b' \
-  "${driver_paths[@]}"
+  "${driver_layers[@]}"
 
 check_forbidden \
   "dynamic child-id validation escaped the reservation boundary:" \
   '\bchecked_id\b' \
-  "$tree_path"
+  "${tree_layers[@]}"
 
 echo "supervision layering restrictions: clean"

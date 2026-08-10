@@ -551,7 +551,6 @@ fn spawn_builder<R>(
     Ok(System {
         root: make_ref(scope_ref),
         run,
-        armed: true,
     })
 }
 
@@ -1411,7 +1410,6 @@ impl DynamicScopeRef {
 pub struct System<R = ScopeRef> {
     root: R,
     run: crate::driver::SystemRun,
-    armed: bool,
 }
 
 impl<R: fmt::Debug> fmt::Debug for System<R> {
@@ -1448,7 +1446,6 @@ impl<R: Clone> System<R> {
             Ok(()) => Ok(self),
             Err(startup) => {
                 let rollback_timeout = self.run.shutdown(timeout).await.err();
-                self.armed = false;
                 Err(StartOrShutdownError {
                     startup,
                     rollback_timeout,
@@ -1463,24 +1460,12 @@ impl<R: Clone> System<R> {
     /// wall-clock return: after escalation every actor future is still joined.
     /// Blocking threads created by `run_blocking` detach past hard abort.
     pub async fn shutdown(mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
-        let result = self.run.shutdown(timeout).await;
-        self.armed = false;
-        result
+        self.run.shutdown(timeout).await
     }
 
     /// Waits for natural or externally requested terminal state.
     pub async fn wait(mut self) -> StopReason {
-        let reason = self.run.wait().await;
-        self.armed = false;
-        reason
-    }
-}
-
-impl<R> Drop for System<R> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.run.request_shutdown();
-        }
+        self.run.wait().await
     }
 }
 

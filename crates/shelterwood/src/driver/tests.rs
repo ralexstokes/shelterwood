@@ -25,12 +25,13 @@ use crate::{
 };
 
 use super::{
-    AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
-    DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
-    Pending, RemovalRequest, RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell,
-    ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
-    cancel_dynamic_reservation, report_slot, reserve_dynamic, resident_projection,
-    restart_shutdown_work, run_nested_factory, run_nested_tree, run_scope_incarnation,
+    AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, ChildTerminality,
+    DriverEvent, DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage,
+    NestedScopeLatches, Pending, RemovalRequest, RemovalResponses, ResidentProjection,
+    RuntimeStorage, ScopeCell, ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime,
+    StartupDisposition, cancel_dynamic_reservation, discharge_child_terminality, report_slot,
+    reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
+    run_nested_tree, run_scope_incarnation, storage::Obligation,
 };
 
 /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -414,6 +415,58 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
 
     nested.finish_incarnation(epoch, StopReason::ShutdownRequested);
     assert_eq!(waiter.await, StopReason::ShutdownRequested);
+}
+
+#[crate::runtime::test]
+async fn terminality_fallback_preserves_restart_window_scope_reason() {
+    let parent = isolated_scope("parent", ScopeFlavor::Ordered);
+    let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+    let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+    parent.set_admitted_children(vec![resident_projection(&slot)]);
+
+    let mut incarnations = ScopeIdentity::new().incarnation_counter(nested.member.membership());
+    let last_incarnation = incarnations.mint().expect("child incarnation is available");
+    nested.member.update(|record| {
+        record.stage = MemberStage::Restarting;
+        record.incarnation = None;
+        record.last_incarnation = Some(last_incarnation);
+        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
+    });
+    nested.set_state(ScopeState::Stopped {
+        reason: StopReason::Finished,
+    });
+    let mut snapshots = nested.subscribe_snapshots();
+
+    let mut terminality = Obligation::new(
+        ChildTerminality {
+            root: Arc::clone(&parent),
+            slot,
+        },
+        discharge_child_terminality,
+    );
+    terminality.discharge();
+
+    assert_eq!(nested.wait_stopped().await, StopReason::Finished);
+    let MemberStage::Terminal(exit) = nested.member.record().stage else {
+        panic!("the fallback must terminalize the nested membership");
+    };
+    assert!(matches!(
+        exit.kind(),
+        ExitKind::Aborted {
+            phase: GracePhase::WithinGrace
+        }
+    ));
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
+    assert_eq!(
+        snapshots.borrow_latest().state,
+        ScopeState::Stopped {
+            reason: StopReason::Finished
+        }
+    );
+    assert!(
+        snapshots.changed().await.is_err(),
+        "the fallback closes observation after retaining the final stopped snapshot"
+    );
 }
 
 #[crate::runtime::test(flavor = "multi_thread", worker_threads = 4)]

@@ -696,7 +696,7 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
 }
 
 #[tokio::test]
-async fn parent_drain_preserves_a_restarting_subtrees_last_stop_reason() {
+async fn shutdown_and_wait_wakes_when_a_parent_drain_terminalizes_a_restarting_subtree() {
     let gate = ReleaseGate::default();
     let inner = Arc::new(Mutex::new(None::<TaskRef>));
     let definition = SubtreeDef::factory({
@@ -767,10 +767,6 @@ async fn parent_drain_preserves_a_restarting_subtrees_last_stop_reason() {
         .await
         .expect("parent drain terminalizes the restarting subtree and wakes waiters")
         .expect("teardown completes in bound");
-    assert!(
-        matches!(sub.wait_stopped().await, StopReason::IntensityTripped(_)),
-        "a scope that ran must retain its last real stop reason"
-    );
 }
 
 /// A subtree that shuts itself down records a cancelled exit: the stop

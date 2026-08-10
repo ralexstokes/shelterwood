@@ -1309,10 +1309,10 @@ impl ScopeRuntime {
     }
 
     fn complete_startup(&mut self) {
-        if !self.lifecycle.complete_startup() {
+        let Some(state) = self.lifecycle.complete_startup() else {
             return;
-        }
-        self.root.set_state(ScopeState::Running);
+        };
+        self.root.set_state(state);
         self.root.set_startup(Ok(()));
         if let Some(parent_ready) = self.role.parent_ready() {
             parent_ready.fire();
@@ -1431,7 +1431,7 @@ impl ScopeRuntime {
         if effect.startup_pending {
             self.root.set_startup(Err(StartupError::ShutdownRequested));
         }
-        self.root.set_state(ScopeState::Draining);
+        self.root.set_state(effect.state);
         match self.root.flavor {
             ScopeFlavor::Ordered => {
                 self.ordered_stop_cursor = self.children.keys().next_back();
@@ -1905,10 +1905,9 @@ impl ScopeRuntime {
                 exit,
             },
         };
-        let first_failure = self.lifecycle.fail_startup();
-        if !first_failure {
+        let Some(state) = self.lifecycle.fail_startup() else {
             return;
-        }
+        };
         self.root
             .set_startup(Err(StartupError::StartupFailed(failure.clone())));
         if self.root.flavor == ScopeFlavor::Ordered {
@@ -1928,7 +1927,7 @@ impl ScopeRuntime {
             }
         }
         if self.role.is_root() {
-            self.root.set_state(ScopeState::StartupFailed);
+            self.root.set_state(state);
         } else {
             self.begin_drain(StopReason::StartupFailed(failure));
         }

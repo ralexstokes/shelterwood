@@ -17,10 +17,10 @@ use std::{
 };
 
 use crate::{
-    ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, RestartCount,
-    ScopeState, Strategy, TotalRestarts,
+    ChildId, Exit, Incarnation, Intensity, Mailbox, Membership, Readiness, RestartCount, Strategy,
+    TotalRestarts,
     admission::{RemoveOutcome, ReserveError},
-    engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs},
+    engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason},
     identity::ScopeIdentity,
     observe::{

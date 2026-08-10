@@ -26,7 +26,7 @@ mod tree;
 pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use admission::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use cancellation::CancellationToken;
-pub use engine::MembershipStatus;
+pub use engine::{MembershipStatus, ScopeState};
 pub use exit::{
     Cancellation, Exit, ExitError, ExitKind, ExitResult, GracePhase, IntensityTrip,
     ShutdownStraggler, ShutdownTimeout, StartupError, StartupFailure, StartupFailureCause,
@@ -40,7 +40,7 @@ pub use mailbox::{
 pub use observe::{
     ChildSnapshot, ChildState, LIFECYCLE_EVENT_CAPACITY, LifecycleEvent, LifecycleEventKind,
     LifecycleEvents, LifecycleItem, LifecycleSeq, LifecycleTryRecvError, ScopeKind, ScopeSnapshot,
-    ScopeState, SnapshotClosed, SnapshotReceiver, WaitError,
+    SnapshotClosed, SnapshotReceiver, WaitError,
 };
 pub use policy::{
     Backoff, BackoffFactor, DefaultsInheritance, Intensity, InvalidPolicy, Jitter, JitterSample,

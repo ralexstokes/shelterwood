@@ -1029,6 +1029,10 @@ impl ChildArena {
             .map(|(key, _)| *key)
     }
 
+    fn previous_key(&self, key: ChildKey) -> Option<ChildKey> {
+        self.children.range(..key).next_back().map(|(key, _)| *key)
+    }
+
     fn values(&self) -> impl Iterator<Item = &ChildRuntime> {
         self.children.values()
     }
@@ -1124,6 +1128,11 @@ struct ScopeRuntime {
     ancestor_shutdown_seen: bool,
     ancestor_abort_seen: bool,
     hard_forced: bool,
+    ordered_stop_progressing: bool,
+    ordered_stop_cursor: Option<ChildKey>,
+    ordered_stop_waiting: Option<ChildKey>,
+    #[cfg(test)]
+    ordered_stop_inspections: usize,
     completion: Option<ScopeCompletion>,
 }
 
@@ -1935,7 +1944,10 @@ impl ScopeRuntime {
         }
         self.root.set_state(ScopeState::Draining);
         match self.root.flavor {
-            ScopeFlavor::Ordered => self.stop_next_ordered(),
+            ScopeFlavor::Ordered => {
+                self.ordered_stop_cursor = self.children.keys().next_back();
+                self.stop_next_ordered();
+            }
             ScopeFlavor::Dynamic => {
                 let children: Vec<_> = self.children.keys().collect();
                 for child in children {
@@ -1946,20 +1958,48 @@ impl ScopeRuntime {
     }
 
     fn stop_next_ordered(&mut self) {
-        if self.root.flavor != ScopeFlavor::Ordered || !self.lifecycle.is_draining() {
+        if self.root.flavor != ScopeFlavor::Ordered
+            || !self.lifecycle.is_draining()
+            || self.ordered_stop_progressing
+        {
             return;
         }
-        loop {
-            let Some(key) = self.children.keys().rev().find(|key| {
-                !self.children[*key].is_terminal() || self.children[*key].is_disposing()
-            }) else {
-                return;
-            };
-            self.begin_stop_child(key, None);
-            if self.children[key].active.is_some() || self.children[key].is_disposing() {
+        self.ordered_stop_progressing = true;
+        if let Some(key) = self.ordered_stop_waiting {
+            let waiting = self
+                .children
+                .get(key)
+                .is_some_and(|child| !child.is_terminal() || child.is_disposing());
+            if waiting {
+                self.ordered_stop_progressing = false;
                 return;
             }
+            self.ordered_stop_waiting = None;
         }
+        while let Some(key) = self.ordered_stop_cursor {
+            self.ordered_stop_cursor = self.children.previous_key(key);
+            #[cfg(test)]
+            {
+                self.ordered_stop_inspections += 1;
+            }
+            // The cursor key is held across await boundaries, so never index
+            // the arena with it: a reclaimed slot is treated as already gone.
+            let Some(child) = self.children.get(key) else {
+                continue;
+            };
+            if child.is_terminal() && !child.is_disposing() {
+                continue;
+            }
+            self.begin_stop_child(key, None);
+            let Some(child) = self.children.get(key) else {
+                continue;
+            };
+            if child.active.is_some() || child.is_disposing() {
+                self.ordered_stop_waiting = Some(key);
+                break;
+            }
+        }
+        self.ordered_stop_progressing = false;
     }
 
     fn force_all(&mut self) {
@@ -2864,6 +2904,11 @@ async fn run_scope_incarnation(
         ancestor_shutdown_seen: false,
         ancestor_abort_seen: false,
         hard_forced: false,
+        ordered_stop_progressing: false,
+        ordered_stop_cursor: None,
+        ordered_stop_waiting: None,
+        #[cfg(test)]
+        ordered_stop_inspections: 0,
         completion: None,
         // Transfer last: every fallible setup expression above remains
         // covered by the pre-driver guard, and completed construction moves
@@ -3523,6 +3568,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -3597,6 +3646,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
+        const CHILDREN: usize = 1_024;
+
+        let mut tree = Tree::new();
+        for index in 0..CHILDREN {
+            tree.add_task(
+                format!("inactive-{index}"),
+                TaskDef::new(|_| future::pending()),
+            )
+            .expect("unique child declaration");
+        }
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let mut children = ChildArena::default();
+        plan.children.reverse();
+        while let Some(child) = plan.children.pop() {
+            children
+                .insert(ChildRuntime::from_plan(child, &root))
+                .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
+        }
+        // Model restart-window children: no incarnation and no retained
+        // construction remains, so forced terminalization completes inline.
+        // This used to re-enter `stop_next_ordered` once per child.
+        for child in children.values_mut() {
+            drop(child.construction.take());
+        }
+        let mut scope = ScopeRuntime {
+            root,
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::running(),
+            next_ordered_start: None,
+            role: ScopeRole::Root,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            hard_forced: true,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        scope.begin_drain(StopReason::ShutdownRequested);
+
+        assert!(scope.children.values().all(ChildRuntime::is_terminal));
+        assert!(!scope.ordered_stop_progressing);
+        assert_eq!(scope.ordered_stop_waiting, None);
+        assert_eq!(
+            scope.ordered_stop_inspections, CHILDREN,
+            "the reverse cursor inspects each ordered child exactly once"
+        );
+    }
+
     #[crate::runtime::test]
     async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3663,6 +3788,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -5304,6 +5433,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -5423,6 +5556,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;

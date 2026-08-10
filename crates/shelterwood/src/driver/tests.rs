@@ -1490,8 +1490,7 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
                     .shutdown(crate::Shutdown::Abort),
             )
             .await
-            .expect("task admission")
-            .into_handles();
+            .expect("task admission");
         assert_eq!(
             cell.runtime_storage(),
             RuntimeStorage {
@@ -1521,8 +1520,7 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
                 TaskDef::new(|_| async { Ok(()) }).retention(Retention::Remove),
             )
             .await
-            .expect("auto-removing task admission")
-            .into_handles();
+            .expect("auto-removing task admission");
         automatic.wait().await;
         assert_eq!(
             cell.runtime_storage(),

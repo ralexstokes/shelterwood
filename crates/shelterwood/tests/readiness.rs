@@ -723,8 +723,7 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
             .readiness_deadline(ReadinessDeadline::Unbounded),
         )
         .await
-        .expect("runtime member is admitted")
-        .into_handles();
+        .expect("runtime member is admitted");
     assert!(runtime_started.load(Ordering::SeqCst));
     initial_release.release();
     system
@@ -1039,8 +1038,7 @@ async fn nested_startup_rollback_includes_runtime_added_members() {
             }),
         )
         .await
-        .expect("runtime member is admitted during nested startup")
-        .into_handles();
+        .expect("runtime member is admitted during nested startup");
     runtime_started.wait().await;
 
     fail.release();

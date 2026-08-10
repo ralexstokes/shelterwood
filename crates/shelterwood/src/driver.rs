@@ -208,6 +208,12 @@ impl SystemRun {
     }
 }
 
+impl Drop for SystemRun {
+    fn drop(&mut self) {
+        self.request_shutdown();
+    }
+}
+
 fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<ShutdownStraggler>) {
     let children = scope.resident_projections();
     for child in children {

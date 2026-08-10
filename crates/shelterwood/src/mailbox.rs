@@ -1289,16 +1289,30 @@ impl<M> ActorRef<M> {
 
 impl<M: Send + 'static> ActorRef<M> {
     /// Sends with backpressure and transparently waits through rebind windows.
+    ///
+    /// On a live latest-value mailbox, acceptance can replace the previous
+    /// message. The displaced message is dropped inline on the task polling
+    /// this send, after the new message's acceptance is visible; a panicking
+    /// displaced-message destructor therefore resumes on that task.
     pub fn send(&self, message: M) -> SendFuture<M> {
         SendFuture::new(Arc::clone(&self.mailbox), message)
     }
 
     /// Attempts immediate acceptance without parking.
+    ///
+    /// On a live latest-value mailbox, acceptance can replace the previous
+    /// message. The displaced message is dropped inline on the calling task,
+    /// after the new message's acceptance is visible; a panicking
+    /// displaced-message destructor therefore resumes on that task.
     pub fn try_send(&self, message: M) -> Result<Incarnation, SendError<M>> {
         self.mailbox.try_send(message)
     }
 
     /// Sends within one acceptance budget, recovering an unaccepted message.
+    ///
+    /// Live latest-value displacement follows [`send`](Self::send): the
+    /// displaced message is dropped inline on the task polling this send,
+    /// after acceptance of the replacement is visible.
     pub fn send_timeout(&self, message: M, deadline: Duration) -> SendTimeout<M> {
         SendTimeout {
             deadlined: Deadlined::new(
@@ -1728,6 +1742,10 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             // existed before it completed, so do not start one after the
             // captured budget is strictly in the past.
             if budget.is_overdue(crate::runtime::now()) {
+                // Construction completed, but timeout cleanup owns the
+                // unsubmitted message. Keep its potentially blocking or
+                // panicking destructor off the caller task.
+                dispose_detached(message);
                 return Poll::Ready(self.short_circuit());
             }
             self.reply = receiver.receiver.take();
@@ -1805,8 +1823,9 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
     }
 
     fn short_circuit(&mut self) -> Self::Output {
-        // No message was ever constructed, so there is nothing to withdraw
-        // and no accepting incarnation to report.
+        // No message was submitted to the mailbox (any constructed message
+        // was already routed to isolated disposal), so there is nothing to
+        // withdraw and no accepting incarnation to report.
         Err(CallError {
             actor_id: self.actor.id().clone(),
             incarnation_observed: self.actor.mailbox.current_observation(),
@@ -1842,11 +1861,6 @@ impl<M: Send + 'static> MailboxReceiver<M> {
     pub(crate) fn try_recv(&self) -> Option<M> {
         self.mailbox
             .receive(self.incarnation, ReceiveMode::IncludeFrozen, None)
-    }
-
-    pub(crate) fn try_recv_live(&self) -> Option<M> {
-        self.mailbox
-            .receive(self.incarnation, ReceiveMode::LiveOnly, None)
     }
 
     pub(crate) fn try_recv_live_through(&self, accepted_sequence: AcceptedSequence) -> Option<M> {

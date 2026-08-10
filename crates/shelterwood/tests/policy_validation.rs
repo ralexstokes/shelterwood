@@ -315,11 +315,24 @@ async fn restartable_subtree_factory_output_reports_structured_policy_failure() 
     let system = root
         .spawn()
         .expect("factory output is produced after root lowering");
-    let StartupError::StartupFailed(failure) = system
+    let startup = system
         .wait_started()
         .await
-        .expect_err("factory output fails policy validation")
-    else {
+        .expect_err("factory output fails policy validation");
+    let outer_source =
+        std::error::Error::source(&startup).expect("startup error exposes its outer child failure");
+    let structured_source = outer_source
+        .source()
+        .expect("the child exit exposes the nested structured failure");
+    let invalid_source = structured_source
+        .source()
+        .expect("the erased structured error forwards invalid-policy detail");
+    assert!(
+        invalid_source
+            .to_string()
+            .contains("invalid restart intensity")
+    );
+    let StartupError::StartupFailed(failure) = startup else {
         panic!("expected structured startup failure");
     };
     let StartupFailureCause::Child { id, exit, .. } = failure.cause else {

@@ -166,10 +166,6 @@ struct RemovalRequest {
 }
 
 impl SystemRun {
-    pub(crate) fn request_shutdown(&self) {
-        let _ = self.root.request_shutdown();
-    }
-
     pub(crate) async fn shutdown(&mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
         let result = shutdown_scope(Arc::clone(&self.root), timeout).await;
         self.join_driver().await;
@@ -210,7 +206,15 @@ impl SystemRun {
 
 impl Drop for SystemRun {
     fn drop(&mut self) {
-        self.request_shutdown();
+        // After a clean shutdown the root epochs are `Idle`, not `Exhausted`,
+        // so this writes a real `ScopeRequest` — targeting the pending next
+        // incarnation — into dead control state and pulses the member record.
+        // That stays harmless only while watchers tolerate spurious wakes and
+        // the driver we already joined was the sole consumer of scope
+        // requests; nothing may come to treat a post-shutdown request as
+        // meaningful. The poison-tolerant entry point keeps this drop from
+        // panicking — and aborting — on an already-unwinding thread.
+        let _ = self.root.request_shutdown_ignoring_poison();
     }
 }
 

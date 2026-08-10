@@ -1351,7 +1351,24 @@ impl ScopeCell {
     }
 
     pub(crate) fn request_shutdown(&self) -> Option<Epoch> {
-        let mut control = self.control.lock().expect("scope control mutex poisoned");
+        let control = self.control.lock().expect("scope control mutex poisoned");
+        self.request_shutdown_locked(control)
+    }
+
+    /// [`Self::request_shutdown`] for destructors: tolerates a poisoned
+    /// control mutex so a drop-path request cannot panic — and abort — on a
+    /// thread that is already unwinding. Control holds plain request state,
+    /// so overwriting a poisoner's partial update is no worse than any other
+    /// racing request.
+    pub(crate) fn request_shutdown_ignoring_poison(&self) -> Option<Epoch> {
+        let control = self
+            .control
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.request_shutdown_locked(control)
+    }
+
+    fn request_shutdown_locked(&self, mut control: MutexGuard<'_, ScopeControl>) -> Option<Epoch> {
         let RequestTarget {
             epoch: target,
             pending_incarnation,

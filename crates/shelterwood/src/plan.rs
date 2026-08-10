@@ -196,6 +196,9 @@ impl SlotCell {
         defaults: &ResolvedDefaults,
     ) -> Result<ResolvedCommonOptions, InvalidPolicy> {
         let (options, mode, default_readiness) = match definition.get() {
+            // A raw definition resolved its effective mode at erasure, where
+            // the actor type's `RawActor::readiness` metadata was still
+            // nameable, so it arrives here as the kind default.
             ChildConstruction::Raw(definition) => {
                 (&definition.options, definition.mode(), definition.readiness)
             }
@@ -218,7 +221,7 @@ impl SlotCell {
                     tree.validate_policies(&inherited)
                         .map_err(|invalid| invalid.prepend(self.member.id()))?;
                 }
-                (&definition.options, definition.mode(), Readiness::Immediate)
+                (&definition.options, definition.mode(), Readiness::Manual)
             }
         };
         resolve_common(options, defaults, mode, default_readiness)
@@ -494,16 +497,18 @@ mod tests {
     };
 
     use crate::{
-        Backoff, ExitError, Readiness, RestartCondition, RestartPolicy, Retention, Shutdown,
-        TaskOnceDef,
-        policy::{ResolvedDefaults, ScopeFlavor},
+        Backoff, DefaultsInheritance, ExitError, Readiness, RestartCondition, RestartPolicy,
+        Retention, Shutdown, TaskOnceDef,
+        definition::DefinitionSource,
+        policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
+        raw::RawConstruction,
         runtime::{self, Timeout},
         task::TaskDef,
     };
 
     use super::{
-        BuilderCore, ChildConstruction, ChildPlan, SlotCell, concrete_dynamic_slot,
-        concrete_dynamic_slot_ref, erase_dynamic_slot,
+        BuilderCore, ChildConstruction, ChildPlan, ScopeConstruction, SlotCell,
+        concrete_dynamic_slot, concrete_dynamic_slot_ref, erase_dynamic_slot,
     };
 
     fn configured_task() -> TaskDef {
@@ -562,6 +567,103 @@ mod tests {
             ChildPlan::with_options(dynamic_slot, dynamic_definition, dynamic_options);
 
         assert_eq!(static_plan.children[0].options, dynamic_plan.options);
+        assert_eq!(dynamic_plan.options.readiness, Readiness::Manual);
+    }
+
+    fn resolved_readiness(construction: ChildConstruction) -> Readiness {
+        let declaration = BuilderCore::new(ScopeFlavor::Dynamic);
+        let slot = SlotCell::new(Arc::clone(&declaration.root.member), None);
+        slot.define(construction);
+        slot.resolve_policy(&ResolvedDefaults::default())
+            .expect("policy is valid")
+            .expect("slot is defined")
+            .readiness
+    }
+
+    fn raw_construction(options: CommonOptions) -> ChildConstruction {
+        // Mirrors `RawDef::erase`: the effective mode is resolved against the
+        // actor type's `RawActor::readiness` metadata (`Manual` here, distinct
+        // from every plan-level kind default) before the construction is
+        // erased.
+        let readiness = options.readiness.unwrap_or(Readiness::Manual);
+        ChildConstruction::Raw(RawConstruction {
+            source: DefinitionSource::Restartable(Arc::new(|| {
+                unreachable!("policy resolution never constructs the actor")
+            })),
+            options,
+            readiness,
+        })
+    }
+
+    fn scope_construction(options: CommonOptions) -> ChildConstruction {
+        ChildConstruction::Scope(Box::new(ScopeConstruction {
+            source: DefinitionSource::Restartable(Arc::new(|| {
+                BuilderCore::new(ScopeFlavor::Ordered)
+            })),
+            options,
+            defaults: DefaultsInheritance::Inherit,
+        }))
+    }
+
+    #[test]
+    fn resolution_applies_per_kind_readiness_defaults() {
+        // Undeclared readiness resolves per construction kind: tasks gate
+        // immediately, scopes wait for their startup barrier, and a raw
+        // definition carries the mode already resolved from its actor type's
+        // metadata at erasure.
+        assert_eq!(
+            resolved_readiness(ChildConstruction::Task(TaskDef::new(|_| async { Ok(()) }))),
+            Readiness::Immediate
+        );
+        let (completion, _claim) = runtime::oneshot();
+        assert_eq!(
+            resolved_readiness(ChildConstruction::TaskOnce(
+                TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }).erase(completion)
+            )),
+            Readiness::Immediate
+        );
+        assert_eq!(
+            resolved_readiness(scope_construction(CommonOptions::default())),
+            Readiness::Manual
+        );
+        assert_eq!(
+            resolved_readiness(raw_construction(CommonOptions::default())),
+            Readiness::Manual
+        );
+
+        // A declared override wins over every per-kind default.
+        assert_eq!(
+            resolved_readiness(ChildConstruction::Task(
+                TaskDef::new(|_| async { Ok(()) })
+                    .readiness(Readiness::Manual)
+                    .expect("manual task readiness is valid")
+            )),
+            Readiness::Manual
+        );
+        let (completion, _claim) = runtime::oneshot();
+        assert_eq!(
+            resolved_readiness(ChildConstruction::TaskOnce(
+                TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) })
+                    .readiness(Readiness::Manual)
+                    .expect("manual task readiness is valid")
+                    .erase(completion)
+            )),
+            Readiness::Manual
+        );
+        assert_eq!(
+            resolved_readiness(scope_construction(CommonOptions {
+                readiness: Some(Readiness::Immediate),
+                ..CommonOptions::default()
+            })),
+            Readiness::Immediate
+        );
+        assert_eq!(
+            resolved_readiness(raw_construction(CommonOptions {
+                readiness: Some(Readiness::Immediate),
+                ..CommonOptions::default()
+            })),
+            Readiness::Immediate
+        );
     }
 
     #[test]

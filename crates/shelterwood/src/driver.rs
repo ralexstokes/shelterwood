@@ -622,6 +622,8 @@ enum SpawnBody {
     Raw {
         spawn: RawSpawn,
         context: RawRunContext,
+        /// Definition-resolved readiness mode handed to the incarnation.
+        readiness: Readiness,
     },
     TaskRestartable {
         factory: TaskFactory,
@@ -694,7 +696,6 @@ struct ChildTaskLaunch {
     key: ChildKey,
     incarnation: Incarnation,
     body: SpawnBody,
-    readiness: Readiness,
     watch_readiness: bool,
     shutdown: Latch,
     ready: CompletionGatedLatch,
@@ -729,6 +730,7 @@ fn dispatch_child_construction(
                         local_stop: latches.local_stop.clone(),
                         mailbox_shutdown: child.options.mailbox_shutdown,
                     },
+                    readiness: child.options.readiness,
                 },
                 declared_readiness: child.options.readiness,
                 construction_spent,
@@ -790,7 +792,7 @@ fn dispatch_child_construction(
             };
             SpawnDispatch {
                 body,
-                declared_readiness: Readiness::Manual,
+                declared_readiness: child.options.readiness,
                 construction_spent,
                 scope_child: true,
             }
@@ -804,7 +806,6 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         key,
         incarnation,
         body,
-        readiness,
         watch_readiness,
         shutdown,
         ready,
@@ -814,7 +815,11 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
     let handle = runtime::spawn(async move {
         let body = async move {
             match body {
-                SpawnBody::Raw { spawn, context } => {
+                SpawnBody::Raw {
+                    spawn,
+                    context,
+                    readiness,
+                } => {
                     let instance = spawn.construct();
                     instance.run(context, readiness).await
                 }
@@ -1126,7 +1131,6 @@ impl ScopeRuntime {
             key,
             incarnation,
             body,
-            readiness: declared_readiness,
             watch_readiness: gated,
             shutdown: latches.shutdown.clone(),
             ready: latches.ready.clone(),

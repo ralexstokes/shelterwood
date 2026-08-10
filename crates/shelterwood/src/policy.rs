@@ -755,6 +755,9 @@ pub(crate) struct ResolvedCommonOptions {
     pub(crate) shutdown: Shutdown,
     pub(crate) mailbox: Mailbox,
     pub(crate) mailbox_shutdown: MailboxShutdown,
+    /// Effective definition readiness. Every kind arrives here already
+    /// resolved: raw actors fold their type-level default into the definition
+    /// at erasure, so no per-incarnation fallback remains.
     pub(crate) readiness: Readiness,
     pub(crate) readiness_deadline: ReadinessDeadline,
     pub(crate) retention: Retention,

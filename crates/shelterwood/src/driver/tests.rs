@@ -3475,6 +3475,21 @@ fn member_transitions_own_their_complete_record_projection() {
     assert_eq!(record.last_exit, Some(exit));
     assert_eq!(record.restart_count, restart_count);
     assert_eq!(record.restart_at, Some(restart_at));
+
+    let second = incarnations.mint().expect("restart incarnation available");
+    member.transition(MemberTransition::Starting {
+        incarnation: second,
+    });
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Starting);
+    assert_eq!(record.incarnation, Some(second));
+    assert_eq!(record.last_incarnation, Some(second));
+    assert_eq!(record.restart_at, None);
+    assert_eq!(
+        record.last_exit,
+        Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved))
+    );
+    assert_eq!(record.restart_count, restart_count);
 }
 
 #[test]

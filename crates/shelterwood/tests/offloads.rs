@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -149,6 +149,220 @@ async fn timers_and_offload_completions_never_cross_an_incarnation_boundary() {
         .expect("replacement live");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert!(!stale_seen.load(Ordering::SeqCst));
+}
+
+enum DetachedBlockingMessage {
+    Poison,
+    Fresh,
+    Stop,
+    StaleCompletion,
+}
+
+struct DetachedBlockingResult(ReleaseGate);
+
+impl Drop for DetachedBlockingResult {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+#[derive(Default)]
+struct BlockingThreadRelease {
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl BlockingThreadRelease {
+    fn gate(&self) -> Arc<(Mutex<bool>, Condvar)> {
+        Arc::clone(&self.gate)
+    }
+
+    fn release(&self) {
+        let (released, changed) = &*self.gate;
+        *released.lock().expect("release mutex poisoned") = true;
+        changed.notify_all();
+    }
+}
+
+impl Drop for BlockingThreadRelease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+struct DetachedBlockingActor {
+    generation: usize,
+    thread_started: ReleaseGate,
+    thread_release: Arc<(Mutex<bool>, Condvar)>,
+    result_disposed: ReleaseGate,
+    fresh_seen: ReleaseGate,
+    stale_seen: Arc<AtomicBool>,
+    map_ran: Arc<AtomicBool>,
+}
+
+impl Actor for DetachedBlockingActor {
+    type Msg = DetachedBlockingMessage;
+    type Args = (
+        usize,
+        ReleaseGate,
+        Arc<(Mutex<bool>, Condvar)>,
+        ReleaseGate,
+        ReleaseGate,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    );
+
+    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self {
+            generation: args.0,
+            thread_started: args.1,
+            thread_release: args.2,
+            result_disposed: args.3,
+            fresh_seen: args.4,
+            stale_seen: args.5,
+            map_ran: args.6,
+        })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            DetachedBlockingMessage::Poison => {
+                assert_eq!(self.generation, 1);
+                let thread_started = self.thread_started.clone();
+                let thread_release = Arc::clone(&self.thread_release);
+                let result_disposed = self.result_disposed.clone();
+                let work = context.run_blocking(move |cancellation| {
+                    thread_started.release();
+                    let (released, changed) = &*thread_release;
+                    let mut released = released.lock().expect("release mutex poisoned");
+                    while !*released {
+                        released = changed
+                            .wait(released)
+                            .expect("release mutex poisoned while waiting");
+                    }
+                    assert!(
+                        cancellation.is_cancelled(),
+                        "the old incarnation cancels detached blocking work"
+                    );
+                    DetachedBlockingResult(result_disposed)
+                });
+                self.thread_started.wait().await;
+                context
+                    .offload(
+                        work,
+                        {
+                            let map_ran = Arc::clone(&self.map_ran);
+                            move |_| {
+                                map_ran.store(true, Ordering::SeqCst);
+                                DetachedBlockingMessage::StaleCompletion
+                            }
+                        },
+                        Duration::MAX,
+                    )
+                    .expect("blocking future is accepted before failure");
+                Err(ExitError::message("poisoned incarnation"))
+            }
+            DetachedBlockingMessage::Fresh => {
+                assert_eq!(self.generation, 2);
+                self.fresh_seen.release();
+                Ok(())
+            }
+            DetachedBlockingMessage::Stop => {
+                assert_eq!(self.generation, 2);
+                context.stop();
+                Ok(())
+            }
+            DetachedBlockingMessage::StaleCompletion => {
+                self.stale_seen.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
+    let generations = Arc::new(AtomicUsize::new(0));
+    let thread_started = ReleaseGate::default();
+    // A failed assertion must not leave Tokio's blocking pool stuck waiting
+    // while the test runtime tries to shut down.
+    let thread_release = BlockingThreadRelease::default();
+    let result_disposed = ReleaseGate::default();
+    let fresh_seen = ReleaseGate::default();
+    let stale_seen = Arc::new(AtomicBool::new(false));
+    let map_ran = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor(
+            "actor",
+            ActorDef::<DetachedBlockingActor>::factory({
+                let generations = Arc::clone(&generations);
+                let thread_started = thread_started.clone();
+                let thread_release = thread_release.gate();
+                let result_disposed = result_disposed.clone();
+                let fresh_seen = fresh_seen.clone();
+                let stale_seen = Arc::clone(&stale_seen);
+                let map_ran = Arc::clone(&map_ran);
+                move || {
+                    (
+                        generations.fetch_add(1, Ordering::SeqCst) + 1,
+                        thread_started.clone(),
+                        Arc::clone(&thread_release),
+                        result_disposed.clone(),
+                        fresh_seen.clone(),
+                        Arc::clone(&stale_seen),
+                        Arc::clone(&map_ran),
+                    )
+                }
+            }),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("first actor starts");
+    actor
+        .send(DetachedBlockingMessage::Poison)
+        .await
+        .expect("actor accepts poison");
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            generations.load(Ordering::SeqCst) >= 2
+        })
+        .await,
+        "replacement starts while the old blocking thread remains detached"
+    );
+
+    thread_release.release();
+    // The gate only witnesses that the result's destructor ran somewhere; the
+    // `map_ran` assertions below pin down that disposal, not the map closure,
+    // consumed it.
+    tokio::time::timeout(POLL_TIMEOUT, result_disposed.wait())
+        .await
+        .expect("the detached blocking result's destructor runs");
+    assert!(
+        !map_ran.load(Ordering::SeqCst),
+        "the detached completion is disposed without running the map closure"
+    );
+
+    actor
+        .send(DetachedBlockingMessage::Fresh)
+        .await
+        .expect("replacement remains live");
+    tokio::time::timeout(POLL_TIMEOUT, fresh_seen.wait())
+        .await
+        .expect("replacement processes the synchronization message");
+    assert_quiet(Duration::from_millis(20), || {
+        stale_seen.load(Ordering::SeqCst)
+    })
+    .await;
+    actor
+        .send(DetachedBlockingMessage::Stop)
+        .await
+        .expect("replacement accepts the final stop");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert!(!stale_seen.load(Ordering::SeqCst));
+    assert!(
+        !map_ran.load(Ordering::SeqCst),
+        "the stale completion was never mapped"
+    );
 }
 
 enum DeadlineMessage {
@@ -1483,9 +1697,10 @@ impl Actor for SaturatedActor {
 }
 
 /// A continuously nonempty mailbox cannot starve queued offload completions:
-/// the completions queued at each mailbox delivery are consumed ahead of
-/// later mailbox input, so the completion backlog stays proportional to the
-/// actor's own in-flight issuance instead of growing with mailbox history.
+/// every bounded arbitration turn admits at most one mailbox delivery before
+/// its captured completion prefix, so the completion backlog stays
+/// proportional to the actor's own in-flight issuance instead of growing with
+/// mailbox history.
 #[tokio::test]
 async fn saturated_mailbox_does_not_grow_the_completion_backlog() {
     let gate = ReleaseGate::default();
@@ -1510,8 +1725,8 @@ async fn saturated_mailbox_does_not_grow_the_completion_backlog() {
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert!(
         peak_backlog.load(Ordering::SeqCst) <= 2,
-        "queued completions drain ahead of later mailbox input instead of \
-         accumulating while the mailbox stays nonempty"
+        "bounded arbitration turns drain completions instead of accumulating \
+         them while the mailbox stays nonempty"
     );
 }
 

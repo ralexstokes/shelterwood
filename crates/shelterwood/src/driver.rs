@@ -20,7 +20,7 @@ use crate::{
     deadline::Deadline,
     engine::{
         ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
-        IncarnationRun, IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent,
+        IncarnationRun, IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent,
         ReadinessGate, RestartState, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate,
         dispatch_exit, schedule_restart,
     },
@@ -858,7 +858,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
         };
-        report.record(RecordedOutcome::Returned(result));
+        report.record(RecordedOutcome::returned(result));
     });
     let abort_handle = handle.abort_handle();
 
@@ -1240,7 +1240,7 @@ impl ScopeRuntime {
                 true
             }
             ReadinessEffect::TimedOut { deadline } => {
-                self.begin_stop_child(key, Some(RecordedOutcome::ReadinessTimedOut { deadline }));
+                self.begin_stop_child(key, Some(RecordedOutcome::readiness_timed_out(deadline)));
                 false
             }
             ReadinessEffect::Disarmed => false,
@@ -1375,7 +1375,7 @@ impl ScopeRuntime {
                 StopAction::AbortFramework { phase } => {
                     active.hard_abort_phase = Some(phase);
                     if active.forced_outcome.is_none() {
-                        active.forced_outcome = Some(RecordedOutcome::Aborted { phase });
+                        active.forced_outcome = Some(RecordedOutcome::aborted(phase));
                     }
                     active
                         .framework_abort
@@ -1682,12 +1682,12 @@ impl ScopeRuntime {
         } else {
             ScopeMode::Running
         };
-        let member_mode = if membership_removing {
-            MembershipMode::Removing
+        let membership_status = if membership_removing {
+            MembershipStatus::Removing
         } else {
-            MembershipMode::Active
+            MembershipStatus::Active
         };
-        match dispatch_exit(&exit, child.options.restart, mode, member_mode) {
+        match dispatch_exit(&exit, child.options.restart, mode, membership_status) {
             ExitDispatch::Terminal => {
                 // §6's startup abort is a startup-sequence property: the
                 // membership failed before its *initial* readiness edge. A
@@ -3741,7 +3741,7 @@ mod tests {
         let exit = DriverEvent::Child(ChildEvent::Exited {
             child: trip,
             incarnation,
-            recorded: Some(RecordedOutcome::Returned(Err(ExitError::message(
+            recorded: Some(RecordedOutcome::returned(Err(ExitError::message(
                 "trip intensity",
             )))),
             join: JoinVerdict::Completed,
@@ -3864,7 +3864,7 @@ mod tests {
             Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
                 child: key,
                 incarnation,
-                recorded: Some(RecordedOutcome::Returned(Ok(()))),
+                recorded: Some(RecordedOutcome::returned(Ok(()))),
                 join: JoinVerdict::Completed,
                 cancellation: Cancellation::NotObserved,
                 readiness_signal_seen: true,
@@ -4081,13 +4081,13 @@ mod tests {
         let shutdown = Latch::default();
         let readiness = CompletionGatedLatch::default();
         let (token, receiver) = report_channel(shutdown.clone(), None, readiness.clone());
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         shutdown.fire();
         readiness.fire();
         let report = receiver.receive();
         assert!(matches!(
             report.outcome,
-            Some(RecordedOutcome::Returned(Ok(())))
+            Some(outcome) if matches!(outcome.kind(), ExitKind::Completed)
         ));
         assert_eq!(report.cancellation, Cancellation::NotObserved);
         assert!(!report.readiness_signal_seen);
@@ -4108,11 +4108,11 @@ mod tests {
         let (token, receiver) =
             report_channel(shutdown.clone(), None, CompletionGatedLatch::default());
         shutdown.fire();
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         let report = receiver.receive();
         assert!(matches!(
             report.outcome,
-            Some(RecordedOutcome::Returned(Ok(())))
+            Some(outcome) if matches!(outcome.kind(), ExitKind::Completed)
         ));
         assert_eq!(report.cancellation, Cancellation::Observed);
     }
@@ -4127,7 +4127,7 @@ mod tests {
             CompletionGatedLatch::default(),
         );
         local_stop.fire();
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         assert_eq!(receiver.receive().cancellation, Cancellation::Observed);
     }
 
@@ -4136,7 +4136,7 @@ mod tests {
         let readiness = CompletionGatedLatch::default();
         let (token, receiver) = report_channel(Latch::default(), None, readiness.clone());
         readiness.fire();
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         assert!(!readiness.fire(), "completion closes retained capabilities");
         assert!(receiver.receive().readiness_signal_seen);
     }

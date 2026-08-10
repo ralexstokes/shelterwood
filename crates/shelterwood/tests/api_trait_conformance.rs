@@ -5,12 +5,12 @@ use shelterwood::{
     CallFuture, Cancellation, CancellationToken, Context, DeadlineElapsed, DefaultsInheritance,
     DynamicActorSlot, DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError,
     ExitResult, GracePhase, Guard, Handler, Incarnation, Intensity, LifecycleEvents,
-    LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, OneShotTaskRef, RawActor,
-    RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, Removal, Reply, ReplyReceive,
-    ReplyReceiver, ReserveError, RestartAttempt, RestartCount, RestartPolicy, Retention,
-    ScopeDefaults, ScopeRef, SendError, SendFuture, SendTimeout, Shutdown, SnapshotClosed,
-    SnapshotReceiver, StopContext, Strategy, SubtreeDef, SubtreeOnceDef, SubtreeSlot, System,
-    TaskDef, TaskOnceDef, TaskRef, TaskSlot, TotalRestarts, Tree, WaitError,
+    LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, MembershipStatus, OneShotTaskRef,
+    RawActor, RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, Removal, Reply,
+    ReplyReceive, ReplyReceiver, ReserveError, RestartAttempt, RestartCount, RestartPolicy,
+    Retention, ScopeDefaults, ScopeRef, SendError, SendFuture, SendTimeout, Shutdown,
+    SnapshotClosed, SnapshotReceiver, StopContext, Strategy, SubtreeDef, SubtreeOnceDef,
+    SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, TotalRestarts, Tree, WaitError,
 };
 
 fn assert_error<T: Error>() {}
@@ -412,6 +412,7 @@ fn all_definition_option_setters_compile() {
 
 #[test]
 fn observation_types_obey_error_and_thread_safety_contracts() {
+    assert_copy_eq_hash_send_sync::<MembershipStatus>();
     assert_error::<LifecycleTryRecvError>();
     assert_error::<SnapshotClosed>();
     assert_error::<WaitError>();

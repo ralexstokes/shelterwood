@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartAttempt, RestartCount, RestartPolicy,
-    Retention, Strategy, TotalRestarts, exit::StopReason, runtime,
+    Retention, Strategy, TotalRestarts, engine::MembershipStatus, exit::StopReason, runtime,
 };
 
 /// Number of lifecycle events retained independently for each subscriber.
@@ -137,15 +137,6 @@ pub enum LifecycleEventKind {
         /// New scope state.
         state: ScopeState,
     },
-}
-
-/// Whether a child membership is active or undergoing planned removal.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum MembershipStatus {
-    /// The membership remains resident normally.
-    Active,
-    /// A planned removal has begun.
-    Removing,
 }
 
 /// Current state of one child membership.

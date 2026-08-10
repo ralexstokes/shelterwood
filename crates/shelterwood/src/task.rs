@@ -1,7 +1,6 @@
 //! Supervised task definitions, contexts, and handles.
 
 use std::{
-    convert::Infallible,
     fmt,
     future::Future,
     hash::{Hash, Hasher},
@@ -14,7 +13,6 @@ use crate::{
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
     cancellation::CancellationToken,
     cells::MemberCell,
-    definition::DefinitionSource,
     policy::CommonOptions,
     runtime::{self, CompletionGatedLatch, Latch},
 };
@@ -164,7 +162,7 @@ impl<T: Send + 'static> TaskOnceDef<T> {
     pub(crate) fn erase(self, completion: runtime::OneShotSender<T>) -> OnceTask {
         let body = self.body;
         OnceTask {
-            source: DefinitionSource::OneShot(Box::new(move |context| {
+            body: Some(Box::new(move |context| {
                 Box::pin(async move {
                     match body(context).await {
                         Ok(value) => {
@@ -188,7 +186,7 @@ impl<T: Send + 'static> TaskOnceDef<T> {
 }
 
 pub(crate) struct OnceTask {
-    source: DefinitionSource<Infallible, OnceTaskFactory>,
+    body: Option<OnceTaskFactory>,
     pub(crate) options: CommonOptions,
 }
 
@@ -196,8 +194,8 @@ type OnceTaskFactory = Box<dyn FnOnce(TaskContext) -> TaskFuture + Send + 'stati
 
 impl OnceTask {
     pub(crate) fn take_body(&mut self) -> OnceTaskFactory {
-        self.source
-            .take_one_shot()
+        self.body
+            .take()
             .expect("one-shot task construction invoked more than once")
     }
 }
@@ -316,17 +314,21 @@ impl<T: Send + 'static> OneShotTaskRef<T> {
 mod tests {
     use std::{
         future::Future,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         task::{Context, Poll, Waker},
     };
 
     use crate::{
-        Cancellation, ChildId, Exit, ExitKind, GracePhase,
+        Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase,
         cells::MemberCell,
         identity::ScopeIdentity,
         runtime::{self, CompletionGatedLatch, Latch},
     };
 
-    use super::{OneShotTaskRef, TaskContext, TaskContextLatches, TaskRef};
+    use super::{OneShotTaskRef, TaskContext, TaskContextLatches, TaskOnceDef, TaskRef};
 
     fn task_context() -> (TaskContext, Latch, Latch, CompletionGatedLatch) {
         let id = ChildId::from("task");
@@ -383,6 +385,43 @@ mod tests {
 
         assert!(!ready.is_fired());
         assert!(!shutdown.is_fired());
+    }
+
+    #[test]
+    fn taking_one_shot_body_moves_its_sole_owner() {
+        struct DropProbe(Arc<AtomicUsize>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let probe = DropProbe(Arc::clone(&drops));
+        let (completion, _claim) = runtime::oneshot::<()>();
+        let mut task = TaskOnceDef::new(move |_| async move {
+            drop(probe);
+            Ok::<_, ExitError>(())
+        })
+        .erase(completion);
+
+        let body = task.take_body();
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(task);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(body);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "one-shot task construction invoked more than once")]
+    fn taking_one_shot_body_twice_preserves_the_invariant_panic() {
+        let (completion, _claim) = runtime::oneshot::<()>();
+        let mut task = TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }).erase(completion);
+
+        drop(task.take_body());
+        drop(task.take_body());
     }
 
     fn one_shot_claim<T: Send + 'static>() -> (

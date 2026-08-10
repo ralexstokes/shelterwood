@@ -385,7 +385,10 @@ fn discharge_child_terminality(completion: ChildTerminality) {
     if matches!(record.stage, MemberStage::Terminal(_)) {
         return;
     }
-    let (exit, exited_incarnation) = if record.last_incarnation.is_some() {
+    let never_started = record.last_incarnation.is_none();
+    let (exit, exited_incarnation) = if never_started {
+        (Exit::never_started(), None)
+    } else {
         (
             Exit::new(
                 ExitKind::Aborted {
@@ -395,12 +398,13 @@ fn discharge_child_terminality(completion: ChildTerminality) {
             ),
             record.incarnation,
         )
-    } else {
-        (Exit::never_started(), None)
     };
-    if exited_incarnation.is_none()
-        && let Some(scope) = &completion.slot.scope
-    {
+    // `incarnation: None` also describes the gap between two incarnations.
+    // Only a membership that never ran needs a synthesized scope stop; a
+    // restarting scope already published its real reason in its last
+    // incarnation's epilogue, and replacing it here would make `wait_stopped`
+    // incorrectly report `NeverStarted`.
+    if never_started && let Some(scope) = &completion.slot.scope {
         scope.terminalize_never_started();
     }
     completion.root.terminalize_child(

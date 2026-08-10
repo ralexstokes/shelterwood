@@ -160,7 +160,8 @@ pub(crate) fn now() -> std::time::Instant {
 }
 
 // Keep each timer registration comfortably inside tokio's millisecond tick
-// range. Tokio caps instants beyond its private `u64::MAX - 3` tick sentinel,
+// range. Tokio caps instants beyond its private `MAX_SAFE_MILLIS_DURATION`
+// (`u64::MAX - 2` milliseconds in tokio 1.53),
 // which would otherwise make a valid but very distant std Instant fire early.
 // Rechecking the original absolute point after bounded slices preserves exact
 // never-early semantics without coupling this crate to that private constant.
@@ -1155,6 +1156,25 @@ where
     let Some(deadline) = deadline(duration).instant() else {
         return Timeout::Completed(future.await);
     };
+    // Deadline's zero-budget carve-out keeps an exact zero budget
+    // representable even when its clock value is too close to Instant's
+    // ceiling for the timer to arm safely. Handing that instant to tokio's
+    // timeout would still arm it — the tick conversion rounds the deadline
+    // up with a panicking add — so apply the carve-out's own due-check here
+    // instead of arming: the budget is already due, and exact-boundary
+    // arbitration gives an immediately ready operation its one poll before
+    // the elapse. Every other zero budget stays on tokio's timeout below,
+    // keeping the normal regime's semantics untouched.
+    if duration.is_zero() && Deadline::at(deadline).instant().is_none() {
+        tokio::pin!(future);
+        return std::future::poll_fn(|context| {
+            std::task::Poll::Ready(match future.as_mut().poll(context) {
+                std::task::Poll::Ready(value) => Timeout::Completed(value),
+                std::task::Poll::Pending => Timeout::Elapsed,
+            })
+        })
+        .await;
+    }
     if duration <= MAX_TIMER_SLICE {
         return match time::timeout(duration, future).await {
             Ok(value) => Timeout::Completed(value),

@@ -45,7 +45,7 @@ pub(super) enum DeadlineKind {
 }
 pub(super) enum Pending {
     Shutdown,
-    RestartShutdown(ChildKey),
+    RestartShutdown { child: ChildKey, target: Epoch },
     AncestorShutdown,
     AncestorAbort,
     Force,
@@ -59,7 +59,7 @@ impl Pending {
             Self::Shutdown | Self::AncestorShutdown | Self::AncestorAbort | Self::Force => {
                 ArbitrationClass::ScopeShutdown
             }
-            Self::RestartShutdown(_) => ArbitrationClass::BackoffDue,
+            Self::RestartShutdown { .. } => ArbitrationClass::BackoffDue,
             Self::Driver(event) => driver_event_class(event),
             Self::Deadline(DeadlineKind::Readiness { .. }) => ArbitrationClass::ReadinessDeadline,
             Self::Deadline(DeadlineKind::Restart { .. }) => ArbitrationClass::BackoffDue,
@@ -94,12 +94,12 @@ pub(super) fn collect_driver_events(
     true
 }
 
-pub(super) fn restart_shutdown_work(child: ChildKey) -> (ArbitrationClass, Pending) {
+pub(super) fn restart_shutdown_work(child: ChildKey, target: Epoch) -> (ArbitrationClass, Pending) {
     // This starts a pending incarnation, so it is restart work, not a
     // scope-shutdown transition. A child exit collected in the same wake must
     // first get the chance to trip intensity or fail startup; the
     // execution-time suppression check then observes that drain.
-    Pending::RestartShutdown(child).classified()
+    Pending::RestartShutdown { child, target }.classified()
 }
 
 pub(super) fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
@@ -166,36 +166,41 @@ impl ScopeRuntime {
         event: ScopeControlEvent,
     ) -> Option<(ArbitrationClass, Pending)> {
         match event {
-            ScopeControlEvent::RestartShutdown { membership } => self
+            ScopeControlEvent::RestartShutdown { membership, target } => self
                 .child_keys
                 .get(&membership)
                 .copied()
-                .map(restart_shutdown_work),
+                .map(|child| restart_shutdown_work(child, target)),
         }
     }
 
-    pub(super) fn expedite_restart_shutdown(&mut self, key: ChildKey) {
+    pub(super) fn expedite_restart_shutdown(&mut self, key: ChildKey, target: Epoch) {
         // Collection and execution are separated by arbitration. Recheck
         // every level-triggered stop source so teardown/removal latched in the
         // same batch suppresses user construction immediately.
         if self.restart_is_suppressed(key) {
             if let Some(child) = self.children.get_mut(key) {
-                child.restart_shutdown_pending = false;
+                child.restart_shutdown_pending = None;
             }
             return;
         }
+        let target_is_pending = self
+            .children
+            .get(key)
+            .and_then(|child| child.slot.scope.as_ref())
+            .is_some_and(|scope| scope.has_pending_incarnation_shutdown(target));
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
-        if child.is_terminal() || child.is_disposing() {
-            child.restart_shutdown_pending = false;
+        if !target_is_pending || child.is_terminal() || child.is_disposing() {
+            child.restart_shutdown_pending = None;
             return;
         }
         if child.active.is_some() {
-            child.restart_shutdown_pending = true;
+            child.restart_shutdown_pending = Some(target);
             return;
         }
-        child.restart_shutdown_pending = false;
+        child.restart_shutdown_pending = None;
         self.spawn_child(key);
     }
 

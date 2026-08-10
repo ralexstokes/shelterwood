@@ -858,7 +858,9 @@ async fn run_scope_incarnation(
                     }
                     scope.begin_drain(StopReason::ShutdownRequested);
                 }
-                Pending::RestartShutdown(child) => scope.expedite_restart_shutdown(child),
+                Pending::RestartShutdown { child, target } => {
+                    scope.expedite_restart_shutdown(child, target);
+                }
                 Pending::AncestorShutdown => {
                     scope.begin_drain(StopReason::ShutdownRequested);
                 }

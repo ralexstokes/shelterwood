@@ -814,7 +814,10 @@ struct ScopeRequest {
 /// index, so stale events miss instead of addressing a replacement child.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ScopeControlEvent {
-    RestartShutdown { membership: Membership },
+    RestartShutdown {
+        membership: Membership,
+        target: Epoch,
+    },
 }
 
 /// Shared scope state follows two distinct synchronization regimes.
@@ -966,14 +969,15 @@ impl ScopeCell {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(parent));
         let control = self.control.lock().expect("scope control mutex poisoned");
-        let pending_shutdown = control.shutdown.is_some_and(|request| {
+        let pending_shutdown = control.shutdown.filter(|request| {
             !request.consumed && control.epochs.request_is_pending(request.epoch)
         });
         drop(control);
-        if pending_shutdown {
+        if let Some(request) = pending_shutdown {
             parent.publish_control_event_locked(
                 ScopeControlEvent::RestartShutdown {
                     membership: self.member.membership(),
+                    target: request.epoch,
                 },
                 txn,
             );
@@ -1693,6 +1697,7 @@ impl ScopeCell {
                 parent.publish_control_event_locked(
                     ScopeControlEvent::RestartShutdown {
                         membership: self.member.membership(),
+                        target,
                     },
                     txn,
                 );
@@ -1718,6 +1723,15 @@ impl ScopeCell {
                 .events
                 .drain(..)
                 .collect()
+        })
+    }
+
+    pub(crate) fn has_pending_incarnation_shutdown(&self, target: Epoch) -> bool {
+        let control = self.control.lock().expect("scope control mutex poisoned");
+        control.shutdown.is_some_and(|request| {
+            request.epoch == target
+                && !request.consumed
+                && control.epochs.request_is_pending(target)
         })
     }
 

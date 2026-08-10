@@ -13,7 +13,9 @@ fn pre_admission_restart_shutdown_is_published_when_the_scope_gets_a_parent() {
         .as_ref()
         .expect("nested scope cell");
 
-    assert!(nested.request_shutdown().is_some());
+    let target = nested
+        .request_shutdown()
+        .expect("the pre-admission shutdown targets the first epoch");
     assert!(root.take_control_events().is_empty());
     root.set_admitted_children(
         plan.children
@@ -26,8 +28,105 @@ fn pre_admission_restart_shutdown_is_published_when_the_scope_gets_a_parent() {
         root.take_control_events(),
         vec![ScopeControlEvent::RestartShutdown {
             membership: nested.member.membership(),
+            target,
         }]
     );
+}
+
+#[crate::runtime::test]
+async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnation() {
+    let mut tree = Tree::new();
+    tree.add_subtree(
+        "nested",
+        SubtreeDef::factory(pending_tree).restart(RestartPolicy::new(
+            RestartCondition::Always,
+            Backoff::fixed(Duration::from_secs(60), crate::Jitter::None)
+                .expect("non-zero restart backoff"),
+        )),
+    )
+    .expect("valid subtree");
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let nested = Arc::clone(
+        plan.children[0]
+            .slot
+            .scope
+            .as_ref()
+            .expect("nested scope cell"),
+    );
+    let target = nested
+        .request_shutdown()
+        .expect("the pre-admission shutdown targets the first epoch");
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let mut children = ChildArena::default();
+    let key = children
+        .insert(child)
+        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_lifecycle(ScopeLifecycle::running())
+        .with_children(children)
+        .build();
+    plan.armed = false;
+    drop(plan);
+
+    scope.spawn_child(key);
+    let first = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the first incarnation is active")
+        .incarnation;
+    assert_eq!(
+        nested.begin_incarnation(ScopeState::Starting),
+        Some(target),
+        "the first nested incarnation claims the pre-admission target"
+    );
+    assert!(nested.take_shutdown_request(target));
+    let event = root
+        .take_control_events()
+        .pop()
+        .expect("parent adoption publishes the pre-admission request");
+    let Some((_, Pending::RestartShutdown { child, target })) = scope.control_event_work(event)
+    else {
+        panic!("the control event resolves to restart-shutdown work");
+    };
+    assert_eq!(child, key);
+    scope.expedite_restart_shutdown(child, target);
+    nested.finish_incarnation(target, StopReason::ShutdownRequested);
+    scope.children[key]
+        .active
+        .as_ref()
+        .expect("the first incarnation is active")
+        .abort_handle
+        .abort();
+
+    scope.handle_exit(
+        key,
+        first,
+        Some(RecordedOutcome::returned(Err(ExitError::message(
+            "restart the nested scope",
+        )))),
+        crate::runtime::JoinOutcome::Ok { value: () },
+        Cancellation::NotObserved,
+        false,
+    );
+
+    assert!(
+        scope.children[key].active.is_none(),
+        "the consumed request must not bypass the following incarnation's backoff"
+    );
+    assert!(scope.children[key].restart_deadline.is_some());
 }
 
 #[crate::runtime::test]
@@ -68,15 +167,23 @@ async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_become
     plan.armed = false;
     drop(plan);
 
+    let target = scope.children[key]
+        .slot
+        .scope
+        .as_ref()
+        .expect("nested scope cell")
+        .request_shutdown()
+        .expect("the shutdown targets the pending nested incarnation");
     scope.spawn_child(key);
     let first = scope.children[key]
         .active
         .as_ref()
         .expect("the first incarnation is active")
         .incarnation;
-    scope.expedite_restart_shutdown(key);
-    assert!(
+    scope.expedite_restart_shutdown(key, target);
+    assert_eq!(
         scope.children[key].restart_shutdown_pending,
+        Some(target),
         "the early event remains owned until the active incarnation exits"
     );
     scope.children[key]
@@ -103,7 +210,7 @@ async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_become
         .expect("the retained event starts the next incarnation immediately");
     assert_ne!(restarted.incarnation, first);
     assert!(scope.children[key].restart_deadline.is_none());
-    assert!(!scope.children[key].restart_shutdown_pending);
+    assert!(scope.children[key].restart_shutdown_pending.is_none());
 }
 
 #[crate::runtime::test]
@@ -172,20 +279,29 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         },
         None,
     );
-    let _ = scope.children[nested]
+    let target = scope.children[nested]
         .slot
         .scope
         .as_ref()
         .expect("nested scope cell")
-        .request_shutdown();
+        .request_shutdown()
+        .expect("the shutdown targets the pending nested incarnation");
     let event = root
         .take_control_events()
         .pop()
         .expect("the request publishes one subject-carrying control event");
-    let Some((_, Pending::RestartShutdown(subject))) = scope.control_event_work(event) else {
+    let Some((
+        _,
+        Pending::RestartShutdown {
+            child: subject,
+            target: event_target,
+        },
+    )) = scope.control_event_work(event)
+    else {
         panic!("the control event resolves to restart-shutdown work");
     };
     assert_eq!(subject, nested);
+    assert_eq!(event_target, target);
 
     scope.spawn_child(trip);
     let incarnation = scope.children[trip]
@@ -210,13 +326,15 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         readiness_signal_seen: false,
     });
     let mut pending = [
-        restart_shutdown_work(nested),
+        restart_shutdown_work(nested, target),
         Pending::Driver(exit).classified(),
     ];
     arbitrate(&mut pending);
     for (_, event) in pending {
         match event {
-            Pending::RestartShutdown(child) => scope.expedite_restart_shutdown(child),
+            Pending::RestartShutdown { child, target } => {
+                scope.expedite_restart_shutdown(child, target);
+            }
             Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
                 child,
                 incarnation,

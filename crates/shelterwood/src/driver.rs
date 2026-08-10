@@ -959,9 +959,12 @@ impl ScopeRuntime {
         else {
             return;
         };
-        if !member.record().removing {
-            self.root
-                .transition_child(&member, |record| record.removing = true, None);
+        if member.record().membership_status != MembershipStatus::Removing {
+            self.root.transition_child(
+                &member,
+                |record| record.membership_status = MembershipStatus::Removing,
+                None,
+            );
         }
     }
 
@@ -1666,7 +1669,7 @@ impl ScopeRuntime {
         );
 
         // Fused cancellation is a level-triggered source. It can linearize
-        // before the forwarded Removal event or its public `removing`
+        // before the forwarded Removal event or its public status projection
         // projection reaches this driver, so exit dispatch must consult the
         // removal sources directly before charging or publishing a restart.
         // Only removal sources classify the membership here: a latched but
@@ -2160,7 +2163,7 @@ impl ScopeRuntime {
         // `RemovalRequest` for the same membership, and `mark_removing`
         // deliberately re-succeeds on an already-Removing entry, so a second
         // delivery reaches this point. Every step below is idempotent:
-        // `publish_dynamic_removal` is guarded by the record's `removing`
+        // `publish_dynamic_removal` is guarded by the record's status
         // flag, `begin_stop_child` by its ladder/disposal guards, and
         // `finalize_removal` removes the entry it matched.
         self.publish_dynamic_removal(key);

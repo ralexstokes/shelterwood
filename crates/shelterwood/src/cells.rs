@@ -96,7 +96,7 @@ pub(crate) struct MemberRecord {
     pub(crate) last_exit: Option<Exit>,
     pub(crate) restart_count: RestartCount,
     pub(crate) restart_at: Option<Instant>,
-    pub(crate) removing: bool,
+    pub(crate) membership_status: MembershipStatus,
     pub(crate) startup_aborted: bool,
 }
 
@@ -152,7 +152,7 @@ impl MemberCell {
             last_exit: None,
             restart_count: RestartCount::ZERO,
             restart_at: None,
-            removing: false,
+            membership_status: MembershipStatus::Active,
             startup_aborted: false,
         });
         Arc::new(Self {
@@ -1151,11 +1151,7 @@ impl ScopeCell {
                 MemberStage::Terminal(exit) => ChildState::Stopped { exit },
             },
             last_exit: record.last_exit,
-            membership_status: if record.removing {
-                MembershipStatus::Removing
-            } else {
-                MembershipStatus::Active
-            },
+            membership_status: record.membership_status,
             restart_count: record.restart_count,
             restart_policy: options.restart,
             retention: options.retention,

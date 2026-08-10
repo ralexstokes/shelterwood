@@ -1670,7 +1670,7 @@ impl ScopeRuntime {
 
         // Fused cancellation is a level-triggered source. It can linearize
         // before the forwarded Removal event or its public status projection
-        // projection reaches this driver, so exit dispatch must consult the
+        // reaches this driver, so exit dispatch must consult the
         // removal sources directly before charging or publishing a restart.
         // Only removal sources classify the membership here: a latched but
         // unprocessed scope stop (shutdown request or ancestor latch) must

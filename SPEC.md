@@ -385,6 +385,18 @@ Consequences (normative):
   `ScopeState` event (B.6, B.4) — before its streams close, so
   `wait_stopped()` (B.9) and snapshot/lifecycle subscribers resolve
   structurally, never merely by stream closure.
+- When a mailbox is attached at terminal publication, publication has one
+  precise internal order: store the terminal cell record, synchronously
+  discharge parked mailbox operations, then pulse the cell's single change
+  signal. A direct or reentrant borrow MAY therefore observe the terminal
+  record while mailbox discharge is still in progress; the guarantee is
+  **discharge-before-pulse**, not discharge-before-store. If terminality wins
+  before attachment, it stores and pulses first; later attachment immediately
+  closes and discharges the mailbox without a second terminal pulse. A panic
+  collected while waking mailbox operations MUST be resumed only after the
+  complete parent snapshot/lifecycle publication and nested observation-close
+  transaction, so a hostile mailbox waker cannot strand membership waiters or
+  skip the matching terminal observation edges.
 - Declaration is O(n): no re-projection of the full child list on every
   builder mutation; no shadow runtime object maintained during declaration;
   no global counters joining side tables [#367]. Pre-spawn snapshots, if
@@ -796,6 +808,18 @@ it), and none between mailbox messages and timer or offload deliveries
 beyond §5.2's loop priority. Conflating mailboxes order by replacement:
 the survivor is the newest accepted value.
 
+**Destruction venue.** Live `latest()` displacement drops the displaced
+payload inline on the displacing task, after acceptance of its replacement
+is visible. This is the deliberate hot-path exception: a panicking foreign
+payload destructor surfaces on that task even though the replacement remains
+accepted. Framework-initiated disposal of externally submitted mailbox or
+reply-bearing payloads — including mailbox teardown, timeout/withdrawal
+cleanup, and accepted-prefix batch disposal — runs detached from the
+initiating task with per-element panic containment. Incarnation-owned
+continuations, timer messages, and offload state instead follow §5.5 and §7's
+incarnation teardown and verdict rules. No single disposal-thread identity is
+promised.
+
 Request/reply on a conflating mailbox is a correctness trap (a barrier can
 be conflated away). A static fence is not possible — mailbox kind is
 per-declaration configuration, invisible in `ActorRef<M>`'s type — so the
@@ -829,25 +853,32 @@ applying between successive continuations. Timers whose deadlines fire
 at the same instant deliver in **arming order** — the order their
 *current* armings were established; re-arming a key (§5.3's
 replacement) takes the new position — and the bounded retraction turn
-below runs once for the whole simultaneous batch: messages queued at
-the fire instant deliver first, then the still-armed members of the
-batch in arming order. Within class 3, ordering between mailbox and
+below runs once for the whole simultaneous batch: work captured in the
+batch's bounded source prefixes delivers first, then the still-armed members
+of the batch in arming order. Within class 3, ordering between mailbox and
 offload deliveries stays deliberately unspecified (§5.1's ordering
 contract promises per-sender FIFO and nothing more).
 
+For this ordering rule, a timer **fires** when the event loop observes due
+armings and begins taking their timer batch, not merely when the wall clock
+passes the timer's deadline. Batch formation records a bounded prefix of each
+input source — continuations, mailbox acceptances, and offload completions —
+at that source's own cutoff. The sources do not share a global linearization
+point: work arriving concurrently with batch formation may land on either side
+of its source cutoff, and class 3 promises no ordering across sources.
+
 Already-queued messages get one bounded turn to retract an elapsed timer:
-when a timer fires, the messages queued *at that instant* are delivered
-first (they may `clear_timer` the fired key), then the timer message goes
-through if still armed.
+when a timer fires, messages captured by the batch's mailbox prefix are
+delivered first (they may `clear_timer` the fired key), then the timer message
+goes through if still armed.
 
 Timers rank last deliberately; the asymmetry is the rationale. A timer's
-lateness under this order is bounded: once a timer fires, only work already
-queued *at that instant* — queued messages (capped by mailbox capacity),
-offload completions already delivered to the loop (an offload still in
-flight holds nothing back: its completion arrives after the fire instant
-and waits behind the timer), and already-scheduled continuations — runs
-before it; work arriving or scheduled *after* the fire instant,
-continuations included, does not preempt the fired timer. The continuation
+lateness under this order is bounded: once a timer fires, only each source's
+captured prefix — queued messages (capped by mailbox capacity), offload
+completions through the recorded offload watermark, and continuations through
+the recorded queue length — runs before it. An offload still in flight holds
+nothing back; work arriving after its source cutoff, continuations included,
+does not preempt the fired timer. The continuation
 clause is load-bearing — continuations are self-replenishing, so without it
 a continuation chain could starve a fired timer forever despite the
 per-continuation fairness turn above. The reverse order is unbounded: timers are
@@ -864,10 +895,15 @@ skip-missed-ticks posture already accepts bounded lateness as the timer
 contract.
 
 On stop (supervisor shutdown, removal, readiness-timeout teardown, or
-local `ctx.stop()`): close
-external intake to freeze the accepted prefix; drain or drop that prefix
-per the mailbox shutdown policy (`Drain` delivers it, `Discard` drops
-it — §10; handlers observe draining state); then `on_stop`.
+local `ctx.stop()`), close external intake to freeze the accepted prefix; then
+follow the mailbox shutdown policy (§10; handlers observe draining state).
+For `Drain`, the actor loop delivers the frozen prefix before `on_stop`. For
+`Discard`, freezing makes the prefix permanently undeliverable and the actor
+loop returns without draining, then runs `on_stop`; the framework extracts and
+schedules the prefix for §5.1's detached, per-element disposal after the actor
+run returns. Physical destruction is not ordered before `on_stop` or exit
+publication. A payload-destructor panic there is a disposal fault: it MUST NOT
+reclassify the actor's exit or skip `on_stop`.
 The stop boundary is exact about what drains: **only the frozen accepted
 mailbox prefix** — under `queue`, every accepted-but-undelivered message
 at the freeze, in acceptance order; under `latest()`, the surviving slot
@@ -1107,9 +1143,14 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   a **nested** scope, the scope rolls itself back and exits as an
   ordinary child failure carrying the structured startup-failure payload
   (§11's nested rule). Readiness reported exactly at the deadline wins
-  over the timeout. Nested scopes report ready recursively once their
-  initial children are up. `spawn()` stays synchronous; `wait_started()`
-  is the readiness barrier.
+  over the timeout. A readiness signal fired before an exit or clean
+  self-stop is observed MUST count for startup accounting even when event
+  arbitration processes the terminal edge first. In particular,
+  ready-then-failed is a post-ready failure: restart policy applies and
+  startup advances exactly as it would if the readiness event had been
+  delivered first. Nested scopes report ready recursively once their initial
+  children are up. `spawn()` stays synchronous; `wait_started()` is the
+  readiness barrier.
 - **Dynamic scopes start their initial members concurrently**, and their
   pre-ready failure rules are the concurrent restatement of the ordered
   ones, not a separate regime. A non-terminal pre-ready exit restarts
@@ -1249,7 +1290,9 @@ One classification, produced at one point, used by every consumer.
   observation is orthogonal and never competes. Concretely: a panic is
   never masked,
   wherever it lands (`run`, `on_stop` — superseding the run's outcome,
-  §4.1 — or a destructor, via the fallback report token); and a
+  §4.1 — or an incarnation-owned destructor, via the fallback report token;
+  §5.1's detached message-disposal faults are outside the incarnation
+  verdict); and a
   readiness-deadline expiry names the *cause* even when the teardown it
   triggers ends in a grace-expiry abort (the mechanism).
 - **`Aborted` genuinely competes with a recorded outcome, and the rule is
@@ -1829,9 +1872,17 @@ Resolution and mechanics:
   declaration named no kind); kind-matched deferral governs a
   *declaration's* unfinished capacity. The exact policy case, decided:
   a child declaring `queue` with deferred capacity under a scope
-  default of `latest()` gets `queue` at the library default capacity —
-  the scope default neither converts the declared kind nor supplies a
-  capacity across kinds.
+  default of `latest()`, with no enclosing `queue` default beyond it,
+  gets `queue` at the library default capacity — the scope default
+  neither converts the declared kind nor supplies a capacity across
+  kinds, and with no outer `queue` default the outward walk ends at
+  the library default. For the full outward walk, suppose the root
+  defaults to `queue(10)`, an inheriting child scope defaults to
+  `latest()`, and an inheriting grandchild scope contains an actor declared
+  with `queue_inherit()`: that actor resolves to `queue(10)`, because the
+  intervening `latest()` is passed over when resolving queue capacity. If
+  the grandchild edge is `Reset` instead, the same declaration resolves to
+  the library `queue(64)`; the reset severs the root's contribution.
 - Validation is eager: any configuration that would fail spawn fails at the
   point of declaration where it is decidable — duplicate/empty ids at add
   time, zero capacities at construction, zero backoff durations at
@@ -1926,7 +1977,9 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   freeze itself is unconditional and engine-enforced — new sends are
   rejected under either policy — so there is no separate "reject-new"
   variant. `Drain` delivers the frozen prefix before `on_stop`;
-  `Discard` drops it. The blanket handler loop honors the policy itself;
+  `Discard` drops it — where and on what task per §5.1's destruction-venue
+  clause, with disposal faults outside the exit verdict (§7). The blanket
+  handler loop honors the policy itself;
   for a raw actor the framework enforces only the freeze — the loop owns
   delivery, so honoring the policy is the raw loop's documented
   obligation, using `RawContext`'s resolved-policy accessor and the
@@ -2364,9 +2417,11 @@ integration toolkit for the driver shell and the end-to-end invariants.
    and a shared order log; assert the later sibling never appears until
    release. Deadline expiry under virtual time yields the *typed* readiness
    verdict carrying the deadline. Edge tests: ready-at-deadline beats
-   timeout; shutdown disarms a pending deadline; a *terminal* pre-ready
-   exit aborts startup while an eligible restart re-runs the gate with a
-   fresh per-incarnation deadline (§6) — on abort the never-started
+   timeout; readiness fired before an immediate clean exit, failure, or
+   self-stop counts before that terminal edge; shutdown disarms a pending
+   deadline; a *terminal* pre-ready exit aborts startup while an eligible
+   restart re-runs the gate with a fresh per-incarnation deadline (§6) — on
+   abort the never-started
    siblings terminalize `NeverStarted`; at the root the started prefix
    stays running, while in a nested scope assert the automatic rollback
    and the structured startup-failure exit at the parent (§11).
@@ -2564,7 +2619,10 @@ Both questions are resolved:
    and its intensity charge. A readiness signal precedes its deadline, so
    ready-at-deadline wins. Child exits precede both, making an incarnation
    that has already ended in the same wake an exit rather than a spurious
-   readiness edge. Backoff work follows all newly observed terminal facts,
+   readiness edge. Exit handling nevertheless consults the incarnation's
+   retained readiness latch: a signal causally fired before that exit is
+   accounted before the exit is classified, without reordering the event
+   classes themselves. Backoff work follows all newly observed terminal facts,
    and ladder deadlines follow because the earlier facts can complete or
    disarm them. Queued admissions run after all already-observed terminal and
    temporal facts, so they cannot enter a scope that the same wake has made
@@ -2897,7 +2955,7 @@ marked *(II)* ship with the named Part II feature.
 | Bounded mailbox capacity | **64** messages | Scope-overridable; per-child overridable; zero rejected at construction |
 | `latest()` slot | **1** | Structural, not configurable |
 | `latest_by_key` capacity *(II §16)* | defers to scope/library mailbox default | Full key set evicts oldest key |
-| Mailbox shutdown policy | **Drain** | Two variants: `Drain` delivers the frozen prefix, `Discard` drops it; the intake freeze is unconditional either way (§5.2, §10) |
+| Mailbox shutdown policy | **Drain** | Two variants: `Drain` delivers the frozen prefix, `Discard` drops it (destruction venue per §5.1; disposal faults per §7); the intake freeze is unconditional either way (§5.2, §10) |
 | Child shutdown policy | **`Graceful { grace: 5 s }`** | `Abort` opt-in |
 | Tidy-abort beat | **`grace / 10`, clamped to [1 ms, 10 ms]** | §10 |
 | Restart condition | **`OnFailure`** | Failure = any non-`Completed` exit (§7) |

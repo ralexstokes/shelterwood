@@ -622,6 +622,91 @@ impl Latch {
     }
 }
 
+const COMPLETION_GATE_OPEN: u8 = 0;
+const COMPLETION_GATE_FIRED: u8 = 1;
+const COMPLETION_GATE_CLOSED: u8 = 2;
+const COMPLETION_GATE_CLOSED_FIRED: u8 = 3;
+
+/// A one-shot signal whose publication is linearized with a completion edge.
+///
+/// `fire` wins only while the gate is open. `complete` atomically closes the
+/// gate and reports whether the signal won first, so a capability retained by
+/// another task cannot publish after completion or disappear between a sample
+/// and the completion notification.
+#[derive(Clone, Debug)]
+pub(crate) struct CompletionGatedLatch {
+    state: Arc<AtomicU8>,
+    fired: Latch,
+    completed: Latch,
+}
+
+impl Default for CompletionGatedLatch {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(COMPLETION_GATE_OPEN)),
+            fired: Latch::default(),
+            completed: Latch::default(),
+        }
+    }
+}
+
+impl CompletionGatedLatch {
+    pub(crate) fn fire(&self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                COMPLETION_GATE_OPEN,
+                COMPLETION_GATE_FIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        let transitioned = self.fired.fire();
+        debug_assert!(transitioned);
+        true
+    }
+
+    pub(crate) fn is_fired(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            COMPLETION_GATE_FIRED | COMPLETION_GATE_CLOSED_FIRED
+        )
+    }
+
+    pub(crate) async fn fired(&self) {
+        self.fired.fired().await;
+    }
+
+    pub(crate) fn complete(&self) -> bool {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            let (next, fired) = match current {
+                COMPLETION_GATE_OPEN => (COMPLETION_GATE_CLOSED, false),
+                COMPLETION_GATE_FIRED => (COMPLETION_GATE_CLOSED_FIRED, true),
+                COMPLETION_GATE_CLOSED => return false,
+                COMPLETION_GATE_CLOSED_FIRED => return true,
+                _ => unreachable!("completion-gated latch state is valid"),
+            };
+            if self
+                .state
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let transitioned = self.completed.fire();
+                debug_assert!(transitioned);
+                return fired;
+            }
+        }
+    }
+
+    pub(crate) async fn completed(&self) {
+        self.completed.fired().await;
+    }
+}
+
 const ONESHOT_OPEN: u8 = 0;
 const ONESHOT_SENDING: u8 = 1;
 const ONESHOT_SENT: u8 = 2;
@@ -1303,8 +1388,9 @@ mod tests {
     };
 
     use super::{
-        DisposalJob, DisposalPanic, JoinOutcome, Latch, MAX_TIMER_SLICE, OneShotClose, Signal,
-        Timeout, discard_panic, join, next_timer_deadline, oneshot, spawn, timeout, yield_now,
+        CompletionGatedLatch, DisposalJob, DisposalPanic, JoinOutcome, Latch, MAX_TIMER_SLICE,
+        OneShotClose, Signal, Timeout, discard_panic, join, next_timer_deadline, oneshot, spawn,
+        timeout, yield_now,
     };
 
     fn latest_representable(started_at: std::time::Instant) -> std::time::Instant {
@@ -1523,6 +1609,49 @@ mod tests {
         assert_eq!(transitions, 1);
         assert!(latch.is_fired());
         assert!(!latch.fire());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completion_gated_fire_and_completion_choose_one_order() {
+        for _ in 0..256 {
+            let latch = CompletionGatedLatch::default();
+            let started = Arc::new(AtomicUsize::new(0));
+            let fire = spawn({
+                let latch = latch.clone();
+                let started = Arc::clone(&started);
+                async move {
+                    started.fetch_add(1, Ordering::AcqRel);
+                    while started.load(Ordering::Acquire) != 2 {
+                        yield_now().await;
+                    }
+                    latch.fire()
+                }
+            });
+            let complete = spawn({
+                let latch = latch.clone();
+                let started = Arc::clone(&started);
+                async move {
+                    started.fetch_add(1, Ordering::AcqRel);
+                    while started.load(Ordering::Acquire) != 2 {
+                        yield_now().await;
+                    }
+                    latch.complete()
+                }
+            });
+
+            let JoinOutcome::Ok { value: fired } = join(fire).await else {
+                panic!("signal task must complete normally");
+            };
+            let JoinOutcome::Ok {
+                value: completion_saw_fire,
+            } = join(complete).await
+            else {
+                panic!("completion task must complete normally");
+            };
+            assert_eq!(fired, completion_saw_fire);
+            assert_eq!(latch.is_fired(), completion_saw_fire);
+            assert!(!latch.fire(), "completion closes later publication");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

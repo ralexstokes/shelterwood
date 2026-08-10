@@ -21,9 +21,9 @@ use crate::{
     mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
     policy::{ChildMode, CommonOptions},
     runtime::{
-        self, ActorWork, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher,
-        UnwindPanics, catch_panic, discard_panic, keep_first_panic, resume_preferred_panic,
-        resume_preferred_panic_outside_unwind,
+        self, ActorWork, CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, Signal,
+        SignalWatcher, UnwindPanics, catch_panic, discard_panic, keep_first_panic,
+        resume_preferred_panic, resume_preferred_panic_outside_unwind,
     },
 };
 
@@ -851,7 +851,7 @@ pub struct RawContext<M> {
     scope: ScopeRef,
     shutdown: CancellationToken,
     abort: CancellationToken,
-    ready: Latch,
+    ready: CompletionGatedLatch,
     local_stop: Latch,
     readiness: Readiness,
     mailbox_shutdown: MailboxShutdown,
@@ -1386,6 +1386,11 @@ impl<M: Send + 'static> RawContext<M> {
         if armings.is_empty() {
             return;
         }
+        // The batch snapshots its own offload prefix. A steady-state credit
+        // captured by an earlier mailbox delivery is superseded here; keeping
+        // it would let completions created during this batch jump mailbox
+        // input accepted after the batch snapshot.
+        self.resources.offloads_lead = 0;
         self.resources.fired_batch = Some(FiredTimerBatch {
             armings,
             continuations_remaining: self.resources.continuations.len(),
@@ -1755,7 +1760,7 @@ pub(crate) struct RawRunContext {
     pub(crate) scope: ScopeRef,
     pub(crate) shutdown: Latch,
     pub(crate) abort: Latch,
-    pub(crate) ready: Latch,
+    pub(crate) ready: CompletionGatedLatch,
     pub(crate) local_stop: Latch,
     pub(crate) mailbox_shutdown: MailboxShutdown,
 }

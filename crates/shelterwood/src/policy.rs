@@ -1169,6 +1169,56 @@ mod tests {
     }
 
     #[test]
+    fn large_exponent_backoff_is_monotone_and_saturates_at_the_maximum() {
+        // Pins the §9.2 amendment (SPEC §4.6): in the large-exponent regime
+        // the derived delay is monotone nondecreasing in the attempt and
+        // plateaus exactly at the configured maximum, including across the
+        // `i32::MAX` exponent clamp and out to `RestartAttempt(u64::MAX)`.
+        let max = Duration::from_secs(3_600);
+        let backoff = Backoff::exponential(
+            Duration::from_millis(1),
+            BackoffFactor::new(1.5).expect("valid factor"),
+            max,
+            Jitter::None,
+        )
+        .expect("valid backoff");
+        let clamp = u64::try_from(i32::MAX).expect("i32::MAX fits in u64");
+        let attempts = [
+            1,
+            2,
+            16,
+            64,
+            256,
+            clamp - 1,
+            clamp,
+            clamp + 1,
+            clamp + 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let mut previous = Duration::ZERO;
+        for attempt in attempts {
+            let delay = backoff.next_delay(RestartAttempt(attempt), JitterSample::new(0.0));
+            assert!(
+                delay >= previous,
+                "attempt {attempt}: delay {delay:?} regressed below {previous:?}"
+            );
+            assert!(
+                delay <= max,
+                "attempt {attempt}: delay {delay:?} exceeds the maximum"
+            );
+            previous = delay;
+        }
+        for attempt in [clamp - 1, clamp, clamp + 1, u64::MAX - 1, u64::MAX] {
+            assert_eq!(
+                backoff.next_delay(RestartAttempt(attempt), JitterSample::new(0.0)),
+                max,
+                "attempt {attempt}: the astronomical-attempt plateau is the exact maximum"
+            );
+        }
+    }
+
+    #[test]
     fn zero_sample_equal_jitter_is_the_exact_half_delay() {
         // Half of an odd nanosecond count rounds up by exactly half a
         // nanosecond; the float path would land one nanosecond short.

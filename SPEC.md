@@ -125,8 +125,10 @@ below is a reachable escape hatch:
   the send flavors, `call`. The escape hatch — per principle 5 it ships with
   core, not after it.
 - **L3 — handler actor**: `Actor`/`init`/`handle`, keyed timers,
-  continuations, offloads. The "simple things easy" layer, implemented
-  entirely on L2's public surface.
+  continuations, offloads. The "simple things easy" layer. Its public
+  `Handler<A>` wrapper is the composition point for raw decorators and
+  encapsulates the callback loop's error-path freeze-and-join discipline;
+  decorators need no framework-internal teardown surface.
 - **L4 — observation**: snapshots and lifecycle events over L1's single
   publication path.
 
@@ -667,7 +669,15 @@ trait RawActor: Send + 'static {
   on the same context and share its readiness, stop state, timers, offloads,
   watches, and identity; the context cannot escape into work that outlives
   the run.
-- Everything the blanket loop uses is public (§1 principle 5).
+- The framework invokes `run` at most once on an incarnation's root raw-actor
+  value and never re-enters `run` on that value. Shutdown may destroy a root
+  value before its run begins; a restart that reaches construction obtains a
+  fresh root value from the definition's source.
+- `Handler<A>` is the public composition point that encapsulates the generated
+  callback loop, including its error-path freeze-and-join discipline.
+  Decorators wrap `Handler<A>` through the public raw-actor surface; they do
+  not perform that discipline themselves and need no access to the
+  framework-internal resource operations that implement it.
 - Raw actors have their own construction path — §8's `define_raw` /
   `define_once_raw` on `ActorSlot`, with fused `add_raw` / `add_raw_once`
   entry points on both scope flavors. There is no `init`/`Args` phase at
@@ -1772,8 +1782,14 @@ Two separated concerns:
   exact configured `max` (never an overflow panic); jitter maps the
   pre-drawn `JitterSample` as `delay = d/2 + sample × d/2`,
   rounded the same way — a zero sample yields the exact half,
-  half-nanosecond remainders rounding up with no float round-trip. The
-  attempt counter is per
+  half-nanosecond remainders rounding up with no float round-trip. This exact
+  exponentiation contract covers attempts operationally reachable by a
+  running membership; the opaque counter's full `u64` domain exists for
+  totality, not as a promise that synthetic multi-billion-attempt inputs use
+  an unbounded exponent representation. Beyond the implementation's supported
+  exponent domain, `next_delay` remains total, nondecreasing for a fixed
+  sample, and bounded by `max`; it may saturate the exponent and plateau rather
+  than evaluate `factor^(n-1)` exactly. The attempt counter is per
   membership: `n = 1` on the first scheduled restart, incremented per
   scheduled restart — a restart scheduled and then cancelled by teardown
   still advanced it, mirroring the intensity charge below — and reset by

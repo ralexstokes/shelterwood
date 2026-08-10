@@ -113,6 +113,16 @@ expect_case layering-nested-crate-root-glob-below check-layering-paths.sh \
   "glob imports of the crate root found below the driver layer:"
 expect_case layering-nested-crate-root-alias-below check-layering-paths.sh \
   "crate-root aliases found below the driver layer:"
+expect_case layering-nested-group-tree-root-reexport-below check-layering-paths.sh \
+  "upward tree root re-exports found below the driver layer:"
+expect_case layering-nested-group-crate-root-glob-below check-layering-paths.sh \
+  "glob imports of the crate root found below the driver layer:"
+expect_case layering-nested-group-crate-root-alias-below check-layering-paths.sh \
+  "crate-root aliases found below the driver layer:"
+expect_case layering-grouped-super-tree-root-reexport-below check-layering-paths.sh \
+  "upward tree root re-exports found below the driver layer:"
+expect_case layering-grouped-super-crate-root-glob-below check-layering-paths.sh \
+  "glob imports of the crate root found below the driver layer:"
 expect_case layering-crate-root-grouped-alias-below check-layering-paths.sh \
   "crate-root aliases found below the driver layer:"
 expect_case layering-crate-root-glob-alias-below check-layering-paths.sh \
@@ -131,6 +141,14 @@ expect_case layering-lib-commented-tree-group-reexport-below check-layering-path
   "upward tree root re-exports found below the driver layer:"
 expect_case layering-lib-chained-tree-reexport-below check-layering-paths.sh \
   "upward tree root re-exports found below the driver layer:"
+expect_case layering-lib-crate-root-alias-reexport-below check-layering-paths.sh \
+  "upward tree root re-exports found below the driver layer:"
+expect_case layering-lib-crate-root-glob-fails-closed check-layering-paths.sh \
+  "crate-root glob imports cannot be derived safely"
+expect_case layering-lib-nested-reexport-fails-closed check-layering-paths.sh \
+  "nested use items cannot participate in the crate-root derivation"
+expect_case layering-lib-tree-type-alias-fails-closed check-layering-paths.sh \
+  "crate-root type aliases over tree exports cannot be derived"
 expect_case layering-lib-tree-glob-fails-closed check-layering-paths.sh \
   "tree glob imports cannot be derived safely"
 expect_case layering-lib-tree-alias-glob-fails-closed check-layering-paths.sh \

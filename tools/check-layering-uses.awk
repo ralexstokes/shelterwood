@@ -213,6 +213,13 @@ function last_path_segment(path, count, parts) {
 }
 
 function record_import_binding(path, alias, index_, normalized, binding, parent, key) {
+  # In lower mode the parsed use-tree items are inspected for crate-root
+  # violations instead of contributing to the lib.rs export derivation.
+  if (mode == "lower") {
+    inspect_lower_use_item(path, 0, index_)
+    return
+  }
+
   normalized = normalized_path(path)
   if (alias == "_") {
     return
@@ -242,6 +249,11 @@ function record_import_binding(path, alias, index_, normalized, binding, parent,
 }
 
 function record_import_glob(path, index_, normalized, key) {
+  if (mode == "lower") {
+    inspect_lower_use_item(path, 1, index_)
+    return
+  }
+
   normalized = normalized_path(path)
   key = normalized SUBSEP index_
   if (!import_globs_seen[key]) {
@@ -252,19 +264,38 @@ function record_import_glob(path, index_, normalized, key) {
   }
 }
 
-function path_is_tree_derived(path, count, parts) {
+function path_is_crate_root(path, count, parts) {
   count = split(path, parts, "/")
-  return parts[1] == "tree" || (parts[1] in tree_bindings)
+  return count == 1 \
+    && (parts[1] == "crate" || parts[1] == "self" || (parts[1] in root_bindings))
+}
+
+function path_is_tree_derived(path, count, parts, first) {
+  count = split(path, parts, "/")
+  first = parts[1]
+  # A crate-root alias re-roots the path one segment later: after
+  # `use crate as root`, the path `root::tree::X` means `crate::tree::X`.
+  if (first in root_bindings) {
+    first = parts[2]
+  }
+  return first == "tree" || (first in tree_bindings)
 }
 
 function resolve_tree_bindings(index_, changed, binding) {
   # Rust item order is irrelevant, so resolve aliases to a fixed point rather
   # than depending on the order of the crate-root use statements. This covers
-  # chains such as `tree::System as First` followed by `First as Second`.
+  # chains such as `tree::System as First` followed by `First as Second`, and
+  # crate-root aliases such as `use crate as root` followed by
+  # `root::tree::System as Third`.
   do {
     changed = 0
     for (index_ = 1; index_ <= import_binding_count; index_++) {
       binding = import_bindings[index_]
+      if (!(binding in root_bindings) \
+          && path_is_crate_root(import_paths[index_])) {
+        root_bindings[binding] = 1
+        changed = 1
+      }
       if (!(binding in tree_bindings) \
           && path_is_tree_derived(import_paths[index_])) {
         tree_bindings[binding] = 1
@@ -273,9 +304,16 @@ function resolve_tree_bindings(index_, changed, binding) {
     }
   } while (changed)
 
-  # A glob through a derived alias is just as opaque as `use tree::*`; fail
-  # closed once alias resolution has identified its tree-layer source.
   for (index_ = 1; index_ <= import_glob_count; index_++) {
+    # A glob of the crate root re-imports every root name, tree exports
+    # included, so the derivation cannot stay complete; fail closed.
+    if (path_is_crate_root(import_glob_paths[index_])) {
+      parse_error("crate-root glob imports cannot be derived safely", \
+        import_glob_indices[index_])
+      return
+    }
+    # A glob through a derived alias is just as opaque as `use tree::*`; fail
+    # closed once alias resolution has identified its tree-layer source.
     if (path_is_tree_derived(import_glob_paths[index_])) {
       parse_error("tree glob imports cannot be derived safely", \
         import_glob_indices[index_])
@@ -344,21 +382,56 @@ function parse_use_tree(position, prefix, segment, path, alias) {
 
 function derive_lib_bindings(index_, position, count, names, name) {
   for (index_ = 1; index_ <= token_count; index_++) {
-    if (tokens[index_] != "use" || brace_depth_at[index_] != 0) {
+    if (tokens[index_] == "use") {
+      # A use item inside a nested module (for example a future
+      # `pub mod prelude { pub use crate::tree::System; }`) can re-export a
+      # tree name the crate-root derivation would never see; fail closed.
+      if (brace_depth_at[index_] != 0) {
+        parse_error("nested use items cannot participate in the crate-root " \
+          "derivation", index_)
+        return
+      }
+      position = parse_use_tree(index_ + 1, "")
+      if (failed) {
+        return
+      }
+      if (tokens[position] != ";") {
+        parse_error("unsupported crate-root use statement", position)
+        return
+      }
+      index_ = position
       continue
     }
-    position = parse_use_tree(index_ + 1, "")
-    if (failed) {
-      return
+    # `extern crate self as name` is one more crate-root alias spelling; feed
+    # it into the fixed-point resolution like `use crate as name`.
+    if (tokens[index_] == "extern" && tokens[index_ + 1] == "crate" \
+        && tokens[index_ + 2] == "self" && tokens[index_ + 3] == "as" \
+        && is_identifier(tokens[index_ + 4])) {
+      record_import_binding("crate", tokens[index_ + 4], index_ + 4)
+      index_ += 4
+      continue
     }
-    if (tokens[position] != ";") {
-      parse_error("unsupported crate-root use statement", position)
-      return
+    # A crate-root type alias such as `pub type Renamed = tree::System;` is a
+    # re-export the use-tree derivation cannot see; record it for the
+    # post-resolution rejection below.
+    if (tokens[index_] == "type" && brace_depth_at[index_] == 0) {
+      type_alias_count++
+      type_alias_starts[type_alias_count] = index_
+      position = index_ + 1
+      while (position <= token_count && tokens[position] != ";") {
+        position++
+      }
+      type_alias_ends[type_alias_count] = position
+      index_ = position
     }
-    index_ = position
   }
 
   resolve_tree_bindings()
+  if (failed) {
+    return
+  }
+
+  reject_tree_type_aliases()
   if (failed) {
     return
   }
@@ -367,6 +440,20 @@ function derive_lib_bindings(index_, position, count, names, name) {
   for (index_ = 1; index_ <= count; index_++) {
     name = names[index_]
     print name
+  }
+}
+
+function reject_tree_type_aliases(index_, position, token_) {
+  for (index_ = 1; index_ <= type_alias_count; index_++) {
+    for (position = type_alias_starts[index_]; \
+         position <= type_alias_ends[index_]; position++) {
+      token_ = tokens[position]
+      if (token_ == "tree" || (token_ in tree_bindings)) {
+        parse_error("crate-root type aliases over tree exports cannot be " \
+          "derived", position)
+        return
+      }
+    }
   }
 }
 
@@ -401,48 +488,87 @@ function emit_finding(kind, index_, detail, key) {
   print kind "\t" token_lines[index_] "\t" detail
 }
 
-function inspect_root_group(position, origin, depth, item_start, token_) {
-  depth = 1
-  item_start = 1
-  for (position = position + 1; position <= token_count; position++) {
-    token_ = tokens[position]
-    if (token_ == "{") {
-      depth++
-      continue
+# Resolve one parsed use-tree path against the module depth of its use
+# statement. Returns 1 when the path reaches the crate root, leaving any
+# remaining segments in lower_root_rest. Parsing resolves each group item to
+# a full path first, so a `super` chain continued inside a nested group
+# (`use super::{super::System}`) counts like the flat spelling.
+function lower_path_reaches_root(path, count, parts, supers, cursor) {
+  count = split(path, parts, "/")
+  cursor = 1
+  if (parts[1] == "crate") {
+    cursor = 2
+  } else {
+    supers = 0
+    while (cursor <= count && parts[cursor] == "super") {
+      supers++
+      cursor++
     }
-    if (token_ == "}") {
-      depth--
-      if (depth == 0) {
-        return
-      }
-      continue
-    }
-    if (depth != 1) {
-      continue
-    }
-    if (token_ == ",") {
-      item_start = 1
-      continue
-    }
-    if (!item_start) {
-      continue
-    }
-
-    item_start = 0
-    if (token_ == "*") {
-      emit_finding("glob", origin, "crate-root glob import")
-    } else if (token_ == "self") {
-      emit_finding("alias", origin, "crate-root self import or alias")
-    } else if (token_ == "driver" || token_ == "tree") {
-      emit_finding("module", origin, "crate-root " token_ " import")
-    } else if (forbidden_names[token_]) {
-      emit_finding("export", origin, "crate-root tree export " token_)
+    # Fewer `super` segments than the module depth stays below the crate
+    # root. More than the depth cannot compile, so treat it as reaching the
+    # root and let the segment inspection fail closed.
+    if (supers == 0 || supers < lower_use_depth) {
+      return 0
     }
   }
-  parse_error("unterminated crate-root use group", origin)
+
+  lower_root_rest = ""
+  while (cursor <= count) {
+    lower_root_rest = append_path(lower_root_rest, parts[cursor])
+    cursor++
+  }
+  return 1
 }
 
-function inspect_root_path(index_, position, token_) {
+function inspect_lower_use_item(path, is_glob, index_, parts) {
+  if (!lower_path_reaches_root(path)) {
+    return
+  }
+  if (lower_root_rest == "") {
+    if (is_glob) {
+      emit_finding("glob", index_, "crate-root glob import")
+    } else {
+      emit_finding("alias", index_, "crate-root alias")
+    }
+    return
+  }
+
+  split(lower_root_rest, parts, "/")
+  if (parts[1] == "self") {
+    emit_finding("alias", index_, "crate-root self import or alias")
+  } else if (parts[1] == "driver" || parts[1] == "tree") {
+    emit_finding("module", index_, "crate-root " parts[1] " import")
+  } else if (forbidden_names[parts[1]]) {
+    emit_finding("export", index_, "crate-root tree export " parts[1])
+  }
+}
+
+function scan_lower_uses(index_, position, cursor) {
+  for (index_ = 1; index_ <= token_count; index_++) {
+    if (tokens[index_] != "use") {
+      continue
+    }
+    # A use statement cannot contain a module declaration, so its module
+    # depth is uniform; capture it for the per-item path resolution.
+    lower_use_depth = module_depth_at[index_]
+    position = parse_use_tree(index_ + 1, "")
+    if (failed) {
+      return
+    }
+    if (tokens[position] != ";") {
+      parse_error("unsupported use statement", position)
+      return
+    }
+    for (cursor = index_; cursor <= position; cursor++) {
+      in_use_statement[cursor] = 1
+    }
+    index_ = position
+  }
+}
+
+# Inspect a crate-root path outside a use statement: an expression, type
+# position, or cast such as `crate::System::new()`.
+function inspect_root_reference(index_, position, token_) {
   position = root_after
   if (tokens[position] == "as") {
     emit_finding("alias", index_, "crate-root alias")
@@ -455,7 +581,7 @@ function inspect_root_path(index_, position, token_) {
   position++
   token_ = tokens[position]
   if (token_ == "{") {
-    inspect_root_group(position, index_)
+    parse_error("crate-root use group outside a use statement", index_)
   } else if (token_ == "*") {
     emit_finding("glob", index_, "crate-root glob import")
   } else if (token_ == "driver" || token_ == "tree") {
@@ -473,14 +599,25 @@ function find_lower_violations(index_, names_count, names) {
     }
   }
 
+  # Use statements get the full recursive use-tree parse so nested groups
+  # and grouped `super` continuations resolve to complete per-item paths.
+  scan_lower_uses()
+  if (failed) {
+    return
+  }
+
+  # Everything else is scanned token-by-token for crate-root paths.
   for (index_ = 1; index_ <= token_count; index_++) {
+    if (in_use_statement[index_]) {
+      continue
+    }
     if (tokens[index_] == "extern" && tokens[index_ + 1] == "crate" \
         && tokens[index_ + 2] == "self" && tokens[index_ + 3] == "as" \
         && is_identifier(tokens[index_ + 4])) {
       emit_finding("alias", index_, "extern crate self alias")
     }
     if (root_path_at(index_, module_depth_at[index_])) {
-      inspect_root_path(index_)
+      inspect_root_reference(index_)
     }
   }
 }

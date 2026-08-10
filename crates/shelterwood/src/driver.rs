@@ -703,7 +703,7 @@ struct ChildTaskLaunch {
     key: ChildKey,
     incarnation: Incarnation,
     body: SpawnBody,
-    readiness_override: Option<Readiness>,
+    readiness: Option<Readiness>,
     watch_readiness: bool,
     shutdown: Latch,
     ready: CompletionGatedLatch,
@@ -750,7 +750,7 @@ fn dispatch_child_construction(
                 factory: Arc::clone(&definition.factory),
                 context: TaskContext::new(id, incarnation, latches.task_context()),
             },
-            declared_readiness: Some(child.options.readiness),
+            declared_readiness: child.options.readiness,
             construction_spent: false,
             scope_child: false,
         },
@@ -759,7 +759,7 @@ fn dispatch_child_construction(
                 body: definition.take_body(),
                 context: TaskContext::new(id, incarnation, latches.task_context()),
             },
-            declared_readiness: Some(child.options.readiness),
+            declared_readiness: child.options.readiness,
             construction_spent: true,
             scope_child: false,
         },
@@ -800,7 +800,7 @@ fn dispatch_child_construction(
             };
             SpawnDispatch {
                 body,
-                declared_readiness: Some(Readiness::Manual),
+                declared_readiness: child.options.readiness,
                 construction_spent,
                 scope_child: true,
             }
@@ -814,7 +814,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         key,
         incarnation,
         body,
-        readiness_override,
+        readiness,
         watch_readiness,
         shutdown,
         ready,
@@ -828,7 +828,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
             match body {
                 SpawnBody::Raw { spawn, context } => {
                     let instance = spawn.construct();
-                    let readiness = readiness_override.unwrap_or_else(|| instance.readiness());
+                    let readiness = readiness.unwrap_or_else(|| instance.readiness());
                     let _ = runtime::mpsc_send(
                         &constructed_sender,
                         DriverEvent::Child(ChildEvent::Constructed {
@@ -1142,7 +1142,7 @@ impl ScopeRuntime {
         });
         let gated = readiness.needs_signal_watch();
 
-        let child_readiness_override = child.options.readiness_override;
+        let child_readiness = child.options.readiness;
         if construction_spent {
             // One-shot actor/task/subtree state has moved into `body`; the
             // retained construction is now framework-only spent metadata.
@@ -1155,7 +1155,7 @@ impl ScopeRuntime {
             key,
             incarnation,
             body,
-            readiness_override: child_readiness_override,
+            readiness: child_readiness,
             watch_readiness: gated,
             shutdown: latches.shutdown.clone(),
             ready: latches.ready.clone(),

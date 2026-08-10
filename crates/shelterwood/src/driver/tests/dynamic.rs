@@ -343,6 +343,297 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     );
 }
 
+// Gate-free never-started terminalization (an `Admission` drop's annul) and
+// gated supervised terminalization (`terminalize_child`) are mutually
+// excluded per member by the reserved→resident transition: the annul decides
+// against `is_reserved` under the dynamic-state mutex, and promotion happens
+// under that same mutex before the member is admitted to residency. The three
+// tests below pin both serialization orders and the racing window between
+// them, so a competing terminalizer can never publish an exit that diverges
+// from the one the lifecycle stream carries.
+
+#[crate::runtime::test]
+async fn annulment_before_admission_owns_never_started_terminality() {
+    let (mut scope, _event_receiver, mut dynamic_event_receiver, _disposal_event_receiver, control) =
+        running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let mut lifecycle = root.subscribe_lifecycle();
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    let response = super::super::start_admission(
+        Arc::clone(&reservation.control),
+        Arc::clone(&reservation.slot),
+        None,
+    )
+    .expect("admission starts inside the runtime");
+    let Some(DriverEvent::Admission(request)) = dynamic_event_receiver.recv().await else {
+        panic!("admission enqueueing submits the request")
+    };
+
+    cancel_dynamic_reservation(reservation.control.as_ref(), &reservation.slot);
+    let annulled_stage = member.record().stage;
+    assert!(matches!(
+        &annulled_stage,
+        MemberStage::Terminal(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+    ));
+
+    scope.handle_admission(request);
+
+    assert!(matches!(
+        response.receive().await,
+        Some(Err(ReserveError::NotAdmitting(
+            crate::NotAdmittingCause::ReservationEnded
+        )))
+    ));
+    assert!(
+        scope.children.is_empty(),
+        "an annulled reservation is never admitted"
+    );
+    assert!(
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex remains healthy")
+            .entries
+            .is_empty()
+    );
+    assert_eq!(
+        member.record().stage,
+        annulled_stage,
+        "the driver's rejection cannot displace the annul's terminal exit"
+    );
+    assert!(root.snapshot().child("worker").is_none());
+    while let Ok(LifecycleItem::Event(event)) = lifecycle.try_recv() {
+        assert!(
+            !matches!(
+                event.kind,
+                LifecycleEventKind::Added { .. } | LifecycleEventKind::Exited { .. }
+            ),
+            "a never-resident member has no supervised lifecycle edges"
+        );
+    }
+}
+
+#[crate::runtime::test]
+async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
+    let (
+        mut scope,
+        mut event_receiver,
+        mut dynamic_event_receiver,
+        mut disposal_event_receiver,
+        control,
+    ) = running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let mut lifecycle = root.subscribe_lifecycle();
+    let started = Latch::default();
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new({
+            let started = started.clone();
+            move |context| {
+                let started = started.clone();
+                async move {
+                    started.fire();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        })));
+    let mut response = super::super::start_admission(
+        Arc::clone(&reservation.control),
+        Arc::clone(&reservation.slot),
+        None,
+    )
+    .expect("admission starts inside the runtime");
+    let Some(DriverEvent::Admission(request)) = dynamic_event_receiver.recv().await else {
+        panic!("admission enqueueing submits the request")
+    };
+    scope.handle_admission(request);
+    assert!(matches!(response.try_receive(), Some(Ok(()))));
+    assert!(matches!(
+        crate::runtime::timeout(Duration::from_secs(2), started.fired()).await,
+        crate::runtime::Timeout::Completed(())
+    ));
+
+    // The promoted entry is no longer reserved, so a late annul (a dropped
+    // `Admission` future racing its own completion) must not terminalize the
+    // now-supervised member.
+    cancel_dynamic_reservation(reservation.control.as_ref(), &reservation.slot);
+    assert!(
+        !matches!(member.record().stage, MemberStage::Terminal(_)),
+        "a late annul cannot compete with supervised terminalization"
+    );
+    assert!(
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex remains healthy")
+            .entries
+            .get(member.id())
+            .is_some_and(|entry| !entry.is_reserved()),
+        "the resident registration survives the inert annul"
+    );
+
+    let removal_response =
+        super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
+    let removal = match crate::runtime::timeout(
+        Duration::from_secs(2),
+        dynamic_event_receiver.recv(),
+    )
+    .await
+    {
+        crate::runtime::Timeout::Completed(Some(DriverEvent::Removal(removal))) => removal,
+        crate::runtime::Timeout::Completed(_) => panic!("the removal reaches the driver"),
+        crate::runtime::Timeout::Elapsed => panic!("the removal must reach the driver"),
+    };
+    scope.handle_removal(removal);
+    let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+        crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
+            child,
+            incarnation,
+            recorded,
+            join,
+            cancellation,
+            readiness_signal_seen,
+        }))) => (
+            child,
+            incarnation,
+            recorded,
+            join,
+            cancellation,
+            readiness_signal_seen,
+        ),
+        crate::runtime::Timeout::Completed(_) => panic!("the stopped child reports exit"),
+        crate::runtime::Timeout::Elapsed => panic!("the stopped child exit must arrive"),
+    };
+    scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);
+    let disposal =
+        match crate::runtime::timeout(Duration::from_secs(2), disposal_event_receiver.recv()).await
+        {
+            crate::runtime::Timeout::Completed(Some(event)) => event,
+            crate::runtime::Timeout::Completed(None) => panic!("the disposal lane remains open"),
+            crate::runtime::Timeout::Elapsed => panic!("retained construction disposal completes"),
+        };
+    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = disposal else {
+        panic!("the stop path reports retained construction disposal")
+    };
+    scope.handle_construction_disposed(child, panic);
+    assert_eq!(
+        removal_response.receive().await,
+        Some(RemoveOutcome::Removed)
+    );
+
+    // The adjudicated consistency property: the terminal record and the
+    // lifecycle stream publish the same exit, because supervision was the
+    // only terminalizer.
+    let MemberStage::Terminal(record_exit) = member.record().stage else {
+        panic!("the removed member publishes a terminal record");
+    };
+    let mut emitted_exit = None;
+    while let Ok(LifecycleItem::Event(event)) = lifecycle.try_recv() {
+        if let LifecycleEventKind::Exited { exit, .. } = event.kind {
+            assert!(
+                emitted_exit.replace(exit).is_none(),
+                "exactly one supervised exit is emitted"
+            );
+        }
+    }
+    assert_eq!(
+        emitted_exit.as_ref(),
+        Some(&record_exit),
+        "the lifecycle stream and the terminal record agree on the exit"
+    );
+}
+
+#[crate::runtime::test]
+async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
+    for _ in 0..64 {
+        let (
+            mut scope,
+            _event_receiver,
+            mut dynamic_event_receiver,
+            _disposal_event_receiver,
+            control,
+        ) = running_dynamic_fixture();
+        let root = Arc::clone(&scope.root);
+        let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+            .expect("running dynamic scope reserves the child");
+        let member = Arc::clone(&reservation.slot.member);
+        reservation
+            .slot
+            .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+        let response = super::super::start_admission(
+            Arc::clone(&reservation.control),
+            Arc::clone(&reservation.slot),
+            None,
+        )
+        .expect("admission starts inside the runtime");
+        let Some(DriverEvent::Admission(request)) = dynamic_event_receiver.recv().await else {
+            panic!("admission enqueueing submits the request")
+        };
+
+        let barrier = Arc::new(Barrier::new(2));
+        let annul = {
+            let barrier = Arc::clone(&barrier);
+            let annul_control = Arc::clone(&reservation.control);
+            let annul_slot = Arc::clone(&reservation.slot);
+            std::thread::spawn(move || {
+                barrier.wait();
+                cancel_dynamic_reservation(annul_control.as_ref(), &annul_slot);
+            })
+        };
+        barrier.wait();
+        scope.handle_admission(request);
+        annul.join().expect("the annul thread completes");
+
+        // Whichever side won the dynamic-state mutex, exactly one owner
+        // published terminality (or none, if the admission won): the record,
+        // the arena, and the control-plane entry always agree.
+        match response.receive().await {
+            Some(Ok(())) => {
+                assert!(
+                    !matches!(member.record().stage, MemberStage::Terminal(_)),
+                    "an admitted member is live; the losing annul is inert"
+                );
+                assert_eq!(scope.children.len(), 1);
+                assert!(
+                    control
+                        .state
+                        .lock()
+                        .expect("dynamic-state mutex remains healthy")
+                        .entries
+                        .get(member.id())
+                        .is_some_and(|entry| !entry.is_reserved())
+                );
+            }
+            Some(Err(ReserveError::NotAdmitting(crate::NotAdmittingCause::ReservationEnded))) => {
+                assert!(matches!(
+                    member.record().stage,
+                    MemberStage::Terminal(exit)
+                        if matches!(exit.kind(), ExitKind::NeverStarted)
+                ));
+                assert!(scope.children.is_empty());
+                assert!(
+                    control
+                        .state
+                        .lock()
+                        .expect("dynamic-state mutex remains healthy")
+                        .entries
+                        .is_empty()
+                );
+            }
+            other => panic!("the race admits exactly two outcomes, got {other:?}"),
+        }
+    }
+}
+
 #[crate::runtime::test]
 async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
     let (mut scope, _event_receiver, mut dynamic_event_receiver, _disposal_event_receiver, control) =

@@ -33,6 +33,14 @@ check_forbidden() {
   local forbidden="$2"
   shift 2
 
+  # With no paths `rg` falls back to scanning the working directory
+  # recursively, so an empty derived set would silently widen the check
+  # instead of failing it.
+  if (($# == 0)); then
+    echo "no files derived for check: $message" >&2
+    exit 1
+  fi
+
   local matches
   local status
   set +e

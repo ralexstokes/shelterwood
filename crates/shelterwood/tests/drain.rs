@@ -213,10 +213,21 @@ enum FaultMode {
     StopBlocking,
 }
 
-#[derive(Clone, Copy)]
 enum FaultMessage {
     Hold,
     Fault,
+    DiscardPanicking(DiscardPanicking),
+}
+
+struct DiscardPanicking {
+    dropped: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl Drop for DiscardPanicking {
+    fn drop(&mut self) {
+        let _ = self.dropped.send(());
+        panic!("discarded message destructor panic");
+    }
 }
 
 struct FaultArgs {
@@ -268,6 +279,13 @@ impl Actor for FaultActor {
                     FaultMode::Discard | FaultMode::StopPanic | FaultMode::StopBlocking => Ok(()),
                 }
             }
+            FaultMessage::DiscardPanicking(probe) => {
+                // This message is queued only behind `Hold`; reaching this
+                // arm means the frozen Discard prefix was incorrectly
+                // delivered instead of transferred to framework disposal.
+                drop(probe);
+                Ok(())
+            }
         }
     }
 
@@ -314,7 +332,7 @@ async fn run_fault_fixture(
     mode: FaultMode,
     mailbox_shutdown: MailboxShutdown,
     grace: Duration,
-    queue_fault: bool,
+    queued: Option<FaultMessage>,
 ) -> FaultOutcome {
     let hold_entered = ReleaseGate::default();
     let hold_release = ReleaseGate::default();
@@ -349,11 +367,11 @@ async fn run_fault_fixture(
         .await
         .expect("hold message is accepted");
     hold_entered.wait().await;
-    if queue_fault {
+    if let Some(message) = queued {
         actor
-            .send(FaultMessage::Fault)
+            .send(message)
             .await
-            .expect("fault message joins the accepted prefix");
+            .expect("message joins the accepted prefix");
     }
 
     let started_at = tokio::time::Instant::now();
@@ -391,11 +409,31 @@ async fn handler_discard_skips_the_prefix_and_still_runs_on_stop() {
         FaultMode::Discard,
         MailboxShutdown::Discard,
         Duration::from_secs(10),
-        true,
+        Some(FaultMessage::Fault),
     )
     .await;
     assert_eq!(outcome.drained, 0);
     assert!(outcome.stop_entered);
+    assert!(matches!(outcome.exit.kind(), ExitKind::Completed));
+    assert_eq!(outcome.exit.cancellation(), Cancellation::Observed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn handler_discard_contains_payload_panic_without_reclassifying_or_skipping_on_stop() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = run_fault_fixture(
+        FaultMode::Discard,
+        MailboxShutdown::Discard,
+        Duration::from_secs(10),
+        Some(FaultMessage::DiscardPanicking(DiscardPanicking { dropped })),
+    )
+    .await;
+
+    drops
+        .recv()
+        .await
+        .expect("the discarded payload destructor runs");
+    assert!(outcome.stop_entered, "discard must still reach on_stop");
     assert!(matches!(outcome.exit.kind(), ExitKind::Completed));
     assert_eq!(outcome.exit.cancellation(), Cancellation::Observed);
 }
@@ -406,7 +444,7 @@ async fn handler_drain_errors_and_panics_keep_their_authoritative_exit() {
         FaultMode::DrainError,
         MailboxShutdown::Drain,
         Duration::from_secs(10),
-        true,
+        Some(FaultMessage::Fault),
     )
     .await;
     assert!(matches!(
@@ -419,7 +457,7 @@ async fn handler_drain_errors_and_panics_keep_their_authoritative_exit() {
         FaultMode::DrainPanic,
         MailboxShutdown::Drain,
         Duration::from_secs(10),
-        true,
+        Some(FaultMessage::Fault),
     )
     .await;
     assert!(matches!(
@@ -435,7 +473,7 @@ async fn handler_on_stop_panic_is_contained_and_classified() {
         FaultMode::StopPanic,
         MailboxShutdown::Drain,
         Duration::from_secs(10),
-        false,
+        None,
     )
     .await;
     assert!(matches!(
@@ -450,7 +488,7 @@ async fn handler_drain_and_on_stop_share_one_grace_budget() {
         FaultMode::SharedGrace,
         MailboxShutdown::Drain,
         Duration::from_secs(10),
-        true,
+        Some(FaultMessage::Fault),
     )
     .await;
     assert_eq!(outcome.drained, 1);
@@ -474,7 +512,7 @@ async fn stop_context_run_blocking_returns_inside_cooperative_grace() {
         FaultMode::StopBlocking,
         MailboxShutdown::Drain,
         Duration::from_secs(1),
-        false,
+        None,
     )
     .await;
     assert_eq!(outcome.blocking_result, 73);

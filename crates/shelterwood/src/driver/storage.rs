@@ -50,7 +50,7 @@ impl<T> Drop for Obligation<T> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(super) struct ChildKey(u64);
+pub(super) struct ChildKey(pub(super) u64);
 
 pub(super) struct ChildArena<T> {
     // Keys are insertion-order ids and are never reused. A late event can
@@ -109,6 +109,14 @@ impl<T> ChildArena<T> {
         self.children
             .range((Bound::Excluded(key), Bound::Unbounded))
             .map(|(key, _)| *key)
+    }
+
+    pub(super) fn previous_key(&self, key: ChildKey) -> Option<ChildKey> {
+        self.children.range(..key).next_back().map(|(key, _)| *key)
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (ChildKey, &T)> {
+        self.children.iter().map(|(key, child)| (*key, child))
     }
 
     pub(super) fn values(&self) -> impl Iterator<Item = &T> {

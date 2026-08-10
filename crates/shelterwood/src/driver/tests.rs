@@ -3064,7 +3064,7 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
 }
 
 #[crate::runtime::test]
-async fn fused_removal_overtaking_admission_rejects_before_conversion() {
+async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
     let (mut scope, mut event_receiver, _disposal_event_receiver, control) =
         running_dynamic_fixture(8);
     let root = Arc::clone(&scope.root);
@@ -3085,27 +3085,20 @@ async fn fused_removal_overtaking_admission_rejects_before_conversion() {
         panic!("the admission forwarder submits the request")
     };
 
-    // The driver hook supplies the exact arbitration order under test:
-    // fused cancellation has linearized, then its Removal is observed
-    // before the already-queued Admission. A reserved entry has no arena
-    // key yet, so the overtaking Removal is deliberately a no-op; the
-    // fired latch remains the authoritative rejection evidence.
+    // Fused cancellation linearizes after Admission is queued but before
+    // the driver handles it. A reserved entry has no arena key, so
+    // `signal_fused_cancel` cannot queue a Removal for this membership;
+    // the fired latch is the authoritative rejection evidence until the
+    // queued Admission reaches the driver.
     super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
-    let removal = RemovalRequest {
-        membership: member.membership(),
-        key: ChildKey(1),
-    };
-    scope
-        .events
-        .try_send(DriverEvent::Removal(removal))
-        .expect("the test hook queues the overtaking removal");
-    let Some(DriverEvent::Removal(removal)) = event_receiver.recv().await else {
-        panic!("the injected removal overtakes admission")
-    };
-    scope.handle_removal(removal);
+    assert!(fused_cancel.is_fired());
+    assert!(
+        crate::runtime::mpsc_try_recv(&mut event_receiver).is_none(),
+        "a reserved membership cannot emit a key-addressed Removal"
+    );
 
     // If handle_admission loses its first latch re-check, conversion now
-    // reaches this poisoned identity mutex and unwinds before the second
+    // reaches this poisoned identity mutex and unwinds before the later
     // under-lock check. The real guard rejects without touching it.
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
@@ -3150,7 +3143,7 @@ async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
         running_dynamic_fixture(8);
     let root = Arc::clone(&scope.root);
     let mut lifecycle = root.subscribe_lifecycle();
-    let started = Arc::new(AtomicBool::new(false));
+    let started = Latch::default();
     let reservation = super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
@@ -3158,11 +3151,11 @@ async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
     reservation
         .slot
         .define(ChildConstruction::Task(TaskDef::new({
-            let started = Arc::clone(&started);
+            let started = started.clone();
             move |context| {
-                let started = Arc::clone(&started);
+                let started = started.clone();
                 async move {
-                    started.store(true, Ordering::SeqCst);
+                    started.fire();
                     context.shutdown_token().cancelled().await;
                     Ok(())
                 }
@@ -3180,13 +3173,10 @@ async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
     };
     scope.handle_admission(request);
     assert!(matches!(admission_response.try_receive(), Some(Ok(()))));
-    for _ in 0..64 {
-        if started.load(Ordering::SeqCst) {
-            break;
-        }
-        crate::runtime::yield_now().await;
-    }
-    assert!(started.load(Ordering::SeqCst), "the admitted task starts");
+    assert!(matches!(
+        crate::runtime::timeout(Duration::from_secs(2), started.fired()).await,
+        crate::runtime::Timeout::Completed(())
+    ));
 
     let key = control
         .state
@@ -3197,22 +3187,20 @@ async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
         .and_then(DynamicEntry::key)
         .expect("the admission installs its child key");
     super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
-    let mut removal_response =
-        super::remove_dynamic(&root, member.id(), Some(member.membership()));
+    let mut removal_response = super::remove_dynamic(&root, member.id(), Some(member.membership()));
 
     let mut removals = Vec::new();
     while removals.len() < 2 {
-        let event = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv())
-            .await
-        {
-            crate::runtime::Timeout::Completed(Some(event)) => event,
-            crate::runtime::Timeout::Completed(None) => {
-                panic!("the driver lane remains open")
-            }
-            crate::runtime::Timeout::Elapsed => {
-                panic!("both removal sources reach the driver")
-            }
-        };
+        let event =
+            match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+                crate::runtime::Timeout::Completed(Some(event)) => event,
+                crate::runtime::Timeout::Completed(None) => {
+                    panic!("the driver lane remains open")
+                }
+                crate::runtime::Timeout::Elapsed => {
+                    panic!("both removal sources reach the driver")
+                }
+            };
         let DriverEvent::Removal(removal) = event else {
             panic!("only removal requests precede stop dispatch")
         };
@@ -3244,9 +3232,7 @@ async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
         assert_eq!(scope.deadlines.len(), deadline_count);
     }
 
-    let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv())
-        .await
-    {
+    let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
         crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
             child,
             incarnation,

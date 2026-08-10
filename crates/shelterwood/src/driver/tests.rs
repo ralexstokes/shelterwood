@@ -13,7 +13,7 @@ use crate::{
     ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
     GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox,
     RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ReserveError, RestartCondition,
-    RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind, StartupError,
+    RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind, StartupError,
     StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
     engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
     exit::{JoinVerdict, RecordedOutcome},
@@ -26,11 +26,12 @@ use crate::{
 
 use super::{
     AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
-    DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
-    Pending, RemovalRequest, RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell,
-    ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
-    cancel_dynamic_reservation, report_slot, reserve_dynamic, resident_projection,
-    restart_shutdown_work, run_nested_factory, run_nested_tree, run_scope_incarnation,
+    DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, MemberTransition,
+    NestedScopeLatches, Pending, RemovalRequest, RemovalResponses, ResidentProjection,
+    RuntimeStorage, ScopeCell, ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime,
+    StartupDisposition, cancel_dynamic_reservation, report_slot, reserve_dynamic,
+    resident_projection, restart_shutdown_work, run_nested_factory, run_nested_tree,
+    run_scope_incarnation,
 };
 
 /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -3436,6 +3437,47 @@ async fn system_shutdown_joins_root_driver_teardown() {
 }
 
 #[test]
+fn member_transitions_own_their_complete_record_projection() {
+    let mut identity = ScopeIdentity::new();
+    let id = ChildId::from("worker");
+    let membership = identity.mint_membership(&id).expect("membership available");
+    let member = MemberCell::new(id, membership);
+    let mut incarnations = identity.incarnation_counter(membership);
+    let incarnation = incarnations.mint().expect("incarnation available");
+
+    member.transition(MemberTransition::Admitted);
+    assert_eq!(member.record().stage, MemberStage::Admitted);
+
+    member.transition(MemberTransition::Starting { incarnation });
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Starting);
+    assert_eq!(record.incarnation, Some(incarnation));
+    assert_eq!(record.last_incarnation, Some(incarnation));
+    assert_eq!(record.restart_at, None);
+
+    member.transition(MemberTransition::Running);
+    assert_eq!(member.record().stage, MemberStage::Running);
+    member.transition(MemberTransition::Stopping);
+    assert_eq!(member.record().stage, MemberStage::Stopping);
+
+    let exit = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+    let restart_count = RestartCount::ZERO.bump();
+    let restart_at = crate::runtime::now();
+    member.transition(MemberTransition::RestartScheduled {
+        exit: exit.clone(),
+        restart_count,
+        restart_at: Some(restart_at),
+    });
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Restarting);
+    assert_eq!(record.incarnation, None);
+    assert_eq!(record.last_incarnation, Some(incarnation));
+    assert_eq!(record.last_exit, Some(exit));
+    assert_eq!(record.restart_count, restart_count);
+    assert_eq!(record.restart_at, Some(restart_at));
+}
+
+#[test]
 fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
@@ -3445,9 +3487,10 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
         ExitKind::Failed(ExitError::message("last completed incarnation")),
         Cancellation::NotObserved,
     );
-    member.update(|record| {
-        record.stage = MemberStage::Restarting;
-        record.last_exit = Some(previous.clone());
+    member.transition(MemberTransition::RestartScheduled {
+        exit: previous.clone(),
+        restart_count: RestartCount::ZERO,
+        restart_at: None,
     });
     let mut counter = IncarnationCounter::near_exhaustion(membership);
 

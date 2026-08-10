@@ -81,6 +81,21 @@ pub(crate) enum MemberStage {
     Terminal(Exit),
 }
 
+/// One non-terminal member-record transition owned by the cell layer.
+pub(crate) enum MemberTransition {
+    Admitted,
+    Starting {
+        incarnation: Incarnation,
+    },
+    Running,
+    Stopping,
+    RestartScheduled {
+        exit: Exit,
+        restart_count: RestartCount,
+        restart_at: Option<Instant>,
+    },
+}
+
 /// Whether a terminal child incarnation failed during aggregate startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartupDisposition {
@@ -98,6 +113,33 @@ pub(crate) struct MemberRecord {
     pub(crate) restart_at: Option<Instant>,
     pub(crate) removing: bool,
     pub(crate) startup_aborted: bool,
+}
+
+impl MemberRecord {
+    fn apply_transition(&mut self, transition: MemberTransition) {
+        match transition {
+            MemberTransition::Admitted => self.stage = MemberStage::Admitted,
+            MemberTransition::Starting { incarnation } => {
+                self.stage = MemberStage::Starting;
+                self.incarnation = Some(incarnation);
+                self.last_incarnation = Some(incarnation);
+                self.restart_at = None;
+            }
+            MemberTransition::Running => self.stage = MemberStage::Running,
+            MemberTransition::Stopping => self.stage = MemberStage::Stopping,
+            MemberTransition::RestartScheduled {
+                exit,
+                restart_count,
+                restart_at,
+            } => {
+                self.stage = MemberStage::Restarting;
+                self.incarnation = None;
+                self.last_exit = Some(exit);
+                self.restart_count = restart_count;
+                self.restart_at = restart_at;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -225,13 +267,23 @@ impl MemberCell {
     /// The driver also treats this channel as its control-plane wake bus: any
     /// field read by a loop precondition must be changed through a pulsing path
     /// like this one, never by a silent write outside an observation gate.
+    #[cfg(test)]
     pub(crate) fn update(&self, update: impl FnOnce(&mut MemberRecord)) {
         self.record.send_modify(update);
+    }
+
+    pub(crate) fn transition(&self, transition: MemberTransition) {
+        self.record
+            .send_modify(|record| record.apply_transition(transition));
     }
 
     fn update_locked(&self, wakes: &mut ObservationWakes, update: impl FnOnce(&mut MemberRecord)) {
         self.record.modify_silently(update);
         wakes.pulse(&self.record);
+    }
+
+    fn transition_locked(&self, wakes: &mut ObservationWakes, transition: MemberTransition) {
+        self.update_locked(wakes, |record| record.apply_transition(transition));
     }
 
     pub(crate) fn set_options(&self, options: ResolvedCommonOptions) {
@@ -957,7 +1009,7 @@ impl ScopeCell {
         });
     }
 
-    pub(crate) fn transition_child(
+    fn update_child_record(
         &self,
         member: &MemberCell,
         update: impl FnOnce(&mut MemberRecord),
@@ -973,6 +1025,29 @@ impl ScopeCell {
         });
     }
 
+    pub(crate) fn set_child_removing(&self, member: &MemberCell) {
+        self.update_child_record(member, |record| record.removing = true, None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transition_child(
+        &self,
+        member: &MemberCell,
+        update: impl FnOnce(&mut MemberRecord),
+        event: Option<LifecycleEventKind>,
+    ) {
+        self.update_child_record(member, update, event);
+    }
+
+    pub(crate) fn transition_child_stage(
+        &self,
+        member: &MemberCell,
+        transition: MemberTransition,
+        event: Option<LifecycleEventKind>,
+    ) {
+        self.update_child_record(member, |record| record.apply_transition(transition), event);
+    }
+
     #[cfg(test)]
     pub(crate) fn emit(&self, event: LifecycleEventKind) {
         self.with_observation_gate(|wakes| self.emit_locked(wakes, event));
@@ -982,7 +1057,7 @@ impl ScopeCell {
         &self,
         member: &MemberCell,
         total_restarts: TotalRestarts,
-        update: impl FnOnce(&mut MemberRecord),
+        transition: MemberTransition,
         exited: LifecycleEventKind,
         scheduled: LifecycleEventKind,
     ) {
@@ -991,7 +1066,7 @@ impl ScopeCell {
                 scope.total_restarts = total_restarts;
             });
             wakes.pulse(&self.record);
-            member.update_locked(wakes, update);
+            member.transition_locked(wakes, transition);
             self.emit_locked(wakes, exited);
             self.emit_locked(wakes, scheduled);
         });
@@ -1438,7 +1513,7 @@ impl ScopeCell {
                 }
                 child
                     .member
-                    .update_locked(wakes, |record| record.stage = MemberStage::Admitted);
+                    .transition_locked(wakes, MemberTransition::Admitted);
                 let id = child.member.id().clone();
                 let membership = child.member.membership();
                 self.current_children()
@@ -1459,7 +1534,7 @@ impl ScopeCell {
             let membership = child.member.membership();
             child
                 .member
-                .update_locked(wakes, |record| record.stage = MemberStage::Admitted);
+                .transition_locked(wakes, MemberTransition::Admitted);
             self.current_children()
                 .push(ResidentChild::new(self, child));
             self.emit_locked(wakes, LifecycleEventKind::Added { id, membership });

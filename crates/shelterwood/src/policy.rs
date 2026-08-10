@@ -681,16 +681,21 @@ pub(crate) struct ResolvedDefaults {
     pub(crate) child_restart: RestartPolicy,
     pub(crate) child_shutdown: Shutdown,
     pub(crate) mailbox: Mailbox,
+    /// Nearest resolved queue capacity, retained across defaults of other kinds.
+    pub(crate) queue_capacity: NonZeroUsize,
     pub(crate) mailbox_shutdown: MailboxShutdown,
     pub(crate) readiness_deadline: ReadinessDeadline,
 }
 
 impl Default for ResolvedDefaults {
     fn default() -> Self {
+        let queue_capacity = NonZeroUsize::new(DEFAULT_MAILBOX_CAPACITY)
+            .expect("the library mailbox capacity is non-zero");
         Self {
             child_restart: RestartPolicy::default(),
             child_shutdown: Shutdown::default(),
-            mailbox: Mailbox::default(),
+            mailbox: Mailbox::Queue(Some(queue_capacity)),
+            queue_capacity,
             mailbox_shutdown: MailboxShutdown::default(),
             readiness_deadline: ReadinessDeadline::Bounded(DEFAULT_READINESS_DEADLINE),
         }
@@ -713,7 +718,11 @@ impl ResolvedDefaults {
         let resolved = Self {
             child_restart: values.child_restart.unwrap_or(self.child_restart),
             child_shutdown: values.child_shutdown.unwrap_or(self.child_shutdown),
-            mailbox: resolve_default_mailbox(values.mailbox, self.mailbox),
+            mailbox: resolve_mailbox(values.mailbox, self.mailbox, self.queue_capacity),
+            queue_capacity: match values.mailbox {
+                Some(Mailbox::Queue(Some(capacity))) => capacity,
+                None | Some(Mailbox::Queue(None) | Mailbox::Latest) => self.queue_capacity,
+            },
             mailbox_shutdown: values.mailbox_shutdown.unwrap_or(self.mailbox_shutdown),
             readiness_deadline: match values.readiness_deadline.unwrap_or(self.readiness_deadline) {
                 ReadinessDeadline::Inherit => self.readiness_deadline,
@@ -734,13 +743,14 @@ impl ResolvedDefaults {
     }
 }
 
-fn resolve_default_mailbox(value: Option<Mailbox>, inherited: Mailbox) -> Mailbox {
+fn resolve_mailbox(
+    value: Option<Mailbox>,
+    inherited: Mailbox,
+    inherited_queue_capacity: NonZeroUsize,
+) -> Mailbox {
     match value {
         None => inherited,
-        Some(Mailbox::Queue(None)) => match inherited {
-            Mailbox::Queue(Some(capacity)) => Mailbox::Queue(Some(capacity)),
-            Mailbox::Queue(None) | Mailbox::Latest => Mailbox::default(),
-        },
+        Some(Mailbox::Queue(None)) => Mailbox::Queue(Some(inherited_queue_capacity)),
         Some(value) => value,
     }
 }
@@ -784,7 +794,7 @@ pub(crate) fn resolve_common(
             options.restart.unwrap_or(defaults.child_restart)
         },
         shutdown: options.shutdown.unwrap_or(defaults.child_shutdown),
-        mailbox: resolve_default_mailbox(options.mailbox, defaults.mailbox),
+        mailbox: resolve_mailbox(options.mailbox, defaults.mailbox, defaults.queue_capacity),
         mailbox_shutdown: options
             .mailbox_shutdown
             .unwrap_or(defaults.mailbox_shutdown),
@@ -1129,9 +1139,29 @@ mod tests {
     }
 
     #[test]
-    fn defaults_overlay_as_one_value_and_mailbox_capacity_resolves_by_kind() {
+    fn mailbox_capacity_walks_outward_by_kind_across_defaults_overlays() {
         let library = ResolvedDefaults::default();
-        let latest = library
+        let library_latest = library
+            .overlay(&ScopeDefaults {
+                mailbox: Some(Mailbox::latest()),
+                ..ScopeDefaults::default()
+            })
+            .expect("valid defaults");
+        let library_queue = library_latest
+            .overlay(&ScopeDefaults {
+                mailbox: Some(Mailbox::queue_inherit()),
+                ..ScopeDefaults::default()
+            })
+            .expect("valid defaults");
+        assert_eq!(library_queue.mailbox, Mailbox::default());
+
+        let outer_queue = library
+            .overlay(&ScopeDefaults {
+                mailbox: Some(Mailbox::queue(10).expect("non-zero capacity")),
+                ..ScopeDefaults::default()
+            })
+            .expect("valid defaults");
+        let latest = outer_queue
             .overlay(&ScopeDefaults {
                 mailbox: Some(Mailbox::latest()),
                 ..ScopeDefaults::default()
@@ -1145,9 +1175,20 @@ mod tests {
                 ..ScopeDefaults::default()
             })
             .expect("valid defaults");
-        assert_eq!(deferred_queue.mailbox, Mailbox::default());
+        assert_eq!(
+            deferred_queue.mailbox,
+            Mailbox::queue(10).expect("non-zero capacity")
+        );
         assert_eq!(deferred_queue.child_restart, latest.child_restart);
         assert_eq!(deferred_queue.child_shutdown, latest.child_shutdown);
+
+        let reset_queue = ResolvedDefaults::default()
+            .overlay(&ScopeDefaults {
+                mailbox: Some(Mailbox::queue_inherit()),
+                ..ScopeDefaults::default()
+            })
+            .expect("valid reset defaults");
+        assert_eq!(reset_queue.mailbox, Mailbox::default());
     }
 
     #[test]

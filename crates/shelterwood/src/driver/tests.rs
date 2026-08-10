@@ -2982,7 +2982,7 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     );
 }
 
-pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
+pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     make_admission: impl FnOnce(super::DynamicReservation) -> A,
 ) where
     A: Future,
@@ -3101,7 +3101,7 @@ pub(crate) async fn exercise_saturated_fused_drop_before_exit<A>(
             }),
         )
         .is_ok(),
-        "the driver lane remains open"
+        "the open lane queues a predecessor edge ahead of the fused removal"
     );
     drop(admission);
     assert!(
@@ -3398,6 +3398,31 @@ async fn queued_admissions_yield_to_shutdown_without_forwarder_tasks() {
     ));
     drop(shutdown);
     assert_eq!(system.wait().await, StopReason::ShutdownRequested);
+
+    // The driver tore down with a control backlog still queued, so every
+    // stranded admission's completion obligation must resolve rather than
+    // hang its caller. Pin both ends of the queue: the head is rejected
+    // while the drain runs, the tail at latest by the obligation's
+    // receiver-drop fallback once the driver's lane closes.
+    let tail = admissions.pop().expect("the backlog has a tail");
+    let head = admissions.swap_remove(0);
+    for (position, admission) in [("head", head), ("tail", tail)] {
+        let outcome = match crate::runtime::timeout(Duration::from_secs(2), admission).await {
+            crate::runtime::Timeout::Completed(outcome) => outcome,
+            crate::runtime::Timeout::Elapsed => {
+                panic!("the {position}-of-queue admission obligation completes at teardown")
+            }
+        };
+        assert!(
+            matches!(
+                outcome,
+                Err(ReserveError::NotAdmitting(
+                    crate::NotAdmittingCause::Draining | crate::NotAdmittingCause::Terminal
+                ))
+            ),
+            "the {position}-of-queue admission reports the stopped scope"
+        );
+    }
 }
 
 #[crate::runtime::test]

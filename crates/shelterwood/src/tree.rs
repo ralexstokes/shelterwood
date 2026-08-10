@@ -1587,8 +1587,8 @@ mod tests {
     }
 
     #[crate::runtime::test]
-    async fn saturated_fused_drop_before_exit_suppresses_restart_accounting() {
-        crate::driver::exercise_saturated_fused_drop_before_exit(|reservation| {
+    async fn queued_fused_drop_before_exit_dispatch_suppresses_restart_accounting() {
+        crate::driver::exercise_queued_fused_drop_before_exit_dispatch(|reservation| {
             Admission::new(reservation, (), AdmissionOwnership::Fused)
         })
         .await;

@@ -2385,7 +2385,13 @@ async fn run_scope_incarnation(
     // Keep child lifecycle events separate from externally generated dynamic
     // control traffic: a large admission prefix must not strand the exit that
     // completes shutdown. Bound each lane's per-wake collection so traffic
-    // cannot defer signals or deadlines indefinitely.
+    // cannot defer signals or deadlines indefinitely. The cap adds one
+    // ordering surface: when a wake finds more than a full batch of primary
+    // events, the deferred suffix (an intensity-tripping exit, say) is
+    // processed one wake after control-lane admissions enqueued earlier.
+    // `arbitrate` promises order only within a batch, and cross-pass
+    // wall-clock inversion was already reachable through the forwarder, so
+    // no promised order is violated.
     let event_batch_limit = plan
         .children
         .len()
@@ -2731,14 +2737,21 @@ fn collect_driver_events(
     limit: usize,
     pending: &mut Vec<(ArbitrationClass, Pending)>,
 ) -> bool {
-    let before = pending.len();
     for _ in 0..limit {
         let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
-            break;
+            return false;
         };
         pending.push(Pending::Driver(event).classified());
     }
-    pending.len() - before == limit
+    // Collecting exactly `limit` events does not by itself show a capped
+    // lane. Probe once more so a lane that drained right at the limit skips
+    // the full-batch yield; a probed event joins this batch rather than
+    // being deferred a wake.
+    let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
+        return false;
+    };
+    pending.push(Pending::Driver(event).classified());
+    true
 }
 
 fn restart_shutdown_work(child: ChildKey) -> (ArbitrationClass, Pending) {
@@ -2764,7 +2777,7 @@ fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
 }
 
 #[cfg(test)]
-pub(crate) use tests::exercise_saturated_fused_drop_before_exit;
+pub(crate) use tests::exercise_queued_fused_drop_before_exit_dispatch;
 
 #[cfg(test)]
 mod tests;

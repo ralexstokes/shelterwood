@@ -160,6 +160,7 @@ pub(super) struct ChildRuntime {
     pub(super) incarnations: IncarnationCounter,
     pub(super) restarts: RestartState,
     pub(super) restart_deadline: Option<DeadlineHandle>,
+    pub(super) restart_shutdown_pending: bool,
     pub(super) active: Option<ActiveChild>,
     pub(super) initial_ready: bool,
     pub(super) initial: bool,
@@ -208,6 +209,7 @@ impl ChildRuntime {
             incarnations,
             restarts: RestartState::new(),
             restart_deadline: None,
+            restart_shutdown_pending: false,
             active: None,
             initial_ready: false,
             initial: true,
@@ -971,6 +973,18 @@ impl ScopeRuntime {
                     }
                 }
             }
+        }
+        if self
+            .children
+            .get(key)
+            .is_some_and(|child| child.restart_shutdown_pending)
+        {
+            // A subject-carrying control event can beat the corresponding
+            // child exit into an earlier driver batch. Retry the retained
+            // fact now that the old incarnation is inactive; otherwise the
+            // one-shot event would be consumed while `spawn_child` still
+            // rejects the active child and the requested expedite is lost.
+            self.expedite_restart_shutdown(key);
         }
     }
 

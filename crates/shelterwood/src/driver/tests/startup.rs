@@ -31,6 +31,82 @@ fn pre_admission_restart_shutdown_is_published_when_the_scope_gets_a_parent() {
 }
 
 #[crate::runtime::test]
+async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_becomes_inactive() {
+    let mut tree = Tree::new();
+    tree.add_subtree(
+        "nested",
+        SubtreeDef::factory(pending_tree).restart(RestartPolicy::new(
+            RestartCondition::Always,
+            Backoff::fixed(Duration::from_secs(60), crate::Jitter::None)
+                .expect("non-zero restart backoff"),
+        )),
+    )
+    .expect("valid subtree");
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let mut children = ChildArena::default();
+    let key = children
+        .insert(child)
+        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_lifecycle(ScopeLifecycle::running())
+        .with_children(children)
+        .build();
+    plan.armed = false;
+    drop(plan);
+
+    scope.spawn_child(key);
+    let first = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the first incarnation is active")
+        .incarnation;
+    scope.expedite_restart_shutdown(key);
+    assert!(
+        scope.children[key].restart_shutdown_pending,
+        "the early event remains owned until the active incarnation exits"
+    );
+    scope.children[key]
+        .active
+        .as_ref()
+        .expect("the first incarnation is active")
+        .abort_handle
+        .abort();
+
+    scope.handle_exit(
+        key,
+        first,
+        Some(RecordedOutcome::returned(Err(ExitError::message(
+            "restart the nested scope",
+        )))),
+        crate::runtime::JoinOutcome::Ok { value: () },
+        Cancellation::NotObserved,
+        false,
+    );
+
+    let restarted = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the retained event starts the next incarnation immediately");
+    assert_ne!(restarted.incarnation, first);
+    assert!(scope.children[key].restart_deadline.is_none());
+    assert!(!scope.children[key].restart_shutdown_pending);
+}
+
+#[crate::runtime::test]
 async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
     let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut tree = Tree::new();

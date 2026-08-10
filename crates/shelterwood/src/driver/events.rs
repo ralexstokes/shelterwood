@@ -178,9 +178,25 @@ impl ScopeRuntime {
         // Collection and execution are separated by arbitration. Recheck
         // every level-triggered stop source so teardown/removal latched in the
         // same batch suppresses user construction immediately.
-        if !self.restart_is_suppressed(key) {
-            self.spawn_child(key);
+        if self.restart_is_suppressed(key) {
+            if let Some(child) = self.children.get_mut(key) {
+                child.restart_shutdown_pending = false;
+            }
+            return;
         }
+        let Some(child) = self.children.get_mut(key) else {
+            return;
+        };
+        if child.is_terminal() || child.is_disposing() {
+            child.restart_shutdown_pending = false;
+            return;
+        }
+        if child.active.is_some() {
+            child.restart_shutdown_pending = true;
+            return;
+        }
+        child.restart_shutdown_pending = false;
+        self.spawn_child(key);
     }
 
     pub(super) fn handle_deadline(&mut self, deadline: DeadlineKind) {

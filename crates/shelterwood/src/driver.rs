@@ -1479,17 +1479,14 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
 }
 
 impl ScopeRuntime {
-    fn restart_is_suppressed(&self, key: ChildKey) -> bool {
-        if self.lifecycle.is_draining()
-            || self.hard_forced
-            || self.root.has_stop_request(self.epoch)
-            || self
-                .role
-                .ancestor()
-                .is_some_and(|latches| latches.shutdown.is_fired() || latches.abort.is_fired())
-        {
-            return true;
-        }
+    /// Reports whether a *removal* source has latched for this membership:
+    /// the public `removing` projection, the forwarded removal latch, or the
+    /// dynamic entry's `removal_started`/fused-cancel state. Scope-level stop
+    /// sources (drain, force, latched shutdown requests, ancestor latches)
+    /// are deliberately excluded: each of those has a guaranteed follow-up
+    /// event that owns the scope verdict, so exit dispatch must not
+    /// reclassify the membership as `Removing` on their behalf.
+    fn membership_is_removing(&self, key: ChildKey) -> bool {
         let Some(child) = self.children.get(key) else {
             return true;
         };
@@ -1510,6 +1507,24 @@ impl ScopeRuntime {
                         || entry.fused_cancel.as_ref().is_some_and(Latch::is_fired)
                 })
         })
+    }
+
+    /// Reports whether any level-triggered stop source forbids constructing
+    /// a new incarnation: a removal source for the membership itself, or a
+    /// scope-level stop (drain, force, a latched shutdown request, or an
+    /// ancestor latch). Every scope-level source has a guaranteed follow-up
+    /// event, so this broad consult belongs only at sites that would
+    /// otherwise invoke user construction — not at exit dispatch, where it
+    /// would misclassify the membership and reroute the scope verdict.
+    fn restart_is_suppressed(&self, key: ChildKey) -> bool {
+        self.lifecycle.is_draining()
+            || self.hard_forced
+            || self.root.has_stop_request(self.epoch)
+            || self
+                .role
+                .ancestor()
+                .is_some_and(|latches| latches.shutdown.is_fired() || latches.abort.is_fired())
+            || self.membership_is_removing(key)
     }
 
     fn pending_restart_shutdowns(&self) -> Vec<ChildKey> {
@@ -2107,8 +2122,15 @@ impl ScopeRuntime {
         // Fused cancellation is a level-triggered source. It can linearize
         // before the forwarded Removal event or its public `removing`
         // projection reaches this driver, so exit dispatch must consult the
-        // source directly before charging or publishing a restart.
-        let restart_suppressed = self.restart_is_suppressed(key);
+        // removal sources directly before charging or publishing a restart.
+        // Only removal sources classify the membership here: a latched but
+        // unprocessed scope stop (shutdown request or ancestor latch) must
+        // not turn this exit Terminal, or a restartable initial child
+        // failing pre-ready would publish `StartupFailed` where the stop's
+        // own follow-up event owns the verdict. The broader
+        // `restart_is_suppressed` still gates the restart deadline arm,
+        // where every suppression source has a guaranteed follow-up event.
+        let membership_removing = self.membership_is_removing(key);
         let child = self
             .children
             .get_mut(key)
@@ -2119,7 +2141,7 @@ impl ScopeRuntime {
         } else {
             ScopeMode::Running
         };
-        let member_mode = if restart_suppressed {
+        let member_mode = if membership_removing {
             MembershipMode::Removing
         } else {
             MembershipMode::Active
@@ -4828,6 +4850,152 @@ mod tests {
         control.request_forwarder_ended.fired().await;
     }
 
+    /// Exercises the `DeadlineKind::Restart` suppression gate on its own:
+    /// the restart deadline is scheduled first (no stop source latched at
+    /// exit time), then the fused cancellation lands before the deadline's
+    /// batch runs. The gate must clear the stale backoff edge without
+    /// invoking user construction.
+    #[crate::runtime::test]
+    async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_scheduling() {
+        let root = isolated_scope("root", ScopeFlavor::Dynamic);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.member
+            .update(|record| record.stage = MemberStage::Running);
+        root.set_state(ScopeState::Running);
+        root.set_startup(Ok(()));
+
+        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let control = DynamicControl::new(events.clone());
+        root.set_dynamic_route(Some(control.clone()));
+        root.set_admitted_children(Vec::new());
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: ResolvedDefaults::default(),
+            intensity_policy: Intensity::default(),
+            intensity: super::IntensityState::default(),
+            children: ChildArena::default(),
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::running(),
+            next_ordered_start: None,
+            role: ScopeRole::Root,
+            dynamic: Some(control.clone()),
+            epoch,
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+
+        let starts = Arc::new(AtomicUsize::new(0));
+        let reservation = super::reserve_dynamic(&root, ChildId::from("worker"), None)
+            .expect("running dynamic scope reserves the child");
+        let member = Arc::clone(&reservation.slot.member);
+        reservation
+            .slot
+            .define(ChildConstruction::Task(TaskDef::new({
+                let starts = Arc::clone(&starts);
+                move |_| {
+                    let invocation = starts.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        if invocation == 1 {
+                            Err(ExitError::message("first incarnation failed"))
+                        } else {
+                            future::pending().await
+                        }
+                    }
+                }
+            })));
+        let membership = member.membership();
+        let fused_cancel = Latch::default();
+        let mut response = super::start_admission(
+            Arc::clone(&reservation.control),
+            Arc::clone(&reservation.slot),
+            Some(fused_cancel.clone()),
+        )
+        .expect("the running scope accepts the admission");
+        let Some(DriverEvent::Admission(request)) = event_receiver.recv().await else {
+            panic!("the admission forwarder submits the request")
+        };
+        scope.handle_admission(request);
+        assert!(matches!(response.try_receive(), Some(Ok(()))));
+
+        let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv())
+            .await
+        {
+            crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
+                child,
+                incarnation,
+                recorded,
+                join,
+                cancellation,
+            }))) => (child, incarnation, recorded, join, cancellation),
+            crate::runtime::Timeout::Completed(_) => panic!("the first incarnation reports exit"),
+            crate::runtime::Timeout::Elapsed => panic!("the first incarnation exit must arrive"),
+        };
+        let key = exit.0;
+        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4);
+        assert!(
+            scope.children[key].restart_deadline.is_some(),
+            "a live fused admission does not suppress the restart at exit dispatch"
+        );
+        assert!(matches!(
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Restarting
+        ));
+
+        // The fused admission handle drops only now: the cancellation latch
+        // fires after the backoff was scheduled, and its Removal edge queues
+        // behind the already-due restart deadline.
+        super::signal_fused_cancel(control.as_ref(), membership, &fused_cancel);
+        assert!(fused_cancel.is_fired());
+
+        let deadline = scope
+            .deadlines
+            .pop_due(crate::runtime::now() + Duration::from_secs(60 * 60))
+            .expect("the immediate-backoff restart deadline is registered");
+        assert!(matches!(deadline, super::DeadlineKind::Restart { .. }));
+        scope.handle_deadline(deadline);
+
+        assert!(
+            scope.children[key].restart_deadline.is_none(),
+            "the gate clears the stale backoff edge"
+        );
+        assert!(scope.children[key].active.is_none());
+        for _ in 0..16 {
+            crate::runtime::yield_now().await;
+        }
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "the restart deadline arm rechecks level-triggered stop sources"
+        );
+
+        let forwarded =
+            match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+                crate::runtime::Timeout::Completed(Some(event)) => event,
+                crate::runtime::Timeout::Completed(None) => panic!("the driver lane remains open"),
+                crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
+            };
+        assert!(matches!(forwarded, DriverEvent::Removal(removed) if removed == membership));
+        scope.handle_removal(membership);
+        let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
+            crate::runtime::unbounded_mpsc_recv(&mut disposal_event_receiver).await
+        else {
+            panic!("removal joins retained construction disposal")
+        };
+        scope.handle_construction_disposed(child, panic);
+        assert!(scope.children.get(key).is_none());
+
+        control.request_forwarder_close.fire();
+        control.request_forwarder_ended.fired().await;
+    }
+
     #[crate::runtime::test]
     async fn saturated_admissions_share_one_forwarder_task_and_all_resolve() {
         const ADMISSIONS: usize = 64;
@@ -5156,6 +5324,136 @@ mod tests {
             ),
             "the pre-readiness position still routes the scope's startup failure"
         );
+    }
+
+    /// Pins main's linearization for a scope stop latched cross-batch: a
+    /// restartable initial child failing pre-ready still dispatches
+    /// `ScheduleRestart`, and the latched stop's own follow-up event owns
+    /// the startup verdict (`ShutdownRequested`). Exit dispatch must not
+    /// consult latched-but-unprocessed scope-stop sources for its membership
+    /// classification, or the failure would be rerouted into
+    /// `StartupFailed` while restart suppression claims the stop was first.
+    #[crate::runtime::test]
+    async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "worker",
+            TaskDef::new(|_| async { Err(ExitError::message("failed before readiness")) })
+                .readiness(Readiness::Manual)
+                .expect("manual readiness is valid"),
+        )
+        .expect("valid task");
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, mut event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+        let mut children = ChildArena::default();
+        let key = children
+            .insert(child)
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::starting(),
+            next_ordered_start: Some(key),
+            role: ScopeRole::Root,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        assert!(scope.children[key].initial);
+        scope.spawn_child(key);
+        assert!(!scope.children[key].initial_ready);
+        let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv())
+            .await
+        {
+            crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
+                child,
+                incarnation,
+                recorded,
+                join,
+                cancellation,
+            }))) => (child, incarnation, recorded, join, cancellation),
+            crate::runtime::Timeout::Completed(_) => panic!("the pre-ready failure reports exit"),
+            crate::runtime::Timeout::Elapsed => panic!("the pre-ready failure exit must arrive"),
+        };
+
+        // The stop request latches after this batch was collected: it is
+        // visible to `has_stop_request`, but its `Pending::Shutdown` follow-up
+        // event belongs to the next batch.
+        assert!(root.request_shutdown().is_some());
+        assert!(root.has_stop_request(scope.epoch));
+
+        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4);
+        assert!(
+            scope.children[key].restart_deadline.is_some(),
+            "a latched scope stop does not reclassify exit dispatch"
+        );
+        assert!(matches!(
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Restarting
+        ));
+        assert!(
+            root.record().startup.is_none(),
+            "the pre-ready failure must not claim the startup verdict: {:?}",
+            root.record().startup
+        );
+
+        // The latched stop's guaranteed follow-up event runs in the next
+        // batch and owns the verdict, exactly as an unlatched scope would.
+        assert!(root.take_shutdown_request(scope.epoch));
+        scope.begin_drain(StopReason::ShutdownRequested);
+        assert!(
+            matches!(
+                root.record().startup,
+                Some(Err(StartupError::ShutdownRequested))
+            ),
+            "the latched stop owns the startup verdict: {:?}",
+            root.record().startup
+        );
+        assert!(scope.children[key].restart_deadline.is_none());
+
+        let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
+            crate::runtime::unbounded_mpsc_recv(&mut disposal_event_receiver).await
+        else {
+            panic!("only construction disposal was armed")
+        };
+        scope.handle_construction_disposed(child, panic);
+        assert!(matches!(
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Terminal(_)
+        ));
+        assert!(
+            !scope.children[key].slot.member.record().startup_aborted,
+            "shutdown-first linearization publishes no startup abort"
+        );
+        assert!(matches!(
+            root.record().startup,
+            Some(Err(StartupError::ShutdownRequested))
+        ));
     }
 
     #[crate::runtime::test]

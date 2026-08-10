@@ -998,7 +998,7 @@ impl ScopeCell {
             if record.last_incarnation.is_none()
                 && let Some(scope) = &nested
             {
-                scope.publish_never_started_locked(wakes);
+                scope.publish_stopped_locked(wakes, StopReason::NeverStarted, None, None);
             }
             if let Some(incarnation) = exited_incarnation {
                 self.emit_locked(
@@ -1300,27 +1300,8 @@ impl ScopeCell {
             if control.force.is_some_and(|request| request.epoch <= epoch) {
                 control.force = None;
             }
-            let state = ScopeState::Stopped {
-                reason: reason.clone(),
-            };
-            self.record.modify_silently(|record| {
-                if record.startup.is_none() {
-                    record.startup = Some(Err(StartupError::ShutdownRequested));
-                }
-                record.state = state.clone();
-            });
             let terminal = terminal_exit.is_some();
-            if let Some(exit) = terminal_exit {
-                self.member.terminalize_locked(exit, wakes);
-            }
-            // Keep epoch ownership through the final record mutation so a
-            // newer begin cannot race an old driver into publishing Stopped.
-            drop(control);
-            wakes.pulse(&self.member.record);
-            // `wait_started` must not observe terminal startup until the member
-            // and incarnation-control planes are mutually consistent.
-            wakes.pulse(&self.record);
-            self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
+            self.publish_stopped_locked(wakes, reason, terminal_exit, Some(control));
             if terminal {
                 self.close_observation_locked(wakes);
             }
@@ -1336,17 +1317,7 @@ impl ScopeCell {
             self.finish_root_incarnation(epoch, reason, exit);
         } else {
             self.with_observation_gate(|wakes| {
-                let state = ScopeState::Stopped { reason };
-                self.record.modify_silently(|record| {
-                    if record.startup.is_none() {
-                        record.startup = Some(Err(StartupError::ShutdownRequested));
-                    }
-                    record.state = state.clone();
-                });
-                self.member.terminalize_locked(exit, wakes);
-                wakes.pulse(&self.member.record);
-                wakes.pulse(&self.record);
-                self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
+                self.publish_stopped_locked(wakes, reason, Some(exit), None);
                 self.close_observation_locked(wakes);
             });
         }
@@ -1524,25 +1495,40 @@ impl ScopeCell {
         }
     }
 
-    fn publish_never_started_locked(&self, wakes: &mut ObservationWakes) {
+    /// Commits one stopped-scope projection and its optional member terminal
+    /// edge under the resident-tree observation gate.
+    ///
+    /// Member terminalization prepares mailbox teardown first; its deferred
+    /// discharge is therefore queued before either member or scope pulses.
+    /// `epoch_owner` carries a live incarnation's control ownership through
+    /// both retained record mutations and is released before snapshot and
+    /// lifecycle publication, preserving the stop transition's ownership
+    /// boundary. Observation closure remains a caller decision because a
+    /// nested scope's final event must precede its parent's terminal event and
+    /// only then close the nested streams.
+    fn publish_stopped_locked(
+        &self,
+        wakes: &mut ObservationWakes,
+        reason: StopReason,
+        terminal_exit: Option<Exit>,
+        epoch_owner: Option<MutexGuard<'_, ScopeControl>>,
+    ) {
+        let state = ScopeState::Stopped { reason };
         self.record.modify_silently(|record| {
             if record.startup.is_none() {
                 record.startup = Some(Err(StartupError::ShutdownRequested));
             }
-            record.state = ScopeState::Stopped {
-                reason: StopReason::NeverStarted,
-            };
+            record.state = state.clone();
         });
+        if let Some(exit) = terminal_exit {
+            self.member.terminalize_locked(exit, wakes);
+        }
+        drop(epoch_owner);
         wakes.pulse(&self.member.record);
+        // `wait_started` must not observe terminal startup until the member
+        // and incarnation-control planes are mutually consistent.
         wakes.pulse(&self.record);
-        self.emit_locked(
-            wakes,
-            LifecycleEventKind::ScopeState {
-                state: ScopeState::Stopped {
-                    reason: StopReason::NeverStarted,
-                },
-            },
-        );
+        self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
     }
 
     pub(crate) fn terminalize_never_started(&self) {
@@ -1551,7 +1537,7 @@ impl ScopeCell {
                 return;
             }
             self.member.terminalize_locked(Exit::never_started(), wakes);
-            self.publish_never_started_locked(wakes);
+            self.publish_stopped_locked(wakes, StopReason::NeverStarted, None, None);
             self.close_observation_locked(wakes);
         });
     }

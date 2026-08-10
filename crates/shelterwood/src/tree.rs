@@ -1,11 +1,9 @@
-//! Tree declarations, scope handles, and the owning system façade.
+//! Tree declarations, dynamic construction handles, and the owning system façade.
 
 use std::{
     fmt,
     future::Future,
-    hash::{Hash, Hasher},
     marker::PhantomData,
-    ops::Deref,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -13,11 +11,10 @@ use std::{
 };
 
 use crate::{
-    ActorDef, ActorOnceDef, ActorRef, ChildId, DefaultsInheritance, Intensity, LifecycleEvents,
-    Membership, ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults, ScopeSnapshot,
-    Shutdown, ShutdownTimeout, SnapshotReceiver, Strategy, WaitError,
+    ActorDef, ActorOnceDef, ActorRef, ChildId, DefaultsInheritance, Intensity, Membership,
+    ReadinessDeadline, RestartPolicy, Retention, ScopeDefaults, Shutdown, ShutdownTimeout,
+    Strategy,
     admission::{RemoveOutcome, ReserveError},
-    cells::{MemberStage, ScopeCell},
     definition::DefinitionSource,
     driver::DynamicReservation,
     exit::{StartupError, StopReason},
@@ -26,6 +23,7 @@ use crate::{
     policy::{CommonOptions, InvalidPolicy, ResolvedDefaults, ScopeFlavor},
     raw::{RawDef, RawOnceDef},
     runtime::{self, Latch},
+    scope::{DynamicScopeRef, ScopeRef},
     task::{OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
 
@@ -585,6 +583,15 @@ impl Tree {
     }
 }
 
+#[cfg(test)]
+impl DynamicTree {
+    pub(crate) fn lower_for_test(self) -> crate::plan::ScopePlan {
+        self.core
+            .lower(ResolvedDefaults::default(), None)
+            .expect("test tree must be fully defined")
+    }
+}
+
 /// An owned pre-spawn actor slot with a stable mailbox binding.
 pub struct ActorSlot<M> {
     core: ActorSlotCore<StaticSlotEndpoint, M>,
@@ -698,8 +705,11 @@ impl<H> AdmissionReceipt<H> {
 /// Fused additions abort on drop; split definitions detach after their first
 /// poll starts admission. Reservation and that first poll require an ambient
 /// Tokio runtime. A first poll outside one returns [`ReserveError::NoRuntime`]
-/// and releases the reservation. Like a fused future, it remains pending if
-/// polled again after completion.
+/// and releases the reservation. If the driver's internal completion route is
+/// lost, release builds fail closed with [`ReserveError::NotAdmitting`] and a
+/// [`crate::NotAdmittingCause::Terminal`] cause. Debug builds additionally
+/// assert that the completion obligation regressed.
+/// Like a fused future, it remains pending if polled again after completion.
 #[must_use]
 pub struct Admission<H> {
     state: AdmissionState<H>,
@@ -864,23 +874,39 @@ impl<H> Drop for Admission<H> {
                 // polled or not. Firing the latch before cancelling keeps the
                 // scope's control-plane wake and the cancellation evidence in
                 // the same order the in-flight path uses.
-                if let Some(cancel) = &pending.fused_cancel {
-                    crate::driver::signal_fused_cancel(
-                        pending.reservation.control.as_ref(),
-                        pending.reservation.slot.member.membership(),
-                        cancel,
-                    );
-                }
-                pending.cancel_reservation();
+                let signal_panic = pending.fused_cancel.as_ref().and_then(|cancel| {
+                    crate::runtime::catch_panic(|| {
+                        crate::driver::signal_fused_cancel(
+                            pending.reservation.control.as_ref(),
+                            &pending.reservation.slot,
+                            cancel,
+                        );
+                    })
+                    .err()
+                });
+                let cleanup_panic =
+                    crate::runtime::catch_panic(|| pending.cancel_reservation()).err();
+                crate::runtime::resume_preferred_panic(crate::runtime::UnwindPanics {
+                    primary: signal_panic,
+                    cleanup: cleanup_panic,
+                });
             }
             AdmissionState::InFlight { pending, .. } => {
                 if let Some(cancel) = &pending.fused_cancel {
-                    crate::driver::signal_fused_cancel(
-                        pending.reservation.control.as_ref(),
-                        pending.reservation.slot.member.membership(),
-                        cancel,
-                    );
-                    pending.cancel_reservation();
+                    let signal_panic = crate::runtime::catch_panic(|| {
+                        crate::driver::signal_fused_cancel(
+                            pending.reservation.control.as_ref(),
+                            &pending.reservation.slot,
+                            cancel,
+                        );
+                    })
+                    .err();
+                    let cleanup_panic =
+                        crate::runtime::catch_panic(|| pending.cancel_reservation()).err();
+                    crate::runtime::resume_preferred_panic(crate::runtime::UnwindPanics {
+                        primary: signal_panic,
+                        cleanup: cleanup_panic,
+                    });
                 }
             }
             AdmissionState::Immediate(_) | AdmissionState::Done => {}
@@ -990,6 +1016,10 @@ impl<T: Subtree> DynamicSubtreeSlot<T> {
 }
 
 /// Observation future for a synchronously latched dynamic removal.
+///
+/// If the driver's internal completion route is lost after the request is
+/// latched, release builds fail closed with [`RemoveOutcome::Removed`]; debug
+/// builds additionally assert that the completion obligation regressed.
 #[must_use]
 pub struct Removal {
     inner: Pin<Box<dyn Future<Output = RemoveOutcome> + Send + 'static>>,
@@ -1001,14 +1031,23 @@ impl fmt::Debug for Removal {
     }
 }
 
+fn lost_removal_response_outcome() -> RemoveOutcome {
+    RemoveOutcome::Removed
+}
+
 impl Removal {
     fn new(response: crate::driver::RemovalResponse) -> Self {
         Self {
             inner: Box::pin(async move {
-                response
-                    .receive()
-                    .await
-                    .expect("removal response obligation must complete")
+                response.receive().await.unwrap_or_else(|| {
+                    // The driver's removal `Obligation` publishes `Removed`
+                    // on every destruction path. A missing response therefore
+                    // means the terminal route vanished after removal latched:
+                    // preserve the removal goal, but flag the invariant break
+                    // in debug builds just as admission does above.
+                    debug_assert!(false, "removal response obligation must complete");
+                    lost_removal_response_outcome()
+                })
             }),
         }
     }
@@ -1191,291 +1230,17 @@ impl Subtree for Tree {}
 
 impl Subtree for DynamicTree {}
 
-#[cfg(test)]
-mod tests {
-    use super::{DynamicTree, Tree, sealed::Sealed};
-    use crate::identity::ScopeIdentity;
-
-    #[test]
-    fn subtree_conversion_moves_without_minting_a_phantom_scope() {
-        let tree = Tree::new();
-        let after_tree = ScopeIdentity::current_thread_creations();
-        let core = <Tree as Sealed>::into_core(tree);
-        assert_eq!(ScopeIdentity::current_thread_creations(), after_tree);
-        drop(core);
-
-        let tree = DynamicTree::new();
-        let after_tree = ScopeIdentity::current_thread_creations();
-        let core = <DynamicTree as Sealed>::into_core(tree);
-        assert_eq!(ScopeIdentity::current_thread_creations(), after_tree);
-        drop(core);
-    }
-}
-
-/// A cheap, membership-addressed ordered scope handle.
-#[derive(Clone)]
-pub struct ScopeRef {
-    pub(crate) cell: Arc<ScopeCell>,
-}
-
-/// A cheap scope handle carrying dynamic-membership capability.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct DynamicScopeRef(ScopeRef);
-
-// Keep the observation/control surface as inherent methods on both handles:
-// callers may use either method syntax or UFCS. `Deref` below is an additional
-// backstop so a future `ScopeRef` method remains reachable even if it is not
-// immediately moved into this shared declaration.
-macro_rules! impl_scope_ref_sync_surface {
-    (
-        $(
-            $(#[$attribute:meta])*
-            fn $method:ident $(<$($generic:ident),+>)? (
-                &$receiver:ident $(, $argument:ident: $argument_type:ty)* $(,)?
-            ) $(-> $output:ty)?
-            $(where [$($constraint:tt)*])?
-            $body:block
-        )*
-    ) => {
-        impl ScopeRef {
-            $(
-                $(#[$attribute])*
-                pub fn $method $(<$($generic),+>)? (
-                    &$receiver,
-                    $($argument: $argument_type),*
-                ) $(-> $output)?
-                $(where $($constraint)*)?
-                $body
-            )*
-        }
-
-        impl DynamicScopeRef {
-            $(
-                $(#[$attribute])*
-                pub fn $method $(<$($generic),+>)? (
-                    &$receiver,
-                    $($argument: $argument_type),*
-                ) $(-> $output)?
-                $(where $($constraint)*)?
-                {
-                    $receiver.0.$method($($argument),*)
-                }
-            )*
-        }
-    };
-}
-
-macro_rules! impl_scope_ref_async_surface {
-    (
-        $(
-            $(#[$attribute:meta])*
-            fn $method:ident $(<$($generic:ident),+>)? (
-                &$receiver:ident $(, $argument:ident: $argument_type:ty)* $(,)?
-            ) $(-> $output:ty)?
-            $(where [$($constraint:tt)*])?
-            $body:block
-        )*
-    ) => {
-        impl ScopeRef {
-            $(
-                $(#[$attribute])*
-                pub async fn $method $(<$($generic),+>)? (
-                    &$receiver,
-                    $($argument: $argument_type),*
-                ) $(-> $output)?
-                $(where $($constraint)*)?
-                $body
-            )*
-        }
-
-        impl DynamicScopeRef {
-            $(
-                $(#[$attribute])*
-                pub async fn $method $(<$($generic),+>)? (
-                    &$receiver,
-                    $($argument: $argument_type),*
-                ) $(-> $output)?
-                $(where $($constraint)*)?
-                {
-                    $receiver.0.$method($($argument),*).await
-                }
-            )*
-        }
-    };
-}
-
-impl_scope_ref_sync_surface! {
-    /// Returns this scope's child id within its parent.
-    #[must_use]
-    fn id(&self) -> &ChildId {
-        self.cell.member.id()
-    }
-
-    /// Returns the scope membership identity.
-    #[must_use]
-    fn membership(&self) -> Membership {
-        self.cell.member.membership()
-    }
-
-    /// Computes an authoritative recursive snapshot on demand.
-    #[must_use]
-    fn snapshot(&self) -> Arc<ScopeSnapshot> {
-        self.cell.snapshot()
-    }
-
-    /// Subscribes to conflated recursive snapshots.
-    #[must_use]
-    fn subscribe_snapshots(&self) -> SnapshotReceiver {
-        self.cell.subscribe_snapshots()
-    }
-
-    /// Subscribes to this scope's lifecycle and all forwarded descendants.
-    #[must_use]
-    fn subscribe_lifecycle(&self) -> LifecycleEvents {
-        self.cell.subscribe_lifecycle()
-    }
-
-    /// Looks up a direct child in an authoritative current snapshot.
-    #[must_use]
-    fn child(&self, id: impl AsRef<str>) -> Option<crate::ChildSnapshot> {
-        self.snapshot().child(id).cloned()
-    }
-
-    /// Traverses a child-id path in an authoritative current snapshot.
-    #[must_use]
-    fn descendant<I, S>(&self, path: I) -> Option<crate::ChildSnapshot>
-    where [
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    ] {
-        self.snapshot().descendant(path).cloned()
-    }
-
-    /// Requests shutdown without waiting.
-    fn request_shutdown(&self) {
-        let _ = self.cell.request_shutdown();
-    }
-}
-
-impl_scope_ref_async_surface! {
-    /// Waits for a named child snapshot satisfying an at-or-past predicate.
-    ///
-    /// Snapshot watches conflate intermediate states, so `pred` should accept
-    /// every state at or beyond the desired edge and must remain cheap and
-    /// non-blocking.
-    fn wait_for_child<P>(
-        &self,
-        id: impl Into<ChildId>,
-        pred: P,
-        timeout: Duration,
-    ) -> Result<crate::ChildSnapshot, WaitError>
-    where [P: FnMut(&crate::ChildSnapshot) -> bool + Send]
-    {
-        let id = id.into();
-        let mut pred = pred;
-        let expires = crate::deadline::Deadline::after(crate::runtime::now(), timeout);
-        let mut snapshots = self.subscribe_snapshots();
-
-        loop {
-            let snapshot = snapshots.borrow_latest();
-            if let Some(child) = snapshot.child(id.as_str())
-                && pred(child)
-            {
-                return Ok(child.clone());
-            }
-            // Inspect the current snapshot before rejecting even an already
-            // elapsed (including zero-duration) budget.
-            if expires.is_due(crate::runtime::now()) {
-                return Err(WaitError::TimedOut);
-            }
-            if matches!(self.cell.member.record().stage, MemberStage::Terminal(_)) {
-                return Err(WaitError::ScopeTerminated {
-                    state: snapshot.state.clone(),
-                });
-            }
-            match crate::runtime::select_two(snapshots.changed(), async {
-                match expires.instant() {
-                    Some(expires) => crate::runtime::sleep_until_std(expires).await,
-                    None => std::future::pending().await,
-                }
-            })
-            .await
-            {
-                crate::runtime::Either::Left(Ok(_)) => {}
-                crate::runtime::Either::Left(Err(_)) => {
-                    let snapshot = snapshots.borrow_latest();
-                    if let Some(child) = snapshot.child(id.as_str())
-                        && pred(child)
-                    {
-                        return Ok(child.clone());
-                    }
-                    return Err(WaitError::ScopeTerminated {
-                        state: snapshot.state.clone(),
-                    });
-                }
-                crate::runtime::Either::Right(()) => {
-                    let snapshot = snapshots.borrow_latest();
-                    if let Some(child) = snapshot.child(id.as_str())
-                        && pred(child)
-                    {
-                        return Ok(child.clone());
-                    }
-                    return Err(WaitError::TimedOut);
-                }
-            }
-        }
-    }
-
-    /// Waits for terminal membership state.
-    fn wait_stopped(&self) -> StopReason {
-        self.cell.wait_stopped().await
-    }
-
+impl ScopeRef {
     /// Requests shutdown and waits for this scope to stop.
-    fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
+    pub async fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
         crate::driver::shutdown_scope(Arc::clone(&self.cell), timeout).await
     }
 }
 
-impl ScopeRef {
-    /// Dynamically queries whether this scope has dynamic capabilities.
-    #[must_use]
-    pub fn dynamic(&self) -> Option<DynamicScopeRef> {
-        (self.cell.flavor == ScopeFlavor::Dynamic).then(|| DynamicScopeRef(self.clone()))
-    }
-}
-
-impl fmt::Debug for ScopeRef {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ScopeRef")
-            .field("membership", &self.membership())
-            .finish()
-    }
-}
-
-// Handle identity is the slot cell, not the membership token: lowering a
-// rebuilt nested declaration rebases the token behind live pre-spawn handles,
-// and a token-value hash would strand entries keyed before the rebase.
-impl PartialEq for ScopeRef {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.cell, &other.cell)
-    }
-}
-
-impl Eq for ScopeRef {}
-
-impl Hash for ScopeRef {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.cell).hash(state);
-    }
-}
-
 impl DynamicScopeRef {
-    /// Returns the underlying observation/control scope handle.
-    #[must_use]
-    pub fn as_scope(&self) -> &ScopeRef {
-        &self.0
+    /// Requests shutdown and waits for this scope to stop.
+    pub async fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
+        self.0.shutdown_and_wait(timeout).await
     }
 
     /// Reserves an actor id synchronously and exposes its exact handle.
@@ -1656,14 +1421,6 @@ impl DynamicScopeRef {
     }
 }
 
-impl Deref for DynamicScopeRef {
-    type Target = ScopeRef;
-
-    fn deref(&self) -> &Self::Target {
-        self.as_scope()
-    }
-}
-
 #[must_use = "dropping the sole system owner requests graceful shutdown"]
 /// The sole owning handle for a running root system.
 pub struct System<R = ScopeRef> {
@@ -1739,5 +1496,151 @@ impl<R> Drop for System<R> {
         if self.armed {
             self.run.request_shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        panic::{AssertUnwindSafe, catch_unwind},
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll, Wake, Waker},
+        time::Duration,
+    };
+
+    use super::{
+        Admission, AdmissionOwnership, DynamicTree, Removal, TaskRef, Tree, sealed::Sealed,
+    };
+    use crate::{ExitKind, TaskDef, identity::ScopeIdentity};
+
+    struct DropAdmissionAndPanic {
+        admission: Mutex<Option<Admission<TaskRef>>>,
+    }
+
+    impl Wake for DropAdmissionAndPanic {
+        fn wake(self: Arc<Self>) {
+            drop(
+                self.admission
+                    .lock()
+                    .expect("admission mutex poisoned")
+                    .take(),
+            );
+            panic!("hostile observation waker");
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            drop(
+                self.admission
+                    .lock()
+                    .expect("admission mutex poisoned")
+                    .take(),
+            );
+            panic!("hostile observation waker");
+        }
+    }
+
+    #[test]
+    fn subtree_conversion_moves_without_minting_a_phantom_scope() {
+        let tree = Tree::new();
+        let after_tree = ScopeIdentity::current_thread_creations();
+        let core = <Tree as Sealed>::into_core(tree);
+        assert_eq!(ScopeIdentity::current_thread_creations(), after_tree);
+        drop(core);
+
+        let tree = DynamicTree::new();
+        let after_tree = ScopeIdentity::current_thread_creations();
+        let core = <DynamicTree as Sealed>::into_core(tree);
+        assert_eq!(ScopeIdentity::current_thread_creations(), after_tree);
+        drop(core);
+    }
+
+    #[test]
+    fn lost_removal_response_policy_fails_closed() {
+        assert_eq!(
+            super::lost_removal_response_outcome(),
+            crate::RemoveOutcome::Removed
+        );
+    }
+
+    #[test]
+    fn closed_removal_response_fails_closed_after_debug_diagnostic() {
+        let (sender, response) = crate::runtime::oneshot();
+        drop(sender);
+        let mut removal = Removal::new(response);
+        let mut context = Context::from_waker(Waker::noop());
+        let observed = catch_unwind(AssertUnwindSafe(|| {
+            Pin::new(&mut removal).poll(&mut context)
+        }));
+
+        #[cfg(debug_assertions)]
+        assert!(
+            observed.is_err(),
+            "debug builds expose the broken removal response obligation"
+        );
+        #[cfg(not(debug_assertions))]
+        assert_eq!(
+            observed.expect("release fallback does not panic"),
+            std::task::Poll::Ready(crate::RemoveOutcome::Removed)
+        );
+    }
+
+    #[crate::runtime::test]
+    async fn saturated_fused_drop_before_exit_suppresses_restart_accounting() {
+        crate::driver::exercise_saturated_fused_drop_before_exit(|reservation| {
+            Admission::new(reservation, (), AdmissionOwnership::Fused)
+        })
+        .await;
+    }
+
+    #[crate::runtime::test]
+    async fn unpolled_fused_drop_releases_reservations_despite_a_reentrant_panicking_waker() {
+        let system = DynamicTree::new().spawn().expect("runtime is available");
+        system.wait_started().await.expect("dynamic root starts");
+        let scope = system.scope();
+
+        let first_slot = scope.reserve_task("first").expect("first id is free");
+        let first = first_slot.task_ref();
+        let first_admission = first_slot.define(TaskDef::new(|_| std::future::pending()));
+        let second_slot = scope.reserve_task("second").expect("second id is free");
+        let second = second_slot.task_ref();
+        let second_admission = second_slot.define(TaskDef::new(|_| std::future::pending()));
+
+        let mut first_wait = Box::pin(first.wait());
+        let waker = Waker::from(Arc::new(DropAdmissionAndPanic {
+            admission: Mutex::new(Some(second_admission)),
+        }));
+        assert!(
+            first_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        catch_unwind(AssertUnwindSafe(|| drop(first_admission)))
+            .expect_err("the hostile membership waker still surfaces");
+        assert!(matches!(
+            first_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(second.wait().await.kind(), ExitKind::NeverStarted));
+
+        drop(
+            scope
+                .reserve_task("first")
+                .expect("first reservation was released"),
+        );
+        drop(
+            scope
+                .reserve_task("second")
+                .expect("reentrant second reservation was released"),
+        );
+        system
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("cancelled reservations leave no stragglers");
     }
 }

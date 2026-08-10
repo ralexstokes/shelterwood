@@ -6,14 +6,19 @@ set -euo pipefail
 cd "${SHELTERWOOD_ENFORCEMENT_ROOT:-.}"
 
 readonly forbidden='[.]downcast(_ref|_mut)?([[:space:]]*)?(::)?[<(]'
-readonly exit_path=(
-  crates/shelterwood/src/driver.rs
+readonly driver_path="crates/shelterwood/src/driver.rs"
+readonly driver_module_root="crates/shelterwood/src/driver"
+
+shopt -s globstar nullglob
+readonly exit_paths=(
+  "$driver_path"
+  "$driver_module_root"/**/*.rs
   crates/shelterwood/src/engine.rs
   crates/shelterwood/src/exit.rs
 )
 
 set +e
-matches="$({ rg --line-number "$forbidden" "${exit_path[@]}"; } 2>&1)"
+matches="$({ rg --line-number "$forbidden" "${exit_paths[@]}"; } 2>&1)"
 status=$?
 set -e
 

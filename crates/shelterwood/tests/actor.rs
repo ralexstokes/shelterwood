@@ -238,8 +238,8 @@ struct AwaitingDecorator<R> {
 impl<R: RawActor> RawActor for AwaitingDecorator<R> {
     type Msg = R::Msg;
 
-    fn readiness(&self) -> Readiness {
-        self.inner.readiness()
+    fn readiness() -> Readiness {
+        R::readiness()
     }
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
@@ -328,8 +328,7 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
             }),
         )
         .await
-        .expect("dynamic actor admitted")
-        .into_handles();
+        .expect("dynamic actor admitted");
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             dynamic_events
@@ -357,8 +356,8 @@ struct ResumeProbeDecorator<R> {
 impl<R: RawActor> RawActor for ResumeProbeDecorator<R> {
     type Msg = R::Msg;
 
-    fn readiness(&self) -> Readiness {
-        self.inner.readiness()
+    fn readiness() -> Readiness {
+        R::readiness()
     }
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {

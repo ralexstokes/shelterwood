@@ -755,8 +755,10 @@ pub(crate) struct ResolvedCommonOptions {
     pub(crate) shutdown: Shutdown,
     pub(crate) mailbox: Mailbox,
     pub(crate) mailbox_shutdown: MailboxShutdown,
+    /// Effective definition readiness. Every kind arrives here already
+    /// resolved: raw actors fold their type-level default into the definition
+    /// at erasure, so no per-incarnation fallback remains.
     pub(crate) readiness: Readiness,
-    pub(crate) readiness_override: Option<Readiness>,
     pub(crate) readiness_deadline: ReadinessDeadline,
     pub(crate) retention: Retention,
 }
@@ -787,7 +789,6 @@ pub(crate) fn resolve_common(
         mailbox: resolve_mailbox(options.mailbox, defaults.mailbox, defaults.queue_capacity),
         mailbox_shutdown: resolve(options.mailbox_shutdown, defaults.mailbox_shutdown),
         readiness: resolve(options.readiness, default_readiness),
-        readiness_override: options.readiness,
         readiness_deadline: resolve_readiness_deadline(
             options.readiness_deadline,
             defaults.readiness_deadline,
@@ -1348,7 +1349,6 @@ mod tests {
         assert_eq!(child.mailbox, inherited.mailbox);
         assert_eq!(child.mailbox_shutdown, inherited.mailbox_shutdown);
         assert_eq!(child.readiness, Readiness::Manual);
-        assert_eq!(child.readiness_override, None);
         assert_eq!(child.readiness_deadline, inherited.readiness_deadline);
         assert_eq!(child.retention, Retention::Retain);
 
@@ -1372,7 +1372,6 @@ mod tests {
         assert_eq!(overridden.mailbox, inherited.mailbox);
         assert_eq!(overridden.mailbox_shutdown, MailboxShutdown::Drain);
         assert_eq!(overridden.readiness, Readiness::Immediate);
-        assert_eq!(overridden.readiness_override, Some(Readiness::Immediate));
         assert_eq!(
             overridden.readiness_deadline,
             ReadinessDeadline::Bounded(Duration::from_nanos(1))

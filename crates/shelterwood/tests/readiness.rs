@@ -11,7 +11,7 @@ use crate::common::{
 };
 use shelterwood::{
     Backoff, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult, Jitter,
-    RawActor, RawContext, RawOnceDef, Readiness, ReadinessDeadline, RestartCondition,
+    RawActor, RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, RestartCondition,
     RestartPolicy, ScopeState, Shutdown, StartupError, StartupFailureCause, SubtreeOnceDef,
     TaskDef, Tree,
 };
@@ -21,7 +21,7 @@ struct ReadyThenStop;
 impl RawActor for ReadyThenStop {
     type Msg = ();
 
-    fn readiness(&self) -> Readiness {
+    fn readiness() -> Readiness {
         Readiness::Manual
     }
 
@@ -723,8 +723,7 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
             .readiness_deadline(ReadinessDeadline::Unbounded),
         )
         .await
-        .expect("runtime member is admitted")
-        .into_handles();
+        .expect("runtime member is admitted");
     assert!(runtime_started.load(Ordering::SeqCst));
     initial_release.release();
     system
@@ -790,14 +789,14 @@ async fn nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause() {
         std::error::Error::source(&startup).expect("startup error exposes its outer child failure");
     assert_eq!(
         outer_source.to_string(),
-        "child `nested` failed during startup"
+        "child `nested` failed during startup: child `inner-failure` failed during startup: startup failure"
     );
     let inner_source = outer_source
         .source()
         .expect("the child exit exposes the nested structured failure");
     assert_eq!(
         inner_source.to_string(),
-        "child `inner-failure` failed during startup"
+        "child `inner-failure` failed during startup: startup failure"
     );
     assert_eq!(
         inner_source
@@ -1039,8 +1038,7 @@ async fn nested_startup_rollback_includes_runtime_added_members() {
             }),
         )
         .await
-        .expect("runtime member is admitted during nested startup")
-        .into_handles();
+        .expect("runtime member is admitted during nested startup");
     runtime_started.wait().await;
 
     fail.release();
@@ -1061,4 +1059,68 @@ async fn nested_startup_rollback_includes_runtime_added_members() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root rolls back");
+}
+
+struct NeverConstructed;
+
+impl RawActor for NeverConstructed {
+    type Msg = ();
+
+    async fn run(&mut self, _: &mut RawContext<Self::Msg>) -> ExitResult {
+        unreachable!("the factory panics before an incarnation exists")
+    }
+}
+
+#[tokio::test]
+async fn immediate_raw_construction_panic_classifies_post_ready() {
+    // Resolved-`Immediate` readiness publishes at spawn, before the raw
+    // factory runs (SPEC §6): a construction panic is a post-ready failure,
+    // so ordered startup has already advanced past the child and later
+    // siblings still start.
+    let sibling_started = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_raw(
+        "constructs-never",
+        RawDef::factory(|| -> NeverConstructed { panic!("raw construction panic") })
+            .restart(never()),
+    )
+    .expect("valid raw actor");
+    tree.add_task(
+        "sibling",
+        TaskDef::new({
+            let sibling_started = Arc::clone(&sibling_started);
+            move |context| {
+                sibling_started.store(true, Ordering::SeqCst);
+                async move {
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        }),
+    )
+    .expect("valid sibling");
+
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("spawn-time readiness classifies the construction panic post-ready");
+    assert!(sibling_started.load(Ordering::SeqCst));
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            system
+                .scope()
+                .child("constructs-never")
+                .is_some_and(|child| matches!(
+                    &child.state,
+                    ChildState::Stopped { exit } if matches!(exit.kind(), ExitKind::Panicked { .. })
+                ))
+        })
+        .await,
+        "the terminal panic is an ordinary post-ready stop, not a startup abort"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("clean shutdown");
 }

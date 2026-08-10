@@ -322,8 +322,8 @@ insertion. All handles resolve through their cell.
 `Membership` is a public opaque token — the membership-level twin of
 §3.3's `Incarnation` (trait matrix: B.10 — `Copy`-cheap, `Eq + Hash`,
 `Send + Sync`). It appears wherever a membership is identified: events
-(B.4), admission receipts (B.8), snapshots (B.6), and §7's structured
-error payloads. Both tokens are views of §3.1's one fencing primitive;
+(B.4), returned admission handles (B.8), snapshots (B.6), and §7's
+structured error payloads. Both tokens are views of §3.1's one fencing primitive;
 `Incarnation::membership()` projects an incarnation's owning membership,
 and equality between an incarnation's projection and a held membership
 token is the "same slot?" question answered exactly. `supersedes` on
@@ -346,8 +346,8 @@ Consequences (normative):
 - `remove` and lookup by handle are cell reads, not scans. There is exactly
   one "child not found" outcome, not one per handle flavor.
 - Dynamic mutations resolve **at admission**: the `add_*` future's value is
-  the stamped cell's receipt, and startup is never part of the call —
-  observe startup separately through the receipt's handles (B.8). A caller
+  the stamped cell's exact per-kind handle set, and startup is never part of
+  the call — observe startup separately through those handles (B.8). A caller
   that abandons or times out its own startup wait therefore already holds
   the exact identity needed to reconcile or remove — closing the
   unknown-outcome window without application-level epoch bookkeeping.
@@ -655,7 +655,8 @@ established in the construction-path types, before erasure:
 ```rust
 trait RawActor: Send + 'static {
     type Msg: Send + 'static;
-    fn readiness(&self) -> Readiness { Readiness::Immediate }   // §6
+    // Type-level definition metadata, read before incarnation construction.
+    fn readiness() -> Readiness { Readiness::Immediate }        // §6
     // Desugared per §4.1's Send-bound rule; implementors write `async fn`.
     fn run(&mut self, ctx: &mut RawContext<Self::Msg>)
         -> impl Future<Output = ExitResult> + Send;
@@ -694,10 +695,12 @@ trait RawActor: Send + 'static {
   raw-actor wrapper, which owns the `Uninit(Args) → Running(A)` transition;
   `ActorDef` and `ActorOnceDef` construct that wrapper rather than relying on
   a blanket `impl<A: Actor> RawActor for A` (which cannot exist before
-  `init` produces `A`). The wrapper stores its declared readiness mode, the
-  engine reads it before `run` is first polled, and only `AfterInit` performs
-  the automatic post-init `mark_ready`; `Immediate` and `Manual` retain their
-  declared meanings. Raw decorators can wrap `Handler<A>` directly and may
+  `init` produces `A`). The wrapper supplies `AfterInit` as its type-level
+  readiness default; the engine resolves that default with any child-definition
+  override before constructing an incarnation, and only an effective
+  `AfterInit` mode performs the automatic post-init `mark_ready`. `Immediate`
+  and `Manual` retain their declared meanings. Raw decorators can wrap
+  `Handler<A>` directly and may
   await before delegation without changing readiness. Handler decorators use
   the zero-cost same-message `Context::for_actor` / `StopContext::for_actor`
   reborrow, sharing identity and incarnation-owned resources. Executable
@@ -1099,8 +1102,8 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
 
 - `Actor` (blanket) children default to `AfterInit`: ready when `init`
   returns `Ok`.
-- Raw actors declare via `RawActor::readiness()`; decorators propagate with
-  a visible `self.inner.readiness()`. The trait default is `Immediate`, so
+- Raw actor types declare via `RawActor::readiness()`; decorators propagate
+  with a visible `R::readiness()`. The trait default is `Immediate`, so
   a decorator that omits propagation reports immediate readiness — an
   ordinary, testable bug (the sibling starts unblocked and ordered-startup
   tests see it), not the origin's silent mid-`init` gate release; §13.6's
@@ -1115,10 +1118,10 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   boundary. A decorator that awaited anything before delegating silently
   released the ordered-startup gate before the inner actor's init ran.)
 - Per-declaration override lives on the child options (§8) uniformly for
-  actor and task children — readiness is per instance, not per type [#368]
-  (e.g. "not ready
-  until an external handshake completes" must be declarable on one instance
-  of an ordinary handler actor). Subtree children are the stated
+  actor and task children. A raw actor type supplies the fallback mode, but
+  each child definition resolves its own effective mode [#368] (e.g. "not
+  ready until an external handshake completes" must be declarable for one
+  ordinary handler child without changing the handler type). Subtree children are the stated
   exception: their readiness is structural (below), so the subtree veneer
   carries no mode override — only the deadline.
 - The deadline is not part of the mode: it lives on the shared options
@@ -1136,6 +1139,16 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   startup-failure exit cause (§7) — one type, for tasks and actors alike,
   produced by one engine-side timeout (not re-implemented per child kind
   and reunited by downcast).
+- An effective `Immediate` mode publishes readiness **at spawn**: the
+  engine marks the child ready when it launches the incarnation, before
+  the child's future is first polled — for a raw child, before its
+  factory has constructed the actor. Uniformly for tasks and raw actors,
+  a failure inside an effectively-immediate child — including a raw
+  construction panic — is therefore a **post-ready** exit for startup
+  classification (§7): an ordered sequence has already advanced past the
+  child, later siblings still start, and `wait_started()` does not
+  report a startup abort for it. A definition that wants construction
+  observed pre-ready declares a gated mode instead.
 - Ordered scopes start children sequentially; a gated child blocks the
   sequence until ready. A pre-ready exit follows the child's restart policy
   like any other exit (§7): while restarts remain eligible the sequence
@@ -1608,17 +1621,19 @@ Rules (normative):
   (and therefore `add_*`) yields the child's handles synchronously:
   `ActorRef<M>` for the four actor forms; `TaskRef` for tasks, joined by
   the owned `OneShotTaskRef<T>` on the one-shot form; `T::Ref` for
-  subtrees. On a dynamic scope the same per-kind handle set arrives
-  inside the admission receipt (B.8), which additionally carries the
-  membership token (§3.2); the slot's pre-admission handles and the
-  receipt's resolve through the same cell — one identity, no
-  reconciling.
+  subtrees. On a dynamic scope the admission future returns that same
+  per-kind handle set directly (B.8). Every returned set contains a
+  membership-addressed component: `ActorRef`, `TaskRef`, or `T::Ref` exposes
+  the membership token through `membership()` (§3.2). The slot's pre-admission
+  handles and the returned handles resolve through the same cell — one identity,
+  no reconciling.
 - **Definition is consuming**, so double-definition is unrepresentable
   (§4.2's owned-`FnOnce` shape at the declaration layer). On a
   declaration builder, `define` completes the declaration synchronously
   and cannot fail — spec-level validation already happened eagerly at
   spec construction (§9.3). On a dynamic scope, `define` *is* the
-  admission call: a future resolving at admission to the receipt (B.8).
+  admission call: a future resolving at admission to the per-kind handles
+  (B.8).
   Its operation errors are `NotAdmitting` and the first-poll
   `NoRuntime` rejection below: the id errors were already spent at
   reserve, and definition validation was spent at spec construction
@@ -2275,7 +2290,8 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   an ordered parent this is a pre-ready exit and §6's sequence rules
   apply unchanged.
 - Dynamic membership operations: `add_*` and their `_once` twins resolve
-  at admission with a receipt (§3.2) — startup is never part of the call
+  at admission with their exact per-kind handles (§3.2) — startup is never
+  part of the call
   (B.8); `remove` is **idempotent at the API
   boundary** — removing an already-absent child is one unified
   already-absent outcome (success-shaped or a single variant; not distinct
@@ -2530,7 +2546,7 @@ integration toolkit for the driver shell and the end-to-end invariants.
 12. **Dynamic mutations resolve at admission with usable identity — they
     never await startup; removal is idempotent.** Await an `add_*` against
     a child whose startup is gated shut (a parked `init`, an unreleased
-    `Manual` gate) and require it to resolve anyway; use the receipt
+    `Manual` gate) and require it to resolve anyway; use the returned handle
     (snapshot subscription, removal) while the child has still never
     started; subscribe from a pre-spawn handle (initial value: the
     `Unstarted` scope snapshot / `Admitted` child state — B.4, B.6) and
@@ -2961,8 +2977,8 @@ downstream applications), never in core:
   refs; the framework deliberately omits name→ref messaging (§11).
 - **`ServiceRef`/route-cell handoff adapter** (§3.4) and the
   **transactional handoff helper** (mount/commit/retire hooks over dynamic
-  scopes): the primitives — receipts (§3.2), idempotent and exact-handle
-  removal (§11), the sibling barrier (§23) — are library surface; the
+  scopes): the primitives — direct admission handles (§3.2), idempotent and
+  exact-handle removal (§11), the sibling barrier (§23) — are library surface; the
   orchestration is a utilities crate.
 - **Distribution / remote refs** (proxy-actor design, #247).
 - **Durable at-least-once delivery** (#244).
@@ -3509,12 +3525,13 @@ is the only lowering with a builder caller: a lowering elsewhere that
 finds unfilled reservations is the scope incarnation's startup failure
 instead, carried as the startup-failure payload's lowering cause
 (§11's lowering rule, B.5). The `add_*`
-future resolves **at admission** and its value is the receipt (§3.2):
-per kind, the same handles the builder forms return — `ActorRef<M>`;
-`TaskRef`, plus `OneShotTaskRef<T>` on one-shot task forms; the
-subtree's `T::Ref` — plus the membership token. Startup is never
-awaited by the call; observe it through the receipt's
-handles (the `wait_for_child` helper — B.9, snapshots, events). A caller
+future resolves **at admission** and returns, per kind, the same handles the
+builder forms return (§3.2): `ActorRef<M>`; `TaskRef`, plus
+`OneShotTaskRef<T>` on one-shot task forms; or the subtree's `T::Ref`. Every
+set contains a membership-addressed component: `ActorRef`, `TaskRef`, or
+`T::Ref` exposes the membership token through `membership()`. Startup is never
+awaited by the call; observe it through the returned handles (the
+`wait_for_child` helper — B.9, snapshots, events). A caller
 that abandons its own startup wait therefore still holds identity, and
 one that *cancels the call itself* is covered by §8's drop rules — a
 dropped fused `add_*` future withdraws or removes, never orphans; a
@@ -3739,8 +3756,8 @@ conflation, outlines, metrics) and port in full alongside it.
    and post-commit reconciliation. Fault injection covers pre-commit crash
    and post-commit reply loss; the script proves accepted-request
    quiescence, the crash-window fence, and reconcile-or-rollback for each
-   outcome. This scenario is the reason receipts (§3.2), incarnation
-   tokens and the retry discipline (§3.3), idempotent/exact-handle removal
+   outcome. This scenario is the reason direct admission handles (§3.2),
+   incarnation tokens and the retry discipline (§3.3), idempotent/exact-handle removal
    (§11), and the replacement-membership boundary (§3.4) exist.
 2. **Sidecar — task-first embedding in a host-owned process.** Four plain
    supervised tasks plus one small actor subtree as a sibling, in a process

@@ -446,8 +446,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     let session = sessions
         .add_subtree_once("session", SubtreeOnceDef::new(session_data.tree))
         .await
-        .expect("session admitted")
-        .into_handles();
+        .expect("session admitted");
     let session_membership = session.membership();
 
     assert!(
@@ -535,8 +534,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
             ActorDef::<ToolActor>::cloned(completions).restart(RestartPolicy::default()),
         )
         .await
-        .expect("temporary tool admitted")
-        .into_handles();
+        .expect("temporary tool admitted");
     tools
         .wait_for_child(
             "temporary-tool",
@@ -647,8 +645,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     let replacement = sessions
         .add_subtree_once("session", SubtreeOnceDef::new(replacement_data.tree))
         .await
-        .expect("same id is reusable after removal completes")
-        .into_handles();
+        .expect("same id is reusable after removal completes");
     assert!(replacement.membership().supersedes(session_membership));
     sessions
         .wait_for_child(
@@ -761,8 +758,7 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
     let session = sessions
         .add_subtree_once("session-1", SubtreeOnceDef::new(session))
         .await
-        .expect("session admitted")
-        .into_handles();
+        .expect("session admitted");
 
     // Mid-life streaming works and the idle timer is armed from init.
     stream.send(5).await.expect("stream accepts mid-life value");

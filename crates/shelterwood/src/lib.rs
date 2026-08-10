@@ -54,9 +54,9 @@ pub use raw::{
 pub use scope::{DynamicScopeRef, ScopeRef};
 pub use task::{OneShotTaskRef, TaskContext, TaskDef, TaskOnceDef, TaskRef};
 pub use tree::{
-    ActorSlot, Admission, AdmissionReceipt, BuildError, DynamicActorSlot, DynamicSubtreeSlot,
-    DynamicTaskSlot, DynamicTree, Removal, StartOrShutdownError, Subtree, SubtreeDef,
-    SubtreeOnceDef, SubtreeSlot, System, TaskSlot, Tree,
+    ActorSlot, Admission, BuildError, DynamicActorSlot, DynamicSubtreeSlot, DynamicTaskSlot,
+    DynamicTree, Removal, StartOrShutdownError, Subtree, SubtreeDef, SubtreeOnceDef, SubtreeSlot,
+    System, TaskSlot, Tree,
 };
 
 // Keep the repository-facing examples in the same rustdoc compilation lane as

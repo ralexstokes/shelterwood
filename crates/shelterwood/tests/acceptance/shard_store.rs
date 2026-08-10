@@ -226,8 +226,7 @@ impl RouterActor {
             .ranges
             .add_subtree_once(id.clone(), SubtreeOnceDef::new(tree))
             .await
-            .map_err(|error| ExitError::message(format!("range admission failed: {error}")))?
-            .into_handles();
+            .map_err(|error| ExitError::message(format!("range admission failed: {error}")))?;
         let ready = self
             .0
             .ranges
@@ -620,8 +619,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
     let scope = ranges
         .add_subtree_once("range-live", SubtreeOnceDef::new(mount))
         .await
-        .expect("range admission")
-        .into_handles();
+        .expect("range admission");
 
     let write = tokio::spawn({
         let actor = actor.clone();

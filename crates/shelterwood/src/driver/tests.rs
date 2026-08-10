@@ -1,7 +1,7 @@
-
 use std::{
     future::{self, Future},
     panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
     sync::{
         Arc, Barrier, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -3315,97 +3315,89 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
 }
 
 #[crate::runtime::test]
-async fn queued_admissions_spawn_no_forwarder_tasks_and_all_resolve() {
-    const ADMISSIONS: usize = super::MIN_EVENT_BATCH_LIMIT + 1;
+async fn queued_admissions_yield_to_shutdown_without_forwarder_tasks() {
+    const ADMISSIONS: usize = super::MIN_EVENT_BATCH_LIMIT * 8 + 1;
 
-    let root = isolated_scope("root", ScopeFlavor::Dynamic);
-    let (control_events, mut control_receiver) = crate::runtime::unbounded_mpsc();
-    let (critical_events, mut critical_receiver) = crate::runtime::unbounded_mpsc();
-    let control = DynamicControl::new(control_events);
-    let child_id = ChildId::from("worker");
-    let member = MemberCell::new(
-        child_id.clone(),
-        root.child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .mint_membership(&child_id)
-            .expect("child membership available"),
-    );
-    let slot = SlotCell::new(Arc::clone(&member), None);
+    let release_holder = Latch::default();
+    let mut tree = DynamicTree::new();
+    let exiting = tree
+        .add_task(
+            "exiting",
+            TaskDef::new(|context| async move {
+                context.shutdown_token().cancelled().await;
+                Ok(())
+            }),
+        )
+        .expect("exiting task is valid");
+    tree.add_task(
+        "holder",
+        TaskDef::new({
+            let release_holder = release_holder.clone();
+            move |context| {
+                let release_holder = release_holder.clone();
+                async move {
+                    context.shutdown_token().cancelled().await;
+                    release_holder.fired().await;
+                    Ok(())
+                }
+            }
+        }),
+    )
+    .expect("holding task is valid");
 
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
     let baseline = crate::runtime::alive_task_count();
-    let mut responses = Vec::with_capacity(ADMISSIONS);
-    for _ in 0..ADMISSIONS {
-        responses.push(
-            super::start_admission(control.clone(), Arc::clone(&slot), None)
-                .expect("runtime is available"),
+    let mut admissions = Vec::with_capacity(ADMISSIONS);
+    for index in 0..ADMISSIONS {
+        let mut admission = scope.add_task(
+            format!("queued-{index}"),
+            TaskDef::new(|_| future::pending()),
         );
+        assert!(
+            Pin::new(&mut admission)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "first poll synchronously queues admission {index}"
+        );
+        admissions.push(admission);
     }
-
     assert_eq!(
         crate::runtime::alive_task_count(),
         baseline,
         "synchronous admission enqueueing spawns no transport tasks"
     );
 
-    let incarnation = root
-        .child_identity
-        .lock()
-        .expect("scope identity mutex poisoned")
-        .incarnation_counter(member.membership())
-        .mint()
-        .expect("incarnation available");
+    // Latch shutdown without yielding to the already-woken driver. Its first
+    // batch begins draining and rejects one control prefix; the full-batch
+    // yield must then let `exiting` run and publish its primary-lane exit.
+    let mut shutdown = Box::pin(scope.shutdown_and_wait(Duration::from_secs(2)));
     assert!(
-        crate::runtime::unbounded_mpsc_send(
-            &critical_events,
-            DriverEvent::Child(ChildEvent::Exited {
-                child: ChildKey(1),
-                incarnation,
-                recorded: Some(RecordedOutcome::returned(Ok(()))),
-                join: JoinVerdict::Completed,
-                cancellation: Cancellation::NotObserved,
-                readiness_signal_seen: false,
-            }),
-        )
-        .is_ok()
+        shutdown
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "shutdown waits for both declared children"
+    );
+    assert!(matches!(
+        crate::runtime::timeout(Duration::from_secs(1), exiting.wait()).await,
+        crate::runtime::Timeout::Completed(_)
+    ));
+    assert!(
+        Pin::new(admissions.last_mut().expect("an admission exists"))
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "the primary exit is handled before the control suffix is drained"
     );
 
-    let mut pending = Vec::new();
-    super::collect_driver_events(
-        &mut critical_receiver,
-        super::MIN_EVENT_BATCH_LIMIT,
-        &mut pending,
-    );
-    super::collect_driver_events(
-        &mut control_receiver,
-        super::MIN_EVENT_BATCH_LIMIT,
-        &mut pending,
-    );
-    arbitrate(&mut pending);
+    release_holder.fire();
     assert!(matches!(
-        pending.first(),
-        Some((
-            _,
-            Pending::Driver(DriverEvent::Child(ChildEvent::Exited { .. }))
-        ))
+        crate::runtime::timeout(Duration::from_secs(1), shutdown.as_mut()).await,
+        crate::runtime::Timeout::Completed(Ok(()))
     ));
-    assert!(matches!(
-        control_receiver.try_recv(),
-        Ok(DriverEvent::Admission(_))
-    ));
-
-    // Ending both the collected batch and queued suffix answers every
-    // admission through its response obligation.
-    drop(pending);
-    drop(control_receiver);
-    for response in responses {
-        assert!(matches!(
-            response.receive().await,
-            Some(Err(crate::ReserveError::NotAdmitting(
-                crate::NotAdmittingCause::Terminal
-            )))
-        ));
-    }
+    drop(shutdown);
+    assert_eq!(system.wait().await, StopReason::ShutdownRequested);
 }
 
 #[crate::runtime::test]

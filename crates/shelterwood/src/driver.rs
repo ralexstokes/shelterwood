@@ -2507,10 +2507,11 @@ async fn run_scope_incarnation(
             // cannot publish Running after the stop boundary.
             pending.push(Pending::Force.classified());
         }
-        collect_driver_events(&mut event_receiver, event_batch_limit, &mut pending);
-        if let Some(receiver) = dynamic_event_receiver.as_mut() {
-            collect_driver_events(receiver, event_batch_limit, &mut pending);
-        }
+        let primary_batch_full =
+            collect_driver_events(&mut event_receiver, event_batch_limit, &mut pending);
+        let control_batch_full = dynamic_event_receiver.as_mut().is_some_and(|receiver| {
+            collect_driver_events(receiver, event_batch_limit, &mut pending)
+        });
         // Disposal completions drain after the primary and dynamic lanes, and `arbitrate`
         // sorts stably, so a `ConstructionDisposed` always trails every
         // same-class `Exited` collected in the same wake — even one produced
@@ -2684,6 +2685,15 @@ async fn run_scope_incarnation(
             });
             return reason;
         }
+
+        // A full lane may still have a queued suffix. On a current-thread
+        // runtime, immediately collecting the next batch would prevent the
+        // child, timer, and helper tasks whose events this loop prioritizes
+        // from running at all. Give those producers one scheduler turn before
+        // returning to either saturated lane.
+        if primary_batch_full || control_batch_full {
+            runtime::yield_now().await;
+        }
     }
 }
 
@@ -2720,13 +2730,15 @@ fn collect_driver_events(
     receiver: &mut runtime::UnboundedMpscReceiver<DriverEvent>,
     limit: usize,
     pending: &mut Vec<(ArbitrationClass, Pending)>,
-) {
+) -> bool {
+    let before = pending.len();
     for _ in 0..limit {
         let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
             break;
         };
         pending.push(Pending::Driver(event).classified());
     }
+    pending.len() - before == limit
 }
 
 fn restart_shutdown_work(child: ChildKey) -> (ArbitrationClass, Pending) {

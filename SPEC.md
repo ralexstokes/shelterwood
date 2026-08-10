@@ -1139,6 +1139,16 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   startup-failure exit cause (§7) — one type, for tasks and actors alike,
   produced by one engine-side timeout (not re-implemented per child kind
   and reunited by downcast).
+- An effective `Immediate` mode publishes readiness **at spawn**: the
+  engine marks the child ready when it launches the incarnation, before
+  the child's future is first polled — for a raw child, before its
+  factory has constructed the actor. Uniformly for tasks and raw actors,
+  a failure inside an effectively-immediate child — including a raw
+  construction panic — is therefore a **post-ready** exit for startup
+  classification (§7): an ordered sequence has already advanced past the
+  child, later siblings still start, and `wait_started()` does not
+  report a startup abort for it. A definition that wants construction
+  observed pre-ready declares a gated mode instead.
 - Ordered scopes start children sequentially; a gated child blocks the
   sequence until ready. A pre-ready exit follows the child's restart policy
   like any other exit (§7): while restarts remain eligible the sequence

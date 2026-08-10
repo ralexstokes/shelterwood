@@ -399,6 +399,10 @@ impl ReadinessGate {
     }
 
     /// Whether a retained signal watcher is needed for this incarnation.
+    ///
+    /// The `Unconfigured` case is unreachable from the driver, which
+    /// configures the gate at spawn now that readiness is definition-level;
+    /// it remains for the state machine's own completeness and unit tests.
     pub(crate) fn needs_signal_watch(self) -> bool {
         matches!(
             self.state,
@@ -451,6 +455,10 @@ impl ReadinessGate {
                 self.state = ReadinessState::Disarmed;
                 Some(ReadinessEffect::TimedOut { deadline })
             }
+            // The `Unconfigured` half of this arm is unreachable from the
+            // driver, which configures the gate at spawn now that readiness
+            // is definition-level; it remains for the state machine's own
+            // completeness and unit tests.
             (
                 ReadinessState::Unconfigured,
                 ReadinessEvent::Shutdown | ReadinessEvent::Exit { .. },

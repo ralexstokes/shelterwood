@@ -35,7 +35,7 @@ use crate::{
     },
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
-    runtime::{self, Latch},
+    runtime::{self, CompletionGatedLatch, Latch},
     task::{TaskContext, TaskContextLatches, TaskFactory},
 };
 
@@ -89,12 +89,14 @@ impl<T> Drop for Obligation<T> {
 struct RecordedReport {
     outcome: Option<RecordedOutcome>,
     cancellation: Cancellation,
+    readiness_signal_seen: bool,
 }
 
 struct ReportCompletion {
     sender: mpsc::Sender<RecordedReport>,
     shutdown: Latch,
     local_stop: Option<Latch>,
+    readiness: CompletionGatedLatch,
 }
 
 pub(crate) struct ReportToken {
@@ -112,11 +114,13 @@ pub(crate) struct ReportReceiver(mpsc::Receiver<RecordedReport>);
 /// language one — any replacement executor behind `runtime` must preserve it),
 /// so the exit joiner may require an immediately available report: one has
 /// already been sent on every return, panic, and cancellation edge. The
-/// shutdown/local-stop latches are sampled by that same send, making the
-/// report and its cancellation evidence one ordered observation.
+/// shutdown/local-stop and readiness latches are sampled by that same send,
+/// making the report and its completion-boundary evidence one ordered
+/// observation.
 pub(crate) fn report_channel(
     shutdown: Latch,
     local_stop: Option<Latch>,
+    readiness: CompletionGatedLatch,
 ) -> (ReportToken, ReportReceiver) {
     let (sender, receiver) = mpsc::channel();
     (
@@ -126,6 +130,7 @@ pub(crate) fn report_channel(
                     sender,
                     shutdown,
                     local_stop,
+                    readiness,
                 },
                 |completion| completion.send(None),
             ),
@@ -142,10 +147,13 @@ impl ReportCompletion {
             } else {
                 Cancellation::NotObserved
             };
-        let _ = self.sender.send(RecordedReport {
+        let readiness_signal_seen = self.readiness.complete();
+        let report = RecordedReport {
             outcome,
             cancellation,
-        });
+            readiness_signal_seen,
+        };
+        let _ = self.sender.send(report);
     }
 }
 
@@ -797,6 +805,7 @@ enum ChildEvent {
         recorded: Option<RecordedOutcome>,
         join: JoinVerdict,
         cancellation: Cancellation,
+        readiness_signal_seen: bool,
     },
     ConstructionDisposed {
         child: ChildKey,
@@ -829,7 +838,7 @@ struct ActiveChild {
     hard_abort_phase: Option<GracePhase>,
     readiness: ReadinessGate,
     readiness_deadline: Option<DeadlineHandle>,
-    ready_signal: Latch,
+    ready_signal: CompletionGatedLatch,
     construction_release: Latch,
     framework_abort: Option<Latch>,
     framework_abort_ack: Option<Latch>,
@@ -952,11 +961,16 @@ impl ChildRuntime {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
-        let changed = root.terminalize_child(&self.slot.member, exit, exited_incarnation, startup);
+        let terminalized = runtime::catch_panic(|| {
+            root.terminalize_child(&self.slot.member, exit, exited_incarnation, startup)
+        });
         if matches!(self.slot.member.record().stage, MemberStage::Terminal(_)) {
             self.terminality.complete(drop);
         }
-        changed
+        match terminalized {
+            Ok(changed) => changed,
+            Err(payload) => runtime::resume_panic(payload),
+        }
     }
 
     fn complete_terminality(&mut self) {
@@ -1015,6 +1029,10 @@ impl ChildArena {
             .map(|(key, _)| *key)
     }
 
+    fn previous_key(&self, key: ChildKey) -> Option<ChildKey> {
+        self.children.range(..key).next_back().map(|(key, _)| *key)
+    }
+
     fn values(&self) -> impl Iterator<Item = &ChildRuntime> {
         self.children.values()
     }
@@ -1063,7 +1081,7 @@ struct AncestorCommandLatches {
 }
 
 struct NestedScopeLatches {
-    parent_ready: Latch,
+    parent_ready: CompletionGatedLatch,
     ancestor: AncestorCommandLatches,
 }
 
@@ -1077,7 +1095,7 @@ impl ScopeRole {
         matches!(self, Self::Root)
     }
 
-    fn parent_ready(&self) -> Option<&Latch> {
+    fn parent_ready(&self) -> Option<&CompletionGatedLatch> {
         match self {
             Self::Root => None,
             Self::Nested(latches) => Some(&latches.parent_ready),
@@ -1110,6 +1128,11 @@ struct ScopeRuntime {
     ancestor_shutdown_seen: bool,
     ancestor_abort_seen: bool,
     hard_forced: bool,
+    ordered_stop_progressing: bool,
+    ordered_stop_cursor: Option<ChildKey>,
+    ordered_stop_waiting: Option<ChildKey>,
+    #[cfg(test)]
+    ordered_stop_inspections: usize,
     completion: Option<ScopeCompletion>,
 }
 
@@ -1208,12 +1231,12 @@ struct SpawnDispatch {
 ///   recursive drain before its task is aborted;
 /// - `construction_release` prevents a raw actor from running before the
 ///   driver has installed the readiness mode reported by construction;
-/// - `ended` makes readiness and self-stop watcher tasks finite.
+/// - `ready` also carries the completion edge that makes readiness and
+///   self-stop watcher tasks finite.
 struct SpawnLatches {
     shutdown: Latch,
     abort: Latch,
-    ready: Latch,
-    ended: Latch,
+    ready: CompletionGatedLatch,
     construction_release: Latch,
     local_stop: Latch,
     framework_abort: Latch,
@@ -1249,8 +1272,7 @@ struct ChildTaskLaunch {
     readiness_override: Option<Readiness>,
     watch_readiness: bool,
     shutdown: Latch,
-    ready: Latch,
-    ended: Latch,
+    ready: CompletionGatedLatch,
     construction_release: Latch,
     local_stop: Latch,
 }
@@ -1362,11 +1384,11 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         watch_readiness,
         shutdown,
         ready,
-        ended,
         construction_release,
         local_stop,
     } = launch;
-    let (report, report_receiver) = report_channel(shutdown, Some(local_stop.clone()));
+    let (report, report_receiver) =
+        report_channel(shutdown, Some(local_stop.clone()), ready.clone());
     let constructed_sender = events.clone();
     let handle = runtime::spawn(async move {
         let body = async move {
@@ -1393,7 +1415,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                     scope,
                     inherited,
                     latches,
-                } => run_nested_tree(factory(), scope, inherited, latches).await,
+                } => run_nested_factory(factory, scope, inherited, latches).await,
                 SpawnBody::ScopeOnce {
                     tree,
                     scope,
@@ -1412,7 +1434,6 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
     let abort_handle = handle.abort_handle();
 
     let exit_sender = events.clone();
-    let exit_ended = ended.clone();
     runtime::spawn(async move {
         let join = match runtime::join(handle).await {
             runtime::JoinOutcome::Ok { .. } => JoinVerdict::Completed,
@@ -1421,7 +1442,6 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 phase: GracePhase::WithinGrace,
             },
         };
-        exit_ended.fire();
         // The task owns `report`, whose explicit record or Drop fallback runs
         // before the join completes. `receive` therefore asserts immediate
         // post-join availability without ever blocking this runtime worker.
@@ -1434,17 +1454,19 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 recorded: report.outcome,
                 join,
                 cancellation: report.cancellation,
+                readiness_signal_seen: report.readiness_signal_seen,
             }),
         )
         .await;
     });
 
+    let completion = ready.clone();
     if watch_readiness {
         let ready_sender = events.clone();
-        let ready_ended = ended.clone();
+        let ready_completion = ready.clone();
         runtime::spawn(async move {
             if matches!(
-                runtime::select_two(ready.fired(), ready_ended.fired()).await,
+                runtime::select_two(ready.fired(), ready_completion.completed()).await,
                 runtime::Either::Left(())
             ) {
                 let _ = runtime::mpsc_send(
@@ -1461,7 +1483,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
 
     runtime::spawn(async move {
         if matches!(
-            runtime::select_two(local_stop.fired(), ended.fired()).await,
+            runtime::select_two(local_stop.fired(), completion.completed()).await,
             runtime::Either::Left(())
         ) {
             let _ = runtime::mpsc_send(
@@ -1604,7 +1626,8 @@ impl ScopeRuntime {
         // Per-incarnation latch topology:
         // - shutdown/abort flow from the ladder into application code;
         // - ready and local_stop flow from application code back to helpers;
-        // - ended terminates those helpers when the child exits first;
+        // - ready's completion edge terminates those helpers when the child
+        //   exits first and orders late retained readiness capabilities;
         // - construction_release keeps a raw actor behind the driver-owned
         //   readiness transition after its construction report is accepted;
         // - framework_abort/ack join nested-scope escalation before exit.
@@ -1612,8 +1635,7 @@ impl ScopeRuntime {
         let latches = SpawnLatches {
             shutdown: Latch::default(),
             abort: Latch::default(),
-            ready: Latch::default(),
-            ended: Latch::default(),
+            ready: CompletionGatedLatch::default(),
             construction_release: Latch::default(),
             local_stop: Latch::default(),
             framework_abort: Latch::default(),
@@ -1680,7 +1702,6 @@ impl ScopeRuntime {
             watch_readiness: gated,
             shutdown: latches.shutdown.clone(),
             ready: latches.ready.clone(),
-            ended: latches.ended.clone(),
             construction_release: latches.construction_release.clone(),
             local_stop: latches.local_stop.clone(),
         });
@@ -1937,7 +1958,10 @@ impl ScopeRuntime {
         }
         self.root.set_state(ScopeState::Draining);
         match self.root.flavor {
-            ScopeFlavor::Ordered => self.stop_next_ordered(),
+            ScopeFlavor::Ordered => {
+                self.ordered_stop_cursor = self.children.keys().next_back();
+                self.stop_next_ordered();
+            }
             ScopeFlavor::Dynamic => {
                 let children: Vec<_> = self.children.keys().collect();
                 for child in children {
@@ -1948,20 +1972,48 @@ impl ScopeRuntime {
     }
 
     fn stop_next_ordered(&mut self) {
-        if self.root.flavor != ScopeFlavor::Ordered || !self.lifecycle.is_draining() {
+        if self.root.flavor != ScopeFlavor::Ordered
+            || !self.lifecycle.is_draining()
+            || self.ordered_stop_progressing
+        {
             return;
         }
-        loop {
-            let Some(key) = self.children.keys().rev().find(|key| {
-                !self.children[*key].is_terminal() || self.children[*key].is_disposing()
-            }) else {
-                return;
-            };
-            self.begin_stop_child(key, None);
-            if self.children[key].active.is_some() || self.children[key].is_disposing() {
+        self.ordered_stop_progressing = true;
+        if let Some(key) = self.ordered_stop_waiting {
+            let waiting = self
+                .children
+                .get(key)
+                .is_some_and(|child| !child.is_terminal() || child.is_disposing());
+            if waiting {
+                self.ordered_stop_progressing = false;
                 return;
             }
+            self.ordered_stop_waiting = None;
         }
+        while let Some(key) = self.ordered_stop_cursor {
+            self.ordered_stop_cursor = self.children.previous_key(key);
+            #[cfg(test)]
+            {
+                self.ordered_stop_inspections += 1;
+            }
+            // The cursor key is held across await boundaries, so never index
+            // the arena with it: a reclaimed slot is treated as already gone.
+            let Some(child) = self.children.get(key) else {
+                continue;
+            };
+            if child.is_terminal() && !child.is_disposing() {
+                continue;
+            }
+            self.begin_stop_child(key, None);
+            let Some(child) = self.children.get(key) else {
+                continue;
+            };
+            if child.active.is_some() || child.is_disposing() {
+                self.ordered_stop_waiting = Some(key);
+                break;
+            }
+        }
+        self.ordered_stop_progressing = false;
     }
 
     fn force_all(&mut self) {
@@ -2066,6 +2118,23 @@ impl ScopeRuntime {
     }
 
     fn handle_self_stop(&mut self, key: ChildKey, incarnation: Incarnation) {
+        let ready_before_stop = self
+            .children
+            .get(key)
+            .and_then(|child| child.active.as_ref())
+            .is_some_and(|active| {
+                active.incarnation == incarnation && active.ready_signal.is_fired()
+            });
+        if ready_before_stop {
+            // A local stop is reported on a separate helper task. Preserve
+            // the application task's mark-ready-before-stop order even when
+            // arbitration observes the stop before the readiness event.
+            // An inverted `stop(); mark_ready()` sequence may also count as
+            // ready here when its latch fires before the driver observes the
+            // stop — licensed by the spec's "fired before ... a clean
+            // self-stop is observed" wording (§6).
+            self.handle_ready(key, incarnation);
+        }
         if self
             .children
             .get(key)
@@ -2083,7 +2152,28 @@ impl ScopeRuntime {
         recorded: Option<RecordedOutcome>,
         mut join: JoinVerdict,
         cancellation: Cancellation,
+        readiness_signal_seen: bool,
     ) {
+        let readiness_effect = self
+            .children
+            .get_mut(key)
+            .and_then(|child| child.active.as_mut())
+            .filter(|active| active.incarnation == incarnation)
+            .and_then(|active| {
+                active.readiness.step(ReadinessEvent::Exit {
+                    signal_seen: readiness_signal_seen,
+                })
+            });
+        let became_ready = readiness_effect
+            .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
+            .unwrap_or(false);
+        if became_ready {
+            // Match the natural signal-before-exit order: ordered startup may
+            // advance, and a sole ready child completes aggregate startup
+            // before its post-ready exit is classified.
+            self.progress_startup();
+        }
+
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
@@ -2105,7 +2195,6 @@ impl ScopeRuntime {
         {
             runtime::dispose_detached(teardown);
         }
-        active.readiness.step(ReadinessEvent::Exit);
         if let (JoinVerdict::Cancelled { .. }, Some(phase)) = (&join, active.hard_abort_phase) {
             join = JoinVerdict::Cancelled { phase };
         }
@@ -2185,10 +2274,10 @@ impl ScopeRuntime {
                         record.last_exit = Some(exit.clone());
                         record.restart_count = decision.restart_count;
                         // Publish the derived schedule even when intensity
-                        // prevents spawning it. The engine clamps
-                        // unrepresentable deadlines far future, so
-                        // `restart_at` is present exactly while restarting.
-                        record.restart_at = Some(decision.restart_at);
+                        // prevents spawning it. `None` means the exact clock
+                        // point cannot be represented and armed; no substitute
+                        // restart is scheduled.
+                        record.restart_at = decision.restart_at;
                         record.stage = MemberStage::Restarting;
                     },
                     LifecycleEventKind::Exited {
@@ -2212,10 +2301,12 @@ impl ScopeRuntime {
                     }
                     self.begin_drain(StopReason::IntensityTripped(trip));
                 } else {
-                    child.restart_deadline = Some(
-                        self.deadlines
-                            .push(decision.restart_at, DeadlineKind::Restart { child: key }),
-                    );
+                    if let Some(restart_at) = decision.restart_at {
+                        child.restart_deadline = Some(
+                            self.deadlines
+                                .push(restart_at, DeadlineKind::Restart { child: key }),
+                        );
+                    }
                 }
             }
         }
@@ -2414,6 +2505,10 @@ impl ScopeRuntime {
                     }
                 } else {
                     self.spawn_child(child);
+                    // A restart-deadline caller is outside `progress_startup`'s
+                    // ordered loop. Revisit the aggregate in case this spawn's
+                    // immediate-readiness effect released its last gate.
+                    self.progress_startup();
                 }
             }
             DeadlineKind::Stop { child, incarnation } => {
@@ -2726,15 +2821,44 @@ async fn run_nested_tree(
     inherited: ResolvedDefaults,
     latches: NestedScopeLatches,
 ) -> crate::ExitResult {
-    let Some(epoch) = ScopeEpochGuard::begin(&scope) else {
+    let epoch = begin_nested_incarnation(&scope)?;
+    run_nested_tree_with_epoch(tree, scope, inherited, latches, epoch).await
+}
+
+/// Begins the nested epoch before invoking its synchronous restartable
+/// factory. Tokio cancellation cannot interrupt one in-progress poll, so a
+/// factory that overlaps parent-driver destruction must already own the
+/// epilogue that makes `wait_stopped` final.
+async fn run_nested_factory(
+    factory: ScopeFactory,
+    scope: Arc<ScopeCell>,
+    inherited: ResolvedDefaults,
+    latches: NestedScopeLatches,
+) -> crate::ExitResult {
+    let epoch = begin_nested_incarnation(&scope)?;
+    let tree = factory();
+    run_nested_tree_with_epoch(tree, scope, inherited, latches, epoch).await
+}
+
+fn begin_nested_incarnation(scope: &Arc<ScopeCell>) -> Result<ScopeEpochGuard, crate::ExitError> {
+    ScopeEpochGuard::begin(scope).ok_or_else(|| {
         let failure = StartupFailure {
             cause: StartupFailureCause::IdentityExhausted {
                 id: scope.member.id().clone(),
             },
         };
         scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
-        return Err(crate::ExitError::from_startup_failure(failure));
-    };
+        crate::ExitError::from_startup_failure(failure)
+    })
+}
+
+async fn run_nested_tree_with_epoch(
+    tree: BuilderCore,
+    scope: Arc<ScopeCell>,
+    inherited: ResolvedDefaults,
+    latches: NestedScopeLatches,
+    epoch: ScopeEpochGuard,
+) -> crate::ExitResult {
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
         Err(error) => {
@@ -2852,6 +2976,11 @@ async fn run_scope_incarnation(
         ancestor_shutdown_seen: false,
         ancestor_abort_seen: false,
         hard_forced: false,
+        ordered_stop_progressing: false,
+        ordered_stop_cursor: None,
+        ordered_stop_waiting: None,
+        #[cfg(test)]
+        ordered_stop_inspections: 0,
         completion: None,
         // Transfer last: every fallible setup expression above remains
         // covered by the pre-driver guard, and completed construction moves
@@ -3032,7 +3161,15 @@ async fn run_scope_incarnation(
                     recorded,
                     join,
                     cancellation,
-                })) => scope.handle_exit(child, incarnation, recorded, join, cancellation),
+                    readiness_signal_seen,
+                })) => scope.handle_exit(
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                ),
                 Pending::Driver(DriverEvent::Child(ChildEvent::ConstructionDisposed {
                     child,
                     panic,
@@ -3133,17 +3270,18 @@ mod tests {
         future::{self, Future},
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
-            Arc, Barrier, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            Arc, Barrier, Condvar, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
 
     use crate::{
-        ActorRef, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
-        GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Readiness,
-        ReadinessDeadline, RemoveOutcome, Retention, ScopeState, SendErrorKind, StartupError,
+        ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError,
+        ExitKind, GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
+        Mailbox, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, RestartCondition,
+        RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind, StartupError,
         StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
         engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
         exit::{JoinVerdict, RecordedOutcome},
@@ -3151,16 +3289,16 @@ mod tests {
         mailbox::MailboxCell,
         plan::{ChildConstruction, SlotCell},
         policy::ResolvedDefaults,
-        runtime::Latch,
+        runtime::{CompletionGatedLatch, Latch},
     };
 
     use super::{
         AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, DriverEvent,
         DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage, NestedScopeLatches,
-        Obligation, Pending, RemovalResponses, RuntimeStorage, ScopeCell, ScopeEpochGuard,
-        ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition, complete_removals,
-        report_channel, resident_projection, restart_shutdown_work, run_nested_tree,
-        run_scope_incarnation,
+        Obligation, Pending, RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell,
+        ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
+        complete_removals, report_channel, resident_projection, restart_shutdown_work,
+        run_nested_factory, run_nested_tree, run_scope_incarnation,
     };
 
     /// Bounds every gate-capture probe wait. The probe sender lives inside
@@ -3179,6 +3317,92 @@ mod tests {
         ScopeCell::new(member, flavor, ScopeIdentity::new())
     }
 
+    #[derive(Debug, Default)]
+    struct FactoryGate {
+        entered: AtomicBool,
+        released: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl FactoryGate {
+        fn block(&self) {
+            self.entered.store(true, Ordering::Release);
+            let mut released = self
+                .released
+                .lock()
+                .expect("factory gate mutex remains healthy");
+            self.changed.notify_all();
+            while !*released {
+                released = self
+                    .changed
+                    .wait(released)
+                    .expect("factory gate mutex remains healthy while blocked");
+            }
+        }
+
+        async fn wait_entered(&self) {
+            while !self.entered.load(Ordering::Acquire) {
+                crate::runtime::yield_now().await;
+            }
+        }
+
+        fn release(&self) {
+            let mut released = self
+                .released
+                .lock()
+                .expect("factory gate mutex remains healthy");
+            *released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    fn pending_tree() -> Tree {
+        let mut tree = Tree::new();
+        tree.add_task("pending", TaskDef::new(|_| future::pending()))
+            .expect("pending child is valid");
+        tree
+    }
+
+    fn finished_tree() -> Tree {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "finished",
+            TaskDef::new(|_| async { Ok::<_, ExitError>(()) }),
+        )
+        .expect("finished child is valid");
+        tree
+    }
+
+    struct SnapshotReentryWake {
+        scope: ScopeRef,
+        observed: std::sync::mpsc::Sender<ScopeState>,
+    }
+
+    impl Wake for SnapshotReentryWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let _ = self.observed.send(self.scope.snapshot().state.clone());
+        }
+    }
+
+    fn snapshot_reentry_waker(
+        scope: &Arc<ScopeCell>,
+    ) -> (Waker, std::sync::mpsc::Receiver<ScopeState>) {
+        let (observed, receiver) = std::sync::mpsc::channel();
+        (
+            Waker::from(Arc::new(SnapshotReentryWake {
+                scope: ScopeRef {
+                    cell: Arc::clone(scope),
+                },
+                observed,
+            })),
+            receiver,
+        )
+    }
+
     struct PendingRaw;
 
     impl crate::RawActor for PendingRaw {
@@ -3190,6 +3414,79 @@ mod tests {
 
         async fn run(&mut self, _: &mut crate::RawContext<Self::Msg>) -> crate::ExitResult {
             future::pending().await
+        }
+    }
+
+    struct PanicWake(&'static str);
+
+    impl Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            std::panic::panic_any(self.0);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            std::panic::panic_any(self.0);
+        }
+    }
+
+    struct PanicDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for PanicDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct CountedPanicWake(Arc<AtomicUsize>);
+
+    impl Wake for CountedPanicWake {
+        fn wake(self: Arc<Self>) {
+            std::panic::panic_any(PanicDropProbe(Arc::clone(&self.0)));
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            std::panic::panic_any(PanicDropProbe(Arc::clone(&self.0)));
+        }
+    }
+
+    struct CountWake(Arc<AtomicUsize>);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ObserveWakeCount {
+        wakes: Arc<AtomicUsize>,
+        observed: Mutex<Option<usize>>,
+    }
+
+    impl Wake for ObserveWakeCount {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            *self.observed.lock().expect("observation mutex poisoned") =
+                Some(self.wakes.load(Ordering::SeqCst));
+        }
+    }
+
+    struct ExitOnSignalRaw {
+        exit: Latch,
+    }
+
+    impl crate::RawActor for ExitOnSignalRaw {
+        type Msg = u8;
+
+        async fn run(&mut self, _: &mut crate::RawContext<Self::Msg>) -> crate::ExitResult {
+            self.exit.fired().await;
+            Ok(())
         }
     }
 
@@ -3215,6 +3512,91 @@ mod tests {
             Ok(()),
             "holding one system's gate must not stall another system"
         );
+    }
+
+    #[test]
+    fn snapshot_subscription_waker_can_reenter_snapshot() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let handle = ScopeRef {
+            cell: Arc::clone(&scope),
+        };
+        let mut snapshots = handle.subscribe_snapshots();
+        let (waker, observed) = snapshot_reentry_waker(&scope);
+        let mut changed = Box::pin(snapshots.changed());
+        assert!(matches!(
+            changed.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+
+        let publisher = std::thread::spawn(move || scope.set_state(ScopeState::Starting));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)),
+            Ok(ScopeState::Starting),
+            "the watch waker must run only after snapshot can reacquire the gate"
+        );
+        publisher.join().expect("snapshot publication completes");
+        assert!(matches!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(_))
+        ));
+    }
+
+    #[test]
+    fn lifecycle_subscription_waker_can_reenter_snapshot() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let handle = ScopeRef {
+            cell: Arc::clone(&scope),
+        };
+        let mut events = handle.subscribe_lifecycle();
+        let (waker, observed) = snapshot_reentry_waker(&scope);
+        let mut next = Box::pin(events.recv());
+        assert!(matches!(
+            next.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+
+        let publisher = std::thread::spawn(move || scope.set_state(ScopeState::Starting));
+        assert_eq!(
+            observed.recv_timeout(Duration::from_secs(2)),
+            Ok(ScopeState::Starting),
+            "the lifecycle waker must run only after snapshot can reacquire the gate"
+        );
+        publisher.join().expect("lifecycle publication completes");
+        assert!(matches!(
+            next.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Some(_))
+        ));
+    }
+
+    #[test]
+    fn scope_wait_waker_can_reenter_snapshot_at_terminality() {
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let handle = ScopeRef {
+            cell: Arc::clone(&scope),
+        };
+        let mut stopped = Box::pin(handle.wait_stopped());
+        let (stopped_waker, stopped_observed) = snapshot_reentry_waker(&scope);
+        assert!(matches!(
+            stopped
+                .as_mut()
+                .poll(&mut Context::from_waker(&stopped_waker)),
+            Poll::Pending
+        ));
+
+        let terminalizer = std::thread::spawn(move || scope.terminalize_never_started());
+        assert!(matches!(
+            stopped_observed.recv_timeout(Duration::from_secs(2)),
+            Ok(ScopeState::Stopped { .. })
+        ));
+        terminalizer.join().expect("terminal publication completes");
+        assert!(matches!(
+            stopped
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(_)
+        ));
     }
 
     #[test]
@@ -3257,6 +3639,202 @@ mod tests {
             }
         );
         assert!(scope.incarnation_finished(second));
+    }
+
+    #[crate::runtime::test]
+    async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
+        let parent = isolated_scope("parent", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+        let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        parent.set_admitted_children(vec![resident_projection(&slot)]);
+
+        let epoch = nested
+            .begin_incarnation()
+            .expect("nested scope epoch is available");
+        let mut incarnations = ScopeIdentity::new().incarnation_counter(nested.member.membership());
+        let incarnation = incarnations.mint().expect("child incarnation is available");
+        nested.member.update(|record| {
+            record.stage = MemberStage::Running;
+            record.incarnation = Some(incarnation);
+            record.last_incarnation = Some(incarnation);
+        });
+        nested.set_state(ScopeState::Running);
+
+        assert!(parent.terminalize_child(
+            &nested.member,
+            Exit::new(
+                ExitKind::Aborted {
+                    phase: GracePhase::WithinGrace,
+                },
+                Cancellation::Observed,
+            ),
+            Some(incarnation),
+            StartupDisposition::NotAborted,
+        ));
+
+        let mut waiter = Box::pin(nested.wait_stopped());
+        let first_poll =
+            std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
+        assert!(
+            first_poll.is_pending(),
+            "membership terminality does not imply that its live scope incarnation stopped"
+        );
+
+        nested.finish_incarnation(epoch, StopReason::ShutdownRequested);
+        assert_eq!(waiter.await, StopReason::ShutdownRequested);
+    }
+
+    #[crate::runtime::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_initial_scope_factory_owns_its_stop_epilogue() {
+        let gate = Arc::new(FactoryGate::default());
+        let mut tree = Tree::new();
+        let nested = tree
+            .add_subtree(
+                "nested",
+                SubtreeDef::factory({
+                    let gate = Arc::clone(&gate);
+                    move || {
+                        gate.block();
+                        pending_tree()
+                    }
+                }),
+            )
+            .expect("nested scope is valid");
+        let plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = ScopeEpochGuard::begin(&root).expect("parent epoch is available");
+        let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
+        let abort = driver.abort_handle();
+
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(2), gate.wait_entered()).await,
+            crate::runtime::Timeout::Completed(())
+        ));
+        let factory_state = nested.snapshot().state.clone();
+
+        abort.abort();
+        let parent_join = crate::runtime::join(driver).await;
+        let mut waiter = Box::pin(nested.wait_stopped());
+        let before_release =
+            std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
+        gate.release();
+        assert_eq!(factory_state, ScopeState::Starting);
+        assert!(matches!(
+            parent_join,
+            crate::runtime::JoinOutcome::Cancelled
+        ));
+        assert!(
+            before_release.is_pending(),
+            "an executing initial factory still owns the final scope epilogue"
+        );
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(2), waiter).await,
+            crate::runtime::Timeout::Completed(StopReason::ShutdownRequested)
+        ));
+    }
+
+    #[crate::runtime::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_restart_scope_factory_supersedes_the_stale_stopped_projection() {
+        let gate = Arc::new(FactoryGate::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tree = Tree::new();
+        let nested = tree
+            .add_subtree(
+                "nested",
+                SubtreeDef::factory({
+                    let gate = Arc::clone(&gate);
+                    let calls = Arc::clone(&calls);
+                    move || {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            finished_tree()
+                        } else {
+                            gate.block();
+                            pending_tree()
+                        }
+                    }
+                })
+                .restart(RestartPolicy::new(
+                    RestartCondition::Always,
+                    Backoff::Immediate,
+                )),
+            )
+            .expect("restartable nested scope is valid");
+        let plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = ScopeEpochGuard::begin(&root).expect("parent epoch is available");
+        let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
+        let abort = driver.abort_handle();
+
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(2), gate.wait_entered()).await,
+            crate::runtime::Timeout::Completed(())
+        ));
+        let factory_calls = calls.load(Ordering::SeqCst);
+        let factory_state = nested.snapshot().state.clone();
+
+        abort.abort();
+        let parent_join = crate::runtime::join(driver).await;
+        let mut waiter = Box::pin(nested.wait_stopped());
+        let before_release =
+            std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
+        gate.release();
+        assert_eq!(factory_calls, 2);
+        assert_eq!(
+            factory_state,
+            ScopeState::Starting,
+            "the second epoch supersedes the first incarnation's Stopped projection before its factory runs"
+        );
+        assert!(matches!(
+            parent_join,
+            crate::runtime::JoinOutcome::Cancelled
+        ));
+        assert!(
+            before_release.is_pending(),
+            "an executing restart factory still owns the final scope epilogue"
+        );
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(2), waiter).await,
+            crate::runtime::Timeout::Completed(StopReason::ShutdownRequested)
+        ));
+    }
+
+    #[crate::runtime::test]
+    async fn panicking_nested_factory_releases_its_pre_driver_epoch() {
+        let scope = isolated_scope("nested", ScopeFlavor::Ordered);
+        let driver_scope = Arc::clone(&scope);
+        let driver = crate::runtime::spawn(async move {
+            let factory = Arc::new(|| -> crate::plan::BuilderCore {
+                panic!("injected nested factory panic");
+            });
+            run_nested_factory(
+                factory,
+                driver_scope,
+                crate::policy::ResolvedDefaults::default(),
+                NestedScopeLatches {
+                    parent_ready: CompletionGatedLatch::default(),
+                    ancestor: AncestorCommandLatches {
+                        shutdown: Latch::default(),
+                        abort: Latch::default(),
+                        abort_ack: Latch::default(),
+                    },
+                },
+            )
+            .await
+        });
+
+        assert!(matches!(
+            crate::runtime::join(driver).await,
+            crate::runtime::JoinOutcome::Panic { .. }
+        ));
+        assert_eq!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::ShutdownRequested,
+            }
+        );
+        let successor = ScopeEpochGuard::begin(&scope)
+            .expect("factory unwind retires the reserved scope epoch");
+        successor.finish(StopReason::NeverStarted);
     }
 
     #[test]
@@ -3449,6 +4027,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -3523,6 +4105,82 @@ mod tests {
         }
     }
 
+    #[test]
+    fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
+        const CHILDREN: usize = 1_024;
+
+        let mut tree = Tree::new();
+        for index in 0..CHILDREN {
+            tree.add_task(
+                format!("inactive-{index}"),
+                TaskDef::new(|_| future::pending()),
+            )
+            .expect("unique child declaration");
+        }
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let mut children = ChildArena::default();
+        plan.children.reverse();
+        while let Some(child) = plan.children.pop() {
+            children
+                .insert(ChildRuntime::from_plan(child, &root))
+                .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
+        }
+        // Model restart-window children: no incarnation and no retained
+        // construction remains, so forced terminalization completes inline.
+        // This used to re-enter `stop_next_ordered` once per child.
+        for child in children.values_mut() {
+            drop(child.construction.take());
+        }
+        let mut scope = ScopeRuntime {
+            root,
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::running(),
+            next_ordered_start: None,
+            role: ScopeRole::Root,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            hard_forced: true,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        scope.begin_drain(StopReason::ShutdownRequested);
+
+        assert!(scope.children.values().all(ChildRuntime::is_terminal));
+        assert!(!scope.ordered_stop_progressing);
+        assert_eq!(scope.ordered_stop_waiting, None);
+        assert_eq!(
+            scope.ordered_stop_inspections, CHILDREN,
+            "the reverse cursor inspects each ordered child exactly once"
+        );
+    }
+
     #[crate::runtime::test]
     async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3589,6 +4247,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -3630,6 +4292,7 @@ mod tests {
             )))),
             join: JoinVerdict::Completed,
             cancellation: Cancellation::NotObserved,
+            readiness_signal_seen: false,
         });
         let mut pending = [
             restart_shutdown_work(nested),
@@ -3645,7 +4308,15 @@ mod tests {
                     recorded,
                     join,
                     cancellation,
-                })) => scope.handle_exit(child, incarnation, recorded, join, cancellation),
+                    readiness_signal_seen,
+                })) => scope.handle_exit(
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                ),
                 _ => unreachable!("the fixture queues only exit and restart work"),
             }
         }
@@ -3661,6 +4332,159 @@ mod tests {
         );
     }
 
+    /// A `mark_ready(); stop()` child reports its local stop and exit on
+    /// helper tasks, so one driver wake can collect both while the fired
+    /// readiness latch's Ready event is still undrained — and arbitration
+    /// orders the stop ahead of the readiness signal. `handle_self_stop`
+    /// must consult the fired latch before `begin_stop_child`'s Shutdown
+    /// step disarms the gate, or the clean post-ready exit is misread as a
+    /// pre-ready stop and spuriously aborts startup.
+    #[crate::runtime::test]
+    async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
+        let mut tree = Tree::new();
+        tree.add_task(
+            "ready-then-stop",
+            TaskDef::new(|_| future::pending::<crate::ExitResult>())
+                .readiness(Readiness::Manual)
+                .expect("manual readiness is valid")
+                .readiness_deadline(ReadinessDeadline::Unbounded),
+        )
+        .expect("valid task");
+        let mut plan = tree.lower_for_test();
+        let root = Arc::clone(&plan.root);
+        let epoch = root
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        let (events, _event_receiver) = crate::runtime::bounded_mpsc(64);
+        let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+        let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+        let mut children = ChildArena::default();
+        let key = children
+            .insert(child)
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+        let mut scope = ScopeRuntime {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.config.intensity,
+            intensity: super::IntensityState::default(),
+            children,
+            events,
+            disposal_events,
+            deadlines: super::DeadlineQueue::default(),
+            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            lifecycle: ScopeLifecycle::starting(),
+            next_ordered_start: Some(key),
+            role: ScopeRole::Root,
+            dynamic: None,
+            epoch,
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
+            completion: None,
+        };
+        plan.armed = false;
+        drop(plan);
+
+        scope.spawn_child(key);
+        let active = scope.children[key]
+            .active
+            .as_ref()
+            .expect("spawned child is active");
+        let incarnation = active.incarnation;
+        // The application task fired its readiness latch before stopping;
+        // the driver has not yet drained the corresponding Ready event.
+        assert!(active.ready_signal.fire());
+        active.abort_handle.abort();
+
+        let mut pending = [
+            Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+                child: key,
+                incarnation,
+                recorded: Some(RecordedOutcome::Returned(Ok(()))),
+                join: JoinVerdict::Completed,
+                cancellation: Cancellation::NotObserved,
+                readiness_signal_seen: true,
+            }))
+            .classified(),
+            Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop {
+                child: key,
+                incarnation,
+            }))
+            .classified(),
+        ];
+        arbitrate(&mut pending);
+        assert!(
+            matches!(
+                pending[0].1,
+                Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop { .. }))
+            ),
+            "the regression premise: arbitration orders the stop ahead of the exit"
+        );
+        for (_, event) in pending {
+            match event {
+                Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop {
+                    child,
+                    incarnation,
+                })) => scope.handle_self_stop(child, incarnation),
+                Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                })) => scope.handle_exit(
+                    child,
+                    incarnation,
+                    recorded,
+                    join,
+                    cancellation,
+                    readiness_signal_seen,
+                ),
+                _ => unreachable!("the fixture queues only the stop and the exit"),
+            }
+        }
+
+        let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
+            disposal_event_receiver
+                .recv()
+                .await
+                .expect("disposal reports completion")
+        else {
+            panic!("only construction disposal was armed")
+        };
+        scope.handle_construction_disposed(child, panic);
+
+        assert!(
+            scope.lifecycle.startup_complete(),
+            "the ready-before-stop child completes startup"
+        );
+        assert!(
+            matches!(root.record().startup, Some(Ok(()))),
+            "a fired readiness latch must survive a same-batch local stop: {:?}",
+            root.record().startup
+        );
+        assert_eq!(root.record().state, ScopeState::Running);
+        assert!(matches!(
+            scope.children[key].slot.member.record().stage,
+            MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::Completed)
+        ));
+        assert!(
+            !scope.children[key].slot.member.record().startup_aborted,
+            "a post-ready clean self-stop is not a startup abort"
+        );
+    }
+
     #[test]
     fn gate_handoff_waits_for_an_in_flight_observation_edge() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
@@ -3670,7 +4494,7 @@ mod tests {
         let (release, release_receiver) = std::sync::mpsc::sync_channel(0);
         let observer = Arc::clone(&nested);
         let observation = std::thread::spawn(move || {
-            observer.with_observation_gate(|| {
+            observer.with_observation_gate(|_| {
                 entered.send(()).expect("test receiver remains available");
                 release_receiver
                     .recv()
@@ -3849,18 +4673,22 @@ mod tests {
     #[test]
     fn owned_report_token_consumes_or_falls_back_once() {
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let readiness = CompletionGatedLatch::default();
+        let (token, receiver) = report_channel(shutdown.clone(), None, readiness.clone());
         token.record(RecordedOutcome::Returned(Ok(())));
         shutdown.fire();
+        readiness.fire();
         let report = receiver.receive();
         assert!(matches!(
             report.outcome,
             Some(RecordedOutcome::Returned(Ok(())))
         ));
         assert_eq!(report.cancellation, Cancellation::NotObserved);
+        assert!(!report.readiness_signal_seen);
 
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let (token, receiver) =
+            report_channel(shutdown.clone(), None, CompletionGatedLatch::default());
         shutdown.fire();
         drop(token);
         let report = receiver.receive();
@@ -3871,7 +4699,8 @@ mod tests {
     #[test]
     fn owned_report_token_records_prior_cancellation() {
         let shutdown = Latch::default();
-        let (token, receiver) = report_channel(shutdown.clone(), None);
+        let (token, receiver) =
+            report_channel(shutdown.clone(), None, CompletionGatedLatch::default());
         shutdown.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
         let report = receiver.receive();
@@ -3886,10 +4715,24 @@ mod tests {
     fn owned_report_token_records_prior_local_stop() {
         let shutdown = Latch::default();
         let local_stop = Latch::default();
-        let (token, receiver) = report_channel(shutdown, Some(local_stop.clone()));
+        let (token, receiver) = report_channel(
+            shutdown,
+            Some(local_stop.clone()),
+            CompletionGatedLatch::default(),
+        );
         local_stop.fire();
         token.record(RecordedOutcome::Returned(Ok(())));
         assert_eq!(receiver.receive().cancellation, Cancellation::Observed);
+    }
+
+    #[test]
+    fn owned_report_token_records_readiness_at_completion() {
+        let readiness = CompletionGatedLatch::default();
+        let (token, receiver) = report_channel(Latch::default(), None, readiness.clone());
+        readiness.fire();
+        token.record(RecordedOutcome::Returned(Ok(())));
+        assert!(!readiness.fire(), "completion closes retained capabilities");
+        assert!(receiver.receive().readiness_signal_seen);
     }
 
     #[test]
@@ -3972,7 +4815,7 @@ mod tests {
         let driver = crate::runtime::spawn(run_scope_incarnation(
             plan,
             ScopeRole::Nested(NestedScopeLatches {
-                parent_ready: Latch::default(),
+                parent_ready: CompletionGatedLatch::default(),
                 ancestor: AncestorCommandLatches {
                     shutdown: Latch::default(),
                     abort: Latch::default(),
@@ -4106,7 +4949,7 @@ mod tests {
         let mut driver = Box::pin(run_scope_incarnation(
             plan,
             ScopeRole::Nested(NestedScopeLatches {
-                parent_ready: Latch::default(),
+                parent_ready: CompletionGatedLatch::default(),
                 ancestor: AncestorCommandLatches {
                     shutdown: Latch::default(),
                     abort: Latch::default(),
@@ -4221,6 +5064,74 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum TerminalStopPath {
+        LiveEpoch,
+        NoLiveEpoch,
+        NeverStarted,
+    }
+
+    #[crate::runtime::test]
+    async fn terminal_stop_paths_share_one_complete_observation_transition() {
+        for (path, reason) in [
+            (TerminalStopPath::LiveEpoch, StopReason::ShutdownRequested),
+            (TerminalStopPath::NoLiveEpoch, StopReason::ShutdownRequested),
+            (TerminalStopPath::NeverStarted, StopReason::NeverStarted),
+        ] {
+            let scope = isolated_scope("root", ScopeFlavor::Ordered);
+            let epoch = matches!(path, TerminalStopPath::LiveEpoch).then(|| {
+                scope
+                    .begin_incarnation()
+                    .expect("test scope epoch is available")
+            });
+            let handle = ScopeRef {
+                cell: Arc::clone(&scope),
+            };
+            let mut snapshots = handle.subscribe_snapshots();
+            let mut events = handle.subscribe_lifecycle();
+
+            match path {
+                TerminalStopPath::LiveEpoch => scope.finish_root_incarnation(
+                    epoch.expect("live path owns an epoch"),
+                    reason.clone(),
+                    Exit::never_started(),
+                ),
+                TerminalStopPath::NoLiveEpoch => {
+                    scope.finish_live_root_incarnation(reason.clone(), Exit::never_started())
+                }
+                TerminalStopPath::NeverStarted => scope.terminalize_never_started(),
+            }
+
+            let expected_state = ScopeState::Stopped {
+                reason: reason.clone(),
+            };
+            assert!(matches!(
+                scope.member.record().stage,
+                MemberStage::Terminal(_)
+            ));
+            assert_eq!(scope.record().state, expected_state);
+            assert_eq!(
+                epoch.map(|epoch| scope.incarnation_finished(epoch)),
+                epoch.map(|_| true)
+            );
+            assert_eq!(snapshots.borrow_latest().state, expected_state);
+            assert!(matches!(
+                events.try_recv(),
+                Ok(LifecycleItem::Event(crate::LifecycleEvent {
+                    kind: LifecycleEventKind::ScopeState { state },
+                    ..
+                })) if state == expected_state
+            ));
+            assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+
+            snapshots
+                .changed()
+                .await
+                .expect("the final snapshot precedes observation closure");
+            assert!(snapshots.changed().await.is_err());
+        }
+    }
+
     impl Wake for ObserveScopeOnStartupWake {
         fn wake(self: Arc<Self>) {
             self.observe();
@@ -4229,6 +5140,300 @@ mod tests {
         fn wake_by_ref(self: &Arc<Self>) {
             self.observe();
         }
+    }
+
+    #[test]
+    fn stopped_publication_keeps_mailbox_panic_primary_and_finishes_observation() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let epoch = scope
+            .begin_incarnation()
+            .expect("test scope epoch is available");
+        let handle = ScopeRef {
+            cell: Arc::clone(&scope),
+        };
+        let mut events = handle.subscribe_lifecycle();
+        let mailbox = MailboxCell::new(scope.member.id().clone());
+        let actor: ActorRef<u8> = ActorRef::new(Arc::clone(&scope.member), Arc::clone(&mailbox));
+        scope.member.attach_mailbox(mailbox);
+
+        let mailbox_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let mailbox_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &mailbox_payload_dropped,
+        ))));
+        let mut parked_send = Box::pin(actor.send(1));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&mailbox_waker))
+                .is_pending()
+        );
+
+        let terminal_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let terminal_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &terminal_payload_dropped,
+        ))));
+        let mut terminal = Box::pin(scope.member.wait_terminal());
+        assert!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&terminal_waker))
+                .is_pending()
+        );
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            scope.finish_root_incarnation(
+                epoch,
+                StopReason::ShutdownRequested,
+                Exit::never_started(),
+            );
+        }))
+        .expect_err("the primary mailbox panic still surfaces");
+        assert_eq!(
+            mailbox_payload_dropped.load(Ordering::SeqCst),
+            0,
+            "the mailbox panic payload remains owned by the caller"
+        );
+        assert!(
+            terminal_payload_dropped.load(Ordering::SeqCst) > 0,
+            "later member-pulse panics are contained as cleanup"
+        );
+        assert!(matches!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::ShutdownRequested
+            }
+        ));
+        assert!(scope.incarnation_finished(epoch));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(LifecycleItem::Event(crate::LifecycleEvent {
+                kind: LifecycleEventKind::ScopeState {
+                    state: ScopeState::Stopped {
+                        reason: StopReason::ShutdownRequested
+                    }
+                },
+                ..
+            }))
+        ));
+        assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+        assert!(matches!(
+            scope.member.record().stage,
+            MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        drop(payload);
+        assert_eq!(mailbox_payload_dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn panicking_mailbox_waker_cannot_skip_the_terminal_pulse() {
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+
+        let mut parked_send = Box::pin(actor.send(1));
+        let panicking_waker = Waker::from(Arc::new(PanicWake("injected mailbox waker panic")));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&panicking_waker))
+                .is_pending()
+        );
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let terminal_waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+        let mut terminal = Box::pin(member.wait_terminal());
+        assert!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&terminal_waker))
+                .is_pending()
+        );
+
+        catch_unwind(AssertUnwindSafe(|| {
+            member.terminalize(Exit::never_started());
+        }))
+        .expect_err("the hostile mailbox waker still surfaces its panic");
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "membership terminality is pulsed before the mailbox panic resumes"
+        );
+        assert!(matches!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(error)) if error.kind == SendErrorKind::Terminated
+        ));
+    }
+
+    #[test]
+    fn mailbox_teardown_panic_precedes_a_terminal_pulse_panic() {
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+
+        let mut parked_send = Box::pin(actor.send(1));
+        let mailbox_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let mailbox_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &mailbox_payload_dropped,
+        ))));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&mailbox_waker))
+                .is_pending()
+        );
+
+        let mut terminal = Box::pin(member.wait_terminal());
+        let pulse_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let terminal_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &pulse_payload_dropped,
+        ))));
+        assert!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&terminal_waker))
+                .is_pending()
+        );
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            member.terminalize(Exit::never_started());
+        }))
+        .expect_err("the primary mailbox panic still surfaces");
+        assert_eq!(
+            mailbox_payload_dropped.load(Ordering::SeqCst),
+            0,
+            "the primary mailbox payload is retained for the caller"
+        );
+        assert_eq!(
+            pulse_payload_dropped.load(Ordering::SeqCst),
+            1,
+            "the membership-pulse panic is cleanup and is contained"
+        );
+        drop(payload);
+        assert_eq!(mailbox_payload_dropped.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(error)) if error.kind == SendErrorKind::Terminated
+        ));
+    }
+
+    #[crate::runtime::test]
+    async fn mailbox_waker_panic_is_contained_without_wedging_system_completion() {
+        let exit = Latch::default();
+        let mut tree = Tree::new();
+        let actor = tree
+            .add_raw_once(
+                "worker",
+                RawOnceDef::new(ExitOnSignalRaw { exit: exit.clone() })
+                    .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
+            )
+            .expect("valid actor");
+        let plan = tree.lower_for_test();
+        let member = Arc::clone(&plan.children[0].slot.member);
+        let root = Arc::clone(&plan.root);
+        let mut events = root.subscribe_lifecycle();
+        let mut system = super::spawn_system(plan);
+        root.wait_started().await.expect("actor starts");
+        actor
+            .try_send(1)
+            .expect("the first message fills the queue");
+
+        let mut parked_send = Box::pin(actor.send(2));
+        let panicking_waker = Waker::from(Arc::new(PanicWake("injected mailbox waker panic")));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&panicking_waker))
+                .is_pending()
+        );
+
+        let waiter_started = Latch::default();
+        let terminal_waiter = crate::runtime::spawn({
+            let member = Arc::clone(&member);
+            let waiter_started = waiter_started.clone();
+            async move {
+                waiter_started.fire();
+                member.wait_terminal().await
+            }
+        });
+        waiter_started.fired().await;
+        exit.fire();
+
+        let member_exit = match crate::runtime::timeout(
+            Duration::from_secs(2),
+            crate::runtime::join(terminal_waiter),
+        )
+        .await
+        {
+            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { value }) => value,
+            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Panic { message }) => {
+                panic!("the terminal waiter panicked: {message:?}")
+            }
+            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Cancelled) => {
+                panic!("the terminal waiter was cancelled")
+            }
+            crate::runtime::Timeout::Elapsed => {
+                panic!("the terminal waiter was not pulsed after the mailbox panic")
+            }
+        };
+        assert!(matches!(member_exit.kind(), ExitKind::Completed));
+
+        let reason = match crate::runtime::timeout(Duration::from_secs(2), system.wait()).await {
+            crate::runtime::Timeout::Completed(reason) => reason,
+            crate::runtime::Timeout::Elapsed => {
+                panic!("the system monitor did not contain the driver unwind")
+            }
+        };
+        assert_eq!(reason, StopReason::ShutdownRequested);
+        let root_exit = root.member.wait_terminal().await;
+        assert!(matches!(
+            root_exit.kind(),
+            ExitKind::Panicked { message }
+                if message.as_deref() == Some("injected mailbox waker panic")
+        ));
+        let mut terminal_trace = Vec::new();
+        while let Some(item) = events.recv().await {
+            let LifecycleItem::Event(event) = item else {
+                panic!("the single-child terminal trace cannot lag");
+            };
+            match event.kind {
+                LifecycleEventKind::Exited { .. } => terminal_trace.push("exited"),
+                LifecycleEventKind::Removed { .. } => terminal_trace.push("removed"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            terminal_trace,
+            ["exited", "removed"],
+            "mailbox panic resumes only after the terminal event, pruning edge, and stream closure"
+        );
     }
 
     #[test]
@@ -4260,6 +5465,143 @@ mod tests {
             Some(SendErrorKind::Terminated)
         );
         assert!(changed.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn supervised_terminality_pulse_follows_mailbox_termination() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+
+        let mailbox_wakes = Arc::new(AtomicUsize::new(0));
+        let mailbox_waker = Waker::from(Arc::new(CountWake(Arc::clone(&mailbox_wakes))));
+        let mut parked_send = Box::pin(actor.send(1));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&mailbox_waker))
+                .is_pending()
+        );
+
+        let probe = Arc::new(ObserveWakeCount {
+            wakes: Arc::clone(&mailbox_wakes),
+            observed: Mutex::new(None),
+        });
+        let terminal_waker = Waker::from(Arc::clone(&probe));
+        let mut terminal = Box::pin(member.wait_terminal());
+        assert!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&terminal_waker))
+                .is_pending()
+        );
+
+        assert!(root.terminalize_child(
+            &member,
+            Exit::never_started(),
+            None,
+            StartupDisposition::Aborted,
+        ));
+
+        assert_eq!(
+            *probe.observed.lock().expect("observation mutex poisoned"),
+            Some(1),
+            "the supervised terminal pulse must follow parked-sender discharge"
+        );
+        assert!(member.record().startup_aborted);
+        assert!(matches!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(error)) if error.kind == SendErrorKind::Terminated
+        ));
+    }
+
+    #[test]
+    fn supervised_mailbox_teardown_panic_precedes_terminal_pulse_panic() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+        let mailbox = MailboxCell::new(member.id().clone());
+        let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        member.attach_mailbox(mailbox);
+
+        let mailbox_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let mailbox_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &mailbox_payload_dropped,
+        ))));
+        let mut parked_send = Box::pin(actor.send(1));
+        assert!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(&mailbox_waker))
+                .is_pending()
+        );
+
+        let terminal_payload_dropped = Arc::new(AtomicUsize::new(0));
+        let terminal_waker = Waker::from(Arc::new(CountedPanicWake(Arc::clone(
+            &terminal_payload_dropped,
+        ))));
+        let mut terminal = Box::pin(member.wait_terminal());
+        assert!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&terminal_waker))
+                .is_pending()
+        );
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            root.terminalize_child(
+                &member,
+                Exit::never_started(),
+                None,
+                StartupDisposition::Aborted,
+            );
+        }))
+        .expect_err("the primary mailbox panic still surfaces");
+        assert_eq!(
+            mailbox_payload_dropped.load(Ordering::SeqCst),
+            0,
+            "the primary mailbox payload is retained for the caller"
+        );
+        assert_eq!(
+            terminal_payload_dropped.load(Ordering::SeqCst),
+            1,
+            "the later terminal-pulse panic is contained as cleanup"
+        );
+        drop(payload);
+        assert_eq!(mailbox_payload_dropped.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(
+            parked_send
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(error)) if error.kind == SendErrorKind::Terminated
+        ));
     }
 
     #[test]
@@ -4727,6 +6069,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
 
@@ -4785,7 +6131,15 @@ mod tests {
                 recorded,
                 join,
                 cancellation,
-            }))) => (child, incarnation, recorded, join, cancellation),
+                readiness_signal_seen,
+            }))) => (
+                child,
+                incarnation,
+                recorded,
+                join,
+                cancellation,
+                readiness_signal_seen,
+            ),
             crate::runtime::Timeout::Completed(_) => panic!("the first incarnation reports exit"),
             crate::runtime::Timeout::Elapsed => panic!("the first incarnation exit must arrive"),
         };
@@ -4810,7 +6164,7 @@ mod tests {
             "fused drop latches cancellation before its queued edge can advance"
         );
 
-        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4);
+        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);
         assert!(scope.children[key].restart_deadline.is_none());
         assert_eq!(
             root.snapshot().total_restarts,
@@ -4889,6 +6243,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
 
@@ -4934,12 +6292,20 @@ mod tests {
                 recorded,
                 join,
                 cancellation,
-            }))) => (child, incarnation, recorded, join, cancellation),
+                readiness_signal_seen,
+            }))) => (
+                child,
+                incarnation,
+                recorded,
+                join,
+                cancellation,
+                readiness_signal_seen,
+            ),
             crate::runtime::Timeout::Completed(_) => panic!("the first incarnation reports exit"),
             crate::runtime::Timeout::Elapsed => panic!("the first incarnation exit must arrive"),
         };
         let key = exit.0;
-        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4);
+        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);
         assert!(
             scope.children[key].restart_deadline.is_some(),
             "a live fused admission does not suppress the restart at exit dispatch"
@@ -5147,6 +6513,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -5266,6 +6636,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -5379,6 +6753,10 @@ mod tests {
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
             hard_forced: false,
+            ordered_stop_progressing: false,
+            ordered_stop_cursor: None,
+            ordered_stop_waiting: None,
+            ordered_stop_inspections: 0,
             completion: None,
         };
         plan.armed = false;
@@ -5396,7 +6774,15 @@ mod tests {
                 recorded,
                 join,
                 cancellation,
-            }))) => (child, incarnation, recorded, join, cancellation),
+                readiness_signal_seen,
+            }))) => (
+                child,
+                incarnation,
+                recorded,
+                join,
+                cancellation,
+                readiness_signal_seen,
+            ),
             crate::runtime::Timeout::Completed(_) => panic!("the pre-ready failure reports exit"),
             crate::runtime::Timeout::Elapsed => panic!("the pre-ready failure exit must arrive"),
         };
@@ -5407,7 +6793,7 @@ mod tests {
         assert!(root.request_shutdown().is_some());
         assert!(root.has_stop_request(scope.epoch));
 
-        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4);
+        scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);
         assert!(
             scope.children[key].restart_deadline.is_some(),
             "a latched scope stop does not reclassify exit dispatch"
@@ -5479,7 +6865,7 @@ mod tests {
                 TaskDef::new(|_| future::pending::<crate::ExitResult>()),
             )
             .expect("provisional declaration succeeds");
-        let ready = Latch::default();
+        let ready = CompletionGatedLatch::default();
         let error = run_nested_tree(
             tree.into_core_for_test(),
             Arc::clone(&scope),

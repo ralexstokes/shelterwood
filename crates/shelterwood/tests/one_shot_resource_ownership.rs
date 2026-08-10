@@ -1,4 +1,5 @@
 use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,7 +18,6 @@ use shelterwood::{
 #[derive(Clone, Copy)]
 enum RawResourceMode {
     Normal,
-    ReadinessPanic,
     StartupFailure,
 }
 
@@ -29,22 +29,29 @@ struct ResourceRawActor {
 impl RawActor for ResourceRawActor {
     type Msg = ();
 
-    fn readiness(&self) -> Readiness {
-        match self.mode {
-            RawResourceMode::Normal => Readiness::Immediate,
-            RawResourceMode::ReadinessPanic => panic!("raw readiness panic"),
-            RawResourceMode::StartupFailure => Readiness::Manual,
-        }
-    }
-
     async fn run(&mut self, _context: &mut RawContext<Self::Msg>) -> ExitResult {
         match self.mode {
             RawResourceMode::Normal => Ok(()),
-            RawResourceMode::ReadinessPanic => unreachable!("readiness prevents run"),
             RawResourceMode::StartupFailure => {
                 Err(ExitError::message("raw actor failed before ready"))
             }
         }
+    }
+}
+
+struct ReadinessPanicRawActor {
+    _guard: ConsumeGuard,
+}
+
+impl RawActor for ReadinessPanicRawActor {
+    type Msg = ();
+
+    fn readiness() -> Readiness {
+        panic!("raw readiness panic")
+    }
+
+    async fn run(&mut self, _: &mut RawContext<Self::Msg>) -> ExitResult {
+        unreachable!("readiness metadata prevents admission")
     }
 }
 
@@ -69,21 +76,19 @@ async fn one_shot_raw_resource_drops_once_on_normal_exit() {
     count.assert_once();
 }
 
-#[tokio::test]
-async fn one_shot_raw_resource_drops_once_on_construction_panic() {
+#[test]
+fn one_shot_raw_resource_drops_once_on_readiness_definition_panic() {
     let count = ConsumeCount::default();
     let mut tree = Tree::new();
-    tree.add_raw_once(
-        "raw",
-        RawOnceDef::new(resource_raw_actor(&count, RawResourceMode::ReadinessPanic)),
-    )
-    .expect("valid actor");
-    let system = tree.spawn().expect("runtime is available");
-    assert!(system.wait_started().await.is_err());
-    system
-        .shutdown(Duration::from_secs(1))
-        .await
-        .expect("failed root rolls back");
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _ = tree.add_raw_once(
+            "raw",
+            RawOnceDef::new(ReadinessPanicRawActor {
+                _guard: count.guard(),
+            }),
+        );
+    }));
+    assert!(result.is_err());
     count.assert_once();
 }
 
@@ -93,7 +98,9 @@ async fn one_shot_raw_resource_drops_once_on_startup_failure() {
     let mut tree = Tree::new();
     tree.add_raw_once(
         "raw",
-        RawOnceDef::new(resource_raw_actor(&count, RawResourceMode::StartupFailure)),
+        RawOnceDef::new(resource_raw_actor(&count, RawResourceMode::StartupFailure))
+            .readiness(Readiness::Manual)
+            .expect("manual raw readiness"),
     )
     .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");

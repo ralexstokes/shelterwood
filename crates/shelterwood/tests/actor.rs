@@ -238,8 +238,8 @@ struct AwaitingDecorator<R> {
 impl<R: RawActor> RawActor for AwaitingDecorator<R> {
     type Msg = R::Msg;
 
-    fn readiness(&self) -> Readiness {
-        self.inner.readiness()
+    fn readiness() -> Readiness {
+        R::readiness()
     }
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
@@ -357,8 +357,8 @@ struct ResumeProbeDecorator<R> {
 impl<R: RawActor> RawActor for ResumeProbeDecorator<R> {
     type Msg = R::Msg;
 
-    fn readiness(&self) -> Readiness {
-        self.inner.readiness()
+    fn readiness() -> Readiness {
+        R::readiness()
     }
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {

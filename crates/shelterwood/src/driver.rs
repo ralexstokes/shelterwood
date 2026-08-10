@@ -316,11 +316,6 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
 }
 
 enum ChildEvent {
-    Constructed {
-        child: ChildKey,
-        incarnation: Incarnation,
-        readiness: Readiness,
-    },
     Ready {
         child: ChildKey,
         incarnation: Incarnation,
@@ -369,7 +364,6 @@ struct ActiveChild {
     readiness: ReadinessGate,
     readiness_deadline: Option<DeadlineHandle>,
     ready_signal: CompletionGatedLatch,
-    construction_release: Latch,
     framework_abort: Option<Latch>,
     framework_abort_ack: Option<Latch>,
     stop_deadline: Option<DeadlineHandle>,
@@ -653,7 +647,7 @@ enum SpawnBody {
 
 struct SpawnDispatch {
     body: SpawnBody,
-    declared_readiness: Option<Readiness>,
+    declared_readiness: Readiness,
     construction_spent: bool,
     scope_child: bool,
 }
@@ -663,15 +657,12 @@ struct SpawnDispatch {
 /// - `shutdown`/`abort` are the child-facing cooperative ladder;
 /// - `framework_abort`/`framework_abort_ack` bound a nested scope driver's
 ///   recursive drain before its task is aborted;
-/// - `construction_release` prevents a raw actor from running before the
-///   driver has installed the readiness mode reported by construction;
 /// - `ready` also carries the completion edge that makes readiness and
 ///   self-stop watcher tasks finite.
 struct SpawnLatches {
     shutdown: Latch,
     abort: Latch,
     ready: CompletionGatedLatch,
-    construction_release: Latch,
     local_stop: Latch,
     framework_abort: Latch,
     framework_abort_ack: Latch,
@@ -703,11 +694,10 @@ struct ChildTaskLaunch {
     key: ChildKey,
     incarnation: Incarnation,
     body: SpawnBody,
-    readiness_override: Option<Readiness>,
+    readiness: Readiness,
     watch_readiness: bool,
     shutdown: Latch,
     ready: CompletionGatedLatch,
-    construction_release: Latch,
     local_stop: Latch,
 }
 
@@ -740,7 +730,7 @@ fn dispatch_child_construction(
                         mailbox_shutdown: child.options.mailbox_shutdown,
                     },
                 },
-                declared_readiness: None,
+                declared_readiness: child.options.readiness,
                 construction_spent,
                 scope_child: false,
             }
@@ -750,7 +740,7 @@ fn dispatch_child_construction(
                 factory: Arc::clone(&definition.factory),
                 context: TaskContext::new(id, incarnation, latches.task_context()),
             },
-            declared_readiness: Some(child.options.readiness),
+            declared_readiness: child.options.readiness,
             construction_spent: false,
             scope_child: false,
         },
@@ -759,7 +749,7 @@ fn dispatch_child_construction(
                 body: definition.take_body(),
                 context: TaskContext::new(id, incarnation, latches.task_context()),
             },
-            declared_readiness: Some(child.options.readiness),
+            declared_readiness: child.options.readiness,
             construction_spent: true,
             scope_child: false,
         },
@@ -800,7 +790,7 @@ fn dispatch_child_construction(
             };
             SpawnDispatch {
                 body,
-                declared_readiness: Some(Readiness::Manual),
+                declared_readiness: Readiness::Manual,
                 construction_spent,
                 scope_child: true,
             }
@@ -814,31 +804,18 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         key,
         incarnation,
         body,
-        readiness_override,
+        readiness,
         watch_readiness,
         shutdown,
         ready,
-        construction_release,
         local_stop,
     } = launch;
     let (report, report_claim) = report_slot(shutdown, Some(local_stop.clone()), ready.clone());
-    let constructed_sender = events.clone();
     let handle = runtime::spawn(async move {
         let body = async move {
             match body {
                 SpawnBody::Raw { spawn, context } => {
                     let instance = spawn.construct();
-                    let readiness = readiness_override.unwrap_or_else(|| instance.readiness());
-                    let _ = runtime::mpsc_send(
-                        &constructed_sender,
-                        DriverEvent::Child(ChildEvent::Constructed {
-                            child: key,
-                            incarnation,
-                            readiness,
-                        }),
-                    )
-                    .await;
-                    construction_release.fired().await;
                     instance.run(context, readiness).await
                 }
                 SpawnBody::TaskRestartable { factory, context } => factory(context).await,
@@ -1085,15 +1062,12 @@ impl ScopeRuntime {
         // - ready and local_stop flow from application code back to helpers;
         // - ready's completion edge terminates those helpers when the child
         //   exits first and orders late retained readiness capabilities;
-        // - construction_release keeps a raw actor behind the driver-owned
-        //   readiness transition after its construction report is accepted;
         // - framework_abort/ack join nested-scope escalation before exit.
         // Each edge is level-triggered, so helper startup cannot lose a pulse.
         let latches = SpawnLatches {
             shutdown: Latch::default(),
             abort: Latch::default(),
             ready: CompletionGatedLatch::default(),
-            construction_release: Latch::default(),
             local_stop: Latch::default(),
             framework_abort: Latch::default(),
             framework_abort_ack: Latch::default(),
@@ -1130,19 +1104,16 @@ impl ScopeRuntime {
         );
 
         let mut readiness = ReadinessGate::new();
-        let readiness_effect = declared_readiness.and_then(|readiness_mode| {
-            let deadline = match child.options.readiness_deadline {
-                ReadinessDeadline::Bounded(duration) => Deadline::after(now, duration).instant(),
-                ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
-            };
-            readiness.step(ReadinessEvent::Configure {
-                readiness: readiness_mode,
-                deadline,
-            })
+        let deadline = match child.options.readiness_deadline {
+            ReadinessDeadline::Bounded(duration) => Deadline::after(now, duration).instant(),
+            ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
+        };
+        let readiness_effect = readiness.step(ReadinessEvent::Configure {
+            readiness: declared_readiness,
+            deadline,
         });
         let gated = readiness.needs_signal_watch();
 
-        let child_readiness_override = child.options.readiness_override;
         if construction_spent {
             // One-shot actor/task/subtree state has moved into `body`; the
             // retained construction is now framework-only spent metadata.
@@ -1155,11 +1126,10 @@ impl ScopeRuntime {
             key,
             incarnation,
             body,
-            readiness_override: child_readiness_override,
+            readiness: declared_readiness,
             watch_readiness: gated,
             shutdown: latches.shutdown.clone(),
             ready: latches.ready.clone(),
-            construction_release: latches.construction_release.clone(),
             local_stop: latches.local_stop.clone(),
         });
 
@@ -1175,7 +1145,6 @@ impl ScopeRuntime {
             readiness,
             readiness_deadline: None,
             ready_signal: latches.ready,
-            construction_release: latches.construction_release,
             framework_abort: scope_child.then_some(latches.framework_abort),
             framework_abort_ack: scope_child.then_some(latches.framework_abort_ack),
             stop_deadline: None,
@@ -1505,55 +1474,6 @@ impl ScopeRuntime {
             // remains. Hard escalation detaches that cleanup, but must not
             // rewrite the actor's recorded verdict.
             self.handle_construction_disposed(key, None);
-        }
-    }
-
-    fn handle_constructed(
-        &mut self,
-        key: ChildKey,
-        incarnation: Incarnation,
-        readiness: Readiness,
-    ) {
-        let effect = {
-            let Some(child) = self.children.get_mut(key) else {
-                return;
-            };
-            let Some(active) = child.active.as_mut() else {
-                return;
-            };
-            if active.incarnation != incarnation {
-                return;
-            }
-            if active.ladder.is_some() {
-                active.construction_release.fire();
-                return;
-            }
-            let deadline = match child.options.readiness_deadline {
-                ReadinessDeadline::Bounded(duration) => {
-                    Deadline::after(active.started_at, duration).instant()
-                }
-                ReadinessDeadline::Unbounded | ReadinessDeadline::Inherit => None,
-            };
-            active.readiness.step(ReadinessEvent::Configure {
-                readiness,
-                deadline,
-            })
-        };
-        let became_ready = effect
-            .map(|effect| self.apply_readiness_effect(key, incarnation, effect))
-            .unwrap_or(false);
-        if let Some(active) = self
-            .children
-            .get(key)
-            .and_then(|child| child.active.as_ref())
-            .filter(|active| active.incarnation == incarnation)
-        {
-            // Readiness state and all shell effects are installed before raw
-            // actor execution is released.
-            active.construction_release.fire();
-        }
-        if became_ready {
-            self.progress_startup();
         }
     }
 
@@ -2602,11 +2522,6 @@ async fn run_scope_incarnation(
                 Pending::Driver(DriverEvent::Admission(request)) => {
                     scope.handle_admission(request);
                 }
-                Pending::Driver(DriverEvent::Child(ChildEvent::Constructed {
-                    child,
-                    incarnation,
-                    readiness,
-                })) => scope.handle_constructed(child, incarnation, readiness),
                 Pending::Driver(DriverEvent::Child(ChildEvent::Ready { child, incarnation })) => {
                     scope.handle_ready(child, incarnation);
                 }
@@ -2710,9 +2625,7 @@ fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
     match event {
         DriverEvent::Child(ChildEvent::SelfStop { .. }) => ArbitrationClass::MembershipRemoval,
         DriverEvent::Removal(_) => ArbitrationClass::MembershipRemoval,
-        DriverEvent::Child(ChildEvent::Constructed { .. } | ChildEvent::Ready { .. }) => {
-            ArbitrationClass::ReadinessSignal
-        }
+        DriverEvent::Child(ChildEvent::Ready { .. }) => ArbitrationClass::ReadinessSignal,
         DriverEvent::Child(ChildEvent::Exited { .. } | ChildEvent::ConstructionDisposed { .. }) => {
             ArbitrationClass::ChildExit
         }

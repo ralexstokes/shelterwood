@@ -21,7 +21,7 @@ struct ReadyThenStop;
 impl RawActor for ReadyThenStop {
     type Msg = ();
 
-    fn readiness(&self) -> Readiness {
+    fn readiness() -> Readiness {
         Readiness::Manual
     }
 

@@ -891,8 +891,11 @@ pub trait RawActor: Send + 'static {
     /// Message accepted by this actor.
     type Msg: Send + 'static;
 
-    /// Declares when this actor becomes ready. Read before `run` is polled.
-    fn readiness(&self) -> Readiness {
+    /// Declares when this actor type becomes ready.
+    ///
+    /// This is definition metadata: the framework reads it before constructing
+    /// an incarnation, so it cannot depend on per-incarnation actor state.
+    fn readiness() -> Readiness {
         Readiness::Immediate
     }
 
@@ -1618,6 +1621,7 @@ impl<R: RawActor> RawDef<R> {
 
     pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
         let factory = self.factory;
+        let readiness = self.options.readiness.unwrap_or_else(R::readiness);
         RawConstruction {
             source: DefinitionSource::Restartable(Arc::new(move || {
                 let actor = factory();
@@ -1627,6 +1631,7 @@ impl<R: RawActor> RawDef<R> {
                 })
             })),
             options: self.options,
+            readiness,
         }
     }
 }
@@ -1666,12 +1671,14 @@ impl<R: RawActor> RawOnceDef<R> {
     );
 
     pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
+        let readiness = self.options.readiness.unwrap_or_else(R::readiness);
         RawConstruction {
             source: DefinitionSource::OneShot(Box::new(RawInstance {
                 actor: self.actor,
                 mailbox,
             })),
             options: self.options,
+            readiness,
         }
     }
 }
@@ -1680,7 +1687,6 @@ pub(crate) type RawFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'st
 type RawFactory = Arc<dyn Fn() -> Box<dyn ErasedRawInstance> + Send + Sync + 'static>;
 
 pub(crate) trait ErasedRawInstance: Send {
-    fn readiness(&self) -> Readiness;
     fn run(self: Box<Self>, context: RawRunContext, readiness: Readiness) -> RawFuture;
 }
 
@@ -1751,10 +1757,6 @@ impl<R: RawActor> Drop for RawIncarnationOwner<R> {
 }
 
 impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
-    fn readiness(&self) -> Readiness {
-        self.actor.readiness()
-    }
-
     fn run(self: Box<Self>, context: RawRunContext, readiness: Readiness) -> RawFuture {
         Box::pin(async move {
             let Self { actor, mailbox } = *self;
@@ -1811,6 +1813,7 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
 pub(crate) struct RawConstruction {
     pub(crate) source: DefinitionSource<RawFactory, Box<dyn ErasedRawInstance>>,
     pub(crate) options: CommonOptions,
+    pub(crate) readiness: Readiness,
 }
 
 impl RawConstruction {

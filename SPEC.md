@@ -655,7 +655,8 @@ established in the construction-path types, before erasure:
 ```rust
 trait RawActor: Send + 'static {
     type Msg: Send + 'static;
-    fn readiness(&self) -> Readiness { Readiness::Immediate }   // §6
+    // Type-level definition metadata, read before incarnation construction.
+    fn readiness() -> Readiness { Readiness::Immediate }        // §6
     // Desugared per §4.1's Send-bound rule; implementors write `async fn`.
     fn run(&mut self, ctx: &mut RawContext<Self::Msg>)
         -> impl Future<Output = ExitResult> + Send;
@@ -1099,8 +1100,8 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
 
 - `Actor` (blanket) children default to `AfterInit`: ready when `init`
   returns `Ok`.
-- Raw actors declare via `RawActor::readiness()`; decorators propagate with
-  a visible `self.inner.readiness()`. The trait default is `Immediate`, so
+- Raw actor types declare via `RawActor::readiness()`; decorators propagate
+  with a visible `R::readiness()`. The trait default is `Immediate`, so
   a decorator that omits propagation reports immediate readiness — an
   ordinary, testable bug (the sibling starts unblocked and ordered-startup
   tests see it), not the origin's silent mid-`init` gate release; §13.6's

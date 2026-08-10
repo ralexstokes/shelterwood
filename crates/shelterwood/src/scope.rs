@@ -3,6 +3,7 @@
 use std::{
     fmt,
     hash::{Hash, Hasher},
+    ops::Deref,
     sync::Arc,
     time::Duration,
 };
@@ -21,68 +22,163 @@ pub struct ScopeRef {
     pub(crate) cell: Arc<ScopeCell>,
 }
 
-impl ScopeRef {
+/// Declares the shared synchronous observation/control surface once for both
+/// handle types: `ScopeRef` gets the inherent method bodies and
+/// `DynamicScopeRef` gets an identical inherent forward, so a method added
+/// here can never silently miss the dynamic handle (UFCS and rustdoc
+/// included). The `Deref` impl below additionally backstops methods added
+/// outside this macro.
+macro_rules! impl_scope_ref_sync_surface {
+    (
+        $(
+            $(#[$attribute:meta])*
+            fn $method:ident $(<$($generic:ident),+>)? (
+                &$receiver:ident $(, $argument:ident: $argument_type:ty)* $(,)?
+            ) $(-> $output:ty)?
+            $(where [$($constraint:tt)*])?
+            $body:block
+        )*
+    ) => {
+        impl ScopeRef {
+            $(
+                $(#[$attribute])*
+                pub fn $method $(<$($generic),+>)? (
+                    &$receiver,
+                    $($argument: $argument_type),*
+                ) $(-> $output)?
+                $(where $($constraint)*)?
+                $body
+            )*
+        }
+
+        impl DynamicScopeRef {
+            $(
+                $(#[$attribute])*
+                pub fn $method $(<$($generic),+>)? (
+                    &$receiver,
+                    $($argument: $argument_type),*
+                ) $(-> $output)?
+                $(where $($constraint)*)?
+                {
+                    $receiver.0.$method($($argument),*)
+                }
+            )*
+        }
+    };
+}
+
+/// The asynchronous half of the shared surface; see
+/// [`impl_scope_ref_sync_surface`]. `shutdown_and_wait` is deliberately not
+/// declared here: it calls into the driver, which the scope layer must not
+/// reference, so both handles hand-forward it from `tree.rs` instead.
+macro_rules! impl_scope_ref_async_surface {
+    (
+        $(
+            $(#[$attribute:meta])*
+            fn $method:ident $(<$($generic:ident),+>)? (
+                &$receiver:ident $(, $argument:ident: $argument_type:ty)* $(,)?
+            ) $(-> $output:ty)?
+            $(where [$($constraint:tt)*])?
+            $body:block
+        )*
+    ) => {
+        impl ScopeRef {
+            $(
+                $(#[$attribute])*
+                pub async fn $method $(<$($generic),+>)? (
+                    &$receiver,
+                    $($argument: $argument_type),*
+                ) $(-> $output)?
+                $(where $($constraint)*)?
+                $body
+            )*
+        }
+
+        impl DynamicScopeRef {
+            $(
+                $(#[$attribute])*
+                pub async fn $method $(<$($generic),+>)? (
+                    &$receiver,
+                    $($argument: $argument_type),*
+                ) $(-> $output)?
+                $(where $($constraint)*)?
+                {
+                    $receiver.0.$method($($argument),*).await
+                }
+            )*
+        }
+    };
+}
+
+impl_scope_ref_sync_surface! {
     /// Returns this scope's child id within its parent.
     #[must_use]
-    pub fn id(&self) -> &ChildId {
+    fn id(&self) -> &ChildId {
         self.cell.member.id()
     }
 
     /// Returns the scope membership identity.
     #[must_use]
-    pub fn membership(&self) -> Membership {
+    fn membership(&self) -> Membership {
         self.cell.member.membership()
     }
 
     /// Computes an authoritative recursive snapshot on demand.
     #[must_use]
-    pub fn snapshot(&self) -> Arc<ScopeSnapshot> {
+    fn snapshot(&self) -> Arc<ScopeSnapshot> {
         self.cell.snapshot()
     }
 
     /// Subscribes to conflated recursive snapshots.
     #[must_use]
-    pub fn subscribe_snapshots(&self) -> SnapshotReceiver {
+    fn subscribe_snapshots(&self) -> SnapshotReceiver {
         self.cell.subscribe_snapshots()
     }
 
     /// Subscribes to this scope's lifecycle and all forwarded descendants.
     #[must_use]
-    pub fn subscribe_lifecycle(&self) -> LifecycleEvents {
+    fn subscribe_lifecycle(&self) -> LifecycleEvents {
         self.cell.subscribe_lifecycle()
     }
 
     /// Looks up a direct child in an authoritative current snapshot.
     #[must_use]
-    pub fn child(&self, id: impl AsRef<str>) -> Option<ChildSnapshot> {
+    fn child(&self, id: impl AsRef<str>) -> Option<ChildSnapshot> {
         self.snapshot().child(id).cloned()
     }
 
     /// Traverses a child-id path in an authoritative current snapshot.
     #[must_use]
-    pub fn descendant<I, S>(&self, path: I) -> Option<ChildSnapshot>
-    where
+    fn descendant<I, S>(&self, path: I) -> Option<ChildSnapshot>
+    where [
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
-    {
+    ] {
         self.snapshot().descendant(path).cloned()
     }
 
+    /// Requests shutdown without waiting.
+    fn request_shutdown(&self) {
+        let _ = self.cell.request_shutdown();
+    }
+}
+
+impl_scope_ref_async_surface! {
     /// Waits for a named child snapshot satisfying an at-or-past predicate.
     ///
     /// Snapshot watches conflate intermediate states, so `pred` should accept
     /// every state at or beyond the desired edge and must remain cheap and
     /// non-blocking.
-    pub async fn wait_for_child<P>(
+    fn wait_for_child<P>(
         &self,
         id: impl Into<ChildId>,
-        mut pred: P,
+        pred: P,
         timeout: Duration,
     ) -> Result<ChildSnapshot, WaitError>
-    where
-        P: FnMut(&ChildSnapshot) -> bool + Send,
+    where [P: FnMut(&ChildSnapshot) -> bool + Send]
     {
         let id = id.into();
+        let mut pred = pred;
         let expires = crate::deadline::Deadline::after(crate::runtime::now(), timeout);
         let mut snapshots = self.subscribe_snapshots();
 
@@ -136,16 +232,13 @@ impl ScopeRef {
         }
     }
 
-    /// Requests shutdown without waiting.
-    pub fn request_shutdown(&self) {
-        let _ = self.cell.request_shutdown();
-    }
-
     /// Waits for terminal membership state.
-    pub async fn wait_stopped(&self) -> StopReason {
+    fn wait_stopped(&self) -> StopReason {
         self.cell.wait_stopped().await
     }
+}
 
+impl ScopeRef {
     /// Dynamically queries whether this scope has dynamic capabilities.
     #[must_use]
     pub fn dynamic(&self) -> Option<DynamicScopeRef> {
@@ -189,73 +282,15 @@ impl DynamicScopeRef {
     pub fn as_scope(&self) -> &ScopeRef {
         &self.0
     }
+}
 
-    /// Returns this scope's child id within its parent.
-    #[must_use]
-    pub fn id(&self) -> &ChildId {
-        self.0.id()
-    }
+/// Backstop for methods declared outside the shared-surface macros: any
+/// future `ScopeRef` method remains reachable on `DynamicScopeRef` through
+/// deref, even before the shared declaration is updated.
+impl Deref for DynamicScopeRef {
+    type Target = ScopeRef;
 
-    /// Returns the scope membership identity.
-    #[must_use]
-    pub fn membership(&self) -> Membership {
-        self.0.membership()
-    }
-
-    /// Computes an authoritative recursive snapshot on demand.
-    #[must_use]
-    pub fn snapshot(&self) -> Arc<ScopeSnapshot> {
-        self.0.snapshot()
-    }
-
-    /// Subscribes to conflated recursive snapshots.
-    #[must_use]
-    pub fn subscribe_snapshots(&self) -> SnapshotReceiver {
-        self.0.subscribe_snapshots()
-    }
-
-    /// Subscribes to this scope's lifecycle and all forwarded descendants.
-    #[must_use]
-    pub fn subscribe_lifecycle(&self) -> LifecycleEvents {
-        self.0.subscribe_lifecycle()
-    }
-
-    /// Looks up a direct child in an authoritative current snapshot.
-    #[must_use]
-    pub fn child(&self, id: impl AsRef<str>) -> Option<ChildSnapshot> {
-        self.0.child(id)
-    }
-
-    /// Traverses a child-id path in an authoritative current snapshot.
-    #[must_use]
-    pub fn descendant<I, S>(&self, path: I) -> Option<ChildSnapshot>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.0.descendant(path)
-    }
-
-    /// Waits for a named child snapshot satisfying an at-or-past predicate.
-    pub async fn wait_for_child<P>(
-        &self,
-        id: impl Into<ChildId>,
-        pred: P,
-        timeout: Duration,
-    ) -> Result<ChildSnapshot, WaitError>
-    where
-        P: FnMut(&ChildSnapshot) -> bool + Send,
-    {
-        self.0.wait_for_child(id, pred, timeout).await
-    }
-
-    /// Requests shutdown without waiting.
-    pub fn request_shutdown(&self) {
-        self.0.request_shutdown();
-    }
-
-    /// Waits for terminal membership state.
-    pub async fn wait_stopped(&self) -> StopReason {
-        self.0.wait_stopped().await
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }

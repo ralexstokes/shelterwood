@@ -1,16 +1,16 @@
-use std::{cell::Cell, error::Error, hash::Hash, time::Duration};
+use std::{cell::Cell, error::Error, hash::Hash, ops::Deref, time::Duration};
 
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ActorSlot, Admission, Blocking, BuildError, CallError,
     CallFuture, Cancellation, CancellationToken, Context, DeadlineElapsed, DefaultsInheritance,
     DynamicActorSlot, DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError,
     ExitResult, GracePhase, Guard, Handler, Incarnation, Intensity, LifecycleEvents,
-    LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, OneShotTaskRef, RawActor,
-    RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, Removal, Reply, ReplyReceive,
-    ReplyReceiver, ReserveError, RestartAttempt, RestartCount, RestartPolicy, Retention,
-    ScopeDefaults, ScopeRef, SendError, SendFuture, SendTimeout, Shutdown, SnapshotClosed,
-    SnapshotReceiver, StopContext, Strategy, SubtreeDef, SubtreeOnceDef, SubtreeSlot, System,
-    TaskDef, TaskOnceDef, TaskRef, TaskSlot, TotalRestarts, Tree, WaitError,
+    LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, MembershipStatus, OneShotTaskRef,
+    RawActor, RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, Removal, Reply,
+    ReplyReceive, ReplyReceiver, ReserveError, RestartAttempt, RestartCount, RestartPolicy,
+    Retention, ScopeDefaults, ScopeRef, SendError, SendFuture, SendTimeout, Shutdown,
+    SnapshotClosed, SnapshotReceiver, StopContext, Strategy, SubtreeDef, SubtreeOnceDef,
+    SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, TotalRestarts, Tree, WaitError,
 };
 
 fn assert_error<T: Error>() {}
@@ -19,6 +19,11 @@ fn assert_send_type<T: Send>() {}
 fn assert_send_sync<T: Send + Sync>() {}
 fn assert_copy_eq_hash_send_sync<T: Copy + Eq + Hash + Send + Sync>() {}
 fn assert_clone_eq_hash_send_sync<T: Clone + Eq + Hash + Send + Sync>() {}
+fn assert_deref<T, U: ?Sized>()
+where
+    T: Deref<Target = U>,
+{
+}
 fn assert_static<T: 'static>() {}
 
 #[test]
@@ -38,6 +43,12 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     assert_clone_eq_hash_send_sync::<TaskRef>();
     assert_clone_eq_hash_send_sync::<ScopeRef>();
     assert_clone_eq_hash_send_sync::<DynamicScopeRef>();
+    // Dynamic scope handles inherit every observation/control method through
+    // this relationship, so adding a ScopeRef method cannot omit it here.
+    assert_deref::<DynamicScopeRef, ScopeRef>();
+    // Existing inherent methods remain addressable through UFCS as well as
+    // ordinary method syntax.
+    let _ = DynamicScopeRef::id;
     assert_send_sync::<SnapshotReceiver>();
     assert_send_sync::<LifecycleEvents>();
     assert_send_sync::<CancellationToken>();
@@ -401,6 +412,7 @@ fn all_definition_option_setters_compile() {
 
 #[test]
 fn observation_types_obey_error_and_thread_safety_contracts() {
+    assert_copy_eq_hash_send_sync::<MembershipStatus>();
     assert_error::<LifecycleTryRecvError>();
     assert_error::<SnapshotClosed>();
     assert_error::<WaitError>();

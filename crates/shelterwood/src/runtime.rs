@@ -923,10 +923,6 @@ impl<T> WatchSender<T> {
         self.0.receiver_count()
     }
 
-    pub(crate) fn read_with<R>(&self, read: impl FnOnce(&T) -> R) -> R {
-        read(&self.0.borrow())
-    }
-
     pub(crate) fn pulse(&self) {
         self.0.send_modify(|_| {});
     }
@@ -935,6 +931,9 @@ impl<T> WatchSender<T> {
         self.0.send_modify(update);
     }
 
+    /// The remaining production writers pulse or replace whole values; only
+    /// test-side publication needs conditional notification.
+    #[cfg(test)]
     pub(crate) fn send_if_modified(&self, update: impl FnOnce(&mut T) -> bool) -> bool {
         self.0.send_if_modified(update)
     }
@@ -950,16 +949,6 @@ impl<T> WatchSender<T> {
             false
         });
         debug_assert!(!notified);
-    }
-
-    pub(crate) fn replace(&self, value: T) {
-        self.0.send_replace(value);
-    }
-}
-
-impl<T: Default> WatchSender<T> {
-    pub(crate) fn take(&self) -> T {
-        self.0.send_replace(T::default())
     }
 }
 

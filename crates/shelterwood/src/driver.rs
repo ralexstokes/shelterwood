@@ -20,7 +20,7 @@ use crate::{
     deadline::Deadline,
     engine::{
         ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
-        IncarnationRun, IntensityState, MembershipMode, ReadinessEffect, ReadinessEvent,
+        IncarnationRun, IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent,
         ReadinessGate, RestartState, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate,
         dispatch_exit, schedule_restart,
     },
@@ -862,7 +862,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
         };
-        report.record(RecordedOutcome::Returned(result));
+        report.record(RecordedOutcome::returned(result));
     });
     let abort_handle = handle.abort_handle();
 
@@ -1245,7 +1245,7 @@ impl ScopeRuntime {
                 true
             }
             ReadinessEffect::TimedOut { deadline } => {
-                self.begin_stop_child(key, Some(RecordedOutcome::ReadinessTimedOut { deadline }));
+                self.begin_stop_child(key, Some(RecordedOutcome::readiness_timed_out(deadline)));
                 false
             }
             ReadinessEffect::Disarmed => false,
@@ -1380,7 +1380,7 @@ impl ScopeRuntime {
                 StopAction::AbortFramework { phase } => {
                     active.hard_abort_phase = Some(phase);
                     if active.forced_outcome.is_none() {
-                        active.forced_outcome = Some(RecordedOutcome::Aborted { phase });
+                        active.forced_outcome = Some(RecordedOutcome::aborted(phase));
                     }
                     active
                         .framework_abort
@@ -1687,12 +1687,12 @@ impl ScopeRuntime {
         } else {
             ScopeMode::Running
         };
-        let member_mode = if membership_removing {
-            MembershipMode::Removing
+        let membership_status = if membership_removing {
+            MembershipStatus::Removing
         } else {
-            MembershipMode::Active
+            MembershipStatus::Active
         };
-        match dispatch_exit(&exit, child.options.restart, mode, member_mode) {
+        match dispatch_exit(&exit, child.options.restart, mode, membership_status) {
             ExitDispatch::Terminal => {
                 // §6's startup abort is a startup-sequence property: the
                 // membership failed before its *initial* readiness edge. A
@@ -3399,6 +3399,93 @@ mod tests {
     }
 
     #[test]
+    fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
+        const UPDATES: usize = 2_000;
+
+        let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+        let first = Intensity::new(1, Duration::from_secs(1)).expect("valid first intensity");
+        let second = Intensity::new(2, Duration::from_secs(2)).expect("valid second intensity");
+        scope.set_observation_config(Default::default(), first);
+
+        let start = Arc::new(Barrier::new(2));
+        let writer_scope = Arc::clone(&scope);
+        let writer_start = Arc::clone(&start);
+        let writer = std::thread::spawn(move || {
+            writer_start.wait();
+            for update in 0..UPDATES {
+                let intensity = if update % 2 == 0 { second } else { first };
+                writer_scope.set_observation_config(Default::default(), intensity);
+            }
+        });
+
+        start.wait();
+        for _ in 0..UPDATES {
+            let intensity = scope.snapshot().intensity;
+            assert!(
+                intensity == first || intensity == second,
+                "a snapshot observes one complete configuration update"
+            );
+        }
+        writer.join().expect("config writer completes");
+    }
+
+    #[test]
+    fn plain_resident_state_is_released_before_recursive_removed_publication() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let first = isolated_scope("first", ScopeFlavor::Dynamic);
+        let second = isolated_scope("second", ScopeFlavor::Dynamic);
+        let first_slot = SlotCell::new(Arc::clone(&first.member), Some(first));
+        let second_slot = SlotCell::new(Arc::clone(&second.member), Some(second));
+        let mut events = root.subscribe_lifecycle();
+        let snapshots = root.subscribe_snapshots();
+
+        root.set_admitted_children(vec![
+            resident_projection(&first_slot),
+            resident_projection(&second_slot),
+        ]);
+        root.clear_residents();
+
+        assert!(root.resident_projections().is_empty());
+        assert!(snapshots.borrow_latest().children.is_empty());
+        let mut added = 0;
+        let mut removed = 0;
+        while let Ok(LifecycleItem::Event(event)) = events.try_recv() {
+            match event.kind {
+                LifecycleEventKind::Added { .. } => added += 1,
+                LifecycleEventKind::Removed { .. } => removed += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((added, removed), (2, 2));
+    }
+
+    #[test]
+    fn plain_parent_state_preserves_nested_snapshot_propagation() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        let mut incarnations = IncarnationCounter::near_exhaustion(nested.member.membership());
+        nested.member.update(|record| {
+            record.incarnation = incarnations.mint();
+            record.stage = MemberStage::Starting;
+        });
+        let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+        root.set_admitted_children(vec![resident_projection(&nested_slot)]);
+        let snapshots = root.subscribe_snapshots();
+        let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
+
+        nested.set_observation_config(Default::default(), intensity);
+
+        assert_eq!(
+            snapshots
+                .borrow_latest()
+                .child("nested")
+                .and_then(|child| child.nested.as_deref())
+                .map(|snapshot| snapshot.intensity),
+            Some(intensity)
+        );
+    }
+
+    #[test]
     fn pre_admission_observer_retries_after_gate_handoff() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
@@ -3746,7 +3833,7 @@ mod tests {
         let exit = DriverEvent::Child(ChildEvent::Exited {
             child: trip,
             incarnation,
-            recorded: Some(RecordedOutcome::Returned(Err(ExitError::message(
+            recorded: Some(RecordedOutcome::returned(Err(ExitError::message(
                 "trip intensity",
             )))),
             join: JoinVerdict::Completed,
@@ -3869,7 +3956,7 @@ mod tests {
             Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
                 child: key,
                 incarnation,
-                recorded: Some(RecordedOutcome::Returned(Ok(()))),
+                recorded: Some(RecordedOutcome::returned(Ok(()))),
                 join: JoinVerdict::Completed,
                 cancellation: Cancellation::NotObserved,
                 readiness_signal_seen: true,
@@ -4086,13 +4173,13 @@ mod tests {
         let shutdown = Latch::default();
         let readiness = CompletionGatedLatch::default();
         let (token, claim) = report_slot(shutdown.clone(), None, readiness.clone());
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         shutdown.fire();
         readiness.fire();
         let report = claim.receive();
         assert!(matches!(
             report.outcome,
-            Some(RecordedOutcome::Returned(Ok(())))
+            Some(outcome) if matches!(outcome.kind(), ExitKind::Completed)
         ));
         assert_eq!(report.cancellation, Cancellation::NotObserved);
         assert!(!report.readiness_signal_seen);
@@ -4111,11 +4198,11 @@ mod tests {
         let shutdown = Latch::default();
         let (token, claim) = report_slot(shutdown.clone(), None, CompletionGatedLatch::default());
         shutdown.fire();
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         let report = claim.receive();
         assert!(matches!(
             report.outcome,
-            Some(RecordedOutcome::Returned(Ok(())))
+            Some(outcome) if matches!(outcome.kind(), ExitKind::Completed)
         ));
         assert_eq!(report.cancellation, Cancellation::Observed);
     }
@@ -4130,7 +4217,7 @@ mod tests {
             CompletionGatedLatch::default(),
         );
         local_stop.fire();
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         assert_eq!(claim.receive().cancellation, Cancellation::Observed);
     }
 
@@ -4180,7 +4267,7 @@ mod tests {
         let readiness = CompletionGatedLatch::default();
         let (token, claim) = report_slot(Latch::default(), None, readiness.clone());
         readiness.fire();
-        token.record(RecordedOutcome::Returned(Ok(())));
+        token.record(RecordedOutcome::returned(Ok(())));
         assert!(!readiness.fire(), "completion closes retained capabilities");
         assert!(claim.receive().readiness_signal_seen);
     }

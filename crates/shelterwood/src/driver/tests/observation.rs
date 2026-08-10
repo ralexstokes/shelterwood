@@ -240,6 +240,56 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
 }
 
 #[crate::runtime::test]
+async fn wait_for_child_reloads_after_its_predicate_closes_the_snapshot_stream() {
+    let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("scope epoch is available");
+    scope.set_state(ScopeState::Running);
+    let child_id = ChildId::from("child");
+    let membership = scope
+        .child_identity
+        .lock()
+        .expect("scope identity mutex is healthy")
+        .mint_membership(&child_id)
+        .expect("child membership is available");
+    let child = MemberCell::new(child_id, membership);
+    let slot = SlotCell::new(Arc::clone(&child), None);
+    scope.set_admitted_children(vec![resident_projection(&slot)]);
+    let scope_ref = ScopeRef {
+        cell: Arc::clone(&scope),
+    };
+    let closing_scope = Arc::clone(&scope);
+    let mut first = true;
+
+    let result = scope_ref
+        .wait_for_child(
+            "child",
+            move |_| {
+                if std::mem::take(&mut first) {
+                    closing_scope.finish_root_incarnation(
+                        epoch,
+                        StopReason::Finished,
+                        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+                    );
+                }
+                false
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(crate::WaitError::ScopeTerminated {
+            state: ScopeState::Stopped {
+                reason: StopReason::Finished
+            }
+        })
+    ));
+}
+
+#[crate::runtime::test]
 async fn terminality_fallback_preserves_restart_window_scope_reason() {
     let parent = isolated_scope("parent", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Ordered);

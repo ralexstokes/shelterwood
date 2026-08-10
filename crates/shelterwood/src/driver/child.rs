@@ -131,9 +131,17 @@ pub(super) fn discharge_child_terminality(completion: ChildTerminality) {
             record.incarnation,
         )
     };
-    // `terminalize_child` synthesizes the nested NeverStarted scope stop in
-    // the same observation transaction as the parent membership edge. A
-    // restarting scope already published its real prior-incarnation reason.
+    // Initial-child conversion precedes residency publication. If a later
+    // conversion unwinds, use the slot-owned gate for the converted prefix;
+    // `terminalize_child` cannot discover those slots through the parent's
+    // resident list yet. Once resident, the parent path synthesizes a nested
+    // NeverStarted scope stop in the same observation transaction as the
+    // membership edge. A restarting scope already published its real prior-
+    // incarnation reason.
+    if never_started && !completion.root.has_resident_child(&completion.slot.member) {
+        completion.slot.terminalize_never_started();
+        return;
+    }
     completion.root.terminalize_child(
         &completion.slot.member,
         exit,

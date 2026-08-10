@@ -920,6 +920,12 @@ impl ScopeCell {
             .collect()
     }
 
+    pub(crate) fn has_resident_child(&self, member: &MemberCell) -> bool {
+        self.current_children()
+            .iter()
+            .any(|resident| resident.projection.member.membership() == member.membership())
+    }
+
     fn current_children(&self) -> MutexGuard<'_, Vec<ResidentChild>> {
         self.current_children
             .lock()

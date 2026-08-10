@@ -183,7 +183,7 @@ impl_scope_ref_async_surface! {
         let mut snapshots = self.subscribe_snapshots();
 
         loop {
-            let snapshot = snapshots.borrow_latest();
+            let (snapshot, closed) = snapshots.borrow_latest_and_closed();
             if let Some(child) = snapshot.child(id.as_str())
                 && pred(child)
             {
@@ -192,7 +192,7 @@ impl_scope_ref_async_surface! {
             // The published stream is the waiter's sole authority. Closure
             // and its final snapshot commit together under ObservationTxn, so
             // the terminal payload cannot come from an earlier cut.
-            if snapshots.is_closed() {
+            if closed {
                 return Err(WaitError::ScopeTerminated {
                     state: snapshot.state.clone(),
                 });

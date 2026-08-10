@@ -300,10 +300,11 @@ impl SnapshotReceiver {
         self.inner.borrow_cloned().snapshot
     }
 
-    /// Returns whether the published snapshot stream is terminal.
+    /// Borrows the newest snapshot and terminal flag from one retained state.
     #[must_use]
-    pub(crate) fn is_closed(&self) -> bool {
-        self.inner.borrow_cloned().closed
+    pub(crate) fn borrow_latest_and_closed(&self) -> (Arc<ScopeSnapshot>, bool) {
+        let state = self.inner.borrow_cloned();
+        (state.snapshot, state.closed)
     }
 
     /// Waits for and returns a newer snapshot.

@@ -13,14 +13,15 @@
       src = ./.;
       # Repository docs and their packaged doctest copies are compared in the
       # clean build sandbox, so keep Markdown alongside Cargo sources; the
-      # enforcement scripts under tools/ run there too (.sh), and nextest
-      # reads its timeout config.
+      # enforcement scripts under tools/ run there too (.sh plus the .awk
+      # use parser), and nextest reads its timeout config.
       extraSourceFilter =
         path: type:
         type == "regular"
         && (
           builtins.match ".*\\.md" (toString path) != null
           || builtins.match ".*\\.sh" (toString path) != null
+          || builtins.match ".*\\.awk" (toString path) != null
           || builtins.match ".*/\\.config/nextest\\.toml" (toString path) != null
         );
       extraChecks =

@@ -256,16 +256,28 @@ async fn over_budget_restart_is_charged_but_never_spawned() {
                     snapshot.total_restarts, expected_total,
                     "the public scope counter advances with each scheduling event"
                 );
-                assert_eq!(
-                    snapshot
-                        .child("failing")
-                        .expect("the restartable child is retained")
-                        .restart_count,
-                    expected_count,
-                    "the membership counter includes the scheduling charge"
-                );
                 if scheduled < releases.len() {
+                    // The next incarnation is still gated, so the member is
+                    // guaranteed to remain resident while we inspect it.
+                    assert_eq!(
+                        snapshot
+                            .child("failing")
+                            .expect("the restartable child is retained")
+                            .restart_count,
+                        expected_count,
+                        "the membership counter includes the scheduling charge"
+                    );
                     releases[scheduled].release();
+                } else if let Some(child) = snapshot.child("failing") {
+                    // No gate holds the tripping charge: the driver drains and
+                    // tears the scope down without waiting for this subscriber,
+                    // so the member may already be pruned by the time event #3
+                    // is processed. Only pin its counter while it is resident;
+                    // `total_restarts` above stays authoritative either way.
+                    assert_eq!(
+                        child.restart_count, expected_count,
+                        "the membership counter includes the tripping charge"
+                    );
                 }
             }
             LifecycleEventKind::ScopeState {

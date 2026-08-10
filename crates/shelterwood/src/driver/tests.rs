@@ -13,8 +13,8 @@ use crate::{
     ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
     GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox,
     MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ReserveError,
-    RestartCondition, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind, StartupError,
-    StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+    RestartCondition, RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind,
+    StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
     engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
     exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
@@ -27,10 +27,10 @@ use crate::{
 use super::{
     AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, ChildTerminality,
     DriverEvent, DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage,
-    NestedScopeLatches, Pending, RemovalRequest, RemovalResponses, ResidentProjection,
-    RuntimeStorage, ScopeCell, ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime,
-    StartupDisposition, cancel_dynamic_reservation, discharge_child_terminality, report_slot,
-    reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
+    MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
+    ResidentProjection, RuntimeStorage, ScopeCell, ScopeEpochGuard, ScopeFlavor, ScopeRole,
+    ScopeRuntime, StartupDisposition, cancel_dynamic_reservation, discharge_child_terminality,
+    report_slot, reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
     run_nested_tree, run_scope_incarnation, storage::Obligation,
 };
 
@@ -839,12 +839,13 @@ fn plain_parent_state_preserves_nested_snapshot_propagation() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
     let mut incarnations = IncarnationCounter::near_exhaustion(nested.member.membership());
-    nested.member.update(|record| {
-        record.incarnation = incarnations.mint();
-        record.stage = MemberStage::Starting;
-    });
     let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
     root.set_admitted_children(vec![resident_projection(&nested_slot)]);
+    // Start the nested member along the production admit-then-spawn order so
+    // the transition-source assertions in `apply_transition` hold here too.
+    nested.member.transition(MemberTransition::Starting {
+        incarnation: incarnations.mint().expect("incarnation available"),
+    });
     let snapshots = root.subscribe_snapshots();
     let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
 
@@ -4052,6 +4053,62 @@ async fn system_shutdown_joins_root_driver_teardown() {
 }
 
 #[test]
+fn member_transitions_own_their_complete_record_projection() {
+    let mut identity = ScopeIdentity::new();
+    let id = ChildId::from("worker");
+    let membership = identity.mint_membership(&id).expect("membership available");
+    let member = MemberCell::new(id, membership);
+    let mut incarnations = identity.incarnation_counter(membership);
+    let incarnation = incarnations.mint().expect("incarnation available");
+
+    member.transition(MemberTransition::Admitted);
+    assert_eq!(member.record().stage, MemberStage::Admitted);
+
+    member.transition(MemberTransition::Starting { incarnation });
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Starting);
+    assert_eq!(record.incarnation, Some(incarnation));
+    assert_eq!(record.last_incarnation, Some(incarnation));
+    assert_eq!(record.restart_at, None);
+
+    member.transition(MemberTransition::Running);
+    assert_eq!(member.record().stage, MemberStage::Running);
+    member.transition(MemberTransition::Stopping);
+    assert_eq!(member.record().stage, MemberStage::Stopping);
+
+    let exit = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+    let restart_count = RestartCount::ZERO.bump();
+    let restart_at = crate::runtime::now();
+    member.transition(MemberTransition::RestartScheduled {
+        exit: exit.clone(),
+        restart_count,
+        restart_at: Some(restart_at),
+    });
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Restarting);
+    assert_eq!(record.incarnation, None);
+    assert_eq!(record.last_incarnation, Some(incarnation));
+    assert_eq!(record.last_exit, Some(exit));
+    assert_eq!(record.restart_count, restart_count);
+    assert_eq!(record.restart_at, Some(restart_at));
+
+    let second = incarnations.mint().expect("restart incarnation available");
+    member.transition(MemberTransition::Starting {
+        incarnation: second,
+    });
+    let record = member.record();
+    assert_eq!(record.stage, MemberStage::Starting);
+    assert_eq!(record.incarnation, Some(second));
+    assert_eq!(record.last_incarnation, Some(second));
+    assert_eq!(record.restart_at, None);
+    assert_eq!(
+        record.last_exit,
+        Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved))
+    );
+    assert_eq!(record.restart_count, restart_count);
+}
+
+#[test]
 fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
@@ -4061,9 +4118,18 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
         ExitKind::Failed(ExitError::message("last completed incarnation")),
         Cancellation::NotObserved,
     );
-    member.update(|record| {
-        record.stage = MemberStage::Restarting;
-        record.last_exit = Some(previous.clone());
+    // Walk the record along the production path so the transition-source
+    // assertions in `apply_transition` cover this setup too.
+    let mut setup_incarnations = identity.incarnation_counter(membership);
+    let spent = setup_incarnations
+        .mint()
+        .expect("setup incarnation available");
+    member.transition(MemberTransition::Admitted);
+    member.transition(MemberTransition::Starting { incarnation: spent });
+    member.transition(MemberTransition::RestartScheduled {
+        exit: previous.clone(),
+        restart_count: RestartCount::ZERO,
+        restart_at: None,
     });
     let mut counter = IncarnationCounter::near_exhaustion(membership);
 

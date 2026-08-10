@@ -16,7 +16,10 @@ use crate::{
     Membership, Readiness, ReadinessDeadline, ScopeState, ShutdownStraggler, ShutdownTimeout,
     StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
-    cells::{MailboxControl, MemberStage, ResidentProjection, ScopeCell, StartupDisposition},
+    cells::{
+        MailboxControl, MemberStage, MemberTransition, ResidentProjection, ScopeCell,
+        StartupDisposition,
+    },
     deadline::Deadline,
     engine::{
         ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
@@ -969,11 +972,7 @@ impl ScopeRuntime {
         // sites (the fused-only removal path, where this write is the sole
         // Removing-projection writer) rather than this check.
         if member.record().membership_status != MembershipStatus::Removing {
-            self.root.transition_child(
-                &member,
-                |record| record.membership_status = MembershipStatus::Removing,
-                None,
-            );
+            self.root.set_child_removing(&member);
         }
     }
 
@@ -1132,14 +1131,9 @@ impl ScopeRuntime {
             );
             mailbox.bind(incarnation);
         }
-        self.root.transition_child(
+        self.root.transition_child_stage(
             &child.slot.member,
-            |record| {
-                record.stage = MemberStage::Starting;
-                record.incarnation = Some(incarnation);
-                record.last_incarnation = Some(incarnation);
-                record.restart_at = None;
-            },
+            MemberTransition::Starting { incarnation },
             Some(LifecycleEventKind::Started {
                 id: child.slot.member.id().clone(),
                 membership: child.slot.member.membership(),
@@ -1251,9 +1245,9 @@ impl ScopeRuntime {
                 if !self.lifecycle.startup_complete() {
                     child.initial_ready = true;
                 }
-                self.root.transition_child(
+                self.root.transition_child_stage(
                     &child.slot.member,
-                    |record| record.stage = MemberStage::Running,
+                    MemberTransition::Running,
                     Some(LifecycleEventKind::Ready {
                         id: child.slot.member.id().clone(),
                         membership: child.slot.member.membership(),
@@ -1333,11 +1327,8 @@ impl ScopeRuntime {
                 }
                 return;
             }
-            self.root.transition_child(
-                &child.slot.member,
-                |record| record.stage = MemberStage::Stopping,
-                None,
-            );
+            self.root
+                .transition_child_stage(&child.slot.member, MemberTransition::Stopping, None);
             if let Some(mailbox) = &child.mailbox {
                 mailbox.freeze(active.incarnation);
             }
@@ -1736,16 +1727,13 @@ impl ScopeRuntime {
                 self.root.publish_child_restart(
                     &child.slot.member,
                     decision.charge.total_restarts,
-                    |record| {
-                        record.incarnation = None;
-                        record.last_exit = Some(exit.clone());
-                        record.restart_count = decision.restart_count;
-                        // Publish the derived schedule even when intensity
-                        // prevents spawning it. `None` means the exact clock
-                        // point cannot be represented and armed; no substitute
-                        // restart is scheduled.
-                        record.restart_at = decision.restart_at;
-                        record.stage = MemberStage::Restarting;
+                    MemberTransition::RestartScheduled {
+                        exit: exit.clone(),
+                        restart_count: decision.restart_count,
+                        // Publish the derived schedule even when intensity prevents spawning it.
+                        // `None` means the exact clock point cannot be represented and armed; no
+                        // substitute restart is scheduled.
+                        restart_at: decision.restart_at,
                     },
                     LifecycleEventKind::Exited {
                         id: child.slot.member.id().clone(),
@@ -2385,8 +2373,7 @@ async fn run_scope_incarnation(
 ) -> StopReason {
     let root = Arc::clone(&plan.root);
     if role.is_root() {
-        root.member
-            .update(|record| record.stage = MemberStage::Running);
+        root.member.transition(MemberTransition::Running);
     }
     let capacity = plan.children.len().saturating_mul(3).max(64);
     let (events, mut event_receiver) = runtime::bounded_mpsc(capacity);

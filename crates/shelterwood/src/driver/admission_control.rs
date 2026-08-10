@@ -488,11 +488,7 @@ fn remove_dynamic_impl(
     // stall every concurrent reservation, removal, and driver admission.
     drop(state);
     if member.record().membership_status != MembershipStatus::Removing {
-        scope.transition_child(
-            &member,
-            |record| record.membership_status = MembershipStatus::Removing,
-            None,
-        );
+        scope.set_child_removing(&member);
     }
     if member.removal.fire() {
         // This latch dedups repeated `remove` calls, but not a concurrent

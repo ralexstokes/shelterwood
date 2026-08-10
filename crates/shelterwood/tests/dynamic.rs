@@ -154,8 +154,7 @@ async fn scope_dynamic_conversion_and_exact_dynamic_scope_removal_are_publicly_u
     let nested = dynamic_scope
         .add_subtree_once("nested-dynamic", SubtreeOnceDef::new(DynamicTree::new()))
         .await
-        .expect("dynamic subtree is admitted")
-        .into_handles();
+        .expect("dynamic subtree is admitted");
     assert_eq!(
         dynamic_scope.remove_dynamic_scope(&nested).await,
         RemoveOutcome::Removed
@@ -172,21 +171,18 @@ async fn restartable_dynamic_surfaces_are_parallel_across_all_three_child_kinds(
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
 
-    let task_receipt = scope
+    let task = scope
         .add_task("task", waiting_task())
         .await
         .expect("restartable task is admitted");
-    let task = task_receipt.into_handles();
-    let raw_receipt = scope
+    let raw = scope
         .add_raw("raw", RawDef::factory(|| WaitingRaw))
         .await
         .expect("restartable raw actor is admitted");
-    let raw = raw_receipt.into_handles();
-    let subtree_receipt = scope
+    let subtree = scope
         .add_subtree("subtree", SubtreeDef::factory(waiting_tree))
         .await
         .expect("restartable subtree is admitted");
-    let subtree = subtree_receipt.into_handles();
 
     assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
     assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
@@ -203,7 +199,7 @@ async fn consuming_dynamic_surfaces_are_parallel_across_all_three_child_kinds() 
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
 
-    let task_receipt = scope
+    let (task, completion) = scope
         .add_task_once(
             "task-once",
             TaskOnceDef::new(|context| async move {
@@ -213,18 +209,15 @@ async fn consuming_dynamic_surfaces_are_parallel_across_all_three_child_kinds() 
         )
         .await
         .expect("one-shot task is admitted");
-    let (task, completion) = task_receipt.into_handles();
     drop(completion);
-    let raw_receipt = scope
+    let raw = scope
         .add_raw_once("raw-once", RawOnceDef::new(WaitingRaw))
         .await
         .expect("one-shot raw actor is admitted");
-    let raw = raw_receipt.into_handles();
-    let subtree_receipt = scope
+    let subtree = scope
         .add_subtree_once("subtree-once", SubtreeOnceDef::new(waiting_tree()))
         .await
         .expect("one-shot subtree is admitted");
-    let subtree = subtree_receipt.into_handles();
 
     assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
     assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
@@ -242,7 +235,7 @@ async fn dynamic_actor_add_resolves_at_admission_without_awaiting_init() {
     system.wait_started().await.expect("dynamic root starts");
     let scope = system.scope();
     let gate = ReleaseGate::default();
-    let receipt = tokio::time::timeout(
+    let actor = tokio::time::timeout(
         Duration::from_secs(1),
         scope.add_actor_once(
             "gated",
@@ -254,7 +247,6 @@ async fn dynamic_actor_add_resolves_at_admission_without_awaiting_init() {
     .await
     .expect("admission does not wait for init")
     .expect("actor admitted");
-    let actor = receipt.into_handles();
     actor.send(()).await.expect("admitted mailbox is usable");
     assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
     system
@@ -274,13 +266,11 @@ async fn exact_handles_reject_cross_scope_and_same_id_successors() {
     let left_task = left_scope
         .add_task("same", waiting_task())
         .await
-        .expect("left admission")
-        .into_handles();
+        .expect("left admission");
     let right_task = right_scope
         .add_task("same", waiting_task())
         .await
-        .expect("right admission")
-        .into_handles();
+        .expect("right admission");
 
     assert_eq!(
         right_scope.remove_task(&left_task).await,
@@ -293,8 +283,7 @@ async fn exact_handles_reject_cross_scope_and_same_id_successors() {
     let replacement = left_scope
         .add_task("same", waiting_task())
         .await
-        .expect("replacement admission")
-        .into_handles();
+        .expect("replacement admission");
     assert!(replacement.membership().supersedes(left_task.membership()));
     assert_eq!(
         left_scope.remove_task(&left_task).await,
@@ -354,8 +343,7 @@ async fn nested_declared_membership_is_superseded_by_its_runtime_replacement() {
     let replacement = nested_scope
         .add_task("worker", waiting_task())
         .await
-        .expect("runtime replacement is admitted")
-        .into_handles();
+        .expect("runtime replacement is admitted");
 
     assert!(replacement.membership().supersedes(declared_membership));
     assert!(!declared_membership.supersedes(replacement.membership()));
@@ -414,8 +402,7 @@ async fn nested_actor_replacement_keeps_mailbox_evidence_in_each_exact_membershi
     let replacement = nested_scope
         .add_actor("worker", shelterwood::ActorDef::<EvidenceActor>::cloned(()))
         .await
-        .expect("runtime replacement is admitted")
-        .into_handles();
+        .expect("runtime replacement is admitted");
     let replacement_incarnation = replacement.try_send(()).expect("replacement actor accepts");
     assert!(replacement.membership().supersedes(declared.membership()));
     assert_eq!(
@@ -441,8 +428,7 @@ async fn exact_scope_removal_does_not_touch_a_same_id_successor() {
     let first = root
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
-        .expect("first subtree admitted")
-        .into_handles();
+        .expect("first subtree admitted");
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), root.remove_scope(&first))
             .await
@@ -452,8 +438,7 @@ async fn exact_scope_removal_does_not_touch_a_same_id_successor() {
     let second = root
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
-        .expect("second subtree admitted")
-        .into_handles();
+        .expect("second subtree admitted");
     assert!(second.membership().supersedes(first.membership()));
     assert_eq!(
         root.remove_scope(&first).await,
@@ -484,8 +469,7 @@ async fn tombstones_occupy_ids_until_explicit_removal() {
                 .retention(Retention::Retain),
         )
         .await
-        .expect("task admitted")
-        .into_handles();
+        .expect("task admitted");
     task.wait().await;
     assert!(matches!(
         scope.add_task("tombstone", waiting_task()).await,
@@ -495,8 +479,7 @@ async fn tombstones_occupy_ids_until_explicit_removal() {
     let replacement = scope
         .add_task("tombstone", waiting_task())
         .await
-        .expect("removal frees id")
-        .into_handles();
+        .expect("removal frees id");
     assert_eq!(
         scope.remove_task(&replacement).await,
         RemoveOutcome::Removed
@@ -533,8 +516,7 @@ async fn removal_is_synchronous_detached_and_shared() {
             }),
         )
         .await
-        .expect("task admitted")
-        .into_handles();
+        .expect("task admitted");
 
     let first = scope.remove_task(&task);
     let second = scope.remove_task(&task);
@@ -554,8 +536,7 @@ async fn removal_is_synchronous_detached_and_shared() {
     let replacement = scope
         .add_task("worker", waiting_task())
         .await
-        .expect("id is free after detached removal")
-        .into_handles();
+        .expect("id is free after detached removal");
     assert_eq!(
         scope.remove_task(&replacement).await,
         RemoveOutcome::Removed
@@ -563,8 +544,7 @@ async fn removal_is_synchronous_detached_and_shared() {
     let shared = scope
         .add_task("shared", waiting_task())
         .await
-        .expect("shared-removal task admitted")
-        .into_handles();
+        .expect("shared-removal task admitted");
     let (left, right) = tokio::join!(scope.remove_task(&shared), scope.remove_task(&shared));
     assert_eq!(left, RemoveOutcome::Removed);
     assert_eq!(right, RemoveOutcome::Removed);
@@ -611,8 +591,7 @@ async fn reserved_cell_removal_wins_a_queued_split_definition() {
     let survivor = scope
         .add_task("survivor", waiting_task())
         .await
-        .expect("scope remains admitting")
-        .into_handles();
+        .expect("scope remains admitting");
     assert_eq!(scope.remove_task(&survivor).await, RemoveOutcome::Removed);
     system
         .shutdown(Duration::from_secs(1))
@@ -665,8 +644,7 @@ fn admission_runtime_guards_leave_reservation_ids_reusable() {
             let task = scope
                 .add_task(id, waiting_task())
                 .await
-                .unwrap_or_else(|error| panic!("id `{id}` remains reusable: {error:?}"))
-                .into_handles();
+                .unwrap_or_else(|error| panic!("id `{id}` remains reusable: {error:?}"));
             assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
         }
         system
@@ -696,8 +674,7 @@ async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
     let reused = scope
         .add_task("fused-select", waiting_task())
         .await
-        .expect("select dropping a fused admission frees its id")
-        .into_handles();
+        .expect("select dropping a fused admission frees its id");
     assert_eq!(scope.remove_task(&reused).await, RemoveOutcome::Removed);
 
     let split_started = Arc::new(AtomicBool::new(false));
@@ -764,8 +741,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     let reused = scope
         .add_task("fused-before-poll", waiting_task())
         .await
-        .expect("never-polled fused add withdraws")
-        .into_handles();
+        .expect("never-polled fused add withdraws");
     assert_eq!(scope.remove_task(&reused).await, RemoveOutcome::Removed);
 
     let fused_started = Arc::new(AtomicBool::new(false));
@@ -805,8 +781,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     let reused = scope
         .add_task("fused-after-admission", waiting_task())
         .await
-        .expect("post-admission fused drop removes")
-        .into_handles();
+        .expect("post-admission fused drop removes");
     assert_eq!(scope.remove_task(&reused).await, RemoveOutcome::Removed);
 
     let split_started = Arc::new(AtomicBool::new(false));
@@ -920,8 +895,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
     let actor = scope
         .add_raw("fused-actor", RawDef::factory(|| WaitingRaw))
         .await
-        .expect("fused actor drop frees its id")
-        .into_handles();
+        .expect("fused actor drop frees its id");
     assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
 
     let subtree_started = Arc::new(AtomicBool::new(false));
@@ -951,8 +925,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
     let subtree = scope
         .add_subtree_once("fused-subtree", SubtreeOnceDef::new(waiting_tree()))
         .await
-        .expect("fused subtree drop frees its id")
-        .into_handles();
+        .expect("fused subtree drop frees its id");
     assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
 
     let actor_started = Arc::new(AtomicBool::new(false));
@@ -1034,8 +1007,7 @@ async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
             }),
         )
         .await
-        .expect("task admitted")
-        .into_handles();
+        .expect("task admitted");
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             started.load(Ordering::SeqCst)
@@ -1173,20 +1145,17 @@ async fn dropping_undefined_dynamic_slots_terminalizes_cells_and_frees_ids() {
     let worker = scope
         .add_task("worker", waiting_task())
         .await
-        .expect("task id was released")
-        .into_handles();
+        .expect("task id was released");
     assert_eq!(scope.remove_task(&worker).await, RemoveOutcome::Removed);
     let actor = scope
         .add_raw("actor", RawDef::factory(|| WaitingRaw))
         .await
-        .expect("actor id was released")
-        .into_handles();
+        .expect("actor id was released");
     assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
     let nested = scope
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
-        .expect("subtree id was released")
-        .into_handles();
+        .expect("subtree id was released");
     assert_eq!(scope.remove_scope(&nested).await, RemoveOutcome::Removed);
     system
         .shutdown(Duration::from_secs(1))
@@ -1266,8 +1235,7 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
     let runtime_task = scope
         .add_task("runtime", waiting_task())
         .await
-        .expect("the replacement incarnation admits")
-        .into_handles();
+        .expect("the replacement incarnation admits");
     assert_eq!(
         scope.remove_task(&runtime_task).await,
         RemoveOutcome::Removed
@@ -1580,8 +1548,7 @@ async fn removal_of_a_polled_split_definition_keeps_the_scope_admitting() {
     let survivor = scope
         .add_task("worker", waiting_task())
         .await
-        .expect("the scope keeps admitting and the id is free")
-        .into_handles();
+        .expect("the scope keeps admitting and the id is free");
     assert_eq!(scope.remove_task(&survivor).await, RemoveOutcome::Removed);
     system
         .shutdown(Duration::from_secs(1))
@@ -1661,9 +1628,9 @@ async fn ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal()
     );
 
     match admission.await {
-        Ok(receipt) => {
-            assert_eq!(receipt.membership(), queued.membership());
-            drop(receipt);
+        Ok(task) => {
+            assert_eq!(task.membership(), queued.membership());
+            drop(task);
         }
         Err(ReserveError::NotAdmitting(_)) => {}
         Err(error) => panic!("unexpected queued-admission result: {error:?}"),
@@ -1684,22 +1651,57 @@ async fn ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal()
 }
 
 #[tokio::test]
-async fn admission_receipts_expose_membership_and_borrowed_handles() {
+async fn admissions_return_kind_specific_handles_directly() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
 
-    let receipt = scope
-        .add_task("worker", waiting_task())
+    let actor_slot = scope
+        .reserve_actor::<()>("actor")
+        .expect("actor is reserved");
+    let reserved_actor = actor_slot.actor_ref();
+    let actor = actor_slot
+        .define(shelterwood::ActorDef::<EvidenceActor>::cloned(()))
+        .await
+        .expect("actor is admitted");
+    assert_eq!(actor.membership(), reserved_actor.membership());
+
+    let task_slot = scope.reserve_task("task").expect("task is reserved");
+    let reserved_task = task_slot.task_ref();
+    let task = task_slot
+        .define(waiting_task())
         .await
         .expect("task is admitted");
-    let membership = receipt.membership();
-    assert_eq!(receipt.handles().membership(), membership);
-    assert_eq!(receipt.handles().id().as_str(), "worker");
-    let task = receipt.into_handles();
-    assert_eq!(task.membership(), membership);
+    assert_eq!(task.membership(), reserved_task.membership());
 
+    let one_shot_slot = scope
+        .reserve_task("one-shot")
+        .expect("one-shot task is reserved");
+    let reserved_one_shot = one_shot_slot.task_ref();
+    let (one_shot, completion) = one_shot_slot
+        .define_once(TaskOnceDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok::<_, ExitError>(())
+        }))
+        .await
+        .expect("one-shot task is admitted");
+    assert_eq!(one_shot.membership(), reserved_one_shot.membership());
+    drop(completion);
+
+    let subtree_slot = scope
+        .reserve_subtree::<Tree>("subtree")
+        .expect("subtree is reserved");
+    let reserved_subtree = subtree_slot.scope_ref();
+    let subtree = subtree_slot
+        .define_once(SubtreeOnceDef::new(waiting_tree()))
+        .await
+        .expect("subtree is admitted");
+    assert_eq!(subtree.membership(), reserved_subtree.membership());
+
+    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
     assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_task(&one_shot).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
     system
         .shutdown(Duration::from_secs(1))
         .await

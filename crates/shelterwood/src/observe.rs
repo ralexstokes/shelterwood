@@ -11,7 +11,9 @@ use std::{
 
 use crate::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartAttempt, RestartCount, RestartPolicy,
-    Retention, Strategy, TotalRestarts, engine::MembershipStatus, exit::StopReason, runtime,
+    Retention, Strategy, TotalRestarts,
+    engine::{MembershipStatus, ScopeState},
+    runtime,
 };
 
 /// Number of lifecycle events retained independently for each subscriber.
@@ -170,39 +172,6 @@ impl ChildState {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Stopped { .. } | Self::StartupAborted { .. })
-    }
-}
-
-/// Current state of a scope membership or incarnation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ScopeState {
-    /// Membership exists but no incarnation has spawned.
-    Unstarted,
-    /// The current incarnation is starting its initial children.
-    Starting,
-    /// Aggregate readiness completed.
-    Running,
-    /// Root startup failed while the started prefix remains supervised.
-    StartupFailed,
-    /// The current incarnation is tearing down.
-    Draining,
-    /// One incarnation stopped.
-    Stopped {
-        /// Structured stop reason.
-        reason: StopReason,
-    },
-}
-
-impl ScopeState {
-    /// Returns whether this is a membership-terminal state.
-    ///
-    /// A nested scope can transiently publish `Stopped` before its parent
-    /// restarts the same membership, so callers that need membership
-    /// terminality should prefer stream closure or `wait_stopped()`.
-    #[must_use]
-    pub fn is_stopped(&self) -> bool {
-        matches!(self, Self::Stopped { .. })
     }
 }
 

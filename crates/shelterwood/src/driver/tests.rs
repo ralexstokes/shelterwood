@@ -3531,10 +3531,11 @@ async fn fused_only_removal_publishes_removing_from_the_driver() {
     // The projection asserts after `handle_removal` pin that call; the
     // explicit-remove variants cannot, because `remove_dynamic_impl`
     // publishes the projection before its request reaches the driver.
-    assert!(!member.record().removing);
+    assert_eq!(member.record().membership_status, MembershipStatus::Active);
     super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
-    assert!(
-        !member.record().removing,
+    assert_eq!(
+        member.record().membership_status,
+        MembershipStatus::Active,
         "the fused source leaves the Removing projection to the driver"
     );
     assert!(matches!(
@@ -3555,8 +3556,9 @@ async fn fused_only_removal_publishes_removing_from_the_driver() {
     assert_eq!(removal.key, key);
 
     scope.handle_removal(removal);
-    assert!(
-        member.record().removing,
+    assert_eq!(
+        member.record().membership_status,
+        MembershipStatus::Removing,
         "handle_removal publishes the Removing projection"
     );
     assert!(matches!(

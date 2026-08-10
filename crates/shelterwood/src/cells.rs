@@ -643,9 +643,9 @@ struct ScopeRequest {
 ///
 /// One gate per resident tree serializes compound observation-visible
 /// transitions across configuration, records, resident children, and parent
-/// links. Their watch channels retain independently readable latest values;
-/// they do not make a multi-field transition atomic, so every recursive
-/// observation path continues to hold that one tree gate.
+/// links. Configuration, residency, and ancestry are plain synchronized state;
+/// their individual locks do not make a multi-field transition atomic, so
+/// every recursive observation path continues to hold that one tree gate.
 ///
 /// Control requests, identity counters, lifecycle sequences, and the dynamic
 /// route remain independent synchronization planes. The member-record watch is
@@ -654,7 +654,7 @@ pub(crate) struct ScopeCell {
     pub(crate) member: Arc<MemberCell>,
     pub(crate) flavor: ScopeFlavor,
     pub(crate) child_identity: Mutex<ScopeIdentity>,
-    config: runtime::WatchSender<ObservationConfig>,
+    config: Mutex<ObservationConfig>,
     record: runtime::WatchSender<ScopeRecord>,
     control: Mutex<ScopeControl>,
     dynamic_route: Mutex<Option<Arc<ErasedDynamicRoute>>>,
@@ -665,9 +665,11 @@ pub(crate) struct ScopeCell {
     // `complete_removal(wakes)`, which emits under the already-held gate.
     // Letting the bare destructor run is reserved for the orphaned path,
     // where the parent `Weak` is dead and the drop emits nothing. Adding a
-    // resident inside a mutation callback remains safe.
-    current_children: runtime::WatchSender<Vec<ResidentChild>>,
-    parent: runtime::WatchSender<Option<Weak<ScopeCell>>>,
+    // resident inside a mutation callback remains safe. Dropping a resident
+    // while holding this mutex would likewise self-deadlock: removal paths
+    // move removed residents into outer storage before the drop runs.
+    current_children: Mutex<Vec<ResidentChild>>,
+    parent: Mutex<Option<Weak<ScopeCell>>>,
     observation_gate: RwLock<ObservationGate>,
     lifecycle_seq: AtomicU64,
     lifecycle: LifecycleHub,
@@ -710,24 +712,21 @@ impl ScopeCell {
         flavor: ScopeFlavor,
         child_identity: ScopeIdentity,
     ) -> Arc<Self> {
-        let (config, _) = runtime::watch(ObservationConfig::default());
         let (record, _) = runtime::watch(ScopeRecord {
             state: ScopeState::Unstarted,
             startup: None,
             total_restarts: TotalRestarts::ZERO,
         });
-        let (current_children, _) = runtime::watch(Vec::new());
-        let (parent, _) = runtime::watch(None);
         Arc::new(Self {
             member,
             flavor,
             child_identity: Mutex::new(child_identity),
-            config,
+            config: Mutex::new(ObservationConfig::default()),
             record,
             control: Mutex::new(ScopeControl::default()),
             dynamic_route: Mutex::new(None),
-            current_children,
-            parent,
+            current_children: Mutex::new(Vec::new()),
+            parent: Mutex::new(None),
             observation_gate: RwLock::new(ObservationGate::new()),
             lifecycle_seq: AtomicU64::new(0),
             lifecycle: LifecycleHub::default(),
@@ -750,12 +749,31 @@ impl ScopeCell {
     }
 
     pub(crate) fn resident_projections(&self) -> Vec<ResidentProjection> {
-        self.current_children.read_with(|children| {
-            children
-                .iter()
-                .map(|resident| resident.projection.clone())
-                .collect()
-        })
+        self.current_children()
+            .iter()
+            .map(|resident| resident.projection.clone())
+            .collect()
+    }
+
+    fn current_children(&self) -> MutexGuard<'_, Vec<ResidentChild>> {
+        self.current_children
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn parent(&self) -> Option<Arc<ScopeCell>> {
+        self.parent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    fn set_parent(&self, parent: &Arc<ScopeCell>) {
+        *self
+            .parent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(parent));
     }
 
     #[cfg(test)]
@@ -860,12 +878,11 @@ impl ScopeCell {
         previous: &ObservationGate,
         gate: &ObservationGate,
     ) {
-        let descendants = self.current_children.read_with(|children| {
-            children
-                .iter()
-                .filter_map(|resident| resident.projection.scope.as_ref().cloned())
-                .collect::<Vec<_>>()
-        });
+        let descendants = self
+            .current_children()
+            .iter()
+            .filter_map(|resident| resident.projection.scope.as_ref().cloned())
+            .collect::<Vec<_>>();
         for descendant in descendants {
             let mut installed = descendant
                 .observation_gate
@@ -929,10 +946,13 @@ impl ScopeCell {
 
     pub(crate) fn set_observation_config(&self, strategy: Strategy, intensity: Intensity) {
         self.with_observation_gate(|wakes| {
-            self.config.replace(ObservationConfig {
+            *self
+                .config
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = ObservationConfig {
                 strategy,
                 intensity,
-            });
+            };
             self.publish_snapshot_chain_locked(wakes);
         });
     }
@@ -998,13 +1018,12 @@ impl ScopeCell {
             // follows terminality. A child that has already left residency
             // owns its nested scope through `SlotCell::terminalize_never_started`
             // instead.
-            let nested = self.current_children.read_with(|children| {
-                children
-                    .iter()
-                    .find(|resident| resident.projection.member.membership() == member.membership())
-                    .and_then(|resident| resident.projection.scope.as_ref())
-                    .cloned()
-            });
+            let nested = self
+                .current_children()
+                .iter()
+                .find(|resident| resident.projection.member.membership() == member.membership())
+                .and_then(|resident| resident.projection.scope.as_ref())
+                .cloned();
             member.terminalize_child_locked(exit.clone(), startup, wakes);
             if record.last_incarnation.is_none()
                 && let Some(scope) = &nested
@@ -1038,21 +1057,16 @@ impl ScopeCell {
     pub(crate) fn prune_child(&self, member: &MemberCell) -> bool {
         self.with_observation_gate(|wakes| {
             let membership = member.membership();
-            let mut resident = None;
-            let removed = self.current_children.send_if_modified(|children| {
-                let Some(index) = children
+            let resident = {
+                let mut children = self.current_children();
+                let index = children
                     .iter()
-                    .position(|child| child.projection.member.membership() == membership)
-                else {
-                    return false;
-                };
-                resident = Some(children.remove(index));
-                true
-            });
-            if !removed {
+                    .position(|child| child.projection.member.membership() == membership);
+                index.map(|index| children.remove(index))
+            };
+            let Some(resident) = resident else {
                 return false;
-            }
-            let resident = resident.expect("a reported removal owns its resident entry");
+            };
             debug_assert_eq!(resident.projection.member.membership(), membership);
             // Dropping residency under the observation gate emits the matching
             // Removed edge through its owned completion.
@@ -1087,13 +1101,15 @@ impl ScopeCell {
 
     fn snapshot_locked(&self) -> Arc<ScopeSnapshot> {
         let record = self.record();
-        let config = self.config.read_cloned();
-        let children = self.current_children.read_with(|children| {
-            children
-                .iter()
-                .map(|resident| resident.projection.clone())
-                .collect::<Vec<_>>()
-        });
+        let config = *self
+            .config
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let children = self
+            .current_children()
+            .iter()
+            .map(|resident| resident.projection.clone())
+            .collect::<Vec<_>>();
         let children = children
             .iter()
             .map(|child| self.child_snapshot_locked(child))
@@ -1154,9 +1170,9 @@ impl ScopeCell {
 
     fn ancestors_locked(&self) -> Vec<Arc<ScopeCell>> {
         let mut ancestors = Vec::new();
-        let mut current = self.parent.read_cloned().as_ref().and_then(Weak::upgrade);
+        let mut current = self.parent();
         while let Some(scope) = current {
-            current = scope.parent.read_cloned().as_ref().and_then(Weak::upgrade);
+            current = scope.parent();
             ancestors.push(scope);
         }
         ancestors
@@ -1351,9 +1367,7 @@ impl ScopeCell {
         }
         drop(control);
         self.member.record.pulse();
-        if pending_incarnation
-            && let Some(parent) = self.parent.read_cloned().as_ref().and_then(Weak::upgrade)
-        {
+        if pending_incarnation && let Some(parent) = self.parent() {
             parent.member.record.pulse();
         }
         Some(target)
@@ -1420,15 +1434,15 @@ impl ScopeCell {
             for child in children {
                 if let Some(scope) = &child.scope {
                     scope.adopt_observation_gate(self, &gate);
-                    scope.parent.replace(Some(Arc::downgrade(self)));
+                    scope.set_parent(self);
                 }
                 child
                     .member
                     .update_locked(wakes, |record| record.stage = MemberStage::Admitted);
                 let id = child.member.id().clone();
                 let membership = child.member.membership();
-                self.current_children
-                    .send_modify(|children| children.push(ResidentChild::new(self, child)));
+                self.current_children()
+                    .push(ResidentChild::new(self, child));
                 self.emit_locked(wakes, LifecycleEventKind::Added { id, membership });
             }
         });
@@ -1439,15 +1453,15 @@ impl ScopeCell {
             let gate = self.current_observation_gate();
             if let Some(scope) = &child.scope {
                 scope.adopt_observation_gate(self, &gate);
-                scope.parent.replace(Some(Arc::downgrade(self)));
+                scope.set_parent(self);
             }
             let id = child.member.id().clone();
             let membership = child.member.membership();
             child
                 .member
                 .update_locked(wakes, |record| record.stage = MemberStage::Admitted);
-            self.current_children
-                .send_modify(|children| children.push(ResidentChild::new(self, child)));
+            self.current_children()
+                .push(ResidentChild::new(self, child));
             self.emit_locked(wakes, LifecycleEventKind::Added { id, membership });
         });
     }
@@ -1457,8 +1471,11 @@ impl ScopeCell {
     }
 
     fn clear_residents_locked(&self, wakes: &mut ObservationWakes) {
-        let residents = self.current_children.take();
-        // Each owned residency emits Removed only after the watch guard has
+        let residents = {
+            let mut children = self.current_children();
+            std::mem::take(&mut *children)
+        };
+        // Each owned residency emits Removed only after the state guard has
         // been released, so the recursively projected set is already empty.
         for resident in residents {
             resident.complete_removal(wakes);

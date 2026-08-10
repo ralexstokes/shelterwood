@@ -401,6 +401,13 @@ fn signal_fused_cancel_impl(control: &DynamicControl, slot: &Arc<SlotCell>, latc
     if !latch.fire() {
         return;
     }
+    // A fused drop and an explicit `remove` dedup only within their own
+    // source (each behind a once-firing latch), not against each other:
+    // `mark_removing` also succeeds on an already-Removing entry, so the
+    // same membership can queue one `RemovalRequest` per source. The
+    // duplicate is benign by construction — `handle_removal` re-enters
+    // `publish_dynamic_removal` behind the record's `removing` guard and
+    // `begin_stop_child` behind its ladder/disposal idempotency guards.
     let removal = {
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
         state
@@ -476,6 +483,10 @@ fn remove_dynamic_impl(
         scope.transition_child(&member, |record| record.removing = true, None);
     }
     if member.removal.fire() {
+        // This latch dedups repeated `remove` calls, but not a concurrent
+        // fused drop, which queues its own `RemovalRequest` for the same
+        // membership (see `signal_fused_cancel_impl`). The driver's stop
+        // path must therefore stay idempotent under a second delivery.
         queue_driver_event(
             control,
             DriverEvent::Removal(RemovalRequest { membership, key }),

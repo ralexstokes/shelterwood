@@ -1656,13 +1656,52 @@ async fn admissions_return_kind_specific_handles_directly() {
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
 
-    let task = scope
-        .add_task("worker", waiting_task())
+    let actor_slot = scope
+        .reserve_actor::<()>("actor")
+        .expect("actor is reserved");
+    let reserved_actor = actor_slot.actor_ref();
+    let actor = actor_slot
+        .define(shelterwood::ActorDef::<EvidenceActor>::cloned(()))
+        .await
+        .expect("actor is admitted");
+    assert_eq!(actor.membership(), reserved_actor.membership());
+
+    let task_slot = scope.reserve_task("task").expect("task is reserved");
+    let reserved_task = task_slot.task_ref();
+    let task = task_slot
+        .define(waiting_task())
         .await
         .expect("task is admitted");
-    assert_eq!(task.id().as_str(), "worker");
+    assert_eq!(task.membership(), reserved_task.membership());
 
+    let one_shot_slot = scope
+        .reserve_task("one-shot")
+        .expect("one-shot task is reserved");
+    let reserved_one_shot = one_shot_slot.task_ref();
+    let (one_shot, completion) = one_shot_slot
+        .define_once(TaskOnceDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok::<_, ExitError>(())
+        }))
+        .await
+        .expect("one-shot task is admitted");
+    assert_eq!(one_shot.membership(), reserved_one_shot.membership());
+    drop(completion);
+
+    let subtree_slot = scope
+        .reserve_subtree::<Tree>("subtree")
+        .expect("subtree is reserved");
+    let reserved_subtree = subtree_slot.scope_ref();
+    let subtree = subtree_slot
+        .define_once(SubtreeOnceDef::new(waiting_tree()))
+        .await
+        .expect("subtree is admitted");
+    assert_eq!(subtree.membership(), reserved_subtree.membership());
+
+    assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
     assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_task(&one_shot).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
     system
         .shutdown(Duration::from_secs(1))
         .await

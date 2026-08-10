@@ -219,6 +219,110 @@ async fn work_created_during_the_retraction_turn_does_not_preempt_fired_timer() 
 }
 
 #[derive(Clone, Copy, Debug)]
+enum TimerBatchFairnessMessage {
+    Arm,
+    DuringBatch,
+    SeedCompletion,
+    Timer,
+    AfterBatch,
+    DuringBatchCompletion,
+}
+
+struct TimerBatchFairnessActor {
+    log: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Actor for TimerBatchFairnessActor {
+    type Msg = TimerBatchFairnessMessage;
+    type Args = (ReleaseGate, Arc<Mutex<Vec<&'static str>>>);
+
+    async fn init(args: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        context
+            .offload(
+                async {},
+                |_| TimerBatchFairnessMessage::SeedCompletion,
+                Duration::ZERO,
+            )
+            .expect("seed completion accepted");
+        args.0.wait().await;
+        Ok(Self { log: args.1 })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        let entry = match message {
+            TimerBatchFairnessMessage::Arm => {
+                context
+                    .set_timeout("timer", TimerBatchFairnessMessage::Timer, Duration::ZERO)
+                    .expect("timer accepted");
+                "arm"
+            }
+            TimerBatchFairnessMessage::DuringBatch => {
+                context
+                    .offload(
+                        async {},
+                        |_| TimerBatchFairnessMessage::DuringBatchCompletion,
+                        Duration::ZERO,
+                    )
+                    .expect("completion accepted during the timer batch");
+                context
+                    .myself()
+                    .try_send(TimerBatchFairnessMessage::AfterBatch)
+                    .expect("post-snapshot mailbox input accepted");
+                "during-batch"
+            }
+            TimerBatchFairnessMessage::SeedCompletion => "seed-completion",
+            TimerBatchFairnessMessage::Timer => "timer",
+            TimerBatchFairnessMessage::AfterBatch => "after-batch",
+            TimerBatchFairnessMessage::DuringBatchCompletion => {
+                context.stop();
+                "during-batch-completion"
+            }
+        };
+        self.log.lock().expect("log mutex poisoned").push(entry);
+        Ok(())
+    }
+}
+
+/// A fired timer batch supersedes the steady-state completion credit captured
+/// by the mailbox delivery that armed it. Completions created during the batch
+/// therefore cannot use that stale credit to jump post-snapshot mailbox input.
+#[tokio::test]
+async fn timer_batch_resets_steady_state_completion_fairness() {
+    let gate = ReleaseGate::default();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "timer-batch-fairness",
+            ActorOnceDef::<TimerBatchFairnessActor>::new((gate.clone(), Arc::clone(&log))),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    actor
+        .send(TimerBatchFairnessMessage::Arm)
+        .await
+        .expect("arm accepted during init");
+    actor
+        .send(TimerBatchFairnessMessage::DuringBatch)
+        .await
+        .expect("batch work accepted during init");
+    gate.release();
+
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(
+        *log.lock().expect("log mutex poisoned"),
+        [
+            "arm",
+            "during-batch",
+            "seed-completion",
+            "timer",
+            "after-batch",
+            "during-batch-completion",
+        ]
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
 enum KeyedMessage {
     Arm,
     FirstType,

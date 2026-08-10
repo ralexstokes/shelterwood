@@ -628,6 +628,8 @@ enum SpawnBody {
     Raw {
         spawn: RawSpawn,
         context: RawRunContext,
+        /// Declared override for the instance-reported readiness mode.
+        readiness: Option<Readiness>,
     },
     TaskRestartable {
         factory: TaskFactory,
@@ -703,7 +705,6 @@ struct ChildTaskLaunch {
     key: ChildKey,
     incarnation: Incarnation,
     body: SpawnBody,
-    readiness: Option<Readiness>,
     watch_readiness: bool,
     shutdown: Latch,
     ready: CompletionGatedLatch,
@@ -739,7 +740,13 @@ fn dispatch_child_construction(
                         local_stop: latches.local_stop.clone(),
                         mailbox_shutdown: child.options.mailbox_shutdown,
                     },
+                    readiness: child.options.readiness,
                 },
+                // `None` means "configure the readiness gate on the
+                // `Constructed` event", not "no readiness": a raw actor's
+                // mode is per-incarnation, so passing `child.options.readiness`
+                // here would arm the readiness deadline at spawn instead of
+                // construction.
                 declared_readiness: None,
                 construction_spent,
                 scope_child: false,
@@ -814,7 +821,6 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         key,
         incarnation,
         body,
-        readiness,
         watch_readiness,
         shutdown,
         ready,
@@ -826,7 +832,11 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
     let handle = runtime::spawn(async move {
         let body = async move {
             match body {
-                SpawnBody::Raw { spawn, context } => {
+                SpawnBody::Raw {
+                    spawn,
+                    context,
+                    readiness,
+                } => {
                     let instance = spawn.construct();
                     let readiness = readiness.unwrap_or_else(|| instance.readiness());
                     let _ = runtime::mpsc_send(
@@ -1142,7 +1152,6 @@ impl ScopeRuntime {
         });
         let gated = readiness.needs_signal_watch();
 
-        let child_readiness = child.options.readiness;
         if construction_spent {
             // One-shot actor/task/subtree state has moved into `body`; the
             // retained construction is now framework-only spent metadata.
@@ -1155,7 +1164,6 @@ impl ScopeRuntime {
             key,
             incarnation,
             body,
-            readiness: child_readiness,
             watch_readiness: gated,
             shutdown: latches.shutdown.clone(),
             ready: latches.ready.clone(),

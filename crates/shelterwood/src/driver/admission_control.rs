@@ -9,6 +9,7 @@ use crate::{
     ChildId, Membership, ScopeState,
     admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
     cells::{DynamicRoute, ErasedDynamicRoute, ErasedDynamicSlot, MemberStage, ScopeCell},
+    engine::MembershipStatus,
     plan::{
         ChildConstruction, SlotCell, checked_id, concrete_dynamic_slot, concrete_dynamic_slot_ref,
         erase_dynamic_slot, mint_reserved_slot,
@@ -60,7 +61,7 @@ pub(super) struct DynamicEntry {
     pub(super) removal: Obligation<RemovalResponses>,
 }
 
-// The authoritative dynamic control-plane phase. `MemberRecord::removing`
+// The authoritative dynamic control-plane phase. `MemberRecord::membership_status`
 // is only its public observation projection; driver decisions use this enum.
 // A resident owns its arena key, so removal and restart paths never have to
 // rediscover the corresponding `ChildRuntime` with a linear scan.
@@ -413,7 +414,7 @@ fn signal_fused_cancel_impl(control: &DynamicControl, slot: &SlotCell, latch: &L
     // `mark_removing` also succeeds on an already-Removing entry, so the
     // same membership can queue one `RemovalRequest` per source. The
     // duplicate is benign by construction — `handle_removal` re-enters
-    // `publish_dynamic_removal` behind the record's `removing` guard and
+    // `publish_dynamic_removal` behind the record's status guard and
     // `begin_stop_child` behind its ladder/disposal idempotency guards.
     let removal = {
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
@@ -486,7 +487,7 @@ fn remove_dynamic_impl(
     // observation work, and blocking there while holding dynamic state would
     // stall every concurrent reservation, removal, and driver admission.
     drop(state);
-    if !member.record().removing {
+    if member.record().membership_status != MembershipStatus::Removing {
         scope.set_child_removing(&member);
     }
     if member.removal.fire() {

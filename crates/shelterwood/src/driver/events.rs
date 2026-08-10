@@ -161,24 +161,17 @@ impl ScopeRuntime {
             || self.dispatch_membership_status(key) == MembershipStatus::Removing
     }
 
-    pub(super) fn pending_restart_shutdowns(&self) -> Vec<ChildKey> {
-        self.children
-            .keys()
-            .filter(|key| {
-                let child = &self.children[*key];
-                // Only a nested scope can hold a pending-incarnation stop, and
-                // only its own control plane can answer whether one exists.
-                // Both are cheap, so they gate the dynamic-state lookup.
-                child.active.is_none()
-                    && matches!(child.slot.member.record().stage, MemberStage::Restarting)
-                    && child
-                        .slot
-                        .scope
-                        .as_ref()
-                        .is_some_and(|scope| scope.has_pending_incarnation_shutdown())
-                    && !self.restart_is_suppressed(*key)
-            })
-            .collect()
+    pub(super) fn control_event_work(
+        &self,
+        event: ScopeControlEvent,
+    ) -> Option<(ArbitrationClass, Pending)> {
+        match event {
+            ScopeControlEvent::RestartShutdown { membership } => self
+                .child_keys
+                .get(&membership)
+                .copied()
+                .map(restart_shutdown_work),
+        }
     }
 
     pub(super) fn expedite_restart_shutdown(&mut self, key: ChildKey) {

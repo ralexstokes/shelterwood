@@ -314,6 +314,15 @@ fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
         scope.ordered_stop_inspections, CHILDREN,
         "the reverse cursor inspects each ordered child exactly once"
     );
+    assert_eq!(
+        scope.incomplete_children, 0,
+        "terminal completion decrements the incremental count exactly once"
+    );
+    assert_eq!(
+        scope.finish_if_ready(),
+        Some(StopReason::ShutdownRequested),
+        "shutdown completion is decided from the maintained count"
+    );
 }
 #[crate::runtime::test]
 async fn system_shutdown_joins_root_driver_teardown() {

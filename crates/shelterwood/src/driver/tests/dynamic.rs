@@ -238,7 +238,7 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
     let mut child = ChildRuntime::from_plan(plan, &root);
     child.initial = false;
     let key = root.with_observation_gate(|txn| {
-        let key = match scope.children.insert(child) {
+        let key = match scope.insert_child(child) {
             Ok(key) => key,
             Err(_) => panic!("the empty arena accepts its first child"),
         };
@@ -253,8 +253,8 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
         root.admit_child_locked(resident_projection(&reservation.slot), txn);
         key
     });
-    assert!(scope.children[key].terminalize(
-        &root,
+    assert!(scope.terminalize_child(
+        key,
         Exit::never_started(),
         None,
         StartupDisposition::NotAborted,

@@ -203,15 +203,11 @@ impl ScopeRuntime {
     }
 
     pub(super) fn finish_if_ready(&mut self) -> Option<StopReason> {
-        let all_terminal = self
-            .children
-            .values()
-            .all(|child| child.is_terminal() && !child.is_disposing());
         self.lifecycle.finish_if_ready(
             self.root.flavor,
             ChildCompletionState {
                 has_children: !self.children.is_empty(),
-                all_terminal,
+                all_terminal: self.incomplete_children == 0,
             },
         )
     }

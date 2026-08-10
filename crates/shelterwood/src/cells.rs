@@ -8,6 +8,7 @@
 
 use std::{
     any::Any,
+    collections::VecDeque,
     fmt,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak,
@@ -797,12 +798,23 @@ struct ScopeControl {
     epochs: ScopeEpochs,
     shutdown: Option<ScopeRequest>,
     force: Option<ScopeRequest>,
+    events: VecDeque<ScopeControlEvent>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ScopeRequest {
     epoch: Epoch,
     consumed: bool,
+}
+
+/// One fact published by a scope control-plane transaction for its driver.
+///
+/// The payload is restart-stable identity rather than a mutable driver key.
+/// The driver resolves it through its incrementally maintained membership
+/// index, so stale events miss instead of addressing a replacement child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScopeControlEvent {
+    RestartShutdown { membership: Membership },
 }
 
 /// Shared scope state follows two distinct synchronization regimes.
@@ -948,11 +960,24 @@ impl ScopeCell {
             .and_then(Weak::upgrade)
     }
 
-    fn set_parent(&self, parent: &Arc<ScopeCell>, _txn: &mut ObservationTxn<'_>) {
+    fn set_parent(&self, parent: &Arc<ScopeCell>, txn: &mut ObservationTxn<'_>) {
         *self
             .parent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(parent));
+        let control = self.control.lock().expect("scope control mutex poisoned");
+        let pending_shutdown = control.shutdown.is_some_and(|request| {
+            !request.consumed && control.epochs.request_is_pending(request.epoch)
+        });
+        drop(control);
+        if pending_shutdown {
+            parent.publish_control_event_locked(
+                ScopeControlEvent::RestartShutdown {
+                    membership: self.member.membership(),
+                },
+                txn,
+            );
+        }
     }
 
     #[cfg(test)]
@@ -1652,27 +1677,47 @@ impl ScopeCell {
             epoch: target,
             pending_incarnation,
         } = control.epochs.request_target()?;
-        if control
+        let published = control
             .shutdown
-            .is_none_or(|request| request.epoch < target)
-        {
+            .is_none_or(|request| request.epoch < target);
+        if published {
             control.shutdown = Some(ScopeRequest {
                 epoch: target,
                 consumed: false,
             });
         }
         drop(control);
-        txn.pulse(&self.member.record);
-        if pending_incarnation && let Some(parent) = self.parent() {
-            txn.pulse(&parent.member.record);
+        if published {
+            txn.pulse(&self.member.record);
+            if pending_incarnation && let Some(parent) = self.parent() {
+                parent.publish_control_event_locked(
+                    ScopeControlEvent::RestartShutdown {
+                        membership: self.member.membership(),
+                    },
+                    txn,
+                );
+            }
         }
         Some(target)
     }
 
-    pub(crate) fn has_pending_incarnation_shutdown(&self) -> bool {
-        let control = self.control.lock().expect("scope control mutex poisoned");
-        control.shutdown.is_some_and(|request| {
-            !request.consumed && control.epochs.request_is_pending(request.epoch)
+    fn publish_control_event_locked(&self, event: ScopeControlEvent, txn: &mut ObservationTxn<'_>) {
+        self.control
+            .lock()
+            .expect("scope control mutex poisoned")
+            .events
+            .push_back(event);
+        txn.pulse(&self.member.record);
+    }
+
+    pub(crate) fn take_control_events(&self) -> Vec<ScopeControlEvent> {
+        self.with_observation_gate(|_txn| {
+            self.control
+                .lock()
+                .expect("scope control mutex poisoned")
+                .events
+                .drain(..)
+                .collect()
         })
     }
 

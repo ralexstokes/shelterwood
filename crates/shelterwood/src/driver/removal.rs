@@ -134,6 +134,12 @@ impl ScopeRuntime {
         let Some(mut child) = self.children.remove(key) else {
             return;
         };
+        let removed = self.child_keys.remove(&child.slot.member.membership());
+        debug_assert_eq!(
+            removed,
+            Some(key),
+            "reclaimed memberships leave the key index"
+        );
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);
         }

@@ -8,6 +8,7 @@ mod shutdown;
 mod startup;
 
 use std::{
+    collections::HashMap,
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -19,9 +20,10 @@ use storage::{ChildArena, ChildKey, Obligation};
 use child::ChildRuntime;
 #[cfg(test)]
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
+#[cfg(test)]
+use events::restart_shutdown_work;
 use events::{
     ChildEvent, DeadlineKind, DriverEvent, MIN_EVENT_BATCH_LIMIT, Pending, collect_driver_events,
-    restart_shutdown_work,
 };
 use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
@@ -33,7 +35,7 @@ use crate::{
     admission::{NotAdmittingCause, ReserveError},
     cells::{
         MailboxControl, MemberStage, MemberTransition, ResidentProjection, ScopeCell,
-        StartupDisposition,
+        ScopeControlEvent, StartupDisposition,
     },
     deadline::Deadline,
     engine::{
@@ -200,6 +202,10 @@ struct ScopeRuntime {
     intensity_policy: crate::Intensity,
     intensity: IntensityState,
     children: ChildArena<ChildRuntime>,
+    // The index and count are maintained only at child installation/completion.
+    // Driver wakes resolve a subject directly and test completion in O(1).
+    child_keys: HashMap<Membership, ChildKey>,
+    incomplete_children: usize,
     events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
@@ -278,6 +284,27 @@ impl Drop for ScopeRuntime {
 }
 
 impl ScopeRuntime {
+    pub(super) fn insert_child(
+        &mut self,
+        child: ChildRuntime,
+    ) -> Result<ChildKey, Box<ChildRuntime>> {
+        let membership = child.slot.member.membership();
+        let incomplete = !child.is_terminal() || child.is_disposing();
+        let key = self.children.insert(child)?;
+        let replaced = self.child_keys.insert(membership, key);
+        assert!(
+            replaced.is_none(),
+            "one live membership maps to exactly one child key"
+        );
+        if incomplete {
+            self.incomplete_children = self
+                .incomplete_children
+                .checked_add(1)
+                .expect("an in-memory child count fits in usize");
+        }
+        Ok(key)
+    }
+
     #[cfg(test)]
     fn record_storage(&self) {
         self.root.record_runtime_storage(RuntimeStorage {
@@ -394,7 +421,7 @@ impl ScopeRuntime {
             // state transition: an exact remover sees either the reservation
             // or a resident carrying its live arena key, never an unindexed
             // admitted intermediate.
-            let key = match self.children.insert(child) {
+            let key = match self.insert_child(child) {
                 Ok(key) => key,
                 Err(child) => {
                     let removed = state.remove(id, txn);
@@ -634,12 +661,22 @@ async fn run_scope_incarnation(
         });
     }
     let next_ordered_start = children.keys().next();
+    let child_keys = children
+        .iter()
+        .map(|(key, child)| (child.slot.member.membership(), key))
+        .collect();
+    let incomplete_children = children
+        .values()
+        .filter(|child| !child.is_terminal() || child.is_disposing())
+        .count();
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
         defaults: plan.defaults.clone(),
         intensity_policy: plan.config.intensity,
         intensity: IntensityState::default(),
         children,
+        child_keys,
+        incomplete_children,
         events,
         disposal_events,
         deadlines: DeadlineQueue::default(),
@@ -700,8 +737,10 @@ async fn run_scope_incarnation(
         if root.take_shutdown_request(scope.epoch) {
             pending.push(Pending::Shutdown.classified());
         }
-        for child in scope.pending_restart_shutdowns() {
-            pending.push(restart_shutdown_work(child));
+        for event in root.take_control_events() {
+            if let Some(work) = scope.control_event_work(event) {
+                pending.push(work);
+            }
         }
         if !scope.ancestor_shutdown_seen
             && scope

@@ -1,5 +1,35 @@
 use super::support::*;
 
+#[test]
+fn pre_admission_restart_shutdown_is_published_when_the_scope_gets_a_parent() {
+    let mut tree = Tree::new();
+    tree.add_subtree("nested", SubtreeDef::factory(Tree::new))
+        .expect("valid subtree");
+    let plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let nested = plan.children[0]
+        .slot
+        .scope
+        .as_ref()
+        .expect("nested scope cell");
+
+    assert!(nested.request_shutdown().is_some());
+    assert!(root.take_control_events().is_empty());
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+
+    assert_eq!(
+        root.take_control_events(),
+        vec![ScopeControlEvent::RestartShutdown {
+            membership: nested.member.membership(),
+        }]
+    );
+}
+
 #[crate::runtime::test]
 async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
     let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -72,7 +102,14 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         .as_ref()
         .expect("nested scope cell")
         .request_shutdown();
-    assert_eq!(scope.pending_restart_shutdowns(), vec![nested]);
+    let event = root
+        .take_control_events()
+        .pop()
+        .expect("the request publishes one subject-carrying control event");
+    let Some((_, Pending::RestartShutdown(subject))) = scope.control_event_work(event) else {
+        panic!("the control event resolves to restart-shutdown work");
+    };
+    assert_eq!(subject, nested);
 
     scope.spawn_child(trip);
     let incarnation = scope.children[trip]

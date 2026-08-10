@@ -536,6 +536,25 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
 }
 
 impl ScopeRuntime {
+    pub(super) fn terminalize_child(
+        &mut self,
+        key: ChildKey,
+        exit: Exit,
+        exited_incarnation: Option<Incarnation>,
+        startup: StartupDisposition,
+    ) -> bool {
+        let changed = self.children[key].terminalize(&self.root, exit, exited_incarnation, startup);
+        debug_assert!(
+            self.children[key].is_terminal() && !self.children[key].is_disposing(),
+            "terminal completion leaves no disposal outstanding"
+        );
+        self.incomplete_children = self
+            .incomplete_children
+            .checked_sub(1)
+            .expect("a child completes terminality exactly once");
+        changed
+    }
+
     pub(super) fn spawn_child(&mut self, key: ChildKey) {
         let Some(child) = self.children.get(key) else {
             return;
@@ -1040,12 +1059,7 @@ impl ScopeRuntime {
         } else {
             StartupDisposition::NotAborted
         };
-        self.children[key].terminalize(
-            &self.root,
-            exit.clone(),
-            terminal.exited_incarnation,
-            startup,
-        );
+        self.terminalize_child(key, exit.clone(), terminal.exited_incarnation, startup);
         if self.dynamic_membership_is_removing(key) {
             self.finalize_removal(key);
         } else if terminal.startup == StartupDisposition::Aborted && !self.lifecycle.is_draining() {

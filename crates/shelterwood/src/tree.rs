@@ -584,6 +584,15 @@ impl Tree {
     }
 }
 
+#[cfg(test)]
+impl DynamicTree {
+    pub(crate) fn lower_for_test(self) -> crate::plan::ScopePlan {
+        self.core
+            .lower(ResolvedDefaults::default(), None)
+            .expect("test tree must be fully defined")
+    }
+}
+
 /// An owned pre-spawn actor slot with a stable mailbox binding.
 pub struct ActorSlot<M> {
     core: ActorSlotCore<StaticSlotEndpoint, M>,
@@ -866,23 +875,39 @@ impl<H> Drop for Admission<H> {
                 // polled or not. Firing the latch before cancelling keeps the
                 // scope's control-plane wake and the cancellation evidence in
                 // the same order the in-flight path uses.
-                if let Some(cancel) = &pending.fused_cancel {
-                    crate::driver::signal_fused_cancel(
-                        pending.reservation.control.as_ref(),
-                        pending.reservation.slot.member.membership(),
-                        cancel,
-                    );
-                }
-                pending.cancel_reservation();
+                let signal_panic = pending.fused_cancel.as_ref().and_then(|cancel| {
+                    crate::runtime::catch_panic(|| {
+                        crate::driver::signal_fused_cancel(
+                            pending.reservation.control.as_ref(),
+                            &pending.reservation.slot,
+                            cancel,
+                        );
+                    })
+                    .err()
+                });
+                let cleanup_panic =
+                    crate::runtime::catch_panic(|| pending.cancel_reservation()).err();
+                crate::runtime::resume_preferred_panic(crate::runtime::UnwindPanics {
+                    primary: signal_panic,
+                    cleanup: cleanup_panic,
+                });
             }
             AdmissionState::InFlight { pending, .. } => {
                 if let Some(cancel) = &pending.fused_cancel {
-                    crate::driver::signal_fused_cancel(
-                        pending.reservation.control.as_ref(),
-                        pending.reservation.slot.member.membership(),
-                        cancel,
-                    );
-                    pending.cancel_reservation();
+                    let signal_panic = crate::runtime::catch_panic(|| {
+                        crate::driver::signal_fused_cancel(
+                            pending.reservation.control.as_ref(),
+                            &pending.reservation.slot,
+                            cancel,
+                        );
+                    })
+                    .err();
+                    let cleanup_panic =
+                        crate::runtime::catch_panic(|| pending.cancel_reservation()).err();
+                    crate::runtime::resume_preferred_panic(crate::runtime::UnwindPanics {
+                        primary: signal_panic,
+                        cleanup: cleanup_panic,
+                    });
                 }
             }
             AdmissionState::Immediate(_) | AdmissionState::Done => {}
@@ -1212,11 +1237,41 @@ mod tests {
         future::Future,
         panic::{AssertUnwindSafe, catch_unwind},
         pin::Pin,
-        task::{Context, Waker},
+        sync::{Arc, Mutex},
+        task::{Context, Poll, Wake, Waker},
+        time::Duration,
     };
 
-    use super::{DynamicTree, Removal, Tree, sealed::Sealed};
-    use crate::identity::ScopeIdentity;
+    use super::{
+        Admission, AdmissionOwnership, DynamicTree, Removal, TaskRef, Tree, sealed::Sealed,
+    };
+    use crate::{ExitKind, TaskDef, identity::ScopeIdentity};
+
+    struct DropAdmissionAndPanic {
+        admission: Mutex<Option<Admission<TaskRef>>>,
+    }
+
+    impl Wake for DropAdmissionAndPanic {
+        fn wake(self: Arc<Self>) {
+            drop(
+                self.admission
+                    .lock()
+                    .expect("admission mutex poisoned")
+                    .take(),
+            );
+            panic!("hostile observation waker");
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            drop(
+                self.admission
+                    .lock()
+                    .expect("admission mutex poisoned")
+                    .take(),
+            );
+            panic!("hostile observation waker");
+        }
+    }
 
     #[test]
     fn subtree_conversion_moves_without_minting_a_phantom_scope() {
@@ -1261,6 +1316,64 @@ mod tests {
             observed.expect("release fallback does not panic"),
             std::task::Poll::Ready(crate::RemoveOutcome::Removed)
         );
+    }
+
+    #[crate::runtime::test]
+    async fn saturated_fused_drop_before_exit_suppresses_restart_accounting() {
+        crate::driver::exercise_saturated_fused_drop_before_exit(|reservation| {
+            Admission::new(reservation, (), AdmissionOwnership::Fused)
+        })
+        .await;
+    }
+
+    #[crate::runtime::test]
+    async fn unpolled_fused_drop_releases_reservations_despite_a_reentrant_panicking_waker() {
+        let system = DynamicTree::new().spawn().expect("runtime is available");
+        system.wait_started().await.expect("dynamic root starts");
+        let scope = system.scope();
+
+        let first_slot = scope.reserve_task("first").expect("first id is free");
+        let first = first_slot.task_ref();
+        let first_admission = first_slot.define(TaskDef::new(|_| std::future::pending()));
+        let second_slot = scope.reserve_task("second").expect("second id is free");
+        let second = second_slot.task_ref();
+        let second_admission = second_slot.define(TaskDef::new(|_| std::future::pending()));
+
+        let mut first_wait = Box::pin(first.wait());
+        let waker = Waker::from(Arc::new(DropAdmissionAndPanic {
+            admission: Mutex::new(Some(second_admission)),
+        }));
+        assert!(
+            first_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        catch_unwind(AssertUnwindSafe(|| drop(first_admission)))
+            .expect_err("the hostile membership waker still surfaces");
+        assert!(matches!(
+            first_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+        ));
+        assert!(matches!(second.wait().await.kind(), ExitKind::NeverStarted));
+
+        drop(
+            scope
+                .reserve_task("first")
+                .expect("first reservation was released"),
+        );
+        drop(
+            scope
+                .reserve_task("second")
+                .expect("reentrant second reservation was released"),
+        );
+        system
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("cancelled reservations leave no stragglers");
     }
 }
 

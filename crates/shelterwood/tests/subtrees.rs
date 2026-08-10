@@ -139,26 +139,156 @@ async fn one_shot_subtree_lowering_failure_retains_structured_provenance() {
 }
 
 #[tokio::test]
+async fn subtree_intensity_trip_retains_structured_provenance() {
+    // The nested scope's zero budget trips on the first failure, before its
+    // manually gated task ever becomes ready, so the parent deterministically
+    // observes the subtree child terminalize during startup.
+    let mut nested = Tree::new();
+    nested.intensity(Intensity::new(0, Duration::from_secs(10)).expect("valid intensity"));
+    nested
+        .add_task(
+            "failing",
+            TaskDef::new(|_| async { Err(ExitError::message("retry")) })
+                .readiness(Readiness::Manual)
+                .expect("manual readiness"),
+        )
+        .expect("valid task");
+    let mut root = Tree::new();
+    root.add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree edge");
+    let system = root.spawn().expect("runtime is available");
+    let StartupError::StartupFailed(failure) = system
+        .wait_started()
+        .await
+        .expect_err("nested budget trips during startup")
+    else {
+        panic!("expected structured startup failure");
+    };
+    let StartupFailureCause::Child { id, exit, .. } = failure.cause else {
+        panic!("root failure must name its nested child");
+    };
+    assert_eq!(id.as_str(), "nested");
+    let ExitKind::Failed(error) = exit.kind() else {
+        panic!("a tripped subtree is a child failure");
+    };
+    let trip = error
+        .intensity_trip()
+        .expect("framework provenance is retained");
+    assert_eq!(trip.max_restarts, 0);
+    assert_eq!(trip.observed_restarts, 1);
+    assert_eq!(trip.within, Duration::from_secs(10));
+    assert!(
+        error.startup_failure().is_none(),
+        "an intensity trip is not a startup failure"
+    );
+    assert_eq!(
+        error.as_error().to_string(),
+        error.to_string(),
+        "as_error exposes the same erased failure that Display renders"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root rolls back");
+}
+
+#[tokio::test]
 async fn over_budget_restart_is_charged_but_never_spawned() {
     let starts = Arc::new(AtomicUsize::new(0));
+    let releases = Arc::new([
+        ReleaseGate::default(),
+        ReleaseGate::default(),
+        ReleaseGate::default(),
+    ]);
     let mut root = Tree::new();
     root.intensity(Intensity::new(2, Duration::from_secs(10)).expect("valid intensity"));
     root.add_task(
         "failing",
         TaskDef::new({
             let starts = Arc::clone(&starts);
+            let releases = Arc::clone(&releases);
             move |_| {
-                starts.fetch_add(1, Ordering::SeqCst);
-                async { Err(ExitError::message("retry")) }
+                let incarnation = starts.fetch_add(1, Ordering::SeqCst);
+                let release = releases
+                    .get(incarnation)
+                    .cloned()
+                    .expect("the over-budget restart is never spawned");
+                async move {
+                    release.wait().await;
+                    Err(ExitError::message("retry"))
+                }
             }
         }),
     )
     .expect("valid task");
     let system = root.spawn().expect("runtime is available");
+    let scope = system.scope();
+    let mut events = scope.subscribe_lifecycle();
     system
         .wait_started()
         .await
         .expect("immediate readiness starts root");
+    releases[0].release();
+    let mut trace = Vec::new();
+    let mut scheduled = 0usize;
+    loop {
+        let item = tokio::time::timeout(POLL_TIMEOUT, events.recv())
+            .await
+            .expect("the next lifecycle event arrives promptly")
+            .expect("the lifecycle stream remains open through scope failure");
+        let LifecycleItem::Event(event) = item else {
+            panic!("the short restart trace cannot lag");
+        };
+        match event.kind {
+            LifecycleEventKind::Exited { .. } => trace.push("exited"),
+            LifecycleEventKind::RestartScheduled { attempt, .. } => {
+                scheduled += 1;
+                trace.push("scheduled");
+                let expected_attempt =
+                    (0..scheduled).fold(RestartAttempt::ZERO, |attempt, _| attempt.bump());
+                let expected_total =
+                    (0..scheduled).fold(shelterwood::TotalRestarts::ZERO, |total, _| total.bump());
+                let expected_count =
+                    (0..scheduled).fold(shelterwood::RestartCount::ZERO, |count, _| count.bump());
+                assert_eq!(attempt, expected_attempt);
+                let snapshot = scope.snapshot();
+                assert_eq!(
+                    snapshot.total_restarts, expected_total,
+                    "the public scope counter advances with each scheduling event"
+                );
+                if scheduled < releases.len() {
+                    // The next incarnation is still gated, so the member is
+                    // guaranteed to remain resident while we inspect it.
+                    assert_eq!(
+                        snapshot
+                            .child("failing")
+                            .expect("the restartable child is retained")
+                            .restart_count,
+                        expected_count,
+                        "the membership counter includes the scheduling charge"
+                    );
+                    releases[scheduled].release();
+                } else if let Some(child) = snapshot.child("failing") {
+                    // No gate holds the tripping charge: the driver drains and
+                    // tears the scope down without waiting for this subscriber,
+                    // so the member may already be pruned by the time event #3
+                    // is processed. Only pin its counter while it is resident;
+                    // `total_restarts` above stays authoritative either way.
+                    assert_eq!(
+                        child.restart_count, expected_count,
+                        "the membership counter includes the tripping charge"
+                    );
+                }
+            }
+            LifecycleEventKind::ScopeState {
+                state: shelterwood::ScopeState::Draining,
+            } => {
+                trace.push("draining");
+                break;
+            }
+            _ => {}
+        }
+    }
     let reason = system.wait().await;
     let StopReason::IntensityTripped(trip) = reason else {
         panic!("expected intensity trip");
@@ -168,6 +298,25 @@ async fn over_budget_restart_is_charged_but_never_spawned() {
         starts.load(Ordering::SeqCst),
         3,
         "fourth spawn is suppressed"
+    );
+    assert_eq!(scheduled, 3);
+    assert_eq!(
+        scope.snapshot().total_restarts,
+        shelterwood::TotalRestarts::ZERO.bump().bump().bump(),
+        "the tripping scheduling charge remains visible after failure"
+    );
+    assert_eq!(
+        trace,
+        [
+            "exited",
+            "scheduled",
+            "exited",
+            "scheduled",
+            "exited",
+            "scheduled",
+            "draining"
+        ],
+        "the tripping charge is emitted before the scope failure"
     );
 }
 
@@ -853,6 +1002,99 @@ async fn subtree_defaults_inherit_or_reset_end_to_end() {
     reset_actor
         .try_send(CapacityMessage::Queued)
         .expect("reset does not inherit the parent's one-slot capacity");
+
+    inherited_release.release();
+    reset_release.release();
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
+async fn three_level_mailbox_capacity_walk_honors_inherit_and_reset() {
+    let inherited_entered = ReleaseGate::default();
+    let inherited_release = ReleaseGate::default();
+    let reset_entered = ReleaseGate::default();
+    let reset_release = ReleaseGate::default();
+
+    let mut inherited_leaf = Tree::new();
+    let inherited_actor = inherited_leaf
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<CapacityActor>::new((
+                inherited_entered.clone(),
+                inherited_release.clone(),
+            ))
+            .mailbox(Mailbox::queue_inherit()),
+        )
+        .expect("valid inherited actor");
+    let mut reset_leaf = Tree::new();
+    let reset_actor = reset_leaf
+        .add_actor_once(
+            "actor",
+            ActorOnceDef::<CapacityActor>::new((reset_entered.clone(), reset_release.clone()))
+                .mailbox(Mailbox::queue_inherit()),
+        )
+        .expect("valid reset actor");
+
+    let mut middle = Tree::new();
+    middle.defaults(ScopeDefaults {
+        mailbox: Some(Mailbox::latest()),
+        ..ScopeDefaults::default()
+    });
+    middle
+        .add_subtree_once(
+            "inherited",
+            SubtreeOnceDef::new(inherited_leaf).defaults(DefaultsInheritance::Inherit),
+        )
+        .expect("valid inherited leaf");
+    middle
+        .add_subtree_once(
+            "reset",
+            SubtreeOnceDef::new(reset_leaf).defaults(DefaultsInheritance::Reset),
+        )
+        .expect("valid reset leaf");
+
+    let mut root = Tree::new();
+    root.defaults(ScopeDefaults {
+        mailbox: Some(Mailbox::queue(1).expect("valid outer capacity")),
+        ..ScopeDefaults::default()
+    });
+    root.add_subtree_once(
+        "middle",
+        SubtreeOnceDef::new(middle).defaults(DefaultsInheritance::Inherit),
+    )
+    .expect("valid middle subtree");
+
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("all scopes start");
+
+    inherited_actor
+        .send(CapacityMessage::Hold)
+        .await
+        .expect("inherited actor accepts hold");
+    reset_actor
+        .send(CapacityMessage::Hold)
+        .await
+        .expect("reset actor accepts hold");
+    inherited_entered.wait().await;
+    reset_entered.wait().await;
+
+    inherited_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("the inherited outer capacity accepts one pending message");
+    let inherited_full = inherited_actor
+        .try_send(CapacityMessage::Queued)
+        .expect_err("latest is passed over and the outer one-slot queue is full");
+    assert_eq!(inherited_full.kind, SendErrorKind::Full);
+
+    reset_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("reset uses the library queue capacity");
+    reset_actor
+        .try_send(CapacityMessage::Queued)
+        .expect("reset severs the outer one-slot queue capacity");
 
     inherited_release.release();
     reset_release.release();

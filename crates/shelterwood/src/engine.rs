@@ -321,9 +321,9 @@ pub(crate) struct RestartDecision {
     pub(crate) attempt: RestartAttempt,
     pub(crate) restart_count: RestartCount,
     pub(crate) delay: Duration,
-    /// Absolute backoff deadline; unrepresentable far-future points are
-    /// clamped (B.6: `restart_at` is present exactly in `Restarting`).
-    pub(crate) restart_at: Instant,
+    /// Absolute backoff deadline, or `None` when the exact point cannot be
+    /// represented and armed by the runtime clock.
+    pub(crate) restart_at: Option<Instant>,
     pub(crate) charge: IntensityCharge,
 }
 
@@ -337,7 +337,7 @@ pub(crate) fn schedule_restart(
 ) -> RestartDecision {
     let (attempt, restart_count) = restarts.schedule();
     let delay = restart_policy.backoff().next_delay(attempt, jitter_sample);
-    let restart_at = Deadline::saturating_after(now, delay);
+    let restart_at = Deadline::after(now, delay).instant();
     let charge = intensity.charge(intensity_policy, now);
     RestartDecision {
         attempt,
@@ -378,7 +378,9 @@ pub(crate) enum ReadinessEvent {
         signal_seen: bool,
     },
     Shutdown,
-    Exit,
+    Exit {
+        signal_seen: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -432,7 +434,8 @@ impl ReadinessGate {
                 ReadinessEvent::Deadline {
                     signal_seen: true, ..
                 },
-            ) => {
+            )
+            | (ReadinessState::Waiting { .. }, ReadinessEvent::Exit { signal_seen: true }) => {
                 self.state = ReadinessState::Ready;
                 Some(ReadinessEffect::BecameReady)
             }
@@ -449,8 +452,12 @@ impl ReadinessGate {
                 Some(ReadinessEffect::TimedOut { deadline })
             }
             (
-                ReadinessState::Unconfigured | ReadinessState::Waiting { .. },
-                ReadinessEvent::Shutdown | ReadinessEvent::Exit,
+                ReadinessState::Unconfigured,
+                ReadinessEvent::Shutdown | ReadinessEvent::Exit { .. },
+            )
+            | (
+                ReadinessState::Waiting { .. },
+                ReadinessEvent::Shutdown | ReadinessEvent::Exit { signal_seen: false },
             ) => {
                 self.state = ReadinessState::Disarmed;
                 Some(ReadinessEffect::Disarmed)
@@ -1139,13 +1146,13 @@ mod tests {
         assert_eq!(decision.attempt, RestartAttempt::ZERO.bump());
         assert_eq!(decision.restart_count, RestartCount::ZERO.bump());
         assert_eq!(decision.delay, Duration::ZERO);
-        assert_eq!(decision.restart_at, now);
+        assert_eq!(decision.restart_at, Some(now));
         assert_eq!(decision.charge.total_restarts, TotalRestarts::ZERO.bump());
         assert!(decision.charge.tripped);
     }
 
     #[test]
-    fn overflowing_restart_delay_clamps_to_a_far_future_deadline() {
+    fn overflowing_restart_delay_has_no_substitute_deadline() {
         let now = Instant::now();
         let intensity_policy = Intensity::new(5, Duration::from_secs(10)).expect("valid intensity");
         let restart_policy = RestartPolicy::new(
@@ -1164,11 +1171,7 @@ mod tests {
         );
 
         assert_eq!(decision.delay, Duration::MAX);
-        let century = Duration::from_secs(60 * 60 * 24 * 365 * 100);
-        assert!(
-            decision.restart_at > now + century,
-            "an unrepresentable backoff deadline clamps far future, never near now"
-        );
+        assert_eq!(decision.restart_at, None);
     }
 
     #[test]
@@ -1235,6 +1238,19 @@ mod tests {
                 signal_seen: false,
             }),
             None
+        );
+
+        let mut exited = ReadinessGate::new();
+        assert_eq!(
+            exited.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::Manual,
+                deadline: None,
+            }),
+            None
+        );
+        assert_eq!(
+            exited.step(ReadinessEvent::Exit { signal_seen: true }),
+            Some(ReadinessEffect::BecameReady)
         );
 
         let mut timed_out = ReadinessGate::new();

@@ -19,6 +19,7 @@ mod plan;
 mod policy;
 mod raw;
 mod runtime;
+mod scope;
 mod task;
 mod tree;
 
@@ -50,11 +51,12 @@ pub use policy::{
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,
 };
+pub use scope::{DynamicScopeRef, ScopeRef};
 pub use task::{OneShotTaskRef, TaskContext, TaskDef, TaskOnceDef, TaskRef};
 pub use tree::{
-    ActorSlot, Admission, AdmissionReceipt, BuildError, DynamicActorSlot, DynamicScopeRef,
-    DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, Removal, ScopeRef, StartOrShutdownError,
-    Subtree, SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskSlot, Tree,
+    ActorSlot, Admission, AdmissionReceipt, BuildError, DynamicActorSlot, DynamicSubtreeSlot,
+    DynamicTaskSlot, DynamicTree, Removal, StartOrShutdownError, Subtree, SubtreeDef,
+    SubtreeOnceDef, SubtreeSlot, System, TaskSlot, Tree,
 };
 
 // Keep the repository-facing examples in the same rustdoc compilation lane as

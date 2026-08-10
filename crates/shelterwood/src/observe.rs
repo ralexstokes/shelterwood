@@ -236,9 +236,8 @@ pub struct ChildSnapshot {
     pub restart_policy: RestartPolicy,
     /// Resolved terminal-retention policy.
     pub retention: Retention,
-    /// Absolute backoff deadline, present exactly while the membership is
-    /// restarting; a delay too distant for the clock to represent is
-    /// clamped to a far-future instant.
+    /// Absolute backoff deadline while restarting, or `None` when the exact
+    /// point is too distant for the runtime clock to represent and arm.
     pub restart_at: Option<Instant>,
     /// Recursive state of a scope child when its incarnation is live or terminal.
     pub nested: Option<Arc<ScopeSnapshot>>,
@@ -415,6 +414,7 @@ impl SnapshotHub {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn publish(&self, snapshot: impl FnOnce() -> Arc<ScopeSnapshot>) {
         if self.closed.load(Ordering::Acquire) {
             return;
@@ -438,12 +438,51 @@ impl SnapshotHub {
         }
     }
 
+    pub(crate) fn publish_deferred(
+        &self,
+        wakes: &mut crate::cells::ObservationWakes,
+        snapshot: impl FnOnce() -> Arc<ScopeSnapshot>,
+    ) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(sender) = self.sender.get() else {
+            return;
+        };
+        if sender.receiver_count() == 0 {
+            return;
+        }
+        let mut modified = false;
+        sender.modify_silently(|state| {
+            if state.closed {
+                return;
+            }
+            state.snapshot = snapshot();
+            state.generation = state.generation.saturating_add(1);
+            modified = true;
+        });
+        if modified {
+            wakes.pulse(sender);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         if let Some(sender) = self.sender.get() {
             sender.send_modify(|state| state.closed = true);
+        }
+    }
+
+    pub(crate) fn close_deferred(&self, wakes: &mut crate::cells::ObservationWakes) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(sender) = self.sender.get() {
+            sender.modify_silently(|state| state.closed = true);
+            wakes.pulse(sender);
         }
     }
 }
@@ -582,6 +621,7 @@ impl LifecycleHub {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn publish(&self, event: LifecycleEvent) {
         tracing::trace!(
             scope = ?event.scope,
@@ -596,10 +636,39 @@ impl LifecycleHub {
         self.publish_past_fast_path(event);
     }
 
+    pub(crate) fn publish_deferred(
+        &self,
+        wakes: &mut crate::cells::ObservationWakes,
+        event: LifecycleEvent,
+    ) {
+        tracing::trace!(
+            scope = ?event.scope,
+            seq = event.seq.get(),
+            path = ?event.scope_path,
+            kind = ?event.kind,
+            "scope lifecycle event"
+        );
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut published = false;
+        self.channels.signal.modify_silently(|signal| {
+            if signal.closed {
+                return;
+            }
+            let _ = self.channels.events.send(event);
+            published = true;
+        });
+        if published {
+            wakes.pulse(&self.channels.signal);
+        }
+    }
+
     /// The enqueue half of [`publish`](Self::publish), after the atomic
     /// fast-path check. Split out so tests can pin the close race: calling
     /// this on a closed hub is exactly a publisher that read `closed ==
     /// false` and then lost the linearization race to `close`.
+    #[cfg(test)]
     fn publish_past_fast_path(&self, event: LifecycleEvent) {
         self.channels.signal.send_if_modified(|signal| {
             // Enqueue and activity notification share the same linearization
@@ -615,6 +684,7 @@ impl LifecycleHub {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn publish_lagged(&self, dropped: u64) {
         if self.closed.load(Ordering::Acquire) {
             return;
@@ -628,12 +698,44 @@ impl LifecycleHub {
         });
     }
 
+    pub(crate) fn publish_lagged_deferred(
+        &self,
+        wakes: &mut crate::cells::ObservationWakes,
+        dropped: u64,
+    ) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut published = false;
+        self.channels.signal.modify_silently(|signal| {
+            if signal.closed {
+                return;
+            }
+            signal.explicit_lag = signal.explicit_lag.saturating_add(dropped);
+            published = true;
+        });
+        if published {
+            wakes.pulse(&self.channels.signal);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
             self.channels
                 .signal
                 .send_modify(|signal| signal.closed = true);
         }
+    }
+
+    pub(crate) fn close_deferred(&self, wakes: &mut crate::cells::ObservationWakes) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.channels
+            .signal
+            .modify_silently(|signal| signal.closed = true);
+        wakes.pulse(&self.channels.signal);
     }
 }
 

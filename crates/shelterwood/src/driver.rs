@@ -228,8 +228,11 @@ struct ScopeCompletion {
 impl Drop for ScopeRuntime {
     fn drop(&mut self) {
         let dynamic_entries = if let Some(dynamic) = &self.dynamic {
-            let entries = dynamic.close();
-            self.root.set_dynamic_route(None);
+            let entries = self.root.with_observation_gate(|txn| {
+                let entries = dynamic.close(txn);
+                self.root.set_dynamic_route_locked(None, txn);
+                entries
+            });
             Some(entries)
         } else {
             None
@@ -304,7 +307,9 @@ impl ScopeRuntime {
             } else {
                 NotAdmittingCause::NoLiveIncarnation
             };
-            let (definition, removed) = cancel_dynamic_reservation_parts(&control, &request.slot);
+            let (definition, removed) = self.root.with_observation_gate(|txn| {
+                cancel_dynamic_reservation_parts(&control, &request.slot, txn)
+            });
             reject_admission_after_disposal(
                 request,
                 definition,
@@ -314,7 +319,9 @@ impl ScopeRuntime {
             return;
         }
         if request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
-            let (definition, removed) = cancel_dynamic_reservation_parts(&control, &request.slot);
+            let (definition, removed) = self.root.with_observation_gate(|txn| {
+                cancel_dynamic_reservation_parts(&control, &request.slot, txn)
+            });
             reject_admission_after_disposal(
                 request,
                 definition,
@@ -327,7 +334,9 @@ impl ScopeRuntime {
         let (definition, resolved) = match request.slot.resolve_and_take_defined(&self.defaults) {
             Ok(Some(claimed)) => claimed,
             Ok(None) => {
-                let (_, removed) = cancel_dynamic_reservation_parts(&control, &request.slot);
+                let (_, removed) = self.root.with_observation_gate(|txn| {
+                    cancel_dynamic_reservation_parts(&control, &request.slot, txn)
+                });
                 reject_admission_after_disposal(
                     request,
                     None,
@@ -337,8 +346,9 @@ impl ScopeRuntime {
                 return;
             }
             Err(invalid) => {
-                let (definition, removed) =
-                    cancel_dynamic_reservation_parts(&control, &request.slot);
+                let (definition, removed) = self.root.with_observation_gate(|txn| {
+                    cancel_dynamic_reservation_parts(&control, &request.slot, txn)
+                });
                 reject_admission_after_disposal(
                     request,
                     definition,
@@ -354,32 +364,31 @@ impl ScopeRuntime {
         // so driver teardown can still close reservations and removals.
         let mut child = ChildRuntime::from_plan(plan, &self.root);
         child.initial = false;
-        let key = {
+        enum AdmissionInstall {
+            Admitted(ChildKey),
+            Rejected {
+                child: Box<ChildRuntime>,
+                removed: Option<DynamicEntry>,
+                error: ReserveError,
+            },
+        }
+        let root = Arc::clone(&self.root);
+        let installed = root.with_observation_gate(|txn| {
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
             let id = request.slot.member.id();
-            let matches_reservation = state.entries.get(id).is_some_and(|entry| {
+            let matches_reservation = state.entry(id).is_some_and(|entry| {
                 entry.slot.member.membership() == request.slot.member.membership()
                     && entry.is_reserved()
             });
             if !matches_reservation || request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
-                let removed = matches_reservation
-                    .then(|| state.entries.remove(id))
-                    .flatten();
+                let removed = matches_reservation.then(|| state.remove(id, txn)).flatten();
                 drop(state);
-                request.slot.terminalize_never_started();
-                // The entry's drop completes its removal response; preserve
-                // the same terminality-before-completion ordering as every
-                // other reservation-cancellation path. Definition disposal
-                // is also complete before either waiter regains ownership.
-                child.complete_terminality();
-                let ChildRuntime { construction, .. } = child;
-                reject_admission_after_disposal(
-                    request,
-                    Some(construction),
+                request.slot.terminalize_never_started_locked(txn);
+                return AdmissionInstall::Rejected {
+                    child: Box::new(child),
                     removed,
-                    ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
-                );
-                return;
+                    error: ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
+                };
             }
             // The control-plane lock makes arena insertion and promotion one
             // state transition: an exact remover sees either the reservation
@@ -388,29 +397,40 @@ impl ScopeRuntime {
             let key = match self.children.insert(child) {
                 Ok(key) => key,
                 Err(child) => {
-                    let removed = state.entries.remove(id);
+                    let removed = state.remove(id, txn);
                     drop(state);
-                    let mut child = *child;
-                    request.slot.terminalize_never_started();
-                    child.complete_terminality();
-                    let ChildRuntime { construction, .. } = child;
-                    reject_admission_after_disposal(
-                        request,
-                        Some(construction),
+                    request.slot.terminalize_never_started_locked(txn);
+                    return AdmissionInstall::Rejected {
+                        child,
                         removed,
-                        ReserveError::IdentityExhausted,
-                    );
-                    return;
+                        error: ReserveError::IdentityExhausted,
+                    };
                 }
             };
             let entry = state
-                .entries
-                .get_mut(id)
+                .entry_mut(id)
                 .expect("the matching reservation was just resolved");
-            entry.promote(key, request.fused_cancel.take());
-            key
+            entry.promote(key, request.fused_cancel.take(), txn);
+            root.admit_child_locked(resident_projection(&request.slot), txn);
+            AdmissionInstall::Admitted(key)
+        });
+        let key = match installed {
+            AdmissionInstall::Admitted(key) => key,
+            AdmissionInstall::Rejected {
+                mut child,
+                removed,
+                error,
+            } => {
+                // The entry's drop completes its removal response; preserve
+                // the same terminality-before-completion ordering as every
+                // other reservation-cancellation path. Definition disposal
+                // is also complete before either waiter regains ownership.
+                child.complete_terminality();
+                let ChildRuntime { construction, .. } = *child;
+                reject_admission_after_disposal(request, Some(construction), removed, error);
+                return;
+            }
         };
-        self.root.admit_child(resident_projection(&request.slot));
         #[cfg(test)]
         self.record_storage();
         request.complete(Ok(()));
@@ -567,7 +587,10 @@ async fn run_scope_incarnation(
 ) -> StopReason {
     let root = Arc::clone(&plan.root);
     if role.is_root() {
-        root.member.transition(MemberTransition::Running);
+        root.with_observation_gate(|txn| {
+            root.member
+                .transition_locked(txn, MemberTransition::Running);
+        });
     }
     // Both lanes are unbounded so their producers can publish synchronously.
     // Keep child lifecycle events separate from externally generated dynamic
@@ -606,7 +629,9 @@ async fn run_scope_incarnation(
         }
     }
     if let Some(control) = &dynamic {
-        control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)));
+        root.with_observation_gate(|txn| {
+            control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
+        });
     }
     let next_ordered_start = children.keys().next();
     let mut scope = ScopeRuntime {

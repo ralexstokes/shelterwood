@@ -429,6 +429,7 @@ impl<T> WatchSender<T> {
         self.0.send_modify(|_| {});
     }
 
+    #[cfg(test)]
     pub(crate) fn send_modify(&self, update: impl FnOnce(&mut T)) {
         self.0.send_modify(update);
     }

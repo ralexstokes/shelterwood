@@ -61,6 +61,7 @@ impl<H> PendingAdmission<H> {
 
     fn cancel_reservation(&self) {
         crate::driver::cancel_dynamic_reservation(
+            &self.reservation.scope,
             self.reservation.control.as_ref(),
             &self.reservation.slot,
         );
@@ -176,6 +177,7 @@ impl<H> Drop for Admission<H> {
                 let signal_panic = pending.fused_cancel.as_ref().and_then(|cancel| {
                     crate::runtime::catch_panic(|| {
                         crate::driver::signal_fused_cancel(
+                            &pending.reservation.scope,
                             pending.reservation.control.as_ref(),
                             &pending.reservation.slot,
                             cancel,
@@ -194,6 +196,7 @@ impl<H> Drop for Admission<H> {
                 if let Some(cancel) = &pending.fused_cancel {
                     let signal_panic = crate::runtime::catch_panic(|| {
                         crate::driver::signal_fused_cancel(
+                            &pending.reservation.scope,
                             pending.reservation.control.as_ref(),
                             &pending.reservation.slot,
                             cancel,

@@ -87,6 +87,7 @@ impl Drop for DynamicSlotEndpoint {
     fn drop(&mut self) {
         if let Some(reservation) = &self.reservation {
             crate::driver::cancel_dynamic_reservation(
+                &reservation.scope,
                 reservation.control.as_ref(),
                 &reservation.slot,
             );

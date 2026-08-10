@@ -16,32 +16,10 @@ impl ScopeRuntime {
                 .state
                 .lock()
                 .expect("dynamic-state mutex poisoned")
-                .entries
-                .get(child.slot.member.id())
+                .entry(child.slot.member.id())
                 .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
                 .is_some_and(|entry| entry.is_removing() && entry.matches_key(key))
         })
-    }
-
-    pub(super) fn publish_dynamic_removal(&self, key: ChildKey) {
-        let Some(member) = self
-            .children
-            .get(key)
-            .map(|child| Arc::clone(&child.slot.member))
-        else {
-            return;
-        };
-        // Idempotency hygiene rather than a load-bearing guard: an explicit
-        // removal publishes this projection before its request reaches the
-        // driver, and duplicate deliveries re-enter here after the first
-        // publication. Skipping the transition only avoids re-publishing an
-        // identical record under the observation gate; no public observable
-        // distinguishes that redundant publication, so tests pin the call
-        // sites (the fused-only removal path, where this write is the sole
-        // Removing-projection writer) rather than this check.
-        if member.record().membership_status != MembershipStatus::Removing {
-            self.root.set_child_removing(&member);
-        }
     }
 
     pub(super) fn handle_removal(&mut self, removal: RemovalRequest) {
@@ -57,26 +35,26 @@ impl ScopeRuntime {
         let Some(control) = &self.dynamic else {
             return;
         };
-        let tracked = {
+        let root = Arc::clone(&self.root);
+        let tracked = root.with_observation_gate(|txn| {
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-            state
-                .entries
-                .get_mut(member.id())
+            let tracked = state
+                .entry_mut(member.id())
                 .filter(|entry| entry.slot.member.membership() == membership)
-                .and_then(DynamicEntry::mark_removing)
-                .is_some_and(|tracked| tracked == key)
-        };
+                .and_then(|entry| entry.mark_removing(txn))
+                .is_some_and(|tracked| tracked == key);
+            if tracked && member.record().membership_status != MembershipStatus::Removing {
+                root.set_child_removing_locked(&member, txn);
+            }
+            tracked
+        });
         if !tracked {
             return;
         }
-        // A fused drop and an explicit `remove` each queue one
-        // `RemovalRequest` for the same membership, and `mark_removing`
-        // deliberately re-succeeds on an already-Removing entry, so a second
-        // delivery reaches this point. Every step below is idempotent:
-        // `publish_dynamic_removal` is guarded by the record's status
-        // flag, `begin_stop_child` by its ladder/disposal guards, and
-        // `finalize_removal` removes the entry it matched.
-        self.publish_dynamic_removal(key);
+        // A fused drop and an explicit `remove` can each queue one request for
+        // the same membership. The phase/projection transaction above,
+        // `begin_stop_child`'s ladder guards, and `finalize_removal`'s exact
+        // match keep that duplicate delivery idempotent.
         if self.children[key].is_terminal() {
             self.finalize_removal(key);
         } else {
@@ -93,15 +71,24 @@ impl ScopeRuntime {
         };
         let member = Arc::clone(&self.children[key].slot.member);
         let id = member.id().clone();
-        let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-        if state.entries.get(&id).is_some_and(|entry| {
-            entry.slot.member.membership() == member.membership()
-                && entry.matches_key(key)
-                && entry.is_removing()
-        }) {
-            let entry = state.entries.remove(&id).expect("entry was just resolved");
-            drop(state);
-            self.root.prune_child(&member);
+        let root = Arc::clone(&self.root);
+        let entry = root.with_observation_gate(|txn| {
+            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
+            let matches = state.entry(&id).is_some_and(|entry| {
+                entry.slot.member.membership() == member.membership()
+                    && entry.matches_key(key)
+                    && entry.is_removing()
+            });
+            if !matches {
+                return None;
+            }
+            // Residency is withdrawn while the identifier remains claimed.
+            // A new reservation can therefore observe only the old resident
+            // or the committed Removed edge, never a reused-id overlap.
+            root.prune_child_locked(&member, txn);
+            state.remove(&id, txn)
+        });
+        if let Some(entry) = entry {
             self.reclaim_child(key);
             drop(entry);
         }
@@ -109,17 +96,26 @@ impl ScopeRuntime {
 
     pub(super) fn prune_terminal(&mut self, key: ChildKey) {
         let member = Arc::clone(&self.children[key].slot.member);
-        let mut removed = None;
-        if let Some(control) = &self.dynamic {
-            let id = member.id().clone();
-            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-            if state.entries.get(&id).is_some_and(|entry| {
-                entry.slot.member.membership() == member.membership() && entry.matches_key(key)
-            }) {
-                removed = state.entries.remove(&id);
+        let root = Arc::clone(&self.root);
+        let removed = root.with_observation_gate(|txn| {
+            let mut state = self
+                .dynamic
+                .as_ref()
+                .map(|control| control.state.lock().expect("dynamic-state mutex poisoned"));
+            let matches = state.as_ref().is_some_and(|state| {
+                state.entry(member.id()).is_some_and(|entry| {
+                    entry.slot.member.membership() == member.membership() && entry.matches_key(key)
+                })
+            });
+            root.prune_child_locked(&member, txn);
+            if matches {
+                state
+                    .as_mut()
+                    .and_then(|state| state.remove(member.id(), txn))
+            } else {
+                None
             }
-        }
-        self.root.prune_child(&member);
+        });
         if self.root.flavor == ScopeFlavor::Dynamic {
             self.reclaim_child(key);
         }

@@ -277,7 +277,11 @@ impl ReserveOnLifecycleWake {
         if result.is_none() {
             *result = Some(
                 reserve_dynamic(&self.scope, ChildId::from("reentrant"), None).map(|reservation| {
-                    cancel_dynamic_reservation(reservation.control.as_ref(), &reservation.slot);
+                    cancel_dynamic_reservation(
+                        &reservation.scope,
+                        reservation.control.as_ref(),
+                        &reservation.slot,
+                    );
                 }),
             );
             self.observed.fire();

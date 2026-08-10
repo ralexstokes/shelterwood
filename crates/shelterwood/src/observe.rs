@@ -300,6 +300,12 @@ impl SnapshotReceiver {
         self.inner.borrow_cloned().snapshot
     }
 
+    /// Returns whether the published snapshot stream is terminal.
+    #[must_use]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.borrow_cloned().closed
+    }
+
     /// Waits for and returns a newer snapshot.
     pub async fn changed(&mut self) -> Result<Arc<ScopeSnapshot>, SnapshotClosed> {
         loop {
@@ -342,7 +348,11 @@ struct SnapshotHubState {
 }
 
 impl SnapshotHub {
-    pub(crate) fn subscribe(&self, initial: Arc<ScopeSnapshot>) -> SnapshotReceiver {
+    pub(crate) fn subscribe(
+        &self,
+        initial: Arc<ScopeSnapshot>,
+        txn: &mut crate::cells::ObservationTxn<'_>,
+    ) -> SnapshotReceiver {
         if self.closed.load(Ordering::Acquire) {
             let (sender, inner) = runtime::watch(SnapshotHubState {
                 snapshot: initial,
@@ -368,12 +378,14 @@ impl SnapshotHub {
         // that first subscriber still observes closure; once installed,
         // `close` itself performs this publication and wakeup.
         if self.closed.load(Ordering::Acquire) {
-            sender.send_modify(|state| state.closed = true);
+            sender.modify_silently(|state| state.closed = true);
+            txn.pulse(sender);
         } else if sender.receiver_count() == 0 {
-            sender.send_modify(|state| {
+            sender.modify_silently(|state| {
                 state.snapshot = initial;
                 state.generation = state.generation.saturating_add(1);
             });
+            txn.pulse(sender);
         }
         let inner = sender.watcher();
         let seen_generation = inner.borrow_cloned().generation;
@@ -409,7 +421,7 @@ impl SnapshotHub {
 
     pub(crate) fn publish_deferred(
         &self,
-        wakes: &mut crate::cells::ObservationWakes,
+        wakes: &mut crate::cells::ObservationTxn<'_>,
         snapshot: impl FnOnce() -> Arc<ScopeSnapshot>,
     ) {
         if self.closed.load(Ordering::Acquire) {
@@ -445,7 +457,7 @@ impl SnapshotHub {
         }
     }
 
-    pub(crate) fn close_deferred(&self, wakes: &mut crate::cells::ObservationWakes) {
+    pub(crate) fn close_deferred(&self, wakes: &mut crate::cells::ObservationTxn<'_>) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -607,7 +619,7 @@ impl LifecycleHub {
 
     pub(crate) fn publish_deferred(
         &self,
-        wakes: &mut crate::cells::ObservationWakes,
+        wakes: &mut crate::cells::ObservationTxn<'_>,
         event: LifecycleEvent,
     ) {
         tracing::trace!(
@@ -669,7 +681,7 @@ impl LifecycleHub {
 
     pub(crate) fn publish_lagged_deferred(
         &self,
-        wakes: &mut crate::cells::ObservationWakes,
+        wakes: &mut crate::cells::ObservationTxn<'_>,
         dropped: u64,
     ) {
         if self.closed.load(Ordering::Acquire) {
@@ -697,7 +709,7 @@ impl LifecycleHub {
         }
     }
 
-    pub(crate) fn close_deferred(&self, wakes: &mut crate::cells::ObservationWakes) {
+    pub(crate) fn close_deferred(&self, wakes: &mut crate::cells::ObservationTxn<'_>) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -772,7 +784,9 @@ mod tests {
     #[crate::runtime::test]
     async fn snapshot_publication_that_linearizes_before_close_is_drained() {
         let hub = Arc::new(SnapshotHub::default());
-        let mut snapshots = hub.subscribe(snapshot(ScopeState::Unstarted));
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let mut snapshots = hub.subscribe(snapshot(ScopeState::Unstarted), &mut txn);
+        drop(txn);
         let (entered, wait_for_release) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
 
@@ -811,9 +825,14 @@ mod tests {
         assert!(snapshots.changed().await.is_err());
         hub.publish(|| panic!("publication after close must remain lazy"));
 
-        let mut after_close = hub.subscribe(snapshot(ScopeState::Stopped {
-            reason: crate::StopReason::Finished,
-        }));
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let mut after_close = hub.subscribe(
+            snapshot(ScopeState::Stopped {
+                reason: crate::StopReason::Finished,
+            }),
+            &mut txn,
+        );
+        drop(txn);
         assert!(matches!(
             after_close.borrow_latest().state,
             ScopeState::Stopped {

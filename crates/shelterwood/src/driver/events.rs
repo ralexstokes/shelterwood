@@ -132,8 +132,7 @@ impl ScopeRuntime {
                 .state
                 .lock()
                 .expect("dynamic-state mutex poisoned")
-                .entries
-                .get(child.slot.member.id())
+                .entry(child.slot.member.id())
                 .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
                 .is_some_and(|entry| entry.restart_is_suppressed(key))
         });

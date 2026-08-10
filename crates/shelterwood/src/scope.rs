@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    cells::{MemberStage, ScopeCell},
+    cells::ScopeCell,
     exit::StopReason,
     identity::{ChildId, Membership},
     observe::{ChildSnapshot, LifecycleEvents, ScopeSnapshot, SnapshotReceiver, WaitError},
@@ -189,15 +189,18 @@ impl_scope_ref_async_surface! {
             {
                 return Ok(child.clone());
             }
-            // Inspect the current snapshot before rejecting even an already
-            // elapsed (including zero-duration) budget.
-            if expires.is_due(crate::runtime::now()) {
-                return Err(WaitError::TimedOut);
-            }
-            if matches!(self.cell.member.record().stage, MemberStage::Terminal(_)) {
+            // The published stream is the waiter's sole authority. Closure
+            // and its final snapshot commit together under ObservationTxn, so
+            // the terminal payload cannot come from an earlier cut.
+            if snapshots.is_closed() {
                 return Err(WaitError::ScopeTerminated {
                     state: snapshot.state.clone(),
                 });
+            }
+            // Precedence is predicate, final termination, then deadline on
+            // both the fast and awaited paths.
+            if expires.is_due(crate::runtime::now()) {
+                return Err(WaitError::TimedOut);
             }
             match crate::runtime::select_two(snapshots.changed(), async {
                 match expires.instant() {
@@ -207,27 +210,8 @@ impl_scope_ref_async_surface! {
             })
             .await
             {
-                crate::runtime::Either::Left(Ok(_)) => {}
-                crate::runtime::Either::Left(Err(_)) => {
-                    let snapshot = snapshots.borrow_latest();
-                    if let Some(child) = snapshot.child(id.as_str())
-                        && pred(child)
-                    {
-                        return Ok(child.clone());
-                    }
-                    return Err(WaitError::ScopeTerminated {
-                        state: snapshot.state.clone(),
-                    });
-                }
-                crate::runtime::Either::Right(()) => {
-                    let snapshot = snapshots.borrow_latest();
-                    if let Some(child) = snapshot.child(id.as_str())
-                        && pred(child)
-                    {
-                        return Ok(child.clone());
-                    }
-                    return Err(WaitError::TimedOut);
-                }
+                crate::runtime::Either::Left(Ok(_) | Err(_))
+                | crate::runtime::Either::Right(()) => continue,
             }
         }
     }

@@ -131,14 +131,9 @@ pub(super) fn discharge_child_terminality(completion: ChildTerminality) {
             record.incarnation,
         )
     };
-    // `incarnation: None` also describes the gap between two incarnations.
-    // Only a membership that never ran needs a synthesized scope stop; a
-    // restarting scope already published its real reason in its last
-    // incarnation's epilogue, and replacing it here would make `wait_stopped`
-    // incorrectly report `NeverStarted`.
-    if never_started && let Some(scope) = &completion.slot.scope {
-        scope.terminalize_never_started();
-    }
+    // `terminalize_child` synthesizes the nested NeverStarted scope stop in
+    // the same observation transaction as the parent membership edge. A
+    // restarting scope already published its real prior-incarnation reason.
     completion.root.terminalize_child(
         &completion.slot.member,
         exit,
@@ -933,10 +928,13 @@ impl ScopeRuntime {
                 if decision.charge.tripped {
                     let trip = IntensityTrip::new(self.intensity_policy, decision.charge);
                     if self.lifecycle.is_starting() {
-                        self.root
-                            .set_startup(Err(StartupError::IntensityTripped(trip.clone())));
+                        self.begin_drain_with_startup(
+                            StopReason::IntensityTripped(trip.clone()),
+                            Err(StartupError::IntensityTripped(trip)),
+                        );
+                    } else {
+                        self.begin_drain(StopReason::IntensityTripped(trip));
                     }
-                    self.begin_drain(StopReason::IntensityTripped(trip));
                 } else {
                     if let Some(restart_at) = decision.restart_at {
                         child.restart_deadline = Some(
@@ -1041,11 +1039,6 @@ impl ScopeRuntime {
             startup,
         );
         if self.dynamic_membership_is_removing(key) {
-            // A foreign remover may have committed the control-plane state
-            // and be waiting for this thread's observation gate. Publish the
-            // Removing projection before pruning so the public lifecycle
-            // cannot skip directly from resident to Removed.
-            self.publish_dynamic_removal(key);
             self.finalize_removal(key);
         } else if terminal.startup == StartupDisposition::Aborted && !self.lifecycle.is_draining() {
             self.fail_startup(key, exit);

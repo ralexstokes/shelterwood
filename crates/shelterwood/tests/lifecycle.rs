@@ -339,6 +339,81 @@ async fn ordered_teardown_is_reverse_and_joins_before_advancing() {
         .expect("clean shutdown");
 }
 
+struct DropSignal(Arc<AtomicBool>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn grace_expiry_mid_ladder_joins_the_abort_before_advancing() {
+    let last_stopping = ReleaseGate::default();
+    let first_stopping = ReleaseGate::default();
+    let last_dropped = Arc::new(AtomicBool::new(false));
+    let joined_before_advance = Arc::new(AtomicBool::new(false));
+    let grace = Duration::from_secs(10);
+    let mut tree = Tree::new();
+    tree.add_task(
+        "first",
+        TaskDef::new({
+            let first_stopping = first_stopping.clone();
+            let last_dropped = Arc::clone(&last_dropped);
+            let joined_before_advance = Arc::clone(&joined_before_advance);
+            move |context| {
+                let first_stopping = first_stopping.clone();
+                let last_dropped = Arc::clone(&last_dropped);
+                let joined_before_advance = Arc::clone(&joined_before_advance);
+                async move {
+                    context.shutdown_token().cancelled().await;
+                    joined_before_advance
+                        .store(last_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+                    first_stopping.release();
+                    Ok(())
+                }
+            }
+        }),
+    )
+    .expect("valid first task");
+    tree.add_task(
+        "last",
+        TaskDef::new({
+            let last_stopping = last_stopping.clone();
+            let last_dropped = Arc::clone(&last_dropped);
+            move |context| {
+                let last_stopping = last_stopping.clone();
+                let last_dropped = Arc::clone(&last_dropped);
+                async move {
+                    let _drop_signal = DropSignal(last_dropped);
+                    context.shutdown_token().cancelled().await;
+                    last_stopping.release();
+                    future::pending::<ExitResult>().await
+                }
+            }
+        })
+        .shutdown(Shutdown::Graceful { grace }),
+    )
+    .expect("valid last task");
+
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("tree starts");
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(30)));
+    last_stopping.wait().await;
+    assert!(!last_dropped.load(Ordering::SeqCst));
+
+    tokio::time::advance(grace).await;
+    tokio::time::timeout(POLL_TIMEOUT, first_stopping.wait())
+        .await
+        .expect("the teardown ladder advances after the abort joins");
+    assert!(last_dropped.load(Ordering::SeqCst));
+    assert!(joined_before_advance.load(Ordering::SeqCst));
+    shutdown
+        .await
+        .expect("shutdown task joins")
+        .expect("shutdown completes within its owner budget");
+}
+
 #[tokio::test]
 async fn ordered_teardown_keeps_its_frontier_when_an_earlier_child_exits() {
     let first_stopping = Arc::new(AtomicBool::new(false));
@@ -530,6 +605,79 @@ async fn concurrent_initial_failures_publish_one_startup_failed_scope_edge() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("failed dynamic root shuts down");
+}
+
+#[tokio::test]
+async fn plain_restart_publishes_exited_old_before_started_new() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let fail_first = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.add_task(
+        "worker",
+        TaskDef::new({
+            let attempts = Arc::clone(&attempts);
+            let fail_first = fail_first.clone();
+            move |context| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let fail_first = fail_first.clone();
+                async move {
+                    if attempt == 0 {
+                        fail_first.wait().await;
+                        return Err(ExitError::message("restart me"));
+                    }
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        }),
+    )
+    .expect("valid worker");
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("first incarnation starts");
+    let first = system
+        .scope()
+        .child("worker")
+        .and_then(|child| child.incarnation)
+        .expect("running child has an incarnation");
+    let mut lifecycle = system.scope().subscribe_lifecycle();
+    fail_first.release();
+
+    loop {
+        let item = tokio::time::timeout(POLL_TIMEOUT, lifecycle.recv())
+            .await
+            .expect("restart lifecycle is bounded")
+            .expect("lifecycle stream remains open");
+        let LifecycleItem::Event(event) = item else {
+            panic!("small restart fixture must not lag");
+        };
+        match event.kind {
+            LifecycleEventKind::Exited { incarnation, .. } if incarnation == first => break,
+            _ => {}
+        }
+    }
+    let second = loop {
+        let item = tokio::time::timeout(POLL_TIMEOUT, lifecycle.recv())
+            .await
+            .expect("replacement lifecycle is bounded")
+            .expect("lifecycle stream remains open");
+        let LifecycleItem::Event(event) = item else {
+            panic!("small restart fixture must not lag");
+        };
+        if let LifecycleEventKind::Started { incarnation, .. } = event.kind
+            && incarnation.supersedes(first)
+        {
+            break incarnation;
+        }
+    };
+    assert!(second.supersedes(first));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("replacement stops");
 }
 
 #[tokio::test]

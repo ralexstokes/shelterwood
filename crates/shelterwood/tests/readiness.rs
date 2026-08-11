@@ -10,10 +10,10 @@ use crate::common::{
     POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, policy::never, poll_until,
 };
 use shelterwood::{
-    Backoff, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult, Jitter,
-    RawActor, RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, RestartCondition,
-    RestartPolicy, ScopeState, Shutdown, StartupError, StartupFailureCause, SubtreeOnceDef,
-    TaskDef, Tree,
+    Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DynamicTree, ExitError,
+    ExitKind, ExitResult, Jitter, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
+    ReadinessDeadline, RestartCondition, RestartPolicy, ScopeState, Shutdown, StartupError,
+    StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
 };
 
 struct ReadyThenStop;
@@ -832,6 +832,147 @@ async fn nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root rolls back");
+}
+
+#[tokio::test]
+async fn nested_ordered_startup_failure_rolls_back_only_the_started_prefix() {
+    let prefix_cancelled = Arc::new(AtomicBool::new(false));
+    let suffix_started = Arc::new(AtomicBool::new(false));
+    let mut nested = Tree::new();
+    nested
+        .add_task(
+            "prefix",
+            TaskDef::new({
+                let prefix_cancelled = Arc::clone(&prefix_cancelled);
+                move |context| {
+                    let prefix_cancelled = Arc::clone(&prefix_cancelled);
+                    async move {
+                        context.shutdown_token().cancelled().await;
+                        prefix_cancelled.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }
+            }),
+        )
+        .expect("valid prefix");
+    nested
+        .add_task(
+            "failure",
+            TaskDef::new(|_| async { Err(ExitError::message("nested ordered failure")) })
+                .restart(never())
+                .readiness(Readiness::Manual)
+                .expect("manual readiness"),
+        )
+        .expect("valid failure");
+    let suffix = nested
+        .add_task(
+            "suffix",
+            TaskDef::new({
+                let suffix_started = Arc::clone(&suffix_started);
+                move |_| {
+                    suffix_started.store(true, Ordering::SeqCst);
+                    async { Ok(()) }
+                }
+            }),
+        )
+        .expect("valid suffix");
+
+    let mut root = Tree::new();
+    let nested_scope = root
+        .add_subtree_once(
+            "nested",
+            SubtreeOnceDef::new(nested).shutdown(Shutdown::Abort),
+        )
+        .expect("valid nested scope");
+    let system = root.spawn().expect("runtime is available");
+    let error = system
+        .wait_started()
+        .await
+        .expect_err("the ordered child failure aborts nested startup");
+    assert!(matches!(
+        error,
+        StartupError::StartupFailed(ref failure)
+            if matches!(failure.cause, StartupFailureCause::Child { ref id, .. } if id.as_str() == "nested")
+    ));
+    assert!(prefix_cancelled.load(Ordering::SeqCst));
+    assert!(!suffix_started.load(Ordering::SeqCst));
+    assert!(matches!(suffix.wait().await.kind(), ExitKind::NeverStarted));
+    assert!(matches!(
+        nested_scope.wait_stopped().await,
+        shelterwood::StopReason::StartupFailed(_)
+    ));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root rolls back");
+}
+
+struct ExplicitInitReady;
+
+impl Actor for ExplicitInitReady {
+    type Msg = ();
+    type Args = (ReleaseGate, ReleaseGate);
+
+    async fn init(
+        (ready, release_init): Self::Args,
+        context: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        context.mark_ready();
+        context.mark_ready();
+        ready.release();
+        release_init.wait().await;
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn earliest_mark_ready_wins_and_later_readiness_edges_are_no_ops() {
+    let explicit_ready = ReleaseGate::default();
+    let release_init = ReleaseGate::default();
+    let sibling_started = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "actor",
+        ActorOnceDef::<ExplicitInitReady>::new((explicit_ready.clone(), release_init.clone()))
+            .readiness(Readiness::AfterInit),
+    )
+    .expect("valid actor");
+    tree.add_task(
+        "sibling",
+        TaskDef::new({
+            let sibling_started = sibling_started.clone();
+            move |context| {
+                let sibling_started = sibling_started.clone();
+                async move {
+                    context.mark_ready();
+                    context.mark_ready();
+                    sibling_started.release();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        }),
+    )
+    .expect("valid sibling");
+
+    let system = tree.spawn().expect("runtime is available");
+    explicit_ready.wait().await;
+    tokio::time::timeout(POLL_TIMEOUT, sibling_started.wait())
+        .await
+        .expect("explicit readiness advances ordered startup before init returns");
+    release_init.release();
+    system
+        .wait_started()
+        .await
+        .expect("automatic and duplicate readiness signals are harmless no-ops");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("tree stops");
 }
 
 #[tokio::test]

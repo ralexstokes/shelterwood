@@ -46,7 +46,9 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     // Dynamic scope handles inherit every observation/control method through
     // this relationship, so adding a ScopeRef method cannot omit it here.
     assert_deref::<DynamicScopeRef, ScopeRef>();
-    // Ordinary method syntax continues to resolve the inherited surface.
+    // Existing inherent methods remain addressable through UFCS as well as
+    // ordinary method syntax.
+    let _ = DynamicScopeRef::id;
     let _assert_dynamic_scope_method = |scope: &DynamicScopeRef| {
         let _ = scope.id();
     };

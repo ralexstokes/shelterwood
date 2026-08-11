@@ -181,8 +181,95 @@ impl DynamicScopeRef {
     }
 }
 
-/// The ordered-scope surface remains available without duplicating inherent
-/// forwarding methods on the capability-preserving dynamic handle.
+/// The shared observation/control surface, forwarded inherently.
+///
+/// The [`Deref`] impl below already makes every [`ScopeRef`] method resolve
+/// through ordinary method syntax, and it is what keeps a newly added method
+/// reachable here without touching this block. These forwards exist for the
+/// resolution form deref coercion cannot serve: associated-function paths.
+/// `DynamicScopeRef::id(&scope)` and `let f = DynamicScopeRef::request_shutdown`
+/// are pinned public API (`tests/api_trait_conformance.rs`), and
+/// associated-function lookup does not follow deref, so dropping these would
+/// silently retract that form. Appendix B.9 states `DynamicScopeRef` carries
+/// "everything on `ScopeRef`" -- keep both mechanisms.
+impl DynamicScopeRef {
+    /// Returns this scope's child id within its parent.
+    #[must_use]
+    pub fn id(&self) -> &ChildId {
+        self.0.id()
+    }
+
+    /// Returns the scope membership identity.
+    #[must_use]
+    pub fn membership(&self) -> Membership {
+        self.0.membership()
+    }
+
+    /// Computes an authoritative recursive snapshot on demand.
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<ScopeSnapshot> {
+        self.0.snapshot()
+    }
+
+    /// Subscribes to conflated recursive snapshots.
+    #[must_use]
+    pub fn subscribe_snapshots(&self) -> SnapshotReceiver {
+        self.0.subscribe_snapshots()
+    }
+
+    /// Subscribes to this scope's lifecycle and all forwarded descendants.
+    #[must_use]
+    pub fn subscribe_lifecycle(&self) -> LifecycleEvents {
+        self.0.subscribe_lifecycle()
+    }
+
+    /// Looks up a direct child in an authoritative current snapshot.
+    #[must_use]
+    pub fn child(&self, id: impl AsRef<str>) -> Option<ChildSnapshot> {
+        self.0.child(id)
+    }
+
+    /// Traverses a child-id path in an authoritative current snapshot.
+    #[must_use]
+    pub fn descendant<I, S>(&self, path: I) -> Option<ChildSnapshot>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.0.descendant(path)
+    }
+
+    /// Requests shutdown without waiting.
+    pub fn request_shutdown(&self) {
+        self.0.request_shutdown();
+    }
+
+    /// Waits for a named child snapshot satisfying an at-or-past predicate.
+    ///
+    /// Snapshot watches conflate intermediate states, so `pred` should accept
+    /// every state at or beyond the desired edge and must remain cheap and
+    /// non-blocking.
+    pub async fn wait_for_child<P>(
+        &self,
+        id: impl Into<ChildId>,
+        pred: P,
+        timeout: Duration,
+    ) -> Result<ChildSnapshot, WaitError>
+    where
+        P: FnMut(&ChildSnapshot) -> bool + Send,
+    {
+        self.0.wait_for_child(id, pred, timeout).await
+    }
+
+    /// Waits for terminal membership state.
+    pub async fn wait_stopped(&self) -> StopReason {
+        self.0.wait_stopped().await
+    }
+}
+
+/// Backstop for methods declared outside the forwarding block above: any
+/// future `ScopeRef` method remains reachable on `DynamicScopeRef` through
+/// deref, even before an inherent forward is added.
 impl Deref for DynamicScopeRef {
     type Target = ScopeRef;
 

@@ -139,7 +139,10 @@ pub(super) fn discharge_child_terminality(completion: ChildTerminality) {
     // membership edge. A restarting scope already published its real prior-
     // incarnation reason.
     if never_started && !completion.root.has_resident_child(&completion.slot.member) {
-        completion.slot.terminalize_never_started();
+        // Every terminalization evicts the lineage; the slot-owned path
+        // passes the owning scope so a restart's rebuild adopts a fresh,
+        // incomparable membership instead of an ordered successor.
+        completion.slot.terminalize_never_started(&completion.root);
         return;
     }
     completion.root.terminalize_child(

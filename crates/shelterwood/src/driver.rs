@@ -415,8 +415,7 @@ impl ScopeRuntime {
             if !matches_reservation || request.fused_cancel.as_ref().is_some_and(Latch::is_fired) {
                 let removed = matches_reservation.then(|| state.remove(id, txn)).flatten();
                 drop(state);
-                request.slot.terminalize_never_started_locked(txn);
-                root.evict_child_identity(&request.slot.member);
+                request.slot.terminalize_never_started_locked(&root, txn);
                 return AdmissionInstall::Rejected {
                     child: Box::new(child),
                     removed,
@@ -432,8 +431,7 @@ impl ScopeRuntime {
                 Err(child) => {
                     let removed = state.remove(id, txn);
                     drop(state);
-                    request.slot.terminalize_never_started_locked(txn);
-                    root.evict_child_identity(&request.slot.member);
+                    request.slot.terminalize_never_started_locked(&root, txn);
                     return AdmissionInstall::Rejected {
                         child,
                         removed,

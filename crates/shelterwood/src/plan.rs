@@ -130,28 +130,40 @@ impl SlotCell {
         }
     }
 
-    /// Publishes one never-started slot under the gate its observers use.
-    pub(crate) fn terminalize_never_started(&self) {
+    /// Publishes one never-started slot under the gate its observers use and
+    /// evicts its lineage from `owner`'s identity map. Every terminalization
+    /// evicts the lineage (SPEC §3.4): a later same-id declaration must mint
+    /// an incomparable membership, never an ordered successor of the
+    /// terminal predecessor. Taking the owning scope here keeps the pairing
+    /// structural instead of repeated at each call site.
+    pub(crate) fn terminalize_never_started(&self, owner: &ScopeCell) {
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started();
         } else {
             self.member.terminalize(Exit::never_started());
         }
+        owner.evict_child_identity(&self.member);
     }
 
-    pub(crate) fn terminalize_never_started_locked(&self, txn: &mut ObservationTxn<'_>) {
+    pub(crate) fn terminalize_never_started_locked(
+        &self,
+        owner: &ScopeCell,
+        txn: &mut ObservationTxn<'_>,
+    ) {
         self.member.terminalize_locked(Exit::never_started(), txn);
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started_locked(txn);
         }
+        owner.evict_child_identity(&self.member);
     }
 
     pub(crate) fn take_never_started_locked(
         &self,
+        owner: &ScopeCell,
         txn: &mut ObservationTxn<'_>,
     ) -> Option<Isolated<ChildConstruction>> {
         let definition = self.take_definition().ok().flatten();
-        self.terminalize_never_started_locked(txn);
+        self.terminalize_never_started_locked(owner, txn);
         definition
     }
 
@@ -383,8 +395,7 @@ impl BuilderCore {
 
     fn terminalize(&self) {
         for slot in &self.slots {
-            slot.terminalize_never_started();
-            self.root.evict_child_identity(&slot.member);
+            slot.terminalize_never_started(&self.root);
         }
         self.root.terminalize_never_started();
     }
@@ -424,8 +435,7 @@ fn terminalize_plan(
 ) {
     if terminality.take().is_some() {
         for child in children {
-            child.slot.terminalize_never_started();
-            root.evict_child_identity(&child.slot.member);
+            child.slot.terminalize_never_started(root);
         }
         root.with_observation_gate(|txn| {
             // Lowering can publish the planned children before ScopeRuntime

@@ -277,9 +277,7 @@ fn take_terminal_reservation(
     slot: &SlotCell,
     txn: &mut ObservationTxn<'_>,
 ) -> Option<runtime::Isolated<ChildConstruction>> {
-    let definition = slot.take_never_started_locked(txn);
-    scope.evict_child_identity(&slot.member);
-    definition
+    slot.take_never_started_locked(scope, txn)
 }
 
 pub(crate) struct DynamicReservation {

@@ -220,6 +220,13 @@ impl fmt::Debug for Removal {
     }
 }
 
+/// Fail-closed outcome when the removal response obligation never completes.
+///
+/// Named so the policy is assertable in every profile: the release fallback is
+/// only reachable once `debug_assert!` is compiled out, so a test that observes
+/// the returned value runs in exactly the builds CI does not exercise.
+const LOST_REMOVAL_RESPONSE_OUTCOME: RemoveOutcome = RemoveOutcome::Removed;
+
 impl Removal {
     pub(super) fn new(response: crate::driver::RemovalResponse) -> Self {
         Self {
@@ -231,7 +238,7 @@ impl Removal {
                     // preserve the removal goal, but flag the invariant break
                     // in debug builds just as admission does above.
                     debug_assert!(false, "removal response obligation must complete");
-                    RemoveOutcome::Removed
+                    LOST_REMOVAL_RESPONSE_OUTCOME
                 })
             }),
         }
@@ -291,6 +298,18 @@ mod tests {
         }
     }
     #[test]
+    fn lost_removal_response_policy_fails_closed() {
+        // Profile-independent: the release fallback below is unreachable in
+        // the debug builds CI runs, so the policy itself is pinned here rather
+        // than only through the value a release build happens to observe.
+        assert_eq!(
+            super::LOST_REMOVAL_RESPONSE_OUTCOME,
+            crate::RemoveOutcome::Removed,
+            "a lost removal response must preserve the removal goal"
+        );
+    }
+
+    #[test]
     fn closed_removal_response_fails_closed_after_debug_diagnostic() {
         let (sender, response) = crate::runtime::oneshot();
         drop(sender);
@@ -308,7 +327,7 @@ mod tests {
         #[cfg(not(debug_assertions))]
         assert_eq!(
             observed.expect("release fallback does not panic"),
-            std::task::Poll::Ready(crate::RemoveOutcome::Removed)
+            std::task::Poll::Ready(super::LOST_REMOVAL_RESPONSE_OUTCOME)
         );
     }
 

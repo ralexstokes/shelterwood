@@ -1285,6 +1285,7 @@ async fn fused_only_removal_commits_phase_and_projection_together() {
     assert_eq!(removal.membership, membership);
     assert_eq!(removal.key, key);
 
+    let duplicate = removal;
     scope.handle_removal(removal);
     assert_eq!(
         member.record().membership_status,
@@ -1297,6 +1298,30 @@ async fn fused_only_removal_commits_phase_and_projection_together() {
             .map(|child| child.membership_status),
         Some(MembershipStatus::Removing)
     ));
+
+    // Coalescing at the `Resident -> Removing` transition means no source can
+    // queue this request twice any more, so the driver-side idempotence guards
+    // lost their only coverage. They remain load-bearing for the pairings that
+    // *can* still deliver a removal to an actively-stopping child in one batch
+    // (`Pending::Shutdown` / `Force` / `SelfStop` alongside a removal, and
+    // `DeadlineKind::Restart` re-entry), so pin them with a synthetic
+    // duplicate: re-delivery must not rewind the armed ladder, push the stop
+    // deadline out, or arm a second timer.
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the removal begins the live stop ladder");
+    let ladder = active.ladder.expect("the stop ladder is armed");
+    let stop_deadline = active.stop_deadline;
+    let deadline_count = scope.deadlines.len();
+    scope.handle_removal(duplicate);
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the duplicate leaves the incarnation active");
+    assert_eq!(active.ladder, Some(ladder));
+    assert_eq!(active.stop_deadline, stop_deadline);
+    assert_eq!(scope.deadlines.len(), deadline_count);
 
     let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
         crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {

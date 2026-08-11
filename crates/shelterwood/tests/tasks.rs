@@ -3,9 +3,22 @@ use std::time::Duration;
 use crate::common::LiveFlag;
 use shelterwood::{
     BuildError, Cancellation, DynamicTree, Exit, ExitError, ExitKind, GracePhase, Readiness,
-    ReadinessDeadline, RemoveOutcome, ReserveError, Shutdown, StopReason, TaskDef, TaskOnceDef,
-    Tree,
+    ReadinessDeadline, RemoveOutcome, PolicyError, ReserveError, Shutdown, StopReason, TaskDef,
+    TaskOnceDef, Tree,
 };
+
+#[test]
+fn task_families_reject_after_init_readiness_eagerly() {
+    let restartable = TaskDef::new(|_| async { Ok(()) })
+        .readiness(Readiness::AfterInit)
+        .expect_err("restartable tasks have no init phase");
+    assert_eq!(restartable, PolicyError::UnsupportedReadiness);
+
+    let one_shot = TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) })
+        .readiness(Readiness::AfterInit)
+        .expect_err("one-shot tasks have no init phase");
+    assert_eq!(one_shot, PolicyError::UnsupportedReadiness);
+}
 
 #[test]
 fn public_exit_constructor_preserves_evidence_and_classifies_failures() {

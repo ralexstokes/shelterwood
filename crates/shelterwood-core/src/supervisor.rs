@@ -79,6 +79,16 @@ impl ChildState {
     }
 
     /// Whether the membership-terminal edge has been published.
+    ///
+    /// Identical to [`Self::joined`] *by construction*, not by accident: this
+    /// model routes every terminal through `Disposing`, and the shell
+    /// publishes the terminal stage only once retained-definition disposal has
+    /// joined. The state that separated them before the consolidation — a
+    /// published terminal with disposal still outstanding — is unrepresentable
+    /// here, so the old `!is_terminal() || is_disposing()` incompleteness test
+    /// collapses to `!joined()`. Both names are kept because the completion
+    /// trichotomy is the vocabulary the shutdown surface is stated in; see
+    /// `ScopeCell::settled` for the scope-level counterparts.
     pub fn membership_terminal(self) -> bool {
         self.incarnation() == IncarnationState::Joined
     }
@@ -735,7 +745,18 @@ impl SupervisorState {
         assert_eq!(self.children.len(), self.child_keys.len());
         for (&key, child) in &self.children {
             assert_eq!(self.child_keys.get(&child.membership), Some(&key));
-            assert_eq!(child.state.membership_terminal(), child.state.joined());
+            // A start effect is only ever derived from `startable`, so a
+            // spawnable record must be one `Event::Spawned` away from
+            // executing. This is the emission/acceptance agreement that keeps
+            // level-triggered settlement terminating.
+            assert!(!child.startable() || !child.state.membership_terminal());
+        }
+        // The ordered cursors are flavor-owned state; a dynamic scope that
+        // grew one would silently acquire a second stop sequencer.
+        if self.flavor != ScopeFlavor::Ordered {
+            assert!(self.next_ordered_start.is_none());
+            assert!(self.ordered_stop_cursor.is_none());
+            assert!(self.ordered_stop_waiting.is_none());
         }
         if let Some(waiting) = self.ordered_stop_waiting {
             assert!(self.lifecycle.is_draining());

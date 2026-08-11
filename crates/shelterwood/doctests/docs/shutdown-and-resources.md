@@ -102,6 +102,14 @@ after it expires Shelterwood escalates stragglers, so destruction of user
 futures can make the final return take longer. A zero timeout skips the
 cooperative wait but still follows token ordering and the tidy beat.
 
+The budget arms when the targeted incarnation enters its drain, not when the
+call is made: a child that cooperates on that first teardown wake, or that is
+sitting in a restart backoff window, is not a straggler. An incarnation its
+ancestor hard-aborts before it ever reaches drain entry therefore has no
+cooperative phase to bound — `shutdown_and_wait` waits on its drop epilogue
+and resolves `Ok` rather than reporting a timeout. Neither form of the call
+uses this timeout to bound its own return.
+
 Normally each scheduled scope driver joins its children before completing. A
 framework driver that misses its abort acknowledgement may instead be
 hard-aborted by its ancestor at the tidy-beat backstop. Its synchronous drop

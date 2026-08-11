@@ -3638,19 +3638,44 @@ implied on all; error/outcome types are B.3 and B.8):
   incarnation has ever existed, so the request arms §10's pending
   latch and waits for the first incarnation, which starts and
   immediately begins teardown. The timeout is an escalation bound on a
-  live teardown and **arms only when the latch begins acting** — at
-  that incarnation's start — never at the call: pre-spawn there is
+  live teardown and **arms only when the latch begins acting** — at that
+  incarnation's *drain entry*, never at the call: pre-spawn there is
   nothing to escalate, and the call waits exactly as a parked send
   does, bounded by §3.2's no-hang rule — a membership terminalized
   with no incarnation ever spawned (tree dropped unspawned, rejected
   or withdrawn insertion) resolves the call immediately as
-  already-stopped. Concurrent
+  already-stopped. Drain entry is the precise arming edge because the
+  budget bounds the **cooperative** phase: the incarnation must first get
+  the wake in which it consumes the latch, enters `Draining`, and starts
+  each child's stop ladder, or a zero budget would report every child that
+  cooperates on that wake — and every child sitting in a restart backoff
+  window — as a straggler, which §7's report explicitly is not for. One
+  consequence is normative: when an ancestor hard-aborts the incarnation
+  **before** it reaches drain entry, the latch never acts and the budget
+  never arms, so there is no cooperative phase to bound and no straggler
+  report to make. The call then waits on that incarnation's drop epilogue
+  — synchronous, awaiting nothing (§11's fallback boundary) — and resolves
+  `Ok`. A caller therefore cannot use this timeout to bound its own
+  return; the return is bounded by the epilogue, as it is on the ordinary
+  path once the budget expires (§11's unbounded join remainder).
+  Concurrent
   callers ride one latch and observe one teardown. A scope whose
   membership is already terminal resolves immediately only when its scope
   projection is `Unstarted` or `Stopped`; if parent teardown published
   terminal membership before a live incarnation's epilogue, the call still
   waits for that incarnation to finish (`Ok` — the terminal state is
   `wait_stopped()`'s and the snapshot's to report, not this call's).
+  That settlement test reads membership and scope projection as two
+  planes, not one atomic fact: a nested driver already inside its first
+  poll when its ancestor publishes terminal membership still reaches
+  `begin_incarnation`, so a wait can settle a hair before that epoch
+  becomes visible. The window is sanctioned rather than closed — the
+  incarnation publishes `Starting` from `begin_incarnation`, superseding
+  the stale `Unstarted`/`Stopped` projection under the same observation
+  gate *before* any of that incarnation's user code runs, and its epoch
+  owner still publishes the final `Stopped` projection — so the settled
+  call reports the state that held at its own resolution and the later
+  incarnation remains `wait_stopped()`'s and the snapshot's to report.
   `wait_stopped()` is the membership-level await — the scope
   analogue of `TaskRef::wait()`: it rides restarts and resolves at
   membership terminality with the scope's terminal state

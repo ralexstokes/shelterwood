@@ -1,5 +1,85 @@
 use super::support::*;
 
+fn disposed(child: ChildKey) -> DriverEvent {
+    DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic: None })
+}
+
+fn disposed_child(pending: &Pending) -> ChildKey {
+    match pending {
+        Pending::Child(ChildEvent::ConstructionDisposed { child, .. }) => *child,
+        _ => panic!("this fixture only queues construction disposals"),
+    }
+}
+
+/// Pins the wiring the driver's per-wake collection depends on: the disposal
+/// lane is collected last, through the same cap as the other two, and its
+/// saturation reaches the caller so the loop yields a scheduler turn instead
+/// of returning to a lane that still has a queued suffix. Without the cap a
+/// disposal flood monopolizes the wake, deferring the shutdown check at the
+/// top of the loop — and with it the start of the shutdown timeout.
+#[test]
+fn every_event_lane_is_capped_and_a_saturated_lane_forces_a_yield() {
+    let limit = super::super::MIN_EVENT_BATCH_LIMIT;
+    let primary_key = ChildKey(1);
+    let control_key = ChildKey(2);
+    let disposal_key = ChildKey(3);
+    let (primary, mut primary_receiver) = crate::runtime::unbounded_mpsc();
+    let (control, mut control_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal, mut disposal_receiver) = crate::runtime::unbounded_mpsc();
+    primary
+        .send(disposed(primary_key))
+        .expect("the primary lane remains open");
+    control
+        .send(disposed(control_key))
+        .expect("the control lane remains open");
+    for _ in 0..limit * 2 {
+        disposal
+            .send(disposed(disposal_key))
+            .expect("the disposal lane remains open");
+    }
+
+    let mut pending = Vec::new();
+    let saturated = super::super::collect_event_lanes(
+        super::super::EventLanes {
+            primary: &mut primary_receiver,
+            control: Some(&mut control_receiver),
+            disposal: &mut disposal_receiver,
+        },
+        limit,
+        &mut pending,
+    );
+
+    assert!(
+        saturated,
+        "a saturated disposal lane reports through to the driver's yield"
+    );
+    assert_eq!(
+        pending.len(),
+        limit + 3,
+        "the disposal lane contributes one bounded batch plus its saturation probe"
+    );
+    assert_eq!(
+        disposed_child(&pending[0].1),
+        primary_key,
+        "child lifecycle events lead the wake"
+    );
+    assert_eq!(
+        disposed_child(&pending[1].1),
+        control_key,
+        "dynamic control traffic collects after the primary lane"
+    );
+    assert!(
+        pending[2..]
+            .iter()
+            .all(|entry| disposed_child(&entry.1) == disposal_key),
+        "disposal completions trail both lifecycle lanes so they stay batch-tail events"
+    );
+    assert!(
+        crate::runtime::unbounded_mpsc_try_recv(&mut disposal_receiver).is_some(),
+        "the disposal suffix remains for a later scheduler turn"
+    );
+}
+
 /// Exercises the `DeadlineKind::Restart` suppression gate on its own:
 /// the restart deadline is scheduled first (no stop source latched at
 /// exit time), then the fused cancellation lands before the deadline's

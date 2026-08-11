@@ -1,6 +1,8 @@
 //! Dynamic membership admission errors and removal outcomes.
 
-use crate::{identity::ChildId, policy::InvalidPolicy};
+use std::fmt;
+
+use crate::identity::ChildId;
 
 /// A child reservation or dynamic admission error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -19,14 +21,11 @@ pub enum ReserveError {
     #[error("child id `{0}` is being removed")]
     RemovalInProgress(ChildId),
     /// The target dynamic scope is not admitting.
-    #[error("scope is not admitting: {0:?}")]
+    #[error("scope is not admitting: {0}")]
     NotAdmitting(NotAdmittingCause),
     /// The scope can mint no further membership identities.
     #[error("membership identity space is exhausted")]
     IdentityExhausted,
-    /// A public policy representation contained an invalid literal value.
-    #[error(transparent)]
-    InvalidPolicy(InvalidPolicy),
 }
 
 /// Exact reason an admission operation could not proceed.
@@ -45,6 +44,18 @@ pub enum NotAdmittingCause {
     ReservationEnded,
 }
 
+impl fmt::Display for NotAdmittingCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Terminal => "terminal",
+            Self::Draining => "draining",
+            Self::StartupFailed => "startup failed",
+            Self::NoLiveIncarnation => "no live incarnation",
+            Self::ReservationEnded => "reservation ended",
+        })
+    }
+}
+
 /// Outcome of an idempotent dynamic removal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RemoveOutcome {
@@ -52,4 +63,28 @@ pub enum RemoveOutcome {
     Removed,
     /// No matching membership remained to remove.
     AlreadyAbsent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NotAdmittingCause, ReserveError};
+
+    #[test]
+    fn not_admitting_display_is_stable_and_does_not_delegate_to_debug() {
+        let cases = [
+            (NotAdmittingCause::Terminal, "terminal"),
+            (NotAdmittingCause::Draining, "draining"),
+            (NotAdmittingCause::StartupFailed, "startup failed"),
+            (NotAdmittingCause::NoLiveIncarnation, "no live incarnation"),
+            (NotAdmittingCause::ReservationEnded, "reservation ended"),
+        ];
+
+        for (cause, expected) in cases {
+            assert_eq!(cause.to_string(), expected);
+            assert_eq!(
+                ReserveError::NotAdmitting(cause).to_string(),
+                format!("scope is not admitting: {expected}")
+            );
+        }
+    }
 }

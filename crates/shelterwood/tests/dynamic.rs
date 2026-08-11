@@ -10,7 +10,10 @@ use crate::common::{
     POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet,
     policy::never,
     poll_once, poll_until,
-    waiting::{signalled_waiting_task, task as waiting_task, tree as waiting_tree},
+    waiting::{
+        liveness_probed_waiting_task, signalled_waiting_task, task as waiting_task,
+        tree as waiting_tree,
+    },
 };
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicScopeRef,
@@ -102,9 +105,25 @@ impl RawActor for WaitingRaw {
     }
 }
 
+struct ManualWaitingRaw;
+
+impl RawActor for ManualWaitingRaw {
+    type Msg = ();
+
+    fn readiness() -> Readiness {
+        Readiness::Manual
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        context.shutdown_token().cancelled().await;
+        Ok(())
+    }
+}
+
 struct SignalledWaitingRaw {
     started: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
+    liveness: Option<(ReleaseGate, Arc<AtomicBool>)>,
 }
 
 impl RawActor for SignalledWaitingRaw {
@@ -112,19 +131,45 @@ impl RawActor for SignalledWaitingRaw {
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
         self.started.store(true, Ordering::SeqCst);
+        if let Some((gate, observed)) = &self.liveness {
+            let shutdown = context.shutdown_token();
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {
+                    self.cancelled.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                () = gate.wait() => observed.store(true, Ordering::SeqCst),
+            }
+        }
         context.shutdown_token().cancelled().await;
         self.cancelled.store(true, Ordering::SeqCst);
         Ok(())
     }
 }
 
-fn signalled_waiting_tree(started: Arc<AtomicBool>, cancelled: Arc<AtomicBool>) -> Tree {
+fn signalled_waiting_tree(
+    started: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    liveness: Option<(ReleaseGate, Arc<AtomicBool>)>,
+) -> Tree {
     let mut tree = Tree::new();
     let (_, completion) = tree
         .add_task_once(
             "worker",
             TaskOnceDef::new(move |context| async move {
                 started.store(true, Ordering::SeqCst);
+                if let Some((gate, observed)) = liveness {
+                    let shutdown = context.shutdown_token();
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => {
+                            cancelled.store(true, Ordering::SeqCst);
+                            return Ok::<_, ExitError>(());
+                        }
+                        () = gate.wait() => observed.store(true, Ordering::SeqCst),
+                    }
+                }
                 context.shutdown_token().cancelled().await;
                 cancelled.store(true, Ordering::SeqCst);
                 Ok::<_, ExitError>(())
@@ -133,6 +178,17 @@ fn signalled_waiting_tree(started: Arc<AtomicBool>, cancelled: Arc<AtomicBool>) 
         .expect("valid signalled task");
     drop(completion);
     tree
+}
+
+async fn assert_positive_liveness(gate: &ReleaseGate, observed: &Arc<AtomicBool>) {
+    gate.release();
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            observed.load(Ordering::SeqCst)
+        })
+        .await,
+        "the detached child must execute work released after its admission future was dropped"
+    );
 }
 
 #[tokio::test]
@@ -254,6 +310,106 @@ async fn dynamic_actor_add_resolves_at_admission_without_awaiting_init() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
+}
+
+#[tokio::test]
+async fn task_raw_and_subtree_admissions_resolve_before_manual_startup() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+
+    let task = tokio::time::timeout(
+        POLL_TIMEOUT,
+        scope.add_task(
+            "gated-task",
+            TaskDef::new(|context| async move {
+                context.shutdown_token().cancelled().await;
+                Ok(())
+            })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .shutdown(Shutdown::Abort),
+        ),
+    )
+    .await
+    .expect("task admission does not await readiness")
+    .expect("task is admitted");
+    let raw = tokio::time::timeout(
+        POLL_TIMEOUT,
+        scope.add_raw_once(
+            "gated-raw",
+            RawOnceDef::new(ManualWaitingRaw).shutdown(Shutdown::Abort),
+        ),
+    )
+    .await
+    .expect("raw admission does not await readiness")
+    .expect("raw actor is admitted");
+
+    let mut gated_tree = Tree::new();
+    gated_tree
+        .add_task(
+            "manual-child",
+            TaskDef::new(|context| async move {
+                context.shutdown_token().cancelled().await;
+                Ok(())
+            })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .shutdown(Shutdown::Abort),
+        )
+        .expect("valid gated child");
+    let subtree = tokio::time::timeout(
+        POLL_TIMEOUT,
+        scope.add_subtree_once(
+            "gated-subtree",
+            SubtreeOnceDef::new(gated_tree).shutdown(Shutdown::Abort),
+        ),
+    )
+    .await
+    .expect("subtree admission does not await aggregate readiness")
+    .expect("subtree is admitted");
+
+    for id in ["gated-task", "gated-raw", "gated-subtree"] {
+        assert!(
+            poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+                scope
+                    .child(id)
+                    .is_some_and(|child| matches!(child.state, ChildState::Starting))
+            })
+            .await,
+            "{id} remains admitted but startup-gated"
+        );
+    }
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
+async fn successful_admission_is_fused_after_returning_its_handle() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+    let mut admission = Box::pin(scope.add_task("fused-success", waiting_task()));
+
+    let task = admission
+        .as_mut()
+        .await
+        .expect("successful admission returns the exact handle once");
+    assert!(
+        poll_once(admission.as_mut()).is_pending(),
+        "re-polling a successful Admission is fused rather than repeating its output"
+    );
+
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
 }
 
 #[tokio::test]
@@ -683,13 +839,17 @@ async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
 
     let split_started = Arc::new(AtomicBool::new(false));
     let split_cancelled = Arc::new(AtomicBool::new(false));
+    let split_liveness_gate = ReleaseGate::default();
+    let split_liveness_seen = Arc::new(AtomicBool::new(false));
     let slot = scope
         .reserve_task("split-timeout")
         .expect("split reservation");
     let task = slot.task_ref();
-    let mut split = Box::pin(slot.define(signalled_waiting_task(
+    let mut split = Box::pin(slot.define(liveness_probed_waiting_task(
         Arc::clone(&split_started),
         Arc::clone(&split_cancelled),
+        split_liveness_gate.clone(),
+        Arc::clone(&split_liveness_seen),
     )));
     assert!(poll_once(split.as_mut()).is_pending());
     let timed_admission = async move {
@@ -716,6 +876,7 @@ async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
         split_cancelled.load(Ordering::SeqCst)
     })
     .await;
+    assert_positive_liveness(&split_liveness_gate, &split_liveness_seen).await;
     assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
     assert!(split_cancelled.load(Ordering::SeqCst));
 
@@ -767,11 +928,15 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
 
     let split_started = Arc::new(AtomicBool::new(false));
     let split_cancelled = Arc::new(AtomicBool::new(false));
+    let split_liveness_gate = ReleaseGate::default();
+    let split_liveness_seen = Arc::new(AtomicBool::new(false));
     let slot = scope.reserve_task("split").expect("split reservation");
     let split_task = slot.task_ref();
-    let mut split = Box::pin(slot.define(signalled_waiting_task(
+    let mut split = Box::pin(slot.define(liveness_probed_waiting_task(
         Arc::clone(&split_started),
         Arc::clone(&split_cancelled),
+        split_liveness_gate.clone(),
+        Arc::clone(&split_liveness_seen),
     )));
     assert!(poll_once(split.as_mut()).is_pending());
     drop(split);
@@ -785,17 +950,22 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         split_cancelled.load(Ordering::SeqCst)
     })
     .await;
+    assert_positive_liveness(&split_liveness_gate, &split_liveness_seen).await;
     assert_eq!(scope.remove_task(&split_task).await, RemoveOutcome::Removed);
 
     let split_after_started = Arc::new(AtomicBool::new(false));
     let split_after_cancelled = Arc::new(AtomicBool::new(false));
+    let split_after_liveness_gate = ReleaseGate::default();
+    let split_after_liveness_seen = Arc::new(AtomicBool::new(false));
     let slot = scope
         .reserve_task("split-after-admission")
         .expect("split reservation");
     let split_after_task = slot.task_ref();
-    let mut split_after = Box::pin(slot.define(signalled_waiting_task(
+    let mut split_after = Box::pin(slot.define(liveness_probed_waiting_task(
         Arc::clone(&split_after_started),
         Arc::clone(&split_after_cancelled),
+        split_after_liveness_gate.clone(),
+        Arc::clone(&split_after_liveness_seen),
     )));
     assert!(poll_once(split_after.as_mut()).is_pending());
     assert!(
@@ -809,6 +979,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         split_after_cancelled.load(Ordering::SeqCst)
     })
     .await;
+    assert_positive_liveness(&split_after_liveness_gate, &split_after_liveness_seen).await;
     assert_eq!(
         scope.remove_task(&split_after_task).await,
         RemoveOutcome::Removed
@@ -835,6 +1006,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
             move || SignalledWaitingRaw {
                 started: Arc::clone(&actor_started),
                 cancelled: Arc::clone(&actor_cancelled),
+                liveness: None,
             }
         }),
     ));
@@ -866,6 +1038,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
         SubtreeOnceDef::new(signalled_waiting_tree(
             Arc::clone(&subtree_started),
             Arc::clone(&subtree_cancelled),
+            None,
         )),
     ));
     assert!(poll_once(fused_subtree.as_mut()).is_pending());
@@ -891,6 +1064,8 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
 
     let actor_started = Arc::new(AtomicBool::new(false));
     let actor_cancelled = Arc::new(AtomicBool::new(false));
+    let actor_liveness_gate = ReleaseGate::default();
+    let actor_liveness_seen = Arc::new(AtomicBool::new(false));
     let slot = scope
         .reserve_actor("split-actor")
         .expect("actor reservation succeeds");
@@ -898,6 +1073,10 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
     let mut split_actor = Box::pin(slot.define_once_raw(RawOnceDef::new(SignalledWaitingRaw {
         started: Arc::clone(&actor_started),
         cancelled: Arc::clone(&actor_cancelled),
+        liveness: Some((
+            actor_liveness_gate.clone(),
+            Arc::clone(&actor_liveness_seen),
+        )),
     })));
     assert!(poll_once(split_actor.as_mut()).is_pending());
     assert!(
@@ -911,18 +1090,27 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
         actor_cancelled.load(Ordering::SeqCst)
     })
     .await;
+    assert_positive_liveness(&actor_liveness_gate, &actor_liveness_seen).await;
     assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
     assert!(actor_cancelled.load(Ordering::SeqCst));
 
     let subtree_started = Arc::new(AtomicBool::new(false));
     let subtree_cancelled = Arc::new(AtomicBool::new(false));
+    let subtree_liveness_gate = ReleaseGate::default();
+    let subtree_liveness_seen = Arc::new(AtomicBool::new(false));
     let slot = scope
         .reserve_subtree::<Tree>("split-subtree")
         .expect("subtree reservation succeeds");
     let subtree = slot.scope_ref();
-    let mut split_subtree = Box::pin(slot.define_once(SubtreeOnceDef::new(
-        signalled_waiting_tree(Arc::clone(&subtree_started), Arc::clone(&subtree_cancelled)),
-    )));
+    let mut split_subtree =
+        Box::pin(slot.define_once(SubtreeOnceDef::new(signalled_waiting_tree(
+            Arc::clone(&subtree_started),
+            Arc::clone(&subtree_cancelled),
+            Some((
+                subtree_liveness_gate.clone(),
+                Arc::clone(&subtree_liveness_seen),
+            )),
+        ))));
     assert!(poll_once(split_subtree.as_mut()).is_pending());
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
@@ -935,6 +1123,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
         subtree_cancelled.load(Ordering::SeqCst)
     })
     .await;
+    assert_positive_liveness(&subtree_liveness_gate, &subtree_liveness_seen).await;
     assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
     assert!(subtree_cancelled.load(Ordering::SeqCst));
 

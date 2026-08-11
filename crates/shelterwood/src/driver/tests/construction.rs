@@ -1,5 +1,8 @@
 use super::support::*;
 
+// The key's controlled membership mutation is exactly the regression under
+// test: pointer-based handle identity must keep the set addressable.
+#[allow(clippy::mutable_key_type)]
 #[test]
 fn handle_identity_is_stable_across_membership_rebase() {
     fn hashed(value: &impl std::hash::Hash) -> u64 {
@@ -22,6 +25,8 @@ fn handle_identity_is_stable_across_membership_rebase() {
     let declared = actor.membership();
     let actor_hash = hashed(&actor);
     let task_hash = hashed(&task);
+    let actor_keys = std::collections::HashSet::from([actor.clone()]);
+    let task_keys = std::collections::HashSet::from([task.clone()]);
 
     member.rebase_membership(
         identity
@@ -33,6 +38,14 @@ fn handle_identity_is_stable_across_membership_rebase() {
     assert_eq!(actor, peer);
     assert_eq!(hashed(&actor), actor_hash);
     assert_eq!(hashed(&task), task_hash);
+    assert!(
+        actor_keys.contains(&actor),
+        "membership rebasing cannot strand a keyed actor handle"
+    );
+    assert!(
+        task_keys.contains(&task),
+        "membership rebasing cannot strand a keyed task handle"
+    );
 }
 
 #[crate::runtime::test]

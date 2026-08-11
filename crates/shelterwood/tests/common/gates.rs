@@ -1,20 +1,68 @@
-use std::sync::{Arc, Condvar, Mutex};
+use std::{
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
-use tokio::sync::Notify;
+use tokio::sync::Semaphore;
+
+#[derive(Debug)]
+struct ReleaseState {
+    permits: Semaphore,
+    // Demand and supply, owned by the gate rather than read back from
+    // `Semaphore::available_permits`. The semaphore reports *storage*, not
+    // intent: it hides a release the instant a waiter is enqueued and
+    // re-stores one when a waiter's `acquire` future is cancelled, so a check
+    // against it both misses and invents over-releases depending on when the
+    // waiting task happened to be polled.
+    waits: AtomicUsize,
+    releases: AtomicUsize,
+}
+
+impl Default for ReleaseState {
+    fn default() -> Self {
+        Self {
+            permits: Semaphore::new(0),
+            waits: AtomicUsize::new(0),
+            releases: AtomicUsize::new(0),
+        }
+    }
+}
 
 /// A one-permit asynchronous gate used to sequence child progress.
+///
+/// A release never collapses the way `Notify::notify_one` does — the extra
+/// permit is stored and the next waiter claims it — but running more than one
+/// release ahead of the waits that have begun is still a test bug, so the gate
+/// fails loudly instead of letting the surplus go unnoticed.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ReleaseGate(Arc<Notify>);
+pub(crate) struct ReleaseGate(Arc<ReleaseState>);
 
 impl ReleaseGate {
     /// Waits until the gate is released.
     pub(crate) async fn wait(&self) {
-        self.0.notified().await;
+        self.0.waits.fetch_add(1, Ordering::SeqCst);
+        self.0
+            .permits
+            .acquire()
+            .await
+            .expect("test release gates are never closed")
+            .forget();
     }
 
     /// Releases one current or future waiter.
+    #[track_caller]
     pub(crate) fn release(&self) {
-        self.0.notify_one();
+        let issued = self.0.releases.fetch_add(1, Ordering::SeqCst) + 1;
+        let begun = self.0.waits.load(Ordering::SeqCst);
+        assert!(
+            issued <= begun + 1,
+            "a ReleaseGate cannot run more than one release ahead of its waiters \
+             ({issued} releases against {begun} waits)"
+        );
+        self.0.permits.add_permits(1);
     }
 }
 
@@ -60,26 +108,100 @@ pub(crate) struct DestructorBlocker(Arc<(Mutex<DestructorState>, Condvar)>);
 
 impl Drop for DestructorBlocker {
     fn drop(&mut self) {
+        // A stuck-test backstop, not an assertion: well above any legitimate
+        // wait (POLL_TIMEOUT and every gate driven by it) so a passing test
+        // can never reach it.
+        const MAX_BLOCK: Duration = Duration::from_secs(30);
+
         let (state, changed) = &*self.0;
         let mut state = state.lock().expect("destructor gate mutex poisoned");
         state.entered = true;
         changed.notify_all();
+        let deadline = Instant::now() + MAX_BLOCK;
         while !state.released {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // This destructor also runs while other panics unwind, where
+                // a nested panic aborts with no diagnostic at all. Report and
+                // abort deliberately instead.
+                eprintln!("destructor gate was not released within {MAX_BLOCK:?}");
+                if std::thread::panicking() {
+                    std::process::abort();
+                }
+                panic!("destructor gate was not released within {MAX_BLOCK:?}");
+            }
             state = changed
-                .wait(state)
-                .expect("destructor gate mutex poisoned while blocking");
+                .wait_timeout(state, remaining)
+                .expect("destructor gate mutex poisoned while blocking")
+                .0;
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        future::Future,
+        sync::atomic::Ordering,
+        task::{Context, Waker},
+    };
+
     use super::ReleaseGate;
 
     #[tokio::test]
     async fn release_gate_stores_one_permit() {
         let gate = ReleaseGate::default();
         gate.release();
+        gate.wait().await;
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot run more than one release ahead of its waiters")]
+    fn release_gate_rejects_a_release_no_waiter_asked_for() {
+        let gate = ReleaseGate::default();
+        gate.release();
+        gate.release();
+    }
+
+    #[tokio::test]
+    async fn release_gate_serves_every_wait_that_has_begun() {
+        let gate = ReleaseGate::default();
+        let first = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.wait().await }
+        });
+        let second = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.wait().await }
+        });
+        while gate.0.waits.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        // Back-to-back releases for two already-parked waiters are ordinary
+        // usage: the check counts demand, not whichever permits the semaphore
+        // happens to be storing at this instant.
+        gate.release();
+        gate.release();
+
+        first.await.expect("first waiter joins");
+        second.await.expect("second waiter joins");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_wait_returns_its_release_to_the_gate() {
+        let gate = ReleaseGate::default();
+        let mut waiting = Box::pin(gate.wait());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+
+        gate.release();
+        // Tokio hands the permit to the parked waiter and takes it back when
+        // that future is dropped. The wait still counts as demand, so the
+        // replacement release is not an over-release.
+        drop(waiting);
+        gate.release();
+
         gate.wait().await;
     }
 }

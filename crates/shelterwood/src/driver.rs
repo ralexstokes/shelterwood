@@ -21,8 +21,8 @@ use child::ChildRuntime;
 #[cfg(test)]
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
 use events::{
-    ChildEvent, DeadlineKind, DriverEvent, MIN_EVENT_BATCH_LIMIT, Pending, collect_driver_events,
-    restart_shutdown_work,
+    ChildEvent, DeadlineKind, DriverEvent, EventLanes, MIN_EVENT_BATCH_LIMIT, Pending,
+    collect_event_lanes, restart_shutdown_work,
 };
 use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
@@ -358,8 +358,8 @@ impl ScopeRuntime {
         }
 
         let (definition, resolved) = match request.slot.resolve_and_take_defined(&self.defaults) {
-            Ok(Some(claimed)) => claimed,
-            Ok(None) => {
+            Some(claimed) => claimed,
+            None => {
                 let (_, removed) = self.root.with_observation_gate(|txn| {
                     cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
                 });
@@ -368,18 +368,6 @@ impl ScopeRuntime {
                     None,
                     removed,
                     ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
-                );
-                return;
-            }
-            Err(invalid) => {
-                let (definition, removed) = self.root.with_observation_gate(|txn| {
-                    cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
-                });
-                reject_admission_after_disposal(
-                    request,
-                    definition,
-                    removed,
-                    ReserveError::InvalidPolicy(invalid),
                 );
                 return;
             }
@@ -492,6 +480,11 @@ impl ScopeEpochGuard {
         self.lifecycle.clone()
     }
 
+    fn epoch(&self) -> Epoch {
+        self.epoch
+            .expect("an owned scope epoch remains available until transfer or finish")
+    }
+
     fn finish(mut self, reason: StopReason) {
         let epoch = self
             .epoch
@@ -558,7 +551,7 @@ async fn run_nested_tree_with_epoch(
     scope: Arc<ScopeCell>,
     inherited: ResolvedDefaults,
     latches: NestedScopeLatches,
-    epoch: ScopeEpochGuard,
+    mut epoch: ScopeEpochGuard,
 ) -> crate::ExitResult {
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
@@ -570,14 +563,6 @@ async fn run_nested_tree_with_epoch(
                 LowerError::IdentityExhausted { id, disposal } => {
                     (StartupFailureCause::IdentityExhausted { id }, disposal)
                 }
-                LowerError::InvalidPolicy { invalid, disposal } => {
-                    // `InvalidPolicy::path` is relative to the scope being
-                    // lowered, which here is this nested scope itself. The
-                    // owning child id is already carried by the enclosing
-                    // `StartupFailureCause::Child`, so prepending it here
-                    // would double-count this frame.
-                    (StartupFailureCause::InvalidPolicy(invalid), disposal)
-                }
             };
             // Lowering never created a nested driver to own teardown. Keep
             // its isolated definitions attached to this incarnation until
@@ -585,9 +570,51 @@ async fn run_nested_tree_with_epoch(
             // cancellation-safe disposal jobs.
             disposal.fired().await;
             let failure = StartupFailure { cause };
-            scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
-            epoch.finish(StopReason::StartupFailed(failure.clone()));
-            return Err(crate::ExitError::from_startup_failure(failure));
+            // A lowering failure occurs before the driver loop exists, but it
+            // still belongs to a live incarnation. Resolve every stop source
+            // through the same monotone verdict lattice as the loop path.
+            // Peek rather than consume: `finish_incarnation` clears both
+            // epoch-tagged request latches after publishing the verdict.
+            // The ancestor *abort* latch needs no separate arm: it is the
+            // framework-abort edge, fired only by `StopAction::AbortFramework`,
+            // and the stop ladder unconditionally passes through
+            // `StopAction::Cancel` — which fires this same ancestor shutdown
+            // latch — before it can reach that phase.
+            if scope.has_stop_request(epoch.epoch()) || latches.ancestor.shutdown.is_fired() {
+                // Mirror the loop's `Pending::Shutdown` arm: firing the
+                // ancestor shutdown latch is what makes this scope's exit read
+                // `Cancellation::Observed` at its parent, as a requested stop
+                // must (§11). The latch is level-triggered, so re-firing an
+                // ancestor-driven stop is a no-op.
+                latches.ancestor.shutdown.fire();
+                epoch.lifecycle.begin_drain(StopReason::ShutdownRequested);
+            }
+            // Both drain effects are deliberately discarded: this path
+            // publishes no `Draining` edge because nothing was ever started to
+            // drain, matching the pre-lattice behaviour of the `StartupFailed`
+            // verdict it generalizes.
+            epoch
+                .lifecycle
+                .begin_drain(StopReason::StartupFailed(failure));
+            let reason = epoch
+                .lifecycle
+                .draining_reason()
+                .cloned()
+                .expect("pre-loop verdicts enter the drain lattice");
+            let startup = match &reason {
+                StopReason::ShutdownRequested => Err(StartupError::ShutdownRequested),
+                StopReason::StartupFailed(failure) => {
+                    Err(StartupError::StartupFailed(failure.clone()))
+                }
+                StopReason::Finished
+                | StopReason::IntensityTripped(_)
+                | StopReason::NeverStarted => {
+                    unreachable!("lowering resolves only failure or shutdown verdicts")
+                }
+            };
+            scope.set_startup(startup);
+            epoch.finish(reason.clone());
+            return reason.into_nested_result();
         }
     };
     run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch)
@@ -778,24 +805,15 @@ async fn run_scope_incarnation(
             // cannot publish Running after the stop boundary.
             pending.push(Pending::Force.classified());
         }
-        let primary_batch_full =
-            collect_driver_events(&mut event_receiver, event_batch_limit, &mut pending);
-        let control_batch_full = dynamic_event_receiver.as_mut().is_some_and(|receiver| {
-            collect_driver_events(receiver, event_batch_limit, &mut pending)
-        });
-        // Disposal completions drain after the primary and dynamic lanes, and `arbitrate`
-        // sorts stably, so a `ConstructionDisposed` always trails every
-        // same-class `Exited` collected in the same wake — even one produced
-        // later. A disposal is therefore a batch-tail event: the exit it
-        // trails may begin a drain first, after which
-        // `handle_construction_disposed` sees `is_draining` and routes the
-        // disposed child through stop progression instead of `fail_startup`.
-        // That is a widening of an order that was already reachable, not a new
-        // one: disposal runs on the blocking pool, so its completion never had
-        // a fixed position relative to concurrent exits.
-        while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut disposal_event_receiver) {
-            pending.push(Pending::from(event).classified());
-        }
+        let lane_batch_full = collect_event_lanes(
+            EventLanes {
+                primary: &mut event_receiver,
+                control: dynamic_event_receiver.as_mut(),
+                disposal: &mut disposal_event_receiver,
+            },
+            event_batch_limit,
+            &mut pending,
+        );
         let now = runtime::now();
         while let Some(deadline) = scope.deadlines.pop_due(now) {
             pending.push(Pending::Deadline(deadline).classified());
@@ -938,8 +956,8 @@ async fn run_scope_incarnation(
         // runtime, immediately collecting the next batch would prevent the
         // child, timer, and helper tasks whose events this loop prioritizes
         // from running at all. Give those producers one scheduler turn before
-        // returning to either saturated lane.
-        if primary_batch_full || control_batch_full {
+        // returning to any saturated lane.
+        if lane_batch_full {
             runtime::yield_now().await;
         }
     }

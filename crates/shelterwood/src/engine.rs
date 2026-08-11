@@ -62,6 +62,10 @@ pub(crate) enum ArbitrationClass {
 }
 
 pub(crate) fn arbitrate<T>(events: &mut [(ArbitrationClass, T)]) {
+    // Priority is deterministic across classes, and input order is FIFO
+    // within one class. Callers build the slice in observation order, so a
+    // stable sort is part of the driver contract rather than an incidental
+    // implementation choice.
     events.sort_by_key(|(class, _)| *class);
 }
 
@@ -278,11 +282,11 @@ pub(crate) struct IntensityCharge {
 
 impl IntensityTrip {
     pub(crate) fn new(policy: Intensity, charge: IntensityCharge) -> Self {
-        debug_assert_eq!(charge.tripped, charge.in_window > policy.max_restarts);
+        debug_assert_eq!(charge.tripped, charge.in_window > policy.max_restarts());
         Self {
-            max_restarts: policy.max_restarts,
+            max_restarts: policy.max_restarts(),
             observed_restarts: charge.in_window,
-            within: policy.within,
+            within: policy.within(),
         }
     }
 }
@@ -291,7 +295,7 @@ impl IntensityState {
     pub(crate) fn charge(&mut self, policy: Intensity, now: Instant) -> IntensityCharge {
         while self.charges.front().is_some_and(|charge| {
             now.checked_duration_since(*charge)
-                .is_some_and(|age| age > policy.within)
+                .is_some_and(|age| age > policy.within())
         }) {
             self.charges.pop_front();
         }
@@ -301,7 +305,7 @@ impl IntensityState {
         IntensityCharge {
             in_window,
             total_restarts: self.total_restarts,
-            tripped: in_window > policy.max_restarts,
+            tripped: in_window > policy.max_restarts(),
         }
     }
 }
@@ -1010,17 +1014,51 @@ mod tests {
             ReadinessSignal, ScopeShutdown, StopDeadline,
         };
         let mut events = [
-            (StopDeadline, 6),
+            (StopDeadline, 8),
             (ChildExit, 2),
-            (ReadinessDeadline, 4),
+            (ReadinessDeadline, 6),
+            (ChildExit, 3),
             (ScopeShutdown, 0),
-            (Admission, 7),
-            (BackoffDue, 5),
+            (Admission, 9),
+            (BackoffDue, 7),
             (MembershipRemoval, 1),
-            (ReadinessSignal, 3),
+            (ReadinessSignal, 4),
+            (ReadinessSignal, 5),
         ];
         arbitrate(&mut events);
-        assert_eq!(events.map(|(_, value)| value), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            events.map(|(_, value)| value),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            "same-class events retain their observation order"
+        );
+
+        // Keep this well above any small-sort threshold: the compact fixture
+        // above documents every class, but an unstable insertion sort can
+        // preserve a couple of duplicate pairs by accident. Every class is
+        // duplicated many times here so the fixture's discriminating power
+        // against a `sort_unstable_by_key` mutant does not rest on one
+        // toolchain's threshold or pivot choice.
+        const CLASSES: [ArbitrationClass; 8] = [
+            ScopeShutdown,
+            MembershipRemoval,
+            ChildExit,
+            ReadinessSignal,
+            ReadinessDeadline,
+            BackoffDue,
+            StopDeadline,
+            Admission,
+        ];
+        const PRESSURE: usize = 256;
+        let mut same_class_pressure: [(ArbitrationClass, usize); PRESSURE] =
+            std::array::from_fn(|index| (CLASSES[index % CLASSES.len()], index));
+        arbitrate(&mut same_class_pressure);
+        assert_eq!(
+            same_class_pressure.map(|(_, value)| value).as_slice(),
+            (0..CLASSES.len())
+                .flat_map(|rank| (rank..PRESSURE).step_by(CLASSES.len()))
+                .collect::<Vec<_>>(),
+            "larger same-class batches retain FIFO rather than unstable-sort order"
+        );
     }
 
     #[test]
@@ -1115,9 +1153,16 @@ mod tests {
             "forcing after expiry cannot move the deadline later"
         );
         assert_eq!(
-            ladder.advance(due),
+            ladder.advance(due + Duration::from_secs(1)),
             Some(StopAction::Escalate),
-            "the original due instant remains actionable"
+            "the already-due ladder remains actionable at the force instant"
+        );
+        assert_eq!(
+            ladder.advance(ladder.deadline().expect("tidy deadline")),
+            Some(StopAction::HardAbort {
+                phase: GracePhase::AfterGrace
+            }),
+            "force arriving after grace expiry preserves after-grace provenance"
         );
     }
 
@@ -1164,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn overflowing_grace_never_becomes_immediately_due() {
+    fn overflowing_grace_stays_pending_until_force_rescues_the_ladder() {
         let start = Instant::now();
         let mut ladder = StopLadder::new(Shutdown::Graceful {
             grace: Duration::MAX,
@@ -1173,6 +1218,17 @@ mod tests {
         assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
         assert_eq!(ladder.deadline(), None);
         assert_eq!(ladder.advance(start), None);
+
+        let forced_at = start + Duration::from_secs(1);
+        ladder.force(forced_at);
+        assert_eq!(ladder.deadline(), Some(forced_at));
+        assert_eq!(ladder.advance(forced_at), Some(StopAction::Escalate));
+        assert_eq!(
+            ladder.advance(ladder.deadline().expect("forced tidy deadline")),
+            Some(StopAction::HardAbort {
+                phase: GracePhase::WithinGrace
+            })
+        );
     }
 
     #[test]
@@ -1200,6 +1256,17 @@ mod tests {
             ),
             ExitDispatch::Terminal
         );
+        let success = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+        assert_eq!(
+            dispatch_exit(
+                &success,
+                restart,
+                ScopeMode::Running,
+                MembershipStatus::Active
+            ),
+            ExitDispatch::Terminal,
+            "a running scope still honors a restart policy that declines this exit"
+        );
         assert_eq!(
             dispatch_exit(
                 &failure,
@@ -1222,9 +1289,9 @@ mod tests {
         assert_eq!(trip.in_window, 2);
         assert_eq!(trip.total_restarts, TotalRestarts::ZERO.bump().bump());
         let trip_payload = crate::IntensityTrip::new(policy, trip);
-        assert_eq!(trip_payload.max_restarts, policy.max_restarts);
+        assert_eq!(trip_payload.max_restarts, policy.max_restarts());
         assert_eq!(trip_payload.observed_restarts, trip.in_window);
-        assert_eq!(trip_payload.within, policy.within);
+        assert_eq!(trip_payload.within, policy.within());
 
         let aged = state.charge(policy, start + Duration::from_secs(21));
         assert!(!aged.tripped);
@@ -1233,6 +1300,34 @@ mod tests {
             aged.total_restarts,
             TotalRestarts::ZERO.bump().bump().bump()
         );
+    }
+
+    /// Pins the observable behaviour of a charge dated before one already in
+    /// the window; it cannot discriminate `charge`'s `checked_duration_since`
+    /// from the saturating `duration_since`. That guard is defence in depth:
+    /// the saturating form yields `Duration::ZERO` for a regressed clock, and
+    /// `Intensity::validate` rejects a zero `within`, so `ZERO > within` is
+    /// already false for every constructible policy. Replacing the checked
+    /// call with the saturating one leaves this assertion — and the rest of
+    /// the suite — green.
+    #[test]
+    fn intensity_clock_regression_retains_future_charges() {
+        let start = Instant::now();
+        let policy = Intensity::new(5, Duration::from_secs(10)).expect("valid intensity");
+        let mut state = IntensityState::default();
+
+        assert_eq!(
+            state
+                .charge(policy, start + Duration::from_secs(5))
+                .in_window,
+            1
+        );
+        let regressed = state.charge(policy, start);
+        assert_eq!(
+            regressed.in_window, 2,
+            "a charge from the apparent future stays in the window"
+        );
+        assert_eq!(regressed.total_restarts, TotalRestarts::ZERO.bump().bump());
     }
 
     #[test]
@@ -1326,6 +1421,7 @@ mod tests {
     fn readiness_configuration_and_signal_deadline_race_are_engine_owned() {
         let deadline = Instant::now();
         let mut ready = ReadinessGate::new();
+        assert!(ready.needs_signal_watch());
         assert_eq!(
             ready.step(ReadinessEvent::Configure {
                 readiness: crate::Readiness::Manual,
@@ -1333,6 +1429,7 @@ mod tests {
             }),
             Some(ReadinessEffect::ArmDeadline { deadline })
         );
+        assert!(ready.needs_signal_watch());
         assert_eq!(
             ready.step(ReadinessEvent::Deadline {
                 now: deadline,
@@ -1340,6 +1437,7 @@ mod tests {
             }),
             Some(ReadinessEffect::BecameReady)
         );
+        assert!(!ready.needs_signal_watch());
         assert_eq!(
             ready.step(ReadinessEvent::Deadline {
                 now: deadline,
@@ -1376,6 +1474,17 @@ mod tests {
             }),
             Some(ReadinessEffect::TimedOut { deadline })
         );
+        assert!(!timed_out.needs_signal_watch());
+
+        let mut immediate = ReadinessGate::new();
+        assert_eq!(
+            immediate.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::Immediate,
+                deadline: None,
+            }),
+            Some(ReadinessEffect::BecameReady)
+        );
+        assert!(!immediate.needs_signal_watch());
 
         let mut shutdown = ReadinessGate::new();
         assert_eq!(
@@ -1389,6 +1498,7 @@ mod tests {
             shutdown.step(ReadinessEvent::Shutdown),
             Some(ReadinessEffect::Disarmed)
         );
+        assert!(!shutdown.needs_signal_watch());
     }
 
     #[test]
@@ -1544,6 +1654,10 @@ mod tests {
         );
         assert_eq!(epochs.begin(), None, "a live epoch cannot be replaced");
         let unminted = first.successor().expect("a successor epoch is available");
+        assert!(!epochs.request_is_pending(first));
+        assert!(!epochs.request_is_pending(unminted));
+        assert!(!epochs.finished(first));
+        assert!(!epochs.finished(unminted));
         assert!(!epochs.finish(unminted));
         assert_eq!(epochs.live_epoch(), Some(first));
         assert!(epochs.finish(first));
@@ -1567,6 +1681,10 @@ mod tests {
         assert_eq!(exhausted.live_epoch(), None);
         assert_eq!(exhausted.request_target(), None);
         assert_eq!(exhausted.begin(), None, "poisoning is permanent");
+        assert!(!exhausted.request_is_pending(last));
+        assert!(!exhausted.request_is_pending(Epoch(u64::MAX)));
+        assert!(exhausted.finished(last));
+        assert!(!exhausted.finished(Epoch(u64::MAX)));
         assert!(!exhausted.finish(Epoch(u64::MAX)));
     }
 

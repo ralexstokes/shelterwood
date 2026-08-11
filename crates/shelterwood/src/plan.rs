@@ -12,8 +12,8 @@ use crate::{
     definition::DefinitionSource,
     identity::ScopeIdentity,
     policy::{
-        ChildMode, CommonOptions, InvalidPolicy, PolicyField, ResolvedCommonOptions,
-        ResolvedDefaults, ScopeFlavor, resolve_common,
+        ChildMode, CommonOptions, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor,
+        resolve_common,
     },
     raw::RawConstruction,
     runtime::{self, Isolated, Latch},
@@ -51,6 +51,19 @@ pub(crate) fn mint_reserved_slot(
         ScopeCell::new(Arc::clone(&member), flavor, identity)
     });
     Ok(SlotCell::new(member, scope))
+}
+
+/// Installs a valid option set for a manually constructed resident fixture,
+/// preserving production lowering's resolve-before-residency ordering.
+#[cfg(test)]
+pub(crate) fn resolve_fixture_options(member: &MemberCell) {
+    let options = resolve_common(
+        &CommonOptions::default(),
+        &ResolvedDefaults::default(),
+        ChildMode::Restartable,
+        Readiness::Immediate,
+    );
+    member.set_options(options);
 }
 
 enum DefinitionState {
@@ -177,12 +190,12 @@ impl SlotCell {
     pub(crate) fn resolve_policy(
         &self,
         defaults: &ResolvedDefaults,
-    ) -> Result<Option<ResolvedCommonOptions>, InvalidPolicy> {
+    ) -> Option<ResolvedCommonOptions> {
         let state = self.definition.lock().expect("definition mutex poisoned");
         let DefinitionState::Defined(definition) = &*state else {
-            return Ok(None);
+            return None;
         };
-        self.resolve_defined_policy(definition, defaults).map(Some)
+        Some(self.resolve_defined_policy(definition, defaults))
     }
 
     /// Resolves policy and claims the matching construction under one
@@ -192,7 +205,7 @@ impl SlotCell {
     pub(crate) fn resolve_and_take_defined(
         &self,
         defaults: &ResolvedDefaults,
-    ) -> Result<Option<(Isolated<ChildConstruction>, ResolvedCommonOptions)>, InvalidPolicy> {
+    ) -> Option<(Isolated<ChildConstruction>, ResolvedCommonOptions)> {
         self.resolve_and_take_defined_with(defaults, || {})
     }
 
@@ -200,26 +213,26 @@ impl SlotCell {
         &self,
         defaults: &ResolvedDefaults,
         before_claim: impl FnOnce(),
-    ) -> Result<Option<(Isolated<ChildConstruction>, ResolvedCommonOptions)>, InvalidPolicy> {
+    ) -> Option<(Isolated<ChildConstruction>, ResolvedCommonOptions)> {
         let mut state = self.definition.lock().expect("definition mutex poisoned");
         let DefinitionState::Defined(definition) = &*state else {
-            return Ok(None);
+            return None;
         };
-        let resolved = self.resolve_defined_policy(definition, defaults)?;
+        let resolved = self.resolve_defined_policy(definition, defaults);
         before_claim();
         let DefinitionState::Defined(definition) =
             std::mem::replace(&mut *state, DefinitionState::Lowered)
         else {
             unreachable!("the definition lock keeps resolution and claim atomic")
         };
-        Ok(Some((definition, resolved)))
+        Some((definition, resolved))
     }
 
     fn resolve_defined_policy(
         &self,
         definition: &Isolated<ChildConstruction>,
         defaults: &ResolvedDefaults,
-    ) -> Result<ResolvedCommonOptions, InvalidPolicy> {
+    ) -> ResolvedCommonOptions {
         let (options, mode, default_readiness) = match definition.get() {
             // A raw definition resolved its effective mode at erasure, where
             // the actor type's `RawActor::readiness` metadata was still
@@ -238,19 +251,10 @@ impl SlotCell {
                 Readiness::Immediate,
             ),
             ChildConstruction::Scope(definition) => {
-                if let DefinitionSource::OneShot(tree) = &definition.source {
-                    let inherited = match definition.defaults {
-                        DefaultsInheritance::Inherit => defaults.clone(),
-                        DefaultsInheritance::Reset => ResolvedDefaults::default(),
-                    };
-                    tree.validate_policies(&inherited)
-                        .map_err(|invalid| invalid.prepend(self.member.id()))?;
-                }
                 (&definition.options, definition.mode(), Readiness::Manual)
             }
         };
         resolve_common(options, defaults, mode, default_readiness)
-            .map_err(|invalid| invalid.prepend(self.member.id()))
     }
 }
 
@@ -332,13 +336,7 @@ impl BuilderCore {
                 disposal,
             });
         }
-        let (defaults, resolved) = match self.validate_policies(&inherited) {
-            Ok(resolved) => resolved,
-            Err(invalid) => {
-                let disposal = self.begin_failed_disposal();
-                return Err(LowerError::InvalidPolicy { invalid, disposal });
-            }
-        };
+        let (defaults, resolved) = self.resolve_policies(&inherited);
         if !Arc::ptr_eq(&root, &self.root) {
             // From the first adoption on, a failed or unwound lowering must
             // evict the terminalized slots from the override's identity map,
@@ -370,7 +368,7 @@ impl BuilderCore {
             "policy resolution is one entry per slot, in slot order"
         );
         for (slot, resolved) in self.slots.iter().zip(resolved) {
-            let resolved = resolved.expect("validated slot must have resolved options");
+            let resolved = resolved.expect("defined slot must have resolved options");
             let definition = slot
                 .take_definition()
                 .expect("a tree must be lowered at most once")
@@ -391,23 +389,19 @@ impl BuilderCore {
         })
     }
 
-    fn validate_policies(
+    fn resolve_policies(
         &self,
         inherited: &ResolvedDefaults,
-    ) -> Result<(ResolvedDefaults, Vec<Option<ResolvedCommonOptions>>), InvalidPolicy> {
-        self.config
-            .intensity
-            .validate()
-            .map_err(|error| InvalidPolicy::new(PolicyField::Intensity, error))?;
-        let defaults = inherited.overlay(&self.config.defaults)?;
+    ) -> (ResolvedDefaults, Vec<Option<ResolvedCommonOptions>>) {
+        let defaults = inherited.overlay(&self.config.defaults);
         // One entry per slot, in slot order. An undefined slot resolves to
         // `None` rather than being skipped, so this vector can never shift a
         // later child onto another child's options.
         let mut resolved = Vec::with_capacity(self.slots.len());
         for slot in &self.slots {
-            resolved.push(slot.resolve_policy(&defaults)?);
+            resolved.push(slot.resolve_policy(&defaults));
         }
-        Ok((defaults, resolved))
+        (defaults, resolved)
     }
 
     fn terminalize(&self) {
@@ -511,10 +505,6 @@ pub(crate) enum LowerError {
     },
     IdentityExhausted {
         id: ChildId,
-        disposal: Latch,
-    },
-    InvalidPolicy {
-        invalid: InvalidPolicy,
         disposal: Latch,
     },
 }
@@ -627,7 +617,6 @@ mod tests {
         dynamic_slot.define(ChildConstruction::Task(configured_task()));
         let dynamic_options = dynamic_slot
             .resolve_policy(&defaults)
-            .expect("dynamic policy is valid")
             .expect("dynamic slot is defined");
         let dynamic_definition = dynamic_slot
             .take_definition()
@@ -645,7 +634,6 @@ mod tests {
         let slot = SlotCell::new(Arc::clone(&declaration.root.member), None);
         slot.define(construction);
         slot.resolve_policy(&ResolvedDefaults::default())
-            .expect("policy is valid")
             .expect("slot is defined")
             .readiness
     }
@@ -760,7 +748,6 @@ mod tests {
                 race.wait();
                 std::thread::yield_now();
             })
-            .expect("dynamic policy is valid")
             .expect("admission claims the defined construction");
         assert!(
             competing_claim
@@ -861,7 +848,6 @@ mod tests {
         let defaults = ResolvedDefaults::default();
         let options = slot
             .resolve_policy(&defaults)
-            .expect("one-shot policy is valid")
             .expect("one-shot slot is defined");
         let construction = slot
             .take_definition()

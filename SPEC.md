@@ -144,10 +144,20 @@ any single design rule:
   invariant makes bit-equality correct: §9.2's backoff factor),
   serializable where Part II §21 needs it, and carrying **no
   behavior** beyond small pure derivation functions of the
-  `should_restart(exit)` / `next_delay(restart_attempt, JitterSample)` /
-  `validate()` shape. Runtime behavior is *derived from* the data by local
+  `should_restart(exit)` / `next_delay(restart_attempt, JitterSample)`
+  shape. Runtime behavior is *derived from* the data by local
   functions; it is never encoded as trait objects, callbacks, or builder
-  side effects.
+  side effects. Plain data is not *open* data: every payload carrying an
+  invariant (§9.3's eager validation — non-zero durations, the backoff
+  factor, the intensity window, mailbox capacity) is a **sealed** struct or
+  newtype whose only mint is its validating constructor, with read access
+  through accessors. Making the invalid unrepresentable is what retires
+  validation as a re-runnable step: there is no second boundary that could
+  re-reject a value, so no `validate()` survives on the public surface and
+  no error variant exists downstream to report one (B.8). Partiality that is
+  legitimate *declared* state — an unset scope default, a deferred mailbox
+  capacity, an inherited deadline — stays openly representable; only the
+  values inside it are sealed.
 - **Pure core, mutable shell.** The engine's decision layer is a
   synchronous state machine: `step(state, event) -> effects`, where
   `event` carries everything external as data (a child exit, a command, a
@@ -2020,10 +2030,16 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   therefore cannot lose its verdict to a lower-precedence cause that
   latched one wake earlier: a restartable exit that trips intensity in
   the same batch as a shutdown request still yields `ShutdownRequested`
-  as the scope's terminal reason. Ladder deadlines share the posture: a
-  forced escalation only ever moves a deadline *earlier* (`min`), never
-  later. (`NeverStarted` sits outside the order — it is the terminal
-  reason of a membership that never had an incarnation to drain.)
+  as the scope's terminal reason. A nested lowering failure before the
+  driver loop follows the same rule: a stop request already latched for
+  its epoch, or a fired ancestor-shutdown latch, upgrades the terminal
+  reason and pending startup result to `ShutdownRequested` — and, like the
+  loop path, records the stop as observed, so the scope still exits at its
+  parent as a cancelled `Completed` (§11). Ladder deadlines
+  share the posture: a forced escalation only ever moves a deadline
+  *earlier* (`min`), never later. (`NeverStarted` sits outside the order — it
+  is the terminal reason of a membership that never had an incarnation to
+  drain.)
 - Mailbox shutdown policy — `Drain` (the default) or `Discard` — is part
   of the actor options. It is a two-variant choice about exactly one
   thing: the fate of the frozen accepted prefix (§5.2). The intake
@@ -3038,7 +3054,7 @@ marked *(II)* ship with the named Part II feature.
 | Child shutdown policy | **`Graceful { grace: 5 s }`** | `Abort` opt-in |
 | Tidy-abort beat | **`grace / 10`, clamped to [1 ms, 10 ms]** | §10 |
 | Restart condition | **`OnFailure`** | Failure = any non-`Completed` exit (§7) |
-| Backoff | **none** (immediate restart) | Exponential: `base × factor^(n−1)` clamped to `max`; `factor` a validated-finite newtype `≥ 1.0` with bit-`Eq` (§9.2); nanosecond rounding per §9.2; equal jitter uniform in `[d/2, d]`; all durations non-zero, validated at construction; attempt origin/reset per §9.2 |
+| Backoff | **none** (immediate restart) | Exponential: `base × factor^(n−1)` clamped to `max`; `factor` a validated-finite newtype `≥ 1.0` with bit-`Eq` (§9.2); nanosecond rounding per §9.2; equal jitter uniform in `[d/2, d]`; all durations non-zero, validated at construction, with the fixed and exponential payloads sealed behind their constructors (§1); attempt origin/reset per §9.2 |
 | Scope intensity | **5 restarts within 30 s** | Trips on the restart *exceeding* the budget; every respawn charges it (§9.2) |
 | Readiness (blanket `Actor`) | **`AfterInit`** | Raw actors and tasks default `Immediate`; subtree readiness is structural (§6) |
 | Readiness deadline (gated modes) | **30 s** | Resolution: declaration → scope default → this; unbounded only via explicit opt-in (§6) |

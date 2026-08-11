@@ -49,7 +49,11 @@ impl ScopeRuntime {
             self.finalize_removal(key);
         } else {
             self.begin_stop_child(key, None);
-            if self.children[key].is_terminal() {
+            if self
+                .children
+                .get(key)
+                .is_some_and(ChildRuntime::is_terminal)
+            {
                 self.finalize_removal(key);
             }
         }

@@ -62,7 +62,7 @@ fn resource_raw_actor(count: &ConsumeCount, mode: RawResourceMode) -> ResourceRa
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_raw_resource_drops_once_on_normal_exit() {
     let count = ConsumeCount::default();
     let mut tree = Tree::new();
@@ -92,7 +92,7 @@ fn one_shot_raw_resource_drops_once_on_readiness_definition_panic() {
     count.assert_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn dynamic_one_shot_raw_resource_drops_once_on_readiness_definition_panic() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("dynamic root starts");
@@ -121,7 +121,7 @@ async fn dynamic_one_shot_raw_resource_drops_once_on_readiness_definition_panic(
         .expect("dynamic root stops");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_raw_resource_drops_once_on_startup_failure() {
     let count = ConsumeCount::default();
     let mut tree = Tree::new();
@@ -141,7 +141,7 @@ async fn one_shot_raw_resource_drops_once_on_startup_failure() {
     count.assert_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_raw_resource_drops_once_on_shutdown_before_start() {
     let count = ConsumeCount::default();
     let mut tree = Tree::new();
@@ -212,7 +212,7 @@ impl Actor for ResourceActor {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_actor_args_drop_once_on_normal_exit() {
     let count = ConsumeCount::default();
     let mut tree = Tree::new();
@@ -255,13 +255,13 @@ async fn assert_actor_init_path_drops_once(mode: ActorResourceMode) {
     count.assert_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_actor_args_drop_once_on_init_panic_and_startup_failure() {
     assert_actor_init_path_drops_once(ActorResourceMode::InitPanic).await;
     assert_actor_init_path_drops_once(ActorResourceMode::StartupFailure).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_actor_args_drop_once_when_shutdown_prevents_start() {
     let count = ConsumeCount::default();
     let gate_started = ReleaseGate::default();
@@ -300,7 +300,7 @@ async fn one_shot_actor_args_drop_once_when_shutdown_prevents_start() {
     count.assert_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_task_resource_drops_once_on_normal_exit() {
     let count = ConsumeCount::default();
     let guard = count.guard();
@@ -320,7 +320,7 @@ async fn one_shot_task_resource_drops_once_on_normal_exit() {
     count.assert_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_task_resource_drops_once_on_panic() {
     let count = ConsumeCount::default();
     let guard = count.guard();
@@ -342,7 +342,7 @@ async fn one_shot_task_resource_drops_once_on_panic() {
     count.assert_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_task_resource_drops_once_on_startup_failure() {
     let count = ConsumeCount::default();
     let guard = count.guard();
@@ -367,7 +367,7 @@ async fn one_shot_task_resource_drops_once_on_startup_failure() {
     count.assert_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_task_resource_drops_once_on_shutdown_before_start() {
     let count = ConsumeCount::default();
     let guard = count.guard();
@@ -476,7 +476,7 @@ fn cancelled_one_shot_subtree(count: &ConsumeCount, started: Arc<AtomicBool>) ->
     tree
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn cancelling_inflight_one_shot_adds_drops_every_kind_resource_once() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("dynamic root starts");
@@ -570,7 +570,7 @@ async fn cancelling_inflight_one_shot_adds_drops_every_kind_resource_once() {
     assert!(!subtree_started.load(Ordering::SeqCst));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_subtree_resource_drops_once_on_normal_exit() {
     let count = ConsumeCount::default();
     let nested = one_shot_subtree_with_guard(&count, "normal");
@@ -582,7 +582,7 @@ async fn one_shot_subtree_resource_drops_once_on_normal_exit() {
     count.assert_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_subtree_resource_drops_once_on_panic() {
     let count = ConsumeCount::default();
     let nested = one_shot_subtree_with_guard(&count, "panic");
@@ -598,7 +598,7 @@ async fn one_shot_subtree_resource_drops_once_on_panic() {
     count.assert_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_subtree_resource_drops_once_on_lowering_failure() {
     let count = ConsumeCount::default();
     let guard = count.guard();
@@ -625,7 +625,7 @@ async fn one_shot_subtree_resource_drops_once_on_lowering_failure() {
     count.assert_once();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn one_shot_subtree_resource_drops_once_on_shutdown_before_start() {
     let count = ConsumeCount::default();
     let nested = one_shot_subtree_with_guard(&count, "normal");

@@ -548,15 +548,13 @@ impl LifecycleEvents {
             // reports lag when `len` exceeds the effective capacity; 128 is
             // already a power of two, so the effective capacity is exact.
             if self.events.len() > LIFECYCLE_EVENT_CAPACITY {
-                match self.events.try_receive() {
-                    runtime::BroadcastReceive::Lagged(overflow) => {
-                        dropped = dropped.saturating_add(overflow);
-                    }
-                    runtime::BroadcastReceive::Item(_)
-                    | runtime::BroadcastReceive::Empty
-                    | runtime::BroadcastReceive::Closed => {
-                        unreachable!("a lagging broadcast receiver reports its dropped prefix")
-                    }
+                let overflow = self.events.try_receive();
+                debug_assert!(
+                    matches!(&overflow, runtime::BroadcastReceive::Lagged(_)),
+                    "a lagging broadcast receiver should report its dropped prefix"
+                );
+                if let runtime::BroadcastReceive::Lagged(overflow) = overflow {
+                    dropped = dropped.saturating_add(overflow);
                 }
             }
             return Ok(LifecycleItem::Lagged { dropped });

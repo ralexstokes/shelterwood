@@ -1,6 +1,26 @@
 use super::support::*;
 
 #[test]
+fn empty_control_peeks_skip_the_tree_observation_gate() {
+    let root = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("the scope has a live epoch");
+    let captures = root.probe_gate_captures();
+
+    assert!(!root.take_shutdown_request(epoch));
+    assert!(!root.take_force_request(epoch));
+    assert!(root.take_control_events().is_empty());
+    assert!(
+        matches!(
+            captures.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "an idle driver wake only peeks under the control mutex"
+    );
+}
+
+#[test]
 fn pre_admission_restart_shutdown_is_published_when_the_scope_gets_a_parent() {
     let mut tree = Tree::new();
     tree.add_subtree("nested", SubtreeDef::factory(Tree::new))
@@ -133,6 +153,62 @@ async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnat
     );
     assert!(scope.children[key].restart_deadline.is_some());
     assert!(scope.children[key].restart_shutdown_pending.is_none());
+}
+
+#[crate::runtime::test]
+async fn expedited_restart_progresses_synchronous_readiness() {
+    let mut tree = Tree::new();
+    tree.add_subtree("nested", SubtreeDef::factory(pending_tree))
+        .expect("valid subtree");
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let nested_cell = Arc::clone(
+        plan.children[0]
+            .slot
+            .scope
+            .as_ref()
+            .expect("nested scope cell"),
+    );
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let mut child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    // Scope definitions currently resolve to Manual and expose no public
+    // readiness setter. Model that API invariant changing: the expedited
+    // restart must still release ordered startup when configuration produces
+    // an immediate readiness effect.
+    child.options.readiness = Readiness::Immediate;
+    child.spawned_once = true;
+    let mut children = ChildArena::default();
+    let key = children
+        .insert(child)
+        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_children(children)
+        .with_next_ordered_start(Some(key))
+        .build();
+    plan.finish_transfer();
+    let target = nested_cell
+        .request_shutdown()
+        .expect("the shutdown targets the pending nested incarnation");
+
+    scope.expedite_restart_shutdown(key, target);
+
+    assert!(scope.children[key].initial_ready);
+    assert!(
+        scope.lifecycle.startup_complete(),
+        "synchronous readiness from an expedited spawn advances aggregate startup"
+    );
+    assert_eq!(root.record().startup, Some(Ok(())));
 }
 
 /// A shutdown request against a nested scope's *first* (still pending)

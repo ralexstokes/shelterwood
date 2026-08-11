@@ -91,6 +91,58 @@ impl From<DriverEvent> for Pending {
     }
 }
 
+/// The three unbounded lanes one driver wake collects from, in collection
+/// order.
+pub(super) struct EventLanes<'a> {
+    pub(super) primary: &'a mut runtime::UnboundedMpscReceiver<DriverEvent>,
+    pub(super) control: Option<&'a mut runtime::UnboundedMpscReceiver<DriverEvent>>,
+    pub(super) disposal: &'a mut runtime::UnboundedMpscReceiver<DriverEvent>,
+}
+
+/// Collects one bounded batch from every unbounded lane and reports whether
+/// *any* of them still had a queued suffix, which is the driver's signal to
+/// yield a scheduler turn before collecting again.
+///
+/// Lane order is a contract, not an implementation detail. Child lifecycle
+/// events lead so a large externally generated admission prefix cannot strand
+/// the exit that completes shutdown. Disposal completions trail, and
+/// `arbitrate` sorts stably, so a `ConstructionDisposed` always follows every
+/// same-class `Exited` collected in the same wake — even one produced later.
+/// A disposal is therefore a batch-tail event: the exit it trails may begin a
+/// drain first, after which `handle_construction_disposed` sees `is_draining`
+/// and routes the disposed child through stop progression instead of
+/// `fail_startup`. That is a widening of an order that was already reachable,
+/// not a new one: disposal runs on the blocking pool, so its completion never
+/// had a fixed position relative to concurrent exits.
+///
+/// Every lane — disposal included — is capped. An uncapped lane can monopolize
+/// a wake before the loop returns to the top and observes a shutdown request
+/// (whose timeout does not start until `Draining` is published). The cap adds
+/// one ordering surface: a deferred suffix is processed one wake later, so it
+/// sorts against that wake's batch rather than this one's. For the disposal
+/// lane that widens the same axis once more — the next wake's shutdown/force
+/// checks run before its collection, and `ScopeShutdown` sorts ahead of
+/// `ChildExit`, so a deferred disposal can observe a drain that a same-wake
+/// exit had not yet begun. Same rationale: a blocking-pool completion never
+/// had a fixed position relative to a request that can arrive on any wake.
+///
+/// The disposal cap only bites for a dynamic scope whose initial plan is small
+/// relative to its admitted population. At most one construction disposal is in
+/// flight per child (`pending_terminal` admits one), so an ordered scope's
+/// disposal lane can never reach the `plan.children.len() * 3` limit.
+pub(super) fn collect_event_lanes(
+    lanes: EventLanes<'_>,
+    limit: usize,
+    pending: &mut Vec<(ArbitrationClass, Pending)>,
+) -> bool {
+    let primary_batch_full = collect_driver_events(lanes.primary, limit, pending);
+    let control_batch_full = lanes
+        .control
+        .is_some_and(|receiver| collect_driver_events(receiver, limit, pending));
+    let disposal_batch_full = collect_driver_events(lanes.disposal, limit, pending);
+    primary_batch_full || control_batch_full || disposal_batch_full
+}
+
 pub(super) fn collect_driver_events(
     receiver: &mut runtime::UnboundedMpscReceiver<DriverEvent>,
     limit: usize,
@@ -221,6 +273,10 @@ impl ScopeRuntime {
         }
         child.restart_shutdown_pending = None;
         self.spawn_child(key);
+        // This path runs outside the ordered-startup loop. Revisit the
+        // aggregate in case the spawn became ready synchronously, just like a
+        // restart-deadline spawn below.
+        self.progress_startup();
     }
 
     pub(super) fn handle_deadline(&mut self, deadline: DeadlineKind) {

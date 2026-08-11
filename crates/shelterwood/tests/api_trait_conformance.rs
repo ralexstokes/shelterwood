@@ -26,6 +26,37 @@ where
 }
 fn assert_static<T: 'static>() {}
 
+macro_rules! assert_not_impl {
+    ($type:ty: $trait:path) => {
+        const _: fn() = || {
+            struct Check<T: ?Sized>(std::marker::PhantomData<T>);
+            trait AmbiguousIfImpl<A> {
+                fn check() {}
+            }
+            impl<T: ?Sized> AmbiguousIfImpl<()> for Check<T> {}
+            impl<T: ?Sized + $trait> AmbiguousIfImpl<u8> for Check<T> {}
+            let _ = <Check<$type> as AmbiguousIfImpl<_>>::check;
+        };
+    };
+}
+
+assert_not_impl!(System<ScopeRef>: Clone);
+assert_not_impl!(System<DynamicScopeRef>: Clone);
+assert_not_impl!(ActorSlot<Cell<()>>: Clone);
+assert_not_impl!(DynamicActorSlot<Cell<()>>: Clone);
+assert_not_impl!(TaskSlot: Clone);
+assert_not_impl!(DynamicTaskSlot: Clone);
+assert_not_impl!(SubtreeSlot<Tree>: Clone);
+assert_not_impl!(SubtreeSlot<DynamicTree>: Clone);
+assert_not_impl!(DynamicSubtreeSlot<Tree>: Clone);
+assert_not_impl!(DynamicSubtreeSlot<DynamicTree>: Clone);
+assert_not_impl!(Reply<Cell<()>>: Clone);
+assert_not_impl!(ReplyReceiver<Cell<()>>: Clone);
+assert_not_impl!(Guard: Clone);
+assert_not_impl!(OneShotTaskRef<Cell<()>>: Clone);
+assert_not_impl!(Membership: Ord);
+assert_not_impl!(Incarnation: Ord);
+
 #[test]
 fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     assert_copy_eq_hash_send_sync::<Membership>();

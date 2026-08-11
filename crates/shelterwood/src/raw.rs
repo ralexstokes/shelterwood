@@ -308,6 +308,12 @@ impl<T> Contained<T> {
         }
     }
 
+    fn get(&self) -> &T {
+        self.value
+            .as_ref()
+            .expect("contained ownership is consumed once")
+    }
+
     fn into_inner(mut self) -> T {
         self.value
             .take()
@@ -535,13 +541,18 @@ impl<M> TimerStore<M> {
     ) where
         K: Hash + Eq + Send + 'static,
     {
-        self.remove(&key);
-        let hash = self.hash_key(&key);
+        // Hash and equality are user code. Keep incoming ownership behind the
+        // disposal boundary until those callbacks finish so a callback panic
+        // cannot unwind through a hostile key or message destructor.
+        let key = Contained::new(key, self.disposal.clone());
+        let message = Contained::new(message, self.disposal.clone());
+        self.remove(key.get());
+        let hash = self.hash_key(key.get());
         self.keyed.entry(hash).or_default().push(TimerEntry {
-            key: Box::new(key),
+            key: Box::new(key.into_inner()),
             deadline,
             arming_order,
-            message,
+            message: message.into_inner(),
             period,
         });
         let previous = self.armings.insert(arming_order, hash);
@@ -593,6 +604,19 @@ impl<M> TimerStore<M> {
         };
         self.dispose_entry(entry);
         true
+    }
+
+    fn clear_and_dispose<K>(&mut self, key: K, message: M)
+    where
+        K: Hash + Eq + Send + 'static,
+    {
+        // A zero-period interval still invokes user Hash/Eq while it owns the
+        // rejected inputs. Keep both values contained through that lookup.
+        let key = Contained::new(key, self.disposal.clone());
+        let message = Contained::new(message, self.disposal.clone());
+        self.remove(key.get());
+        drop(key);
+        drop(message);
     }
 
     fn dispose_entry(&self, entry: TimerEntry<M>) {
@@ -1223,9 +1247,7 @@ impl<M: Send + 'static> RawContext<M> {
             return Err(Rejected::new((key, message)));
         }
         if period.is_zero() {
-            let _ = self.clear_timer(&key);
-            self.resources.disposal.dispose(key);
-            self.resources.disposal.dispose(message);
+            self.resources.timers.clear_and_dispose(key, message);
             return Ok(());
         }
         self.replace_timer(
@@ -2445,6 +2467,11 @@ mod tests {
 mod timer_store_tests {
     use std::{
         collections::HashSet,
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -2460,6 +2487,38 @@ mod timer_store_tests {
     impl std::hash::Hash for CollidingKey {
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
             0_u8.hash(state);
+        }
+    }
+
+    struct PanickingHashKey(Arc<AtomicUsize>);
+
+    impl PartialEq for PanickingHashKey {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+
+    impl Eq for PanickingHashKey {}
+
+    impl std::hash::Hash for PanickingHashKey {
+        fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {
+            panic!("timer key hash panic");
+        }
+    }
+
+    impl Drop for PanickingHashKey {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("timer key destructor panic");
+        }
+    }
+
+    struct PanickingTimerMessage(Arc<AtomicUsize>);
+
+    impl Drop for PanickingTimerMessage {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("timer message destructor panic");
         }
     }
 
@@ -2553,6 +2612,77 @@ mod timer_store_tests {
                     .expect("replacement remains registered")
             ),
             "replacement"
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn timer_input_cleanup_stays_contained_when_hash_panics() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut timers = TimerStore::default();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            timers.replace(
+                PanickingHashKey(Arc::clone(&drops)),
+                None,
+                order(1),
+                TimerMessage::Once(PanickingTimerMessage(Arc::clone(&drops))),
+                None,
+            );
+        }))
+        .expect_err("the user key hash panic escapes the timer operation");
+
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("timer key hash panic"),
+            "the callback panic remains primary"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "both hostile incoming destructors run behind independent boundaries"
+        );
+        let cleanup = timers
+            .disposal
+            .panic
+            .take()
+            .expect("the first destructor panic is retained as cleanup evidence");
+        assert!(
+            matches!(
+                cleanup.downcast_ref::<&'static str>().copied(),
+                Some("timer message destructor panic" | "timer key destructor panic")
+            ),
+            "a hostile incoming destructor is recorded"
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn zero_period_timer_cleanup_stays_contained_when_hash_panics() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut timers = TimerStore::default();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            timers.clear_and_dispose(
+                PanickingHashKey(Arc::clone(&drops)),
+                PanickingTimerMessage(Arc::clone(&drops)),
+            );
+        }))
+        .expect_err("the user key hash panic escapes the clear operation");
+
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("timer key hash panic"),
+            "the callback panic remains primary"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "both zero-period inputs are destroyed behind containment"
+        );
+        assert!(
+            timers.disposal.panic.take().is_some(),
+            "a hostile input destructor is retained as cleanup evidence"
         );
         assert!(timers.is_empty());
     }

@@ -46,6 +46,10 @@
                 # so every crate contributing public façade items is walked
                 # separately. See the justfile recipe for the full rationale.
                 RUSTDOCFLAGS="-Z unstable-options --output-format json" \
+                  cargo rustdoc --locked -p shelterwood-cells --all-features --lib
+                cargo run --locked -p shelterwood-api-reachability -- \
+                  target/doc/shelterwood_cells.json
+                RUSTDOCFLAGS="-Z unstable-options --output-format json" \
                   cargo rustdoc --locked -p shelterwood-mailbox --all-features --lib
                 cargo run --locked -p shelterwood-api-reachability -- \
                   target/doc/shelterwood_mailbox.json

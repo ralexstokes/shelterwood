@@ -32,6 +32,8 @@ doc-check:
 runtime-api-check:
     RUSTDOCFLAGS="-Z unstable-options --output-format json" cargo +nightly rustdoc --locked -p shelterwood --all-features --lib
     cargo run --locked -p shelterwood-api-reachability -- target/doc/shelterwood.json
+    RUSTDOCFLAGS="-Z unstable-options --output-format json" cargo +nightly rustdoc --locked -p shelterwood-cells --all-features --lib
+    cargo run --locked -p shelterwood-api-reachability -- target/doc/shelterwood_cells.json
     RUSTDOCFLAGS="-Z unstable-options --output-format json" cargo +nightly rustdoc --locked -p shelterwood-mailbox --all-features --lib
     cargo run --locked -p shelterwood-api-reachability -- target/doc/shelterwood_mailbox.json
 

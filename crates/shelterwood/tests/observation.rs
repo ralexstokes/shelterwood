@@ -802,14 +802,18 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
         .shutdown(Duration::from_secs(1))
         .await
         .expect("root shuts down");
-    assert!(matches!(
-        scope
-            .wait_for_child("missing", |_| false, Duration::ZERO)
-            .await,
-        Err(WaitError::ScopeTerminated {
-            state: ScopeState::Stopped { .. }
-        })
-    ));
+    let after_shutdown = scope
+        .wait_for_child("missing", |_| false, Duration::ZERO)
+        .await;
+    assert!(
+        matches!(
+            after_shutdown,
+            Err(WaitError::ScopeTerminated {
+                state: ScopeState::Stopped { .. }
+            })
+        ),
+        "terminal scope wait returned {after_shutdown:?}"
+    );
 
     let mut declaration = Tree::new();
     let never_spawned = declaration

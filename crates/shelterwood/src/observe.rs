@@ -417,11 +417,14 @@ impl SnapshotHub {
         txn: &mut crate::cells::ObservationTxn<'_>,
         final_snapshot: impl FnOnce() -> Arc<ScopeSnapshot>,
     ) {
+        let mut final_snapshot = Some(final_snapshot);
         let mut initialized = false;
         let sender = self.sender.get_or_init(|| {
             initialized = true;
             runtime::watch(SnapshotHubState {
-                snapshot: final_snapshot(),
+                snapshot: final_snapshot
+                    .take()
+                    .expect("final snapshot is built exactly once")(),
                 generation: crate::identity::PoisonedCounter::new(),
                 closed: true,
             })
@@ -431,8 +434,15 @@ impl SnapshotHub {
             return;
         }
         let mut modified = false;
+        let receiverless = sender.receiver_count() == 0;
         sender.modify_silently(|state| {
             if !state.closed {
+                if receiverless {
+                    state.snapshot = final_snapshot
+                        .take()
+                        .expect("final snapshot is built exactly once")(
+                    );
+                }
                 state.closed = true;
                 modified = true;
             }
@@ -790,6 +800,34 @@ mod tests {
             receiver.borrow_latest().state,
             ScopeState::Stopped {
                 reason: crate::StopReason::NeverStarted
+            }
+        ));
+        assert!(receiver.changed().await.is_err());
+    }
+
+    #[crate::runtime::test]
+    async fn initialized_receiverless_snapshot_close_refreshes_the_terminal_state() {
+        let hub = SnapshotHub::default();
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let receiver = hub.subscribe(snapshot(ScopeState::Running), &mut txn);
+        drop(txn);
+        drop(receiver);
+
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.close(&mut txn, || {
+            snapshot(ScopeState::Stopped {
+                reason: crate::StopReason::Finished,
+            })
+        });
+        drop(txn);
+
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let mut receiver = hub.subscribe(snapshot(ScopeState::Running), &mut txn);
+        drop(txn);
+        assert!(matches!(
+            receiver.borrow_latest().state,
+            ScopeState::Stopped {
+                reason: crate::StopReason::Finished
             }
         ));
         assert!(receiver.changed().await.is_err());

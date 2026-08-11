@@ -20,7 +20,7 @@ pub(super) use crate::{
     exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
     mailbox::MailboxCell,
-    plan::{ChildConstruction, SlotCell},
+    plan::{BuilderCore, ChildConstruction, SlotCell},
     policy::ResolvedDefaults,
     runtime::{CompletionGatedLatch, Latch},
 };

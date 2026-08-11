@@ -630,7 +630,10 @@ mod tests {
     fn child_startup_failure_display_summarizes_every_exit_kind() {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("worker");
-        let membership = identity.mint_membership(&id).expect("membership available");
+        let membership = identity
+            .mint_membership(&id)
+            .expect("membership available")
+            .membership();
         let deadline = Instant::now() + Duration::from_secs(1);
         let cases = [
             (

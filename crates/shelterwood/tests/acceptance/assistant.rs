@@ -646,7 +646,8 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .add_subtree_once("session", SubtreeOnceDef::new(replacement_data.tree))
         .await
         .expect("same id is reusable after removal completes");
-    assert!(replacement.membership().supersedes(session_membership));
+    assert!(!replacement.membership().supersedes(session_membership));
+    assert!(!session_membership.supersedes(replacement.membership()));
     sessions
         .wait_for_child(
             "session",

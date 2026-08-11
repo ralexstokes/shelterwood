@@ -130,28 +130,40 @@ impl SlotCell {
         }
     }
 
-    /// Publishes one never-started slot under the gate its observers use.
-    pub(crate) fn terminalize_never_started(&self) {
+    /// Publishes one never-started slot under the gate its observers use and
+    /// evicts its lineage from `owner`'s identity map. Every terminalization
+    /// evicts the lineage (SPEC §3.4): a later same-id declaration must mint
+    /// an incomparable membership, never an ordered successor of the
+    /// terminal predecessor. Taking the owning scope here keeps the pairing
+    /// structural instead of repeated at each call site.
+    pub(crate) fn terminalize_never_started(&self, owner: &ScopeCell) {
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started();
         } else {
             self.member.terminalize(Exit::never_started());
         }
+        owner.evict_child_identity(&self.member);
     }
 
-    pub(crate) fn terminalize_never_started_locked(&self, txn: &mut ObservationTxn<'_>) {
+    pub(crate) fn terminalize_never_started_locked(
+        &self,
+        owner: &ScopeCell,
+        txn: &mut ObservationTxn<'_>,
+    ) {
         self.member.terminalize_locked(Exit::never_started(), txn);
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started_locked(txn);
         }
+        owner.evict_child_identity(&self.member);
     }
 
     pub(crate) fn take_never_started_locked(
         &self,
+        owner: &ScopeCell,
         txn: &mut ObservationTxn<'_>,
     ) -> Option<Isolated<ChildConstruction>> {
         let definition = self.take_definition().ok().flatten();
-        self.terminalize_never_started_locked(txn);
+        self.terminalize_never_started_locked(owner, txn);
         definition
     }
 
@@ -241,6 +253,11 @@ pub(crate) struct BuilderCore {
     pub(crate) config: ScopeConfig,
     pub(crate) slots: Vec<Arc<SlotCell>>,
     ids: HashMap<ChildId, Arc<SlotCell>>,
+    /// The stable scope whose identity map `lower(root_override)` adopts the
+    /// slots' lineages into. Eviction must target the map a lineage actually
+    /// entered: before adoption begins the lineages live in `root`'s map,
+    /// afterwards they live here.
+    adopting_root: Option<Arc<ScopeCell>>,
     armed: bool,
 }
 
@@ -269,6 +286,7 @@ impl BuilderCore {
             config: ScopeConfig::default(),
             slots: Vec::new(),
             ids: HashMap::new(),
+            adopting_root: None,
             armed: true,
         }
     }
@@ -315,12 +333,16 @@ impl BuilderCore {
             }
         };
         if !Arc::ptr_eq(&root, &self.root) {
+            // From the first adoption on, a failed or unwound lowering must
+            // evict the terminalized slots from the override's identity map,
+            // not this builder's throwaway root.
+            self.adopting_root = Some(Arc::clone(&root));
             let mut identity = root
                 .child_identity
                 .lock()
                 .expect("scope identity mutex poisoned");
             for slot in &self.slots {
-                let Some(membership) =
+                let Some(rebased) =
                     identity.adopt_or_mint_membership(slot.member.id(), slot.member.membership())
                 else {
                     let id = slot.member.id().clone();
@@ -328,8 +350,8 @@ impl BuilderCore {
                     let disposal = self.begin_failed_disposal();
                     return Err(LowerError::IdentityExhausted { id, disposal });
                 };
-                if membership != slot.member.membership() {
-                    slot.member.rebase_membership(membership);
+                if let Some(identity) = rebased {
+                    slot.member.rebase_membership(identity);
                 }
             }
         }
@@ -358,7 +380,7 @@ impl BuilderCore {
             config: self.config.clone(),
             defaults,
             children,
-            armed: true,
+            terminality: Some(ScopePlanTerminality),
         })
     }
 
@@ -382,8 +404,13 @@ impl BuilderCore {
     }
 
     fn terminalize(&self) {
+        // A failed `lower(root_override)` may have adopted only a prefix of
+        // these lineages into the override's map before the error or unwind.
+        // Slots past the failure point never left `self.root`'s map, so their
+        // eviction from the override is a fence-mismatch no-op (fail closed).
+        let identity_root = self.adopting_root.as_ref().unwrap_or(&self.root);
         for slot in &self.slots {
-            slot.terminalize_never_started();
+            slot.terminalize_never_started(identity_root);
         }
         self.root.terminalize_never_started();
     }
@@ -403,24 +430,77 @@ pub(crate) struct ScopePlan {
     pub(crate) config: ScopeConfig,
     pub(crate) defaults: ResolvedDefaults,
     pub(crate) children: Vec<ChildPlan>,
-    pub(crate) armed: bool,
+    terminality: Option<ScopePlanTerminality>,
+}
+
+struct ScopePlanTerminality;
+
+pub(crate) struct RuntimeScopePlan {
+    pub(crate) root: Arc<ScopeCell>,
+    pub(crate) config: ScopeConfig,
+    pub(crate) defaults: ResolvedDefaults,
+    pub(crate) children: Vec<ChildPlan>,
+    terminality: Option<ScopePlanTerminality>,
+}
+
+fn terminalize_plan(
+    root: &ScopeCell,
+    children: &[ChildPlan],
+    terminality: &mut Option<ScopePlanTerminality>,
+) {
+    if terminality.take().is_some() {
+        for child in children {
+            child.slot.terminalize_never_started(root);
+        }
+        root.with_observation_gate(|txn| {
+            // Lowering can publish the planned children before ScopeRuntime
+            // takes ownership. The plan fallback commits residency withdrawal
+            // and root closure as one root-scope observation.
+            root.clear_residents_locked(txn);
+            root.terminalize_never_started_locked(txn);
+        });
+    }
+}
+
+impl ScopePlan {
+    /// Consumes declaration ownership and transfers its terminality obligation
+    /// to the runtime plan. There is no independently mutable disarm bit: a
+    /// caller either owns the declaration plan or has consumed it here.
+    pub(crate) fn take_for_runtime(mut self) -> RuntimeScopePlan {
+        RuntimeScopePlan {
+            root: Arc::clone(&self.root),
+            config: self.config.clone(),
+            defaults: self.defaults.clone(),
+            children: std::mem::take(&mut self.children),
+            terminality: self.terminality.take(),
+        }
+    }
 }
 
 impl Drop for ScopePlan {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        for child in &self.children {
-            child.slot.terminalize_never_started();
-        }
-        self.root.with_observation_gate(|txn| {
-            // Lowering can publish the planned children before ScopeRuntime
-            // takes ownership. The plan fallback commits residency withdrawal
-            // and root closure as one root-scope observation.
-            self.root.clear_residents_locked(txn);
-            self.root.terminalize_never_started_locked(txn);
-        });
+        terminalize_plan(&self.root, &self.children, &mut self.terminality);
+    }
+}
+
+impl RuntimeScopePlan {
+    /// Finishes the transfer after every child has installed its own
+    /// terminality obligation. Consuming `self` makes a partial handoff
+    /// impossible to mistake for a completed one.
+    pub(crate) fn finish_transfer(mut self) {
+        assert!(
+            self.children.is_empty(),
+            "runtime transfer completes only after every child owns terminality"
+        );
+        self.terminality
+            .take()
+            .expect("runtime plan transfer completes exactly once");
+    }
+}
+
+impl Drop for RuntimeScopePlan {
+    fn drop(&mut self) {
+        terminalize_plan(&self.root, &self.children, &mut self.terminality);
     }
 }
 
@@ -505,9 +585,11 @@ mod tests {
     };
 
     use crate::{
-        Backoff, DefaultsInheritance, ExitError, Readiness, RestartCondition, RestartPolicy,
-        Retention, Shutdown, TaskOnceDef,
+        Backoff, ChildId, DefaultsInheritance, ExitError, Readiness, RestartCondition,
+        RestartPolicy, Retention, Shutdown, TaskOnceDef,
+        cells::{MemberCell, ScopeCell},
         definition::DefinitionSource,
+        identity::ScopeIdentity,
         policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
         raw::RawConstruction,
         runtime::{self, Timeout},
@@ -515,7 +597,7 @@ mod tests {
     };
 
     use super::{
-        BuilderCore, ChildConstruction, ChildPlan, ScopeConstruction, SlotCell,
+        BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeConstruction, SlotCell,
         concrete_dynamic_slot, concrete_dynamic_slot_ref, erase_dynamic_slot,
     };
 
@@ -708,6 +790,69 @@ mod tests {
             "removal cannot claim between policy resolution and admission"
         );
         drop(claim);
+    }
+
+    #[crate::runtime::test]
+    async fn failed_override_lowering_evicts_adopted_lineages_from_the_override() {
+        // A stable scope whose identity domain for "exhausted" has no
+        // generations left, so adoption of that id must fail after the
+        // preceding slot's lineage was already adopted.
+        let root_id = ChildId::from("$root");
+        let mut root_identity = ScopeIdentity::new();
+        let root_membership = root_identity
+            .mint_membership(&root_id)
+            .expect("fresh scope identity must mint its root membership");
+        let member = MemberCell::new(root_id, root_membership);
+        let exhausted_id = ChildId::from("exhausted");
+        let mut child_identity = ScopeIdentity::near_exhaustion(exhausted_id.clone(), 7);
+        let _ = child_identity
+            .mint_membership(&exhausted_id)
+            .expect("the final generation is mintable");
+        let stable = ScopeCell::new(member, ScopeFlavor::Ordered, child_identity);
+
+        let mut builder = BuilderCore::new(ScopeFlavor::Ordered);
+        let adopted = builder
+            .reserve("adopted", None)
+            .expect("reservation succeeds");
+        adopted.define(ChildConstruction::Task(configured_task()));
+        let adopted_membership = adopted.member.membership();
+        let failing = builder
+            .reserve("exhausted", None)
+            .expect("reservation succeeds");
+        failing.define(ChildConstruction::Task(configured_task()));
+
+        let Err(error) = builder.lower(ResolvedDefaults::default(), Some(Arc::clone(&stable)))
+        else {
+            panic!("the exhausted id fails adoption");
+        };
+        let LowerError::IdentityExhausted { id, disposal } = error else {
+            panic!("partial adoption fails with identity exhaustion");
+        };
+        assert_eq!(id.as_str(), "exhausted");
+        disposal.fired().await;
+
+        // A restart-style rebuild reconciles against the same stable scope.
+        // The terminalized slot's lineage must have been evicted from the
+        // override's identity map — not the failed builder's throwaway root —
+        // so the re-added id donates a fresh lineage that is incomparable in
+        // both directions instead of minting an ordered successor.
+        let mut rebuild = BuilderCore::new(ScopeFlavor::Ordered);
+        let readded = rebuild
+            .reserve("adopted", None)
+            .expect("re-added id is reservable");
+        readded.define(ChildConstruction::Task(configured_task()));
+        let replacement = rebuild
+            .lower(ResolvedDefaults::default(), Some(stable))
+            .expect("the rebuild lowers");
+        let readded_membership = replacement.children[0].slot.member.membership();
+        assert!(
+            !readded_membership.supersedes(adopted_membership),
+            "a rebuilt membership must not supersede its terminalized predecessor"
+        );
+        assert!(
+            !adopted_membership.supersedes(readded_membership),
+            "a terminalized predecessor must not order against its replacement"
+        );
     }
 
     struct DropFlag(Arc<AtomicBool>);

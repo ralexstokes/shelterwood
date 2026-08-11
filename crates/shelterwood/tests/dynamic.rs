@@ -285,7 +285,8 @@ async fn exact_handles_reject_cross_scope_and_same_id_successors() {
         .add_task("same", waiting_task())
         .await
         .expect("replacement admission");
-    assert!(replacement.membership().supersedes(left_task.membership()));
+    assert!(!replacement.membership().supersedes(left_task.membership()));
+    assert!(!left_task.membership().supersedes(replacement.membership()));
     assert_eq!(
         left_scope.remove_task(&left_task).await,
         RemoveOutcome::AlreadyAbsent
@@ -308,7 +309,7 @@ async fn exact_handles_reject_cross_scope_and_same_id_successors() {
 }
 
 #[tokio::test]
-async fn nested_declared_membership_is_superseded_by_its_runtime_replacement() {
+async fn nested_declared_membership_is_incomparable_with_its_runtime_replacement() {
     let mut nested = DynamicTree::new();
     let declared = nested
         .add_task("worker", waiting_task())
@@ -346,7 +347,7 @@ async fn nested_declared_membership_is_superseded_by_its_runtime_replacement() {
         .await
         .expect("runtime replacement is admitted");
 
-    assert!(replacement.membership().supersedes(declared_membership));
+    assert!(!replacement.membership().supersedes(declared_membership));
     assert!(!declared_membership.supersedes(replacement.membership()));
     assert!(
         !replacement
@@ -405,7 +406,8 @@ async fn nested_actor_replacement_keeps_mailbox_evidence_in_each_exact_membershi
         .await
         .expect("runtime replacement is admitted");
     let replacement_incarnation = replacement.try_send(()).expect("replacement actor accepts");
-    assert!(replacement.membership().supersedes(declared.membership()));
+    assert!(!replacement.membership().supersedes(declared.membership()));
+    assert!(!declared.membership().supersedes(replacement.membership()));
     assert_eq!(
         replacement_incarnation.membership(),
         replacement.membership()
@@ -440,7 +442,8 @@ async fn exact_scope_removal_does_not_touch_a_same_id_successor() {
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
         .expect("second subtree admitted");
-    assert!(second.membership().supersedes(first.membership()));
+    assert!(!second.membership().supersedes(first.membership()));
+    assert!(!first.membership().supersedes(second.membership()));
     assert_eq!(
         root.remove_scope(&first).await,
         RemoveOutcome::AlreadyAbsent

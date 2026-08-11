@@ -247,7 +247,11 @@ impl DynamicControl {
             .close_admission(_txn);
     }
 
-    pub(super) fn close(&self, txn: &mut ObservationTxn<'_>) -> HashMap<ChildId, DynamicEntry> {
+    pub(super) fn close(
+        &self,
+        scope: &ScopeCell,
+        txn: &mut ObservationTxn<'_>,
+    ) -> HashMap<ChildId, DynamicEntry> {
         self.close_admission_in(txn);
         let mut state = self.state.lock().expect("dynamic-state mutex poisoned");
         let entries = state.take_entries(txn);
@@ -255,7 +259,7 @@ impl DynamicControl {
         let mut retained = HashMap::new();
         for (id, entry) in entries {
             if entry.is_reserved() {
-                let definition = entry.slot.take_never_started_locked(txn);
+                let definition = take_terminal_reservation(scope, &entry.slot, txn);
                 txn.defer(move || dispose_definition_then(definition, move || drop(entry)));
             } else {
                 retained.insert(id, entry);
@@ -266,6 +270,14 @@ impl DynamicControl {
         // removal without waking a remover before those observation edges.
         retained
     }
+}
+
+fn take_terminal_reservation(
+    scope: &ScopeCell,
+    slot: &SlotCell,
+    txn: &mut ObservationTxn<'_>,
+) -> Option<runtime::Isolated<ChildConstruction>> {
+    slot.take_never_started_locked(scope, txn)
 }
 
 pub(crate) struct DynamicReservation {
@@ -377,6 +389,7 @@ fn start_dynamic_admission(
 }
 
 pub(super) fn cancel_dynamic_reservation_parts(
+    scope: &ScopeCell,
     control: &DynamicControl,
     slot: &SlotCell,
     txn: &mut ObservationTxn<'_>,
@@ -391,11 +404,9 @@ pub(super) fn cancel_dynamic_reservation_parts(
     });
     let removed = cancelled.then(|| state.remove(&id, txn)).flatten();
     drop(state);
-    let definition = if cancelled {
-        slot.take_never_started_locked(txn)
-    } else {
-        None
-    };
+    let definition = cancelled
+        .then(|| take_terminal_reservation(scope, slot, txn))
+        .flatten();
     (definition, removed)
 }
 
@@ -404,15 +415,16 @@ pub(crate) fn cancel_dynamic_reservation(
     control: &ErasedDynamicRoute,
     slot: &Arc<SlotCell>,
 ) {
-    scope.with_observation_gate(|txn| control.cancel_reservation(slot.as_ref(), txn));
+    scope.with_observation_gate(|txn| control.cancel_reservation(scope, slot.as_ref(), txn));
 }
 
 fn cancel_dynamic_reservation_impl(
+    scope: &ScopeCell,
     control: &DynamicControl,
     slot: &SlotCell,
     txn: &mut ObservationTxn<'_>,
 ) {
-    let (definition, removed) = cancel_dynamic_reservation_parts(control, slot, txn);
+    let (definition, removed) = cancel_dynamic_reservation_parts(scope, control, slot, txn);
     // The entry's drop completes its removal response; it must follow the
     // member's terminal publication and isolated definition disposal.
     txn.defer(move || dispose_definition_then(definition, move || drop(removed)));
@@ -505,7 +517,7 @@ fn remove_dynamic_impl(
     if entry.is_reserved() {
         let entry = state.remove(id, txn).expect("entry was just resolved");
         drop(state);
-        let definition = entry.slot.take_never_started_locked(txn);
+        let definition = take_terminal_reservation(scope, &entry.slot, txn);
         txn.defer(move || dispose_definition_then(definition, move || drop(entry)));
         return response;
     }
@@ -564,8 +576,13 @@ impl DynamicRoute for DynamicControl {
         start_dynamic_admission(self, concrete_dynamic_slot(slot), fused_cancel)
     }
 
-    fn cancel_reservation(&self, slot: &Self::Slot, txn: &mut ObservationTxn<'_>) {
-        cancel_dynamic_reservation_impl(self, concrete_dynamic_slot_ref(slot), txn);
+    fn cancel_reservation(
+        &self,
+        scope: &Arc<ScopeCell>,
+        slot: &Self::Slot,
+        txn: &mut ObservationTxn<'_>,
+    ) {
+        cancel_dynamic_reservation_impl(scope, self, concrete_dynamic_slot_ref(slot), txn);
     }
 
     fn signal_fused_cancel(

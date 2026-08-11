@@ -311,9 +311,9 @@ impl SnapshotReceiver {
     pub async fn changed(&mut self) -> Result<Arc<ScopeSnapshot>, SnapshotClosed> {
         loop {
             let state = self.inner.borrow_cloned();
-            if state.generation != self.seen_generation {
+            if state.generation.current() != self.seen_generation {
                 let state = self.inner.borrow_and_update_cloned();
-                self.seen_generation = state.generation;
+                self.seen_generation = state.generation.current();
                 return Ok(state.snapshot);
             }
             if state.closed {
@@ -344,7 +344,7 @@ pub(crate) struct SnapshotHub {
 #[derive(Clone, Debug)]
 struct SnapshotHubState {
     snapshot: Arc<ScopeSnapshot>,
-    generation: u64,
+    generation: crate::identity::PoisonedCounter,
     closed: bool,
 }
 
@@ -357,7 +357,7 @@ impl SnapshotHub {
         if self.closed.load(Ordering::Acquire) {
             let (sender, inner) = runtime::watch(SnapshotHubState {
                 snapshot: initial,
-                generation: 0,
+                generation: crate::identity::PoisonedCounter::new(),
                 closed: true,
             });
             drop(sender);
@@ -369,7 +369,7 @@ impl SnapshotHub {
         let sender = self.sender.get_or_init(|| {
             runtime::watch(SnapshotHubState {
                 snapshot: Arc::clone(&initial),
-                generation: 0,
+                generation: crate::identity::PoisonedCounter::new(),
                 closed: false,
             })
             .0
@@ -384,12 +384,15 @@ impl SnapshotHub {
         } else if sender.receiver_count() == 0 {
             sender.modify_silently(|state| {
                 state.snapshot = initial;
-                state.generation = state.generation.saturating_add(1);
+                state
+                    .generation
+                    .mint()
+                    .expect("snapshot generation space exhausted");
             });
             txn.pulse(sender);
         }
         let inner = sender.watcher();
-        let seen_generation = inner.borrow_cloned().generation;
+        let seen_generation = inner.borrow_cloned().generation.current();
         SnapshotReceiver {
             inner,
             seen_generation,
@@ -414,7 +417,10 @@ impl SnapshotHub {
                     return false;
                 }
                 state.snapshot = snapshot();
-                state.generation = state.generation.saturating_add(1);
+                state
+                    .generation
+                    .mint()
+                    .expect("snapshot generation space exhausted");
                 true
             });
         }
@@ -440,7 +446,10 @@ impl SnapshotHub {
                 return;
             }
             state.snapshot = snapshot();
-            state.generation = state.generation.saturating_add(1);
+            state
+                .generation
+                .mint()
+                .expect("snapshot generation space exhausted");
             modified = true;
         });
         if modified {
@@ -577,6 +586,9 @@ struct LifecycleChannels {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct LifecycleSignal {
+    // A diagnostic-only loss total. Saturation deliberately preserves the
+    // strongest possible "at least this many" report; it never routes an
+    // event or identifies storage.
     explicit_lag: u64,
     closed: bool,
 }
@@ -860,7 +872,8 @@ mod tests {
         let mut identity = ScopeIdentity::new();
         let membership = identity
             .mint_membership(&crate::ChildId::from("scope"))
-            .expect("membership available");
+            .expect("membership available")
+            .membership();
         let hub = LifecycleHub::default();
         let mut events = hub.subscribe();
         hub.close();
@@ -887,7 +900,8 @@ mod tests {
         let mut identity = ScopeIdentity::new();
         let membership = identity
             .mint_membership(&crate::ChildId::from("scope"))
-            .expect("membership available");
+            .expect("membership available")
+            .membership();
         let event = |seq| LifecycleEvent {
             scope_path: Vec::new(),
             scope: membership,
@@ -924,7 +938,8 @@ mod tests {
         let mut identity = ScopeIdentity::new();
         let membership = identity
             .mint_membership(&crate::ChildId::from("scope"))
-            .expect("membership available");
+            .expect("membership available")
+            .membership();
         let event = |seq| LifecycleEvent {
             scope_path: Vec::new(),
             scope: membership,

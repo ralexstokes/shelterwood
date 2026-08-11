@@ -13,7 +13,9 @@ use super::{
     Admission, DynamicActorSlot, DynamicSubtreeSlot, DynamicTaskSlot, Removal, Subtree, SubtreeDef,
     SubtreeOnceDef,
     builders::dispose_rejected,
-    slots::{ActorSlotCore, DynamicSlotEndpoint, SubtreeSlotCore, TaskSlotCore},
+    slots::{
+        ActorSlotCore, AdmissionOwnership, DynamicSlotEndpoint, SubtreeSlotCore, TaskSlotCore,
+    },
     system::sealed,
 };
 
@@ -25,6 +27,43 @@ impl ScopeRef {
 }
 
 impl DynamicScopeRef {
+    fn reserve_actor_with<M: Send + 'static>(
+        &self,
+        id: impl Into<ChildId>,
+        ownership: AdmissionOwnership,
+    ) -> Result<DynamicActorSlot<M>, ReserveError> {
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
+            let mailbox = MailboxCell::new(reservation.slot.member.id().clone());
+            reservation.slot.member.attach_mailbox(mailbox.clone());
+            DynamicActorSlot {
+                core: ActorSlotCore::new(DynamicSlotEndpoint::new(reservation, ownership), mailbox),
+            }
+        })
+    }
+
+    fn reserve_task_with(
+        &self,
+        id: impl Into<ChildId>,
+        ownership: AdmissionOwnership,
+    ) -> Result<DynamicTaskSlot, ReserveError> {
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
+            DynamicTaskSlot {
+                core: TaskSlotCore::new(DynamicSlotEndpoint::new(reservation, ownership)),
+            }
+        })
+    }
+
+    fn reserve_subtree_with<T: Subtree>(
+        &self,
+        id: impl Into<ChildId>,
+        ownership: AdmissionOwnership,
+    ) -> Result<DynamicSubtreeSlot<T>, ReserveError> {
+        crate::driver::reserve_dynamic(&self.0.cell, id.into(), Some(<T as sealed::Sealed>::FLAVOR))
+            .map(|reservation| DynamicSubtreeSlot {
+                core: SubtreeSlotCore::new(DynamicSlotEndpoint::new(reservation, ownership)),
+            })
+    }
+
     /// Requests shutdown and waits for this scope to stop.
     pub async fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
         self.0.shutdown_and_wait(timeout).await
@@ -37,13 +76,7 @@ impl DynamicScopeRef {
         &self,
         id: impl Into<ChildId>,
     ) -> Result<DynamicActorSlot<M>, ReserveError> {
-        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
-            let mailbox = MailboxCell::new(reservation.slot.member.id().clone());
-            reservation.slot.member.attach_mailbox(mailbox.clone());
-            DynamicActorSlot {
-                core: ActorSlotCore::new(DynamicSlotEndpoint::split(reservation), mailbox),
-            }
-        })
+        self.reserve_actor_with(id, AdmissionOwnership::Split)
     }
 
     /// Adds a restartable callback-oriented actor, resolving at admission.
@@ -52,11 +85,8 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: ActorDef<A>,
     ) -> Admission<ActorRef<A::Msg>> {
-        match self.reserve_actor(id) {
-            Ok(mut slot) => {
-                slot.core.endpoint.fuse();
-                slot.core.define_raw(definition.into_raw())
-            }
+        match self.reserve_actor_with(id, AdmissionOwnership::Fused) {
+            Ok(slot) => slot.core.define_raw(definition.into_raw()),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
@@ -67,11 +97,8 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: ActorOnceDef<A>,
     ) -> Admission<ActorRef<A::Msg>> {
-        match self.reserve_actor(id) {
-            Ok(mut slot) => {
-                slot.core.endpoint.fuse();
-                slot.core.define_once_raw(definition.into_raw())
-            }
+        match self.reserve_actor_with(id, AdmissionOwnership::Fused) {
+            Ok(slot) => slot.core.define_once_raw(definition.into_raw()),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
@@ -82,11 +109,8 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: RawDef<R>,
     ) -> Admission<ActorRef<R::Msg>> {
-        match self.reserve_actor(id) {
-            Ok(mut slot) => {
-                slot.core.endpoint.fuse();
-                slot.core.define_raw(definition)
-            }
+        match self.reserve_actor_with(id, AdmissionOwnership::Fused) {
+            Ok(slot) => slot.core.define_raw(definition),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
@@ -97,11 +121,8 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: RawOnceDef<R>,
     ) -> Admission<ActorRef<R::Msg>> {
-        match self.reserve_actor(id) {
-            Ok(mut slot) => {
-                slot.core.endpoint.fuse();
-                slot.core.define_once_raw(definition)
-            }
+        match self.reserve_actor_with(id, AdmissionOwnership::Fused) {
+            Ok(slot) => slot.core.define_once_raw(definition),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
@@ -110,20 +131,13 @@ impl DynamicScopeRef {
     ///
     /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
     pub fn reserve_task(&self, id: impl Into<ChildId>) -> Result<DynamicTaskSlot, ReserveError> {
-        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
-            DynamicTaskSlot {
-                core: TaskSlotCore::new(DynamicSlotEndpoint::split(reservation)),
-            }
-        })
+        self.reserve_task_with(id, AdmissionOwnership::Split)
     }
 
     /// Adds a restartable task, resolving at admission rather than startup.
     pub fn add_task(&self, id: impl Into<ChildId>, definition: TaskDef) -> Admission<TaskRef> {
-        match self.reserve_task(id) {
-            Ok(mut slot) => {
-                slot.core.endpoint.fuse();
-                slot.core.define(definition)
-            }
+        match self.reserve_task_with(id, AdmissionOwnership::Fused) {
+            Ok(slot) => slot.core.define(definition),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
@@ -134,11 +148,8 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
-        match self.reserve_task(id) {
-            Ok(mut slot) => {
-                slot.core.endpoint.fuse();
-                slot.core.define_once(definition)
-            }
+        match self.reserve_task_with(id, AdmissionOwnership::Fused) {
+            Ok(slot) => slot.core.define_once(definition),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
@@ -150,10 +161,7 @@ impl DynamicScopeRef {
         &self,
         id: impl Into<ChildId>,
     ) -> Result<DynamicSubtreeSlot<T>, ReserveError> {
-        crate::driver::reserve_dynamic(&self.0.cell, id.into(), Some(<T as sealed::Sealed>::FLAVOR))
-            .map(|reservation| DynamicSubtreeSlot {
-                core: SubtreeSlotCore::new(DynamicSlotEndpoint::split(reservation)),
-            })
+        self.reserve_subtree_with(id, AdmissionOwnership::Split)
     }
 
     /// Adds a restartable subtree, resolving at admission.
@@ -162,11 +170,8 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: SubtreeDef<T>,
     ) -> Admission<T::Ref> {
-        match self.reserve_subtree::<T>(id) {
-            Ok(mut slot) => {
-                slot.core.endpoint.fuse();
-                slot.core.define(definition)
-            }
+        match self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused) {
+            Ok(slot) => slot.core.define(definition),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
@@ -177,11 +182,8 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: SubtreeOnceDef<T>,
     ) -> Admission<T::Ref> {
-        match self.reserve_subtree::<T>(id) {
-            Ok(mut slot) => {
-                slot.core.endpoint.fuse();
-                slot.core.define_once(definition)
-            }
+        match self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused) {
+            Ok(slot) => slot.core.define_once(definition),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }

@@ -20,6 +20,9 @@ impl RestartAttempt {
     pub const ZERO: Self = Self(0);
 
     /// Returns the next attempt, saturating at the numeric limit.
+    ///
+    /// This is bounded policy arithmetic, not an identity: equal saturated
+    /// values cannot alias a resource or route an event.
     #[must_use]
     pub const fn bump(self) -> Self {
         Self(self.0.saturating_add(1))
@@ -41,6 +44,9 @@ impl RestartCount {
     pub const ZERO: Self = Self(0);
 
     /// Returns the next count, saturating at the numeric limit.
+    ///
+    /// This public diagnostic total deliberately stays monotone at exhaustion;
+    /// it is never used as identity or a storage key.
     #[must_use]
     pub const fn bump(self) -> Self {
         Self(self.0.saturating_add(1))
@@ -62,6 +68,9 @@ impl TotalRestarts {
     pub const ZERO: Self = Self(0);
 
     /// Returns the next total, saturating at the numeric limit.
+    ///
+    /// This public diagnostic total deliberately stays monotone at exhaustion;
+    /// it is never used as identity or a storage key.
     #[must_use]
     pub const fn bump(self) -> Self {
         Self(self.0.saturating_add(1))
@@ -438,13 +447,6 @@ impl ReadinessDeadline {
             Self::Inherit | Self::Bounded(_) | Self::Unbounded => Ok(()),
         }
     }
-
-    fn validate_resolved(self) -> Result<(), PolicyError> {
-        match self {
-            Self::Inherit => Err(PolicyError::UnresolvedReadinessDeadline),
-            value => value.validate_declared(),
-        }
-    }
 }
 
 /// The scope-wide restart budget.
@@ -591,9 +593,6 @@ pub enum PolicyError {
     /// An exponential maximum preceded its base delay.
     #[error("backoff maximum must not be shorter than its base")]
     BackoffMaximumBeforeBase,
-    /// An inherited readiness deadline remained unresolved at execution.
-    #[error("readiness deadline must be resolved before execution")]
-    UnresolvedReadinessDeadline,
     /// A readiness mode is not meaningful for this child kind.
     #[error("readiness mode is not supported by this child kind")]
     UnsupportedReadiness,
@@ -668,11 +667,23 @@ pub(crate) struct CommonOptions {
 pub(crate) struct ResolvedDefaults {
     pub(crate) child_restart: RestartPolicy,
     pub(crate) child_shutdown: Shutdown,
-    pub(crate) mailbox: Mailbox,
+    pub(crate) mailbox: ResolvedMailbox,
     /// Nearest resolved queue capacity, retained across defaults of other kinds.
     pub(crate) queue_capacity: NonZeroUsize,
     pub(crate) mailbox_shutdown: MailboxShutdown,
-    pub(crate) readiness_deadline: ReadinessDeadline,
+    pub(crate) readiness_deadline: ResolvedReadinessDeadline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResolvedMailbox {
+    Queue(NonZeroUsize),
+    Latest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResolvedReadinessDeadline {
+    Bounded(Duration),
+    Unbounded,
 }
 
 impl Default for ResolvedDefaults {
@@ -682,10 +693,10 @@ impl Default for ResolvedDefaults {
         Self {
             child_restart: RestartPolicy::default(),
             child_shutdown: Shutdown::default(),
-            mailbox: Mailbox::Queue(Some(queue_capacity)),
+            mailbox: ResolvedMailbox::Queue(queue_capacity),
             queue_capacity,
             mailbox_shutdown: MailboxShutdown::default(),
-            readiness_deadline: ReadinessDeadline::Bounded(DEFAULT_READINESS_DEADLINE),
+            readiness_deadline: ResolvedReadinessDeadline::Bounded(DEFAULT_READINESS_DEADLINE),
         }
     }
 }
@@ -702,10 +713,10 @@ impl ResolvedDefaults {
                 None | Some(Mailbox::Queue(None) | Mailbox::Latest) => self.queue_capacity,
             },
             mailbox_shutdown: resolve(values.mailbox_shutdown, self.mailbox_shutdown),
-            readiness_deadline: resolve_readiness_deadline(
-                resolve(values.readiness_deadline, self.readiness_deadline),
-                self.readiness_deadline,
-            ),
+            readiness_deadline: values
+                .readiness_deadline
+                .map(|value| resolve_readiness_deadline(value, self.readiness_deadline))
+                .unwrap_or(self.readiness_deadline),
         };
         // Validating the resolved value covers every selected override. The
         // inherited value was checked above even when an override replaces it.
@@ -717,9 +728,12 @@ impl ResolvedDefaults {
         self.child_restart
             .validate()
             .map_err(|error| InvalidPolicy::new(PolicyField::RestartBackoff, error))?;
-        self.readiness_deadline
-            .validate_resolved()
-            .map_err(|error| InvalidPolicy::new(PolicyField::ReadinessDeadline, error))
+        match self.readiness_deadline {
+            ResolvedReadinessDeadline::Bounded(duration) if duration.is_zero() => Err(
+                InvalidPolicy::new(PolicyField::ReadinessDeadline, PolicyError::ZeroDuration),
+            ),
+            ResolvedReadinessDeadline::Bounded(_) | ResolvedReadinessDeadline::Unbounded => Ok(()),
+        }
     }
 }
 
@@ -729,23 +743,25 @@ fn resolve<T: Copy>(value: Option<T>, inherited: T) -> T {
 
 fn resolve_readiness_deadline(
     value: ReadinessDeadline,
-    inherited: ReadinessDeadline,
-) -> ReadinessDeadline {
+    inherited: ResolvedReadinessDeadline,
+) -> ResolvedReadinessDeadline {
     match value {
         ReadinessDeadline::Inherit => inherited,
-        value => value,
+        ReadinessDeadline::Bounded(duration) => ResolvedReadinessDeadline::Bounded(duration),
+        ReadinessDeadline::Unbounded => ResolvedReadinessDeadline::Unbounded,
     }
 }
 
 fn resolve_mailbox(
     value: Option<Mailbox>,
-    inherited: Mailbox,
+    inherited: ResolvedMailbox,
     inherited_queue_capacity: NonZeroUsize,
-) -> Mailbox {
+) -> ResolvedMailbox {
     match value {
         None => inherited,
-        Some(Mailbox::Queue(None)) => Mailbox::Queue(Some(inherited_queue_capacity)),
-        Some(value) => value,
+        Some(Mailbox::Queue(None)) => ResolvedMailbox::Queue(inherited_queue_capacity),
+        Some(Mailbox::Queue(Some(capacity))) => ResolvedMailbox::Queue(capacity),
+        Some(Mailbox::Latest) => ResolvedMailbox::Latest,
     }
 }
 
@@ -753,13 +769,13 @@ fn resolve_mailbox(
 pub(crate) struct ResolvedCommonOptions {
     pub(crate) restart: RestartPolicy,
     pub(crate) shutdown: Shutdown,
-    pub(crate) mailbox: Mailbox,
+    pub(crate) mailbox: ResolvedMailbox,
     pub(crate) mailbox_shutdown: MailboxShutdown,
     /// Effective definition readiness. Every kind arrives here already
     /// resolved: raw actors fold their type-level default into the definition
     /// at erasure, so no per-incarnation fallback remains.
     pub(crate) readiness: Readiness,
-    pub(crate) readiness_deadline: ReadinessDeadline,
+    pub(crate) readiness_deadline: ResolvedReadinessDeadline,
     pub(crate) retention: Retention,
 }
 
@@ -811,9 +827,9 @@ mod tests {
     use super::{
         Backoff, BackoffFactor, ChildMode, CommonOptions, Intensity, InvalidPolicy, Jitter,
         JitterSample, Mailbox, MailboxShutdown, PolicyError, PolicyField, Readiness,
-        ReadinessDeadline, ResolvedDefaults, RestartAttempt, RestartCondition, RestartCount,
-        RestartPolicy, Retention, ScopeDefaults, Shutdown, TotalRestarts, resolve_common,
-        tidy_abort_beat,
+        ReadinessDeadline, ResolvedDefaults, ResolvedMailbox, ResolvedReadinessDeadline,
+        RestartAttempt, RestartCondition, RestartCount, RestartPolicy, Retention, ScopeDefaults,
+        Shutdown, TotalRestarts, resolve_common, tidy_abort_beat,
     };
 
     fn assert_constructor_matches_literal<T>(
@@ -845,7 +861,7 @@ mod tests {
         );
         assert_eq!(
             ResolvedDefaults::default().readiness_deadline,
-            ReadinessDeadline::Bounded(Duration::from_secs(30))
+            ResolvedReadinessDeadline::Bounded(Duration::from_secs(30))
         );
         assert_eq!(
             Intensity::default(),
@@ -1268,7 +1284,10 @@ mod tests {
                 ..ScopeDefaults::default()
             })
             .expect("valid defaults");
-        assert_eq!(library_queue.mailbox, Mailbox::default());
+        assert_eq!(
+            library_queue.mailbox,
+            ResolvedMailbox::Queue(NonZeroUsize::new(64).expect("capacity is non-zero"))
+        );
 
         let outer_queue = library
             .overlay(&ScopeDefaults {
@@ -1282,7 +1301,7 @@ mod tests {
                 ..ScopeDefaults::default()
             })
             .expect("valid defaults");
-        assert_eq!(latest.mailbox, Mailbox::Latest);
+        assert_eq!(latest.mailbox, ResolvedMailbox::Latest);
 
         let deferred_queue = latest
             .overlay(&ScopeDefaults {
@@ -1292,7 +1311,7 @@ mod tests {
             .expect("valid defaults");
         assert_eq!(
             deferred_queue.mailbox,
-            Mailbox::queue(10).expect("non-zero capacity")
+            ResolvedMailbox::Queue(NonZeroUsize::new(10).expect("capacity is non-zero"))
         );
         assert_eq!(deferred_queue.child_restart, latest.child_restart);
         assert_eq!(deferred_queue.child_shutdown, latest.child_shutdown);
@@ -1303,7 +1322,10 @@ mod tests {
                 ..ScopeDefaults::default()
             })
             .expect("valid reset defaults");
-        assert_eq!(reset_queue.mailbox, Mailbox::default());
+        assert_eq!(
+            reset_queue.mailbox,
+            ResolvedMailbox::Queue(NonZeroUsize::new(64).expect("capacity is non-zero"))
+        );
     }
 
     #[test]
@@ -1374,7 +1396,7 @@ mod tests {
         assert_eq!(overridden.readiness, Readiness::Immediate);
         assert_eq!(
             overridden.readiness_deadline,
-            ReadinessDeadline::Bounded(Duration::from_nanos(1))
+            ResolvedReadinessDeadline::Bounded(Duration::from_nanos(1))
         );
         assert_eq!(overridden.retention, Retention::Remove);
     }
@@ -1502,14 +1524,14 @@ mod tests {
         );
 
         let unresolved = ResolvedDefaults {
-            readiness_deadline: ReadinessDeadline::Inherit,
+            readiness_deadline: ResolvedReadinessDeadline::Bounded(Duration::ZERO),
             ..ResolvedDefaults::default()
         };
         assert_eq!(
             unresolved.overlay(&ScopeDefaults::default()),
             Err(InvalidPolicy::new(
                 PolicyField::ReadinessDeadline,
-                PolicyError::UnresolvedReadinessDeadline
+                PolicyError::ZeroDuration
             ))
         );
     }
@@ -1535,7 +1557,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            ReadinessDeadline::Bounded(Duration::from_nanos(1)).validate_resolved(),
+            ReadinessDeadline::Bounded(Duration::from_nanos(1)).validate_declared(),
             Ok(())
         );
         assert_eq!(

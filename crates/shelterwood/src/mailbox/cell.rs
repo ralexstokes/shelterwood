@@ -2,16 +2,15 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
     num::NonZeroUsize,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::Ordering},
     task::Waker,
 };
 
 use crate::{
-    ChildId, Incarnation, Mailbox,
+    ChildId, Incarnation,
     cells::{MailboxControl, MailboxDisposal, MailboxTermination},
+    identity::{AtomicPoisonedCounter, PoisonedCounter},
+    policy::ResolvedMailbox,
     runtime::{PanicAccumulator, PanicPayload, Signal, SignalWatcher, resume_panic},
 };
 
@@ -270,13 +269,8 @@ pub(super) enum Submission<M> {
 struct WaiterId(u64);
 
 impl WaiterId {
-    const ZERO: Self = Self(0);
+    #[cfg(test)]
     const POISON: Self = Self(u64::MAX);
-
-    fn checked_next(self) -> Option<Self> {
-        let next = self.0.checked_add(1)?;
-        (next != Self::POISON.0).then_some(Self(next))
-    }
 }
 
 /// FIFO registrations with direct removal by a send operation.
@@ -289,7 +283,7 @@ impl WaiterId {
 /// instead of wrapping back into the live id domain.
 pub(super) struct WaiterQueue<M> {
     entries: BTreeMap<WaiterId, Arc<SendOperation<M>>>,
-    next_id: WaiterId,
+    ids: PoisonedCounter,
     #[cfg(test)]
     direct_removals: usize,
 }
@@ -298,7 +292,7 @@ impl<M> Default for WaiterQueue<M> {
     fn default() -> Self {
         Self {
             entries: BTreeMap::new(),
-            next_id: WaiterId::ZERO,
+            ids: PoisonedCounter::new(),
             #[cfg(test)]
             direct_removals: 0,
         }
@@ -316,11 +310,11 @@ impl<M> WaiterQueue<M> {
     }
 
     fn push_back(&mut self, operation: Arc<SendOperation<M>>) -> WaiterId {
-        let Some(next) = self.next_id.checked_next() else {
-            self.next_id = WaiterId::POISON;
-            panic!("mailbox waiter identity space exhausted");
-        };
-        self.next_id = next;
+        let next = WaiterId(
+            self.ids
+                .mint()
+                .expect("mailbox waiter identity space exhausted"),
+        );
         let replaced = self.entries.insert(next, operation);
         debug_assert!(replaced.is_none());
         next
@@ -511,7 +505,7 @@ impl<M: Send + 'static> Drop for MailboxTeardown<M> {
 pub(crate) struct MailboxCell<M> {
     pub(super) actor_id: ChildId,
     pub(super) state: Mutex<MailboxState<M>>,
-    accepted: AtomicU64,
+    accepted: AtomicPoisonedCounter,
     changed: Signal,
 }
 
@@ -535,7 +529,7 @@ impl<M: Send + 'static> MailboxCell<M> {
                 queue: VecDeque::new(),
                 latest: None,
             }),
-            accepted: AtomicU64::new(0),
+            accepted: AtomicPoisonedCounter::new(),
             changed: Signal::default(),
         })
     }
@@ -758,14 +752,10 @@ impl<M> MailboxCell<M> {
 }
 
 impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
-    fn configure(&self, mailbox: Mailbox) {
+    fn configure(&self, mailbox: ResolvedMailbox) {
         let kind = match mailbox {
-            Mailbox::Queue(Some(capacity)) => MailboxKind::Queue(capacity),
-            Mailbox::Queue(None) => MailboxKind::Queue(
-                NonZeroUsize::new(crate::policy::DEFAULT_MAILBOX_CAPACITY)
-                    .expect("library mailbox capacity is non-zero"),
-            ),
-            Mailbox::Latest => MailboxKind::Latest,
+            ResolvedMailbox::Queue(capacity) => MailboxKind::Queue(capacity),
+            ResolvedMailbox::Latest => MailboxKind::Latest,
         };
         let mut state = self.state.lock().expect("mailbox mutex poisoned");
         match state.kind {
@@ -925,21 +915,18 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
     }
 }
 
-fn mint_accepted_sequence(accepted: &AtomicU64) -> AcceptedSequence {
+fn mint_accepted_sequence(accepted: &AtomicPoisonedCounter) -> AcceptedSequence {
     AcceptedSequence(
         accepted
-            .try_update(Ordering::Release, Ordering::Relaxed, |accepted| {
-                Some(accepted.saturating_add(1))
-            })
-            .expect("accepted sequence updates never reject")
-            .saturating_add(1),
+            .mint(Ordering::Release, Ordering::Relaxed)
+            .expect("mailbox accepted-sequence space exhausted"),
     )
 }
 
 fn accept_locked<M>(
     state: &mut MailboxState<M>,
     message: M,
-    accepted: &AtomicU64,
+    accepted: &AtomicPoisonedCounter,
 ) -> Result<Acceptance<M>, M> {
     let incarnation = match &state.binding {
         MailboxBinding::Bound(BoundState::Available(incarnation)) => *incarnation,
@@ -977,7 +964,7 @@ fn accept_locked<M>(
 
 fn promote_waiters<M: Send + 'static>(
     state: &mut MailboxState<M>,
-    accepted_sequence: &AtomicU64,
+    accepted_sequence: &AtomicPoisonedCounter,
 ) -> Promotion<M> {
     let Some(kind) = state.kind else {
         return Promotion::default();
@@ -1010,7 +997,7 @@ fn promote_waiter_queue<M: Send + 'static>(
     waiters: &mut WaiterQueue<M>,
     queue: &mut VecDeque<Envelope<M>>,
     latest: &mut Option<Envelope<M>>,
-    accepted_sequence: &AtomicU64,
+    accepted_sequence: &AtomicPoisonedCounter,
 ) -> Promotion<M> {
     let mut promotion = Promotion::default();
     let available = match kind {
@@ -1116,10 +1103,11 @@ pub(super) mod tests {
     };
 
     use crate::{
-        ChildId, Mailbox, SendErrorKind,
+        ChildId, SendErrorKind,
         cells::{MailboxControl, MemberCell},
         identity::ScopeIdentity,
         mailbox::ActorRef,
+        policy::{ResolvedDefaults, ResolvedMailbox},
     };
 
     use super::MailboxCell;
@@ -1161,10 +1149,10 @@ pub(super) mod tests {
     fn binding_before_configuration_trips_the_driver_contract() {
         let (mailbox, _) = actor();
         let mut identity = ScopeIdentity::new();
-        let membership = identity
+        let (_, mut incarnations) = identity
             .mint_membership(&ChildId::from("actor"))
-            .expect("membership available");
-        let mut incarnations = identity.incarnation_counter(membership);
+            .expect("membership available")
+            .into_pair();
         let incarnation = incarnations.mint().expect("incarnation available");
 
         MailboxControl::bind(&*mailbox, incarnation);
@@ -1174,12 +1162,12 @@ pub(super) mod tests {
     #[should_panic(expected = "mailbox must close the prior incarnation before rebinding")]
     fn rebinding_before_close_trips_the_driver_contract() {
         let (mailbox, _) = actor();
-        MailboxControl::configure(&*mailbox, Mailbox::default());
+        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox);
         let mut identity = ScopeIdentity::new();
-        let membership = identity
+        let (_, mut incarnations) = identity
             .mint_membership(&ChildId::from("actor"))
-            .expect("membership available");
-        let mut incarnations = identity.incarnation_counter(membership);
+            .expect("membership available")
+            .into_pair();
         let first = incarnations.mint().expect("first incarnation available");
         let second = incarnations.mint().expect("second incarnation available");
 
@@ -1192,16 +1180,16 @@ pub(super) mod tests {
         let (mailbox, _) = actor();
         MailboxControl::configure(
             &*mailbox,
-            Mailbox::queue(1).expect("non-zero queue capacity"),
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ),
         );
         let mut identity = ScopeIdentity::new();
-        let membership = identity
+        let (_, mut incarnations) = identity
             .mint_membership(&ChildId::from("actor"))
-            .expect("membership available");
-        let incarnation = identity
-            .incarnation_counter(membership)
-            .mint()
-            .expect("incarnation available");
+            .expect("membership available")
+            .into_pair();
+        let incarnation = incarnations.mint().expect("incarnation available");
         MailboxControl::bind(&*mailbox, incarnation);
 
         assert!(matches!(
@@ -1292,13 +1280,14 @@ pub(super) mod tests {
         park_with(&mut first, &first_panicking);
         park_with(&mut second, &second_panicking);
         park_with(&mut third, &counting);
-        MailboxControl::configure(&*mailbox, Mailbox::default());
+        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox);
         let mut generations = {
             let mut identity = ScopeIdentity::new();
-            let membership = identity
+            let (_, generations) = identity
                 .mint_membership(&ChildId::from("actor"))
-                .expect("membership available");
-            identity.incarnation_counter(membership)
+                .expect("membership available")
+                .into_pair();
+            generations
         };
         let incarnation = generations.mint().expect("incarnation available");
 
@@ -1431,7 +1420,7 @@ pub(super) mod tests {
     #[test]
     fn waiter_identity_exhaustion_poison_is_never_minted() {
         let mut waiters = super::WaiterQueue {
-            next_id: super::WaiterId(u64::MAX - 2),
+            ids: crate::identity::PoisonedCounter::near_exhaustion(),
             ..super::WaiterQueue::default()
         };
         let last = waiters.push_back(super::SendOperation::new(1_u8));
@@ -1444,7 +1433,7 @@ pub(super) mod tests {
             .is_err(),
             "the poison key is never minted"
         );
-        assert_eq!(waiters.next_id, super::WaiterId::POISON);
+        assert!(waiters.ids.is_poisoned());
         assert!(!waiters.entries.contains_key(&super::WaiterId::POISON));
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -1452,6 +1441,28 @@ pub(super) mod tests {
             }))
             .is_err(),
             "the exhausted domain stays poisoned"
+        );
+    }
+
+    #[test]
+    fn accepted_sequence_exhaustion_poison_is_never_minted() {
+        let accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
+        assert_eq!(
+            super::mint_accepted_sequence(&accepted),
+            super::AcceptedSequence(u64::MAX - 1)
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                super::mint_accepted_sequence(&accepted);
+            }))
+            .is_err()
+        );
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                super::mint_accepted_sequence(&accepted);
+            }))
+            .is_err(),
+            "the accepted-sequence domain stays poisoned"
         );
     }
 }

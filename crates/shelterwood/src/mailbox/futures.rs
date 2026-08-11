@@ -158,9 +158,9 @@ impl<M> fmt::Debug for ActorRef<M> {
     }
 }
 
-// Handle identity is the slot cell, not the membership token: lowering a
-// rebuilt nested declaration rebases the token behind live pre-spawn handles,
-// and a token-value hash would strand entries keyed before the rebase.
+// Handle identity is the slot cell, not the membership token: declaration
+// lowering can rebase a provisional token behind live pre-spawn handles, and
+// a token-value hash would strand entries keyed before that rebase.
 impl<M> PartialEq for ActorRef<M> {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.member, &other.member)
@@ -634,7 +634,7 @@ mod tests {
     };
 
     use crate::{
-        ChildId, Mailbox,
+        ChildId,
         cells::{MailboxControl, MemberCell},
         identity::ScopeIdentity,
     };
@@ -644,12 +644,15 @@ mod tests {
     #[test]
     fn an_accepted_send_reports_acceptance_on_every_poll() {
         let (mailbox, actor) = actor();
-        MailboxControl::configure(&*mailbox, Mailbox::default());
+        MailboxControl::configure(
+            &*mailbox,
+            crate::policy::ResolvedDefaults::default().mailbox,
+        );
         let mut identity = ScopeIdentity::new();
-        let membership = identity
+        let (_, mut incarnations) = identity
             .mint_membership(&ChildId::from("actor"))
-            .expect("membership available");
-        let mut incarnations = identity.incarnation_counter(membership);
+            .expect("membership available")
+            .into_pair();
         let incarnation = incarnations.mint().expect("incarnation available");
         MailboxControl::bind(&*mailbox, incarnation);
 

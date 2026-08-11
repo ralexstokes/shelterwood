@@ -78,7 +78,7 @@ async fn task_aborted_scope_driver_resolves_startup() {
     let scope = Arc::clone(&plan.root);
     let epoch = ScopeEpochGuard::begin(&scope).expect("test scope epoch is available");
     let driver = crate::runtime::spawn(run_scope_incarnation(
-        plan,
+        plan.take_for_runtime(),
         ScopeRole::Nested(NestedScopeLatches {
             parent_ready: CompletionGatedLatch::default(),
             ancestor: AncestorCommandLatches {
@@ -243,17 +243,14 @@ async fn scope_plan_conversion_panic_terminalizes_every_child() {
 
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
-            let _identity = root
-                .child_identity
-                .lock()
-                .expect("scope identity mutex starts healthy");
+            let _incarnations = children[1].lock_incarnation_counter();
             panic!("inject child conversion failure");
         }))
         .is_err()
     );
 
     let mut driver = Box::pin(run_scope_incarnation(
-        plan,
+        plan.take_for_runtime(),
         ScopeRole::Nested(NestedScopeLatches {
             parent_ready: CompletionGatedLatch::default(),
             ancestor: AncestorCommandLatches {
@@ -304,6 +301,95 @@ async fn scope_plan_conversion_panic_terminalizes_every_child() {
         removed, 0,
         "conversion must finish before publication begins"
     );
+}
+
+#[crate::runtime::test]
+async fn conversion_unwind_evicts_never_started_child_identities() {
+    let mut tree = Tree::new();
+    for id in ["first", "second"] {
+        tree.add_task(id, TaskDef::new(|_| future::pending()))
+            .expect("valid task");
+    }
+    let plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let children: Vec<_> = plan
+        .children
+        .iter()
+        .map(|child| Arc::clone(&child.slot.member))
+        .collect();
+    let terminalized: Vec<_> = children
+        .iter()
+        .map(|member| (member.id().clone(), member.membership()))
+        .collect();
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
+
+    // Converting "second" panics after "first" was converted, so "first"
+    // reaches its Obligation fallback never started and not yet resident,
+    // while "second" unwinds out of its own conversion.
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _incarnations = children[1].lock_incarnation_counter();
+            panic!("inject child conversion failure");
+        }))
+        .is_err()
+    );
+    let mut driver = Box::pin(run_scope_incarnation(
+        plan.take_for_runtime(),
+        ScopeRole::Nested(NestedScopeLatches {
+            parent_ready: CompletionGatedLatch::default(),
+            ancestor: AncestorCommandLatches {
+                shutdown: Latch::default(),
+                abort: Latch::default(),
+                abort_ack: Latch::default(),
+            },
+        }),
+        epoch,
+    ));
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let mut context = Context::from_waker(Waker::noop());
+            let _ = driver.as_mut().poll(&mut context);
+        }))
+        .is_err()
+    );
+    drop(driver);
+    for child in &children {
+        assert!(
+            matches!(child.record().stage, MemberStage::Terminal(_)),
+            "every transferred or pending child must terminalize"
+        );
+    }
+
+    // The supervisor restart rebuilds the declarations against the same
+    // stable scope. Terminalization must have evicted each lineage, so the
+    // rebuild adopts fresh, incomparable memberships; a retained lineage
+    // would mint an ordered successor that supersedes its terminalized
+    // predecessor.
+    let mut rebuild = BuilderCore::new(ScopeFlavor::Ordered);
+    for id in ["first", "second"] {
+        let slot = rebuild
+            .reserve(id, None)
+            .expect("re-added id is reservable");
+        slot.define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    }
+    let replacement = rebuild
+        .lower(ResolvedDefaults::default(), Some(Arc::clone(&root)))
+        .expect("the restart rebuild lowers");
+    for child in &replacement.children {
+        let (_, predecessor) = terminalized
+            .iter()
+            .find(|(id, _)| id == child.slot.member.id())
+            .expect("the rebuild redeclares every terminalized id");
+        let replacement = child.slot.member.membership();
+        assert!(
+            !replacement.supersedes(*predecessor),
+            "a re-minted membership must not supersede its terminalized predecessor"
+        );
+        assert!(
+            !predecessor.supersedes(replacement),
+            "a terminalized predecessor must not order against its replacement"
+        );
+    }
 }
 
 struct ReserveOnLifecycleWake {
@@ -365,7 +451,11 @@ async fn initial_added_wake_observes_the_keyed_dynamic_route() {
             .is_pending()
     );
 
-    let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
+    let driver = crate::runtime::spawn(run_scope_incarnation(
+        plan.take_for_runtime(),
+        ScopeRole::Root,
+        epoch,
+    ));
     let abort = driver.abort_handle();
     assert!(matches!(
         crate::runtime::timeout(Duration::from_secs(1), probe.observed.fired()).await,

@@ -239,9 +239,9 @@ impl fmt::Debug for TaskRef {
     }
 }
 
-// Handle identity is the slot cell, not the membership token: lowering a
-// rebuilt nested declaration rebases the token behind live pre-spawn handles,
-// and a token-value hash would strand entries keyed before the rebase.
+// Handle identity is the slot cell, not the membership token: declaration
+// lowering can rebase a provisional token behind live pre-spawn handles, and
+// a token-value hash would strand entries keyed before that rebase.
 impl PartialEq for TaskRef {
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.cell, &other.cell)
@@ -333,8 +333,10 @@ mod tests {
     fn task_context() -> (TaskContext, Latch, Latch, CompletionGatedLatch) {
         let id = ChildId::from("task");
         let mut identity = ScopeIdentity::new();
-        let membership = identity.mint_membership(&id).expect("membership available");
-        let mut incarnations = identity.incarnation_counter(membership);
+        let (_, mut incarnations) = identity
+            .mint_membership(&id)
+            .expect("membership available")
+            .into_pair();
         let incarnation = incarnations.mint().expect("incarnation available");
         let shutdown = Latch::default();
         let abort = Latch::default();

@@ -130,7 +130,7 @@ impl StopLadder {
             {
                 self.grace_phase = GracePhase::AfterGrace;
             }
-            self.deadline = Some(now);
+            self.deadline = Some(self.deadline.map_or(now, |deadline| deadline.min(now)));
         }
         self.force_requested = true;
     }
@@ -666,6 +666,28 @@ enum StartupPhase {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DrainReasonPrecedence {
+    Finished,
+    IntensityTripped,
+    StartupFailed,
+    ShutdownRequested,
+}
+
+impl DrainReasonPrecedence {
+    fn of(reason: &StopReason) -> Self {
+        match reason {
+            StopReason::Finished => Self::Finished,
+            StopReason::IntensityTripped(_) => Self::IntensityTripped,
+            StopReason::StartupFailed(_) => Self::StartupFailed,
+            StopReason::ShutdownRequested => Self::ShutdownRequested,
+            StopReason::NeverStarted => {
+                unreachable!("NeverStarted is not a live-incarnation drain reason")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScopeDrain {
     reason: StopReason,
@@ -788,12 +810,27 @@ impl ScopeLifecycle {
         Some(self.state.clone())
     }
 
+    /// Begins draining or monotonically upgrades an in-progress drain.
+    ///
+    /// The returned effect exists only for the initial transition: upgrades
+    /// change the eventual verdict without repeating teardown side effects.
     pub(crate) fn begin_drain(&mut self, reason: StopReason) -> Option<DrainEffect> {
+        let incoming_precedence = DrainReasonPrecedence::of(&reason);
         let startup = match self.state {
             ScopeState::Starting => StartupPhase::Pending,
             ScopeState::Running => StartupPhase::Complete,
             ScopeState::StartupFailed => StartupPhase::Failed,
-            ScopeState::Draining => return None,
+            ScopeState::Draining => {
+                let drain = self
+                    .drain
+                    .as_mut()
+                    .expect("the drain invariant supplies a reason while draining");
+                if incoming_precedence > DrainReasonPrecedence::of(&drain.reason) {
+                    drain.reason = reason;
+                }
+                self.assert_drain_invariant();
+                return None;
+            }
             ScopeState::Unstarted | ScopeState::Stopped { .. } => {
                 unreachable!("a scope incarnation owns only live lifecycle states")
             }
@@ -1081,6 +1118,28 @@ mod tests {
             ladder.advance(tidy),
             None,
             "a finished ladder stays finished"
+        );
+    }
+
+    #[test]
+    fn force_preserves_an_already_due_deadline() {
+        let start = Instant::now();
+        let grace = Duration::from_secs(30);
+        let mut ladder = StopLadder::new(Shutdown::Graceful { grace });
+
+        assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
+        let due = ladder.deadline().expect("grace deadline");
+        ladder.force(due + Duration::from_secs(1));
+
+        assert_eq!(
+            ladder.deadline(),
+            Some(due),
+            "forcing after expiry cannot move the deadline later"
+        );
+        assert_eq!(
+            ladder.advance(due),
+            Some(StopAction::Escalate),
+            "the original due instant remains actionable"
         );
     }
 
@@ -1418,6 +1477,72 @@ mod tests {
             .expect("starting can begin draining");
         assert!(drain.startup_pending);
         assert_eq!(drain.state, ScopeState::Draining);
+    }
+
+    #[test]
+    fn scope_lifecycle_upgrades_drain_reasons_monotonically() {
+        let trip = crate::IntensityTrip {
+            max_restarts: 0,
+            observed_restarts: 1,
+            within: Duration::from_secs(10),
+        };
+        let startup_failure = crate::StartupFailure {
+            cause: crate::StartupFailureCause::IdentityExhausted {
+                id: crate::ChildId::from("worker"),
+            },
+        };
+        let mut lifecycle = ScopeLifecycle::running();
+
+        assert!(lifecycle.begin_drain(crate::StopReason::Finished).is_some());
+        assert_eq!(
+            lifecycle.draining_reason(),
+            Some(&crate::StopReason::Finished)
+        );
+
+        assert!(
+            lifecycle
+                .begin_drain(crate::StopReason::IntensityTripped(trip.clone()))
+                .is_none(),
+            "an upgrade does not repeat the enter-drain effect"
+        );
+        assert_eq!(
+            lifecycle.draining_reason(),
+            Some(&crate::StopReason::IntensityTripped(trip.clone()))
+        );
+
+        assert!(
+            lifecycle
+                .begin_drain(crate::StopReason::StartupFailed(startup_failure.clone()))
+                .is_none()
+        );
+        assert_eq!(
+            lifecycle.draining_reason(),
+            Some(&crate::StopReason::StartupFailed(startup_failure.clone()))
+        );
+
+        assert!(
+            lifecycle
+                .begin_drain(crate::StopReason::ShutdownRequested)
+                .is_none()
+        );
+        assert_eq!(
+            lifecycle.draining_reason(),
+            Some(&crate::StopReason::ShutdownRequested)
+        );
+
+        let lower_reasons = [
+            crate::StopReason::Finished,
+            crate::StopReason::IntensityTripped(trip),
+            crate::StopReason::StartupFailed(startup_failure),
+        ];
+        for reason in lower_reasons {
+            assert!(lifecycle.begin_drain(reason).is_none());
+            assert_eq!(
+                lifecycle.draining_reason(),
+                Some(&crate::StopReason::ShutdownRequested),
+                "a lower-precedence reason cannot replace shutdown"
+            );
+        }
     }
 
     #[test]

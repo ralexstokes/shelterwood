@@ -145,9 +145,11 @@ impl ScopeRuntime {
 
     pub(super) fn force_all(&mut self) {
         self.hard_forced = true;
-        if !self.lifecycle.is_draining() {
-            self.begin_drain(StopReason::ShutdownRequested);
-        }
+        // Unconditional: on an already-draining scope this is a pure monotone
+        // reason upgrade (no drain-entry side effects are replayed), and a
+        // hard-forced scope must terminalize as ShutdownRequested even if it
+        // was mid-drain for a lower-precedence reason.
+        self.begin_drain(StopReason::ShutdownRequested);
         let now = runtime::now();
         let children: Vec<_> = self.children.keys().collect();
         for key in children {

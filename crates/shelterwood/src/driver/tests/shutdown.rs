@@ -1,6 +1,155 @@
 use super::support::*;
 
 #[crate::runtime::test]
+async fn latched_shutdown_upgrades_an_intensity_drain() {
+    let mut tree = Tree::new();
+    tree.intensity(Intensity::new(0, Duration::from_secs(10)).expect("valid intensity"));
+    tree.add_task(
+        "worker",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>()),
+    )
+    .expect("valid task");
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    root.set_state(ScopeState::Running);
+    root.set_startup(Ok(()));
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let mut children = ChildArena::default();
+    let key = children
+        .insert(child)
+        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_intensity_policy(plan.config.intensity)
+        .with_children(children)
+        .with_lifecycle(ScopeLifecycle::running())
+        .build();
+    plan.armed = false;
+    drop(plan);
+
+    scope.spawn_child(key);
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("worker is active");
+    let incarnation = active.incarnation;
+    active.abort_handle.abort();
+
+    // Model a shutdown request that latches after this pass sampled the
+    // control plane but before the collected child exit is dispatched.
+    assert!(root.request_shutdown().is_some());
+    scope.handle_exit(
+        key,
+        incarnation,
+        Some(RecordedOutcome::returned(Err(ExitError::message(
+            "trip intensity",
+        )))),
+        crate::runtime::JoinOutcome::Ok { value: () },
+        Cancellation::NotObserved,
+        false,
+    );
+    assert!(matches!(
+        scope.lifecycle.draining_reason(),
+        Some(StopReason::IntensityTripped(_))
+    ));
+
+    // The request's next-pass follow-up owns the stronger verdict even
+    // though teardown was already started by the intensity trip.
+    assert!(root.take_shutdown_request(scope.epoch));
+    scope.begin_drain(StopReason::ShutdownRequested);
+    assert_eq!(
+        scope.lifecycle.draining_reason(),
+        Some(&StopReason::ShutdownRequested)
+    );
+}
+
+#[crate::runtime::test]
+async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
+    let mut tree = Tree::new();
+    tree.intensity(Intensity::new(0, Duration::from_secs(10)).expect("valid intensity"));
+    tree.add_task(
+        "worker",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>()),
+    )
+    .expect("valid task");
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    root.set_state(ScopeState::Running);
+    root.set_startup(Ok(()));
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let mut children = ChildArena::default();
+    let key = children
+        .insert(child)
+        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_intensity_policy(plan.config.intensity)
+        .with_children(children)
+        .with_lifecycle(ScopeLifecycle::running())
+        .build();
+    plan.armed = false;
+    drop(plan);
+
+    scope.spawn_child(key);
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("worker is active");
+    let incarnation = active.incarnation;
+    active.abort_handle.abort();
+    scope.handle_exit(
+        key,
+        incarnation,
+        Some(RecordedOutcome::returned(Err(ExitError::message(
+            "trip intensity",
+        )))),
+        crate::runtime::JoinOutcome::Ok { value: () },
+        Cancellation::NotObserved,
+        false,
+    );
+    assert!(matches!(
+        scope.lifecycle.draining_reason(),
+        Some(StopReason::IntensityTripped(_))
+    ));
+
+    // Model the child driver collecting only the ancestor abort latch: force
+    // runs on a scope already draining for the trip, without a processed
+    // shutdown request having upgraded the reason first.
+    scope.force_all();
+    assert_eq!(
+        scope.lifecycle.draining_reason(),
+        Some(&StopReason::ShutdownRequested)
+    );
+    assert_eq!(
+        scope.finish_if_ready(),
+        Some(StopReason::ShutdownRequested),
+        "the same pass terminalizes with the forced verdict, not the stale trip"
+    );
+}
+
+#[crate::runtime::test(start_paused = true)]
 async fn force_uses_the_stop_funnel_for_every_ordered_child() {
     let mut tree = Tree::new();
     let first = tree

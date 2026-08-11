@@ -1032,6 +1032,29 @@ mod tests {
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
             "same-class events retain their observation order"
         );
+
+        // Keep this above the small-sort threshold: the compact fixture
+        // above documents every class, but an unstable insertion sort can
+        // preserve its two duplicate pairs by accident. This alternating
+        // shape makes a `sort_unstable_by_key` mutant reorder the larger
+        // ReadinessSignal class on the supported toolchain.
+        let mut same_class_pressure: [(ArbitrationClass, usize); 33] =
+            std::array::from_fn(|index| {
+                if index.is_multiple_of(2) {
+                    (ReadinessSignal, index)
+                } else {
+                    (ChildExit, index)
+                }
+            });
+        arbitrate(&mut same_class_pressure);
+        assert_eq!(
+            same_class_pressure.map(|(_, value)| value).as_slice(),
+            (1..33)
+                .step_by(2)
+                .chain((0..33).step_by(2))
+                .collect::<Vec<_>>(),
+            "larger same-class batches retain FIFO rather than unstable-sort order"
+        );
     }
 
     #[test]

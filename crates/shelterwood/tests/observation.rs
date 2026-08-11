@@ -747,7 +747,7 @@ async fn rebuilt_declared_handles_and_incarnations_keep_identity() {
             .lock()
             .expect("handle set mutex intact")
             .contains(&second),
-        "the rebuilt declaration remains retrievable after its membership rebase"
+        "the rebuilt declaration remains retrievable after lowering into the restarted subtree"
     );
     assert_eq!(
         hashed(&second),

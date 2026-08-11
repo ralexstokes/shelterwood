@@ -227,8 +227,26 @@ async fn assert_batch_trace(fire_timer: bool) {
     assert_subsequence(&trace, &["start", "continuation-1", "continuation-2"]);
     assert_subsequence(&trace, &["start", "mailbox"]);
     assert_subsequence(&trace, &["start", "offload"]);
+    let first_continuation = trace
+        .iter()
+        .position(|entry| *entry == "continuation-1")
+        .expect("the first continuation is present");
+    let second_continuation = trace
+        .iter()
+        .position(|entry| *entry == "continuation-2")
+        .expect("the second continuation is present");
+    assert!(
+        trace[first_continuation + 1..second_continuation]
+            .iter()
+            .any(|entry| matches!(*entry, "mailbox" | "offload")),
+        "one ready external delivery gets the fairness turn between consecutive continuations: {trace:?}"
+    );
     if fire_timer {
-        assert_subsequence(&trace, &["start", "timer"]);
+        assert_eq!(
+            trace.last(),
+            Some(&"timer"),
+            "the fired timer follows every captured continuation, mailbox, and offload entry"
+        );
     }
 }
 
@@ -323,8 +341,7 @@ async fn continuation_queued_by_external_handler_leads_remaining_steady_batch_wo
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     let trace = log.lock().expect("log mutex poisoned");
     assert_exact_entries(&trace, &["start", "offload-1", "offload-2", "continuation"]);
-    assert_subsequence(&trace, &["start", "offload-1", "offload-2"]);
-    assert_subsequence(&trace, &["offload-1", "continuation"]);
+    assert_subsequence(&trace, &["start", "offload-1", "continuation", "offload-2"]);
 }
 
 #[derive(Clone, Copy, Debug)]

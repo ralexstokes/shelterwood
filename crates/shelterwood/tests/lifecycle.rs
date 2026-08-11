@@ -9,7 +9,9 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, policy::never, poll_until};
+use crate::common::{
+    POLL_TIMEOUT, ReleaseGate, assert_quiet, policy::never, poll_once, poll_until,
+};
 use shelterwood::{
     Actor, ActorOnceDef, Cancellation, Context, DynamicTree, ExitError, ExitKind, ExitResult,
     GracePhase, Intensity, LifecycleEventKind, LifecycleItem, Readiness, Retention, ScopeState,
@@ -377,6 +379,7 @@ async fn grace_expiry_mid_ladder_joins_the_abort_before_advancing() {
     let first_stopping = ReleaseGate::default();
     let last_dropped = Arc::new(AtomicBool::new(false));
     let joined_before_advance = Arc::new(AtomicBool::new(false));
+    let last_handle = Arc::new(Mutex::new(None::<shelterwood::TaskRef>));
     let grace = Duration::from_secs(10);
     let mut tree = Tree::new();
     tree.add_task(
@@ -385,14 +388,25 @@ async fn grace_expiry_mid_ladder_joins_the_abort_before_advancing() {
             let first_stopping = first_stopping.clone();
             let last_dropped = Arc::clone(&last_dropped);
             let joined_before_advance = Arc::clone(&joined_before_advance);
+            let last_handle = Arc::clone(&last_handle);
             move |context| {
                 let first_stopping = first_stopping.clone();
                 let last_dropped = Arc::clone(&last_dropped);
                 let joined_before_advance = Arc::clone(&joined_before_advance);
+                let last_handle = Arc::clone(&last_handle);
                 async move {
                     context.shutdown_token().cancelled().await;
-                    joined_before_advance
-                        .store(last_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+                    let last = last_handle
+                        .lock()
+                        .expect("last handle mutex poisoned")
+                        .clone()
+                        .expect("last handle is installed before spawn");
+                    let mut terminal = Box::pin(last.wait());
+                    joined_before_advance.store(
+                        poll_once(terminal.as_mut()).is_ready()
+                            && last_dropped.load(Ordering::SeqCst),
+                        Ordering::SeqCst,
+                    );
                     first_stopping.release();
                     Ok(())
                 }
@@ -400,25 +414,27 @@ async fn grace_expiry_mid_ladder_joins_the_abort_before_advancing() {
         }),
     )
     .expect("valid first task");
-    tree.add_task(
-        "last",
-        TaskDef::new({
-            let last_stopping = last_stopping.clone();
-            let last_dropped = Arc::clone(&last_dropped);
-            move |context| {
+    let last = tree
+        .add_task(
+            "last",
+            TaskDef::new({
                 let last_stopping = last_stopping.clone();
                 let last_dropped = Arc::clone(&last_dropped);
-                async move {
-                    let _drop_signal = DropSignal(last_dropped);
-                    context.shutdown_token().cancelled().await;
-                    last_stopping.release();
-                    future::pending::<ExitResult>().await
+                move |context| {
+                    let last_stopping = last_stopping.clone();
+                    let last_dropped = Arc::clone(&last_dropped);
+                    async move {
+                        let _drop_signal = DropSignal(last_dropped);
+                        context.shutdown_token().cancelled().await;
+                        last_stopping.release();
+                        future::pending::<ExitResult>().await
+                    }
                 }
-            }
-        })
-        .shutdown(Shutdown::Graceful { grace }),
-    )
-    .expect("valid last task");
+            })
+            .shutdown(Shutdown::Graceful { grace }),
+        )
+        .expect("valid last task");
+    *last_handle.lock().expect("last handle mutex poisoned") = Some(last.clone());
 
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
@@ -436,6 +452,12 @@ async fn grace_expiry_mid_ladder_joins_the_abort_before_advancing() {
         .await
         .expect("shutdown task joins")
         .expect("shutdown completes within its owner budget");
+    assert!(matches!(
+        last.wait().await.kind(),
+        ExitKind::Aborted {
+            phase: GracePhase::AfterGrace
+        }
+    ));
 }
 
 #[tokio::test(start_paused = true)]

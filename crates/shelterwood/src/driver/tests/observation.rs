@@ -343,6 +343,63 @@ async fn terminal_scope_in_drain_waits_for_its_live_incarnation_to_stop() {
 }
 
 #[crate::runtime::test]
+async fn terminal_unstarted_scope_is_already_settled() {
+    let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+    scope
+        .member
+        .terminalize(Exit::never_started(), StartupDisposition::Unchanged);
+    assert_eq!(scope.record().state, ScopeState::Unstarted);
+
+    let scope_ref = ScopeRef { cell: scope };
+    let mut shutdown = Box::pin(scope_ref.shutdown_and_wait(Duration::from_secs(10)));
+    let first_poll =
+        std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+    assert!(
+        matches!(first_poll, Poll::Ready(Ok(()))),
+        "terminal membership with no spawned incarnation settles at entry"
+    );
+}
+
+#[crate::runtime::test]
+async fn shutdown_wait_settles_its_epoch_after_a_newer_incarnation_starts() {
+    let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+    let first = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("first scope epoch is available");
+    scope.set_state(ScopeState::Running);
+    let scope_ref = ScopeRef {
+        cell: Arc::clone(&scope),
+    };
+    let mut shutdown = Box::pin(scope_ref.shutdown_and_wait(Duration::from_secs(10)));
+    let accepted =
+        std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+    assert!(
+        accepted.is_pending(),
+        "the first live epoch accepts shutdown"
+    );
+
+    scope.set_state(ScopeState::Draining);
+    let draining =
+        std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+    assert!(draining.is_pending(), "the waiter targets the first epoch");
+
+    scope.finish_incarnation(first, StopReason::ShutdownRequested);
+    let second = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("second scope epoch is available");
+    scope.set_state(ScopeState::Running);
+    let superseded =
+        std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+    assert!(
+        matches!(superseded, Poll::Ready(Ok(()))),
+        "a newer live incarnation must not extend the captured epoch's wait"
+    );
+    assert!(!scope.incarnation_finished(second));
+
+    scope.finish_incarnation(second, StopReason::Finished);
+}
+
+#[crate::runtime::test]
 async fn wait_for_child_reloads_after_its_predicate_closes_the_snapshot_stream() {
     let scope = isolated_scope("scope", ScopeFlavor::Ordered);
     let epoch = scope

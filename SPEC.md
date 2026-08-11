@@ -2697,13 +2697,22 @@ integration toolkit for the driver shell and the end-to-end invariants.
     storm under `Always`.
 13. **No Tokio or runtime-adapter types are reachable from public façade
     items.** Tokio and `fastrand` integration is confined to
-    `shelterwood-runtime`; `shelterwood-core` has neither dependency, and the
-    mailbox state machines name runtime operations only through that adapter.
-    Crate dependencies enforce the implementation boundary. CI's retained
-    rustdoc-JSON walk separately rejects public reachability of
-    `shelterwood_runtime`, `tokio`, `tokio_util`, or `fastrand`. The former
+    `shelterwood-runtime`; `shelterwood-core` has neither dependency, so no
+    core item can name one. The mailbox state machines still reach the adapter
+    for the clock, sleeps, and detached disposal, so their contribution to the
+    public surface is checked rather than implied. CI's rustdoc-JSON walk
+    rejects public reachability of `shelterwood_runtime`, `tokio`,
+    `tokio_util`, or `fastrand`, and runs once per crate that contributes
+    public façade items — cross-crate re-exports are absent from the façade's
+    own document, so a single walk over it would not see them. The former
     regex/awk source-path checks and their fixtures are retired by the crate
     split; removing them does not relax either architectural requirement.
+    What the crate boundary does *not* yet carry is the intra-façade module
+    layering the retired checks also policed — `cells`, `plan`, `observe`, and
+    `cancellation` still sit alongside `driver`, and the exit path's
+    no-downcast rule now holds by construction only inside `shelterwood-core`.
+    Those lapse until the reducer consolidation moves the driver's decision
+    state into core; the requirements themselves are unchanged.
 14. **Event-woken observers see consistent-or-newer snapshots.** Subscribe
    to lifecycle events; *synchronously inside the event arm*, read the
    snapshot and assert it already reflects the event — at both ends of the

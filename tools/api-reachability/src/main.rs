@@ -11,6 +11,14 @@ use serde_json::Value;
 const FORBIDDEN_ROOTS: &[&str] = &["fastrand", "shelterwood_runtime", "tokio", "tokio_util"];
 const SUPPORTED_FORMAT_VERSION: u64 = 61;
 
+// This walk is scoped to the items one document actually contains. Rustdoc
+// JSON does not inline cross-crate re-exports: an item the façade re-exports
+// from a sibling crate appears only as a `use` whose target lives in that
+// sibling's document, so its signature is invisible here even though rustdoc
+// renders it as part of the façade's public API. Covering the façade surface
+// therefore means running this check once per crate that contributes public
+// items to it, not once on the façade — see the `runtime-api-check` recipe.
+
 fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args_os()
         .nth(1)
@@ -273,6 +281,42 @@ mod tests {
                 "shelterwood::leaked_join -> shelterwood_runtime::spawn::JoinHandle".to_owned(),
             ])
         );
+    }
+
+    /// Pins the limitation that makes the per-crate lanes necessary.
+    ///
+    /// A façade item re-exported from a sibling crate reaches this document
+    /// only as a `use` pointing at an id the document does not describe, so
+    /// whatever that item's signature names is unreachable from here even
+    /// though rustdoc renders it as public façade API. The walk must run on
+    /// the sibling's own document to see it. If rustdoc ever begins inlining
+    /// cross-crate re-exports this test fails, which is the signal to revisit
+    /// whether the extra lanes are still required.
+    #[test]
+    fn cannot_see_through_a_cross_crate_re_export() {
+        let document = json!({
+            "format_version": 61,
+            "index": {
+                "0": {
+                    "id": 0,
+                    "inner": { "module": { "items": [1] } }
+                },
+                "1": {
+                    "id": 1,
+                    "inner": { "use": { "id": 2, "name": "ActorRef" } }
+                }
+            },
+            "paths": {
+                "0": { "crate_id": 0, "path": ["shelterwood"] },
+                // The re-exported type itself is not forbidden; the leak would
+                // be inside one of its methods, which this document omits
+                // entirely because the item is defined in another crate.
+                "2": { "crate_id": 5, "path": ["shelterwood_mailbox", "futures", "ActorRef"] }
+            }
+        });
+
+        let leaks = find_leaks(&document).expect("fixture must be valid rustdoc-shaped JSON");
+        assert!(leaks.is_empty());
     }
 
     #[test]

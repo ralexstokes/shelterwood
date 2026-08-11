@@ -24,9 +24,16 @@ test:
 doc-check:
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --all-features
 
+# Rustdoc JSON does not inline cross-crate re-exports, so the façade document
+# describes only the items the façade itself defines. Every crate that
+# contributes items to the public façade is therefore walked on its own
+# document; `shelterwood-core` needs no walk because it has no adapter, tokio,
+# or fastrand dependency for an item to name.
 runtime-api-check:
     RUSTDOCFLAGS="-Z unstable-options --output-format json" cargo +nightly rustdoc --locked -p shelterwood --all-features --lib
     cargo run --locked -p shelterwood-api-reachability -- target/doc/shelterwood.json
+    RUSTDOCFLAGS="-Z unstable-options --output-format json" cargo +nightly rustdoc --locked -p shelterwood-mailbox --all-features --lib
+    cargo run --locked -p shelterwood-api-reachability -- target/doc/shelterwood_mailbox.json
 
 packaged-docs-sync:
     ./tools/sync-packaged-docs.sh --write

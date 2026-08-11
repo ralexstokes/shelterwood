@@ -42,6 +42,13 @@
                   cargo rustdoc --locked -p shelterwood --all-features --lib
                 cargo run --locked -p shelterwood-api-reachability -- \
                   target/doc/shelterwood.json
+                # Cross-crate re-exports are absent from the façade document,
+                # so every crate contributing public façade items is walked
+                # separately. See the justfile recipe for the full rationale.
+                RUSTDOCFLAGS="-Z unstable-options --output-format json" \
+                  cargo rustdoc --locked -p shelterwood-mailbox --all-features --lib
+                cargo run --locked -p shelterwood-api-reachability -- \
+                  target/doc/shelterwood_mailbox.json
                 ${pkgs.bash}/bin/bash ./tools/sync-packaged-docs.sh --check
                 ${pkgs.bash}/bin/bash ./tools/check-packaged-crate.sh
               '';

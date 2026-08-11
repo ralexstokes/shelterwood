@@ -141,7 +141,7 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
 
-    actor.send(Message::Stop).await.expect("stop accepted");
+    let accepting_incarnation = actor.send(Message::Stop).await.expect("stop accepted");
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             stop_entered.load(Ordering::SeqCst)
@@ -168,7 +168,11 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
         .try_send(Message::Value(3))
         .expect_err("frozen intake rejects fail-fast sends");
     assert_eq!(rejection.kind, SendErrorKind::NotRunning);
-    assert!(rejection.incarnation_observed.is_some());
+    assert_eq!(
+        rejection.incarnation_observed,
+        Some(accepting_incarnation),
+        "freeze rejection reports the exact incarnation that accepted the frozen prefix"
+    );
 
     let parked_actor = actor.clone();
     let parked_started = ReleaseGate::default();

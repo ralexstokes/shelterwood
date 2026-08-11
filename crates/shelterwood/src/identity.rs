@@ -521,8 +521,10 @@ mod tests {
         let id = ChildId::from("worker");
         let first_grant = scope.mint_membership(&id).expect("membership available");
         let first = first_grant.membership();
+        assert!(!first.supersedes(first));
         let second_grant = scope.mint_membership(&id).expect("membership available");
         let second = second_grant.membership();
+        assert!(!second.supersedes(second));
         assert!(second.supersedes(first));
         assert!(!first.supersedes(second));
 
@@ -536,6 +538,8 @@ mod tests {
         let (_, mut generations) = first_grant.into_pair();
         let a = generations.mint().expect("incarnation available");
         let b = generations.mint().expect("incarnation available");
+        assert!(!a.supersedes(a));
+        assert!(!b.supersedes(b));
         assert!(b.supersedes(a));
         assert_eq!(a.membership(), first);
         assert!(
@@ -547,6 +551,43 @@ mod tests {
                     .expect("incarnation available")
             )
         );
+    }
+
+    #[test]
+    fn adopted_membership_orders_a_direct_mint_and_later_rebuild() {
+        let id = ChildId::from("worker");
+        let mut declaration = ScopeIdentity::new();
+        let provisional = declaration
+            .mint_membership(&id)
+            .expect("provisional membership available")
+            .membership();
+
+        let mut stable = ScopeIdentity::new();
+        assert!(matches!(
+            stable.adopt_or_mint_membership(&id, provisional),
+            Some(None)
+        ));
+        let direct = stable
+            .mint_membership(&id)
+            .expect("a direct mint follows the adopted generation")
+            .membership();
+
+        let mut rebuilt_declaration = ScopeIdentity::new();
+        let rebuilt = rebuilt_declaration
+            .mint_membership(&id)
+            .expect("rebuilt provisional membership available")
+            .membership();
+        let reconciled = stable
+            .adopt_or_mint_membership(&id, rebuilt)
+            .expect("stable identity is not exhausted")
+            .expect("an occupied stable identity mints a successor")
+            .membership();
+
+        assert!(direct.supersedes(provisional));
+        assert!(reconciled.supersedes(direct));
+        assert!(!direct.supersedes(reconciled));
+        assert!(!rebuilt.supersedes(reconciled));
+        assert!(!reconciled.supersedes(rebuilt));
     }
 
     #[test]

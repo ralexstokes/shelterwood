@@ -486,6 +486,11 @@ impl ScopeEpochGuard {
         self.lifecycle.clone()
     }
 
+    fn epoch(&self) -> Epoch {
+        self.epoch
+            .expect("an owned scope epoch remains available until transfer or finish")
+    }
+
     fn finish(mut self, reason: StopReason) {
         let epoch = self
             .epoch
@@ -552,7 +557,7 @@ async fn run_nested_tree_with_epoch(
     scope: Arc<ScopeCell>,
     inherited: ResolvedDefaults,
     latches: NestedScopeLatches,
-    epoch: ScopeEpochGuard,
+    mut epoch: ScopeEpochGuard,
 ) -> crate::ExitResult {
     let plan = match tree.lower(inherited, Some(Arc::clone(&scope))) {
         Ok(plan) => plan,
@@ -571,9 +576,51 @@ async fn run_nested_tree_with_epoch(
             // cancellation-safe disposal jobs.
             disposal.fired().await;
             let failure = StartupFailure { cause };
-            scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
-            epoch.finish(StopReason::StartupFailed(failure.clone()));
-            return Err(crate::ExitError::from_startup_failure(failure));
+            // A lowering failure occurs before the driver loop exists, but it
+            // still belongs to a live incarnation. Resolve every stop source
+            // through the same monotone verdict lattice as the loop path.
+            // Peek rather than consume: `finish_incarnation` clears both
+            // epoch-tagged request latches after publishing the verdict.
+            // The ancestor *abort* latch needs no separate arm: it is the
+            // framework-abort edge, fired only by `StopAction::AbortFramework`,
+            // and the stop ladder unconditionally passes through
+            // `StopAction::Cancel` — which fires this same ancestor shutdown
+            // latch — before it can reach that phase.
+            if scope.has_stop_request(epoch.epoch()) || latches.ancestor.shutdown.is_fired() {
+                // Mirror the loop's `Pending::Shutdown` arm: firing the
+                // ancestor shutdown latch is what makes this scope's exit read
+                // `Cancellation::Observed` at its parent, as a requested stop
+                // must (§11). The latch is level-triggered, so re-firing an
+                // ancestor-driven stop is a no-op.
+                latches.ancestor.shutdown.fire();
+                epoch.lifecycle.begin_drain(StopReason::ShutdownRequested);
+            }
+            // Both drain effects are deliberately discarded: this path
+            // publishes no `Draining` edge because nothing was ever started to
+            // drain, matching the pre-lattice behaviour of the `StartupFailed`
+            // verdict it generalizes.
+            epoch
+                .lifecycle
+                .begin_drain(StopReason::StartupFailed(failure));
+            let reason = epoch
+                .lifecycle
+                .draining_reason()
+                .cloned()
+                .expect("pre-loop verdicts enter the drain lattice");
+            let startup = match &reason {
+                StopReason::ShutdownRequested => Err(StartupError::ShutdownRequested),
+                StopReason::StartupFailed(failure) => {
+                    Err(StartupError::StartupFailed(failure.clone()))
+                }
+                StopReason::Finished
+                | StopReason::IntensityTripped(_)
+                | StopReason::NeverStarted => {
+                    unreachable!("lowering resolves only failure or shutdown verdicts")
+                }
+            };
+            scope.set_startup(startup);
+            epoch.finish(reason.clone());
+            return reason.into_nested_result();
         }
     };
     run_scope_incarnation(plan.take_for_runtime(), ScopeRole::Nested(latches), epoch)

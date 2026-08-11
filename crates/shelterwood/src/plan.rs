@@ -53,6 +53,19 @@ pub(crate) fn mint_reserved_slot(
     Ok(SlotCell::new(member, scope))
 }
 
+/// Installs a valid option set for a manually constructed resident fixture,
+/// preserving production lowering's resolve-before-residency ordering.
+#[cfg(test)]
+pub(crate) fn resolve_fixture_options(member: &MemberCell) {
+    let options = resolve_common(
+        &CommonOptions::default(),
+        &ResolvedDefaults::default(),
+        ChildMode::Restartable,
+        Readiness::Immediate,
+    );
+    member.set_options(options);
+}
+
 enum DefinitionState {
     Undefined,
     Defined(Isolated<ChildConstruction>),

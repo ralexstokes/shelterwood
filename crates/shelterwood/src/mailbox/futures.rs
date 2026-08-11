@@ -277,6 +277,10 @@ impl<M: Send + 'static> Future for SendFuture<M> {
         let SendFutureState::Parked(operation) = &this.state else {
             panic!("a completed send future was polled")
         };
+        // A RawWaker vtable is caller code: clone before taking the operation
+        // lock, and release the lock before destroying either this clone or a
+        // previously registered waker.
+        let next_waker = context.waker().clone();
         let mut operation_state = operation
             .state
             .lock()
@@ -305,7 +309,9 @@ impl<M: Send + 'static> Future for SendFuture<M> {
                 Poll::Ready(Err(error))
             }
             OperationOutcome::Waiting { .. } => {
-                operation_state.waker = Some(context.waker().clone());
+                let stale_waker = operation_state.waker.replace(next_waker);
+                drop(operation_state);
+                drop(stale_waker);
                 Poll::Pending
             }
             OperationOutcome::Withdrawn => panic!("a withdrawn send future was polled"),
@@ -615,11 +621,12 @@ impl<M: Send + 'static, T: Send + 'static> Future for CallFuture<M, T> {
 mod tests {
     use std::{
         future::Future,
+        mem::ManuallyDrop,
         sync::{
-            Arc,
+            Arc, Weak,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Poll, Waker},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     };
 
     use crate::{
@@ -628,7 +635,78 @@ mod tests {
         identity::ScopeIdentity,
     };
 
-    use super::{super::cell::tests::actor, ActorRef, MailboxCell};
+    use super::{super::cell::tests::actor, ActorRef, MailboxCell, SendFutureState, SendOperation};
+
+    #[derive(Default)]
+    struct WakerVtableCalls {
+        clones: AtomicUsize,
+        drops: AtomicUsize,
+    }
+
+    struct OperationLockProbe {
+        operation: Weak<SendOperation<u8>>,
+        calls: Arc<WakerVtableCalls>,
+    }
+
+    impl OperationLockProbe {
+        fn assert_operation_unlocked(&self, callback: &str) {
+            let operation = self
+                .operation
+                .upgrade()
+                .expect("the parked send retains its operation");
+            let _guard = operation
+                .state
+                .try_lock()
+                .unwrap_or_else(|_| panic!("waker {callback} ran under the operation lock"));
+        }
+    }
+
+    unsafe fn clone_operation_lock_probe(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable was produced by
+        // `Arc::into_raw` for an `OperationLockProbe`. `ManuallyDrop` preserves
+        // the reference represented by `data`; the returned raw waker owns the
+        // newly cloned reference.
+        let probe = ManuallyDrop::new(unsafe { Arc::<OperationLockProbe>::from_raw(data.cast()) });
+        probe.assert_operation_unlocked("clone");
+        probe.calls.clones.fetch_add(1, Ordering::SeqCst);
+        let cloned = Arc::clone(&probe);
+        RawWaker::new(Arc::into_raw(cloned).cast(), &OPERATION_LOCK_PROBE_VTABLE)
+    }
+
+    unsafe fn wake_operation_lock_probe(data: *const ()) {
+        // SAFETY: `wake` consumes the raw-waker reference represented by data.
+        drop(unsafe { Arc::<OperationLockProbe>::from_raw(data.cast()) });
+    }
+
+    unsafe fn wake_operation_lock_probe_by_ref(_data: *const ()) {}
+
+    unsafe fn drop_operation_lock_probe(data: *const ()) {
+        // SAFETY: `drop` consumes the raw-waker reference represented by data.
+        let probe = unsafe { Arc::<OperationLockProbe>::from_raw(data.cast()) };
+        probe.assert_operation_unlocked("drop");
+        probe.calls.drops.fetch_add(1, Ordering::SeqCst);
+    }
+
+    static OPERATION_LOCK_PROBE_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_operation_lock_probe,
+        wake_operation_lock_probe,
+        wake_operation_lock_probe_by_ref,
+        drop_operation_lock_probe,
+    );
+
+    fn operation_lock_probe_waker(
+        operation: &Arc<SendOperation<u8>>,
+        calls: Arc<WakerVtableCalls>,
+    ) -> Waker {
+        let probe = Arc::new(OperationLockProbe {
+            operation: Arc::downgrade(operation),
+            calls,
+        });
+        let raw = RawWaker::new(Arc::into_raw(probe).cast(), &OPERATION_LOCK_PROBE_VTABLE);
+        // SAFETY: `raw` owns one `OperationLockProbe` reference and its vtable
+        // maintains that reference count for every clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
 
     #[test]
     fn an_accepted_send_reports_acceptance_on_every_poll() {
@@ -655,6 +733,46 @@ mod tests {
         };
         assert_eq!(first, second);
         assert_eq!(first, incarnation);
+    }
+
+    #[test]
+    fn replacing_a_send_waker_runs_its_vtable_outside_the_operation_lock() {
+        let (_, actor) = actor();
+        let mut send = Box::pin(actor.send(1));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let operation = match &send.as_ref().get_ref().state {
+            SendFutureState::Parked(operation) => Arc::clone(operation),
+            SendFutureState::Immediate(_) | SendFutureState::Sent(_) | SendFutureState::Done => {
+                panic!("an unbound mailbox parks its send")
+            }
+        };
+        let calls = Arc::new(WakerVtableCalls::default());
+        let hostile = operation_lock_probe_waker(&operation, Arc::clone(&calls));
+
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        drop(hostile);
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+
+        assert_eq!(calls.clones.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.drops.load(Ordering::SeqCst), 2);
+        drop(
+            operation
+                .state
+                .lock()
+                .expect("hostile waker callbacks cannot poison the operation lock"),
+        );
     }
 
     struct CountedDrop(Arc<AtomicUsize>);

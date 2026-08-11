@@ -1194,7 +1194,10 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   per policy and holds the aggregate open (the latch rule below),
   exactly as an ordered gate does. A **terminal** pre-ready exit of an
   initial member before the aggregate fires is the scope's terminal
-  startup failure — and because every initial member was spawned at
+  startup failure — *unless* that exit is the commit of an
+  owner-initiated removal, in which case the member simply leaves
+  the declared set under the aggregate rule below and startup
+  continues — and because every initial member was spawned at
   lowering, there is no not-yet-started suffix: **no sibling
   terminalizes `NeverStarted`**. The transition is pinned: the scope
   leaves `Starting` the moment the exit funnel dispatches that terminal
@@ -1218,9 +1221,24 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   lowered with — its declared initial set; runtime additions to a
   dynamic scope never join the aggregate, whether they are admitted
   before or after it fires (their per-child `Ready` events, B.4, are
-  the observation surface). The aggregate fires at most once per scope
-  incarnation and is latched: an already-ready child that fails and
-  restarts afterwards does not rewind it — readiness is a
+  the observation surface). Removing an initial member while the scope
+  is `Starting` shrinks that declared set, and the aggregate may
+  complete when the remaining initial members are ready — including
+  the empty case, where removing every initial member completes
+  startup. The shrink is **commit-time, not request-time**: the member
+  leaves the declared set when its removal commits (residency
+  withdrawn, `Removed` published), so a slow-stopping member holds the
+  aggregate open for its whole stop ladder, and the recomputation is
+  ordered ahead of the removal response — a returned `Removed` implies
+  the aggregate has already seen the shrunken set. That commit point
+  pins the race against the member's own pre-ready failure: a terminal
+  pre-ready exit or readiness timeout whose terminal routing observes
+  the membership *not yet* marked removing fails startup under the
+  rule above, while once the mark is in place removal outranks it and
+  the aggregate simply shrinks. Both orders are legal; which one a
+  given run takes is not specified. The aggregate fires at most once
+  per scope incarnation and is latched: an already-ready child that
+  fails and restarts afterwards does not rewind it — readiness is a
   startup-phase edge, not a liveness signal (snapshots carry liveness,
   B.6). The same latch decides the pre-fire race: a gated child that
   restarts *before* the aggregate has fired holds it open until the
@@ -2544,6 +2562,16 @@ integration toolkit for the driver shell and the end-to-end invariants.
    while a gated runtime member sits unready); an already-ready child
    restarting before the aggregate fires holds it open, and one
    restarting after it fires does not rewind it.
+   Removal shrinks the declared set (§6), pinned by public-API repros
+   that hang the unfixed driver for a full virtual timeout: removing
+   the sole unready initial member completes startup; so does removing
+   the last unready one beside a ready sibling, removing every initial
+   member concurrently (the empty declared set), and removing the sole
+   unready member of a *nested* dynamic scope — which must publish the
+   aggregate up to an ordered parent and release its gated sibling.
+   The negative pins the guard: removing an *already-ready* initial
+   member while an unready one remains leaves the scope quietly
+   `Starting`.
 7. **Exactly one published exit report per incarnation, on every path
    including panic and abort; publication is post-join (§7's two-phase
    rule); one runner, one exit type.** The two hard provocations: an
@@ -3311,7 +3339,11 @@ Ordering and delivery contract:
   descendant memberships). `Stopped` is an incarnation edge, not a
   closure signal: only membership terminality ends the stream (closure
   rule below), so every non-final `Stopped` is followed on the same
-  sequence by the next incarnation's `Starting`, and the positive
+  sequence either by the next incarnation's `Starting` or by a
+  strictly-higher-precedence `Stopped` for the *same* incarnation
+  (B.6's stop-reason lattice — a bounded, monotone correction, never a
+  repeat of an equal verdict), and the final `Stopped` is the one
+  followed by neither. The positive
   terminality signals are the membership edges — the parent's `Removed`
   for this scope child, or this stream's own closure, always preceded
   by the final event. Snapshot receivers hold the last published snapshot through the
@@ -3360,7 +3392,8 @@ Ordering and delivery contract:
   scope's final event — closure is always preceded by one (under
   sequence exhaustion, by the final `Lagged`), and per the restart
   rule above a `Stopped` alone is not closure: the final `Stopped` is
-  the one no restart follows. For a scope membership that never spawns
+  the one no restart and no precedence upgrade follows. For a scope
+  membership that never spawns
   (a declaring tree dropped unspawned, a withdrawn or rejected
   insertion, §3.2), that terminal event is
   `ScopeState { Stopped { reason: NeverStarted } }` (B.6), published at
@@ -3490,7 +3523,9 @@ ScopeSnapshot   { state: Unstarted                              // membership ex
                                                                 //   tree, rejected/withdrawn insertion,
                                                                 //   removal before first spawn, startup-
                                                                 //   aborted ordered sibling (§6) — the
-                                                                //   scope-state twin of §7's exit
+                                                                //   scope-state twin of §7's exit, an
+                                                                //   invariant the stop-reason lattice
+                                                                //   below preserves in either order
                   kind: Ordered | Dynamic, strategy (ordered only), intensity,
                   total_restarts: TotalRestarts,         // charges per §9.2 — group respawns count
                   lifecycle_seq: LifecycleSeq,           // aligns events with snapshots (§12)
@@ -3499,6 +3534,28 @@ ScopeSnapshot   { state: Unstarted                              // membership ex
                                                          //   pre-admission reserved cells are
                                                          //   absent (§3.2)
                 + child(id), descendant(path) traversal helpers
+
+**Stop-reason lattice.** Several owners can independently reach a stop verdict
+for one incarnation — a driver's drain epilogue, a join monitor's fallback
+after that driver panicked or was cancelled, a never-started terminalization —
+so a scope's published `Stopped { reason }` resolves competing verdicts by
+**precedence, never by arrival order**. The total order is
+`Finished < IntensityTripped < StartupFailed < ShutdownRequested <
+NeverStarted`. A later verdict replaces the published reason — and emits a
+corrected `ScopeState` edge, per B.4's non-final-`Stopped` rule — iff it
+strictly outranks the recorded one; equal or weaker verdicts are idempotent
+repeats that publish nothing. The order is severity-ascending: `Finished` is
+the weakest claim, since a drain that began on natural completion says nothing
+about how the teardown itself ended; `ShutdownRequested` supersedes the
+structured failures, matching §11's drain-upgrade rule, which joins through
+this same lattice; and `NeverStarted` is the top element because it is not a
+live incarnation's verdict but the membership-terminal twin of §7's
+`NeverStarted` exit, so the scope-state projection and the membership exit
+agree whichever publication lands first. The consequences are that
+`wait_stopped()`, the final snapshot, and the stream's last `ScopeState` event
+always report the same, highest-precedence verdict, and that a root driver
+that dies mid-drain reports the join monitor's `ShutdownRequested` rather than
+the abandoned drain's `Finished`.
 
 ActorStats (II §20)
                 { messages_received, messages_accepted, messages_conflated,

@@ -1116,9 +1116,16 @@ mod tests {
             "forcing after expiry cannot move the deadline later"
         );
         assert_eq!(
-            ladder.advance(due),
+            ladder.advance(due + Duration::from_secs(1)),
             Some(StopAction::Escalate),
-            "the original due instant remains actionable"
+            "the already-due ladder remains actionable at the force instant"
+        );
+        assert_eq!(
+            ladder.advance(ladder.deadline().expect("tidy deadline")),
+            Some(StopAction::HardAbort {
+                phase: GracePhase::AfterGrace
+            }),
+            "force arriving after grace expiry preserves after-grace provenance"
         );
     }
 
@@ -1165,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    fn overflowing_grace_never_becomes_immediately_due() {
+    fn overflowing_grace_stays_pending_until_force_rescues_the_ladder() {
         let start = Instant::now();
         let mut ladder = StopLadder::new(Shutdown::Graceful {
             grace: Duration::MAX,
@@ -1174,6 +1181,17 @@ mod tests {
         assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
         assert_eq!(ladder.deadline(), None);
         assert_eq!(ladder.advance(start), None);
+
+        let forced_at = start + Duration::from_secs(1);
+        ladder.force(forced_at);
+        assert_eq!(ladder.deadline(), Some(forced_at));
+        assert_eq!(ladder.advance(forced_at), Some(StopAction::Escalate));
+        assert_eq!(
+            ladder.advance(ladder.deadline().expect("forced tidy deadline")),
+            Some(StopAction::HardAbort {
+                phase: GracePhase::WithinGrace
+            })
+        );
     }
 
     #[test]
@@ -1200,6 +1218,17 @@ mod tests {
                 MembershipStatus::Active
             ),
             ExitDispatch::Terminal
+        );
+        let success = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+        assert_eq!(
+            dispatch_exit(
+                &success,
+                restart,
+                ScopeMode::Running,
+                MembershipStatus::Active
+            ),
+            ExitDispatch::Terminal,
+            "a running scope still honors a restart policy that declines this exit"
         );
         assert_eq!(
             dispatch_exit(
@@ -1234,6 +1263,34 @@ mod tests {
             aged.total_restarts,
             TotalRestarts::ZERO.bump().bump().bump()
         );
+    }
+
+    /// Pins the observable behaviour of a charge dated before one already in
+    /// the window; it cannot discriminate `charge`'s `checked_duration_since`
+    /// from the saturating `duration_since`. That guard is defence in depth:
+    /// the saturating form yields `Duration::ZERO` for a regressed clock, and
+    /// `Intensity::validate` rejects a zero `within`, so `ZERO > within` is
+    /// already false for every constructible policy. Replacing the checked
+    /// call with the saturating one leaves this assertion — and the rest of
+    /// the suite — green.
+    #[test]
+    fn intensity_clock_regression_retains_future_charges() {
+        let start = Instant::now();
+        let policy = Intensity::new(5, Duration::from_secs(10)).expect("valid intensity");
+        let mut state = IntensityState::default();
+
+        assert_eq!(
+            state
+                .charge(policy, start + Duration::from_secs(5))
+                .in_window,
+            1
+        );
+        let regressed = state.charge(policy, start);
+        assert_eq!(
+            regressed.in_window, 2,
+            "a charge from the apparent future stays in the window"
+        );
+        assert_eq!(regressed.total_restarts, TotalRestarts::ZERO.bump().bump());
     }
 
     #[test]
@@ -1327,6 +1384,7 @@ mod tests {
     fn readiness_configuration_and_signal_deadline_race_are_engine_owned() {
         let deadline = Instant::now();
         let mut ready = ReadinessGate::new();
+        assert!(ready.needs_signal_watch());
         assert_eq!(
             ready.step(ReadinessEvent::Configure {
                 readiness: crate::Readiness::Manual,
@@ -1334,6 +1392,7 @@ mod tests {
             }),
             Some(ReadinessEffect::ArmDeadline { deadline })
         );
+        assert!(ready.needs_signal_watch());
         assert_eq!(
             ready.step(ReadinessEvent::Deadline {
                 now: deadline,
@@ -1341,6 +1400,7 @@ mod tests {
             }),
             Some(ReadinessEffect::BecameReady)
         );
+        assert!(!ready.needs_signal_watch());
         assert_eq!(
             ready.step(ReadinessEvent::Deadline {
                 now: deadline,
@@ -1377,6 +1437,17 @@ mod tests {
             }),
             Some(ReadinessEffect::TimedOut { deadline })
         );
+        assert!(!timed_out.needs_signal_watch());
+
+        let mut immediate = ReadinessGate::new();
+        assert_eq!(
+            immediate.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::Immediate,
+                deadline: None,
+            }),
+            Some(ReadinessEffect::BecameReady)
+        );
+        assert!(!immediate.needs_signal_watch());
 
         let mut shutdown = ReadinessGate::new();
         assert_eq!(
@@ -1390,6 +1461,7 @@ mod tests {
             shutdown.step(ReadinessEvent::Shutdown),
             Some(ReadinessEffect::Disarmed)
         );
+        assert!(!shutdown.needs_signal_watch());
     }
 
     #[test]
@@ -1545,6 +1617,10 @@ mod tests {
         );
         assert_eq!(epochs.begin(), None, "a live epoch cannot be replaced");
         let unminted = first.successor().expect("a successor epoch is available");
+        assert!(!epochs.request_is_pending(first));
+        assert!(!epochs.request_is_pending(unminted));
+        assert!(!epochs.finished(first));
+        assert!(!epochs.finished(unminted));
         assert!(!epochs.finish(unminted));
         assert_eq!(epochs.live_epoch(), Some(first));
         assert!(epochs.finish(first));
@@ -1568,6 +1644,10 @@ mod tests {
         assert_eq!(exhausted.live_epoch(), None);
         assert_eq!(exhausted.request_target(), None);
         assert_eq!(exhausted.begin(), None, "poisoning is permanent");
+        assert!(!exhausted.request_is_pending(last));
+        assert!(!exhausted.request_is_pending(Epoch(u64::MAX)));
+        assert!(exhausted.finished(last));
+        assert!(!exhausted.finished(Epoch(u64::MAX)));
         assert!(!exhausted.finish(Epoch(u64::MAX)));
     }
 

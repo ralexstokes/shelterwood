@@ -762,8 +762,9 @@ impl SharedOffloadState {
             return None;
         }
         debug_assert!(!state.polling, "offload work must have one poller");
-        state.polling = true;
-        state.future.take()
+        let future = state.future.take();
+        state.polling = future.is_some();
+        future
     }
 
     fn finish_poll(&self, future: OffloadFuture, outcome: OffloadPoll) -> Option<OffloadFuture> {
@@ -1984,7 +1985,7 @@ mod tests {
     };
 
     use super::{
-        Contained, EventQueue, OffloadResource, PanicSlot, QueuedEvent, RawResources,
+        Contained, EventQueue, OffloadPoll, OffloadResource, PanicSlot, QueuedEvent, RawResources,
         SharedOffloadFuture, SharedOffloadState,
     };
     use crate::runtime::{
@@ -2263,6 +2264,29 @@ mod tests {
         assert_eq!(
             panic_message(&payload),
             Some("unit offload destructor panic")
+        );
+    }
+
+    #[test]
+    fn absent_offload_future_does_not_claim_a_poller() {
+        let state = SharedOffloadState::new(
+            Box::pin(std::future::pending()),
+            Arc::new(PanicSlot::default()),
+            Signal::default(),
+            Latch::default(),
+        );
+        let future = state.take_for_poll().expect("fixture future is present");
+        let dispose = state.finish_poll(future, OffloadPoll::Finished);
+        state.dispose(dispose);
+
+        assert!(state.take_for_poll().is_none());
+        assert!(
+            !state
+                .state
+                .lock()
+                .expect("offload future mutex starts healthy")
+                .polling,
+            "a contract-violating re-poll with no future cannot leave a poller claimed"
         );
     }
 

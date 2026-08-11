@@ -86,12 +86,6 @@ impl PanicOnDrop {
     }
 }
 
-impl Default for PanicOnDrop {
-    fn default() -> Self {
-        Self::new("intentional destructor panic")
-    }
-}
-
 impl Drop for PanicOnDrop {
     fn drop(&mut self) {
         panic!("{}", self.0);

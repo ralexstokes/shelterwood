@@ -379,11 +379,7 @@ async fn blocked_initial_scope_factory_owns_its_stop_epilogue() {
     let plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = ScopeEpochGuard::begin(&root).expect("parent epoch is available");
-    let driver = crate::runtime::spawn(run_scope_incarnation(
-        plan.take_for_runtime(),
-        ScopeRole::Root,
-        epoch,
-    ));
+    let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
     let abort = driver.abort_handle();
 
     assert!(matches!(
@@ -442,11 +438,7 @@ async fn blocked_restart_scope_factory_supersedes_the_stale_stopped_projection()
     let plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let epoch = ScopeEpochGuard::begin(&root).expect("parent epoch is available");
-    let driver = crate::runtime::spawn(run_scope_incarnation(
-        plan.take_for_runtime(),
-        ScopeRole::Root,
-        epoch,
-    ));
+    let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
     let abort = driver.abort_handle();
 
     assert!(matches!(

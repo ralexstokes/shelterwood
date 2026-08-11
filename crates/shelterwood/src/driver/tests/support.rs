@@ -121,7 +121,7 @@ impl ScopeRuntimeBuilder {
             events: self.events,
             disposal_events: self.disposal_events,
             deadlines: super::super::DeadlineQueue::default(),
-            jitter: crate::runtime::JitterRng::from_system_entropy(),
+            jitter: crate::runtime::JitterRng::new(),
             lifecycle: self.lifecycle,
             next_ordered_start: self.next_ordered_start,
             role: ScopeRole::Root,

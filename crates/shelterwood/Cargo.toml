@@ -10,6 +10,9 @@ homepage = "https://github.com/ralexstokes/shelterwood"
 repository = "https://github.com/ralexstokes/shelterwood"
 autotests = false
 
+[lints]
+workspace = true
+
 [dependencies]
 fastrand.workspace = true
 thiserror.workspace = true

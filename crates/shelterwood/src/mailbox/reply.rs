@@ -88,6 +88,32 @@ pub(super) struct ReplyOperation<T> {
     receiver: DisposingReceiver<T>,
 }
 
+pub(super) enum ReplyPoll<T> {
+    Value(T),
+    SenderClosed,
+    TimedOut,
+}
+
+pub(super) fn poll_reply<T>(
+    receiver: &mut DisposingReceiver<T>,
+    context: &mut Context<'_>,
+    phase: DeadlinePhase,
+) -> Poll<ReplyPoll<T>> {
+    match receiver.poll_receive(context) {
+        Poll::Ready(Some(value)) => Poll::Ready(ReplyPoll::Value(value)),
+        Poll::Ready(None) => Poll::Ready(ReplyPoll::SenderClosed),
+        Poll::Pending if phase == DeadlinePhase::TimeoutArbitration => {
+            match receiver.close_and_poll_receive(context) {
+                OneShotClose::Value(value) => Poll::Ready(ReplyPoll::Value(value)),
+                OneShotClose::SenderClosed => Poll::Ready(ReplyPoll::SenderClosed),
+                OneShotClose::Empty => Poll::Ready(ReplyPoll::TimedOut),
+                OneShotClose::Pending => Poll::Pending,
+            }
+        }
+        Poll::Pending => Poll::Pending,
+    }
+}
+
 impl<T> DeadlineOperation for ReplyOperation<T> {
     type Output = Result<T, ReplyError>;
 
@@ -97,23 +123,16 @@ impl<T> DeadlineOperation for ReplyOperation<T> {
         _budget: crate::deadline::Deadline,
         phase: DeadlinePhase,
     ) -> Poll<Self::Output> {
-        match self.receiver.inner.poll_receive(context) {
-            Poll::Ready(Some(value)) => Poll::Ready(Ok(value)),
-            Poll::Ready(None) => Poll::Ready(Err(ReplyError::Dropped)),
-            Poll::Pending if phase == DeadlinePhase::Elapsed => {
-                match self.receiver.inner.close_and_poll_receive(context) {
-                    OneShotClose::Value(value) => Poll::Ready(Ok(value)),
-                    OneShotClose::SenderClosed => Poll::Ready(Err(ReplyError::Dropped)),
-                    OneShotClose::Empty => Poll::Ready(Err(ReplyError::Timeout)),
-                    OneShotClose::Pending => Poll::Pending,
-                }
-            }
+        match poll_reply(&mut self.receiver, context, phase) {
+            Poll::Ready(ReplyPoll::Value(value)) => Poll::Ready(Ok(value)),
+            Poll::Ready(ReplyPoll::SenderClosed) => Poll::Ready(Err(ReplyError::Dropped)),
+            Poll::Ready(ReplyPoll::TimedOut) => Poll::Ready(Err(ReplyError::Timeout)),
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn short_circuit(&mut self) -> Self::Output {
-        self.receiver.inner.close();
+        self.receiver.close();
         Err(ReplyError::Timeout)
     }
 }

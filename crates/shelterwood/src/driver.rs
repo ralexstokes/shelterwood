@@ -49,8 +49,7 @@ use crate::{
     identity::IncarnationCounter,
     observe::LifecycleEventKind,
     plan::{
-        BuilderCore, ChildConstruction, ChildPlan, LowerError, RuntimeScopePlan, ScopeFactory,
-        ScopePlan, SlotCell,
+        BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
     },
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
@@ -98,24 +97,27 @@ impl SystemRun {
         let Some(driver) = self.driver.take() else {
             return;
         };
-        // Only a crashed or cancelled driver leaves a live root incarnation to
-        // classify; cancellation of the driver itself is the one join verdict
-        // that proves the root observed cancellation.
-        let (join, cancellation) = match runtime::join(driver).await {
-            runtime::JoinOutcome::Ok { .. } => return,
-            runtime::JoinOutcome::Panic { message } => (
-                runtime::JoinOutcome::Panic { message },
-                Cancellation::NotObserved,
-            ),
-            runtime::JoinOutcome::Cancelled => {
-                (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
-            }
-        };
-        self.root.finish_live_root_incarnation(
-            StopReason::ShutdownRequested,
-            classify_exit(None, join, None, cancellation),
-        );
+        if let Err(exit) = classify_root_driver_join(runtime::join(driver).await) {
+            self.root
+                .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
+        }
     }
+}
+
+fn classify_root_driver_join(
+    outcome: runtime::JoinOutcome<StopReason>,
+) -> Result<StopReason, Exit> {
+    let (join, cancellation) = match outcome {
+        runtime::JoinOutcome::Ok { value } => return Ok(value),
+        runtime::JoinOutcome::Panic { message } => (
+            runtime::JoinOutcome::Panic { message },
+            Cancellation::NotObserved,
+        ),
+        runtime::JoinOutcome::Cancelled => {
+            (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
+        }
+    };
+    Err(classify_exit(None, join, None, cancellation))
 }
 
 impl Drop for SystemRun {
@@ -137,21 +139,13 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
     let monitor_root = Arc::clone(&root);
     let driver = runtime::spawn(async move { run_scope(plan, ScopeRole::Root).await });
     let lifecycle = runtime::spawn(async move {
-        let (join, cancellation) = match runtime::join(driver).await {
-            runtime::JoinOutcome::Ok { value } => return value,
-            runtime::JoinOutcome::Panic { message } => (
-                runtime::JoinOutcome::Panic { message },
-                Cancellation::NotObserved,
-            ),
-            runtime::JoinOutcome::Cancelled => {
-                (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
+        match classify_root_driver_join(runtime::join(driver).await) {
+            Ok(reason) => reason,
+            Err(exit) => {
+                monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
+                StopReason::ShutdownRequested
             }
-        };
-        monitor_root.finish_live_root_incarnation(
-            StopReason::ShutdownRequested,
-            classify_exit(None, join, None, cancellation),
-        );
-        StopReason::ShutdownRequested
+        }
     });
     SystemRun {
         root,
@@ -623,7 +617,7 @@ async fn run_nested_tree_with_epoch(
             return reason.into_nested_result();
         }
     };
-    run_scope_incarnation(plan.take_for_runtime(), ScopeRole::Nested(latches), epoch)
+    run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch)
         .await
         .into_nested_result()
 }
@@ -636,7 +630,7 @@ async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
         drop(plan);
         return StopReason::NeverStarted;
     };
-    run_scope_incarnation(plan.take_for_runtime(), role, epoch).await
+    run_scope_incarnation(plan, role, epoch).await
 }
 
 /// Derives the membership index and incompleteness count for a freshly
@@ -655,7 +649,7 @@ fn index_children(children: &ChildArena<ChildRuntime>) -> (HashMap<Membership, C
 }
 
 async fn run_scope_incarnation(
-    mut plan: RuntimeScopePlan,
+    mut plan: ScopePlan,
     role: ScopeRole,
     epoch: ScopeEpochGuard,
 ) -> StopReason {
@@ -691,7 +685,7 @@ async fn run_scope_incarnation(
         (None, None)
     };
     // Transfer children one at a time. The not-yet-converted suffix remains
-    // owned by RuntimeScopePlan, while ChildRuntime::from_plan arms the current
+    // owned by ScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
     // exactly one terminality owner for every child.
     let mut children = ChildArena::default();
@@ -721,7 +715,7 @@ async fn run_scope_incarnation(
         events,
         disposal_events,
         deadlines: DeadlineQueue::default(),
-        jitter: runtime::JitterRng::from_system_entropy(),
+        jitter: runtime::JitterRng::new(),
         lifecycle: epoch.lifecycle(),
         next_ordered_start,
         role,
@@ -874,10 +868,10 @@ async fn run_scope_incarnation(
                     continue;
                 }
                 runtime::ScopeWake::Message(Some(event)) => {
-                    pending.push(Pending::Driver(event).classified());
+                    pending.push(Pending::from(event).classified());
                 }
                 runtime::ScopeWake::ControlMessage(Some(event)) => {
-                    pending.push(Pending::Driver(event).classified());
+                    pending.push(Pending::from(event).classified());
                 }
                 runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
                     continue;
@@ -914,25 +908,24 @@ async fn run_scope_incarnation(
                 Pending::Force => {
                     scope.force_all();
                 }
-                Pending::Driver(DriverEvent::Removal(removal)) => scope.handle_removal(removal),
-                Pending::Driver(DriverEvent::Admission(request)) => {
+                Pending::Removal(removal) => scope.handle_removal(removal),
+                Pending::Admission(request) => {
                     scope.handle_admission(request);
                 }
-                Pending::Driver(DriverEvent::Child(ChildEvent::Ready { child, incarnation })) => {
+                Pending::Child(ChildEvent::Ready { child, incarnation }) => {
                     scope.handle_ready(child, incarnation);
                 }
-                Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop {
-                    child,
-                    incarnation,
-                })) => scope.handle_self_stop(child, incarnation),
-                Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+                Pending::Child(ChildEvent::SelfStop { child, incarnation }) => {
+                    scope.handle_self_stop(child, incarnation)
+                }
+                Pending::Child(ChildEvent::Exited {
                     child,
                     incarnation,
                     recorded,
                     join,
                     cancellation,
                     readiness_signal_seen,
-                })) => scope.handle_exit(
+                }) => scope.handle_exit(
                     child,
                     incarnation,
                     recorded,
@@ -940,10 +933,9 @@ async fn run_scope_incarnation(
                     cancellation,
                     readiness_signal_seen,
                 ),
-                Pending::Driver(DriverEvent::Child(ChildEvent::ConstructionDisposed {
-                    child,
-                    panic,
-                })) => scope.handle_construction_disposed(child, panic),
+                Pending::Child(ChildEvent::ConstructionDisposed { child, panic }) => {
+                    scope.handle_construction_disposed(child, panic);
+                }
                 Pending::Deadline(deadline) => scope.handle_deadline(deadline),
             }
         }

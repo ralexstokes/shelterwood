@@ -114,7 +114,7 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
         response.try_receive().is_none(),
         "closing admission must not complete removal before teardown"
     );
-    member.terminalize(Exit::never_started());
+    member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
     assert!(root.prune_child(&member));
     assert!(
         response.try_receive().is_none(),
@@ -409,14 +409,21 @@ async fn removal_tolerates_synchronous_reclaim_from_the_stop_funnel() {
         let key = scope
             .insert_child(child)
             .unwrap_or_else(|_| panic!("the empty arena accepts its first child"));
-        control
-            .state
-            .lock()
-            .expect("dynamic-state mutex poisoned")
-            .entries
-            .get_mut(member.id())
-            .expect("the reservation remains registered")
-            .promote(key, None, txn);
+        {
+            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
+            let entry = state
+                .entries
+                .get_mut(member.id())
+                .expect("the reservation remains registered");
+            entry.promote(key, None, txn);
+            // Removal requests are now published at the authoritative
+            // `Resident -> Removing` transition rather than by the driver, so
+            // drive the entry through it exactly as `remove_dynamic` would
+            // before the synthetic request below reaches `handle_removal`.
+            entry
+                .mark_removing(txn)
+                .expect("the promoted resident transitions to Removing");
+        }
         root.admit_child_locked(resident_projection(&reservation.slot), txn);
         key
     });
@@ -1089,13 +1096,7 @@ async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_rech
     assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
 }
 
-#[derive(Clone, Copy)]
-enum DuplicateRemovalDelivery {
-    WhileActive,
-    DuringDisposal,
-}
-
-async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
+async fn exercise_coalesced_removal() {
     let (
         mut scope,
         mut event_receiver,
@@ -1157,50 +1158,24 @@ async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
     let mut removal_response =
         super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
 
-    let mut removals = Vec::new();
-    while removals.len() < 2 {
-        let event =
-            match crate::runtime::timeout(Duration::from_secs(2), dynamic_event_receiver.recv())
-                .await
-            {
-                crate::runtime::Timeout::Completed(Some(event)) => event,
-                crate::runtime::Timeout::Completed(None) => {
-                    panic!("the dynamic-control lane remains open")
-                }
-                crate::runtime::Timeout::Elapsed => {
-                    panic!("both removal sources reach the driver")
-                }
-            };
-        let DriverEvent::Removal(removal) = event else {
-            panic!("only removal requests reach the dynamic-control lane here")
-        };
-        removals.push(removal);
-    }
+    let removal = match crate::runtime::timeout(
+        Duration::from_secs(2),
+        dynamic_event_receiver.recv(),
+    )
+    .await
+    {
+        crate::runtime::Timeout::Completed(Some(DriverEvent::Removal(removal))) => removal,
+        crate::runtime::Timeout::Completed(_) => panic!("one removal request reaches the driver"),
+        crate::runtime::Timeout::Elapsed => panic!("the removal request reaches the driver"),
+    };
+    assert_eq!(removal.membership, membership);
+    assert_eq!(removal.key, key);
     assert!(
-        removals
-            .iter()
-            .all(|removal| { removal.membership == membership && removal.key == key })
+        crate::runtime::unbounded_mpsc_try_recv(&mut dynamic_event_receiver).is_none(),
+        "the state transition coalesces fused and explicit removal sources"
     );
 
-    scope.handle_removal(removals.remove(0));
-    let active = scope.children[key]
-        .active
-        .as_ref()
-        .expect("the first removal begins the live stop ladder");
-    let ladder = active.ladder.expect("the stop ladder is armed");
-    let stop_deadline = active.stop_deadline;
-    let deadline_count = scope.deadlines.len();
-
-    if matches!(delivery, DuplicateRemovalDelivery::WhileActive) {
-        scope.handle_removal(removals.remove(0));
-        let active = scope.children[key]
-            .active
-            .as_ref()
-            .expect("the duplicate leaves the incarnation active");
-        assert_eq!(active.ladder, Some(ladder));
-        assert_eq!(active.stop_deadline, stop_deadline);
-        assert_eq!(scope.deadlines.len(), deadline_count);
-    }
+    scope.handle_removal(removal);
 
     let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
         crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
@@ -1224,23 +1199,6 @@ async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
     scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);
     assert!(scope.children[key].pending_terminal.is_some());
 
-    if matches!(delivery, DuplicateRemovalDelivery::DuringDisposal) {
-        // Defense-in-depth, pinned jointly rather than individually: the
-        // duplicate is dropped by `begin_stop_child`'s terminal/disposing
-        // guard, and even without that guard `begin_terminal_disposal`'s
-        // pending-terminal guard returns before disturbing disposal. Either
-        // check alone suffices to protect this observable, so this test
-        // fails only when both are removed together.
-        scope.handle_removal(removals.remove(0));
-        assert!(
-            scope
-                .children
-                .get(key)
-                .is_some_and(|child| child.pending_terminal.is_some()),
-            "the duplicate cannot bypass retained-construction disposal"
-        );
-    }
-    assert!(removals.is_empty());
     assert_eq!(
         removal_response.try_receive(),
         None,
@@ -1291,13 +1249,8 @@ async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
 }
 
 #[crate::runtime::test]
-async fn double_removal_is_idempotent_while_the_child_is_active() {
-    exercise_double_removal(DuplicateRemovalDelivery::WhileActive).await;
-}
-
-#[crate::runtime::test]
-async fn double_removal_is_idempotent_during_construction_disposal() {
-    exercise_double_removal(DuplicateRemovalDelivery::DuringDisposal).await;
+async fn fused_and_explicit_removal_queue_once_at_transition() {
+    exercise_coalesced_removal().await;
 }
 
 #[crate::runtime::test]
@@ -1390,11 +1343,12 @@ async fn fused_only_removal_commits_phase_and_projection_together() {
     assert_eq!(removal.membership, membership);
     assert_eq!(removal.key, key);
 
+    let duplicate = removal;
     scope.handle_removal(removal);
     assert_eq!(
         member.record().membership_status,
         MembershipStatus::Removing,
-        "handle_removal publishes the Removing projection"
+        "driver handling preserves the already-published Removing projection"
     );
     assert!(matches!(
         root.snapshot()
@@ -1402,6 +1356,30 @@ async fn fused_only_removal_commits_phase_and_projection_together() {
             .map(|child| child.membership_status),
         Some(MembershipStatus::Removing)
     ));
+
+    // Coalescing at the `Resident -> Removing` transition means no source can
+    // queue this request twice any more, so the driver-side idempotence guards
+    // lost their only coverage. They remain load-bearing for the pairings that
+    // *can* still deliver a removal to an actively-stopping child in one batch
+    // (`Pending::Shutdown` / `Force` / `SelfStop` alongside a removal, and
+    // `DeadlineKind::Restart` re-entry), so pin them with a synthetic
+    // duplicate: re-delivery must not rewind the armed ladder, push the stop
+    // deadline out, or arm a second timer.
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the removal begins the live stop ladder");
+    let ladder = active.ladder.expect("the stop ladder is armed");
+    let stop_deadline = active.stop_deadline;
+    let deadline_count = scope.deadlines.len();
+    scope.handle_removal(duplicate);
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the duplicate leaves the incarnation active");
+    assert_eq!(active.ladder, Some(ladder));
+    assert_eq!(active.stop_deadline, stop_deadline);
+    assert_eq!(scope.deadlines.len(), deadline_count);
 
     let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
         crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {

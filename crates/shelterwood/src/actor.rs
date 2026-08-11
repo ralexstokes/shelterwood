@@ -2,7 +2,7 @@
 //! wrapper, which encapsulates the callback loop's error-path freeze-and-join
 //! discipline.
 
-use std::{fmt, future::Future, hash::Hash, marker::PhantomData, sync::Arc, time::Duration};
+use std::{fmt, future::Future, hash::Hash, marker::PhantomData, time::Duration};
 
 use crate::{
     ActorRef, Blocking, ChildId, DeadlineElapsed, ExitError, ExitResult, Guard, Incarnation,
@@ -402,7 +402,7 @@ async fn fail_after_teardown<M: Send + 'static>(
     Err(error)
 }
 
-type ArgsFactory<A> = Arc<dyn Fn() -> <A as Actor>::Args + Send + Sync + 'static>;
+type ArgsFactory<A> = Box<dyn Fn() -> <A as Actor>::Args + Send + Sync + 'static>;
 
 /// Restartable handler-actor definition.
 pub struct ActorDef<A: Actor> {
@@ -434,7 +434,7 @@ impl<A: Actor> ActorDef<A> {
     /// Creates a restartable definition from a fresh per-incarnation args source.
     pub fn factory(factory: impl Fn() -> A::Args + Send + Sync + 'static) -> Self {
         Self {
-            factory: Arc::new(factory),
+            factory: Box::new(factory),
             options: CommonOptions::default(),
         }
     }

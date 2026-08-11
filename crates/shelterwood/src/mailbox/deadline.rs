@@ -5,11 +5,20 @@ use std::{
     time::Duration,
 };
 
-/// Whether an operation is being polled before or after its deadline expires.
+/// Which of the two passes an operation is being polled in.
+///
+/// A `Deadlined` future polls its operation twice per wakeup: once optimistic,
+/// and -- once the timer has fired -- again to let the operation arbitrate
+/// between a value that landed concurrently and the timeout it would otherwise
+/// report. The distinction is the pass, not merely whether the clock has
+/// passed the deadline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DeadlinePhase {
-    BeforeExpiry,
-    Elapsed,
+    /// Optimistic pass: the operation may only complete on its own terms.
+    InitialAttempt,
+    /// Post-expiry pass: the operation closes its channel and decides between
+    /// a concurrently delivered value and reporting the timeout.
+    TimeoutArbitration,
 }
 
 pub(super) trait DeadlineOperation {
@@ -55,7 +64,7 @@ impl<F> Deadlined<F> {
             budget: None,
             timer: None,
             started: false,
-            phase: DeadlinePhase::BeforeExpiry,
+            phase: DeadlinePhase::InitialAttempt,
         }
     }
 }
@@ -85,11 +94,11 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             .expect("a started deadline future retains its captured budget");
         if let Poll::Ready(result) =
             this.operation
-                .poll_deadlined(context, budget, DeadlinePhase::BeforeExpiry)
+                .poll_deadlined(context, budget, DeadlinePhase::InitialAttempt)
         {
             return Poll::Ready(result);
         }
-        if this.phase == DeadlinePhase::BeforeExpiry {
+        if this.phase == DeadlinePhase::InitialAttempt {
             if this
                 .timer
                 .as_mut()
@@ -103,11 +112,11 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             // The timer is a one-shot future: polling it again after it
             // resolves panics. Latch the transition and release it, so an
             // elapsed poll that stays pending re-polls only the operation.
-            this.phase = DeadlinePhase::Elapsed;
+            this.phase = DeadlinePhase::TimeoutArbitration;
             this.timer = None;
         }
         this.operation
-            .poll_deadlined(context, budget, DeadlinePhase::Elapsed)
+            .poll_deadlined(context, budget, DeadlinePhase::TimeoutArbitration)
     }
 }
 
@@ -134,7 +143,7 @@ mod tests {
             _budget: crate::deadline::Deadline,
             phase: super::DeadlinePhase,
         ) -> Poll<usize> {
-            if phase == super::DeadlinePhase::BeforeExpiry {
+            if phase == super::DeadlinePhase::InitialAttempt {
                 return Poll::Pending;
             }
             self.elapsed_polls += 1;

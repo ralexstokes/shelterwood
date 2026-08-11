@@ -80,6 +80,9 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     // Existing inherent methods remain addressable through UFCS as well as
     // ordinary method syntax.
     let _ = DynamicScopeRef::id;
+    let _assert_dynamic_scope_method = |scope: &DynamicScopeRef| {
+        let _ = scope.id();
+    };
     assert_send_sync::<SnapshotReceiver>();
     assert_send_sync::<LifecycleEvents>();
     assert_send_sync::<CancellationToken>();

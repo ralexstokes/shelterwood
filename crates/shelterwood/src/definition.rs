@@ -87,18 +87,15 @@ macro_rules! common_options_setters {
     };
 
     (@emit raw_readiness) => {
-        /// Overrides the actor's declared readiness mode.
-        pub fn readiness(mut self, readiness: Readiness) -> Result<Self, PolicyError> {
-            if readiness == Readiness::AfterInit {
-                return Err(PolicyError::UnsupportedReadiness);
-            }
-            self.options.readiness = Some(readiness);
-            Ok(self)
-        }
+        common_options_setters!(@readiness "Overrides the actor's declared readiness mode.");
     };
 
     (@emit task_readiness) => {
-        /// Overrides task readiness (`Immediate` or `Manual`).
+        common_options_setters!(@readiness "Overrides task readiness (`Immediate` or `Manual`).");
+    };
+
+    (@readiness $doc:literal) => {
+        #[doc = $doc]
         pub fn readiness(mut self, readiness: Readiness) -> Result<Self, PolicyError> {
             if readiness == Readiness::AfterInit {
                 return Err(PolicyError::UnsupportedReadiness);
@@ -109,16 +106,15 @@ macro_rules! common_options_setters {
     };
 
     (@emit structural_readiness_deadline) => {
-        /// Overrides the structural readiness deadline.
-        #[must_use]
-        pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
-            self.options.readiness_deadline = deadline;
-            self
-        }
+        common_options_setters!(@readiness_deadline "Overrides the structural readiness deadline.");
     };
 
     (@emit task_readiness_deadline) => {
-        /// Overrides the readiness deadline.
+        common_options_setters!(@readiness_deadline "Overrides the readiness deadline.");
+    };
+
+    (@readiness_deadline $doc:literal) => {
+        #[doc = $doc]
         #[must_use]
         pub fn readiness_deadline(mut self, deadline: ReadinessDeadline) -> Self {
             self.options.readiness_deadline = deadline;

@@ -6,9 +6,7 @@ fn disposed(child: ChildKey) -> DriverEvent {
 
 fn disposed_child(pending: &Pending) -> ChildKey {
     match pending {
-        Pending::Driver(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, .. })) => {
-            *child
-        }
+        Pending::Child(ChildEvent::ConstructionDisposed { child, .. }) => *child,
         _ => panic!("this fixture only queues construction disposals"),
     }
 }

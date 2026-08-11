@@ -1,5 +1,5 @@
 use shelterwood::{Backoff, RestartCondition, RestartPolicy};
 
-pub fn never() -> RestartPolicy {
+pub(crate) fn never() -> RestartPolicy {
     RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
 }

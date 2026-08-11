@@ -11,7 +11,6 @@ use crate::{
     cells::{
         DynamicRoute, ErasedDynamicRoute, ErasedDynamicSlot, MemberStage, ObservationTxn, ScopeCell,
     },
-    engine::MembershipStatus,
     plan::{
         ChildConstruction, SlotCell, checked_id, concrete_dynamic_slot, concrete_dynamic_slot_ref,
         erase_dynamic_slot, mint_reserved_slot,
@@ -149,7 +148,9 @@ impl DynamicEntry {
     }
 
     pub(super) fn mark_removing(&mut self, _txn: &mut ObservationTxn<'_>) -> Option<ChildKey> {
-        let key = self.key()?;
+        let DynamicMembershipState::Resident { key, .. } = self.state else {
+            return None;
+        };
         self.state = DynamicMembershipState::Removing { key };
         Some(key)
     }
@@ -455,12 +456,8 @@ fn signal_fused_cancel_impl(
     }
     let latch = latch.clone();
     txn.defer(move || latch.notify());
-    // A fused drop and an explicit `remove` dedup only within their own
-    // source (each behind a once-firing latch), not against each other:
-    // `mark_removing` also succeeds on an already-Removing entry, so the
-    // same membership can queue one `RemovalRequest` per source. The
-    // duplicate is benign by construction — the shared transaction retains
-    // one Removing phase/projection, and `begin_stop_child` is idempotent.
+    // The authoritative state transition owns request publication, so a
+    // racing explicit removal cannot queue the same membership again.
     let removal = {
         let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
         state
@@ -473,9 +470,7 @@ fn signal_fused_cancel_impl(
             })
     };
     if let Some(removal) = removal {
-        if slot.member.record().membership_status != MembershipStatus::Removing {
-            scope.set_child_removing_locked(&slot.member, txn);
-        }
+        scope.set_child_removing_locked(&slot.member, txn);
         defer_driver_event(txn, control, DriverEvent::Removal(removal));
     }
 }
@@ -526,27 +521,15 @@ fn remove_dynamic_impl(
     // registration is reclaimed before the removal response completes.
     let member = Arc::clone(&entry.slot.member);
     let membership = member.membership();
-    let key = entry
+    let removal = entry
         .mark_removing(txn)
-        .expect("a non-reservation has a resident child key");
+        .map(|key| RemovalRequest { membership, key });
     drop(state);
-    if member.record().membership_status != MembershipStatus::Removing {
+    if let Some(removal) = removal {
+        // Projection first, then the deferred request: the same order the
+        // fused source commits in.
         scope.set_child_removing_locked(&member, txn);
-    }
-    // The fire linearizes inside the transaction; the waker-visible wake is
-    // deferred past the gate release.
-    if member.removal.fire_silently() {
-        let removal = member.removal.clone();
-        txn.defer(move || removal.notify());
-        // This latch dedups repeated `remove` calls, but not a concurrent
-        // fused drop, which queues its own `RemovalRequest` for the same
-        // membership (see `signal_fused_cancel_impl`). The driver's stop
-        // path must therefore stay idempotent under a second delivery.
-        defer_driver_event(
-            txn,
-            control,
-            DriverEvent::Removal(RemovalRequest { membership, key }),
-        );
+        defer_driver_event(txn, control, DriverEvent::Removal(removal));
     }
     response
 }

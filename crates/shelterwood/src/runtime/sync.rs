@@ -38,7 +38,6 @@ impl Signal {
     pub(crate) fn watcher(&self) -> SignalWatcher {
         SignalWatcher {
             inner: self.inner.watcher(),
-            _signal: self.clone(),
         }
     }
 
@@ -50,9 +49,6 @@ impl Signal {
 
 pub(crate) struct SignalWatcher {
     inner: WatchReceiver<()>,
-    // Retain the source through every watcher so channel closure cannot turn
-    // into a spurious pulse.
-    _signal: Signal,
 }
 
 impl SignalWatcher {
@@ -398,8 +394,15 @@ impl<T> OneShotReceiver<T> {
 /// disposal function is captured at construction, where the value type's
 /// `Send + 'static` bounds hold, so unbounded holders can still route an
 /// unclaimed stored value through isolated disposal on drop.
+///
+/// The erasure is load-bearing API design, not incidental: `Drop` must repeat
+/// whatever bounds the struct declares, so bounding this type would push
+/// `T: Send + 'static` onto the *definitions* of the public wrappers that hold
+/// it (`ReplyReceiver`, `ReplyReceive`, `CallFuture`, `OneShotTaskRef`) and
+/// force downstream generic declarations to carry a bound they never asked
+/// for. Execution bounds belong on constructors and operational impls here.
 pub(crate) struct DisposingReceiver<T> {
-    pub(crate) inner: OneShotReceiver<T>,
+    inner: OneShotReceiver<T>,
     dispose: fn(T),
 }
 
@@ -409,6 +412,26 @@ impl<T: Send + 'static> DisposingReceiver<T> {
             inner,
             dispose: dispose_detached::<T>,
         }
+    }
+}
+
+impl<T> DisposingReceiver<T> {
+    pub(crate) fn poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<T>> {
+        self.inner.poll_receive(context)
+    }
+
+    pub(crate) fn close_and_poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> OneShotClose<T> {
+        self.inner.close_and_poll_receive(context)
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.inner.close();
     }
 }
 
@@ -450,18 +473,6 @@ impl<T> WatchSender<T> {
         self.0.send_modify(|_| {});
     }
 
-    #[cfg(test)]
-    pub(crate) fn send_modify(&self, update: impl FnOnce(&mut T)) {
-        self.0.send_modify(update);
-    }
-
-    /// The remaining production writers pulse or replace whole values; only
-    /// test-side publication needs conditional notification.
-    #[cfg(test)]
-    pub(crate) fn send_if_modified(&self, update: impl FnOnce(&mut T) -> bool) -> bool {
-        self.0.send_if_modified(update)
-    }
-
     /// Mutates the retained value without advancing the watch version.
     ///
     /// This is only for compound publication that must finish another
@@ -473,6 +484,14 @@ impl<T> WatchSender<T> {
             false
         });
         debug_assert!(!notified);
+    }
+
+    /// Reads a projection of the retained value without cloning it.
+    ///
+    /// `project` runs under the watch's read guard, so it must stay cheap and
+    /// must not touch the same channel.
+    pub(crate) fn read_with<R>(&self, project: impl FnOnce(&T) -> R) -> R {
+        project(&self.0.borrow())
     }
 }
 

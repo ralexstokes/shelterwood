@@ -11,14 +11,14 @@ use std::{
 use crate::{
     ChildId, Incarnation, Membership,
     cells::MemberCell,
-    runtime::{DisposingReceiver, OneShotClose, dispose_detached},
+    runtime::{DisposingReceiver, dispose_detached},
 };
 
 use super::{
     CallError, CallErrorKind, Replied, Reply, ReplyError, SendError, SendErrorKind,
     cell::{MailboxCell, OperationOutcome, SendOperation, Submission, Withdrawal},
     deadline::{DeadlineOperation, DeadlinePhase, Deadlined},
-    reply::ReplyOperation,
+    reply::{ReplyOperation, ReplyPoll, poll_reply},
 };
 
 /// Future returned by [`ReplyReceiver::recv`](crate::ReplyReceiver::recv).
@@ -386,7 +386,7 @@ impl<M: Send + 'static> DeadlineOperation for TimedSend<M> {
         if let Poll::Ready(result) = Pin::new(&mut self.send).poll(context) {
             return Poll::Ready(result);
         }
-        if phase == DeadlinePhase::BeforeExpiry {
+        if phase == DeadlinePhase::InitialAttempt {
             Poll::Pending
         } else {
             Poll::Ready(withdraw_send(&mut self.send))
@@ -462,36 +462,25 @@ impl<M, T> CallOperation<M, T> {
             .reply
             .as_mut()
             .expect("accepted call retains reply state");
-        match reply.inner.poll_receive(context) {
-            Poll::Ready(Some(value)) => Poll::Ready(Ok(Replied { value, incarnation })),
-            Poll::Ready(None) => Poll::Ready(Err(CallError {
+        match poll_reply(reply, context, phase) {
+            Poll::Ready(ReplyPoll::Value(value)) => Poll::Ready(Ok(Replied { value, incarnation })),
+            Poll::Ready(ReplyPoll::SenderClosed) => Poll::Ready(Err(CallError {
                 actor_id: self.actor.id().clone(),
                 incarnation_observed: Some(incarnation),
                 kind: CallErrorKind::ReplyDropped,
             })),
-            Poll::Pending if phase == DeadlinePhase::Elapsed => {
-                match reply.inner.close_and_poll_receive(context) {
-                    OneShotClose::Value(value) => Poll::Ready(Ok(Replied { value, incarnation })),
-                    OneShotClose::SenderClosed => Poll::Ready(Err(CallError {
-                        actor_id: self.actor.id().clone(),
-                        incarnation_observed: Some(incarnation),
-                        kind: CallErrorKind::ReplyDropped,
-                    })),
-                    OneShotClose::Empty => Poll::Ready(Err(CallError {
-                        actor_id: self.actor.id().clone(),
-                        incarnation_observed: Some(incarnation),
-                        kind: CallErrorKind::ResponseTimedOut,
-                    })),
-                    OneShotClose::Pending => Poll::Pending,
-                }
-            }
+            Poll::Ready(ReplyPoll::TimedOut) => Poll::Ready(Err(CallError {
+                actor_id: self.actor.id().clone(),
+                incarnation_observed: Some(incarnation),
+                kind: CallErrorKind::ResponseTimedOut,
+            })),
             Poll::Pending => Poll::Pending,
         }
     }
 
     fn close_reply(&mut self) {
         if let Some(reply) = &mut self.reply {
-            reply.inner.close();
+            reply.close();
         }
     }
 }
@@ -506,7 +495,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
         phase: DeadlinePhase,
     ) -> Poll<Self::Output> {
         if self.make_msg.is_some() {
-            if phase == DeadlinePhase::Elapsed {
+            if phase == DeadlinePhase::TimeoutArbitration {
                 return Poll::Ready(self.short_circuit());
             }
             // Capture the one overall budget before invoking user code. A
@@ -567,7 +556,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             return self.poll_reply(context, accepted, phase);
         }
 
-        if phase == DeadlinePhase::BeforeExpiry {
+        if phase == DeadlinePhase::InitialAttempt {
             return Poll::Pending;
         }
 
@@ -580,7 +569,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
         match result {
             Ok(incarnation) => {
                 self.accepted = Some(incarnation);
-                self.poll_reply(context, incarnation, DeadlinePhase::Elapsed)
+                self.poll_reply(context, incarnation, DeadlinePhase::TimeoutArbitration)
             }
             Err(error) => {
                 self.close_reply();

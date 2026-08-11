@@ -182,7 +182,9 @@ impl<R: Clone> System<R> {
     pub fn scope(&self) -> R {
         self.root.clone()
     }
+}
 
+impl<R> System<R> {
     /// Waits until the declared tree is ready or startup terminally fails.
     pub async fn wait_started(&self) -> Result<(), StartupError> {
         self.run.root.wait_started().await

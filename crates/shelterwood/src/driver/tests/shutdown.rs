@@ -35,7 +35,7 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .build();
-    plan.take_for_runtime().finish_transfer();
+    plan.finish_transfer();
 
     scope.spawn_child(key);
     let active = scope.children[key]
@@ -108,7 +108,7 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .build();
-    plan.take_for_runtime().finish_transfer();
+    plan.finish_transfer();
 
     scope.spawn_child(key);
     let active = scope.children[key]
@@ -183,7 +183,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .build();
-    plan.take_for_runtime().finish_transfer();
+    plan.finish_transfer();
 
     for key in &keys {
         scope.spawn_child(*key);
@@ -299,7 +299,7 @@ fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
         .with_lifecycle(ScopeLifecycle::running())
         .with_hard_forced(true)
         .build();
-    plan.take_for_runtime().finish_transfer();
+    plan.finish_transfer();
 
     scope.begin_drain(StopReason::ShutdownRequested);
 

@@ -1,7 +1,7 @@
 //! Declaration lowering and its owned construction plan.
 
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     sync::{Arc, Mutex},
 };
 
@@ -10,7 +10,7 @@ use crate::{
     admission::ReserveError,
     cells::{ErasedDynamicSlot, MemberCell, ObservationTxn, ScopeCell},
     definition::DefinitionSource,
-    identity::{IdError, ScopeIdentity},
+    identity::ScopeIdentity,
     policy::{
         ChildMode, CommonOptions, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor,
         resolve_common,
@@ -153,7 +153,10 @@ impl SlotCell {
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started();
         } else {
-            self.member.terminalize(Exit::never_started());
+            self.member.terminalize(
+                Exit::never_started(),
+                crate::cells::StartupDisposition::Unchanged,
+            );
         }
         owner.evict_child_identity(&self.member);
     }
@@ -163,7 +166,11 @@ impl SlotCell {
         owner: &ScopeCell,
         txn: &mut ObservationTxn<'_>,
     ) {
-        self.member.terminalize_locked(Exit::never_started(), txn);
+        self.member.terminalize_locked(
+            Exit::never_started(),
+            crate::cells::StartupDisposition::Unchanged,
+            txn,
+        );
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started_locked(txn);
         }
@@ -256,7 +263,7 @@ pub(crate) struct BuilderCore {
     pub(crate) root: Arc<ScopeCell>,
     pub(crate) config: ScopeConfig,
     pub(crate) slots: Vec<Arc<SlotCell>>,
-    ids: HashMap<ChildId, Arc<SlotCell>>,
+    ids: HashSet<ChildId>,
     /// The stable scope whose identity map `lower(root_override)` adopts the
     /// slots' lineages into. Eviction must target the map a lineage actually
     /// entered: before adoption begins the lineages live in `root`'s map,
@@ -289,7 +296,7 @@ impl BuilderCore {
             root,
             config: ScopeConfig::default(),
             slots: Vec::new(),
-            ids: HashMap::new(),
+            ids: HashSet::new(),
             adopting_root: None,
             armed: true,
         }
@@ -301,11 +308,11 @@ impl BuilderCore {
         scope: Option<ScopeFlavor>,
     ) -> Result<Arc<SlotCell>, ReserveError> {
         let id = checked_id(id)?;
-        if self.ids.contains_key(&id) {
+        if self.ids.contains(&id) {
             return Err(ReserveError::DuplicateId(id));
         }
         let slot = mint_reserved_slot(&self.root, &id, scope)?;
-        self.ids.insert(id, Arc::clone(&slot));
+        self.ids.insert(id);
         self.slots.push(Arc::clone(&slot));
         Ok(slot)
     }
@@ -429,14 +436,6 @@ pub(crate) struct ScopePlan {
 
 struct ScopePlanTerminality;
 
-pub(crate) struct RuntimeScopePlan {
-    pub(crate) root: Arc<ScopeCell>,
-    pub(crate) config: ScopeConfig,
-    pub(crate) defaults: ResolvedDefaults,
-    pub(crate) children: Vec<ChildPlan>,
-    terminality: Option<ScopePlanTerminality>,
-}
-
 fn terminalize_plan(
     root: &ScopeCell,
     children: &[ChildPlan],
@@ -457,27 +456,6 @@ fn terminalize_plan(
 }
 
 impl ScopePlan {
-    /// Consumes declaration ownership and transfers its terminality obligation
-    /// to the runtime plan. There is no independently mutable disarm bit: a
-    /// caller either owns the declaration plan or has consumed it here.
-    pub(crate) fn take_for_runtime(mut self) -> RuntimeScopePlan {
-        RuntimeScopePlan {
-            root: Arc::clone(&self.root),
-            config: self.config.clone(),
-            defaults: self.defaults.clone(),
-            children: std::mem::take(&mut self.children),
-            terminality: self.terminality.take(),
-        }
-    }
-}
-
-impl Drop for ScopePlan {
-    fn drop(&mut self) {
-        terminalize_plan(&self.root, &self.children, &mut self.terminality);
-    }
-}
-
-impl RuntimeScopePlan {
     /// Finishes the transfer after every child has installed its own
     /// terminality obligation. Consuming `self` makes a partial handoff
     /// impossible to mistake for a completed one.
@@ -492,7 +470,7 @@ impl RuntimeScopePlan {
     }
 }
 
-impl Drop for RuntimeScopePlan {
+impl Drop for ScopePlan {
     fn drop(&mut self) {
         terminalize_plan(&self.root, &self.children, &mut self.terminality);
     }
@@ -559,9 +537,11 @@ impl ScopeConstruction {
 
 pub(crate) fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError> {
     let id = id.into();
-    ChildId::validate(id.as_str().to_owned()).map_err(|error| match error {
-        IdError::Empty => ReserveError::EmptyId,
-    })
+    if id.as_str().is_empty() {
+        Err(ReserveError::EmptyId)
+    } else {
+        Ok(id)
+    }
 }
 
 #[cfg(test)]

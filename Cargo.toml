@@ -14,6 +14,13 @@ resolver = "3"
 [workspace.metadata]
 name = "shelterwood"
 
+# Enforced in every lane that compiles the workspace -- plain `cargo check`
+# included -- rather than by appending a flag to one CI clippy invocation.
+# `-D warnings` escalates these to errors in `just lint` and the Nix
+# `cargo-clippy` check, so the template's check definition stays unforked.
+[workspace.lints.rust]
+unreachable_pub = "warn"
+
 [workspace.dependencies]
 fastrand = "2.5.0"
 serde_json = "1.0.151"

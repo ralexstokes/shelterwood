@@ -221,6 +221,27 @@ impl<M> MailboxState<M> {
         }
     }
 
+    /// Detaches every waiter from a non-terminal binding before a transition.
+    ///
+    /// Taking directly from the owning variant avoids temporarily claiming
+    /// the mailbox is terminal merely to move its queue out.
+    fn take_waiters(&mut self) -> WaiterQueue<M> {
+        match &mut self.binding {
+            MailboxBinding::Unbound(waiters)
+            | MailboxBinding::Frozen { waiters, .. }
+            | MailboxBinding::Bound(BoundState::Full { waiters, .. }) => std::mem::take(waiters),
+            MailboxBinding::Bound(BoundState::Available(_)) => WaiterQueue::default(),
+            MailboxBinding::Terminal(_) => {
+                // Terminalization takes the waiters exactly once and no live
+                // transition follows it. This runs under the mailbox mutex
+                // with no way to release it first, so diagnose in debug rather
+                // than poisoning the lock for every sender in release.
+                debug_assert!(false, "a terminal mailbox has no live transition");
+                WaiterQueue::default()
+            }
+        }
+    }
+
     fn remove_waiter(&mut self, registration: WaiterId) -> Option<Arc<SendOperation<M>>> {
         let mut available = None;
         let removed = match &mut self.binding {
@@ -358,6 +379,18 @@ struct Acceptance<M> {
     displaced: Option<Envelope<M>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RejectionReason {
+    NotAccepting,
+    Unconfigured,
+    Full,
+}
+
+struct Rejected<M> {
+    message: M,
+    reason: RejectionReason,
+}
+
 impl<M> Acceptance<M> {
     fn finish(self, changed: &Signal) -> Incarnation {
         changed.pulse();
@@ -383,7 +416,7 @@ impl<M: Send + 'static> Default for Promotion<M> {
 impl<M: Send + 'static> Promotion<M> {
     // Drop is the completion path on every ownership edge. `finish` only
     // names the intentional consume point; its Drop still wakes all accepted
-    // senders and isolates every displaced-message destructor.
+    // senders and panic-contains each displaced-message destructor inline.
     fn finish(self) {}
 
     fn finish_isolated(mut self) {
@@ -547,7 +580,19 @@ impl<M: Send + 'static> MailboxCell<M> {
                         drop(state);
                         Submission::Accepted(acceptance.finish(&self.changed))
                     }
-                    Err(message) => {
+                    Err(Rejected { message, reason }) => {
+                        if !matches!(reason, RejectionReason::Full) {
+                            // `Full` is the only rejection a bound, configured
+                            // mailbox can produce. Follow `bind`'s convention
+                            // and release the lock before panicking, so an
+                            // invariant break stays on this thread instead of
+                            // poisoning the mutex under every other sender --
+                            // and so the rejected payload's destructor does not
+                            // run under it either.
+                            drop(state);
+                            drop(message);
+                            unreachable!("a bound configured mailbox rejected as {reason:?}");
+                        }
                         let operation = SendOperation::new(message);
                         operation.observe(incarnation);
                         state.park(&operation);
@@ -591,24 +636,26 @@ impl<M: Send + 'static> MailboxCell<M> {
                 kind: SendErrorKind::NotRunning,
             }),
             BindingStatus::Bound(incarnation) => {
-                if state.kind.is_none() {
-                    return Err(SendError {
-                        actor_id: self.actor_id.clone(),
-                        incarnation_observed: None,
-                        message,
-                        kind: SendErrorKind::NotRunning,
-                    });
-                }
                 match accept_locked(&mut state, message, &self.accepted) {
                     Ok(acceptance) => {
                         drop(state);
                         Ok(acceptance.finish(&self.changed))
                     }
-                    Err(message) => Err(SendError {
+                    Err(Rejected { message, reason }) => Err(SendError {
                         actor_id: self.actor_id.clone(),
-                        incarnation_observed: Some(incarnation),
+                        incarnation_observed: match reason {
+                            RejectionReason::Full | RejectionReason::NotAccepting => {
+                                Some(incarnation)
+                            }
+                            RejectionReason::Unconfigured => None,
+                        },
                         message,
-                        kind: SendErrorKind::Full,
+                        kind: match reason {
+                            RejectionReason::Full => SendErrorKind::Full,
+                            RejectionReason::Unconfigured | RejectionReason::NotAccepting => {
+                                SendErrorKind::NotRunning
+                            }
+                        },
                     }),
                 }
             }
@@ -780,13 +827,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             drop(state);
             panic!("mailbox must close the prior incarnation before rebinding");
         }
-        let binding = std::mem::replace(
-            &mut state.binding,
-            MailboxBinding::Bound(BoundState::Available(incarnation)),
-        );
-        let MailboxBinding::Unbound(mut waiters) = binding else {
-            unreachable!("the bind-order contract was checked above")
-        };
+        let mut waiters = state.take_waiters();
         state.last_bound = Some(incarnation);
         // Binding is an observation edge for every operation that remained
         // parked through it, including FIFO overflow that cannot be promoted
@@ -805,7 +846,9 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
                 &self.accepted,
             )
         };
-        if !waiters.is_empty() {
+        if waiters.is_empty() {
+            state.binding = MailboxBinding::Bound(BoundState::Available(incarnation));
+        } else {
             let MailboxKind::Queue(capacity) = kind else {
                 unreachable!("a latest mailbox finishes all waiting submissions")
             };
@@ -825,13 +868,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         if state.status() != BindingStatus::Bound(incarnation) {
             return;
         }
-        let last_bound = state.last_bound;
-        let binding = std::mem::replace(&mut state.binding, MailboxBinding::Terminal(last_bound));
-        let waiters = match binding {
-            MailboxBinding::Bound(BoundState::Available(_)) => WaiterQueue::default(),
-            MailboxBinding::Bound(BoundState::Full { waiters, .. }) => waiters,
-            _ => unreachable!("the status check selected a bound mailbox"),
-        };
+        let waiters = state.take_waiters();
         state.binding = MailboxBinding::Frozen {
             incarnation,
             waiters,
@@ -849,14 +886,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         ) {
             return None;
         }
-        let last_bound = state.last_bound;
-        let binding = std::mem::replace(&mut state.binding, MailboxBinding::Terminal(last_bound));
-        let waiters = match binding {
-            MailboxBinding::Bound(BoundState::Available(_)) => WaiterQueue::default(),
-            MailboxBinding::Bound(BoundState::Full { waiters, .. })
-            | MailboxBinding::Frozen { waiters, .. } => waiters,
-            _ => unreachable!("the status check selected a live mailbox"),
-        };
+        let waiters = state.take_waiters();
         state.binding = MailboxBinding::Unbound(waiters);
         let queue = std::mem::take(&mut state.queue);
         let latest = state.latest.take();
@@ -875,17 +905,8 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             return None;
         }
         let final_incarnation = state.last_bound;
-        let binding = std::mem::replace(
-            &mut state.binding,
-            MailboxBinding::Terminal(final_incarnation),
-        );
-        let waiters = match binding {
-            MailboxBinding::Unbound(waiters)
-            | MailboxBinding::Frozen { waiters, .. }
-            | MailboxBinding::Bound(BoundState::Full { waiters, .. }) => waiters,
-            MailboxBinding::Bound(BoundState::Available(_)) => WaiterQueue::default(),
-            MailboxBinding::Terminal(_) => unreachable!("terminality was checked above"),
-        };
+        let waiters = state.take_waiters();
+        state.binding = MailboxBinding::Terminal(final_incarnation);
         let queue = std::mem::take(&mut state.queue);
         let latest = state.latest.take();
         let termination = Termination {
@@ -927,20 +948,41 @@ fn accept_locked<M>(
     state: &mut MailboxState<M>,
     message: M,
     accepted: &AtomicPoisonedCounter,
-) -> Result<Acceptance<M>, M> {
+) -> Result<Acceptance<M>, Rejected<M>> {
     let incarnation = match &state.binding {
         MailboxBinding::Bound(BoundState::Available(incarnation)) => *incarnation,
+        MailboxBinding::Bound(BoundState::Full { .. }) => {
+            return Err(Rejected {
+                message,
+                reason: RejectionReason::Full,
+            });
+        }
         MailboxBinding::Unbound(_)
-        | MailboxBinding::Bound(BoundState::Full { .. })
         | MailboxBinding::Frozen { .. }
-        | MailboxBinding::Terminal(_) => return Err(message),
+        | MailboxBinding::Terminal(_) => {
+            return Err(Rejected {
+                message,
+                reason: RejectionReason::NotAccepting,
+            });
+        }
     };
     let kind = match state.kind {
         Some(MailboxKind::Queue(capacity)) if state.queue.len() < capacity.get() => {
             MailboxKind::Queue(capacity)
         }
         Some(MailboxKind::Latest) => MailboxKind::Latest,
-        Some(MailboxKind::Queue(_)) | None => return Err(message),
+        Some(MailboxKind::Queue(_)) => {
+            return Err(Rejected {
+                message,
+                reason: RejectionReason::Full,
+            });
+        }
+        None => {
+            return Err(Rejected {
+                message,
+                reason: RejectionReason::Unconfigured,
+            });
+        }
     };
     let accepted_sequence = mint_accepted_sequence(accepted);
     let displaced = match kind {

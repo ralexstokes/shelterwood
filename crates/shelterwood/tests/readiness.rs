@@ -724,7 +724,12 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
         )
         .await
         .expect("runtime member is admitted");
-    assert!(runtime_started.load(Ordering::SeqCst));
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            runtime_started.load(Ordering::SeqCst)
+        })
+        .await
+    );
     initial_release.release();
     system
         .wait_started()

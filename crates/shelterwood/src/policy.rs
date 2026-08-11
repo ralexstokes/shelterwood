@@ -187,30 +187,30 @@ impl std::hash::Hash for BackoffFactor {
 
 /// Delay policy for a scheduled restart.
 ///
-/// Payloads with validation invariants cannot be forged as literals:
+/// A fixed-backoff payload cannot be forged as a literal:
 ///
 /// ```compile_fail
 /// use std::time::Duration;
-/// use shelterwood::{
-///     Backoff, BackoffFactor, BoundedReadinessDeadline, ExponentialBackoff, FixedBackoff,
-///     Intensity, Jitter, ReadinessDeadline,
-/// };
+/// use shelterwood::{Backoff, FixedBackoff, Jitter};
 ///
 /// let _ = Backoff::Fixed(FixedBackoff {
 ///     delay: Duration::ZERO,
 ///     jitter: Jitter::None,
 /// });
+/// ```
+///
+/// An exponential-backoff payload is sealed independently:
+///
+/// ```compile_fail
+/// use std::time::Duration;
+/// use shelterwood::{Backoff, BackoffFactor, ExponentialBackoff, Jitter};
+///
 /// let _ = Backoff::Exponential(ExponentialBackoff {
 ///     base: Duration::ZERO,
 ///     factor: BackoffFactor::new(2.0).unwrap(),
 ///     max: Duration::from_secs(1),
 ///     jitter: Jitter::None,
 /// });
-/// let _ = ReadinessDeadline::Bounded(BoundedReadinessDeadline(Duration::ZERO));
-/// let _ = Intensity {
-///     max_restarts: 1,
-///     within: Duration::ZERO,
-/// };
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Backoff {
@@ -493,6 +493,13 @@ pub enum ReadinessDeadline {
 /// Validated non-zero payload of a bounded [`ReadinessDeadline`].
 ///
 /// Values are created by [`ReadinessDeadline::bounded`].
+///
+/// ```compile_fail
+/// use std::time::Duration;
+/// use shelterwood::{BoundedReadinessDeadline, ReadinessDeadline};
+///
+/// let _ = ReadinessDeadline::Bounded(BoundedReadinessDeadline(Duration::ZERO));
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BoundedReadinessDeadline(Duration);
 
@@ -515,6 +522,19 @@ impl ReadinessDeadline {
 }
 
 /// The scope-wide restart budget.
+///
+/// Values are created by [`Intensity::new`], and cannot be forged with an
+/// invalid zero-length window.
+///
+/// ```compile_fail
+/// use std::time::Duration;
+/// use shelterwood::Intensity;
+///
+/// let _ = Intensity {
+///     max_restarts: 1,
+///     within: Duration::ZERO,
+/// };
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Intensity {
     /// Maximum restart charges allowed inside the rolling window.

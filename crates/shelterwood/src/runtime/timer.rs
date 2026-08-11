@@ -30,7 +30,11 @@ fn next_timer_deadline(
         return None;
     }
     let slice = requested.duration_since(current).min(MAX_TIMER_SLICE);
-    current.checked_add(slice)
+    Some(
+        current
+            .checked_add(slice)
+            .expect("a timer slice no later than the requested instant must fit"),
+    )
 }
 
 pub(crate) type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;

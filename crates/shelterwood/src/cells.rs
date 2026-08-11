@@ -18,8 +18,7 @@ use std::{
 };
 
 use crate::{
-    ChildId, Exit, Incarnation, Intensity, Membership, Readiness, RestartCount, Strategy,
-    TotalRestarts,
+    ChildId, Exit, Incarnation, Intensity, Membership, RestartCount, Strategy, TotalRestarts,
     admission::{RemoveOutcome, ReserveError},
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason},
@@ -432,16 +431,8 @@ impl MemberCell {
             .expect("member options are resolved exactly once");
     }
 
-    fn options(&self) -> ResolvedCommonOptions {
-        self.options.get().cloned().unwrap_or_else(|| {
-            crate::policy::resolve_common(
-                &crate::policy::CommonOptions::default(),
-                &crate::policy::ResolvedDefaults::default(),
-                crate::policy::ChildMode::Restartable,
-                Readiness::Immediate,
-            )
-            .expect("library defaults must be valid")
-        })
+    fn options(&self) -> Option<ResolvedCommonOptions> {
+        self.options.get().cloned()
     }
 
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
@@ -1461,6 +1452,9 @@ impl ScopeCell {
     fn child_snapshot_locked(&self, child: &ResidentProjection) -> ChildSnapshot {
         let record = child.member.record();
         let options = child.member.options();
+        let (restart_policy, retention) = options.map_or((None, None), |options| {
+            (Some(options.restart), Some(options.retention))
+        });
         let terminal = matches!(record.stage, MemberStage::Terminal(_));
         let nested = child.scope.as_ref().and_then(|scope| {
             (record.incarnation.is_some() || terminal).then(|| scope.snapshot_locked())
@@ -1483,8 +1477,8 @@ impl ScopeCell {
             last_exit: record.last_exit,
             membership_status: record.membership_status,
             restart_count: record.restart_count,
-            restart_policy: options.restart,
-            retention: options.retention,
+            restart_policy,
+            retention,
             restart_at: record.restart_at,
             nested,
             scope_seq: child

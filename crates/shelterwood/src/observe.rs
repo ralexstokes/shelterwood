@@ -201,10 +201,12 @@ pub struct ChildSnapshot {
     pub membership_status: MembershipStatus,
     /// Cumulative scheduled-restart charges for this membership.
     pub restart_count: RestartCount,
-    /// Resolved restart policy.
-    pub restart_policy: RestartPolicy,
-    /// Resolved terminal-retention policy.
-    pub retention: Retention,
+    /// Resolved restart policy, or `None` while an admitted dynamic
+    /// reservation is still being lowered.
+    pub restart_policy: Option<RestartPolicy>,
+    /// Resolved terminal-retention policy, or `None` while an admitted
+    /// dynamic reservation is still being lowered.
+    pub retention: Option<Retention>,
     /// Absolute backoff deadline while restarting, or `None` when the exact
     /// point is too distant for the runtime clock to represent and arm.
     pub restart_at: Option<Instant>,

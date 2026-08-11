@@ -17,6 +17,9 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
 use crate::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartCount, Strategy, TotalRestarts,
     admission::{RemoveOutcome, ReserveError},
@@ -894,6 +897,8 @@ pub(crate) struct ScopeCell {
     snapshots: SnapshotHub,
     observation_closed: AtomicBool,
     #[cfg(test)]
+    ancestor_parent_reads: AtomicUsize,
+    #[cfg(test)]
     runtime_storage: Mutex<RuntimeStorage>,
     #[cfg(test)]
     gate_capture_probe: Mutex<Option<std::sync::mpsc::Sender<GateCapture>>>,
@@ -959,6 +964,8 @@ impl ScopeCell {
             snapshots: SnapshotHub::default(),
             observation_closed: AtomicBool::new(false),
             #[cfg(test)]
+            ancestor_parent_reads: AtomicUsize::new(0),
+            #[cfg(test)]
             runtime_storage: Mutex::new(RuntimeStorage::default()),
             #[cfg(test)]
             gate_capture_probe: Mutex::new(None),
@@ -994,11 +1001,18 @@ impl ScopeCell {
     }
 
     fn parent(&self) -> Option<Arc<ScopeCell>> {
+        #[cfg(test)]
+        self.ancestor_parent_reads.fetch_add(1, Ordering::Relaxed);
         self.parent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .and_then(Weak::upgrade)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_ancestor_parent_reads(&self) -> usize {
+        self.ancestor_parent_reads.swap(0, Ordering::Relaxed)
     }
 
     fn set_parent(&self, parent: &Arc<ScopeCell>, txn: &mut ObservationTxn<'_>) {
@@ -1512,17 +1526,30 @@ impl ScopeCell {
         ancestors
     }
 
-    fn publish_snapshot_chain_locked(&self, wakes: &mut ObservationTxn<'_>) {
+    fn publish_snapshot_chain_through_locked(
+        &self,
+        wakes: &mut ObservationTxn<'_>,
+        ancestors: &[Arc<ScopeCell>],
+    ) {
         self.snapshots
             .publish_deferred(wakes, || self.snapshot_locked());
-        for ancestor in self.ancestors_locked() {
+        for ancestor in ancestors {
             ancestor
                 .snapshots
                 .publish_deferred(wakes, || ancestor.snapshot_locked());
         }
     }
 
+    fn publish_snapshot_chain_locked(&self, wakes: &mut ObservationTxn<'_>) {
+        let ancestors = self.ancestors_locked();
+        self.publish_snapshot_chain_through_locked(wakes, &ancestors);
+    }
+
     fn emit_locked(&self, wakes: &mut ObservationTxn<'_>, kind: LifecycleEventKind) {
+        // Parent links cannot change under the resident-tree observation gate.
+        // Resolve them once for snapshot and lifecycle propagation so one leaf
+        // edge does not repeatedly lock every ancestor's parent mutex.
+        let ancestors = self.ancestors_locked();
         // The resident-tree observation gate serializes every mint; the
         // atomic is the published watermark as well as the counter, avoiding
         // a second, provably uncontended lock on every lifecycle edge. The
@@ -1532,14 +1559,14 @@ impl ScopeCell {
             .lifecycle_seq
             .mint(Ordering::Release, Ordering::Relaxed);
         let Some(seq) = seq.map(LifecycleSeq::new) else {
-            self.publish_snapshot_chain_locked(wakes);
+            self.publish_snapshot_chain_through_locked(wakes, &ancestors);
             self.lifecycle.publish_lagged_deferred(wakes, 1);
-            for ancestor in self.ancestors_locked() {
+            for ancestor in &ancestors {
                 ancestor.lifecycle.publish_lagged_deferred(wakes, 1);
             }
             return;
         };
-        self.publish_snapshot_chain_locked(wakes);
+        self.publish_snapshot_chain_through_locked(wakes, &ancestors);
 
         let scope = self.member.membership();
         let mut event = LifecycleEvent {
@@ -1550,7 +1577,7 @@ impl ScopeCell {
         };
         self.lifecycle.publish_deferred(wakes, event.clone());
         let mut child_id = self.member.id().clone();
-        for ancestor in self.ancestors_locked() {
+        for ancestor in ancestors {
             event.scope_path.insert(0, child_id);
             child_id = ancestor.member.id().clone();
             ancestor.lifecycle.publish_deferred(wakes, event.clone());
@@ -1757,6 +1784,15 @@ impl ScopeCell {
     }
 
     pub(crate) fn take_control_events(&self) -> Vec<ScopeControlEvent> {
+        if self
+            .control
+            .lock()
+            .expect("scope control mutex poisoned")
+            .events
+            .is_empty()
+        {
+            return Vec::new();
+        }
         self.with_observation_gate(|_txn| {
             self.control
                 .lock()
@@ -1785,6 +1821,15 @@ impl ScopeCell {
     }
 
     pub(crate) fn take_shutdown_request(&self, epoch: Epoch) -> bool {
+        let pending = self
+            .control
+            .lock()
+            .expect("scope control mutex poisoned")
+            .shutdown
+            .is_some_and(|request| request.epoch == epoch && !request.consumed);
+        if !pending {
+            return false;
+        }
         self.with_observation_gate(|_txn| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             match control.shutdown.as_mut() {
@@ -1812,6 +1857,15 @@ impl ScopeCell {
     }
 
     pub(crate) fn take_force_request(&self, epoch: Epoch) -> bool {
+        let pending = self
+            .control
+            .lock()
+            .expect("scope control mutex poisoned")
+            .force
+            .is_some_and(|request| request.epoch == epoch && !request.consumed);
+        if !pending {
+            return false;
+        }
         self.with_observation_gate(|_txn| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             match control.force.as_mut() {

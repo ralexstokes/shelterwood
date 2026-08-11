@@ -21,8 +21,8 @@ use child::ChildRuntime;
 #[cfg(test)]
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
 use events::{
-    ChildEvent, DeadlineKind, DriverEvent, MIN_EVENT_BATCH_LIMIT, Pending, collect_driver_events,
-    restart_shutdown_work,
+    ChildEvent, DeadlineKind, DriverEvent, EventLanes, MIN_EVENT_BATCH_LIMIT, Pending,
+    collect_event_lanes, restart_shutdown_work,
 };
 use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
@@ -811,24 +811,15 @@ async fn run_scope_incarnation(
             // cannot publish Running after the stop boundary.
             pending.push(Pending::Force.classified());
         }
-        let primary_batch_full =
-            collect_driver_events(&mut event_receiver, event_batch_limit, &mut pending);
-        let control_batch_full = dynamic_event_receiver.as_mut().is_some_and(|receiver| {
-            collect_driver_events(receiver, event_batch_limit, &mut pending)
-        });
-        // Disposal completions drain after the primary and dynamic lanes, and `arbitrate`
-        // sorts stably, so a `ConstructionDisposed` always trails every
-        // same-class `Exited` collected in the same wake — even one produced
-        // later. A disposal is therefore a batch-tail event: the exit it
-        // trails may begin a drain first, after which
-        // `handle_construction_disposed` sees `is_draining` and routes the
-        // disposed child through stop progression instead of `fail_startup`.
-        // That is a widening of an order that was already reachable, not a new
-        // one: disposal runs on the blocking pool, so its completion never had
-        // a fixed position relative to concurrent exits.
-        while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut disposal_event_receiver) {
-            pending.push(Pending::Driver(event).classified());
-        }
+        let lane_batch_full = collect_event_lanes(
+            EventLanes {
+                primary: &mut event_receiver,
+                control: dynamic_event_receiver.as_mut(),
+                disposal: &mut disposal_event_receiver,
+            },
+            event_batch_limit,
+            &mut pending,
+        );
         let now = runtime::now();
         while let Some(deadline) = scope.deadlines.pop_due(now) {
             pending.push(Pending::Deadline(deadline).classified());
@@ -973,8 +964,8 @@ async fn run_scope_incarnation(
         // runtime, immediately collecting the next batch would prevent the
         // child, timer, and helper tasks whose events this loop prioritizes
         // from running at all. Give those producers one scheduler turn before
-        // returning to either saturated lane.
-        if primary_batch_full || control_batch_full {
+        // returning to any saturated lane.
+        if lane_batch_full {
             runtime::yield_now().await;
         }
     }

@@ -737,6 +737,37 @@ fn plain_parent_state_preserves_nested_snapshot_propagation() {
 }
 
 #[test]
+fn lifecycle_emit_resolves_the_ancestor_chain_once() {
+    let root = isolated_scope("root", ScopeFlavor::Ordered);
+    let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+    let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+    root.set_admitted_children(vec![resident_projection(&nested_slot)]);
+    let mut root_events = root.subscribe_lifecycle();
+
+    let _ = nested.take_ancestor_parent_reads();
+    let _ = root.take_ancestor_parent_reads();
+    nested.emit(LifecycleEventKind::ScopeState {
+        state: ScopeState::Running,
+    });
+
+    assert_eq!(
+        nested.take_ancestor_parent_reads(),
+        1,
+        "the emitting scope reads its parent link once"
+    );
+    assert_eq!(
+        root.take_ancestor_parent_reads(),
+        1,
+        "each ancestor reads its parent link once while building the chain"
+    );
+    assert!(matches!(
+        root_events.try_recv(),
+        Ok(LifecycleItem::Event(event))
+            if matches!(event.kind, LifecycleEventKind::ScopeState { state: ScopeState::Running })
+    ));
+}
+
+#[test]
 fn pre_admission_observer_retries_after_gate_handoff() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);

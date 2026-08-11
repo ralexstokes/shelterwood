@@ -947,3 +947,200 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
         "the live successor still gates the aggregate"
     );
 }
+
+/// A removal response is an observation boundary, not merely a wake. Keep it
+/// pending after membership commit until the batch epilogue has recomputed
+/// startup over the shrunken declared set.
+#[crate::runtime::test]
+async fn startup_removal_response_follows_aggregate_recomputation() {
+    let mut tree = DynamicTree::new();
+    tree.add_task(
+        "gate",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness is valid")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid initial member");
+
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (control_events, _control_event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(control_events);
+    let mut children = ChildArena::default();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let key = children
+        .insert(child)
+        .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
+    root.with_observation_gate(|txn| {
+        control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
+    });
+    root.set_dynamic_route(Some(control.clone()));
+    let member = Arc::clone(&children[key].slot.member);
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_children(children)
+        .with_dynamic(Some(control))
+        .build();
+    plan.finish_transfer();
+
+    assert!(scope.terminalize_child(
+        key,
+        Exit::never_started(),
+        None,
+        StartupDisposition::NotAborted,
+    ));
+    let mut removal = super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
+    scope.finalize_removal(key);
+
+    assert_eq!(
+        removal.try_receive(),
+        None,
+        "membership commit alone cannot publish Removed before settlement"
+    );
+    assert!(!scope.lifecycle.startup_complete());
+
+    scope.progress_startup();
+    assert!(scope.lifecycle.startup_complete());
+    assert_eq!(root.record().startup, Some(Ok(())));
+    scope.publish_startup_removals();
+    assert_eq!(removal.try_receive(), Some(RemoveOutcome::Removed));
+}
+
+/// A latched removal outranks readiness structurally, and arbitration alone
+/// cannot deliver that: `SelfStop` shares `MembershipRemoval` with `Removal`
+/// and the primary lane is collected first, so the queued removal can never
+/// preempt the readiness `handle_self_stop` replays. Publication consults the
+/// removal sources at execution time instead — without that, a `Ready` is
+/// published for a membership the owner already observes as `Removing`, and
+/// it completes scope startup on a member that is leaving.
+#[crate::runtime::test]
+async fn queued_removal_suppresses_replayed_self_stop_readiness() {
+    let mut tree = DynamicTree::new();
+    tree.add_task(
+        "gate",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness is valid")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid initial member");
+
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (control_events, mut control_event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(control_events);
+    let mut children = ChildArena::default();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let key = children
+        .insert(child)
+        .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
+    root.with_observation_gate(|txn| {
+        control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
+    });
+    root.set_dynamic_route(Some(control.clone()));
+    let member = Arc::clone(&children[key].slot.member);
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_children(children)
+        .with_dynamic(Some(control))
+        .build();
+    plan.finish_transfer();
+
+    scope.spawn_child(key);
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("the spawned child is active");
+    let incarnation = active.incarnation;
+    // The application task fired readiness and then stopped; the driver has
+    // not drained the corresponding Ready event yet.
+    assert!(active.ready_signal.fire());
+
+    let mut lifecycle = root.subscribe_lifecycle();
+    let _removal = super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
+    assert_eq!(
+        member.record().membership_status,
+        MembershipStatus::Removing,
+        "remove() latches Removing in the caller's observation gate"
+    );
+
+    // The premise: full-drain collection leads with the primary lane, so the
+    // self-stop sorts ahead of the removal it shares a class with.
+    let mut pending = vec![
+        Pending::Child(ChildEvent::SelfStop {
+            child: key,
+            incarnation,
+        })
+        .classified(),
+    ];
+    while let Some(event) = crate::runtime::unbounded_mpsc_try_recv(&mut control_event_receiver) {
+        pending.push(Pending::from(event).classified());
+    }
+    arbitrate(&mut pending);
+    assert_eq!(
+        pending.len(),
+        2,
+        "the removal request reached the control lane"
+    );
+    assert!(
+        matches!(pending[0].1, Pending::Child(ChildEvent::SelfStop { .. })),
+        "the premise: arbitration cannot order the removal ahead of the self-stop"
+    );
+    assert!(matches!(pending[1].1, Pending::Removal(_)));
+
+    scope.handle_self_stop(key, incarnation);
+
+    let mut published = Vec::new();
+    while let Ok(crate::observe::LifecycleItem::Event(event)) = lifecycle.try_recv() {
+        published.push(event.kind);
+    }
+    assert!(
+        !published
+            .iter()
+            .any(|kind| matches!(kind, LifecycleEventKind::Ready { .. })),
+        "no readiness edge is published for an already-Removing membership: {published:?}"
+    );
+    assert!(
+        !matches!(member.record().stage, MemberStage::Running),
+        "the suppressed edge does not project Running: {:?}",
+        member.record().stage
+    );
+    assert!(
+        !scope.children[key].initial_ready,
+        "a leaving membership is not credited to the startup aggregate"
+    );
+    assert!(!scope.lifecycle.startup_complete());
+    scope.progress_startup();
+    assert!(
+        !scope.lifecycle.startup_complete(),
+        "startup waits for the removal to shrink the declared set"
+    );
+    assert_eq!(root.record().state, ScopeState::Starting);
+}

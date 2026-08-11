@@ -91,6 +91,24 @@ impl From<DriverEvent> for Pending {
     }
 }
 
+/// Retains the item that ended a blocking wait. The driver then returns to
+/// its single collection site so this head is arbitrated with every other
+/// input that became eligible before the wake was observed.
+///
+/// The retained head keeps its own lane's FIFO position — it was that
+/// channel's head — but it sits ahead of the whole re-entered collection, so
+/// a woken *control* head precedes the primary lane the collection order
+/// otherwise puts first. `MembershipRemoval` is the only class both lanes
+/// produce (`Removal` and `SelfStop`), and neither ordering of that pair
+/// changes a verdict: readiness publication consults the removal sources at
+/// execution time rather than relying on arbitration position.
+pub(super) fn retain_woken_event(
+    event: DriverEvent,
+    pending: &mut Vec<(ArbitrationClass, Pending)>,
+) {
+    pending.push(Pending::from(event).classified());
+}
+
 /// The three unbounded lanes one driver wake collects from, in collection
 /// order.
 pub(super) struct EventLanes<'a> {

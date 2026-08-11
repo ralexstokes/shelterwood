@@ -126,6 +126,7 @@ impl ScopeRuntimeBuilder {
             next_ordered_start: self.next_ordered_start,
             role: ScopeRole::Root,
             dynamic: self.dynamic,
+            pending_startup_removals: Vec::new(),
             epoch: self.epoch,
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,

@@ -1236,7 +1236,16 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   the membership *not yet* marked removing fails startup under the
   rule above, while once the mark is in place removal outranks it and
   the aggregate simply shrinks. Both orders are legal; which one a
-  given run takes is not specified. The aggregate fires at most once
+  given run takes is not specified. The mark suppresses the member's
+  own **readiness edge** on the same terms: a membership observed
+  removing where a readiness edge would be published emits no `Ready`
+  (B.4) and is credited to no aggregate, even when its readiness latch
+  fired before the mark — and this binds every membership, not only
+  initial ones, so a runtime-added member being removed publishes no
+  per-child `Ready` either. Which side of *that* race a run takes is
+  likewise unspecified; what is pinned is that the mark is consulted
+  where the edge would be published, never by arbitration position
+  (§14.2). The aggregate fires at most once
   per scope incarnation and is latched: an already-ready child that
   fails and restarts afterwards does not rewind it — readiness is a
   startup-phase edge, not a liveness signal (snapshots carry liveness,
@@ -1383,7 +1392,11 @@ One classification, produced at one point, used by every consumer.
   restarts (§10), and a membership whose removal is in progress
   (`membership_status: Removing`, B.6) has its restarts suppressed even
   while its containing scope keeps running — dynamic removal of one
-  child must not depend on the whole scope draining (§11).
+  child must not depend on the whole scope draining (§11). The same
+  mark suppresses that membership's readiness publication (§6): one
+  level-triggered removal source, consulted at execution time by every
+  site that would otherwise publish or schedule on the membership's
+  behalf.
 - There is exactly **one incarnation runner**, and it yields this one exit
   type — including `Panicked` — regardless of how it is hosted. The
   supervisor is a policy loop over the runner's output. (The public
@@ -2763,7 +2776,13 @@ Both questions are resolved:
    pins the complete table without runtime selection; each pending item
    derives its class through `Pending::class()` rather than accepting a class
    beside it at collection sites, and the driver drains all currently eligible
-   inputs into that table before applying effects.
+   inputs into that table before applying effects. Class position is not,
+   however, what protects a leaving membership from a spurious readiness edge:
+   a child's self-stop shares membership removal's class, so a queued removal
+   cannot be ordered ahead of the readiness that self-stop dispatch replays.
+   That rule is structural instead — the readiness publication site consults
+   the membership's removal mark at execution time (§6, §7), the same
+   discipline exit dispatch follows for restart suppression.
 
 (Resolved elsewhere: stage-generic `handle` is rejected — drain-stage
 rejection stays value-level, §5.4; the conflating-mailbox control lane is

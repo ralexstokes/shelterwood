@@ -29,6 +29,20 @@ impl ScopeRuntime {
                 false
             }
             ReadinessEffect::BecameReady => {
+                // Removal outranks readiness structurally, and arbitration
+                // alone does not deliver that: `SelfStop` shares removal's
+                // class, so a same-batch `Removal` cannot preempt the
+                // readiness `handle_self_stop` replays, and an exit's
+                // readiness step runs from the same collection. Consult the
+                // removal sources at execution time — the discipline exit
+                // dispatch already follows — so no readiness edge is
+                // published for, or credited to startup by, a membership the
+                // owner already observes as `Removing`. The internal latch
+                // still records that the edge happened: a removing member's
+                // terminal routes through `finalize_removal`, and its exit
+                // classification must not mistake a post-ready stop for a
+                // pre-ready failure.
+                let removing = self.dispatch_membership_status(key) == MembershipStatus::Removing;
                 let Some(child) = self.children.get_mut(key) else {
                     return false;
                 };
@@ -42,6 +56,9 @@ impl ScopeRuntime {
                     self.deadlines.cancel(deadline);
                 }
                 active.ready_signal.fire();
+                if removing {
+                    return false;
+                }
                 if !self.lifecycle.startup_complete() {
                     child.initial_ready = true;
                 }

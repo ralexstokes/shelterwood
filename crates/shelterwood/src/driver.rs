@@ -22,7 +22,7 @@ use child::ChildRuntime;
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
 use events::{
     ChildEvent, DeadlineKind, DriverEvent, EventLanes, MIN_EVENT_BATCH_LIMIT, Pending,
-    collect_event_lanes, restart_shutdown_work,
+    collect_event_lanes, restart_shutdown_work, retain_woken_event,
 };
 use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
@@ -213,6 +213,11 @@ struct ScopeRuntime {
     next_ordered_start: Option<ChildKey>,
     role: ScopeRole,
     dynamic: Option<Arc<DynamicControl>>,
+    // Removing an initial member can complete startup. Hold its response
+    // obligation until the batch epilogue has recomputed that aggregate, so
+    // observing `Removed` implies the declared set already reflects the
+    // committed shrink.
+    pending_startup_removals: Vec<DynamicEntry>,
     epoch: Epoch,
     ancestor_shutdown_seen: bool,
     ancestor_abort_seen: bool,
@@ -722,6 +727,7 @@ async fn run_scope_incarnation(
         next_ordered_start,
         role,
         dynamic,
+        pending_startup_removals: Vec::new(),
         ancestor_shutdown_seen: false,
         ancestor_abort_seen: false,
         hard_forced: false,
@@ -768,8 +774,8 @@ async fn run_scope_incarnation(
     }
 
     let mut signal = root.signal().watcher();
+    let mut pending = Vec::new();
     loop {
-        let mut pending = Vec::new();
         if root.take_shutdown_request(scope.epoch) {
             pending.push(Pending::Shutdown.classified());
         }
@@ -860,29 +866,29 @@ async fn run_scope_incarnation(
             )
             .await
             {
-                runtime::ScopeWake::Signal | runtime::ScopeWake::ParentShutdown => continue,
+                runtime::ScopeWake::Signal
+                | runtime::ScopeWake::ParentShutdown
+                | runtime::ScopeWake::Message(None)
+                | runtime::ScopeWake::ControlMessage(None) => {}
                 runtime::ScopeWake::Deadline => {
                     // A producer becoming ready at the same instant owns the
                     // tie over its deadline. Give tasks woken by that clock
                     // edge one turn to publish their retained readiness
                     // latch before collecting due registrations.
                     runtime::yield_now().await;
-                    continue;
                 }
-                runtime::ScopeWake::Message(Some(event)) => {
-                    pending.push(Pending::from(event).classified());
-                }
-                runtime::ScopeWake::ControlMessage(Some(event)) => {
-                    pending.push(Pending::from(event).classified());
-                }
-                runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
-                    continue;
+                runtime::ScopeWake::Message(Some(event))
+                | runtime::ScopeWake::ControlMessage(Some(event)) => {
+                    retain_woken_event(event, &mut pending);
                 }
             }
+            // Every wake re-enters the collection site above. Nothing is
+            // dispatched from this arm.
+            continue;
         }
 
         arbitrate(&mut pending);
-        for (_, event) in pending {
+        for (_, event) in pending.drain(..) {
             match event {
                 Pending::Shutdown => {
                     if let Some(latches) = scope.role.ancestor() {
@@ -942,6 +948,15 @@ async fn run_scope_incarnation(
             }
         }
 
+        // Settlement is level-triggered from authoritative state after every
+        // batch. Any transition that changes the startup aggregate therefore
+        // gets the same recomputation point as terminal completion.
+        scope.progress_startup();
+        // A removal response is also an observation edge: SPEC §6 promises
+        // that a returned `Removed` has already been incorporated into the
+        // startup aggregate. Finalization retains starting-phase obligations
+        // until the recomputation above establishes that order.
+        scope.publish_startup_removals();
         if let Some(reason) = scope.finish_if_ready() {
             let root_exit = scope.role.is_root().then(|| reason.root_exit());
             // ScopeRuntime's synchronous epilogue clears dynamic state,

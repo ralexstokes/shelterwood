@@ -188,6 +188,10 @@ pub(crate) struct MemberCell {
     membership: Membership,
     rebased_membership: OnceLock<Membership>,
     record: runtime::WatchSender<MemberRecord>,
+    // Guards only a gate-pointer swap, so no torn state is possible; every
+    // access deliberately tolerates poisoning (mirroring
+    // `ObservationGate::lock`) so drop-path shutdown after a panicked assert
+    // cannot itself panic.
     observation_gate: RwLock<ObservationGate>,
     terminal_disposal_pending: AtomicBool,
     mailbox: Mutex<MemberMailbox>,
@@ -343,7 +347,7 @@ impl MemberCell {
     fn current_observation_gate(&self) -> ObservationGate {
         self.observation_gate
             .read()
-            .expect("member observation gate handoff mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -356,7 +360,7 @@ impl MemberCell {
         let mut installed = self
             .observation_gate
             .write()
-            .expect("member observation gate handoff mutex poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if installed.same_gate(previous) {
             *installed = gate.clone();
         } else {
@@ -834,6 +838,10 @@ pub(crate) struct ScopeCell {
     // move removed residents into outer storage before the drop runs.
     current_children: Mutex<Vec<ResidentChild>>,
     parent: Mutex<Option<Weak<ScopeCell>>>,
+    // Guards only a gate-pointer swap, so no torn state is possible; every
+    // access deliberately tolerates poisoning (mirroring
+    // `ObservationGate::lock`) so drop-path shutdown after a panicked assert
+    // cannot itself panic.
     observation_gate: RwLock<ObservationGate>,
     lifecycle_seq: AtomicU64,
     lifecycle: LifecycleHub,
@@ -995,7 +1003,7 @@ impl ScopeCell {
     fn current_observation_gate(&self) -> ObservationGate {
         self.observation_gate
             .read()
-            .expect("observation gate handoff mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -1033,7 +1041,7 @@ impl ScopeCell {
             let mut installed = self
                 .observation_gate
                 .write()
-                .expect("observation gate handoff mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if current.same_gate(&installed) {
                 *installed = gate.clone();
                 self.member.install_observation_gate_locked(&current, gate);
@@ -1080,7 +1088,7 @@ impl ScopeCell {
                 let mut installed = scope
                     .observation_gate
                     .write()
-                    .expect("observation gate handoff mutex poisoned");
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if installed.same_gate(previous) {
                     *installed = gate.clone();
                     descendant
@@ -1494,7 +1502,7 @@ impl ScopeCell {
         *self
             .observation_gate
             .write()
-            .expect("observation gate handoff mutex remains healthy") = gate;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
     }
 
     #[cfg(test)]

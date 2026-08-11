@@ -136,6 +136,57 @@ async fn terminal_stop_paths_share_one_complete_observation_transition() {
     }
 }
 
+#[crate::runtime::test]
+async fn no_live_root_fallback_preserves_the_first_stopped_publication() {
+    let scope = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    let handle = ScopeRef {
+        cell: Arc::clone(&scope),
+    };
+    let mut snapshots = handle.subscribe_snapshots();
+    let mut events = handle.subscribe_lifecycle();
+
+    scope.finish_incarnation(epoch, StopReason::Finished);
+    assert!(
+        !matches!(scope.member.record().stage, MemberStage::Terminal(_)),
+        "the driver-drop publication leaves root terminality to the join monitor"
+    );
+
+    let panic_exit = Exit::new(
+        ExitKind::Panicked {
+            message: Some("root driver panicked mid-drain".to_owned()),
+        },
+        Cancellation::NotObserved,
+    );
+    scope.finish_live_root_incarnation(StopReason::ShutdownRequested, panic_exit.clone());
+
+    let stopped = ScopeState::Stopped {
+        reason: StopReason::Finished,
+    };
+    assert_eq!(scope.record().state, stopped);
+    assert!(matches!(
+        scope.member.record().stage,
+        MemberStage::Terminal(ref exit) if exit == &panic_exit
+    ));
+    assert!(matches!(
+        events.try_recv(),
+        Ok(LifecycleItem::Event(crate::LifecycleEvent {
+            kind: LifecycleEventKind::ScopeState { state },
+            ..
+        })) if state == stopped
+    ));
+    assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+
+    assert_eq!(snapshots.borrow_latest().state, stopped);
+    snapshots
+        .changed()
+        .await
+        .expect("the first stopped snapshot precedes fallback closure");
+    assert!(snapshots.changed().await.is_err());
+}
+
 impl Wake for ObserveScopeOnStartupWake {
     fn wake(self: Arc<Self>) {
         self.observe();

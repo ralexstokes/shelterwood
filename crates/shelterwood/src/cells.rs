@@ -1993,17 +1993,19 @@ impl ScopeCell {
         }
     }
 
-    /// Commits one stopped-scope projection and its optional member terminal
-    /// edge under the resident-tree observation gate.
+    /// Commits at most one stopped-scope projection and applies its optional
+    /// member terminal edge under the resident-tree observation gate.
     ///
     /// Member terminalization prepares mailbox teardown first; its deferred
     /// discharge is therefore queued before either member or scope pulses.
     /// `epoch_owner` carries a live incarnation's control ownership through
     /// both retained record mutations and is released before snapshot and
     /// lifecycle publication, preserving the stop transition's ownership
-    /// boundary. Observation closure remains a caller decision because a
-    /// nested scope's final event must precede its parent's terminal event and
-    /// only then close the nested streams.
+    /// boundary. A later terminal fallback still terminalizes the member but
+    /// cannot replace the first authoritative stop reason or emit another
+    /// lifecycle edge. Observation closure remains a caller decision because
+    /// a nested scope's final event must precede its parent's terminal event
+    /// and only then close the nested streams.
     fn publish_stopped_locked(
         &self,
         wakes: &mut ObservationTxn<'_>,
@@ -2012,11 +2014,16 @@ impl ScopeCell {
         epoch_owner: Option<MutexGuard<'_, ScopeControl>>,
     ) {
         let state = ScopeState::Stopped { reason };
+        let mut published = false;
         self.observation.record.modify_silently(|record| {
+            if matches!(&record.state, ScopeState::Stopped { .. }) {
+                return;
+            }
             if record.startup.is_none() {
                 record.startup = Some(Err(StartupError::ShutdownRequested));
             }
             record.state = state.clone();
+            published = true;
         });
         if let Some(exit) = terminal_exit {
             self.member
@@ -2026,8 +2033,10 @@ impl ScopeCell {
         wakes.pulse(&self.member.record);
         // `wait_started` must not observe terminal startup until the member
         // and incarnation-control planes are mutually consistent.
-        wakes.pulse(&self.observation.record);
-        self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
+        if published {
+            wakes.pulse(&self.observation.record);
+            self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
+        }
     }
 
     pub(crate) fn terminalize_never_started(&self) {

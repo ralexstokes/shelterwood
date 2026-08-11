@@ -140,7 +140,10 @@ impl SlotCell {
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started();
         } else {
-            self.member.terminalize(Exit::never_started());
+            self.member.terminalize(
+                Exit::never_started(),
+                crate::cells::StartupDisposition::Unchanged,
+            );
         }
         owner.evict_child_identity(&self.member);
     }
@@ -150,7 +153,11 @@ impl SlotCell {
         owner: &ScopeCell,
         txn: &mut ObservationTxn<'_>,
     ) {
-        self.member.terminalize_locked(Exit::never_started(), txn);
+        self.member.terminalize_locked(
+            Exit::never_started(),
+            crate::cells::StartupDisposition::Unchanged,
+            txn,
+        );
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started_locked(txn);
         }

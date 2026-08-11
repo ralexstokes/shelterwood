@@ -34,7 +34,8 @@ struct ObserveMemberOnMailboxWake {
 impl ObserveMemberOnMailboxWake {
     fn observe(&self) {
         let before = self.member.record().stage;
-        self.member.terminalize(self.competing_exit.clone());
+        self.member
+            .terminalize(self.competing_exit.clone(), StartupDisposition::Unchanged);
         let after = self.member.record().stage;
         *self.observed.lock().expect("observation mutex poisoned") = Some((before, after));
     }
@@ -255,7 +256,7 @@ fn panicking_mailbox_waker_cannot_skip_the_terminal_pulse() {
     );
 
     catch_unwind(AssertUnwindSafe(|| {
-        member.terminalize(Exit::never_started());
+        member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
     }))
     .expect_err("the hostile mailbox waker still surfaces its panic");
     assert_eq!(
@@ -314,7 +315,7 @@ fn mailbox_teardown_panic_precedes_a_terminal_pulse_panic() {
     );
 
     let payload = catch_unwind(AssertUnwindSafe(|| {
-        member.terminalize(Exit::never_started());
+        member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
     }))
     .expect_err("the primary mailbox panic still surfaces");
     assert_eq!(
@@ -457,7 +458,7 @@ fn terminality_signal_follows_mailbox_termination() {
     let mut changed = Box::pin(watcher.changed());
     assert!(changed.as_mut().poll(&mut context).is_pending());
 
-    member.terminalize(Exit::never_started());
+    member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
 
     assert_eq!(
         *probe.observed.lock().expect("observation mutex poisoned"),
@@ -629,7 +630,7 @@ fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent
             .is_pending()
     );
 
-    member.terminalize(first_exit.clone());
+    member.terminalize(first_exit.clone(), StartupDisposition::Unchanged);
 
     assert_eq!(
         *probe.observed.lock().expect("observation mutex poisoned"),
@@ -704,7 +705,7 @@ fn concurrent_terminalizers_return_after_one_consistent_record_is_visible() {
         let start = Arc::clone(&start);
         std::thread::spawn(move || {
             start.wait();
-            member.terminalize(exit);
+            member.terminalize(exit, StartupDisposition::Unchanged);
             assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
         })
     })

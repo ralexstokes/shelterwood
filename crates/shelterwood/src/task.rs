@@ -448,7 +448,10 @@ mod tests {
         let mut context = Context::from_waker(Waker::noop());
 
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
-        member.terminalize(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
+        member.terminalize(
+            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+            crate::cells::StartupDisposition::Unchanged,
+        );
         assert_eq!(waiting.await, Ok(42));
     }
 
@@ -466,7 +469,7 @@ mod tests {
         );
 
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
-        member.terminalize(exit.clone());
+        member.terminalize(exit.clone(), crate::cells::StartupDisposition::Unchanged);
         assert_eq!(waiting.await, Err(exit));
     }
 
@@ -475,7 +478,10 @@ mod tests {
     async fn completed_terminal_publication_requires_a_typed_value() {
         let (sender, claim, member) = one_shot_claim::<u8>();
         drop(sender);
-        member.terminalize(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
+        member.terminalize(
+            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+            crate::cells::StartupDisposition::Unchanged,
+        );
 
         let _ = claim.wait().await;
     }

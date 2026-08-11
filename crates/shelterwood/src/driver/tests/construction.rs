@@ -50,7 +50,7 @@ async fn attaching_after_terminality_closes_the_mailbox() {
         std::future::poll_fn(|context| Poll::Ready(parked.as_mut().poll(context))).await;
     assert!(first_poll.is_pending());
 
-    member.terminalize(Exit::never_started());
+    member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
     member.attach_mailbox(mailbox);
 
     let parked = match crate::runtime::timeout(Duration::from_secs(1), parked).await {

@@ -412,19 +412,40 @@ impl SnapshotHub {
     }
 
     /// Closes while the containing scope's observation gate is held.
-    pub(crate) fn close(&self, txn: &mut crate::cells::ObservationTxn<'_>) {
-        if let Some(sender) = self.sender.get() {
-            let mut modified = false;
-            sender.modify_silently(|state| {
-                if !state.closed {
-                    state.closed = true;
-                    modified = true;
-                }
-            });
-            if modified {
-                txn.pulse(sender);
-            }
+    pub(crate) fn close(
+        &self,
+        txn: &mut crate::cells::ObservationTxn<'_>,
+        final_snapshot: impl FnOnce() -> Arc<ScopeSnapshot>,
+    ) {
+        let mut initialized = false;
+        let sender = self.sender.get_or_init(|| {
+            initialized = true;
+            runtime::watch(SnapshotHubState {
+                snapshot: final_snapshot(),
+                generation: crate::identity::PoisonedCounter::new(),
+                closed: true,
+            })
+            .0
+        });
+        if initialized {
+            return;
         }
+        let mut modified = false;
+        sender.modify_silently(|state| {
+            if !state.closed {
+                state.closed = true;
+                modified = true;
+            }
+        });
+        if modified {
+            txn.pulse(sender);
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.sender
+            .get()
+            .is_some_and(|sender| sender.read_cloned().closed)
     }
 }
 
@@ -439,13 +460,7 @@ impl fmt::Debug for SnapshotHub {
                     .get()
                     .map_or(0, |sender| sender.receiver_count()),
             )
-            .field(
-                "closed",
-                &self
-                    .sender
-                    .get()
-                    .is_some_and(|sender| sender.read_cloned().closed),
-            )
+            .field("closed", &self.is_closed())
             .finish()
     }
 }
@@ -567,6 +582,10 @@ impl LifecycleHub {
             signal,
             seen_explicit_lag,
         }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.channels.signal.read_cloned().closed
     }
 
     /// Publishes while the containing scope's observation gate is held.
@@ -712,7 +731,11 @@ mod tests {
                 reason: crate::StopReason::Finished,
             })
         });
-        hub.close(&mut txn);
+        hub.close(&mut txn, || {
+            snapshot(ScopeState::Stopped {
+                reason: crate::StopReason::Finished,
+            })
+        });
         drop(txn);
 
         assert!(matches!(
@@ -747,6 +770,29 @@ mod tests {
             }
         ));
         assert!(after_close.changed().await.is_err());
+    }
+
+    #[crate::runtime::test]
+    async fn receiverless_snapshot_close_installs_the_terminal_state() {
+        let hub = SnapshotHub::default();
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.close(&mut txn, || {
+            snapshot(ScopeState::Stopped {
+                reason: crate::StopReason::NeverStarted,
+            })
+        });
+        drop(txn);
+
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let mut receiver = hub.subscribe(snapshot(ScopeState::Running), &mut txn);
+        drop(txn);
+        assert!(matches!(
+            receiver.borrow_latest().state,
+            ScopeState::Stopped {
+                reason: crate::StopReason::NeverStarted
+            }
+        ));
+        assert!(receiver.changed().await.is_err());
     }
 
     #[crate::runtime::test]

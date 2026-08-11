@@ -114,7 +114,7 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
         response.try_receive().is_none(),
         "closing admission must not complete removal before teardown"
     );
-    member.terminalize(Exit::never_started());
+    member.terminalize(Exit::never_started(), StartupDisposition::Unchanged);
     assert!(root.prune_child(&member));
     assert!(
         response.try_receive().is_none(),

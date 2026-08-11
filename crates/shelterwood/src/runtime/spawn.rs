@@ -27,11 +27,11 @@ impl ActorWork {
         self.abort.abort();
     }
 
-    pub(crate) async fn join(mut self) {
+    pub(crate) async fn join(mut self) -> JoinOutcome<()> {
         let Some(handle) = self.handle.take() else {
-            return;
+            return JoinOutcome::Cancelled;
         };
-        let _ = join(handle).await;
+        join(handle).await
     }
 }
 

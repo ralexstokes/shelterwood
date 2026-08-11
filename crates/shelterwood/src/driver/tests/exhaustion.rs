@@ -466,6 +466,101 @@ async fn nested_membership_exhaustion_is_structured_and_fail_closed() {
     assert!(matches!(worker.wait().await.kind(), ExitKind::NeverStarted));
 }
 
+#[derive(Clone, Copy)]
+enum PreLoopStopSource {
+    ScopeShutdown,
+    ScopeForce,
+    AncestorShutdown,
+}
+
+async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoopStopSource) {
+    let nested_id = ChildId::from("nested");
+    let mut parent_identity = ScopeIdentity::new();
+    let nested_membership = parent_identity
+        .mint_membership(&nested_id)
+        .expect("nested membership available");
+    let nested_member = MemberCell::new(nested_id, nested_membership);
+
+    let worker_id = ChildId::from("worker");
+    let mut child_identity = ScopeIdentity::near_exhaustion(worker_id.clone(), 7);
+    child_identity
+        .mint_membership(&worker_id)
+        .expect("last usable membership is minted before the rebuild");
+    let scope = ScopeCell::new(nested_member, ScopeFlavor::Ordered, child_identity);
+
+    let mut tree = Tree::new();
+    let worker = tree
+        .add_task(
+            worker_id,
+            TaskDef::new(|_| future::pending::<crate::ExitResult>()),
+        )
+        .expect("provisional declaration succeeds");
+    let epoch = ScopeEpochGuard::begin(&scope).expect("the first nested epoch is available");
+    let ancestor_shutdown = Latch::default();
+    match source {
+        PreLoopStopSource::ScopeShutdown => {
+            let target = scope
+                .request_shutdown()
+                .expect("declaration-time shutdown targets the live epoch");
+            assert_eq!(target, epoch.epoch());
+        }
+        PreLoopStopSource::ScopeForce => scope.force_shutdown(epoch.epoch()),
+        PreLoopStopSource::AncestorShutdown => {
+            ancestor_shutdown.fire();
+        }
+    }
+    let ready = CompletionGatedLatch::default();
+    let result = super::super::run_nested_tree_with_epoch(
+        tree.into_core_for_test(),
+        Arc::clone(&scope),
+        crate::policy::ResolvedDefaults::default(),
+        NestedScopeLatches {
+            parent_ready: ready.clone(),
+            ancestor: AncestorCommandLatches {
+                shutdown: ancestor_shutdown.clone(),
+                abort: Latch::default(),
+                abort_ack: Latch::default(),
+            },
+        },
+        epoch,
+    )
+    .await;
+
+    assert!(result.is_ok());
+    assert!(
+        ancestor_shutdown.is_fired(),
+        "the upgraded verdict fires the latch that reports the exit as cancelled"
+    );
+    assert!(matches!(
+        scope.record().startup,
+        Some(Err(StartupError::ShutdownRequested))
+    ));
+    assert!(matches!(
+        scope.record().state,
+        ScopeState::Stopped {
+            reason: StopReason::ShutdownRequested
+        }
+    ));
+    assert!(!ready.is_fired());
+    assert!(matches!(worker.wait().await.kind(), ExitKind::NeverStarted));
+}
+
+#[crate::runtime::test]
+async fn pre_loop_shutdown_upgrades_a_nested_lowering_failure() {
+    assert_pre_loop_stop_upgrades_a_nested_lowering_failure(PreLoopStopSource::ScopeShutdown).await;
+}
+
+#[crate::runtime::test]
+async fn pre_loop_force_upgrades_a_nested_lowering_failure() {
+    assert_pre_loop_stop_upgrades_a_nested_lowering_failure(PreLoopStopSource::ScopeForce).await;
+}
+
+#[crate::runtime::test]
+async fn pre_loop_ancestor_shutdown_upgrades_a_nested_lowering_failure() {
+    assert_pre_loop_stop_upgrades_a_nested_lowering_failure(PreLoopStopSource::AncestorShutdown)
+        .await;
+}
+
 #[crate::runtime::test]
 async fn scope_incarnation_exhaustion_closes_nested_observation() {
     let parent = isolated_scope("parent", ScopeFlavor::Ordered);
@@ -531,6 +626,7 @@ async fn scope_incarnation_exhaustion_closes_nested_observation() {
 async fn never_started_nested_terminal_publishes_one_final_parent_snapshot() {
     let parent = isolated_scope("parent", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+    resolve_fixture_options(&nested.member);
     let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
     parent.set_admitted_children(vec![resident_projection(&slot)]);
     let mut snapshots = parent.subscribe_snapshots();

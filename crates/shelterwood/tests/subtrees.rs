@@ -828,6 +828,48 @@ async fn locally_requested_subtree_shutdown_reads_cancelled() {
     );
 }
 
+/// The pre-driver lowering-failure path resolves the same verdict as the loop
+/// above, including the cancellation evidence: a stop request latched against
+/// the first (still pending) incarnation outranks the lowering failure, so the
+/// subtree exits `Completed`/`Observed` rather than `Failed`.
+#[tokio::test]
+async fn shutdown_latched_before_a_subtree_lowering_failure_reads_cancelled() {
+    let mut nested = Tree::new();
+    let _undefined = nested.reserve_task("missing").expect("reservation");
+    let mut root = Tree::new();
+    let sub = root
+        .add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree edge");
+    // Declaration-time request: it latches against the incarnation the nested
+    // driver has not minted yet, so lowering fails with the stop already held.
+    sub.request_shutdown();
+    let system = root.spawn().expect("runtime is available");
+    let startup = system
+        .wait_started()
+        .await
+        .expect_err("the nested stop aborts parent startup pre-ready");
+    let StartupError::StartupFailed(failure) = startup else {
+        panic!("unexpected startup error: {startup:?}");
+    };
+    let StartupFailureCause::Child { id, exit, .. } = &failure.cause else {
+        panic!("unexpected failure cause: {:?}", failure.cause);
+    };
+    assert_eq!(id.as_str(), "nested");
+    assert!(
+        matches!(exit.kind(), ExitKind::Completed),
+        "the latched stop outranks the lowering failure: {exit:?}"
+    );
+    assert_eq!(
+        exit.cancellation(),
+        Cancellation::Observed,
+        "a pre-loop stop request is still a stop request: {exit:?}"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the stopped root rolls back");
+}
+
 #[tokio::test(start_paused = true)]
 async fn restart_attempt_resets_after_a_ready_incarnation_settles() {
     let starts = Arc::new(AtomicUsize::new(0));

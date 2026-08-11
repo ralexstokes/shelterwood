@@ -866,8 +866,9 @@ impl SharedOffloadState {
             return None;
         }
         debug_assert!(!state.polling, "offload work must have one poller");
-        state.polling = true;
-        state.future.take()
+        let future = state.future.take();
+        state.polling = future.is_some();
+        future
     }
 
     fn finish_poll(&self, future: OffloadFuture, outcome: OffloadPoll) -> Option<OffloadFuture> {
@@ -1062,7 +1063,17 @@ impl<M> RawResources<M> {
     async fn join_offloads(&mut self) {
         for offload in &mut self.offloads {
             if let Some(task) = offload.task.take() {
-                task.join().await;
+                match task.join().await {
+                    runtime::JoinOutcome::Ok { value: () } | runtime::JoinOutcome::Cancelled => {}
+                    runtime::JoinOutcome::Panic { message } => {
+                        let message = message.unwrap_or_else(|| {
+                            "library-owned offload task panicked without a string payload"
+                                .to_owned()
+                        });
+                        tracing::error!(%message, "library-owned offload task panicked");
+                        self.panic.record(Box::new(message));
+                    }
+                }
             }
         }
         self.events.clear();
@@ -2096,8 +2107,8 @@ mod tests {
     };
 
     use super::{
-        ArmingOrder, EventQueue, OffloadResource, PanicSlot, QueuedEvent, RawContext, RawResources,
-        RawRunContext, SharedOffloadFuture, SharedOffloadState, TimerMessage,
+        ArmingOrder, EventQueue, OffloadPoll, OffloadResource, PanicSlot, QueuedEvent, RawContext,
+        RawResources, RawRunContext, SharedOffloadFuture, SharedOffloadState, TimerMessage,
     };
     use crate::{
         ChildId, MailboxShutdown, Readiness,
@@ -2448,6 +2459,29 @@ mod tests {
     }
 
     #[test]
+    fn absent_offload_future_does_not_claim_a_poller() {
+        let state = SharedOffloadState::new(
+            Box::pin(std::future::pending()),
+            Arc::new(PanicSlot::default()),
+            Signal::default(),
+            Latch::default(),
+        );
+        let future = state.take_for_poll().expect("fixture future is present");
+        let dispose = state.finish_poll(future, OffloadPoll::Finished);
+        state.dispose(dispose);
+
+        assert!(state.take_for_poll().is_none());
+        assert!(
+            !state
+                .state
+                .lock()
+                .expect("offload future mutex starts healthy")
+                .polling,
+            "a contract-violating re-poll with no future cannot leave a poller claimed"
+        );
+    }
+
+    #[test]
     fn finished_offload_ledger_entries_are_reclaimed() {
         let mut resources = RawResources::<()>::default();
         for finished in [true, false, true] {
@@ -2566,6 +2600,30 @@ mod tests {
             Arc::strong_count(&resources.panic),
             baseline,
             "continuations, events, and timers store raw elements without disposal clones"
+        );
+    }
+
+    #[crate::runtime::test]
+    async fn joining_offloads_retains_a_framework_task_panic() {
+        let mut resources = RawResources::<()>::default();
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished: Latch::default(),
+            state: None,
+            task: Some(crate::runtime::spawn_actor_work(async {
+                panic!("unit framework offload panic");
+            })),
+        });
+
+        resources.join_offloads().await;
+
+        let payload = resources
+            .panic
+            .take()
+            .expect("the framework panic is retained for incarnation teardown");
+        assert_eq!(
+            panic_message(&payload),
+            Some("unit framework offload panic")
         );
     }
 

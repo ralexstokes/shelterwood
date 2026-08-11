@@ -186,6 +186,32 @@ impl std::hash::Hash for BackoffFactor {
 }
 
 /// Delay policy for a scheduled restart.
+///
+/// Payloads with validation invariants cannot be forged as literals:
+///
+/// ```compile_fail
+/// use std::time::Duration;
+/// use shelterwood::{
+///     Backoff, BackoffFactor, BoundedReadinessDeadline, ExponentialBackoff, FixedBackoff,
+///     Intensity, Jitter, ReadinessDeadline,
+/// };
+///
+/// let _ = Backoff::Fixed(FixedBackoff {
+///     delay: Duration::ZERO,
+///     jitter: Jitter::None,
+/// });
+/// let _ = Backoff::Exponential(ExponentialBackoff {
+///     base: Duration::ZERO,
+///     factor: BackoffFactor::new(2.0).unwrap(),
+///     max: Duration::from_secs(1),
+///     jitter: Jitter::None,
+/// });
+/// let _ = ReadinessDeadline::Bounded(BoundedReadinessDeadline(Duration::ZERO));
+/// let _ = Intensity {
+///     max_restarts: 1,
+///     within: Duration::ZERO,
+/// };
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Backoff {
     /// Restart without a delay.

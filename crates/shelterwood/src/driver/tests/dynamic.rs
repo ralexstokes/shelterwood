@@ -106,7 +106,7 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
         .entries
         .insert(
             ChildId::from("worker"),
-            DynamicEntry::removing(slot, ChildKey(1), responses),
+            DynamicEntry::removing(slot, ChildKey::fixture(1), responses),
         );
 
     let entries = root.with_observation_gate(|txn| control.close(&root, txn));
@@ -242,7 +242,7 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
     root.set_admitted_children(vec![resident_projection(&slot)]);
     let (events, _receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
-    let key = ChildKey(1);
+    let key = ChildKey::fixture(1);
     control
         .state
         .lock()
@@ -310,10 +310,9 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
         .expect("the slot is defined");
     let plan =
         crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
-    let mut child = ChildRuntime::from_plan(plan, &root);
-    child.initial = false;
+    let child = ChildRuntime::from_plan(plan, &root);
     let key = root.with_observation_gate(|txn| {
-        let key = match scope.insert_child(child) {
+        let key = match scope.insert_child(child, false) {
             Ok(key) => key,
             Err(_) => panic!("the empty arena accepts its first child"),
         };
@@ -400,14 +399,13 @@ async fn removal_tolerates_synchronous_reclaim_from_the_stop_funnel() {
     let plan =
         crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
     let mut child = ChildRuntime::from_plan(plan, &root);
-    child.initial = false;
     // Model the latent restart-gap shape: there is no active incarnation and
     // no retained construction, so a hard-force stop can terminalize and
     // reclaim this Removing member synchronously from `begin_stop_child`.
     drop(child.construction.take());
     let key = root.with_observation_gate(|txn| {
         let key = scope
-            .insert_child(child)
+            .insert_child(child, false)
             .unwrap_or_else(|_| panic!("the empty arena accepts its first child"));
         {
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
@@ -427,12 +425,9 @@ async fn removal_tolerates_synchronous_reclaim_from_the_stop_funnel() {
         root.admit_child_locked(resident_projection(&reservation.slot), txn);
         key
     });
-    scope.hard_forced = true;
+    scope.supervisor.set_hard_forced_for_test(true);
 
-    scope.handle_removal(RemovalRequest {
-        membership: member.membership(),
-        key,
-    });
+    scope.handle_removal(RemovalRequest { key });
 
     assert!(
         scope.children.get(key).is_none(),
@@ -515,9 +510,8 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
         .mint_membership(&child_id)
         .expect("membership available");
     let member = MemberCell::new(child_id.clone(), membership);
-    let membership = member.membership();
     let slot = SlotCell::new(Arc::clone(&member), None);
-    let key = ChildKey(1);
+    let key = ChildKey::fixture(1);
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
     control
@@ -556,7 +550,6 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
     let DriverEvent::Removal(observed) = event else {
         panic!("the queued event is the requested removal");
     };
-    assert_eq!(observed.membership, membership);
     assert_eq!(observed.key, key);
 }
 
@@ -1110,7 +1103,6 @@ async fn exercise_coalesced_removal() {
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
-    let membership = member.membership();
     reservation
         .slot
         .define(ChildConstruction::Task(TaskDef::new({
@@ -1168,7 +1160,6 @@ async fn exercise_coalesced_removal() {
         crate::runtime::Timeout::Completed(_) => panic!("one removal request reaches the driver"),
         crate::runtime::Timeout::Elapsed => panic!("the removal request reaches the driver"),
     };
-    assert_eq!(removal.membership, membership);
     assert_eq!(removal.key, key);
     assert!(
         crate::runtime::unbounded_mpsc_try_recv(&mut dynamic_event_receiver).is_none(),
@@ -1268,7 +1259,6 @@ async fn fused_only_removal_commits_phase_and_projection_together() {
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
-    let membership = member.membership();
     reservation
         .slot
         .define(ChildConstruction::Task(TaskDef::new({
@@ -1340,7 +1330,6 @@ async fn fused_only_removal_commits_phase_and_projection_together() {
         }
         crate::runtime::Timeout::Elapsed => panic!("the fused removal reaches the driver"),
     };
-    assert_eq!(removal.membership, membership);
     assert_eq!(removal.key, key);
 
     let duplicate = removal;
@@ -1489,7 +1478,6 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
                 }
             }
         })));
-    let membership = member.membership();
     let mut admission = Box::pin(make_admission(reservation));
     assert!(
         admission
@@ -1536,8 +1524,7 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
         crate::runtime::unbounded_mpsc_send(
             &scope.events,
             DriverEvent::Removal(RemovalRequest {
-                membership: root.member.membership(),
-                key: ChildKey(u64::MAX - 1),
+                key: ChildKey::fixture(u64::MAX - 1),
             }),
         )
         .is_ok(),
@@ -1585,7 +1572,7 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     assert!(matches!(
         event_receiver.recv().await,
         Some(DriverEvent::Removal(queued))
-            if queued.membership == root.member.membership()
+            if queued.key == ChildKey::fixture(u64::MAX - 1)
     ));
     let forwarded =
         match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
@@ -1596,7 +1583,6 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     let DriverEvent::Removal(removal) = forwarded else {
         panic!("the queued event is the fused removal")
     };
-    assert_eq!(removal.membership, membership);
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =

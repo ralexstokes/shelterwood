@@ -157,7 +157,7 @@ fn stale_scope_driver_cannot_stop_a_newer_live_incarnation_projection() {
 
     scope.finish_incarnation(first, StopReason::Finished);
     assert_eq!(scope.record().state, ScopeState::Running);
-    assert!(!scope.incarnation_finished(second));
+    assert!(!scope.settled(Some(second)));
 
     scope.finish_incarnation(second, StopReason::Finished);
     assert_eq!(
@@ -166,7 +166,7 @@ fn stale_scope_driver_cannot_stop_a_newer_live_incarnation_projection() {
             reason: StopReason::Finished,
         }
     );
-    assert!(scope.incarnation_finished(second));
+    assert!(scope.settled(Some(second)));
 }
 
 #[test]
@@ -528,7 +528,7 @@ async fn shutdown_wait_settles_its_epoch_after_a_newer_incarnation_starts() {
         matches!(superseded, Poll::Ready(Ok(()))),
         "a newer live incarnation must not extend the captured epoch's wait"
     );
-    assert!(!scope.incarnation_finished(second));
+    assert!(!scope.settled(Some(second)));
 
     scope.finish_incarnation(second, StopReason::Finished);
 }

@@ -234,8 +234,8 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
     scope.children[key].incarnations =
         IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
     assert!(scope.children[key].incarnations.mint().is_some());
-    assert!(scope.children[key].initial);
-    assert!(!scope.children[key].initial_ready);
+    assert!(scope.supervisor.is_initial(key));
+    assert!(!scope.supervisor.initial_ready(key));
     assert_eq!(
         scope.children[key].slot.member.record().last_incarnation,
         None
@@ -326,9 +326,9 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
         .build();
     plan.finish_transfer();
 
-    assert!(scope.children[key].initial);
+    assert!(scope.supervisor.is_initial(key));
     scope.spawn_child(key);
-    assert!(!scope.children[key].initial_ready);
+    assert!(!scope.supervisor.initial_ready(key));
     let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
         crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
             child,

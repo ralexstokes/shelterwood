@@ -13,6 +13,7 @@ pub mod exit;
 pub mod identity;
 pub mod panic;
 pub mod policy;
+pub mod supervisor;
 
 pub use deadline::*;
 pub use engine::{MembershipStatus, ScopeState};

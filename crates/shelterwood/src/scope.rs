@@ -22,160 +22,73 @@ pub struct ScopeRef {
     pub(crate) cell: Arc<ScopeCell>,
 }
 
-/// Declares the shared synchronous observation/control surface once for both
-/// handle types: `ScopeRef` gets the inherent method bodies and
-/// `DynamicScopeRef` gets an identical inherent forward, so a method added
-/// here can never silently miss the dynamic handle (UFCS and rustdoc
-/// included). The `Deref` impl below additionally backstops methods added
-/// outside this macro.
-macro_rules! impl_scope_ref_sync_surface {
-    (
-        $(
-            $(#[$attribute:meta])*
-            fn $method:ident $(<$($generic:ident),+>)? (
-                &$receiver:ident $(, $argument:ident: $argument_type:ty)* $(,)?
-            ) $(-> $output:ty)?
-            $(where [$($constraint:tt)*])?
-            $body:block
-        )*
-    ) => {
-        impl ScopeRef {
-            $(
-                $(#[$attribute])*
-                pub fn $method $(<$($generic),+>)? (
-                    &$receiver,
-                    $($argument: $argument_type),*
-                ) $(-> $output)?
-                $(where $($constraint)*)?
-                $body
-            )*
-        }
-
-        impl DynamicScopeRef {
-            $(
-                $(#[$attribute])*
-                pub fn $method $(<$($generic),+>)? (
-                    &$receiver,
-                    $($argument: $argument_type),*
-                ) $(-> $output)?
-                $(where $($constraint)*)?
-                {
-                    $receiver.0.$method($($argument),*)
-                }
-            )*
-        }
-    };
-}
-
-/// The asynchronous half of the shared surface; see
-/// [`impl_scope_ref_sync_surface`]. `shutdown_and_wait` is deliberately not
-/// declared here: it calls into the driver, which the scope layer must not
-/// reference, so both handles hand-forward it from `tree.rs` instead.
-macro_rules! impl_scope_ref_async_surface {
-    (
-        $(
-            $(#[$attribute:meta])*
-            fn $method:ident $(<$($generic:ident),+>)? (
-                &$receiver:ident $(, $argument:ident: $argument_type:ty)* $(,)?
-            ) $(-> $output:ty)?
-            $(where [$($constraint:tt)*])?
-            $body:block
-        )*
-    ) => {
-        impl ScopeRef {
-            $(
-                $(#[$attribute])*
-                pub async fn $method $(<$($generic),+>)? (
-                    &$receiver,
-                    $($argument: $argument_type),*
-                ) $(-> $output)?
-                $(where $($constraint)*)?
-                $body
-            )*
-        }
-
-        impl DynamicScopeRef {
-            $(
-                $(#[$attribute])*
-                pub async fn $method $(<$($generic),+>)? (
-                    &$receiver,
-                    $($argument: $argument_type),*
-                ) $(-> $output)?
-                $(where $($constraint)*)?
-                {
-                    $receiver.0.$method($($argument),*).await
-                }
-            )*
-        }
-    };
-}
-
-impl_scope_ref_sync_surface! {
+impl ScopeRef {
     /// Returns this scope's child id within its parent.
     #[must_use]
-    fn id(&self) -> &ChildId {
+    pub fn id(&self) -> &ChildId {
         self.cell.member.id()
     }
 
     /// Returns the scope membership identity.
     #[must_use]
-    fn membership(&self) -> Membership {
+    pub fn membership(&self) -> Membership {
         self.cell.member.membership()
     }
 
     /// Computes an authoritative recursive snapshot on demand.
     #[must_use]
-    fn snapshot(&self) -> Arc<ScopeSnapshot> {
+    pub fn snapshot(&self) -> Arc<ScopeSnapshot> {
         self.cell.snapshot()
     }
 
     /// Subscribes to conflated recursive snapshots.
     #[must_use]
-    fn subscribe_snapshots(&self) -> SnapshotReceiver {
+    pub fn subscribe_snapshots(&self) -> SnapshotReceiver {
         self.cell.subscribe_snapshots()
     }
 
     /// Subscribes to this scope's lifecycle and all forwarded descendants.
     #[must_use]
-    fn subscribe_lifecycle(&self) -> LifecycleEvents {
+    pub fn subscribe_lifecycle(&self) -> LifecycleEvents {
         self.cell.subscribe_lifecycle()
     }
 
     /// Looks up a direct child in an authoritative current snapshot.
     #[must_use]
-    fn child(&self, id: impl AsRef<str>) -> Option<ChildSnapshot> {
+    pub fn child(&self, id: impl AsRef<str>) -> Option<ChildSnapshot> {
         self.snapshot().child(id).cloned()
     }
 
     /// Traverses a child-id path in an authoritative current snapshot.
     #[must_use]
-    fn descendant<I, S>(&self, path: I) -> Option<ChildSnapshot>
-    where [
+    pub fn descendant<I, S>(&self, path: I) -> Option<ChildSnapshot>
+    where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
-    ] {
+    {
         self.snapshot().descendant(path).cloned()
     }
 
     /// Requests shutdown without waiting.
-    fn request_shutdown(&self) {
+    pub fn request_shutdown(&self) {
         let _ = self.cell.request_shutdown();
     }
 }
 
-impl_scope_ref_async_surface! {
+impl ScopeRef {
     /// Waits for a named child snapshot satisfying an at-or-past predicate.
     ///
     /// Snapshot watches conflate intermediate states, so `pred` should accept
     /// every state at or beyond the desired edge and must remain cheap and
     /// non-blocking.
-    fn wait_for_child<P>(
+    pub async fn wait_for_child<P>(
         &self,
         id: impl Into<ChildId>,
         pred: P,
         timeout: Duration,
     ) -> Result<ChildSnapshot, WaitError>
-    where [P: FnMut(&ChildSnapshot) -> bool + Send]
+    where
+        P: FnMut(&ChildSnapshot) -> bool + Send,
     {
         let id = id.into();
         let mut pred = pred;
@@ -217,7 +130,7 @@ impl_scope_ref_async_surface! {
     }
 
     /// Waits for terminal membership state.
-    fn wait_stopped(&self) -> StopReason {
+    pub async fn wait_stopped(&self) -> StopReason {
         self.cell.wait_stopped().await
     }
 }
@@ -268,9 +181,8 @@ impl DynamicScopeRef {
     }
 }
 
-/// Backstop for methods declared outside the shared-surface macros: any
-/// future `ScopeRef` method remains reachable on `DynamicScopeRef` through
-/// deref, even before the shared declaration is updated.
+/// The ordered-scope surface remains available without duplicating inherent
+/// forwarding methods on the capability-preserving dynamic handle.
 impl Deref for DynamicScopeRef {
     type Target = ScopeRef;
 

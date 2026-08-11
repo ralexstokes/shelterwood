@@ -868,3 +868,82 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
         "a post-ready clean self-stop is not a startup abort"
     );
 }
+
+/// `next_ordered_start` is held across `spawn_child` and is never cleared by
+/// `reclaim_child`, so `progress_startup` must treat a vacated slot the way
+/// `stop_next_ordered` treats its own cursor: already gone, advance past it.
+/// Ordered scopes carry no dynamic control today and so never reclaim, which
+/// is exactly why this is pinned here — the arena is a monotonic key domain,
+/// so `keys_after` still ranges correctly over a removed key.
+#[crate::runtime::test]
+async fn ordered_startup_advances_past_a_reclaimed_cursor() {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "gone",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness is valid")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid task");
+    tree.add_task(
+        "next",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness is valid")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid task");
+
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let mut children = ChildArena::default();
+    plan.children.reverse();
+    while let Some(child) = plan.children.pop() {
+        children
+            .insert(ChildRuntime::from_plan(child, &root))
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+    }
+    let gone = children.keys().next().expect("first ordered child");
+    let next = children.keys().nth(1).expect("second ordered child");
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_children(children)
+        .with_next_ordered_start(Some(gone))
+        .build();
+    plan.finish_transfer();
+
+    // Vacate the slot the cursor points at, exactly as a reclaim would leave
+    // it, without disturbing the child that follows.
+    scope
+        .children
+        .remove(gone)
+        .expect("the cursor's child is live before the reclaim");
+
+    scope.progress_startup();
+
+    assert_eq!(
+        scope.next_ordered_start,
+        Some(next),
+        "a vacated cursor advances to the next live child instead of panicking"
+    );
+    assert!(
+        scope.children[next].active.is_some(),
+        "the following child starts at its ordered turn"
+    );
+    assert!(
+        !scope.lifecycle.startup_complete(),
+        "the live successor still gates the aggregate"
+    );
+}

@@ -768,8 +768,8 @@ async fn run_scope_incarnation(
     }
 
     let mut signal = root.signal().watcher();
+    let mut pending = Vec::new();
     loop {
-        let mut pending = Vec::new();
         if root.take_shutdown_request(scope.epoch) {
             pending.push(Pending::Shutdown.classified());
         }
@@ -871,9 +871,11 @@ async fn run_scope_incarnation(
                 }
                 runtime::ScopeWake::Message(Some(event)) => {
                     pending.push(Pending::from(event).classified());
+                    continue;
                 }
                 runtime::ScopeWake::ControlMessage(Some(event)) => {
                     pending.push(Pending::from(event).classified());
+                    continue;
                 }
                 runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
                     continue;
@@ -882,7 +884,7 @@ async fn run_scope_incarnation(
         }
 
         arbitrate(&mut pending);
-        for (_, event) in pending {
+        for (_, event) in pending.drain(..) {
             match event {
                 Pending::Shutdown => {
                     if let Some(latches) = scope.role.ancestor() {

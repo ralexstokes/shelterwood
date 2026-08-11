@@ -1218,8 +1218,11 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   lowered with — its declared initial set; runtime additions to a
   dynamic scope never join the aggregate, whether they are admitted
   before or after it fires (their per-child `Ready` events, B.4, are
-  the observation surface). The aggregate fires at most once per scope
-  incarnation and is latched: an already-ready child that fails and
+  the observation surface). Removing an initial member while the scope
+  is `Starting` shrinks that declared set, and the aggregate may complete
+  when the remaining initial members are ready. The aggregate fires at
+  most once per scope incarnation and is latched: an already-ready child
+  that fails and
   restarts afterwards does not rewind it — readiness is a
   startup-phase edge, not a liveness signal (snapshots carry liveness,
   B.6). The same latch decides the pre-fire race: a gated child that

@@ -19,6 +19,32 @@ enum ZeroMessage {
 
 struct ZeroDeadlineActor;
 
+struct ZeroDeadlinePanickingDrop {
+    polled: Arc<AtomicBool>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl std::future::Future for ZeroDeadlinePanickingDrop {
+    type Output = usize;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.polled.store(true, Ordering::SeqCst);
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for ZeroDeadlinePanickingDrop {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+        panic!("zero-budget offload destructor panic");
+    }
+}
+
+struct ZeroDeadlinePanickingDropActor;
+
 impl Actor for ZeroDeadlineActor {
     type Msg = ZeroMessage;
     type Args = Arc<AtomicBool>;
@@ -52,6 +78,33 @@ impl Actor for ZeroDeadlineActor {
     }
 }
 
+impl Actor for ZeroDeadlinePanickingDropActor {
+    type Msg = ZeroMessage;
+    type Args = (Arc<AtomicBool>, Arc<AtomicUsize>);
+
+    async fn init(
+        (polled, drops): Self::Args,
+        context: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        context
+            .offload(
+                ZeroDeadlinePanickingDrop { polled, drops },
+                |_| ZeroMessage::Done,
+                Duration::ZERO,
+            )
+            .expect("live offload accepted");
+        Ok(Self)
+    }
+
+    async fn handle(
+        &mut self,
+        ZeroMessage::Done: Self::Msg,
+        _: &mut Context<'_, Self>,
+    ) -> ExitResult {
+        panic!("cleanup panic must precede continuation delivery");
+    }
+}
+
 #[tokio::test]
 async fn zero_budget_offload_never_polls_work_and_times_out_on_actor_task() {
     let polled = Arc::new(AtomicBool::new(false));
@@ -64,6 +117,40 @@ async fn zero_budget_offload_never_polls_work_and_times_out_on_actor_task() {
     let system = tree.spawn().expect("runtime is available");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert!(!polled.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn zero_budget_offload_contains_and_classifies_its_work_destructor_panic() {
+    let polled = Arc::new(AtomicBool::new(false));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "zero-drop-panic",
+        ActorOnceDef::<ZeroDeadlinePanickingDropActor>::new((
+            Arc::clone(&polled),
+            Arc::clone(&drops),
+        ))
+        .readiness(Readiness::Manual),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+
+    let message = startup_panic_message(
+        system
+            .wait_started()
+            .await
+            .expect_err("the contained pre-ready panic fails startup"),
+    );
+    assert_eq!(
+        message.as_deref(),
+        Some("zero-budget offload destructor panic")
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root shuts down");
 }
 
 enum RestartMessage {

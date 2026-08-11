@@ -944,6 +944,10 @@ async fn run_scope_incarnation(
             }
         }
 
+        // Settlement is level-triggered from authoritative state after every
+        // batch. Any transition that changes the startup aggregate therefore
+        // gets the same recomputation point as terminal completion.
+        scope.progress_startup();
         if let Some(reason) = scope.finish_if_ready() {
             let root_exit = scope.role.is_root().then(|| reason.root_exit());
             // ScopeRuntime's synchronous epilogue clears dynamic state,

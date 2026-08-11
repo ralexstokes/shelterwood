@@ -40,10 +40,11 @@ depend on such a notification arriving; scope order and cancellation tokens
 are the reliable control plane.
 
 Ordered scopes stop children in reverse declaration order, one fully joined
-child at a time. Put a slow resource owner earlier in declaration order so its
-dependents stop first and its close runs quiescent. Per-child graces therefore
-sum in an ordered scope. Dynamic scopes start all stop ladders together and
-drain concurrently.
+child at a time while the scope driver remains scheduled. Put a slow resource
+owner earlier in declaration order so its dependents stop first and its close
+runs quiescent. Per-child graces therefore sum in an ordered scope. Dynamic
+scopes start all stop ladders together and drain concurrently. The hard-abort
+fallback exception is described below.
 
 ## Raw actors must implement the drain policy
 
@@ -96,10 +97,22 @@ from `StopContext`.
 ## Owner and runtime lifetime
 
 `System::shutdown(timeout)` consumes the owner, requests teardown, and joins
-every descendant before returning. The timeout bounds the cooperative phase;
-after it expires Shelterwood escalates and joins stragglers, so destruction of
-user futures can make the final return take longer. A zero timeout skips the
+the root driver before returning. The timeout bounds the cooperative phase;
+after it expires Shelterwood escalates stragglers, so destruction of user
+futures can make the final return take longer. A zero timeout skips the
 cooperative wait but still follows token ordering and the tidy beat.
+
+Normally each scheduled scope driver joins its children before completing. A
+framework driver that misses its abort acknowledgement may instead be
+hard-aborted by its ancestor at the tidy-beat backstop. Its synchronous drop
+epilogue requests abort for active children but cannot await their join
+handles, so deeper task cancellation and user-future destruction may complete
+after `System::shutdown` or `shutdown_and_wait` returns. Return guarantees that
+the root driver is joined and the target scope epilogue is complete; that
+epilogue has requested stop or abort for each directly owned child. It does not
+guarantee either a recursive join or completed abort propagation through deeper
+fallback boundaries. `run_blocking` threads have the separate detach behavior
+described above.
 
 Dropping `System` requests graceful shutdown, but an embedding host should
 normally await `shutdown` before tearing down the Tokio runtime. The ambient

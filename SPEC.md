@@ -2227,26 +2227,36 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   the funnel, but the draining parent schedules nothing — §10's mode
   dispatch.)
 - The owner has two further consuming awaits. `shutdown(timeout)` requests
-  the §10 ladder and waits until every descendant is stopped *and joined*.
+  the §10 ladder and waits for the root driver's terminal epilogue. While a
+  framework driver remains scheduled, it joins each child before completing.
   The timeout bounds the **cooperative** phase, not the return: at expiry
-  the stragglers are hard-aborted recursively and joined, and the call
-  returns the structured shutdown-timeout error (§7) naming them. That
-  final join is the one unbounded remainder — a hard-aborted future can
-  block arbitrarily in `Drop`, and returning before the join would leave
-  teardown running concurrently with the caller, the worse contract;
-  `run_blocking` threads detach past abort (§5.5) and are never joined.
+  the stragglers owned by scheduled drivers are hard-aborted and joined, and
+  the call returns the structured shutdown-timeout error (§7) naming them.
+  There is one recursive-join exception: if a framework driver misses its
+  abort acknowledgement and its ancestor hard-aborts it at the tidy-beat
+  backstop, the driver's synchronous `Drop` epilogue requests abort for its
+  active children but cannot await their join handles. Those deeper tasks
+  may finish cancellation and destroy their user futures after the owner's
+  call returns. The return still joins the root driver and completes the
+  target scope epilogue; that epilogue has requested stop or abort for each
+  directly owned child. It does not claim either a recursive join or completed
+  abort propagation through deeper fallback boundaries.
+  `run_blocking` threads are a separate, unconditional detach-past-abort
+  exception (§5.5) and are never joined.
   Expiry does not bypass the single ladder: the stragglers are driven
   through its abort tail — abort token, one tidy-abort beat, hard abort
-  (§10) — concurrently, then joined. A
+  (§10) — concurrently, then joined while their scope driver remains
+  scheduled. A
   zero timeout skips only the cooperative *wait*: every descendant is
   escalated immediately through that same abort tail (tokens still fire
   in order, the tidy beat still runs — `shutdown(0)` means "every child
   under `Abort` policy", §10, not a second mechanism), then the same
-  joins. The zero form is exempt from Appendix B's
+  driver-owned joins. The zero form is exempt from Appendix B's
   zero-budget-fails-immediately rule (stated there): this timeout is an
-  escalation bound, not a failure deadline. Nothing continues tearing
-  down after it returns, and consuming the owner is what makes the wait
-  explicit. `wait()` awaits natural termination without requesting
+  escalation bound, not a failure deadline. Except for the documented
+  hard-abort fallback and `run_blocking` detach boundaries, no teardown
+  remains after return; consuming the owner makes that wait explicit.
+  `wait()` awaits natural termination without requesting
   shutdown, and resolves with the root's terminal reason (B.6:
   `Finished`, `IntensityTripped`, or `ShutdownRequested` when teardown
   was requested concurrently elsewhere);
@@ -3617,7 +3627,10 @@ implied on all; error/outcome types are B.3 and B.8):
   landing in a restart window is held by §10's pending-incarnation
   stop latch and armed onto the next incarnation, which
   starts and immediately begins teardown), and the call resolves once
-  *that incarnation* is stopped and joined. Under a parent `Always`
+  *that incarnation* has finished its scope epilogue. On the ordinary
+  teardown path that includes joining its children; §11 defines the
+  recursive-join exception when an ancestor hard-aborts a framework driver.
+  Under a parent `Always`
   policy (§11's nested-shutdown rule) a fresh incarnation may already
   be running at resolution — the contract is about the incarnation the
   latch stopped, deliberately not about the membership. A **pre-spawn**
@@ -3688,15 +3701,16 @@ enums are non-exhaustive.
 - `shutdown(self, timeout) -> Result<(), ShutdownTimeout>` — `Ok` iff
   every descendant stopped within the cooperative phase;
   `ShutdownTimeout` is §7's structured straggler report (child-id
-  paths with membership tokens). Fully joined on return either way
-  (§11).
+  paths with membership tokens). The root driver is joined on return either
+  way; recursive joining is subject to §11's hard-abort fallback boundary.
 - `wait(self) -> StopReason` — infallible; `StopReason` is B.6's
   `Stopped { reason }` payload (`IntensityTripped` and `StartupFailed`
   carrying their structured data).
 - `shutdown_and_wait(&self, timeout) -> Result<(), ShutdownTimeout>` —
   the owner's `shutdown` shapes on the non-owning handle (semantics
   above); an already-terminal scope resolves `Ok` immediately only after any
-  live incarnation has finished its scope epilogue.
+  live incarnation has finished its scope epilogue. Descendant joining is
+  subject to §11's hard-abort fallback boundary.
 - `wait_stopped(&self) -> StopReason` — the membership's terminal
   reason, `NeverStarted` included (§3.2).
 

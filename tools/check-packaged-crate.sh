@@ -19,7 +19,12 @@ cd "$repo_root"
 # dependencies, then add each exact archive to it in dependency order. This
 # keeps package normalization honest even in Nix, where crates.io is already
 # replaced by a read-only vendored source.
-cargo vendor --locked --offline --respect-source-config "$vendor_root" >/dev/null
+# `cargo vendor` is the acquisition boundary for the isolated source. The
+# ordinary PR lane can start without crate archives in Cargo's user cache, so
+# allow this locked step to fetch a missing archive. Nix builds continue to use
+# their configured read-only source, and every operation against the generated
+# vendor below remains offline.
+cargo vendor --locked --respect-source-config "$vendor_root" >/dev/null
 mkdir -p "$package_home"
 cat > "$package_home/config.toml" <<EOF
 [source.crates-io]

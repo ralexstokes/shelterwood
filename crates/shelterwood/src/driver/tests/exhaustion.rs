@@ -234,8 +234,8 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
     scope.children[key].incarnations =
         IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
     assert!(scope.children[key].incarnations.mint().is_some());
-    assert!(scope.children[key].initial);
-    assert!(!scope.children[key].initial_ready);
+    assert!(scope.supervisor.is_initial(key));
+    assert!(!scope.supervisor.initial_ready(key));
     assert_eq!(
         scope.children[key].slot.member.record().last_incarnation,
         None
@@ -326,9 +326,9 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
         .build();
     plan.finish_transfer();
 
-    assert!(scope.children[key].initial);
+    assert!(scope.supervisor.is_initial(key));
     scope.spawn_child(key);
-    assert!(!scope.children[key].initial_ready);
+    assert!(!scope.supervisor.initial_ready(key));
     let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
         crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
             child,
@@ -687,5 +687,80 @@ fn lifecycle_sequence_exhaustion_poison_is_never_minted_and_becomes_lag() {
     assert_eq!(
         scope.snapshot().lifecycle_seq,
         crate::LifecycleSeq::EXHAUSTED
+    );
+}
+
+/// Level-triggered settlement re-enters the reducer until a pass emits
+/// nothing, so a start effect the construction funnel declines is re-derived
+/// from unchanged state rather than merely wasted. Incarnation exhaustion is
+/// the reachable shape: it terminalizes a membership that never spawned while
+/// the scope is still `Starting`, so `spawned_once` stays false with no
+/// `Spawned` edge ever coming. A regression here does not fail — it spins the
+/// driver task, which is why this pins the loop that `run_scope_incarnation`
+/// runs before its event loop even starts.
+#[crate::runtime::test]
+async fn settlement_terminates_when_the_first_spawn_exhausts_incarnations() {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "worker",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>()),
+    )
+    .expect("valid task");
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let mut children = ChildArena::default();
+    let key = children
+        .insert(child)
+        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_intensity_policy(plan.intensity_policy())
+        .with_children(children)
+        .with_next_ordered_start(Some(key))
+        .build();
+    plan.finish_transfer();
+
+    scope.children[key].incarnations =
+        IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
+    assert!(scope.children[key].incarnations.mint().is_some());
+
+    // The pre-loop settlement in `run_scope_incarnation`: the reducer asks for
+    // construction, the funnel exhausts, and the child terminalizes in place.
+    scope.settle_supervisor();
+    assert!(scope.children[key].is_disposing());
+    assert!(
+        scope.supervisor.lifecycle().is_starting(),
+        "disposal is still in flight, so startup has not yet failed"
+    );
+
+    // Settling again over that state must still reach a fixed point: the
+    // membership gates ordered startup, but can no longer be constructed.
+    scope.settle_supervisor();
+
+    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
+        disposal_event_receiver
+            .recv()
+            .await
+            .expect("disposal reports completion")
+    else {
+        panic!("only construction disposal was armed")
+    };
+    scope.handle_construction_disposed(child, panic);
+    scope.settle_supervisor();
+    assert!(
+        scope.supervisor.lifecycle().startup_failed(),
+        "the pre-readiness position routes the scope's startup failure"
     );
 }

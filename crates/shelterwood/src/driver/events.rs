@@ -194,30 +194,17 @@ pub(super) fn restart_shutdown_work(child: ChildKey, target: Epoch) -> (Arbitrat
 impl ScopeRuntime {
     /// Projects the membership status from the *removal* sources alone:
     /// `Removing` when one has latched for this membership — the dynamic
-    /// entry's authoritative `Removing` control-plane state or a fired
+    /// entry's latched `Removing` control-plane state or a fired
     /// fused-cancel latch on its `Resident` state. Scope-level stop
     /// sources (drain, force, latched shutdown requests, ancestor latches)
     /// are deliberately excluded: each of those has a guaranteed follow-up
     /// event that owns the scope verdict, so exit dispatch must not
     /// reclassify the membership as `Removing` on their behalf.
-    pub(super) fn dispatch_membership_status(&self, key: ChildKey) -> MembershipStatus {
-        let Some(child) = self.children.get(key) else {
-            return MembershipStatus::Removing;
-        };
-        let removing = self.dynamic.as_ref().is_some_and(|control| {
-            control
-                .state
-                .lock()
-                .expect("dynamic-state mutex poisoned")
-                .entry(child.slot.member.id())
-                .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
-                .is_some_and(|entry| entry.restart_is_suppressed(key))
-        });
-        if removing {
-            MembershipStatus::Removing
-        } else {
-            MembershipStatus::Active
+    pub(super) fn dispatch_membership_status(&mut self, key: ChildKey) -> MembershipStatus {
+        if self.removal_latched(key) {
+            self.reduce(SupervisorEvent::RemovalSampled { child: key });
         }
+        self.supervisor.membership_status(key)
     }
 
     /// Reports whether any level-triggered stop source forbids constructing
@@ -227,15 +214,15 @@ impl ScopeRuntime {
     /// event, so this broad consult belongs only at sites that would
     /// otherwise invoke user construction — not at exit dispatch, where it
     /// would misclassify the membership and reroute the scope verdict.
-    pub(super) fn restart_is_suppressed(&self, key: ChildKey) -> bool {
-        self.lifecycle.is_draining()
-            || self.hard_forced
+    pub(super) fn construction_is_suppressed(&self, key: ChildKey) -> bool {
+        self.supervisor.lifecycle().is_draining()
+            || self.supervisor.hard_forced()
             || self.root.has_stop_request(self.epoch)
             || self
                 .role
                 .ancestor()
                 .is_some_and(|latches| latches.shutdown.is_fired() || latches.abort.is_fired())
-            || self.dispatch_membership_status(key) == MembershipStatus::Removing
+            || self.removal_latched(key)
     }
 
     pub(super) fn control_event_work(
@@ -244,9 +231,8 @@ impl ScopeRuntime {
     ) -> Option<(ArbitrationClass, Pending)> {
         match event {
             ScopeControlEvent::RestartShutdown { membership, target } => self
-                .child_keys
-                .get(&membership)
-                .copied()
+                .supervisor
+                .key_for(membership)
                 .map(|child| restart_shutdown_work(child, target)),
         }
     }
@@ -255,7 +241,7 @@ impl ScopeRuntime {
         // Collection and execution are separated by arbitration. Recheck
         // every level-triggered stop source so teardown/removal latched in the
         // same batch suppresses user construction immediately.
-        if self.restart_is_suppressed(key) {
+        if self.construction_is_suppressed(key) {
             if let Some(child) = self.children.get_mut(key) {
                 child.restart_shutdown_pending = None;
             }
@@ -269,7 +255,10 @@ impl ScopeRuntime {
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
-        if !target_is_pending || child.is_terminal() || child.is_disposing() {
+        if !target_is_pending
+            || self.supervisor.membership_terminal(key)
+            || self.supervisor.is_disposing(key)
+        {
             child.restart_shutdown_pending = None;
             return;
         }
@@ -277,7 +266,7 @@ impl ScopeRuntime {
             child.restart_shutdown_pending = Some(target);
             return;
         }
-        if !child.spawned_once {
+        if !self.supervisor.spawned_once(key) {
             // Only a member in the restart gap may be expedited. The wake-start
             // scan this path replaced required `MemberStage::Restarting`; with
             // no active incarnation and the terminal/disposing cases excluded
@@ -332,7 +321,7 @@ impl ScopeRuntime {
                 // this deadline but before the deadline's batch runs. Recheck
                 // the level-triggered sources at execution time so a stale
                 // backoff edge never invokes user construction.
-                if self.restart_is_suppressed(child) {
+                if self.construction_is_suppressed(child) {
                     if let Some(child) = self.children.get_mut(child) {
                         child.restart_deadline.take();
                     }

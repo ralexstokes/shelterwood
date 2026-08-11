@@ -60,11 +60,8 @@ struct ObserveScopeOnStartupWake {
 impl ObserveScopeOnStartupWake {
     fn observe(&self) {
         let member = self.scope.member.record().stage;
-        let incarnation_finished = self
-            .epoch
-            .map(|epoch| self.scope.incarnation_finished(epoch));
-        *self.observed.lock().expect("observation mutex poisoned") =
-            Some((member, incarnation_finished));
+        let settled = self.epoch.map(|epoch| self.scope.settled(Some(epoch)));
+        *self.observed.lock().expect("observation mutex poisoned") = Some((member, settled));
     }
 }
 
@@ -115,7 +112,7 @@ async fn terminal_stop_paths_share_one_complete_observation_transition() {
         ));
         assert_eq!(scope.record().state, expected_state);
         assert_eq!(
-            epoch.map(|epoch| scope.incarnation_finished(epoch)),
+            epoch.map(|epoch| scope.settled(Some(epoch))),
             epoch.map(|_| true)
         );
         assert_eq!(snapshots.borrow_latest().state, expected_state);
@@ -192,7 +189,7 @@ async fn root_driver_panic_mid_drain_upgrades_to_the_join_monitor_verdict() {
         "the unwind epilogue leaves root terminality to the join monitor"
     );
     assert!(
-        scope.incarnation_finished(epoch),
+        scope.settled(Some(epoch)),
         "the unwind epilogue retires its epoch, so the join monitor must take \
          the no-live-epoch fallback this test is named for"
     );
@@ -430,7 +427,7 @@ fn stopped_publication_keeps_mailbox_panic_primary_and_finishes_observation() {
             reason: StopReason::ShutdownRequested
         }
     ));
-    assert!(scope.incarnation_finished(epoch));
+    assert!(scope.settled(Some(epoch)));
     assert!(matches!(
         events.try_recv(),
         Ok(LifecycleItem::Event(crate::LifecycleEvent {

@@ -17,4 +17,5 @@ pub use shelterwood_core::exit::JoinVerdict as JoinOutcome;
 pub use spawn::*;
 pub use sync::*;
 pub use timer::*;
+#[cfg(feature = "test-util")]
 pub use tokio::test;

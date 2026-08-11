@@ -8,6 +8,7 @@ use super::{PanicPayload, catch_panic, discard_panic, sleep_until_std};
 
 /// Counts the runtime's currently alive spawned tasks, keeping runtime
 /// metrics access in this module.
+#[cfg(any(test, feature = "test-util"))]
 pub fn alive_task_count() -> usize {
     tokio::runtime::Handle::current()
         .metrics()

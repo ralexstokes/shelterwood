@@ -105,8 +105,8 @@ these, in order.
    Durable or at-least-once delivery is out of core (§24).
 7. **The public API is runtime-independent.** No tokio (or other runtime)
    types are reachable from any public item; boundary types are library-owned.
-   Internally, all runtime touchpoints route through the private `runtime`
-   module. [#359]
+   Internally, all runtime touchpoints route through the private façade over
+   `shelterwood-runtime`. [#359]
 
 **Layering.** The implementation is structured as four layers, each complete
 before the next begins, so simple things are easy at the top and every layer
@@ -165,7 +165,7 @@ any single design rule:
   sample) and `effects` is data describing what the shell should do
   (spawn this, abort that, arm a deadline, publish a snapshot). Decision
   modules contain no awaits, no clock reads, no channel operations, no
-  spawns, and import neither Tokio nor the D.3 `runtime` module — only the
+  spawns, and depend on neither Tokio nor `shelterwood-runtime` — only the
   thin driver shell does, feeding events in and executing effects out. This
   is what makes policy behavior unit-testable with no runtime at all (§13),
   and it is why the ladder (§10) is `advance(now) -> Option<action>`
@@ -508,7 +508,8 @@ trait Actor: Sized + Send + 'static {
   desugared `-> impl Future + Send` form (likewise `RawActor::run`, §4.3)
   because the single incarnation runner (§7) is generic over the actor type
   and hands the incarnation future to the runtime's multithreaded spawn
-  through D.3's `runtime` module — under bare `async fn` sugar a generic `A`'s
+  through the private façade over `shelterwood-runtime` — under bare `async fn`
+  sugar a generic `A`'s
   callback futures carry no `Send` bound and no such runner compiles.
   Implementors still write plain `async fn`: an ordinary implementation's
   future is auto-`Send` and satisfies the bound; one that holds a `!Send`
@@ -1825,7 +1826,8 @@ Two separated concerns:
   equal-jitter drawing uniformly from `[d/2, d]`; all durations validated
   non-zero at construction). Delay computation is a pure function of
   (attempt, policy, `JitterSample`) — the sample is an input, not drawn
-  inside (§1 implementation shape; D.3 names the source). `JitterSample`
+  inside (§1 implementation shape; `shelterwood-runtime` owns the source).
+  `JitterSample`
   owns the `[0, 1)` invariant: its constructor clamps finite inputs and maps
   non-finite inputs to zero, while `from_u64_ratio` owns the driver's integer
   random-source normalization. Pinned
@@ -2184,10 +2186,10 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   classification is unwind-based, and under `panic = "abort"` a panic
   kills the process before supervision can observe anything (the
   documentation states this; there is nothing to detect). The ambient
-  runtime is a Tokio runtime with time enabled, reached only through
-  D.3's `runtime` module. The owner resolves `shutdown()` (or drops `System`
-  and lets teardown finish) before tearing the runtime itself down —
-  destroying the runtime around a live system is outside the
+  runtime is a Tokio runtime with time enabled, reached only through the
+  private façade over `shelterwood-runtime`. The owner resolves `shutdown()`
+  (or drops `System` and lets teardown finish) before tearing the runtime
+  itself down — destroying the runtime around a live system is outside the
   contract.
 - `wait_started()` resolves when the whole declared tree is up, or reports
   terminal startup failure. **At the root, startup failure does not
@@ -2607,11 +2609,13 @@ integration toolkit for the driver shell and the end-to-end invariants.
 8. **Framework verdicts never travel through the user-error channel.**
    Provoke each verdict (readiness expiry, grace-expiry abort, cancelled
    completion) and match the typed variant — never a stringly `Failed`.
-   Enforce the mechanism structurally: the runner's classification takes
-   the user error by value and no downcast appears anywhere in the exit
-   path — §7's provenance design leaves the lint (a grep-level CI check
-   on `downcast` in those modules) with zero exceptions, B.5's named
-   accessors included. Add the forgery probe: an application error type
+   Enforce the mechanism structurally: core classification consumes typed
+   `RecordedOutcome` and `JoinVerdict` values and contains no `Any` or
+   downcast path; the runtime adapter converts its join result before core
+   sees it, while user error erasure stays at the façade boundary. The former
+   grep-level exit-path check is retired with the crate split because the
+   dependency boundary now makes that direction explicit. Add the forgery
+   probe: an application error type
    imitating the intensity-trip or startup-failure payload arrives as an
    erased user error — `intensity_trip()` / `startup_failure()` return
    `None` for it.
@@ -2691,12 +2695,15 @@ integration toolkit for the driver shell and the end-to-end invariants.
     restart window stops the next incarnation, while a latch consumed
     by a previous incarnation never carries forward — no stop/restart
     storm under `Always`.
-13. **No tokio types are reachable from public items; internal runtime
-    touchpoints are confined to the private `runtime` module.** During initial
-    development Appendix D.3 enforces these constraints in CI with a
-    rustdoc-JSON reachability walk and a source-path lint. Those checks are
-    temporary guardrails, not permanent project infrastructure; retiring them
-    does not relax either architectural requirement.
+13. **No Tokio or runtime-adapter types are reachable from public façade
+    items.** Tokio and `fastrand` integration is confined to
+    `shelterwood-runtime`; `shelterwood-core` has neither dependency, and the
+    mailbox state machines name runtime operations only through that adapter.
+    Crate dependencies enforce the implementation boundary. CI's retained
+    rustdoc-JSON walk separately rejects public reachability of
+    `shelterwood_runtime`, `tokio`, `tokio_util`, or `fastrand`. The former
+    regex/awk source-path checks and their fixtures are retired by the crate
+    split; removing them does not relax either architectural requirement.
 14. **Event-woken observers see consistent-or-newer snapshots.** Subscribe
    to lifecycle events; *synchronously inside the event arm*, read the
    snapshot and assert it already reflects the event — at both ends of the
@@ -3169,10 +3176,10 @@ guaranteed-not-accepted (§3.3 step 4) exact rather than probabilistic.
 Public time representation, pinned once: absolute points on the public
 surface — B.6's `restart_at`, B.5's `ReadinessTimedOut { deadline }` —
 are `std::time::Instant`; spans and budgets are `std::time::Duration`.
-No runtime time type is public (D.3 clause 1 checks this during initial
-development): the `runtime` module converts at the boundary, and under
-virtual time its clock mints the instants — still `std` values, mutually
-coherent, which is all any contract here compares.
+No runtime time type is public (the retained rustdoc reachability gate checks
+this): `shelterwood-runtime` converts at the private façade boundary, and
+under virtual time its clock mints the instants — still `std` values,
+mutually coherent, which is all any contract here compares.
 
 Rows marked *(II)* ship with the named Part II feature.
 
@@ -3500,7 +3507,7 @@ ChildSnapshot   { id, membership,                       // §3 identity types
                   restart_policy, retention,
                   restart_at: Option<Instant>,          // a representable, safely schedulable backoff
                                                         //   deadline while Restarting, as an absolute
-                                                        //   runtime-clock instant (D.3); None outside
+                                                        //   runtime-adapter clock instant; None outside
                                                         //   Restarting and also for an unrepresentable
                                                         //   or unschedulable requested point. The runtime
                                                         //   may wait in bounded internal timer slices,
@@ -3651,12 +3658,12 @@ poll or `NotAdmitting`; declaration builders share the reserve id errors
 and their defines cannot fail (§8).
 
 `BuildError` (spawn-time, §11) is enumerated and non-exhaustive:
-`NoRuntime` (no ambient async runtime reachable through D.3's `runtime`
-module) and `UnfilledReservations` (the child-id paths of every undefined
-reserved slot, §8). Nothing else lives there by design: everything
-decidable earlier fails at declaration (§9.3's eager validation), and
-everything later is the child's ordinary supervision story — spawn is
-not a third validation point. `BuildError` is spawn-only because spawn
+`NoRuntime` (no ambient async runtime reachable through the private façade
+over `shelterwood-runtime`) and `UnfilledReservations` (the child-id paths of
+every undefined reserved slot, §8). Nothing else lives there by design:
+everything decidable earlier fails at declaration (§9.3's eager validation),
+and everything later is the child's ordinary supervision story — spawn is not
+a third validation point. `BuildError` is spawn-only because spawn
 is the only lowering with a builder caller: a lowering elsewhere that
 finds unfilled reservations is the scope incarnation's startup failure
 instead, carried as the startup-failure payload's lowering cause

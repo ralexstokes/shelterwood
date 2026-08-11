@@ -103,9 +103,10 @@ EOF
 
 (
   cd "$stage_root"
-  cargo generate-lockfile --offline
-  CARGO_TARGET_DIR="$doctest_target" \
+  CARGO_HOME="$package_home" \
+    cargo generate-lockfile --offline
+  CARGO_HOME="$package_home" CARGO_TARGET_DIR="$doctest_target" \
     cargo check --locked --offline --workspace --all-features
-  CARGO_TARGET_DIR="$doctest_target" \
+  CARGO_HOME="$package_home" CARGO_TARGET_DIR="$doctest_target" \
     cargo test --locked --offline --doc --all-features -p shelterwood
 )

@@ -8,7 +8,7 @@ use std::{
 
 use serde_json::Value;
 
-const FORBIDDEN_ROOTS: &[&str] = &["fastrand", "tokio", "tokio_util"];
+const FORBIDDEN_ROOTS: &[&str] = &["fastrand", "shelterwood_runtime", "tokio", "tokio_util"];
 const SUPPORTED_FORMAT_VERSION: u64 = 61;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -229,6 +229,48 @@ mod tests {
             BTreeSet::from([
                 "shelterwood -> tokio::time::Instant".to_owned(),
                 "shelterwood::leak -> tokio::time::Instant".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_runtime_adapter_types_that_hide_tokio() {
+        let document = json!({
+            "format_version": 61,
+            "index": {
+                "0": {
+                    "id": 0,
+                    "inner": { "module": { "items": [1] } }
+                },
+                "1": {
+                    "id": 1,
+                    "inner": {
+                        "function": {
+                            "sig": {
+                                "output": {
+                                    "resolved_path": { "id": 2 }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "paths": {
+                "0": { "crate_id": 0, "path": ["shelterwood"] },
+                "1": { "crate_id": 0, "path": ["shelterwood", "leaked_join"] },
+                "2": {
+                    "crate_id": 8,
+                    "path": ["shelterwood_runtime", "spawn", "JoinHandle"]
+                }
+            }
+        });
+
+        let leaks = find_leaks(&document).expect("fixture must be valid rustdoc-shaped JSON");
+        assert_eq!(
+            leaks,
+            BTreeSet::from([
+                "shelterwood -> shelterwood_runtime::spawn::JoinHandle".to_owned(),
+                "shelterwood::leaked_join -> shelterwood_runtime::spawn::JoinHandle".to_owned(),
             ])
         );
     }

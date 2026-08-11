@@ -349,6 +349,29 @@ async fn task_raw_and_subtree_admissions_resolve_before_manual_startup() {
 }
 
 #[tokio::test]
+async fn successful_admission_is_fused_after_returning_its_handle() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+    let mut admission = Box::pin(scope.add_task("fused-success", waiting_task()));
+
+    let task = admission
+        .as_mut()
+        .await
+        .expect("successful admission returns the exact handle once");
+    assert!(
+        poll_once(admission.as_mut()).is_pending(),
+        "re-polling a successful Admission is fused rather than repeating its output"
+    );
+
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
 async fn exact_handles_reject_cross_scope_and_same_id_successors() {
     let left = DynamicTree::new().spawn().expect("runtime is available");
     let right = DynamicTree::new().spawn().expect("runtime is available");

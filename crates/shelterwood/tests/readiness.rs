@@ -237,7 +237,7 @@ async fn immediate_restart_deadline_rechecks_aggregate_startup() {
         .expect("restarted task cooperates");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ordered_startup_waits_for_manual_readiness() {
     let order = Arc::new(Mutex::new(Vec::new()));
     let release_ready = ReleaseGate::default();
@@ -372,7 +372,7 @@ async fn readiness_deadline_is_typed_and_absolute() {
         )
         .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
-    let before = std::time::Instant::now();
+    let before = tokio::time::Instant::now().into_std();
     advance_time(deadline_width).await;
     let startup = system.wait_started().await.expect_err("startup times out");
     let exit = task.wait().await;
@@ -467,7 +467,7 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
     assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn restart_before_aggregate_readiness_rearms_the_gate() {
     let incarnation = Arc::new(AtomicUsize::new(0));
     let fail_first = ReleaseGate::default();
@@ -557,7 +557,7 @@ async fn restart_before_aggregate_readiness_rearms_the_gate() {
         .expect("clean shutdown");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ordered_terminal_pre_ready_exit_parks_the_root_and_marks_suffix_never_started() {
     let prefix_cancelled = Arc::new(AtomicBool::new(false));
     let suffix_started = Arc::new(AtomicBool::new(false));
@@ -616,7 +616,7 @@ async fn ordered_terminal_pre_ready_exit_parks_the_root_and_marks_suffix_never_s
         .expect("owner rolls back live prefix");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn dynamic_startup_failure_keeps_other_initial_members_supervised() {
     let sibling_cancelled = Arc::new(AtomicBool::new(false));
     let sibling_started = Arc::new(AtomicBool::new(false));

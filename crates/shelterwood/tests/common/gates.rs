@@ -1,4 +1,7 @@
-use std::sync::{Arc, Condvar, Mutex};
+use std::{
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
+};
 
 use tokio::sync::Notify;
 
@@ -60,14 +63,27 @@ pub(crate) struct DestructorBlocker(Arc<(Mutex<DestructorState>, Condvar)>);
 
 impl Drop for DestructorBlocker {
     fn drop(&mut self) {
+        const MAX_BLOCK: Duration = Duration::from_secs(5);
+
         let (state, changed) = &*self.0;
         let mut state = state.lock().expect("destructor gate mutex poisoned");
         state.entered = true;
         changed.notify_all();
+        let deadline = Instant::now() + MAX_BLOCK;
         while !state.released {
-            state = changed
-                .wait(state)
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "destructor gate was not released within {MAX_BLOCK:?}"
+            );
+            let (next, timeout) = changed
+                .wait_timeout(state, remaining)
                 .expect("destructor gate mutex poisoned while blocking");
+            state = next;
+            assert!(
+                !timeout.timed_out() || state.released,
+                "destructor gate was not released within {MAX_BLOCK:?}"
+            );
         }
     }
 }

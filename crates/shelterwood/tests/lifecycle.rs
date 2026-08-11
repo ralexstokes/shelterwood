@@ -1,15 +1,15 @@
 use std::{
-    future,
+    future::{self, Future},
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context as FutureContext, Poll},
     time::Duration,
 };
 
-use crate::common::{
-    POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_quiet, policy::never, poll_until,
-};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, policy::never, poll_until};
 use shelterwood::{
     Actor, ActorOnceDef, Cancellation, Context, DynamicTree, ExitError, ExitKind, ExitResult,
     GracePhase, Intensity, LifecycleEventKind, LifecycleItem, Readiness, Retention, ScopeState,
@@ -17,7 +17,7 @@ use shelterwood::{
     Tree,
 };
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn non_owners_are_quiet_and_an_empty_root_needs_its_owner() {
     let empty = Tree::new().spawn().expect("runtime is available");
     empty.wait_started().await.expect("empty root starts");
@@ -137,16 +137,40 @@ async fn framework_task_verdicts_remain_typed() {
     ));
 }
 
+struct CompletedTaskFuture {
+    returned: bool,
+}
+
+impl Future for CompletedTaskFuture {
+    type Output = Result<(), ExitError>;
+
+    fn poll(mut self: Pin<&mut Self>, _: &mut FutureContext<'_>) -> Poll<Self::Output> {
+        assert!(
+            !self.returned,
+            "completed task future must not be re-polled"
+        );
+        self.returned = true;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for CompletedTaskFuture {
+    fn drop(&mut self) {
+        assert!(
+            self.returned,
+            "fixture must first produce a completed output"
+        );
+        panic!("task future destructor panic");
+    }
+}
+
 #[tokio::test]
-async fn task_destructor_panic_is_one_post_join_panic_exit() {
+async fn task_future_destructor_panic_folds_after_its_completed_output() {
     let mut tree = Tree::new();
     let task = tree
         .add_task_once(
             "panic-on-drop",
-            TaskOnceDef::new(|_| async move {
-                let _value = PanicOnDrop::new("task destructor panic");
-                Ok::<_, ExitError>(())
-            }),
+            TaskOnceDef::new(|_| CompletedTaskFuture { returned: false }),
         )
         .expect("valid task")
         .0;
@@ -155,7 +179,7 @@ async fn task_destructor_panic_is_one_post_join_panic_exit() {
     let exit = task.wait().await;
     assert!(matches!(
         exit.kind(),
-        ExitKind::Panicked { message: Some(message) } if message == "task destructor panic"
+        ExitKind::Panicked { message: Some(message) } if message == "task future destructor panic"
     ));
     assert_eq!(system.wait().await, StopReason::Finished);
 }
@@ -278,7 +302,7 @@ async fn replacement_starts_only_after_the_old_future_is_destroyed() {
         .expect("tree shuts down");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ordered_teardown_is_reverse_and_joins_before_advancing() {
     let order = Arc::new(Mutex::new(Vec::new()));
     let gates = [
@@ -414,7 +438,7 @@ async fn grace_expiry_mid_ladder_joins_the_abort_before_advancing() {
         .expect("shutdown completes within its owner budget");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn ordered_teardown_keeps_its_frontier_when_an_earlier_child_exits() {
     let first_stopping = Arc::new(AtomicBool::new(false));
     let middle_exit = ReleaseGate::default();

@@ -933,11 +933,15 @@ impl<M> RawResources<M> {
 
     /// Drops ledger entries for offloads that already finished, keeping a
     /// long-lived incarnation's ledger O(in-flight) rather than
-    /// O(offloads-ever-issued). Invoked at the two cheap points that bound
-    /// steady-state retention: when a new offload starts and when the loop
-    /// goes idle.
+    /// O(offloads-ever-issued). Invoked when a new offload starts, before each
+    /// ready-selection turn, and when the loop goes idle. The selection point
+    /// is what bounds retention for an actor whose mailbox never empties.
     fn reclaim_finished(&mut self) {
         self.offloads.retain(|offload| !offload.finished.is_fired());
+    }
+
+    fn begin_ready_selection(&mut self) {
+        self.reclaim_finished();
     }
 
     fn resume_pending_panic(&self) {
@@ -1221,8 +1225,8 @@ impl<M: Send + 'static> RawContext<M> {
     /// admits at most one mailbox delivery before its captured completion
     /// prefix. Its population therefore stays proportional to the caller's
     /// in-flight count even under sustained mailbox traffic. Bookkeeping for
-    /// finished offloads is reclaimed when a new offload starts and when the
-    /// loop goes idle.
+    /// finished offloads is reclaimed when a new offload starts, on every
+    /// input-selection turn, and when the loop goes idle.
     pub fn offload<F, T, C>(
         &mut self,
         work: F,
@@ -1468,6 +1472,10 @@ impl<M: Send + 'static> RawContext<M> {
     /// [`try_recv`](Self::try_recv) bypasses this selector and drains the
     /// accepted prefix directly according to the caller's shutdown policy.
     fn next_ready(&mut self) -> Option<M> {
+        // A permanently busy actor never reaches `wait_for_event`; reclaim at
+        // its other guaranteed re-entry point so completed task handles do not
+        // accumulate for the lifetime of the incarnation.
+        self.resources.begin_ready_selection();
         loop {
             self.resources.resume_pending_panic();
             self.begin_ready_batch();
@@ -2267,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn finished_offload_ledger_entries_are_reclaimed_eagerly() {
+    fn ready_selection_reclaims_finished_offload_ledger_entries() {
         let mut resources = RawResources::<()>::default();
         for finished in [true, false, true] {
             let completion = Latch::default();
@@ -2282,7 +2290,7 @@ mod tests {
             });
         }
 
-        resources.reclaim_finished();
+        resources.begin_ready_selection();
 
         assert_eq!(
             resources.offloads.len(),

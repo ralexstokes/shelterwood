@@ -282,7 +282,9 @@ impl WaiterId {
 /// FIFO registrations with direct removal by a send operation.
 ///
 /// Monotonic keys are insertion order, so the first map entry is the oldest
-/// waiter. Keys are never reused, making stale cancellation ids harmless.
+/// waiter. Keys are never reused within one queue instance; a queue is only
+/// replaced when it is empty or by the absorbing Terminal state, so no
+/// registration outlives its queue and stale cancellation ids remain harmless.
 /// `u64::MAX` is a poison key and is never minted; exhaustion remains poisoned
 /// instead of wrapping back into the live id domain.
 pub(super) struct WaiterQueue<M> {

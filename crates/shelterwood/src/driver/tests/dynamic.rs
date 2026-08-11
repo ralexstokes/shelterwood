@@ -109,7 +109,7 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
             DynamicEntry::removing(slot, ChildKey(1), responses),
         );
 
-    let entries = root.with_observation_gate(|txn| control.close(txn));
+    let entries = root.with_observation_gate(|txn| control.close(&root, txn));
     assert!(
         response.try_receive().is_none(),
         "closing admission must not complete removal before teardown"
@@ -122,6 +122,82 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
     );
     drop(entries);
     assert_eq!(response.try_receive(), Some(RemoveOutcome::Removed));
+}
+
+#[test]
+fn dynamic_close_evicts_a_terminal_reservation_before_readd() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state(ScopeState::Running);
+    let child_id = ChildId::from("worker");
+    let (events, _receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(events);
+    root.set_dynamic_route(Some(control.clone()));
+
+    let first = root
+        .with_observation_gate(|txn| {
+            super::super::admission_control::reserve_dynamic_in(&root, child_id.clone(), None, txn)
+        })
+        .expect("the first incarnation reserves the child");
+    let first_membership = first.slot.member.membership();
+    let retained = root.with_observation_gate(|txn| control.close(&root, txn));
+    assert!(
+        retained.is_empty(),
+        "reservations are terminalized on close"
+    );
+
+    let (restart_events, _restart_receiver) = crate::runtime::unbounded_mpsc();
+    let restart_control = DynamicControl::new(restart_events);
+    root.set_dynamic_route(Some(restart_control));
+    let replacement = root
+        .with_observation_gate(|txn| {
+            super::super::admission_control::reserve_dynamic_in(&root, child_id, None, txn)
+        })
+        .expect("the restarted scope can reserve the id again");
+    let replacement_membership = replacement.slot.member.membership();
+    assert!(!first_membership.supersedes(replacement_membership));
+    assert!(!replacement_membership.supersedes(first_membership));
+    cancel_dynamic_reservation(
+        &replacement.scope,
+        replacement.control.as_ref(),
+        &replacement.slot,
+    );
+}
+
+#[test]
+fn removing_a_reservation_evicts_its_identity_before_readd() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state(ScopeState::Running);
+    let child_id = ChildId::from("worker");
+    let (events, _receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(events);
+    root.set_dynamic_route(Some(control));
+
+    let first = root
+        .with_observation_gate(|txn| {
+            super::super::admission_control::reserve_dynamic_in(&root, child_id.clone(), None, txn)
+        })
+        .expect("the first reservation succeeds");
+    let first_membership = first.slot.member.membership();
+    let mut removal = super::super::remove_dynamic(&root, &child_id, Some(first_membership));
+    assert_eq!(removal.try_receive(), Some(RemoveOutcome::Removed));
+
+    let replacement = root
+        .with_observation_gate(|txn| {
+            super::super::admission_control::reserve_dynamic_in(&root, child_id, None, txn)
+        })
+        .expect("the removed reservation releases the id");
+    let replacement_membership = replacement.slot.member.membership();
+    assert!(!first_membership.supersedes(replacement_membership));
+    assert!(!replacement_membership.supersedes(first_membership));
+    cancel_dynamic_reservation(
+        &replacement.scope,
+        replacement.control.as_ref(),
+        &replacement.slot,
+    );
 }
 
 #[crate::runtime::test]

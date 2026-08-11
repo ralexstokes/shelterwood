@@ -247,7 +247,11 @@ impl DynamicControl {
             .close_admission(_txn);
     }
 
-    pub(super) fn close(&self, txn: &mut ObservationTxn<'_>) -> HashMap<ChildId, DynamicEntry> {
+    pub(super) fn close(
+        &self,
+        scope: &ScopeCell,
+        txn: &mut ObservationTxn<'_>,
+    ) -> HashMap<ChildId, DynamicEntry> {
         self.close_admission_in(txn);
         let mut state = self.state.lock().expect("dynamic-state mutex poisoned");
         let entries = state.take_entries(txn);
@@ -255,7 +259,7 @@ impl DynamicControl {
         let mut retained = HashMap::new();
         for (id, entry) in entries {
             if entry.is_reserved() {
-                let definition = entry.slot.take_never_started_locked(txn);
+                let definition = take_terminal_reservation(scope, &entry.slot, txn);
                 txn.defer(move || dispose_definition_then(definition, move || drop(entry)));
             } else {
                 retained.insert(id, entry);
@@ -266,6 +270,16 @@ impl DynamicControl {
         // removal without waking a remover before those observation edges.
         retained
     }
+}
+
+fn take_terminal_reservation(
+    scope: &ScopeCell,
+    slot: &SlotCell,
+    txn: &mut ObservationTxn<'_>,
+) -> Option<runtime::Isolated<ChildConstruction>> {
+    let definition = slot.take_never_started_locked(txn);
+    scope.evict_child_identity(&slot.member);
+    definition
 }
 
 pub(crate) struct DynamicReservation {
@@ -392,14 +406,9 @@ pub(super) fn cancel_dynamic_reservation_parts(
     });
     let removed = cancelled.then(|| state.remove(&id, txn)).flatten();
     drop(state);
-    let definition = if cancelled {
-        slot.take_never_started_locked(txn)
-    } else {
-        None
-    };
-    if cancelled {
-        scope.evict_child_identity(&slot.member);
-    }
+    let definition = cancelled
+        .then(|| take_terminal_reservation(scope, slot, txn))
+        .flatten();
     (definition, removed)
 }
 
@@ -510,7 +519,7 @@ fn remove_dynamic_impl(
     if entry.is_reserved() {
         let entry = state.remove(id, txn).expect("entry was just resolved");
         drop(state);
-        let definition = entry.slot.take_never_started_locked(txn);
+        let definition = take_terminal_reservation(scope, &entry.slot, txn);
         txn.defer(move || dispose_definition_then(definition, move || drop(entry)));
         return response;
     }

@@ -240,7 +240,7 @@ impl Drop for ScopeRuntime {
     fn drop(&mut self) {
         let dynamic_entries = if let Some(dynamic) = &self.dynamic {
             let entries = self.root.with_observation_gate(|txn| {
-                let entries = dynamic.close(txn);
+                let entries = dynamic.close(&self.root, txn);
                 self.root.set_dynamic_route_locked(None, txn);
                 entries
             });

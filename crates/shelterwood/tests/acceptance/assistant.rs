@@ -576,11 +576,17 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         "temporary children retire by exact handle"
     );
 
+    const DELIVERY_ID: u64 = 7;
+    let delivery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let first_delivery = gateway
         .ingress
         .call(
-            |reply| IngressMessage::Deliver { id: 7, reply },
-            Duration::from_secs(1),
+            |reply| IngressMessage::Deliver {
+                id: DELIVERY_ID,
+                reply,
+            },
+            Duration::from_secs(1)
+                .min(delivery_deadline.saturating_duration_since(tokio::time::Instant::now())),
         )
         .await
         .expect_err("durable write crash loses the first acknowledgement");
@@ -588,17 +594,47 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         first_delivery.kind,
         shelterwood::CallErrorKind::ReplyDropped
     );
-    gateway
+    let accepting_incarnation = first_delivery
+        .incarnation_observed
+        .expect("ReplyDropped proves which incarnation accepted the request");
+    let remaining = delivery_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let replacement = gateway_scope
+        .wait_for_child(
+            "ingress",
+            move |child| {
+                child
+                    .incarnation
+                    .is_some_and(|current| current.supersedes(accepting_incarnation))
+            },
+            remaining,
+        )
+        .await
+        .expect("redelivery waits for a superseding ingress incarnation");
+    let replacement_incarnation = replacement
+        .incarnation
+        .expect("running replacement has an incarnation");
+    assert!(replacement_incarnation.supersedes(accepting_incarnation));
+    let remaining = delivery_deadline.saturating_duration_since(tokio::time::Instant::now());
+    assert!(
+        !remaining.is_zero(),
+        "one overall redelivery budget remains"
+    );
+    let acknowledgement = gateway
         .ingress
         .call(
-            |reply| IngressMessage::Deliver { id: 7, reply },
-            Duration::from_secs(1),
+            |reply| IngressMessage::Deliver {
+                id: DELIVERY_ID,
+                reply,
+            },
+            Duration::from_secs(1).min(remaining),
         )
         .await
         .expect("redelivery of the same journal id is acknowledged");
+    assert_eq!(acknowledgement.incarnation, replacement_incarnation);
+    assert!(tokio::time::Instant::now() <= delivery_deadline);
     assert_eq!(
         gateway.processed.try_recv().ok(),
-        Some(7),
+        Some(DELIVERY_ID),
         "the durable write happened exactly once"
     );
     assert!(gateway.processed.try_recv().is_err());

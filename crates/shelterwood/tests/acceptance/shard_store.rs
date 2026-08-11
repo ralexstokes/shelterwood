@@ -7,7 +7,7 @@ use std::{
 use crate::common::ReleaseGate;
 use shelterwood::{
     Actor, ActorDef, ActorRef, CallErrorKind, Context, DynamicScopeRef, DynamicTree, ExitError,
-    ExitResult, Membership, RemoveOutcome, Reply, ScopeRef, SubtreeOnceDef, Tree,
+    ExitResult, Incarnation, Membership, RemoveOutcome, Reply, ScopeRef, SubtreeOnceDef, Tree,
 };
 
 /// A shard's durable contents. Deliberately not actor-owned state: the test
@@ -372,12 +372,27 @@ impl Actor for RouterActor {
 /// id, and a resend after `ReplyDropped` only once a *superseding* router
 /// incarnation is running — never into the same doomed mailbox or the rebind
 /// window.
+struct RetryOutcome {
+    route: Route,
+    fault_record: Option<OperationRecord>,
+    directory_at_fault: Option<Option<Route>>,
+    attempted_operations: Vec<u64>,
+    dropped_incarnation: Option<Incarnation>,
+    reply_incarnation: Incarnation,
+}
+
 async fn replace_with_retry(
     scope: &ScopeRef,
     router: &ActorRef<RouterMessage>,
+    directory: &ActorRef<DirectoryMessage>,
+    durable: &DurableTopology,
     operation: u64,
-) -> Route {
+) -> RetryOutcome {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut fault_record = None;
+    let mut directory_at_fault = None;
+    let mut attempted_operations = Vec::new();
+    let mut dropped_incarnation = None;
     for _ in 0..4 {
         // Every attempt spends from the one overall budget (§3.3 step 1),
         // the call's own acceptance deadline included.
@@ -386,6 +401,7 @@ async fn replace_with_retry(
             !remaining.is_zero(),
             "the overall deadline bounds the whole logical operation"
         );
+        attempted_operations.push(operation);
         match router
             .call(
                 move |reply| RouterMessage::Replace { operation, reply },
@@ -393,7 +409,27 @@ async fn replace_with_retry(
             )
             .await
         {
-            Ok(reply) => return reply.value,
+            Ok(reply) => {
+                assert!(
+                    tokio::time::Instant::now() <= deadline,
+                    "the successful retry remains inside the one overall deadline"
+                );
+                if let Some(observed) = dropped_incarnation {
+                    assert!(
+                        reply.incarnation.supersedes(observed),
+                        "the retry is accepted only by a superseding incarnation"
+                    );
+                }
+                assert!(attempted_operations.iter().all(|id| *id == operation));
+                return RetryOutcome {
+                    route: reply.value,
+                    fault_record,
+                    directory_at_fault,
+                    attempted_operations,
+                    dropped_incarnation,
+                    reply_incarnation: reply.incarnation,
+                };
+            }
             Err(error) => match error.kind {
                 CallErrorKind::ReplyDropped => {
                     // Acceptance happened and the accepting incarnation lost
@@ -402,8 +438,18 @@ async fn replace_with_retry(
                     let observed = error
                         .incarnation_observed
                         .expect("ReplyDropped carries the accepting incarnation");
+                    assert!(
+                        dropped_incarnation.replace(observed).is_none(),
+                        "each injected logical operation faults only once"
+                    );
+                    fault_record = Some(
+                        durable
+                            .operation(operation)
+                            .expect("the faulting attempt journaled durable evidence"),
+                    );
+                    directory_at_fault = Some(lookup(directory).await);
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    scope
+                    let replacement = scope
                         .wait_for_child(
                             "topology-writer",
                             move |child| {
@@ -415,6 +461,12 @@ async fn replace_with_retry(
                         )
                         .await
                         .expect("a superseding router incarnation runs");
+                    assert!(
+                        replacement
+                            .incarnation
+                            .expect("running replacement has an incarnation")
+                            .supersedes(observed)
+                    );
                 }
                 CallErrorKind::AcceptanceTimedOut => {
                     // Guaranteed-not-accepted; always safe to retry
@@ -428,7 +480,9 @@ async fn replace_with_retry(
             },
         }
     }
-    panic!("idempotent topology operation did not reconcile")
+    panic!(
+        "idempotent topology operation {operation} did not reconcile within one overall deadline"
+    )
 }
 
 async fn lookup(directory: &ActorRef<DirectoryMessage>) -> Option<Route> {
@@ -470,24 +524,32 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
     system.wait_started().await.expect("store starts");
     let root_scope = system.scope();
 
-    let first_error = router
-        .call(
-            |reply| RouterMessage::Replace {
-                operation: 1,
-                reply,
-            },
-            Duration::from_secs(1),
+    let first_retry = replace_with_retry(&root_scope, &router, &directory, &durable, 1).await;
+    assert_eq!(first_retry.attempted_operations, [1, 1]);
+    assert!(first_retry.dropped_incarnation.is_some());
+    assert!(
+        first_retry.reply_incarnation.supersedes(
+            first_retry
+                .dropped_incarnation
+                .expect("the helper observed its injected fault")
         )
-        .await
-        .expect_err("pre-commit crash drops its reply");
-    assert_eq!(first_error.kind, CallErrorKind::ReplyDropped);
-    assert!(lookup(&directory).await.is_none(), "cutover did not happen");
-    let failed_candidate = match durable.operation(1).expect("mount was journaled") {
+    );
+    assert!(
+        first_retry
+            .directory_at_fault
+            .expect("the helper captured the pre-retry directory")
+            .is_none(),
+        "pre-commit cutover did not happen"
+    );
+    let failed_candidate = match first_retry
+        .fault_record
+        .expect("the helper captured the pre-commit journal")
+    {
         OperationRecord::Mounted { candidate, .. } => candidate,
         OperationRecord::Committed { .. } => panic!("pre-commit crash cannot be committed"),
     };
 
-    let first = replace_with_retry(&root_scope, &router, 1).await;
+    let first = first_retry.route;
     assert!(
         !first
             .membership
@@ -511,34 +573,31 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
         shelterwood::StopReason::ShutdownRequested
     );
 
-    let second_error = router
-        .call(
-            |reply| RouterMessage::Replace {
-                operation: 2,
-                reply,
-            },
-            Duration::from_secs(1),
-        )
-        .await
-        .expect_err("post-commit crash drops its reply");
-    assert_eq!(second_error.kind, CallErrorKind::ReplyDropped);
-    let committed_candidate = match durable.operation(2).expect("commit was journaled") {
+    let second_retry = replace_with_retry(&root_scope, &router, &directory, &durable, 2).await;
+    assert_eq!(second_retry.attempted_operations, [2, 2]);
+    let committed_candidate = match second_retry
+        .fault_record
+        .expect("the helper captured the post-commit journal")
+    {
         OperationRecord::Committed { candidate, .. } => candidate,
         OperationRecord::Mounted { .. } => panic!("directory cutover must be committed"),
     };
     assert_eq!(
-        lookup(&directory)
-            .await
+        second_retry
+            .directory_at_fault
+            .expect("the helper captured the post-commit directory")
             .expect("post-commit route is visible")
             .membership,
         committed_candidate.route.membership
     );
 
-    let second = replace_with_retry(&root_scope, &router, 2).await;
+    let second = second_retry.route;
     assert_eq!(second.membership, committed_candidate.route.membership);
+    let replay = replace_with_retry(&root_scope, &router, &directory, &durable, 2).await;
+    assert_eq!(replay.attempted_operations, [2]);
+    assert!(replay.fault_record.is_none());
     assert_eq!(
-        replace_with_retry(&root_scope, &router, 2).await.membership,
-        second.membership,
+        replay.route.membership, second.membership,
         "replaying a committed operation is idempotent"
     );
 

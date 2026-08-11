@@ -84,8 +84,18 @@ impl ScopeRuntime {
         });
         if let Some(entry) = entry {
             self.reclaim_child(key);
-            drop(entry);
+            // Removal is an owner action, not a startup failure: the reclaim
+            // above shrank the declared initial set, so re-evaluate the
+            // aggregate (self-guarded on `is_starting`). This runs outside
+            // the observation gate closed above — `complete_startup` reopens
+            // that gate, and it is not reentrant.
+            //
+            // Ordered ahead of the entry's drop: that drop completes the
+            // in-flight removal response, so recomputing first is what makes
+            // a returned `RemoveOutcome::Removed` imply the aggregate already
+            // saw the shrunken set.
             self.progress_startup();
+            drop(entry);
         }
     }
 
@@ -113,6 +123,13 @@ impl ScopeRuntime {
         });
         if self.root.flavor == ScopeFlavor::Dynamic {
             self.reclaim_child(key);
+            // Symmetry with `finalize_removal`: a reclaim can shrink the
+            // declared initial set. Unreachable during `Starting` today —
+            // every terminal route for an unready initial member routes
+            // through `fail_startup` or the removal branch — but it closes
+            // the residual missed-recomputation class rather than relying on
+            // that reachability argument holding forever.
+            self.progress_startup();
         }
         // The entry's drop completes any in-flight removal response; it must
         // follow the Removed edge so a woken remover never sees the child

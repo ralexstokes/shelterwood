@@ -668,20 +668,35 @@ async fn dynamic_startup_failure_keeps_other_initial_members_supervised() {
         .expect("owner rolls back sibling");
 }
 
+/// A `Manual` member that never marks ready, so it gates its scope's
+/// aggregate until it is removed.
+fn unbounded_manual_gate() -> TaskDef {
+    TaskDef::new(|context| async move {
+        context.shutdown_token().cancelled().await;
+        Ok(())
+    })
+    .readiness(Readiness::Manual)
+    .expect("manual readiness")
+    .readiness_deadline(ReadinessDeadline::Unbounded)
+}
+
+/// A `Manual` member that marks ready immediately and then parks.
+fn unbounded_manual_ready() -> TaskDef {
+    TaskDef::new(|context| async move {
+        context.mark_ready();
+        context.shutdown_token().cancelled().await;
+        Ok(())
+    })
+    .readiness(Readiness::Manual)
+    .expect("manual readiness")
+    .readiness_deadline(ReadinessDeadline::Unbounded)
+}
+
 #[tokio::test(start_paused = true)]
 async fn dynamic_startup_completes_after_removing_sole_unready_initial_member() {
     let mut tree = DynamicTree::new();
-    tree.add_task(
-        "gate",
-        TaskDef::new(|context| async move {
-            context.shutdown_token().cancelled().await;
-            Ok(())
-        })
-        .readiness(Readiness::Manual)
-        .expect("manual readiness")
-        .readiness_deadline(ReadinessDeadline::Unbounded),
-    )
-    .expect("valid initial member");
+    tree.add_task("gate", unbounded_manual_gate())
+        .expect("valid initial member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
     assert!(
@@ -708,29 +723,10 @@ async fn dynamic_startup_completes_after_removing_sole_unready_initial_member() 
 #[tokio::test(start_paused = true)]
 async fn dynamic_startup_completes_after_removing_last_unready_initial_member() {
     let mut tree = DynamicTree::new();
-    tree.add_task(
-        "ready",
-        TaskDef::new(|context| async move {
-            context.mark_ready();
-            context.shutdown_token().cancelled().await;
-            Ok(())
-        })
-        .readiness(Readiness::Manual)
-        .expect("manual readiness")
-        .readiness_deadline(ReadinessDeadline::Unbounded),
-    )
-    .expect("valid ready sibling");
-    tree.add_task(
-        "gate",
-        TaskDef::new(|context| async move {
-            context.shutdown_token().cancelled().await;
-            Ok(())
-        })
-        .readiness(Readiness::Manual)
-        .expect("manual readiness")
-        .readiness_deadline(ReadinessDeadline::Unbounded),
-    )
-    .expect("valid unready member");
+    tree.add_task("ready", unbounded_manual_ready())
+        .expect("valid ready sibling");
+    tree.add_task("gate", unbounded_manual_gate())
+        .expect("valid unready member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
     assert!(
@@ -755,6 +751,124 @@ async fn dynamic_startup_completes_after_removing_last_unready_initial_member() 
         .shutdown(Duration::from_secs(1))
         .await
         .expect("ready sibling stops");
+}
+
+/// The declared set can empty out: two removals in flight at once leave no
+/// initial member at all, and the aggregate completes on the vacuous set.
+#[tokio::test(start_paused = true)]
+async fn dynamic_startup_completes_after_removing_every_initial_member() {
+    let mut tree = DynamicTree::new();
+    tree.add_task("first", unbounded_manual_gate())
+        .expect("valid unready member");
+    tree.add_task("second", unbounded_manual_gate())
+        .expect("valid unready member");
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            scope.child("first").is_some() && scope.child("second").is_some()
+        })
+        .await
+    );
+
+    let (first, second) = tokio::join!(scope.remove("first"), scope.remove("second"));
+    assert_eq!(first, shelterwood::RemoveOutcome::Removed);
+    assert_eq!(second, shelterwood::RemoveOutcome::Removed);
+    tokio::time::timeout(Duration::from_secs(60), system.wait_started())
+        .await
+        .expect("an emptied declared set completes startup")
+        .expect("removal is not a startup failure");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("empty root stops");
+}
+
+/// Completion has to publish upwards, not just locally: the nested dynamic
+/// scope's aggregate is the ordered parent's gate, so removal must release
+/// the sibling declared after it.
+#[tokio::test(start_paused = true)]
+async fn removal_completed_nested_startup_releases_the_ordered_sibling() {
+    let mut nested = DynamicTree::new();
+    nested
+        .add_task("gate", unbounded_manual_gate())
+        .expect("valid unready member");
+    let mut root = Tree::new();
+    let nested_scope = root
+        .add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid nested dynamic scope");
+    root.add_task("after", unbounded_manual_ready())
+        .expect("valid gated sibling");
+
+    let system = root.spawn().expect("runtime is available");
+    let scope = system.scope();
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            nested_scope.child("gate").is_some()
+        })
+        .await
+    );
+    assert_quiet(Duration::from_secs(5), || {
+        scope
+            .child("after")
+            .is_some_and(|child| matches!(child.state, ChildState::Running))
+    })
+    .await;
+
+    assert_eq!(
+        nested_scope.remove("gate").await,
+        shelterwood::RemoveOutcome::Removed
+    );
+    tokio::time::timeout(Duration::from_secs(60), system.wait_started())
+        .await
+        .expect("nested completion releases the ordered gate")
+        .expect("removal is not a startup failure");
+    assert!(
+        scope
+            .child("after")
+            .is_some_and(|child| matches!(child.state, ChildState::Running)),
+        "the gated sibling starts once removal completes the nested aggregate"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+/// The negative that pins the recomputation's guard: removal recomputes the
+/// aggregate, it does not assert it. Dropping an already-ready member cannot
+/// complete startup while an unready one is still declared.
+#[tokio::test(start_paused = true)]
+async fn removing_a_ready_initial_member_leaves_startup_pending() {
+    let mut tree = DynamicTree::new();
+    tree.add_task("ready", unbounded_manual_ready())
+        .expect("valid ready member");
+    tree.add_task("gate", unbounded_manual_gate())
+        .expect("valid unready member");
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            scope
+                .child("ready")
+                .is_some_and(|child| matches!(child.state, ChildState::Running))
+                && scope.child("gate").is_some()
+        })
+        .await
+    );
+
+    assert_eq!(
+        scope.remove("ready").await,
+        shelterwood::RemoveOutcome::Removed
+    );
+    assert_quiet(Duration::from_secs(30), || {
+        !matches!(scope.snapshot().state, ScopeState::Starting)
+    })
+    .await;
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("the still-gated root stops");
 }
 
 #[tokio::test]

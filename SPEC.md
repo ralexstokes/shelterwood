@@ -1194,7 +1194,10 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   per policy and holds the aggregate open (the latch rule below),
   exactly as an ordered gate does. A **terminal** pre-ready exit of an
   initial member before the aggregate fires is the scope's terminal
-  startup failure — and because every initial member was spawned at
+  startup failure — *unless* that exit is the commit of an
+  owner-initiated removal, in which case the member simply leaves
+  the declared set under the aggregate rule below and startup
+  continues — and because every initial member was spawned at
   lowering, there is no not-yet-started suffix: **no sibling
   terminalizes `NeverStarted`**. The transition is pinned: the scope
   leaves `Starting` the moment the exit funnel dispatches that terminal
@@ -1219,11 +1222,23 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   dynamic scope never join the aggregate, whether they are admitted
   before or after it fires (their per-child `Ready` events, B.4, are
   the observation surface). Removing an initial member while the scope
-  is `Starting` shrinks that declared set, and the aggregate may complete
-  when the remaining initial members are ready. The aggregate fires at
-  most once per scope incarnation and is latched: an already-ready child
-  that fails and
-  restarts afterwards does not rewind it — readiness is a
+  is `Starting` shrinks that declared set, and the aggregate may
+  complete when the remaining initial members are ready — including
+  the empty case, where removing every initial member completes
+  startup. The shrink is **commit-time, not request-time**: the member
+  leaves the declared set when its removal commits (residency
+  withdrawn, `Removed` published), so a slow-stopping member holds the
+  aggregate open for its whole stop ladder, and the recomputation is
+  ordered ahead of the removal response — a returned `Removed` implies
+  the aggregate has already seen the shrunken set. That commit point
+  pins the race against the member's own pre-ready failure: a terminal
+  pre-ready exit or readiness timeout whose terminal routing observes
+  the membership *not yet* marked removing fails startup under the
+  rule above, while once the mark is in place removal outranks it and
+  the aggregate simply shrinks. Both orders are legal; which one a
+  given run takes is not specified. The aggregate fires at most once
+  per scope incarnation and is latched: an already-ready child that
+  fails and restarts afterwards does not rewind it — readiness is a
   startup-phase edge, not a liveness signal (snapshots carry liveness,
   B.6). The same latch decides the pre-fire race: a gated child that
   restarts *before* the aggregate has fired holds it open until the
@@ -2537,6 +2552,16 @@ integration toolkit for the driver shell and the end-to-end invariants.
    while a gated runtime member sits unready); an already-ready child
    restarting before the aggregate fires holds it open, and one
    restarting after it fires does not rewind it.
+   Removal shrinks the declared set (§6), pinned by public-API repros
+   that hang the unfixed driver for a full virtual timeout: removing
+   the sole unready initial member completes startup; so does removing
+   the last unready one beside a ready sibling, removing every initial
+   member concurrently (the empty declared set), and removing the sole
+   unready member of a *nested* dynamic scope — which must publish the
+   aggregate up to an ordered parent and release its gated sibling.
+   The negative pins the guard: removing an *already-ready* initial
+   member while an unready one remains leaves the scope quietly
+   `Starting`.
 7. **Exactly one published exit report per incarnation, on every path
    including panic and abort; publication is post-join (§7's two-phase
    rule); one runner, one exit type.** The two hard provocations: an

@@ -84,11 +84,21 @@ impl ScopeRuntime {
         });
         if let Some(entry) = entry {
             self.reclaim_child(key);
-            if self.lifecycle.is_starting() {
-                self.pending_startup_removals.push(entry);
-            } else {
-                drop(entry);
-            }
+            self.release_removed_entry(entry);
+        }
+    }
+
+    /// Releases a committed removal's entry. The drop completes the in-flight
+    /// removal response, so during `Starting` — where the reclaim that
+    /// precedes it can shrink the declared initial set — the completion is
+    /// retained until the batch epilogue recomputes the aggregate. That
+    /// ordering is what makes a returned `RemoveOutcome::Removed` imply
+    /// startup already saw the shrunken set (SPEC §6).
+    fn release_removed_entry(&mut self, entry: DynamicEntry) {
+        if self.lifecycle.is_starting() {
+            self.pending_startup_removals.push(entry);
+        } else {
+            drop(entry);
         }
     }
 
@@ -123,10 +133,15 @@ impl ScopeRuntime {
         if self.root.flavor == ScopeFlavor::Dynamic {
             self.reclaim_child(key);
         }
-        // The entry's drop completes any in-flight removal response; it must
-        // follow the Removed edge so a woken remover never sees the child
-        // resident.
-        drop(removed);
+        // The entry's release completes any in-flight removal response; it
+        // must follow the Removed edge so a woken remover never sees the
+        // child resident. A removal that latches between this path's
+        // `dynamic_membership_is_removing` check and the gate above lands its
+        // response here rather than in `finalize_removal`, so it takes the
+        // same starting-phase retention.
+        if let Some(entry) = removed {
+            self.release_removed_entry(entry);
+        }
     }
 
     pub(super) fn reclaim_child(&mut self, key: ChildKey) {

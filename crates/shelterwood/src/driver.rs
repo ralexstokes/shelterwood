@@ -866,27 +866,25 @@ async fn run_scope_incarnation(
             )
             .await
             {
-                runtime::ScopeWake::Signal | runtime::ScopeWake::ParentShutdown => continue,
+                runtime::ScopeWake::Signal
+                | runtime::ScopeWake::ParentShutdown
+                | runtime::ScopeWake::Message(None)
+                | runtime::ScopeWake::ControlMessage(None) => {}
                 runtime::ScopeWake::Deadline => {
                     // A producer becoming ready at the same instant owns the
                     // tie over its deadline. Give tasks woken by that clock
                     // edge one turn to publish their retained readiness
                     // latch before collecting due registrations.
                     runtime::yield_now().await;
-                    continue;
                 }
-                runtime::ScopeWake::Message(Some(event)) => {
+                runtime::ScopeWake::Message(Some(event))
+                | runtime::ScopeWake::ControlMessage(Some(event)) => {
                     retain_woken_event(event, &mut pending);
-                    continue;
-                }
-                runtime::ScopeWake::ControlMessage(Some(event)) => {
-                    retain_woken_event(event, &mut pending);
-                    continue;
-                }
-                runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
-                    continue;
                 }
             }
+            // Every wake re-enters the collection site above. Nothing is
+            // dispatched from this arm.
+            continue;
         }
 
         arbitrate(&mut pending);

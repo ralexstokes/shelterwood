@@ -134,6 +134,14 @@ impl ScopeRuntime {
         let Some(mut child) = self.children.remove(key) else {
             return;
         };
+        // Reclaim never adjusts `incomplete_children`: every reclaim path runs
+        // after terminal completion, which already decremented the count. An
+        // early reclaim would leak the count and stall scope completion, so
+        // fail loudly instead.
+        debug_assert!(
+            !child.is_incomplete(),
+            "reclaim runs only after terminal completion"
+        );
         let removed = self.child_keys.remove(&child.slot.member.membership());
         debug_assert_eq!(
             removed,

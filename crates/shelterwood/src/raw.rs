@@ -1380,7 +1380,7 @@ impl<M: Send + 'static> RawContext<M> {
             armed: true,
         });
         let events = Arc::clone(&self.resources.events);
-        let panic = Arc::clone(&self.resources.panic);
+        let disposal = self.resources.disposal.clone();
         if deadline.is_zero() {
             drop(work);
             events.push(QueuedEvent {
@@ -1422,8 +1422,7 @@ impl<M: Send + 'static> RawContext<M> {
                     });
                 }
                 runtime::Either::Right(Err(payload)) => {
-                    panic.record(payload);
-                    events.signal.pulse();
+                    disposal.record(payload);
                 }
             }
         };

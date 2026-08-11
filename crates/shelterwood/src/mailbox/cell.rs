@@ -1203,6 +1203,12 @@ pub(super) mod tests {
                 .mailbox
                 .upgrade()
                 .expect("the cancelling send retains its mailbox");
+            drop(
+                mailbox
+                    .state
+                    .try_lock()
+                    .expect("waker drop runs after the mailbox lock is released"),
+            );
             let error = mailbox
                 .try_send(2)
                 .expect_err("a reentrant try-send observes the unbound mailbox");

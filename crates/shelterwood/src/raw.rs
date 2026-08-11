@@ -264,6 +264,19 @@ struct RawDisposal {
     signal: Signal,
 }
 
+/// Test-only: mints an orphan disposal whose panic slot and signal nothing
+/// observes. Production wiring threads one shared disposal per incarnation
+/// through the container constructors.
+#[cfg(test)]
+impl Default for RawDisposal {
+    fn default() -> Self {
+        Self {
+            panic: Arc::new(PanicSlot::default()),
+            signal: Signal::default(),
+        }
+    }
+}
+
 impl RawDisposal {
     fn record(&self, payload: PanicPayload) {
         self.panic.record(payload);
@@ -339,14 +352,10 @@ struct EventQueue<M> {
     disposal: RawDisposal,
 }
 
+#[cfg(test)]
 impl<M> Default for EventQueue<M> {
     fn default() -> Self {
-        let signal = Signal::default();
-        let disposal = RawDisposal {
-            panic: Arc::new(PanicSlot::default()),
-            signal: signal.clone(),
-        };
-        Self::new(disposal)
+        Self::new(RawDisposal::default())
     }
 }
 
@@ -477,13 +486,10 @@ struct TimerStore<M> {
     lookup_probes: usize,
 }
 
+#[cfg(test)]
 impl<M> Default for TimerStore<M> {
     fn default() -> Self {
-        let signal = Signal::default();
-        Self::new(RawDisposal {
-            panic: Arc::new(PanicSlot::default()),
-            signal,
-        })
+        Self::new(RawDisposal::default())
     }
 }
 

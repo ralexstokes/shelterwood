@@ -74,7 +74,7 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
     );
 }
 
-#[crate::runtime::test]
+#[crate::runtime::test(start_paused = true)]
 async fn force_uses_the_stop_funnel_for_every_ordered_child() {
     let mut tree = Tree::new();
     let first = tree

@@ -8,14 +8,15 @@ mod shutdown;
 mod startup;
 
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
+    ops::{Index, IndexMut},
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
 mod storage;
 
-use storage::{ChildArena, ChildKey, Obligation};
+use storage::Obligation;
 
 use child::ChildRuntime;
 #[cfg(test)]
@@ -28,8 +29,8 @@ use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
 
 use crate::{
-    Cancellation, ChildId, Exit, GracePhase, Incarnation, JitterSample, Membership, Readiness,
-    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    Cancellation, ChildId, Exit, GracePhase, Incarnation, JitterSample, Readiness, ScopeState,
+    ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
         MemberStage, MemberTransition, ResidentProjection, ScopeCell, ScopeControlEvent,
@@ -37,10 +38,11 @@ use crate::{
     },
     deadline::Deadline,
     engine::{
-        ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
-        IncarnationRun, IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent,
-        ReadinessGate, RestartState, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate,
-        dispatch_exit, schedule_restart,
+        ArbitrationClass, ChildKey, DeadlineHandle, DeadlineQueue, Effect as SupervisorEffect,
+        Epoch, Event as SupervisorEvent, ExitDispatch, IncarnationRun, IntensityState,
+        MembershipStatus, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState,
+        ScopeLifecycle, ScopeMode, StopAction, StopLadder, SupervisorState, arbitrate,
+        dispatch_exit, schedule_restart, step as supervisor_step,
     },
     exit::{
         RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
@@ -196,11 +198,11 @@ struct ScopeRuntime {
     defaults: ResolvedDefaults,
     intensity_policy: crate::Intensity,
     intensity: IntensityState,
-    children: ChildArena<ChildRuntime>,
-    // The index and count are maintained only at child installation/completion.
-    // Driver wakes resolve a subject directly and test completion in O(1).
-    child_keys: HashMap<Membership, ChildKey>,
-    incomplete_children: usize,
+    // Runtime resources are keyed by the arena owned by `supervisor`; this
+    // map carries no lifecycle or membership decisions.
+    children: ChildResources<ChildRuntime>,
+    supervisor: SupervisorState,
+    supervisor_effects: Vec<SupervisorEffect>,
     // Retained restart-shutdown facts whose subjects became inactive mid-batch.
     // `handle_exit` queues them here instead of expediting synchronously so the
     // retry re-enters arbitration on the next wake: an exit collected in the
@@ -211,8 +213,6 @@ struct ScopeRuntime {
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
-    lifecycle: ScopeLifecycle,
-    next_ordered_start: Option<ChildKey>,
     role: ScopeRole,
     dynamic: Option<Arc<DynamicControl>>,
     // Removing an initial member can complete startup. Hold its response
@@ -223,13 +223,104 @@ struct ScopeRuntime {
     epoch: Epoch,
     ancestor_shutdown_seen: bool,
     ancestor_abort_seen: bool,
-    hard_forced: bool,
-    ordered_stop_progressing: bool,
-    ordered_stop_cursor: Option<ChildKey>,
-    ordered_stop_waiting: Option<ChildKey>,
-    #[cfg(test)]
-    ordered_stop_inspections: usize,
     completion: Option<ScopeCompletion>,
+    finished: Option<StopReason>,
+}
+
+struct ChildResources<T>(BTreeMap<ChildKey, T>);
+
+impl<T> Default for ChildResources<T> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+trait ChildKeyArg {
+    fn child_key(self) -> ChildKey;
+}
+
+impl ChildKeyArg for ChildKey {
+    fn child_key(self) -> ChildKey {
+        self
+    }
+}
+
+impl ChildKeyArg for &ChildKey {
+    fn child_key(self) -> ChildKey {
+        *self
+    }
+}
+
+impl<T> ChildResources<T> {
+    fn insert(&mut self, key: ChildKey, child: T) -> Option<T> {
+        self.0.insert(key, child)
+    }
+
+    fn get(&self, key: impl ChildKeyArg) -> Option<&T> {
+        self.0.get(&key.child_key())
+    }
+
+    fn get_mut(&mut self, key: impl ChildKeyArg) -> Option<&mut T> {
+        self.0.get_mut(&key.child_key())
+    }
+
+    fn remove(&mut self, key: impl ChildKeyArg) -> Option<T> {
+        self.0.remove(&key.child_key())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (ChildKey, &T)> {
+        self.0.iter().map(|(key, child)| (*key, child))
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.0.values()
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.0.values_mut()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl<T> Index<ChildKey> for ChildResources<T> {
+    type Output = T;
+
+    fn index(&self, key: ChildKey) -> &Self::Output {
+        self.get(key).expect("live child resource key")
+    }
+}
+
+impl<T> Index<&ChildKey> for ChildResources<T> {
+    type Output = T;
+
+    fn index(&self, key: &ChildKey) -> &Self::Output {
+        self.get(key).expect("live child resource key")
+    }
+}
+
+impl<T> IndexMut<ChildKey> for ChildResources<T> {
+    fn index_mut(&mut self, key: ChildKey) -> &mut Self::Output {
+        self.get_mut(key).expect("live child resource key")
+    }
+}
+
+impl<T> IndexMut<&ChildKey> for ChildResources<T> {
+    fn index_mut(&mut self, key: &ChildKey) -> &mut Self::Output {
+        self.get_mut(key).expect("live child resource key")
+    }
 }
 
 struct ScopeCompletion {
@@ -281,7 +372,7 @@ impl Drop for ScopeRuntime {
         let reason = completion
             .as_ref()
             .map(|completion| completion.reason.clone())
-            .or_else(|| self.lifecycle.draining_reason().cloned())
+            .or_else(|| self.supervisor.lifecycle().draining_reason().cloned())
             .unwrap_or(StopReason::ShutdownRequested);
         if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
             self.root.finish_root_incarnation(self.epoch, reason, exit);
@@ -292,24 +383,73 @@ impl Drop for ScopeRuntime {
 }
 
 impl ScopeRuntime {
+    fn reduce(&mut self, event: SupervisorEvent) {
+        supervisor_step(&mut self.supervisor, event, &mut self.supervisor_effects);
+    }
+
+    fn flush_supervisor_effects(&mut self) {
+        while !self.supervisor_effects.is_empty() {
+            let effects = std::mem::take(&mut self.supervisor_effects);
+            for effect in effects {
+                match effect {
+                    SupervisorEffect::Admitted { .. } => {
+                        unreachable!("admission consumes its key synchronously")
+                    }
+                    SupervisorEffect::StartChild { child } => self.spawn_child(child),
+                    SupervisorEffect::StopChild { child } => self.begin_stop_child(child, None),
+                    SupervisorEffect::ForceChild { child } => self.force_child(child),
+                    SupervisorEffect::FinalizeRemoval { child } => self.finalize_removal(child),
+                    SupervisorEffect::StartupCompleted { state } => {
+                        self.publish_startup_complete(state);
+                    }
+                    SupervisorEffect::Finished { reason } => {
+                        self.finished.get_or_insert(reason);
+                    }
+                    SupervisorEffect::StartupFailed { .. }
+                    | SupervisorEffect::DrainStarted { .. } => {
+                        unreachable!("the transition owner publishes its contextual result")
+                    }
+                }
+            }
+        }
+    }
+
+    fn settle_supervisor(&mut self) {
+        loop {
+            self.reduce(SupervisorEvent::Settle);
+            if self.supervisor_effects.is_empty() {
+                break;
+            }
+            self.flush_supervisor_effects();
+            if self.finished.is_some() {
+                break;
+            }
+        }
+    }
+
     pub(super) fn insert_child(
         &mut self,
         child: ChildRuntime,
+        initial: bool,
     ) -> Result<ChildKey, Box<ChildRuntime>> {
         let membership = child.slot.member.membership();
-        let incomplete = child.is_incomplete();
-        let key = self.children.insert(child)?;
-        let replaced = self.child_keys.insert(membership, key);
-        assert!(
+        let before = self.supervisor_effects.len();
+        self.reduce(SupervisorEvent::Admit {
+            membership,
+            initial,
+            start_immediately: false,
+        });
+        let key = match self.supervisor_effects.get(before) {
+            Some(SupervisorEffect::Admitted { child }) => *child,
+            None => return Err(Box::new(child)),
+            Some(effect) => unreachable!("admission emitted {effect:?} before its key"),
+        };
+        self.supervisor_effects.remove(before);
+        let replaced = self.children.insert(key, child);
+        debug_assert!(
             replaced.is_none(),
-            "one live membership maps to exactly one child key"
+            "the reducer's monotonic child key is new to runtime resources"
         );
-        if incomplete {
-            self.incomplete_children = self
-                .incomplete_children
-                .checked_add(1)
-                .expect("an in-memory child count fits in usize");
-        }
         Ok(key)
     }
 
@@ -317,7 +457,7 @@ impl ScopeRuntime {
     fn record_storage(&self) {
         self.root.record_runtime_storage(RuntimeStorage {
             children: self.children.len(),
-            child_slots: self.children.storage_len(),
+            child_slots: self.children.len(),
             deadlines: self.deadlines.len(),
             deadline_slots: self.deadlines.storage_len(),
         });
@@ -332,12 +472,12 @@ impl ScopeRuntime {
             .dynamic
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &control))
-            || self.lifecycle.is_draining()
-            || self.lifecycle.startup_failed()
+            || self.supervisor.lifecycle().is_draining()
+            || self.supervisor.lifecycle().startup_failed()
         {
-            let cause = if self.lifecycle.is_draining() {
+            let cause = if self.supervisor.lifecycle().is_draining() {
                 NotAdmittingCause::Draining
-            } else if self.lifecycle.startup_failed() {
+            } else if self.supervisor.lifecycle().startup_failed() {
                 NotAdmittingCause::StartupFailed
             } else {
                 NotAdmittingCause::NoLiveIncarnation
@@ -385,8 +525,7 @@ impl ScopeRuntime {
         // Conversion can unwind while acquiring child identity or configuring
         // the mailbox. Keep that fallible work outside the control-plane lock
         // so driver teardown can still close reservations and removals.
-        let mut child = ChildRuntime::from_plan(plan, &self.root);
-        child.initial = false;
+        let child = ChildRuntime::from_plan(plan, &self.root);
         enum AdmissionInstall {
             Admitted(ChildKey),
             Rejected {
@@ -417,7 +556,7 @@ impl ScopeRuntime {
             // state transition: an exact remover sees either the reservation
             // or a resident carrying its live arena key, never an unindexed
             // admitted intermediate.
-            let key = match self.insert_child(child) {
+            let key = match self.insert_child(child, false) {
                 Ok(key) => key,
                 Err(child) => {
                     let removed = state.remove(id, txn);
@@ -642,21 +781,6 @@ async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
     run_scope_incarnation(plan, role, epoch).await
 }
 
-/// Derives the membership index and incompleteness count for a freshly
-/// assembled child arena. Production construction and the test builder both
-/// call this, so the derived state cannot drift between them.
-fn index_children(children: &ChildArena<ChildRuntime>) -> (HashMap<Membership, ChildKey>, usize) {
-    let child_keys = children
-        .iter()
-        .map(|(key, child)| (child.slot.member.membership(), key))
-        .collect();
-    let incomplete_children = children
-        .values()
-        .filter(|child| child.is_incomplete())
-        .count();
-    (child_keys, incomplete_children)
-}
-
 async fn run_scope_incarnation(
     mut plan: ScopePlan,
     role: ScopeRole,
@@ -697,48 +821,53 @@ async fn run_scope_incarnation(
     // owned by ScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
     // exactly one terminality owner for every child.
-    let mut children = ChildArena::default();
+    let mut supervisor = SupervisorState::new(root.flavor, epoch.lifecycle());
+    let mut supervisor_effects = Vec::new();
+    let mut children = ChildResources::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
         let child = ChildRuntime::from_plan(child, &root);
-        if children.insert(child).is_err() {
-            unreachable!("a fresh child-key domain accommodates an in-memory child collection");
-        }
+        let membership = child.slot.member.membership();
+        supervisor_step(
+            &mut supervisor,
+            SupervisorEvent::Admit {
+                membership,
+                initial: true,
+                start_immediately: false,
+            },
+            &mut supervisor_effects,
+        );
+        let Some(SupervisorEffect::Admitted { child: key }) = supervisor_effects.pop() else {
+            unreachable!("a fresh child-key domain accommodates an in-memory child collection")
+        };
+        let replaced = children.insert(key, child);
+        debug_assert!(replaced.is_none());
     }
     if let Some(control) = &dynamic {
         root.with_observation_gate(|txn| {
             control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
         });
     }
-    let next_ordered_start = children.keys().next();
-    let (child_keys, incomplete_children) = index_children(&children);
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
         defaults: plan.defaults.clone(),
         intensity_policy: plan.intensity_policy(),
         intensity: IntensityState::default(),
         children,
-        child_keys,
-        incomplete_children,
+        supervisor,
+        supervisor_effects,
         restart_shutdown_retries: Vec::new(),
         events,
         disposal_events,
         deadlines: DeadlineQueue::default(),
         jitter: runtime::JitterRng::new(),
-        lifecycle: epoch.lifecycle(),
-        next_ordered_start,
         role,
         dynamic,
         pending_startup_removals: Vec::new(),
         ancestor_shutdown_seen: false,
         ancestor_abort_seen: false,
-        hard_forced: false,
-        ordered_stop_progressing: false,
-        ordered_stop_cursor: None,
-        ordered_stop_waiting: None,
-        #[cfg(test)]
-        ordered_stop_inspections: 0,
         completion: None,
+        finished: None,
         // Transfer last: every fallible setup expression above remains
         // covered by the pre-driver guard, and completed construction moves
         // the raw epoch directly into ScopeRuntime's synchronous epilogue.
@@ -764,16 +893,7 @@ async fn run_scope_incarnation(
     #[cfg(test)]
     scope.record_storage();
 
-    match scope.root.flavor {
-        ScopeFlavor::Ordered => scope.progress_startup(),
-        ScopeFlavor::Dynamic => {
-            let children: Vec<_> = scope.children.keys().collect();
-            for child in children {
-                scope.spawn_child(child);
-            }
-            scope.progress_startup();
-        }
-    }
+    scope.settle_supervisor();
 
     let mut signal = root.signal().watcher();
     let mut pending = Vec::new();
@@ -953,13 +1073,13 @@ async fn run_scope_incarnation(
         // Settlement is level-triggered from authoritative state after every
         // batch. Any transition that changes the startup aggregate therefore
         // gets the same recomputation point as terminal completion.
-        scope.progress_startup();
+        scope.settle_supervisor();
         // A removal response is also an observation edge: SPEC §6 promises
         // that a returned `Removed` has already been incorporated into the
         // startup aggregate. Finalization retains starting-phase obligations
         // until the recomputation above establishes that order.
         scope.publish_startup_removals();
-        if let Some(reason) = scope.finish_if_ready() {
+        if let Some(reason) = scope.finished.take() {
             let root_exit = scope.role.is_root().then(|| stop_reason_root_exit(&reason));
             // ScopeRuntime's synchronous epilogue clears dynamic state,
             // discharges child obligations and residency, and only then

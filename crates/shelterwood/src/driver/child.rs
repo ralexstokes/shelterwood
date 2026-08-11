@@ -165,9 +165,6 @@ pub(super) struct ChildRuntime {
     pub(super) restart_deadline: Option<DeadlineHandle>,
     pub(super) restart_shutdown_pending: Option<Epoch>,
     pub(super) active: Option<ActiveChild>,
-    pub(super) initial_ready: bool,
-    pub(super) initial: bool,
-    pub(super) spawned_once: bool,
 }
 
 pub(super) struct PendingTerminal {
@@ -210,26 +207,17 @@ impl ChildRuntime {
             restart_deadline: None,
             restart_shutdown_pending: None,
             active: None,
-            initial_ready: false,
-            initial: true,
-            spawned_once: false,
         }
     }
 
+    #[cfg(test)]
     pub(super) fn is_disposing(&self) -> bool {
         self.pending_terminal.is_some()
     }
 
+    #[cfg(test)]
     pub(super) fn is_terminal(&self) -> bool {
         matches!(self.slot.member.record().stage, MemberStage::Terminal(_))
-    }
-
-    /// Reports whether this child still counts against scope completeness:
-    /// it has not published a terminal stage, or its terminal disposal is
-    /// still outstanding. Every `incomplete_children` adjustment and the
-    /// `child_keys` index derivation consult exactly this predicate.
-    pub(super) fn is_incomplete(&self) -> bool {
-        !self.is_terminal() || self.is_disposing()
     }
 
     pub(super) fn terminalize(
@@ -286,9 +274,7 @@ enum SpawnBody {
 
 struct SpawnDispatch {
     body: SpawnBody,
-    declared_readiness: Readiness,
     construction_spent: bool,
-    scope_child: bool,
 }
 
 /// Latches have deliberately separate ownership:
@@ -303,11 +289,22 @@ struct SpawnLatches {
     abort: Latch,
     ready: CompletionGatedLatch,
     local_stop: Latch,
-    framework_abort: Latch,
-    framework_abort_ack: Latch,
+    framework_abort: Option<Latch>,
+    framework_abort_ack: Option<Latch>,
 }
 
 impl SpawnLatches {
+    fn new(scope_child: bool) -> Self {
+        Self {
+            shutdown: Latch::default(),
+            abort: Latch::default(),
+            ready: CompletionGatedLatch::default(),
+            local_stop: Latch::default(),
+            framework_abort: scope_child.then(Latch::default),
+            framework_abort_ack: scope_child.then(Latch::default),
+        }
+    }
+
     fn task_context(&self) -> TaskContextLatches {
         TaskContextLatches {
             shutdown: self.shutdown.clone(),
@@ -321,8 +318,14 @@ impl SpawnLatches {
             parent_ready: self.ready.clone(),
             ancestor: AncestorCommandLatches {
                 shutdown: self.shutdown.clone(),
-                abort: self.framework_abort.clone(),
-                abort_ack: self.framework_abort_ack.clone(),
+                abort: self
+                    .framework_abort
+                    .clone()
+                    .expect("scope incarnations own a framework-abort latch"),
+                abort_ack: self
+                    .framework_abort_ack
+                    .clone()
+                    .expect("scope incarnations own a framework-abort acknowledgement"),
             },
         }
     }
@@ -369,9 +372,7 @@ fn dispatch_child_construction(
                     },
                     readiness: child.options.readiness,
                 },
-                declared_readiness: child.options.readiness,
                 construction_spent,
-                scope_child: false,
             }
         }
         ChildConstruction::Task(definition) => SpawnDispatch {
@@ -379,18 +380,14 @@ fn dispatch_child_construction(
                 factory: Arc::clone(&definition.factory),
                 context: TaskContext::new(id, incarnation, latches.task_context()),
             },
-            declared_readiness: child.options.readiness,
             construction_spent: false,
-            scope_child: false,
         },
         ChildConstruction::TaskOnce(definition) => SpawnDispatch {
             body: SpawnBody::TaskOnce {
                 body: definition.take_body(),
                 context: TaskContext::new(id, incarnation, latches.task_context()),
             },
-            declared_readiness: child.options.readiness,
             construction_spent: true,
-            scope_child: false,
         },
         ChildConstruction::Scope(definition) => {
             let inherited = match definition.defaults {
@@ -429,9 +426,7 @@ fn dispatch_child_construction(
             };
             SpawnDispatch {
                 body,
-                declared_readiness: child.options.readiness,
                 construction_spent,
-                scope_child: true,
             }
         }
     }
@@ -549,30 +544,57 @@ impl ScopeRuntime {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
-        let changed = self.children[key].terminalize(&self.root, exit, exited_incarnation, startup);
+        // Production terminal publication follows joined construction
+        // disposal.  A few structural test/fallback paths synthesize that
+        // already-joined boundary directly, so normalize them through the
+        // same reducer predecessor instead of allowing `Terminalized` to
+        // skip arbitrary incarnation states.
+        if !self.supervisor.is_disposing(key) && !self.supervisor.membership_terminal(key) {
+            self.reduce(SupervisorEvent::DisposalStarted { child: key });
+        }
+        let changed = self
+            .children
+            .get_mut(key)
+            .expect("terminalized child remains registered")
+            .terminalize(&self.root, exit, exited_incarnation, startup);
+        self.reduce(SupervisorEvent::Terminalized { child: key });
+        // The reducer drops an event whose predecessor never ran, which keeps
+        // `step` total but leaves the shell no return channel. A child that
+        // published terminality without reaching `Joined` would never count
+        // toward completion, so the scope would simply never finish. Assert
+        // the transition landed rather than discovering it as a stall.
         debug_assert!(
-            !self.children[key].is_incomplete(),
-            "terminal completion leaves no disposal outstanding"
+            self.supervisor.joined(key),
+            "terminal publication must leave the reducer's membership joined"
         );
-        self.incomplete_children = self
-            .incomplete_children
-            .checked_sub(1)
-            .expect("a child completes terminality exactly once");
         changed
     }
 
     pub(super) fn spawn_child(&mut self, key: ChildKey) {
+        // A queued start effect can outlive the synchronous removal latch
+        // that it was computed against. Re-sample that source at the single
+        // construction funnel so initial and freshly admitted children obey
+        // the same execution-time suppression rule as restart deadlines.
+        // Scope-stop sources remain owned by their ordered control event; this
+        // gate is the membership-local rule from SPEC §7.
+        if self.removal_latched(key) {
+            self.reduce(SupervisorEvent::RemovalSampled { child: key });
+            return;
+        }
         let Some(child) = self.children.get(key) else {
             return;
         };
-        if self.lifecycle.is_draining()
+        if self.supervisor.lifecycle().is_draining()
             || child.active.is_some()
-            || child.is_terminal()
-            || child.is_disposing()
+            || self.supervisor.membership_terminal(key)
+            || self.supervisor.is_disposing(key)
         {
             return;
         }
-        let child = &mut self.children[key];
+        let child = self
+            .children
+            .get_mut(key)
+            .expect("the spawnable child remains registered");
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);
         }
@@ -583,12 +605,14 @@ impl ScopeRuntime {
                 .record()
                 .last_exit
                 .unwrap_or_else(Exit::never_started);
-            let startup =
-                if child.initial && !self.lifecycle.startup_complete() && !child.initial_ready {
-                    StartupDisposition::Aborted
-                } else {
-                    StartupDisposition::NotAborted
-                };
+            let startup = if self.supervisor.is_initial(key)
+                && !self.supervisor.lifecycle().startup_complete()
+                && !self.supervisor.initial_ready(key)
+            {
+                StartupDisposition::Aborted
+            } else {
+                StartupDisposition::NotAborted
+            };
             // Exhaustion is a terminal outcome, not an exceptional cleanup
             // path. Join retained-definition disposal before terminality,
             // retention, removal completion, or ordered-scope progression.
@@ -603,22 +627,13 @@ impl ScopeRuntime {
         //   exits first and orders late retained readiness capabilities;
         // - framework_abort/ack join nested-scope escalation before exit.
         // Each edge is level-triggered, so helper startup cannot lose a pulse.
-        let latches = SpawnLatches {
-            shutdown: Latch::default(),
-            abort: Latch::default(),
-            ready: CompletionGatedLatch::default(),
-            local_stop: Latch::default(),
-            framework_abort: Latch::default(),
-            framework_abort_ack: Latch::default(),
-        };
+        let scope_child = matches!(child.construction.get_mut(), ChildConstruction::Scope(_));
+        let latches = SpawnLatches::new(scope_child);
         let SpawnDispatch {
             body,
-            declared_readiness,
             construction_spent,
-            scope_child,
         } = dispatch_child_construction(child, &self.root, &self.defaults, incarnation, &latches);
         let now = runtime::now();
-        child.spawned_once = true;
         if let Some(mailbox) = &child.mailbox {
             #[cfg(debug_assertions)]
             debug_assert!(
@@ -643,7 +658,7 @@ impl ScopeRuntime {
             .readiness_deadline()
             .and_then(|duration| Deadline::after(now, duration).instant());
         let readiness_effect = readiness.step(ReadinessEvent::Configure {
-            readiness: declared_readiness,
+            readiness: child.options.readiness,
             deadline,
         });
         let gated = readiness.needs_signal_watch();
@@ -678,10 +693,11 @@ impl ScopeRuntime {
             readiness,
             readiness_deadline: None,
             ready_signal: latches.ready,
-            framework_abort: scope_child.then_some(latches.framework_abort),
-            framework_abort_ack: scope_child.then_some(latches.framework_abort_ack),
+            framework_abort: latches.framework_abort,
+            framework_abort_ack: latches.framework_abort_ack,
             stop_deadline: None,
         });
+        self.reduce(SupervisorEvent::Spawned { child: key });
         if let Some(effect) = readiness_effect {
             // `progress_startup` already owns this ordered-startup loop. Do
             // not re-enter it synchronously for an immediate child.
@@ -692,19 +708,37 @@ impl ScopeRuntime {
     }
 
     pub(super) fn begin_stop_child(&mut self, key: ChildKey, forced: Option<RecordedOutcome>) {
-        let Some(child) = self.children.get_mut(key) else {
+        let Some(child) = self.children.get(key) else {
             return;
         };
-        if child.is_terminal() || child.is_disposing() {
+        if self.supervisor.membership_terminal(key) || self.supervisor.is_disposing(key) {
             return;
         }
-        if let Some(active) = &mut child.active {
-            if active.ladder.is_some() {
-                if forced.is_some() {
-                    active.forced_outcome = forced;
-                }
-                return;
+        if child
+            .active
+            .as_ref()
+            .is_some_and(|active| active.ladder.is_some())
+        {
+            if let Some(active) = self
+                .children
+                .get_mut(key)
+                .and_then(|child| child.active.as_mut())
+                && forced.is_some()
+            {
+                active.forced_outcome = forced;
             }
+            return;
+        }
+        if child.active.is_some() {
+            self.reduce(SupervisorEvent::StopStarted { child: key });
+            let child = self
+                .children
+                .get_mut(key)
+                .expect("the stopped child remains registered");
+            let active = child
+                .active
+                .as_mut()
+                .expect("the stopped child remains active");
             self.root
                 .transition_child_stage(&child.slot.member, MemberTransition::Stopping, None);
             if let Some(mailbox) = &child.mailbox {
@@ -724,6 +758,10 @@ impl ScopeRuntime {
             });
             self.advance_ladder(key, runtime::now());
         } else {
+            let child = self
+                .children
+                .get_mut(key)
+                .expect("the inactive child remains registered");
             if let Some(deadline) = child.restart_deadline.take() {
                 self.deadlines.cancel(deadline);
             }
@@ -880,6 +918,7 @@ impl ScopeRuntime {
             },
             self.intensity_policy.within(),
         );
+        self.reduce(SupervisorEvent::IncarnationComplete { child: key });
 
         // Fused cancellation is a level-triggered source. It can linearize
         // before the forwarded Removal event or its public status projection
@@ -890,7 +929,7 @@ impl ScopeRuntime {
         // not turn this exit Terminal, or a restartable initial child
         // failing pre-ready would publish `StartupFailed` where the stop's
         // own follow-up event owns the verdict. The broader
-        // `restart_is_suppressed` still gates the restart deadline arm,
+        // `construction_is_suppressed` still gates the restart deadline arm,
         // where every suppression source has a guaranteed follow-up event.
         let membership_status = self.dispatch_membership_status(key);
         let child = self
@@ -898,7 +937,7 @@ impl ScopeRuntime {
             .get_mut(key)
             .expect("the exiting child remains registered");
 
-        let mode = if self.lifecycle.is_draining() {
+        let mode = if self.supervisor.lifecycle().is_draining() {
             ScopeMode::Draining
         } else {
             ScopeMode::Running
@@ -909,9 +948,9 @@ impl ScopeRuntime {
                 // membership failed before its *initial* readiness edge. A
                 // later incarnation stopped pre-ready (e.g. during drain)
                 // does not rewind it.
-                let startup = if child.initial
-                    && !self.lifecycle.startup_complete()
-                    && !child.initial_ready
+                let startup = if self.supervisor.is_initial(key)
+                    && !self.supervisor.lifecycle().startup_complete()
+                    && !self.supervisor.initial_ready(key)
                 {
                     StartupDisposition::Aborted
                 } else {
@@ -920,9 +959,6 @@ impl ScopeRuntime {
                 self.begin_terminal_disposal(key, exit, Some(incarnation), startup);
             }
             ExitDispatch::ScheduleRestart => {
-                if !self.lifecycle.startup_complete() {
-                    child.initial_ready = false;
-                }
                 let sample =
                     JitterSample::from_u64_ratio(self.jitter.sample(0..u64::MAX), u64::MAX);
                 let now = runtime::now();
@@ -958,21 +994,25 @@ impl ScopeRuntime {
                         delay: decision.delay(),
                     },
                 );
-                if let Some(trip) = decision.intensity_trip(self.intensity_policy) {
-                    if self.lifecycle.is_starting() {
+                let trip = decision.intensity_trip(self.intensity_policy);
+                if trip.is_none()
+                    && let Some(restart_at) = decision.restart_at()
+                {
+                    child.restart_deadline = Some(
+                        self.deadlines
+                            .push(restart_at, DeadlineKind::Restart { child: key }),
+                    );
+                }
+                let startup_pending = self.supervisor.lifecycle().is_starting();
+                self.reduce(SupervisorEvent::RestartPending { child: key });
+                if let Some(trip) = trip {
+                    if startup_pending {
                         self.begin_drain_with_startup(
                             StopReason::IntensityTripped(trip.clone()),
                             Err(StartupError::IntensityTripped(trip)),
                         );
                     } else {
                         self.begin_drain(StopReason::IntensityTripped(trip));
-                    }
-                } else {
-                    if let Some(restart_at) = decision.restart_at() {
-                        child.restart_deadline = Some(
-                            self.deadlines
-                                .push(restart_at, DeadlineKind::Restart { child: key }),
-                        );
                     }
                 }
             }
@@ -1003,6 +1043,20 @@ impl ScopeRuntime {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) {
+        if !self.supervisor.contains(key)
+            || self.supervisor.is_disposing(key)
+            || self.supervisor.membership_terminal(key)
+        {
+            return;
+        }
+        self.reduce(SupervisorEvent::DisposalStarted { child: key });
+        // Same reasoning as `terminalize_child`: a dropped `DisposalStarted`
+        // would make the later `Terminalized` unreachable too, stranding the
+        // membership short of `Joined` with no loud failure.
+        debug_assert!(
+            self.supervisor.is_disposing(key),
+            "terminal disposal must leave the reducer's incarnation disposing"
+        );
         let construction = {
             let Some(child) = self.children.get_mut(key) else {
                 return;
@@ -1023,7 +1077,7 @@ impl ScopeRuntime {
             return;
         };
 
-        if self.hard_forced {
+        if self.supervisor.hard_forced() {
             runtime::dispose_detached(construction);
             self.handle_construction_disposed(key, None);
             return;
@@ -1082,19 +1136,18 @@ impl ScopeRuntime {
             StartupDisposition::NotAborted
         };
         self.terminalize_child(key, exit.clone(), terminal.exited_incarnation, startup);
-        if self.dynamic_membership_is_removing(key) {
-            self.finalize_removal(key);
-        } else if terminal.startup == StartupDisposition::Aborted && !self.lifecycle.is_draining() {
+        if self.supervisor.membership_status(key) == MembershipStatus::Removing {
+            self.flush_supervisor_effects();
+        } else if terminal.startup == StartupDisposition::Aborted
+            && !self.supervisor.lifecycle().is_draining()
+        {
             self.fail_startup(key, exit);
-            if self.children[key].options.retention == crate::Retention::Remove {
+            if self.children[&key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
             }
         } else {
-            if self.children[key].options.retention == crate::Retention::Remove {
+            if self.children[&key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
-            }
-            if self.lifecycle.is_draining() {
-                self.stop_next_ordered();
             }
         }
     }

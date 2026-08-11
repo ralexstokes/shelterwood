@@ -1,5 +1,7 @@
 pub(super) use std::{
+    collections::BTreeMap,
     future::{self, Future},
+    ops::{Index, IndexMut},
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     sync::{
@@ -16,7 +18,10 @@ pub(super) use crate::{
     MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ReserveError,
     RestartCondition, RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind,
     StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
-    engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
+    engine::{
+        ChildKey, Effect as SupervisorEffect, Epoch, Event as SupervisorEvent, ScopeLifecycle,
+        StopLadder, SupervisorState, arbitrate, step as supervisor_step,
+    },
     exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
     mailbox::{MailboxCell, actor_ref_from_parts},
@@ -26,15 +31,68 @@ pub(super) use crate::{
 };
 
 pub(super) use super::super::{
-    AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, ChildTerminality,
+    AncestorCommandLatches, ChildEvent, ChildResources, ChildRuntime, ChildTerminality,
     DriverEvent, DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage,
     MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
     ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard, ScopeFlavor,
     ScopeRole, ScopeRuntime, StartupDisposition, cancel_dynamic_reservation,
-    discharge_child_terminality, index_children, report_slot, reserve_dynamic, resident_projection,
+    discharge_child_terminality, report_slot, reserve_dynamic, resident_projection,
     restart_shutdown_work, run_nested_factory, run_nested_tree, run_scope_incarnation,
     storage::Obligation,
 };
+
+pub(super) struct ChildArena<T> {
+    children: BTreeMap<ChildKey, T>,
+    next: u64,
+}
+
+impl<T> Default for ChildArena<T> {
+    fn default() -> Self {
+        Self {
+            children: BTreeMap::new(),
+            next: 0,
+        }
+    }
+}
+
+impl<T> ChildArena<T> {
+    pub(super) fn insert(&mut self, child: T) -> Result<ChildKey, Box<T>> {
+        self.next += 1;
+        let key = ChildKey::fixture(self.next);
+        self.children.insert(key, child);
+        Ok(key)
+    }
+
+    pub(super) fn keys(&self) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
+        self.children.keys().copied()
+    }
+
+    pub(super) fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.children.values_mut()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (ChildKey, &T)> {
+        self.children.iter().map(|(key, child)| (*key, child))
+    }
+
+    fn into_iter(self) -> impl Iterator<Item = (ChildKey, T)> {
+        self.children.into_iter()
+    }
+}
+
+impl<T> Index<ChildKey> for ChildArena<T> {
+    type Output = T;
+
+    fn index(&self, key: ChildKey) -> &Self::Output {
+        &self.children[&key]
+    }
+}
+
+impl<T> IndexMut<ChildKey> for ChildArena<T> {
+    fn index_mut(&mut self, key: ChildKey) -> &mut Self::Output {
+        self.children.get_mut(&key).expect("fixture child key")
+    }
+}
 
 pub(super) struct ScopeRuntimeBuilder {
     root: Arc<ScopeCell>,
@@ -45,7 +103,7 @@ pub(super) struct ScopeRuntimeBuilder {
     intensity_policy: Intensity,
     children: ChildArena<ChildRuntime>,
     lifecycle: ScopeLifecycle,
-    next_ordered_start: Option<ChildKey>,
+    next_ordered_start: Option<Option<ChildKey>>,
     dynamic: Option<Arc<DynamicControl>>,
     hard_forced: bool,
 }
@@ -93,7 +151,7 @@ impl ScopeRuntimeBuilder {
     }
 
     pub(super) fn with_next_ordered_start(mut self, next: Option<ChildKey>) -> Self {
-        self.next_ordered_start = next;
+        self.next_ordered_start = Some(next);
         self
     }
 
@@ -108,34 +166,51 @@ impl ScopeRuntimeBuilder {
     }
 
     pub(super) fn build(self) -> ScopeRuntime {
-        let (child_keys, incomplete_children) = index_children(&self.children);
+        let mut supervisor = SupervisorState::new(self.root.flavor, self.lifecycle);
+        let mut supervisor_effects = Vec::new();
+        let mut children = ChildResources::default();
+        for (expected, child) in self.children.into_iter() {
+            supervisor_step(
+                &mut supervisor,
+                SupervisorEvent::Admit {
+                    membership: child.slot.member.membership(),
+                    initial: true,
+                    start_immediately: false,
+                },
+                &mut supervisor_effects,
+            );
+            let Some(SupervisorEffect::Admitted { child: actual }) = supervisor_effects.pop()
+            else {
+                panic!("fixture admission produces one key")
+            };
+            assert_eq!(actual, expected);
+            children.insert(actual, child);
+        }
+        if let Some(next) = self.next_ordered_start {
+            supervisor.set_next_ordered_start_for_test(next);
+        }
+        supervisor.set_hard_forced_for_test(self.hard_forced);
         ScopeRuntime {
             root: self.root,
             defaults: self.defaults,
             intensity_policy: self.intensity_policy,
             intensity: super::super::IntensityState::default(),
-            child_keys,
-            incomplete_children,
             restart_shutdown_retries: Vec::new(),
-            children: self.children,
+            children,
+            supervisor,
+            supervisor_effects,
             events: self.events,
             disposal_events: self.disposal_events,
             deadlines: super::super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::new(),
-            lifecycle: self.lifecycle,
-            next_ordered_start: self.next_ordered_start,
             role: ScopeRole::Root,
             dynamic: self.dynamic,
             pending_startup_removals: Vec::new(),
             epoch: self.epoch,
             ancestor_shutdown_seen: false,
             ancestor_abort_seen: false,
-            hard_forced: self.hard_forced,
-            ordered_stop_progressing: false,
-            ordered_stop_cursor: None,
-            ordered_stop_waiting: None,
-            ordered_stop_inspections: 0,
             completion: None,
+            finished: None,
         }
     }
 }

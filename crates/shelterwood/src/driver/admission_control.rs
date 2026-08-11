@@ -62,10 +62,11 @@ pub(super) struct DynamicEntry {
     pub(super) removal: Obligation<RemovalResponses>,
 }
 
-// The authoritative dynamic control-plane phase. `MemberRecord::membership_status`
-// is only its public observation projection; driver decisions use this enum.
-// A resident owns its arena key, so removal and restart paths never have to
-// rediscover the corresponding `ChildRuntime` with a linear scan.
+// Synchronous reservation transport and removal-latch state. Once admitted,
+// `SupervisorState` is the driver's authority; this phase is sampled at step
+// entry so callers can latch removal under the observation gate without
+// mutating reducer state behind its back. A resident retains its reducer key
+// so the sample never needs a linear runtime-resource scan.
 enum DynamicMembershipState {
     Reserved,
     Resident {
@@ -155,14 +156,13 @@ impl DynamicEntry {
         Some(key)
     }
 
-    pub(super) fn restart_is_suppressed(&self, key: ChildKey) -> bool {
+    pub(super) fn removal_latched(&self) -> bool {
         match &self.state {
             DynamicMembershipState::Reserved => false,
-            DynamicMembershipState::Resident {
-                key: resident,
-                fused_cancel,
-            } => *resident == key && fused_cancel.as_ref().is_some_and(Latch::is_fired),
-            DynamicMembershipState::Removing { key: removing } => *removing == key,
+            DynamicMembershipState::Resident { fused_cancel, .. } => {
+                fused_cancel.as_ref().is_some_and(Latch::is_fired)
+            }
+            DynamicMembershipState::Removing { .. } => true,
         }
     }
 }
@@ -464,10 +464,7 @@ fn signal_fused_cancel_impl(
             .entry_mut(slot.member.id())
             .filter(|entry| entry.slot.member.membership() == slot.member.membership())
             .and_then(|entry| entry.mark_removing(txn))
-            .map(|key| RemovalRequest {
-                membership: slot.member.membership(),
-                key,
-            })
+            .map(|key| RemovalRequest { key })
     };
     if let Some(removal) = removal {
         scope.set_child_removing_locked(&slot.member, txn);
@@ -520,10 +517,7 @@ fn remove_dynamic_impl(
     // through the normal removal path, like live residents, so that
     // registration is reclaimed before the removal response completes.
     let member = Arc::clone(&entry.slot.member);
-    let membership = member.membership();
-    let removal = entry
-        .mark_removing(txn)
-        .map(|key| RemovalRequest { membership, key });
+    let removal = entry.mark_removing(txn).map(|key| RemovalRequest { key });
     drop(state);
     if let Some(removal) = removal {
         // Projection first, then the deferred request: the same order the

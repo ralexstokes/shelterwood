@@ -59,7 +59,7 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
         false,
     );
     assert!(matches!(
-        scope.lifecycle.draining_reason(),
+        scope.supervisor.lifecycle().draining_reason(),
         Some(StopReason::IntensityTripped(_))
     ));
 
@@ -68,7 +68,7 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
     assert!(root.take_shutdown_request(scope.epoch));
     scope.begin_drain(StopReason::ShutdownRequested);
     assert_eq!(
-        scope.lifecycle.draining_reason(),
+        scope.supervisor.lifecycle().draining_reason(),
         Some(&StopReason::ShutdownRequested)
     );
 }
@@ -128,7 +128,7 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
         false,
     );
     assert!(matches!(
-        scope.lifecycle.draining_reason(),
+        scope.supervisor.lifecycle().draining_reason(),
         Some(StopReason::IntensityTripped(_))
     ));
 
@@ -137,7 +137,7 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
     // shutdown request having upgraded the reason first.
     scope.force_all();
     assert_eq!(
-        scope.lifecycle.draining_reason(),
+        scope.supervisor.lifecycle().draining_reason(),
         Some(&StopReason::ShutdownRequested)
     );
     assert_eq!(
@@ -304,15 +304,15 @@ fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
     scope.begin_drain(StopReason::ShutdownRequested);
 
     assert!(scope.children.values().all(ChildRuntime::is_terminal));
-    assert!(!scope.ordered_stop_progressing);
-    assert_eq!(scope.ordered_stop_waiting, None);
+    assert_eq!(scope.supervisor.ordered_stop_waiting(), None);
     assert_eq!(
-        scope.ordered_stop_inspections, CHILDREN,
+        scope.supervisor.ordered_stop_inspections(),
+        CHILDREN,
         "the reverse cursor inspects each ordered child exactly once"
     );
-    assert_eq!(
-        scope.incomplete_children, 0,
-        "terminal completion decrements the incremental count exactly once"
+    assert!(
+        scope.supervisor.all_children_joined(),
+        "completion is derived from authoritative child states"
     );
     assert_eq!(
         scope.finish_if_ready(),

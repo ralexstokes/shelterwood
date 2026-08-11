@@ -155,7 +155,32 @@ impl Actor for BatchTraceActor {
     }
 }
 
-async fn assert_batch_trace(fire_timer: bool, expected: &[&str]) {
+fn assert_subsequence(trace: &[&str], expected: &[&str]) {
+    let mut cursor = 0;
+    for entry in trace {
+        if expected.get(cursor).is_some_and(|next| next == entry) {
+            cursor += 1;
+        }
+    }
+    assert_eq!(
+        cursor,
+        expected.len(),
+        "missing ordered subsequence {expected:?} in {trace:?}"
+    );
+}
+
+fn assert_exact_entries(trace: &[&str], expected: &[&str]) {
+    assert_eq!(trace.len(), expected.len());
+    for entry in expected {
+        assert_eq!(
+            trace.iter().filter(|observed| observed == &entry).count(),
+            1,
+            "expected one {entry:?} entry in {trace:?}"
+        );
+    }
+}
+
+async fn assert_batch_trace(fire_timer: bool) {
     let gate = ReleaseGate::default();
     let log = Arc::new(Mutex::new(Vec::new()));
     let mut tree = Tree::new();
@@ -177,38 +202,62 @@ async fn assert_batch_trace(fire_timer: bool, expected: &[&str]) {
     gate.release();
 
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    assert_eq!(log.lock().expect("log mutex poisoned").as_slice(), expected);
+    let trace = log.lock().expect("log mutex poisoned");
+    let expected = if fire_timer {
+        &[
+            "start",
+            "continuation-1",
+            "continuation-2",
+            "mailbox",
+            "offload",
+            "timer",
+        ][..]
+    } else {
+        &[
+            "start",
+            "continuation-1",
+            "continuation-2",
+            "mailbox",
+            "offload",
+        ][..]
+    };
+    assert_exact_entries(&trace, expected);
+    // SPEC preserves FIFO within each source and the causal start edge, but
+    // intentionally does not order mailbox delivery against offload delivery.
+    assert_subsequence(&trace, &["start", "continuation-1", "continuation-2"]);
+    assert_subsequence(&trace, &["start", "mailbox"]);
+    assert_subsequence(&trace, &["start", "offload"]);
+    let first_continuation = trace
+        .iter()
+        .position(|entry| *entry == "continuation-1")
+        .expect("the first continuation is present");
+    let second_continuation = trace
+        .iter()
+        .position(|entry| *entry == "continuation-2")
+        .expect("the second continuation is present");
+    assert!(
+        trace[first_continuation + 1..second_continuation]
+            .iter()
+            .any(|entry| matches!(*entry, "mailbox" | "offload")),
+        "one ready external delivery gets the fairness turn between consecutive continuations: {trace:?}"
+    );
+    if fire_timer {
+        assert_eq!(
+            trace.last(),
+            Some(&"timer"),
+            "the fired timer follows every captured continuation, mailbox, and offload entry"
+        );
+    }
 }
 
 #[tokio::test]
 async fn steady_state_uses_the_shared_bounded_batch_trace() {
-    assert_batch_trace(
-        false,
-        &[
-            "start",
-            "continuation-1",
-            "mailbox",
-            "continuation-2",
-            "offload",
-        ],
-    )
-    .await;
+    assert_batch_trace(false).await;
 }
 
 #[tokio::test]
 async fn due_timer_promotes_the_steady_batch_without_changing_source_priority() {
-    assert_batch_trace(
-        true,
-        &[
-            "start",
-            "continuation-1",
-            "mailbox",
-            "continuation-2",
-            "offload",
-            "timer",
-        ],
-    )
-    .await;
+    assert_batch_trace(true).await;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -290,10 +339,9 @@ async fn continuation_queued_by_external_handler_leads_remaining_steady_batch_wo
         .expect("actor accepts start");
 
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    assert_eq!(
-        *log.lock().expect("log mutex poisoned"),
-        ["start", "offload-1", "continuation", "offload-2"]
-    );
+    let trace = log.lock().expect("log mutex poisoned");
+    assert_exact_entries(&trace, &["start", "offload-1", "offload-2", "continuation"]);
+    assert_subsequence(&trace, &["start", "offload-1", "continuation", "offload-2"]);
 }
 
 #[derive(Clone, Copy, Debug)]

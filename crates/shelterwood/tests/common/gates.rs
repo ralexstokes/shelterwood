@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Condvar, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use tokio::sync::Semaphore;
@@ -105,14 +108,32 @@ pub(crate) struct DestructorBlocker(Arc<(Mutex<DestructorState>, Condvar)>);
 
 impl Drop for DestructorBlocker {
     fn drop(&mut self) {
+        // A stuck-test backstop, not an assertion: well above any legitimate
+        // wait (POLL_TIMEOUT and every gate driven by it) so a passing test
+        // can never reach it.
+        const MAX_BLOCK: Duration = Duration::from_secs(30);
+
         let (state, changed) = &*self.0;
         let mut state = state.lock().expect("destructor gate mutex poisoned");
         state.entered = true;
         changed.notify_all();
+        let deadline = Instant::now() + MAX_BLOCK;
         while !state.released {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                // This destructor also runs while other panics unwind, where
+                // a nested panic aborts with no diagnostic at all. Report and
+                // abort deliberately instead.
+                eprintln!("destructor gate was not released within {MAX_BLOCK:?}");
+                if std::thread::panicking() {
+                    std::process::abort();
+                }
+                panic!("destructor gate was not released within {MAX_BLOCK:?}");
+            }
             state = changed
-                .wait(state)
-                .expect("destructor gate mutex poisoned while blocking");
+                .wait_timeout(state, remaining)
+                .expect("destructor gate mutex poisoned while blocking")
+                .0;
         }
     }
 }

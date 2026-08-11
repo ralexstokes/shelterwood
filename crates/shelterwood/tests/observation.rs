@@ -1187,6 +1187,60 @@ async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_va
 }
 
 #[tokio::test(start_paused = true)]
+async fn cloned_snapshot_receivers_observe_independently_and_inherit_the_seen_generation() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+    let mut original = scope.subscribe_snapshots();
+    let mut peer = original.clone();
+
+    let task = scope
+        .add_task("worker", waiting_task())
+        .await
+        .expect("worker is admitted");
+    scope
+        .wait_for_child(
+            "worker",
+            |child| matches!(child.state, ChildState::Running),
+            POLL_TIMEOUT,
+        )
+        .await
+        .expect("worker starts");
+    let from_original = original.changed().await.expect("original observes update");
+    let from_peer = peer
+        .changed()
+        .await
+        .expect("clone independently observes update");
+    assert_eq!(from_original, from_peer);
+    assert_eq!(
+        from_original.child("worker").unwrap().membership,
+        task.membership()
+    );
+
+    let mut inherited = original.clone();
+    let mut no_replay = Box::pin(inherited.changed());
+    assert_quiet(Duration::from_secs(1), || {
+        poll_once(no_replay.as_mut()).is_ready()
+    })
+    .await;
+    drop(no_replay);
+
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    let removed_from_original = original.changed().await.expect("original observes removal");
+    let removed_from_inherited = inherited
+        .changed()
+        .await
+        .expect("post-observation clone independently observes removal");
+    assert_eq!(removed_from_original, removed_from_inherited);
+    assert!(removed_from_original.child("worker").is_none());
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test(start_paused = true)]
 async fn lifecycle_subscriptions_start_now_without_replaying_prior_history() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");

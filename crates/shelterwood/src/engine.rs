@@ -62,6 +62,10 @@ pub(crate) enum ArbitrationClass {
 }
 
 pub(crate) fn arbitrate<T>(events: &mut [(ArbitrationClass, T)]) {
+    // Priority is deterministic across classes, and input order is FIFO
+    // within one class. Callers build the slice in observation order, so a
+    // stable sort is part of the driver contract rather than an incidental
+    // implementation choice.
     events.sort_by_key(|(class, _)| *class);
 }
 
@@ -1011,17 +1015,51 @@ mod tests {
             ReadinessSignal, ScopeShutdown, StopDeadline,
         };
         let mut events = [
-            (StopDeadline, 6),
+            (StopDeadline, 8),
             (ChildExit, 2),
-            (ReadinessDeadline, 4),
+            (ReadinessDeadline, 6),
+            (ChildExit, 3),
             (ScopeShutdown, 0),
-            (Admission, 7),
-            (BackoffDue, 5),
+            (Admission, 9),
+            (BackoffDue, 7),
             (MembershipRemoval, 1),
-            (ReadinessSignal, 3),
+            (ReadinessSignal, 4),
+            (ReadinessSignal, 5),
         ];
         arbitrate(&mut events);
-        assert_eq!(events.map(|(_, value)| value), [0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(
+            events.map(|(_, value)| value),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            "same-class events retain their observation order"
+        );
+
+        // Keep this well above any small-sort threshold: the compact fixture
+        // above documents every class, but an unstable insertion sort can
+        // preserve a couple of duplicate pairs by accident. Every class is
+        // duplicated many times here so the fixture's discriminating power
+        // against a `sort_unstable_by_key` mutant does not rest on one
+        // toolchain's threshold or pivot choice.
+        const CLASSES: [ArbitrationClass; 8] = [
+            ScopeShutdown,
+            MembershipRemoval,
+            ChildExit,
+            ReadinessSignal,
+            ReadinessDeadline,
+            BackoffDue,
+            StopDeadline,
+            Admission,
+        ];
+        const PRESSURE: usize = 256;
+        let mut same_class_pressure: [(ArbitrationClass, usize); PRESSURE] =
+            std::array::from_fn(|index| (CLASSES[index % CLASSES.len()], index));
+        arbitrate(&mut same_class_pressure);
+        assert_eq!(
+            same_class_pressure.map(|(_, value)| value).as_slice(),
+            (0..CLASSES.len())
+                .flat_map(|rank| (rank..PRESSURE).step_by(CLASSES.len()))
+                .collect::<Vec<_>>(),
+            "larger same-class batches retain FIFO rather than unstable-sort order"
+        );
     }
 
     #[test]

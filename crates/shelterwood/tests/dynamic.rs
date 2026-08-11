@@ -102,6 +102,21 @@ impl RawActor for WaitingRaw {
     }
 }
 
+struct ManualWaitingRaw;
+
+impl RawActor for ManualWaitingRaw {
+    type Msg = ();
+
+    fn readiness() -> Readiness {
+        Readiness::Manual
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        context.shutdown_token().cancelled().await;
+        Ok(())
+    }
+}
+
 struct SignalledWaitingRaw {
     started: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
@@ -292,6 +307,106 @@ async fn dynamic_actor_add_resolves_at_admission_without_awaiting_init() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
+}
+
+#[tokio::test]
+async fn task_raw_and_subtree_admissions_resolve_before_manual_startup() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+
+    let task = tokio::time::timeout(
+        POLL_TIMEOUT,
+        scope.add_task(
+            "gated-task",
+            TaskDef::new(|context| async move {
+                context.shutdown_token().cancelled().await;
+                Ok(())
+            })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .shutdown(Shutdown::Abort),
+        ),
+    )
+    .await
+    .expect("task admission does not await readiness")
+    .expect("task is admitted");
+    let raw = tokio::time::timeout(
+        POLL_TIMEOUT,
+        scope.add_raw_once(
+            "gated-raw",
+            RawOnceDef::new(ManualWaitingRaw).shutdown(Shutdown::Abort),
+        ),
+    )
+    .await
+    .expect("raw admission does not await readiness")
+    .expect("raw actor is admitted");
+
+    let mut gated_tree = Tree::new();
+    gated_tree
+        .add_task(
+            "manual-child",
+            TaskDef::new(|context| async move {
+                context.shutdown_token().cancelled().await;
+                Ok(())
+            })
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .shutdown(Shutdown::Abort),
+        )
+        .expect("valid gated child");
+    let subtree = tokio::time::timeout(
+        POLL_TIMEOUT,
+        scope.add_subtree_once(
+            "gated-subtree",
+            SubtreeOnceDef::new(gated_tree).shutdown(Shutdown::Abort),
+        ),
+    )
+    .await
+    .expect("subtree admission does not await aggregate readiness")
+    .expect("subtree is admitted");
+
+    for id in ["gated-task", "gated-raw", "gated-subtree"] {
+        assert!(
+            poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+                scope
+                    .child(id)
+                    .is_some_and(|child| matches!(child.state, ChildState::Starting))
+            })
+            .await,
+            "{id} remains admitted but startup-gated"
+        );
+    }
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
+    assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
+async fn successful_admission_is_fused_after_returning_its_handle() {
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+    let mut admission = Box::pin(scope.add_task("fused-success", waiting_task()));
+
+    let task = admission
+        .as_mut()
+        .await
+        .expect("successful admission returns the exact handle once");
+    assert!(
+        poll_once(admission.as_mut()).is_pending(),
+        "re-polling a successful Admission is fused rather than repeating its output"
+    );
+
+    assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
 }
 
 #[tokio::test]

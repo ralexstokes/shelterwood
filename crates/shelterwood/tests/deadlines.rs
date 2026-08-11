@@ -133,6 +133,52 @@ async fn prebind_overflow_timeouts_observe_the_bound_incarnation() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn maximum_mailbox_deadlines_are_unbounded_waits() {
+    let values = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "maximum-mailbox-deadlines",
+            RawOnceDef::new(boundary_actor(None, &values, &calls, false)),
+        )
+        .expect("valid actor");
+
+    let mut send = Box::pin(actor.send_timeout(Message::Value(1), Duration::MAX));
+    let mut call = Box::pin(actor.call(Message::Ask, Duration::MAX));
+    let (reply, receiver) = Reply::channel();
+    let mut receive = Box::pin(receiver.recv(Duration::MAX));
+    assert!(poll_once(send.as_mut()).is_pending());
+    assert!(poll_once(call.as_mut()).is_pending());
+    assert!(poll_once(receive.as_mut()).is_pending());
+
+    // Cross several of the runtime's bounded timer slices. `Duration::MAX`
+    // means no substitute deadline, so none of the three mailbox surfaces may
+    // resolve until its underlying operation does.
+    advance_time(Duration::from_secs(5 * 365 * 24 * 60 * 60)).await;
+    assert!(poll_once(send.as_mut()).is_pending());
+    assert!(poll_once(call.as_mut()).is_pending());
+    assert!(poll_once(receive.as_mut()).is_pending());
+
+    reply.send(9);
+    assert_eq!(receive.await, Ok(9));
+
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    let accepting = send.await.expect("unbounded send accepts after binding");
+    let response = call.await.expect("unbounded call completes after binding");
+    assert_eq!(response.value, 17);
+    assert_eq!(response.incarnation, accepting);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*values.lock().expect("values mutex poisoned"), [1]);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("actor stops");
+}
+
+#[tokio::test(start_paused = true)]
 async fn acceptance_winning_the_deadline_withdrawal_race_succeeds() {
     let gate = ReleaseGate::default();
     let values = Arc::new(Mutex::new(Vec::new()));

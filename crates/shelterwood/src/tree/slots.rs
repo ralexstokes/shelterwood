@@ -3,7 +3,7 @@ use std::{fmt, marker::PhantomData, sync::Arc};
 use crate::{
     ActorDef, ActorOnceDef, ActorRef,
     driver::DynamicReservation,
-    mailbox::MailboxCell,
+    mailbox::{MailboxCell, actor_ref_from_parts},
     plan::{ChildConstruction, SlotCell},
     raw::{RawDef, RawOnceDef},
     runtime,
@@ -115,7 +115,7 @@ impl<E: SlotEndpoint, M: Send + 'static> ActorSlotCore<E, M> {
     }
 
     fn actor_ref(&self) -> ActorRef<M> {
-        ActorRef::new(
+        actor_ref_from_parts(
             Arc::clone(&self.endpoint.slot().member),
             Arc::clone(&self.mailbox),
         )

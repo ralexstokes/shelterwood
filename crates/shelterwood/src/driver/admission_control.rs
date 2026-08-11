@@ -210,7 +210,7 @@ impl DynamicState {
     }
 }
 
-pub(crate) struct DynamicControl {
+pub(super) struct DynamicControl {
     requests: runtime::UnboundedMpscSender<DriverEvent>,
     pub(super) state: Mutex<DynamicState>,
 }

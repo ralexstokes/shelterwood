@@ -28,12 +28,12 @@ use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
 
 use crate::{
-    Cancellation, ChildId, Exit, GracePhase, Incarnation, IntensityTrip, JitterSample, Membership,
-    Readiness, ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    Cancellation, ChildId, Exit, GracePhase, Incarnation, JitterSample, Membership, Readiness,
+    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
-        MailboxControl, MemberStage, MemberTransition, ResidentProjection, ScopeCell,
-        ScopeControlEvent, StartupDisposition,
+        MemberStage, MemberTransition, ResidentProjection, ScopeCell, ScopeControlEvent,
+        StartupDisposition,
     },
     deadline::Deadline,
     engine::{
@@ -44,9 +44,11 @@ use crate::{
     },
     exit::{
         RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
-        reconcile_recorded_outcomes,
+        reconcile_recorded_outcomes, stop_reason_into_nested_result, stop_reason_root_exit,
+        structured_startup_failure_error,
     },
     identity::IncarnationCounter,
+    mailbox::MailboxControl,
     observe::LifecycleEventKind,
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
@@ -549,7 +551,7 @@ fn begin_nested_incarnation(scope: &Arc<ScopeCell>) -> Result<ScopeEpochGuard, c
             },
         };
         scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
-        crate::ExitError::from_startup_failure(failure)
+        structured_startup_failure_error(failure)
     })
 }
 
@@ -621,12 +623,12 @@ async fn run_nested_tree_with_epoch(
             };
             scope.set_startup(startup);
             epoch.finish(reason.clone());
-            return reason.into_nested_result();
+            return stop_reason_into_nested_result(reason);
         }
     };
-    run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch)
-        .await
-        .into_nested_result()
+    stop_reason_into_nested_result(
+        run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch).await,
+    )
 }
 
 async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
@@ -713,7 +715,7 @@ async fn run_scope_incarnation(
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
         defaults: plan.defaults.clone(),
-        intensity_policy: plan.config.intensity,
+        intensity_policy: plan.intensity_policy(),
         intensity: IntensityState::default(),
         children,
         child_keys,
@@ -862,7 +864,7 @@ async fn run_scope_incarnation(
                 },
                 &mut event_receiver,
                 dynamic_event_receiver.as_mut(),
-                scope.deadlines.next(),
+                scope.deadlines.next_deadline(),
             )
             .await
             {
@@ -958,7 +960,7 @@ async fn run_scope_incarnation(
         // until the recomputation above establishes that order.
         scope.publish_startup_removals();
         if let Some(reason) = scope.finish_if_ready() {
-            let root_exit = scope.role.is_root().then(|| reason.root_exit());
+            let root_exit = scope.role.is_root().then(|| stop_reason_root_exit(&reason));
             // ScopeRuntime's synchronous epilogue clears dynamic state,
             // discharges child obligations and residency, and only then
             // publishes the scope's terminal state.

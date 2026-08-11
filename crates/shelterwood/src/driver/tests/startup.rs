@@ -464,7 +464,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
     let next_ordered_start = children.keys().next();
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
         .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.config.intensity)
+        .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .with_next_ordered_start(next_ordered_start)
@@ -625,7 +625,7 @@ async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
     let next_ordered_start = children.keys().next();
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
         .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.config.intensity)
+        .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .with_next_ordered_start(next_ordered_start)
@@ -777,7 +777,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
         .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.config.intensity)
+        .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
         .with_next_ordered_start(Some(key))
         .build();

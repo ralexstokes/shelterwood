@@ -13,15 +13,14 @@
       src = ./.;
       # Repository docs and their packaged doctest copies are compared in the
       # clean build sandbox, so keep Markdown alongside Cargo sources; the
-      # enforcement scripts under tools/ run there too (.sh plus the .awk
-      # use parser), and nextest reads its timeout config.
+      # packaging/documentation scripts under tools/ run there too, and
+      # nextest reads its timeout config.
       extraSourceFilter =
         path: type:
         type == "regular"
         && (
           builtins.match ".*\\.md" (toString path) != null
           || builtins.match ".*\\.sh" (toString path) != null
-          || builtins.match ".*\\.awk" (toString path) != null
           || builtins.match ".*/\\.config/nextest\\.toml" (toString path) != null
         );
       extraChecks =
@@ -43,10 +42,13 @@
                   cargo rustdoc --locked -p shelterwood --all-features --lib
                 cargo run --locked -p shelterwood-api-reachability -- \
                   target/doc/shelterwood.json
-                ${pkgs.bash}/bin/bash ./tools/check-runtime-paths.sh
-                ${pkgs.bash}/bin/bash ./tools/check-exit-paths.sh
-                ${pkgs.bash}/bin/bash ./tools/check-layering-paths.sh
-                ${pkgs.bash}/bin/bash ./tools/check-enforcement-fixtures.sh
+                # Cross-crate re-exports are absent from the façade document,
+                # so every crate contributing public façade items is walked
+                # separately. See the justfile recipe for the full rationale.
+                RUSTDOCFLAGS="-Z unstable-options --output-format json" \
+                  cargo rustdoc --locked -p shelterwood-mailbox --all-features --lib
+                cargo run --locked -p shelterwood-api-reachability -- \
+                  target/doc/shelterwood_mailbox.json
                 ${pkgs.bash}/bin/bash ./tools/sync-packaged-docs.sh --check
                 ${pkgs.bash}/bin/bash ./tools/check-packaged-crate.sh
               '';

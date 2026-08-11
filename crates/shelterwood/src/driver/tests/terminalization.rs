@@ -384,7 +384,7 @@ fn stopped_publication_keeps_mailbox_panic_primary_and_finishes_observation() {
     };
     let mut events = handle.subscribe_lifecycle();
     let mailbox = MailboxCell::new(scope.member.id().clone());
-    let actor: ActorRef<u8> = ActorRef::new(Arc::clone(&scope.member), Arc::clone(&mailbox));
+    let actor: ActorRef<u8> = actor_ref_from_parts(Arc::clone(&scope.member), Arc::clone(&mailbox));
     scope.member.attach_mailbox(mailbox);
 
     let mailbox_payload_dropped = Arc::new(AtomicUsize::new(0));
@@ -460,7 +460,7 @@ fn panicking_mailbox_waker_cannot_skip_the_terminal_pulse() {
         identity.mint_membership(&id).expect("membership available"),
     );
     let mailbox = MailboxCell::new(member.id().clone());
-    let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+    let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
 
     let mut parked_send = Box::pin(actor.send(1));
@@ -514,7 +514,7 @@ fn mailbox_teardown_panic_precedes_a_terminal_pulse_panic() {
         identity.mint_membership(&id).expect("membership available"),
     );
     let mailbox = MailboxCell::new(member.id().clone());
-    let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+    let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
 
     let mut parked_send = Box::pin(actor.send(1));
@@ -672,7 +672,7 @@ fn terminality_signal_follows_mailbox_termination() {
         identity.mint_membership(&id).expect("membership available"),
     );
     let mailbox = MailboxCell::new(member.id().clone());
-    let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+    let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
 
     let probe = Arc::new(TrySendOnWake {
@@ -705,7 +705,7 @@ fn supervised_terminality_pulse_follows_mailbox_termination() {
     );
     root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
     let mailbox = MailboxCell::new(member.id().clone());
-    let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+    let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
 
     let mailbox_wakes = Arc::new(AtomicUsize::new(0));
@@ -769,7 +769,7 @@ fn supervised_mailbox_teardown_panic_precedes_terminal_pulse_panic() {
     );
     root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
     let mailbox = MailboxCell::new(member.id().clone());
-    let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+    let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
 
     let mailbox_payload_dropped = Arc::new(AtomicUsize::new(0));
@@ -840,7 +840,7 @@ fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent
         identity.mint_membership(&id).expect("membership available"),
     );
     let mailbox = MailboxCell::new(member.id().clone());
-    let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+    let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
     let first_exit = Exit::never_started();
     let probe = Arc::new(ObserveMemberOnMailboxWake {
@@ -881,7 +881,7 @@ fn attach_during_terminal_publication_finishes_record_before_mailbox_wake() {
         identity.mint_membership(&id).expect("membership available"),
     );
     let mailbox = MailboxCell::new(member.id().clone());
-    let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+    let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     let first_exit = Exit::never_started();
     member.stage_terminal_before_mailbox(first_exit.clone());
     let probe = Arc::new(ObserveMemberOnMailboxWake {

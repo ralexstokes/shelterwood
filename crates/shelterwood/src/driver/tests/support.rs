@@ -19,7 +19,7 @@ pub(super) use crate::{
     engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
     exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
-    mailbox::MailboxCell,
+    mailbox::{MailboxCell, actor_ref_from_parts},
     plan::{BuilderCore, ChildConstruction, SlotCell, resolve_fixture_options},
     policy::ResolvedDefaults,
     runtime::{CompletionGatedLatch, Latch},

@@ -21,10 +21,10 @@ use crate::{
 };
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ScopeConfig {
-    pub(crate) strategy: Strategy,
-    pub(crate) intensity: Intensity,
-    pub(crate) defaults: ScopeDefaults,
+struct ScopeConfig {
+    strategy: Strategy,
+    intensity: Intensity,
+    defaults: ScopeDefaults,
 }
 
 pub(crate) enum ChildConstruction {
@@ -73,7 +73,7 @@ enum DefinitionState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DefinitionAlreadyLowered;
+struct DefinitionAlreadyLowered;
 
 /// Stable declaration slot joining identity, observation, and owned construction.
 pub(crate) struct SlotCell {
@@ -129,7 +129,7 @@ impl SlotCell {
         )
     }
 
-    pub(crate) fn take_definition(
+    fn take_definition(
         &self,
     ) -> Result<Option<Isolated<ChildConstruction>>, DefinitionAlreadyLowered> {
         let mut state = self.definition.lock().expect("definition mutex poisoned");
@@ -237,9 +237,11 @@ impl SlotCell {
             // A raw definition resolved its effective mode at erasure, where
             // the actor type's `RawActor::readiness` metadata was still
             // nameable, so it arrives here as the kind default.
-            ChildConstruction::Raw(definition) => {
-                (&definition.options, definition.mode(), definition.readiness)
-            }
+            ChildConstruction::Raw(definition) => (
+                definition.options(),
+                definition.mode(),
+                definition.readiness(),
+            ),
             ChildConstruction::Task(definition) => (
                 &definition.options,
                 ChildMode::Restartable,
@@ -261,7 +263,7 @@ impl SlotCell {
 /// Erased declaration storage before inherited defaults and identities are lowered.
 pub(crate) struct BuilderCore {
     pub(crate) root: Arc<ScopeCell>,
-    pub(crate) config: ScopeConfig,
+    config: ScopeConfig,
     pub(crate) slots: Vec<Arc<SlotCell>>,
     ids: HashSet<ChildId>,
     /// The stable scope whose identity map `lower(root_override)` adopts the
@@ -273,6 +275,22 @@ pub(crate) struct BuilderCore {
 }
 
 impl BuilderCore {
+    pub(crate) fn set_strategy(&mut self, strategy: Strategy) {
+        self.config.strategy = strategy;
+    }
+
+    pub(crate) fn set_intensity(&mut self, intensity: Intensity) {
+        self.config.intensity = intensity;
+    }
+
+    pub(crate) fn set_defaults(&mut self, defaults: ScopeDefaults) {
+        self.config.defaults = defaults;
+    }
+
+    pub(crate) fn config_debug(&self) -> impl std::fmt::Debug + '_ {
+        &self.config
+    }
+
     fn begin_failed_disposal(&self) -> Latch {
         let definitions = self
             .slots
@@ -428,13 +446,19 @@ impl Drop for BuilderCore {
 /// Fully lowered scope plan whose construction payloads still have one owner.
 pub(crate) struct ScopePlan {
     pub(crate) root: Arc<ScopeCell>,
-    pub(crate) config: ScopeConfig,
+    config: ScopeConfig,
     pub(crate) defaults: ResolvedDefaults,
     pub(crate) children: Vec<ChildPlan>,
     terminality: Option<ScopePlanTerminality>,
 }
 
 struct ScopePlanTerminality;
+
+impl ScopePlan {
+    pub(crate) fn intensity_policy(&self) -> Intensity {
+        self.config.intensity
+    }
+}
 
 fn terminalize_plan(
     root: &ScopeCell,
@@ -644,13 +668,7 @@ mod tests {
         // from every plan-level kind default) before the construction is
         // erased.
         let readiness = options.readiness.unwrap_or(Readiness::Manual);
-        ChildConstruction::Raw(RawConstruction {
-            source: DefinitionSource::Restartable(Arc::new(|| {
-                unreachable!("policy resolution never constructs the actor")
-            })),
-            options,
-            readiness,
-        })
+        ChildConstruction::Raw(RawConstruction::for_policy_test(options, readiness))
     }
 
     fn scope_construction(options: CommonOptions) -> ChildConstruction {

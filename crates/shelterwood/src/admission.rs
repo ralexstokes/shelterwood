@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::{identity::ChildId, policy::InvalidPolicy};
+use crate::identity::ChildId;
 
 /// A child reservation or dynamic admission error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -26,9 +26,6 @@ pub enum ReserveError {
     /// The scope can mint no further membership identities.
     #[error("membership identity space is exhausted")]
     IdentityExhausted,
-    /// A public policy representation contained an invalid literal value.
-    #[error(transparent)]
-    InvalidPolicy(InvalidPolicy),
 }
 
 /// Exact reason an admission operation could not proceed.

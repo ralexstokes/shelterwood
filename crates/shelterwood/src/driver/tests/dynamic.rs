@@ -307,7 +307,6 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
     let (definition, resolved) = reservation
         .slot
         .resolve_and_take_defined(&scope.defaults)
-        .expect("the definition has not been claimed")
         .expect("the slot is defined");
     let plan =
         crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
@@ -397,7 +396,6 @@ async fn removal_tolerates_synchronous_reclaim_from_the_stop_funnel() {
     let (definition, resolved) = reservation
         .slot
         .resolve_and_take_defined(&scope.defaults)
-        .expect("the definition has not been claimed")
         .expect("the slot is defined");
     let plan =
         crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
@@ -1042,7 +1040,7 @@ async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_rech
         // while the latch was still unfired.
         let deadline = std::time::Instant::now() + CAPTURE_PROBE_WAIT;
         while std::time::Instant::now() < deadline {
-            if matches!(reservation.slot.resolve_policy(&defaults), Ok(None)) {
+            if reservation.slot.resolve_policy(&defaults).is_none() {
                 definition_claimed = true;
                 break;
             }

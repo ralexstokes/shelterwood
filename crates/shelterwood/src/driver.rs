@@ -29,7 +29,7 @@ pub(crate) use shutdown::shutdown_scope;
 
 use crate::{
     Cancellation, ChildId, Exit, GracePhase, Incarnation, JitterSample, Membership, Readiness,
-    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
         MemberStage, MemberTransition, ResidentProjection, ScopeCell, ScopeControlEvent,
@@ -44,7 +44,8 @@ use crate::{
     },
     exit::{
         RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
-        reconcile_recorded_outcomes,
+        framework_startup_failure, reconcile_recorded_outcomes, stop_reason_into_nested_result,
+        stop_reason_root_exit, structured_startup_failure_error,
     },
     identity::IncarnationCounter,
     mailbox::MailboxControl,
@@ -544,11 +545,11 @@ async fn run_nested_factory(
 
 fn begin_nested_incarnation(scope: &Arc<ScopeCell>) -> Result<ScopeEpochGuard, crate::ExitError> {
     ScopeEpochGuard::begin(scope).ok_or_else(|| {
-        let failure = StartupFailure::framework(StartupFailureCause::IdentityExhausted {
+        let failure = framework_startup_failure(StartupFailureCause::IdentityExhausted {
             id: scope.member.id().clone(),
         });
         scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
-        crate::ExitError::from_startup_failure(failure)
+        structured_startup_failure_error(failure)
     })
 }
 
@@ -575,7 +576,7 @@ async fn run_nested_tree_with_epoch(
             // they finish; hard-aborting the incarnation still detaches the
             // cancellation-safe disposal jobs.
             disposal.fired().await;
-            let failure = StartupFailure::framework(cause);
+            let failure = framework_startup_failure(cause);
             // A lowering failure occurs before the driver loop exists, but it
             // still belongs to a live incarnation. Resolve every stop source
             // through the same monotone verdict lattice as the loop path.
@@ -621,12 +622,12 @@ async fn run_nested_tree_with_epoch(
             };
             scope.set_startup(startup);
             epoch.finish(reason.clone());
-            return reason.into_nested_result();
+            return stop_reason_into_nested_result(reason);
         }
     };
-    run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch)
-        .await
-        .into_nested_result()
+    stop_reason_into_nested_result(
+        run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch).await,
+    )
 }
 
 async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
@@ -958,7 +959,7 @@ async fn run_scope_incarnation(
         // until the recomputation above establishes that order.
         scope.publish_startup_removals();
         if let Some(reason) = scope.finish_if_ready() {
-            let root_exit = scope.role.is_root().then(|| reason.root_exit());
+            let root_exit = scope.role.is_root().then(|| stop_reason_root_exit(&reason));
             // ScopeRuntime's synchronous epilogue clears dynamic state,
             // discharges child obligations and residency, and only then
             // publishes the scope's terminal state.

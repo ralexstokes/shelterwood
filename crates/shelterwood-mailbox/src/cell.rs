@@ -1264,7 +1264,10 @@ pub(super) mod tests {
                 .0,
         });
         let mailbox = MailboxCell::new(id);
-        (Arc::clone(&mailbox), ActorRef::new(member, mailbox))
+        (
+            Arc::clone(&mailbox),
+            crate::actor_ref_from_parts(member, mailbox),
+        )
     }
 
     pub(crate) fn actor() -> (Arc<MailboxCell<u8>>, ActorRef<u8>) {

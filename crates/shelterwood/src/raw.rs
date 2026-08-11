@@ -19,7 +19,9 @@ use crate::{
     cells::MemberCell,
     definition::DefinitionSource,
     identity::PoisonedCounter,
-    mailbox::{AcceptedSequence, MailboxCell, MailboxControl, MailboxReceiver},
+    mailbox::{
+        AcceptedSequence, MailboxCell, MailboxControl, MailboxReceiver, actor_ref_from_parts,
+    },
     policy::{ChildMode, CommonOptions},
     runtime::{
         self, ActorWork, CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, Signal,
@@ -1986,7 +1988,7 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
         Box::pin(async move {
             let Self { actor, mailbox } = *self;
             let incarnation = context.incarnation;
-            let myself = ActorRef::new(Arc::clone(&context.member), Arc::clone(&mailbox));
+            let myself = actor_ref_from_parts(Arc::clone(&context.member), Arc::clone(&mailbox));
             let raw = RawContext::new(context, myself, Arc::clone(&mailbox), readiness);
             let mut owner = RawIncarnationOwner::new(raw, actor);
             let outcome = {
@@ -2134,7 +2136,7 @@ mod tests {
         ChildId, MailboxShutdown, Readiness,
         cells::{MemberCell, ScopeCell},
         identity::ScopeIdentity,
-        mailbox::{ActorRef, MailboxCell, MailboxControl},
+        mailbox::{ActorRef, MailboxCell, MailboxControl, actor_ref_from_parts},
         policy::{ResolvedDefaults, ScopeFlavor},
         runtime::{
             CompletionGatedLatch, Latch, PanicPayload, Signal, UnwindPanics,
@@ -2171,7 +2173,7 @@ mod tests {
         );
         let scope = ScopeCell::new(scope_member, ScopeFlavor::Ordered, ScopeIdentity::new());
 
-        let myself = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        let myself = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
         let context = RawContext::new(
             RawRunContext {
                 id,

@@ -49,13 +49,6 @@ pub struct ActorRef<M> {
 }
 
 impl<M> ActorRef<M> {
-    pub fn new<I>(member: Arc<I>, mailbox: Arc<MailboxCell<M>>) -> Self
-    where
-        I: ActorIdentity + 'static,
-    {
-        Self { member, mailbox }
-    }
-
     /// Returns the actor's child id.
     #[must_use]
     pub fn id(&self) -> &ChildId {
@@ -67,6 +60,15 @@ impl<M> ActorRef<M> {
     pub fn membership(&self) -> Membership {
         self.member.membership()
     }
+}
+
+/// Builds the façade's actor handle from its cross-crate identity and mailbox
+/// capabilities without exposing a new inherent constructor on `ActorRef`.
+pub fn actor_ref_from_parts<I, M>(member: Arc<I>, mailbox: Arc<MailboxCell<M>>) -> ActorRef<M>
+where
+    I: ActorIdentity + 'static,
+{
+    ActorRef { member, mailbox }
 }
 
 impl<M: Send + 'static> ActorRef<M> {

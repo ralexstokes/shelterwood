@@ -443,7 +443,7 @@ impl RestartPolicy {
         matches!(self.condition, RestartCondition::Never)
     }
 
-    pub fn should_restart(self, exit: &Exit) -> bool {
+    pub(crate) fn should_restart(self, exit: &Exit) -> bool {
         match self.condition {
             RestartCondition::Always => true,
             RestartCondition::OnFailure => exit.is_failure(),

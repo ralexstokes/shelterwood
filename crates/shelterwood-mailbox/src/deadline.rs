@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-pub use shelterwood_core::deadline::Deadline;
+pub(crate) use shelterwood_core::deadline::Deadline;
 
 /// Which of the two passes an operation is being polled in.
 ///

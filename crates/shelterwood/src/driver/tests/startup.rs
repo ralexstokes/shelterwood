@@ -1,6 +1,26 @@
 use super::support::*;
 
 #[test]
+fn empty_control_peeks_skip_the_tree_observation_gate() {
+    let root = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("the scope has a live epoch");
+    let captures = root.probe_gate_captures();
+
+    assert!(!root.take_shutdown_request(epoch));
+    assert!(!root.take_force_request(epoch));
+    assert!(root.take_control_events().is_empty());
+    assert!(
+        matches!(
+            captures.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
+        "an idle driver wake only peeks under the control mutex"
+    );
+}
+
+#[test]
 fn pre_admission_restart_shutdown_is_published_when_the_scope_gets_a_parent() {
     let mut tree = Tree::new();
     tree.add_subtree("nested", SubtreeDef::factory(Tree::new))

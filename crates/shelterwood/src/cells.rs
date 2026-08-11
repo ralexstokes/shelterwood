@@ -1776,6 +1776,15 @@ impl ScopeCell {
     }
 
     pub(crate) fn take_control_events(&self) -> Vec<ScopeControlEvent> {
+        if self
+            .control
+            .lock()
+            .expect("scope control mutex poisoned")
+            .events
+            .is_empty()
+        {
+            return Vec::new();
+        }
         self.with_observation_gate(|_txn| {
             self.control
                 .lock()
@@ -1804,6 +1813,15 @@ impl ScopeCell {
     }
 
     pub(crate) fn take_shutdown_request(&self, epoch: Epoch) -> bool {
+        let pending = self
+            .control
+            .lock()
+            .expect("scope control mutex poisoned")
+            .shutdown
+            .is_some_and(|request| request.epoch == epoch && !request.consumed);
+        if !pending {
+            return false;
+        }
         self.with_observation_gate(|_txn| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             match control.shutdown.as_mut() {
@@ -1831,6 +1849,15 @@ impl ScopeCell {
     }
 
     pub(crate) fn take_force_request(&self, epoch: Epoch) -> bool {
+        let pending = self
+            .control
+            .lock()
+            .expect("scope control mutex poisoned")
+            .force
+            .is_some_and(|request| request.epoch == epoch && !request.consumed);
+        if !pending {
+            return false;
+        }
         self.with_observation_gate(|_txn| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             match control.force.as_mut() {

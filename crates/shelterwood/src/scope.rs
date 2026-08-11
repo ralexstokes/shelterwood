@@ -260,16 +260,16 @@ impl DynamicScopeRef {
     /// Snapshot watches conflate intermediate states, so `pred` should accept
     /// every state at or beyond the desired edge and must remain cheap and
     /// non-blocking.
-    pub async fn wait_for_child<P>(
+    pub fn wait_for_child<P>(
         &self,
         id: impl Into<ChildId>,
         pred: P,
         timeout: Duration,
-    ) -> Result<ChildSnapshot, WaitError>
+    ) -> impl std::future::Future<Output = Result<ChildSnapshot, WaitError>> + Send
     where
         P: FnMut(&ChildSnapshot) -> bool + Send,
     {
-        self.0.wait_for_child(id, pred, timeout).await
+        self.0.wait_for_child(id, pred, timeout)
     }
 
     /// Waits for terminal membership state.

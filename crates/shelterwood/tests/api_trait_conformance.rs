@@ -140,7 +140,11 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     let _assert_dynamic_scope_futures = |scope: &DynamicScopeRef| {
         assert_send(scope.wait_stopped());
         assert_send(scope.shutdown_and_wait(Duration::ZERO));
-        assert_send(scope.wait_for_child("child", |_| true, Duration::ZERO));
+        assert_send(scope.wait_for_child(
+            RcId(Rc::new(()), "child".into()),
+            |_| true,
+            Duration::ZERO,
+        ));
     };
     let _assert_start_future = |system: System<ScopeRef>| {
         assert_send(system.start_or_shutdown(Duration::ZERO));

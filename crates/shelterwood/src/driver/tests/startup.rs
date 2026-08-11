@@ -129,6 +129,119 @@ async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnat
     assert!(scope.children[key].restart_deadline.is_some());
 }
 
+/// A shutdown request against a nested scope's *first* (still pending)
+/// incarnation, published before the ordered start reaches that child, must
+/// not expedite-spawn it: only a member in the restart gap may bypass
+/// `progress_startup`'s in-order gating. The request stays latched on the
+/// nested cell and is claimed when the child starts at its ordered turn.
+#[crate::runtime::test]
+async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child() {
+    let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    tree.add_task(
+        "a",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness is valid")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid task");
+    tree.add_subtree(
+        "nested",
+        SubtreeDef::factory({
+            let factories = Arc::clone(&factories);
+            move || {
+                factories.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Tree::new()
+            }
+        }),
+    )
+    .expect("valid subtree");
+
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let nested_cell = Arc::clone(
+        plan.children[1]
+            .slot
+            .scope
+            .as_ref()
+            .expect("nested scope cell"),
+    );
+    let target = nested_cell
+        .request_shutdown()
+        .expect("the pre-admission shutdown targets the first epoch");
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let mut children = ChildArena::default();
+    plan.children.reverse();
+    while let Some(child) = plan.children.pop() {
+        children
+            .insert(ChildRuntime::from_plan(child, &root))
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+    }
+    let first = children.keys().next().expect("first ordered child");
+    let nested = children
+        .keys()
+        .find(|key| children[*key].slot.member.id().as_str() == "nested")
+        .expect("nested child key");
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_children(children)
+        .with_next_ordered_start(Some(first))
+        .build();
+    plan.armed = false;
+    drop(plan);
+
+    // Ordered startup spawns "a" and parks on its (never-fired) readiness.
+    scope.progress_startup();
+    assert!(scope.children[first].active.is_some());
+    assert!(!scope.children[first].initial_ready);
+
+    let event = root
+        .take_control_events()
+        .pop()
+        .expect("parent adoption publishes the pre-admission request");
+    let Some((
+        _,
+        Pending::RestartShutdown {
+            child,
+            target: event_target,
+        },
+    )) = scope.control_event_work(event)
+    else {
+        panic!("the control event resolves to restart-shutdown work");
+    };
+    assert_eq!(child, nested);
+    assert_eq!(event_target, target);
+    scope.expedite_restart_shutdown(child, event_target);
+
+    crate::runtime::yield_now().await;
+    crate::runtime::yield_now().await;
+
+    assert_eq!(
+        factories.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a never-started ordered child must not be expedite-spawned before its turn"
+    );
+    assert!(scope.children[nested].active.is_none());
+    assert!(!scope.children[nested].spawned_once);
+    assert!(scope.children[nested].restart_shutdown_pending.is_none());
+    assert_eq!(
+        nested_cell.begin_incarnation(ScopeState::Starting),
+        Some(target),
+        "the request stays latched for the first incarnation's ordered turn"
+    );
+}
+
 #[crate::runtime::test]
 async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_becomes_inactive() {
     let mut tree = Tree::new();

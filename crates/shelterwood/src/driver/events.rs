@@ -200,6 +200,18 @@ impl ScopeRuntime {
             child.restart_shutdown_pending = Some(target);
             return;
         }
+        if !child.spawned_once {
+            // Only a member in the restart gap may be expedited. The wake-start
+            // scan this path replaced required `MemberStage::Restarting`; with
+            // no active incarnation and the terminal/disposing cases excluded
+            // above, `spawned_once` is that stage bit — false means the member
+            // is still `Admitted` and has never run. Expediting it would let a
+            // shutdown request against the first (pending) incarnation start an
+            // ordered child before its in-order turn. Leave the request latched
+            // on the nested cell: the first incarnation claims it when
+            // `progress_startup` reaches the child.
+            return;
+        }
         child.restart_shutdown_pending = None;
         self.spawn_child(key);
     }

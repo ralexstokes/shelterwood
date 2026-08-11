@@ -129,6 +129,16 @@ requires `panic = "unwind"`. The standard double-panic exclusion remains: a
 destructor that panics while its user future is already unwinding aborts the
 process before the supervisor can publish an exit.
 
+Shelterwood's detached disposal is detached from the caller, not from the
+runtime's lifetime. On a healthy runtime it uses Tokio's blocking pool, so a
+permanently blocked destructor can make the default `Runtime::drop` wait
+indefinitely. Embedding hosts that cannot accept that wait must choose Tokio's
+`Runtime::shutdown_timeout` or `Runtime::shutdown_background` as a host-level
+mitigation, accepting that blocking work may then outlive the runtime. Once
+either returns, disposals submitted during teardown may still be in flight on
+a Shelterwood-owned thread that nothing joins, so a host that exits the process
+immediately afterwards loses those destructors.
+
 A shutdown request through a pre-spawn scope handle is retained as a pending
 stop. The first incarnation starts and immediately enters teardown; the timeout
 for `shutdown_and_wait` begins when that incarnation starts, because there is

@@ -621,12 +621,7 @@ pub(crate) trait DynamicRoute: Send + Sync {
 /// lock deliberately tolerates poisoning: a panic in an observation path must
 /// not permanently wedge later observation or a subtree handoff.
 #[derive(Clone, Debug)]
-#[cfg(test)]
 pub(crate) struct ObservationGate(Arc<Mutex<()>>);
-
-#[derive(Clone, Debug)]
-#[cfg(not(test))]
-struct ObservationGate(Arc<Mutex<()>>);
 
 impl ObservationGate {
     fn new() -> Self {

@@ -2618,7 +2618,14 @@ integration toolkit for the driver shell and the end-to-end invariants.
    probe: an application error type
    imitating the intensity-trip or startup-failure payload arrives as an
    erased user error — `intensity_trip()` / `startup_failure()` return
-   `None` for it.
+   `None` for it. Note what the split changed here: minting an authenticated
+   payload was a crate-privacy rule and is now a convention, because the
+   functions that wrap `ExitError`'s private inner variants must be `pub` for
+   the façade to reach them across the crate boundary. They are
+   `#[doc(hidden)]` implementation seams. The property the probe checks is
+   unaffected — the blanket user conversion still cannot produce an
+   authenticated payload — but a user who depends on `shelterwood-core`
+   directly is outside the boundary rather than defeated by it.
 9. **Every respawn charges the scope intensity budget.** Terminal removal
    cannot mask exhaustion; the window ages out under virtual time; backoff
    progression is unit-tested as pure math. The over-budget edge is

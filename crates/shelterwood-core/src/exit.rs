@@ -162,12 +162,25 @@ impl ExitError {
     }
 }
 
+/// Mints the framework-authenticated intensity-trip payload.
+///
+/// This and its startup-failure twin are the entire authentication boundary
+/// for [`ExitError::intensity_trip`] and [`ExitError::startup_failure`]: the
+/// wrapped inner variants are unreachable any other way, so a value that
+/// arrived through the blanket user conversion can never answer `Some`. The
+/// split published this crate, which means the boundary is now a convention
+/// rather than a privacy rule — hidden from documentation so it does not read
+/// as supported API.
+#[doc(hidden)]
 pub fn structured_intensity_trip_error(value: IntensityTrip) -> ExitError {
     ExitError(Arc::new(ExitErrorInner::IntensityTrip(
         StructuredIntensityTrip(value),
     )))
 }
 
+/// Mints the framework-authenticated startup-failure payload; see
+/// [`structured_intensity_trip_error`] for the boundary this participates in.
+#[doc(hidden)]
 pub fn structured_startup_failure_error(value: StartupFailure) -> ExitError {
     ExitError(Arc::new(ExitErrorInner::StartupFailure(
         StructuredStartupFailure(value),

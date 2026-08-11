@@ -12,8 +12,9 @@ use std::{
 
 use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
-    Actor, ActorDef, Context, ExitError, ExitKind, ExitResult, GracePhase, Readiness,
-    SendErrorKind, StartupError, StopReason, TaskDef, Tree,
+    Actor, ActorDef, Backoff, Context, DynamicTree, ExitError, ExitKind, ExitResult, GracePhase,
+    RawActor, RawContext, RawOnceDef, Readiness, RestartCount, Retention, SendErrorKind,
+    StartupError, StopReason, TaskDef, TaskOnceDef, Tree,
 };
 
 enum CapacityMessage {
@@ -213,4 +214,171 @@ async fn default_intensity_allows_five_restarts_before_tripping() {
         6,
         "initial run plus 5 restarts spawn; the tripping restart never does"
     );
+}
+
+#[tokio::test]
+async fn default_restart_backoff_and_retention_follow_definition_ownership() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+
+    let restartable = scope
+        .add_task(
+            "restartable",
+            TaskDef::new({
+                let runs = Arc::clone(&runs);
+                move |context| {
+                    let attempt = runs.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if attempt == 0 {
+                            Err(ExitError::message("exercise the default restart"))
+                        } else {
+                            context.shutdown_token().cancelled().await;
+                            Ok(())
+                        }
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("restartable task is admitted");
+    let running = scope
+        .wait_for_child(
+            "restartable",
+            |child| {
+                child.restart_count == RestartCount::ZERO.bump()
+                    && matches!(child.state, shelterwood::ChildState::Running)
+            },
+            POLL_TIMEOUT,
+        )
+        .await
+        .expect("the immediate default backoff starts the replacement");
+    assert_eq!(running.restart_policy.backoff(), Backoff::Immediate);
+    assert_eq!(running.retention, Retention::Retain);
+    assert_eq!(restartable.membership(), running.membership);
+
+    let (one_shot, completion) = scope
+        .add_task_once(
+            "one-shot",
+            TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }),
+        )
+        .await
+        .expect("one-shot task is admitted");
+    completion.wait().await.expect("one-shot task completes");
+    one_shot.wait().await;
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            scope.child("one-shot").is_none()
+        })
+        .await,
+        "the default one-shot retention removes the terminal membership"
+    );
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root stops");
+}
+
+struct DefaultDrainActor {
+    entered: ReleaseGate,
+    release: ReleaseGate,
+    values: Arc<AtomicUsize>,
+}
+
+impl RawActor for DefaultDrainActor {
+    type Msg = ();
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        self.entered.release();
+        self.release.wait().await;
+        while context.recv().await.is_some() {
+            self.values.fetch_add(1, Ordering::SeqCst);
+        }
+        while context.try_recv().is_some() {
+            self.values.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn default_mailbox_shutdown_drains_the_frozen_prefix() {
+    let entered = ReleaseGate::default();
+    let release = ReleaseGate::default();
+    let values = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "drain",
+            RawOnceDef::new(DefaultDrainActor {
+                entered: entered.clone(),
+                release: release.clone(),
+                values: Arc::clone(&values),
+            }),
+        )
+        .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("raw actor starts");
+    entered.wait().await;
+    actor.try_send(()).expect("first message accepts");
+    actor.try_send(()).expect("second message accepts");
+
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1)));
+    release.release();
+    shutdown
+        .await
+        .expect("shutdown task joins")
+        .expect("implicit drain completes");
+    assert_eq!(
+        values.load(Ordering::SeqCst),
+        2,
+        "MailboxShutdown::Drain is the shipped default"
+    );
+}
+
+async fn exit_after_default_tidy_cleanup(cleanup: Duration) -> shelterwood::Exit {
+    let abort_seen = ReleaseGate::default();
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "tidy",
+            TaskDef::new({
+                let abort_seen = abort_seen.clone();
+                move |context| {
+                    let abort_seen = abort_seen.clone();
+                    async move {
+                        context.abort_token().cancelled().await;
+                        abort_seen.release();
+                        tokio::time::sleep(cleanup).await;
+                        Ok(())
+                    }
+                }
+            }),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("task starts");
+    let mut shutdown = Box::pin(system.shutdown(Duration::from_secs(60)));
+    assert!(poll_once(shutdown.as_mut()).is_pending());
+    advance_time(Duration::from_secs(5)).await;
+    abort_seen.wait().await;
+    advance_time(cleanup.min(Duration::from_millis(10))).await;
+    shutdown.await.expect("default ladder completes");
+    task.wait().await
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_tidy_abort_beat_is_capped_at_ten_milliseconds() {
+    let inside = exit_after_default_tidy_cleanup(Duration::from_millis(9)).await;
+    assert!(matches!(inside.kind(), ExitKind::Completed));
+
+    let outside = exit_after_default_tidy_cleanup(Duration::from_millis(11)).await;
+    assert!(matches!(
+        outside.kind(),
+        ExitKind::Aborted {
+            phase: GracePhase::AfterGrace
+        }
+    ));
 }

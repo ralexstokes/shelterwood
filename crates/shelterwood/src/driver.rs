@@ -789,7 +789,7 @@ async fn run_scope_incarnation(
         let control_batch_full = dynamic_event_receiver.as_mut().is_some_and(|receiver| {
             collect_driver_events(receiver, event_batch_limit, &mut pending)
         });
-        // Disposal completions drain after the primary and dynamic lanes, and `arbitrate`
+        // Disposal completions collect after the primary and dynamic lanes, and `arbitrate`
         // sorts stably, so a `ConstructionDisposed` always trails every
         // same-class `Exited` collected in the same wake — even one produced
         // later. A disposal is therefore a batch-tail event: the exit it
@@ -799,9 +799,14 @@ async fn run_scope_incarnation(
         // That is a widening of an order that was already reachable, not a new
         // one: disposal runs on the blocking pool, so its completion never had
         // a fixed position relative to concurrent exits.
-        while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut disposal_event_receiver) {
-            pending.push(Pending::Driver(event).classified());
-        }
+        // Apply the same per-wake cap as the other unbounded lanes. Otherwise
+        // a disposal flood can monopolize this loop before a shutdown request
+        // is observed (and before its timeout begins).
+        let disposal_batch_full = collect_driver_events(
+            &mut disposal_event_receiver,
+            event_batch_limit,
+            &mut pending,
+        );
         let now = runtime::now();
         while let Some(deadline) = scope.deadlines.pop_due(now) {
             pending.push(Pending::Deadline(deadline).classified());
@@ -946,8 +951,8 @@ async fn run_scope_incarnation(
         // runtime, immediately collecting the next batch would prevent the
         // child, timer, and helper tasks whose events this loop prioritizes
         // from running at all. Give those producers one scheduler turn before
-        // returning to either saturated lane.
-        if primary_batch_full || control_batch_full {
+        // returning to any saturated lane.
+        if primary_batch_full || control_batch_full || disposal_batch_full {
             runtime::yield_now().await;
         }
     }

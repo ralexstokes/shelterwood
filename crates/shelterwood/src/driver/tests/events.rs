@@ -1,5 +1,38 @@
 use super::support::*;
 
+#[test]
+fn disposal_event_collection_caps_a_saturated_lane() {
+    let (sender, mut receiver) = crate::runtime::unbounded_mpsc();
+    let queued = super::super::MIN_EVENT_BATCH_LIMIT * 2;
+    for _ in 0..queued {
+        sender
+            .send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
+                child: ChildKey(0),
+                panic: None,
+            }))
+            .expect("the disposal lane remains open");
+    }
+
+    let mut pending = Vec::new();
+    assert!(
+        super::super::collect_driver_events(
+            &mut receiver,
+            super::super::MIN_EVENT_BATCH_LIMIT,
+            &mut pending,
+        ),
+        "a disposal suffix reports saturation so the driver yields"
+    );
+    assert_eq!(
+        pending.len(),
+        super::super::MIN_EVENT_BATCH_LIMIT + 1,
+        "the one-event saturation probe joins the bounded batch"
+    );
+    assert!(
+        crate::runtime::unbounded_mpsc_try_recv(&mut receiver).is_some(),
+        "the disposal suffix remains for a later scheduler turn"
+    );
+}
+
 /// Exercises the `DeadlineKind::Restart` suppression gate on its own:
 /// the restart deadline is scheduled first (no stop source latched at
 /// exit time), then the fused cancellation lands before the deadline's

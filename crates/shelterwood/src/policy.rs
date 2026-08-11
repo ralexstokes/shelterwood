@@ -674,10 +674,42 @@ pub(crate) enum ResolvedMailbox {
     Latest,
 }
 
+impl ResolvedMailbox {
+    fn resolve(
+        value: Option<Mailbox>,
+        inherited: Self,
+        inherited_queue_capacity: NonZeroUsize,
+    ) -> Self {
+        match value {
+            None => inherited,
+            Some(Mailbox::Queue(None)) => Self::Queue(inherited_queue_capacity),
+            Some(Mailbox::Queue(Some(capacity))) => Self::Queue(capacity),
+            Some(Mailbox::Latest) => Self::Latest,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResolvedReadinessDeadline {
-    Bounded(Duration),
+    Bounded(BoundedReadinessDeadline),
     Unbounded,
+}
+
+impl ResolvedReadinessDeadline {
+    fn resolve(value: ReadinessDeadline, inherited: Self) -> Self {
+        match value {
+            ReadinessDeadline::Inherit => inherited,
+            ReadinessDeadline::Bounded(duration) => Self::Bounded(duration),
+            ReadinessDeadline::Unbounded => Self::Unbounded,
+        }
+    }
+
+    pub(crate) fn duration(self) -> Option<Duration> {
+        match self {
+            Self::Bounded(duration) => Some(duration.duration()),
+            Self::Unbounded => None,
+        }
+    }
 }
 
 impl Default for ResolvedDefaults {
@@ -690,7 +722,9 @@ impl Default for ResolvedDefaults {
             mailbox: ResolvedMailbox::Queue(queue_capacity),
             queue_capacity,
             mailbox_shutdown: MailboxShutdown::default(),
-            readiness_deadline: ResolvedReadinessDeadline::Bounded(DEFAULT_READINESS_DEADLINE),
+            readiness_deadline: ResolvedReadinessDeadline::Bounded(BoundedReadinessDeadline(
+                DEFAULT_READINESS_DEADLINE,
+            )),
         }
     }
 }
@@ -700,7 +734,7 @@ impl ResolvedDefaults {
         Self {
             child_restart: resolve(values.child_restart, self.child_restart),
             child_shutdown: resolve(values.child_shutdown, self.child_shutdown),
-            mailbox: resolve_mailbox(values.mailbox, self.mailbox, self.queue_capacity),
+            mailbox: ResolvedMailbox::resolve(values.mailbox, self.mailbox, self.queue_capacity),
             queue_capacity: match values.mailbox {
                 Some(Mailbox::Queue(Some(capacity))) => capacity,
                 None | Some(Mailbox::Queue(None) | Mailbox::Latest) => self.queue_capacity,
@@ -708,7 +742,7 @@ impl ResolvedDefaults {
             mailbox_shutdown: resolve(values.mailbox_shutdown, self.mailbox_shutdown),
             readiness_deadline: values
                 .readiness_deadline
-                .map(|value| resolve_readiness_deadline(value, self.readiness_deadline))
+                .map(|value| ResolvedReadinessDeadline::resolve(value, self.readiness_deadline))
                 .unwrap_or(self.readiness_deadline),
         }
     }
@@ -716,32 +750,6 @@ impl ResolvedDefaults {
 
 fn resolve<T: Copy>(value: Option<T>, inherited: T) -> T {
     value.unwrap_or(inherited)
-}
-
-fn resolve_readiness_deadline(
-    value: ReadinessDeadline,
-    inherited: ResolvedReadinessDeadline,
-) -> ResolvedReadinessDeadline {
-    match value {
-        ReadinessDeadline::Inherit => inherited,
-        ReadinessDeadline::Bounded(duration) => {
-            ResolvedReadinessDeadline::Bounded(duration.duration())
-        }
-        ReadinessDeadline::Unbounded => ResolvedReadinessDeadline::Unbounded,
-    }
-}
-
-fn resolve_mailbox(
-    value: Option<Mailbox>,
-    inherited: ResolvedMailbox,
-    inherited_queue_capacity: NonZeroUsize,
-) -> ResolvedMailbox {
-    match value {
-        None => inherited,
-        Some(Mailbox::Queue(None)) => ResolvedMailbox::Queue(inherited_queue_capacity),
-        Some(Mailbox::Queue(Some(capacity))) => ResolvedMailbox::Queue(capacity),
-        Some(Mailbox::Latest) => ResolvedMailbox::Latest,
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -771,10 +779,14 @@ pub(crate) fn resolve_common(
             resolve(options.restart, defaults.child_restart)
         },
         shutdown: resolve(options.shutdown, defaults.child_shutdown),
-        mailbox: resolve_mailbox(options.mailbox, defaults.mailbox, defaults.queue_capacity),
+        mailbox: ResolvedMailbox::resolve(
+            options.mailbox,
+            defaults.mailbox,
+            defaults.queue_capacity,
+        ),
         mailbox_shutdown: resolve(options.mailbox_shutdown, defaults.mailbox_shutdown),
         readiness: resolve(options.readiness, default_readiness),
-        readiness_deadline: resolve_readiness_deadline(
+        readiness_deadline: ResolvedReadinessDeadline::resolve(
             options.readiness_deadline,
             defaults.readiness_deadline,
         ),
@@ -796,9 +808,8 @@ mod tests {
     use super::{
         Backoff, BackoffFactor, ChildMode, CommonOptions, Intensity, Jitter, JitterSample, Mailbox,
         MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, ResolvedDefaults,
-        ResolvedMailbox, ResolvedReadinessDeadline, RestartAttempt, RestartCondition, RestartCount,
-        RestartPolicy, Retention, ScopeDefaults, Shutdown, TotalRestarts, resolve_common,
-        tidy_abort_beat,
+        ResolvedMailbox, RestartAttempt, RestartCondition, RestartCount, RestartPolicy, Retention,
+        ScopeDefaults, Shutdown, TotalRestarts, resolve_common, tidy_abort_beat,
     };
 
     #[test]
@@ -822,8 +833,8 @@ mod tests {
             }
         );
         assert_eq!(
-            ResolvedDefaults::default().readiness_deadline,
-            ResolvedReadinessDeadline::Bounded(Duration::from_secs(30))
+            ResolvedDefaults::default().readiness_deadline.duration(),
+            Some(Duration::from_secs(30))
         );
         assert_eq!(
             Intensity::default(),
@@ -1264,8 +1275,8 @@ mod tests {
         assert_eq!(overridden.mailbox_shutdown, MailboxShutdown::Drain);
         assert_eq!(overridden.readiness, Readiness::Immediate);
         assert_eq!(
-            overridden.readiness_deadline,
-            ResolvedReadinessDeadline::Bounded(Duration::from_nanos(1))
+            overridden.readiness_deadline.duration(),
+            Some(Duration::from_nanos(1))
         );
         assert_eq!(overridden.retention, Retention::Remove);
     }

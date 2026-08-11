@@ -124,6 +124,7 @@ impl ScopeRuntimeBuilder {
                 .map(|(key, child)| (child.slot.member.membership(), key))
                 .collect(),
             incomplete_children,
+            restart_shutdown_retries: Vec::new(),
             children: self.children,
             events: self.events,
             disposal_events: self.disposal_events,

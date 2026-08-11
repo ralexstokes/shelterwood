@@ -984,7 +984,12 @@ impl ScopeRuntime {
             // fact now that the old incarnation is inactive; otherwise the
             // one-shot event would be consumed while `spawn_child` still
             // rejects the active child and the requested expedite is lost.
-            self.expedite_restart_shutdown(key, target);
+            // Queue the retry rather than expediting synchronously: it
+            // re-enters arbitration on the next wake, so a later exit
+            // collected in this same batch first gets the chance to trip
+            // intensity or fail startup, and the execution-time suppression
+            // re-check then observes that drain.
+            self.restart_shutdown_retries.push((key, target));
         }
     }
 

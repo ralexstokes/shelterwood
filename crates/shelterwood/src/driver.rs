@@ -20,10 +20,9 @@ use storage::{ChildArena, ChildKey, Obligation};
 use child::ChildRuntime;
 #[cfg(test)]
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
-#[cfg(test)]
-use events::restart_shutdown_work;
 use events::{
     ChildEvent, DeadlineKind, DriverEvent, MIN_EVENT_BATCH_LIMIT, Pending, collect_driver_events,
+    restart_shutdown_work,
 };
 use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
@@ -206,6 +205,12 @@ struct ScopeRuntime {
     // Driver wakes resolve a subject directly and test completion in O(1).
     child_keys: HashMap<Membership, ChildKey>,
     incomplete_children: usize,
+    // Retained restart-shutdown facts whose subjects became inactive mid-batch.
+    // `handle_exit` queues them here instead of expediting synchronously so the
+    // retry re-enters arbitration on the next wake: an exit collected in the
+    // same batch must first get the chance to trip intensity or fail startup.
+    // Duplicates are harmless — expediting is idempotent.
+    restart_shutdown_retries: Vec<(ChildKey, Epoch)>,
     events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
@@ -677,6 +682,7 @@ async fn run_scope_incarnation(
         children,
         child_keys,
         incomplete_children,
+        restart_shutdown_retries: Vec::new(),
         events,
         disposal_events,
         deadlines: DeadlineQueue::default(),
@@ -741,6 +747,12 @@ async fn run_scope_incarnation(
             if let Some(work) = scope.control_event_work(event) {
                 pending.push(work);
             }
+        }
+        // Retries queued at the tail of a previous batch's exit handling
+        // re-enter arbitration here, so a same-wake exit sorts ahead of them
+        // and the execution-time suppression re-check observes its drain.
+        for (child, target) in std::mem::take(&mut scope.restart_shutdown_retries) {
+            pending.push(restart_shutdown_work(child, target));
         }
         if !scope.ancestor_shutdown_seen
             && scope

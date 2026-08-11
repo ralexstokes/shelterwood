@@ -122,11 +122,18 @@ async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnat
         false,
     );
 
+    // Drive the deferred retry the exit queued: the consumed target must not
+    // expedite the following incarnation.
+    for (child, target) in std::mem::take(&mut scope.restart_shutdown_retries) {
+        scope.expedite_restart_shutdown(child, target);
+    }
+
     assert!(
         scope.children[key].active.is_none(),
         "the consumed request must not bypass the following incarnation's backoff"
     );
     assert!(scope.children[key].restart_deadline.is_some());
+    assert!(scope.children[key].restart_shutdown_pending.is_none());
 }
 
 /// A shutdown request against a nested scope's *first* (still pending)
@@ -317,10 +324,18 @@ async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_become
         false,
     );
 
+    // Exit handling queues the retry rather than expediting mid-batch; the
+    // driver loop drains it into the next wake's arbitration.
+    let retries = std::mem::take(&mut scope.restart_shutdown_retries);
+    assert_eq!(retries, vec![(key, target)]);
+    for (child, target) in retries {
+        scope.expedite_restart_shutdown(child, target);
+    }
+
     let restarted = scope.children[key]
         .active
         .as_ref()
-        .expect("the retained event starts the next incarnation immediately");
+        .expect("the retained event starts the next incarnation on the following wake");
     assert_ne!(restarted.incarnation, first);
     assert!(scope.children[key].restart_deadline.is_none());
     assert!(scope.children[key].restart_shutdown_pending.is_none());
@@ -476,6 +491,181 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         0,
         "the production guard must suppress the expedited factory after intensity drain"
     );
+}
+
+/// The retained-fact twin of the test above: a restart-shutdown fact retained
+/// while its subject was active is retried when the subject's exit is handled
+/// — but the retry must re-enter arbitration rather than expedite mid-batch,
+/// so an intensity-tripping exit collected in the same wake drains the scope
+/// before the retry can start a doomed incarnation.
+#[crate::runtime::test]
+async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
+    let factories = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    tree.intensity(Intensity::new(1, Duration::from_secs(10)).expect("valid intensity"));
+    tree.add_subtree(
+        "nested",
+        SubtreeDef::factory({
+            let factories = Arc::clone(&factories);
+            move || {
+                factories.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Tree::new()
+            }
+        })
+        .restart(RestartPolicy::new(
+            RestartCondition::Always,
+            Backoff::fixed(Duration::from_secs(60), crate::Jitter::None)
+                .expect("non-zero restart backoff"),
+        )),
+    )
+    .expect("valid subtree");
+    tree.add_task("trip", TaskDef::new(|_| future::pending()))
+        .expect("valid task");
+
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let mut children = ChildArena::default();
+    plan.children.reverse();
+    while let Some(child) = plan.children.pop() {
+        children
+            .insert(ChildRuntime::from_plan(child, &root))
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+    }
+    let nested = children
+        .keys()
+        .find(|key| children[*key].slot.member.id().as_str() == "nested")
+        .expect("nested child key");
+    let trip = children
+        .keys()
+        .find(|key| children[*key].slot.member.id().as_str() == "trip")
+        .expect("tripping child key");
+    let next_ordered_start = children.keys().next();
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_intensity_policy(plan.config.intensity)
+        .with_children(children)
+        .with_lifecycle(ScopeLifecycle::running())
+        .with_next_ordered_start(next_ordered_start)
+        .build();
+    plan.armed = false;
+    drop(plan);
+
+    let target = scope.children[nested]
+        .slot
+        .scope
+        .as_ref()
+        .expect("nested scope cell")
+        .request_shutdown()
+        .expect("the shutdown targets the pending nested incarnation");
+    scope.spawn_child(nested);
+    let nested_first = scope.children[nested]
+        .active
+        .as_ref()
+        .expect("the first nested incarnation is active")
+        .incarnation;
+    // The subject-carrying event runs while the child is still active, so the
+    // fact is retained for the exit-time retry.
+    scope.expedite_restart_shutdown(nested, target);
+    assert_eq!(
+        scope.children[nested].restart_shutdown_pending,
+        Some(target)
+    );
+    scope.children[nested]
+        .active
+        .as_ref()
+        .expect("the first nested incarnation is active")
+        .abort_handle
+        .abort();
+
+    scope.spawn_child(trip);
+    let trip_incarnation = scope.children[trip]
+        .active
+        .as_ref()
+        .expect("tripping child is active")
+        .incarnation;
+    scope.children[trip]
+        .active
+        .as_ref()
+        .expect("tripping child is active")
+        .abort_handle
+        .abort();
+
+    let nested_exit = DriverEvent::Child(ChildEvent::Exited {
+        child: nested,
+        incarnation: nested_first,
+        recorded: Some(RecordedOutcome::returned(Err(ExitError::message(
+            "restart the nested scope",
+        )))),
+        join: crate::runtime::JoinOutcome::Ok { value: () },
+        cancellation: Cancellation::NotObserved,
+        readiness_signal_seen: false,
+    });
+    let trip_exit = DriverEvent::Child(ChildEvent::Exited {
+        child: trip,
+        incarnation: trip_incarnation,
+        recorded: Some(RecordedOutcome::returned(Err(ExitError::message(
+            "trip intensity",
+        )))),
+        join: crate::runtime::JoinOutcome::Ok { value: () },
+        cancellation: Cancellation::NotObserved,
+        readiness_signal_seen: false,
+    });
+    let mut pending = [
+        Pending::Driver(nested_exit).classified(),
+        Pending::Driver(trip_exit).classified(),
+    ];
+    arbitrate(&mut pending);
+    for (_, event) in pending {
+        match event {
+            Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+                child,
+                incarnation,
+                recorded,
+                join,
+                cancellation,
+                readiness_signal_seen,
+            })) => scope.handle_exit(
+                child,
+                incarnation,
+                recorded,
+                join,
+                cancellation,
+                readiness_signal_seen,
+            ),
+            _ => unreachable!("the fixture queues only the two exits"),
+        }
+    }
+
+    // The nested exit deferred its retry through arbitration, so the trip
+    // exit from the same batch drained the scope first.
+    assert!(scope.lifecycle.is_draining());
+    let retries = std::mem::take(&mut scope.restart_shutdown_retries);
+    assert_eq!(retries, vec![(nested, target)]);
+    for (child, target) in retries {
+        scope.expedite_restart_shutdown(child, target);
+    }
+
+    crate::runtime::yield_now().await;
+    crate::runtime::yield_now().await;
+
+    assert_eq!(
+        factories.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the deferred retry must not start a doomed incarnation after intensity drain"
+    );
+    assert!(scope.children[nested].active.is_none());
+    assert!(scope.children[nested].restart_shutdown_pending.is_none());
 }
 
 /// A `mark_ready(); stop()` child reports its local stop and exit on

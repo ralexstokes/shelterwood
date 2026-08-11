@@ -617,7 +617,13 @@ impl SupervisorState {
                     &[IncarnationState::Complete],
                     IncarnationState::RestartPending,
                 ) && let Some(record) = self.children.get_mut(&child)
-                    && self.lifecycle.is_starting()
+                    // Deliberately the *consumers'* predicate, not
+                    // `is_starting`: a startup-failed or draining scope has
+                    // not completed startup either, and every reader of this
+                    // flag gates on `startup_complete`. Narrowing it here
+                    // would let a pre-ready exit publish `NotAborted` where a
+                    // scope that already failed startup published `Aborted`.
+                    && !self.lifecycle.startup_complete()
                     && let StartupMembership::Initial { ready } = &mut record.startup
                 {
                     *ready = false;

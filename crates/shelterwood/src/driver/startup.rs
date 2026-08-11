@@ -106,8 +106,7 @@ impl ScopeRuntime {
         let Some(state) = self.lifecycle.complete_startup() else {
             return;
         };
-        self.root.set_state(state);
-        self.root.set_startup(Ok(()));
+        self.root.set_state_and_startup(state, Ok(()));
         if let Some(parent_ready) = self.role.parent_ready() {
             parent_ready.fire();
         }
@@ -146,8 +145,6 @@ impl ScopeRuntime {
         let Some(state) = self.lifecycle.fail_startup() else {
             return;
         };
-        self.root
-            .set_startup(Err(StartupError::StartupFailed(failure.clone())));
         if self.root.flavor == ScopeFlavor::Ordered {
             let later_children: Vec<_> = self.children.keys_after(key).collect();
             for later in later_children {
@@ -165,9 +162,13 @@ impl ScopeRuntime {
             }
         }
         if self.role.is_root() {
-            self.root.set_state(state);
+            self.root
+                .set_state_and_startup(state, Err(StartupError::StartupFailed(failure.clone())));
         } else {
-            self.begin_drain(StopReason::StartupFailed(failure));
+            self.begin_drain_with_startup(
+                StopReason::StartupFailed(failure.clone()),
+                Err(StartupError::StartupFailed(failure)),
+            );
         }
     }
 }

@@ -184,6 +184,47 @@ async fn dropped_unpolled_scope_plan_terminalizes_nested_declarations() {
 }
 
 #[crate::runtime::test]
+async fn converted_nested_child_without_residency_closes_its_scope_on_drop() {
+    let mut outer = Tree::new();
+    let nested = outer
+        .add_subtree_once("nested", SubtreeOnceDef::new(Tree::new()))
+        .expect("valid nested scope");
+    let mut snapshots = nested.subscribe_snapshots();
+    let mut plan = outer.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let nested_index = plan
+        .children
+        .iter()
+        .position(|child| child.slot.member.id().as_str() == "nested")
+        .expect("nested child is present");
+    let nested_runtime = ChildRuntime::from_plan(plan.children.remove(nested_index), &root);
+
+    assert!(
+        root.snapshot().children.is_empty(),
+        "initial-child conversion precedes residency publication"
+    );
+    // Models an unwind while converting a later child: the converted prefix
+    // is dropped while its nested slot is not yet discoverable as a resident.
+    drop(nested_runtime);
+
+    assert!(matches!(
+        crate::runtime::timeout(Duration::from_secs(1), nested.wait_stopped()).await,
+        crate::runtime::Timeout::Completed(StopReason::NeverStarted)
+    ));
+    snapshots
+        .changed()
+        .await
+        .expect("the final nested snapshot is delivered before closure");
+    assert!(matches!(
+        snapshots.borrow_latest().state,
+        ScopeState::Stopped {
+            reason: StopReason::NeverStarted
+        }
+    ));
+    assert!(snapshots.changed().await.is_err());
+}
+
+#[crate::runtime::test]
 async fn scope_plan_conversion_panic_terminalizes_every_child() {
     let mut tree = Tree::new();
     for id in ["first", "second"] {
@@ -277,7 +318,11 @@ impl ReserveOnLifecycleWake {
         if result.is_none() {
             *result = Some(
                 reserve_dynamic(&self.scope, ChildId::from("reentrant"), None).map(|reservation| {
-                    cancel_dynamic_reservation(reservation.control.as_ref(), &reservation.slot);
+                    cancel_dynamic_reservation(
+                        &reservation.scope,
+                        reservation.control.as_ref(),
+                        &reservation.slot,
+                    );
                 }),
             );
             self.observed.fire();

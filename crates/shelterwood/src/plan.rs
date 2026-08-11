@@ -8,7 +8,7 @@ use std::{
 use crate::{
     ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults, Strategy,
     admission::ReserveError,
-    cells::{ErasedDynamicSlot, MemberCell, ScopeCell},
+    cells::{ErasedDynamicSlot, MemberCell, ObservationTxn, ScopeCell},
     definition::DefinitionSource,
     identity::{IdError, ScopeIdentity},
     policy::{
@@ -130,22 +130,28 @@ impl SlotCell {
         }
     }
 
-    /// Publishes the canonical never-started terminal state for this slot.
-    ///
-    /// Member terminality closes any mailbox before the nested scope closes
-    /// its observation surfaces. Every static and dynamic path uses this
-    /// method so those edges cannot drift independently.
+    /// Publishes one never-started slot under the gate its observers use.
     pub(crate) fn terminalize_never_started(&self) {
-        self.member.terminalize(Exit::never_started());
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started();
+        } else {
+            self.member.terminalize(Exit::never_started());
         }
     }
 
-    /// Claims an unlowered definition and publishes never-started terminality.
-    pub(crate) fn take_never_started(&self) -> Option<Isolated<ChildConstruction>> {
+    pub(crate) fn terminalize_never_started_locked(&self, txn: &mut ObservationTxn<'_>) {
+        self.member.terminalize_locked(Exit::never_started(), txn);
+        if let Some(scope) = &self.scope {
+            scope.terminalize_never_started_locked(txn);
+        }
+    }
+
+    pub(crate) fn take_never_started_locked(
+        &self,
+        txn: &mut ObservationTxn<'_>,
+    ) -> Option<Isolated<ChildConstruction>> {
         let definition = self.take_definition().ok().flatten();
-        self.terminalize_never_started();
+        self.terminalize_never_started_locked(txn);
         definition
     }
 
@@ -408,11 +414,13 @@ impl Drop for ScopePlan {
         for child in &self.children {
             child.slot.terminalize_never_started();
         }
-        // Lowering can publish the planned children before ScopeRuntime takes
-        // ownership. If construction then unwinds, the plan fallback also
-        // owns those residencies and their matching Removed edges.
-        self.root.clear_residents();
-        self.root.terminalize_never_started();
+        self.root.with_observation_gate(|txn| {
+            // Lowering can publish the planned children before ScopeRuntime
+            // takes ownership. The plan fallback commits residency withdrawal
+            // and root closure as one root-scope observation.
+            self.root.clear_residents_locked(txn);
+            self.root.terminalize_never_started_locked(txn);
+        });
     }
 }
 

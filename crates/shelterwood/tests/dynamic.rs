@@ -30,9 +30,10 @@ use shelterwood::{
 /// `ReserveError::RemovalInProgress`: a surviving entry whose member is
 /// already `removing`.
 ///
-/// Removal completion releases the entry before it withdraws residency, so
-/// an absent resident is a sound — slightly conservative — signal that the
-/// id is free again.
+/// Removal withdraws residency and publishes `Removed` while the old entry
+/// still claims the id, then releases the entry in the same observation
+/// transaction. An absent resident is therefore a sound signal that the id
+/// is free again.
 async fn wait_for_id_release(scope: &DynamicScopeRef, id: &str) {
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {

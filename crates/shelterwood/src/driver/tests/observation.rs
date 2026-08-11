@@ -207,6 +207,18 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
         StartupDisposition::NotAborted,
     ));
 
+    let nested_ref = ScopeRef {
+        cell: Arc::clone(&nested),
+    };
+    let mut snapshot_waiter =
+        Box::pin(nested_ref.wait_for_child("missing", |_| false, Duration::from_secs(10)));
+    let first_snapshot_poll =
+        std::future::poll_fn(|context| Poll::Ready(snapshot_waiter.as_mut().poll(context))).await;
+    assert!(
+        first_snapshot_poll.is_pending(),
+        "membership terminality must not close a live scope's snapshot stream"
+    );
+
     let mut waiter = Box::pin(nested.wait_stopped());
     let first_poll =
         std::future::poll_fn(|context| Poll::Ready(waiter.as_mut().poll(context))).await;
@@ -217,6 +229,64 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
 
     nested.finish_incarnation(epoch, StopReason::ShutdownRequested);
     assert_eq!(waiter.await, StopReason::ShutdownRequested);
+    assert!(matches!(
+        snapshot_waiter.await,
+        Err(crate::WaitError::ScopeTerminated {
+            state: ScopeState::Stopped {
+                reason: StopReason::ShutdownRequested
+            }
+        })
+    ));
+}
+
+#[crate::runtime::test]
+async fn wait_for_child_reloads_after_its_predicate_closes_the_snapshot_stream() {
+    let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("scope epoch is available");
+    scope.set_state(ScopeState::Running);
+    let child_id = ChildId::from("child");
+    let membership = scope
+        .child_identity
+        .lock()
+        .expect("scope identity mutex is healthy")
+        .mint_membership(&child_id)
+        .expect("child membership is available");
+    let child = MemberCell::new(child_id, membership);
+    let slot = SlotCell::new(Arc::clone(&child), None);
+    scope.set_admitted_children(vec![resident_projection(&slot)]);
+    let scope_ref = ScopeRef {
+        cell: Arc::clone(&scope),
+    };
+    let closing_scope = Arc::clone(&scope);
+    let mut first = true;
+
+    let result = scope_ref
+        .wait_for_child(
+            "child",
+            move |_| {
+                if std::mem::take(&mut first) {
+                    closing_scope.finish_root_incarnation(
+                        epoch,
+                        StopReason::Finished,
+                        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+                    );
+                }
+                false
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(crate::WaitError::ScopeTerminated {
+            state: ScopeState::Stopped {
+                reason: StopReason::Finished
+            }
+        })
+    ));
 }
 
 #[crate::runtime::test]
@@ -512,12 +582,31 @@ fn admitted_subtree_rehomes_existing_descendants_to_one_gate() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
     let leaf = isolated_scope("leaf", ScopeFlavor::Ordered);
+    let raw_leaf_id = ChildId::from("raw-leaf");
+    let raw_leaf = MemberCell::new(
+        raw_leaf_id.clone(),
+        nested
+            .child_identity
+            .lock()
+            .expect("scope identity mutex poisoned")
+            .mint_membership(&raw_leaf_id)
+            .expect("raw leaf membership is available"),
+    );
     let leaf_slot = SlotCell::new(Arc::clone(&leaf.member), Some(Arc::clone(&leaf)));
-    nested.set_admitted_children(vec![resident_projection(&leaf_slot)]);
+    let raw_leaf_slot = SlotCell::new(Arc::clone(&raw_leaf), None);
+    nested.set_admitted_children(vec![
+        resident_projection(&leaf_slot),
+        resident_projection(&raw_leaf_slot),
+    ]);
     assert!(
         nested
             .observation_gate()
             .same_gate(&leaf.observation_gate())
+    );
+    assert!(
+        nested
+            .observation_gate()
+            .same_gate(&raw_leaf.observation_gate())
     );
 
     let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
@@ -526,6 +615,7 @@ fn admitted_subtree_rehomes_existing_descendants_to_one_gate() {
     let root_gate = root.observation_gate();
     assert!(root_gate.same_gate(&nested.observation_gate()));
     assert!(root_gate.same_gate(&leaf.observation_gate()));
+    assert!(root_gate.same_gate(&raw_leaf.observation_gate()));
 }
 
 #[test]

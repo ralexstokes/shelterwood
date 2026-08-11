@@ -89,17 +89,38 @@ struct LatchState {
 
 impl Latch {
     pub(crate) fn fire(&self) -> bool {
-        if self
-            .state
-            .fired
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.state.notify.notify_waiters();
+        if self.fire_silently() {
+            self.notify();
             true
         } else {
             false
         }
+    }
+
+    /// Performs the one-shot transition without waking waiters.
+    ///
+    /// Splitting the transition from the wake lets an observation-gate
+    /// transaction linearize the fire inside its critical section while
+    /// deferring the waker-visible [`Self::notify`] until after the gate is
+    /// released. Deferral cannot strand a waiter: [`Self::fired`] rechecks
+    /// `is_fired` after creating its notification, so a waiter either
+    /// observes the committed transition directly or holds a notification
+    /// created before the deferred `notify_waiters`, which Tokio guarantees
+    /// to be observed even when it has not been polled yet.
+    pub(crate) fn fire_silently(&self) -> bool {
+        self.state
+            .fired
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Wakes waiters after a [`Self::fire_silently`] transition.
+    ///
+    /// Idempotent and only meaningful once the latch is fired; callers that
+    /// won `fire_silently` inside an observation-gate transaction defer this
+    /// wake past the gate release.
+    pub(crate) fn notify(&self) {
+        self.state.notify.notify_waiters();
     }
 
     pub(crate) fn is_fired(&self) -> bool {
@@ -429,6 +450,7 @@ impl<T> WatchSender<T> {
         self.0.send_modify(|_| {});
     }
 
+    #[cfg(test)]
     pub(crate) fn send_modify(&self, update: impl FnOnce(&mut T)) {
         self.0.send_modify(update);
     }

@@ -109,7 +109,7 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
             DynamicEntry::removing(slot, ChildKey(1), responses),
         );
 
-    let entries = control.close();
+    let entries = root.with_observation_gate(|txn| control.close(txn));
     assert!(
         response.try_receive().is_none(),
         "closing admission must not complete removal before teardown"
@@ -151,7 +151,7 @@ fn reserve_dynamic_rejects_an_empty_id_at_the_driver_boundary() {
 }
 
 #[test]
-fn dynamic_removal_releases_state_before_waiting_for_the_observation_gate() {
+fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
@@ -183,10 +183,9 @@ fn dynamic_removal_releases_state_before_waiting_for_the_observation_gate() {
     let worker =
         std::thread::spawn(move || super::super::remove_dynamic(&removal_root, &removal_id, None));
 
-    // The capture report proves removal committed to the held observation
-    // gate for its removing transition. Dynamic state cannot change again
-    // until that gate is released, so a single acquisition attempt decides
-    // whether removal reached the gate while still holding the state.
+    // Capturing the gate attempt proves the remover has reached its commit
+    // boundary. No retained control-plane state may change until that one
+    // observation transaction begins.
     assert_eq!(
         captures
             .recv_timeout(CAPTURE_PROBE_WAIT)
@@ -196,33 +195,189 @@ fn dynamic_removal_releases_state_before_waiting_for_the_observation_gate() {
     let state = control
         .state
         .try_lock()
-        .expect("a removal waiting on observation must release dynamic state");
+        .expect("a removal waiting on observation has not acquired or mutated dynamic state");
     let entry = state
         .entries
         .get(&child_id)
         .expect("the removal keeps its resident registration");
-    assert!(entry.is_removing());
+    assert!(!entry.is_removing());
     assert!(entry.matches_key(key));
     drop(state);
+
+    drop(held_gate);
+    let response = worker.join().expect("removal transition completes");
+    drop(response);
 
     let route = root
         .dynamic_route()
         .expect("the fixture exposes its dynamic route");
     assert!(matches!(
-        route.reserve(&root, child_id.clone(), None),
+        root.with_observation_gate(|txn| route.reserve(&root, child_id.clone(), None, txn)),
         Err(crate::ReserveError::RemovalInProgress(id)) if id == child_id
     ));
+}
 
-    drop(held_gate);
-    let response = worker.join().expect("removal transition completes");
-    drop(response);
+#[crate::runtime::test]
+async fn final_removal_holds_the_id_until_removed_publication_commits() {
+    let (mut scope, _events, _dynamic_events, _disposal_events, control) =
+        running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    let (definition, resolved) = reservation
+        .slot
+        .resolve_and_take_defined(&scope.defaults)
+        .expect("the definition has not been claimed")
+        .expect("the slot is defined");
+    let plan =
+        crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
+    let mut child = ChildRuntime::from_plan(plan, &root);
+    child.initial = false;
+    let key = root.with_observation_gate(|txn| {
+        let key = match scope.children.insert(child) {
+            Ok(key) => key,
+            Err(_) => panic!("the empty arena accepts its first child"),
+        };
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entries
+            .get_mut(member.id())
+            .expect("the reservation remains registered")
+            .promote(key, None, txn);
+        root.admit_child_locked(resident_projection(&reservation.slot), txn);
+        key
+    });
+    assert!(scope.children[key].terminalize(
+        &root,
+        Exit::never_started(),
+        None,
+        StartupDisposition::NotAborted,
+    ));
+    let mut removal = super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
+    assert!(root.snapshot().child("worker").is_some());
+
+    let captures = root.probe_gate_captures();
+    let gate = root.observation_gate();
+    let held_gate = gate.lock();
+    std::thread::scope(|threads| {
+        let finalizer = threads.spawn(|| scope.finalize_removal(key));
+        assert_eq!(
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("finalization reaches its commit gate within the bound"),
+            GateCapture::Observation
+        );
+        assert!(
+            control
+                .state
+                .lock()
+                .expect("dynamic-state mutex remains available")
+                .entries
+                .contains_key(member.id()),
+            "the old id remains claimed until residency withdrawal can commit"
+        );
+        drop(held_gate);
+        finalizer.join().expect("finalization completes");
+    });
+
+    assert!(root.snapshot().child("worker").is_none());
+    assert!(
+        !control
+            .state
+            .lock()
+            .expect("dynamic-state mutex remains healthy")
+            .entries
+            .contains_key(member.id()),
+        "id release follows the Removed publication"
+    );
+    assert_eq!(removal.try_receive(), Some(RemoveOutcome::Removed));
+
+    let replacement = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("the id is reusable after the Removed commit");
+    cancel_dynamic_reservation(
+        &replacement.scope,
+        replacement.control.as_ref(),
+        &replacement.slot,
+    );
+}
+
+#[test]
+fn draining_cannot_publish_across_an_inflight_reservation_transaction() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state(ScopeState::Running);
+    let (events, _receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(events);
+    root.set_dynamic_route(Some(control.clone()));
+
+    let state = control.state.lock().expect("dynamic-state mutex poisoned");
+    let (entered, observed) = std::sync::mpsc::channel();
+    std::thread::scope(|threads| {
+        let reserve_root = Arc::clone(&root);
+        let reserver = threads.spawn(move || {
+            reserve_root.with_observation_gate(|txn| {
+                entered
+                    .send(())
+                    .expect("the test waits for the reservation transaction");
+                super::super::admission_control::reserve_dynamic_in(
+                    &reserve_root,
+                    ChildId::from("worker"),
+                    None,
+                    txn,
+                )
+            })
+        });
+        observed
+            .recv_timeout(CAPTURE_PROBE_WAIT)
+            .expect("reservation acquires the observation gate");
+
+        let captures = root.probe_gate_captures();
+        let drain_root = Arc::clone(&root);
+        let drainer = threads.spawn(move || drain_root.set_state(ScopeState::Draining));
+        assert_eq!(
+            captures
+                .recv_timeout(CAPTURE_PROBE_WAIT)
+                .expect("draining reaches the occupied gate within the bound"),
+            GateCapture::Observation
+        );
+        assert_eq!(
+            root.record().state,
+            ScopeState::Running,
+            "draining cannot publish after the reservation has read the live phase"
+        );
+
+        drop(state);
+        let reservation = reserver
+            .join()
+            .expect("reservation transaction does not panic")
+            .expect("the earlier transaction reserves before draining");
+        drainer
+            .join()
+            .expect("draining completes after reservation");
+        assert_eq!(root.record().state, ScopeState::Draining);
+        cancel_dynamic_reservation(
+            &reservation.scope,
+            reservation.control.as_ref(),
+            &reservation.slot,
+        );
+    });
 }
 
 #[crate::runtime::test]
 async fn removal_from_a_foreign_thread_reaches_the_driver() {
-    let mut identity = ScopeIdentity::new();
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
-    let membership = identity
+    let membership = root
+        .child_identity
+        .lock()
+        .expect("scope identity mutex poisoned")
         .mint_membership(&child_id)
         .expect("membership available");
     let member = MemberCell::new(child_id.clone(), membership);
@@ -241,12 +396,14 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
         );
     let foreign_control = Arc::clone(&control);
     let foreign_slot = Arc::clone(&slot);
+    let foreign_root = Arc::clone(&root);
     std::thread::spawn(move || {
         assert!(
             !crate::runtime::is_available(),
             "Tokio context is not inherited by a foreign thread"
         );
         super::super::signal_fused_cancel(
+            &foreign_root,
             foreign_control.as_ref(),
             &foreign_slot,
             &Latch::default(),
@@ -374,7 +531,11 @@ async fn annulment_before_admission_owns_never_started_terminality() {
         panic!("admission enqueueing submits the request")
     };
 
-    cancel_dynamic_reservation(reservation.control.as_ref(), &reservation.slot);
+    cancel_dynamic_reservation(
+        &reservation.scope,
+        reservation.control.as_ref(),
+        &reservation.slot,
+    );
     let annulled_stage = member.record().stage;
     assert!(matches!(
         &annulled_stage,
@@ -465,7 +626,11 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
     // The promoted entry is no longer reserved, so a late annul (a dropped
     // `Admission` future racing its own completion) must not terminalize the
     // now-supervised member.
-    cancel_dynamic_reservation(reservation.control.as_ref(), &reservation.slot);
+    cancel_dynamic_reservation(
+        &reservation.scope,
+        reservation.control.as_ref(),
+        &reservation.slot,
+    );
     assert!(
         !matches!(member.record().stage, MemberStage::Terminal(_)),
         "a late annul cannot compete with supervised terminalization"
@@ -584,9 +749,10 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
             let barrier = Arc::clone(&barrier);
             let annul_control = Arc::clone(&reservation.control);
             let annul_slot = Arc::clone(&reservation.slot);
+            let annul_scope = Arc::clone(&reservation.scope);
             std::thread::spawn(move || {
                 barrier.wait();
-                cancel_dynamic_reservation(annul_control.as_ref(), &annul_slot);
+                cancel_dynamic_reservation(&annul_scope, annul_control.as_ref(), &annul_slot);
             })
         };
         barrier.wait();
@@ -661,7 +827,12 @@ async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
     // `signal_fused_cancel` cannot queue a Removal for this membership;
     // the fired latch is the authoritative rejection evidence until the
     // queued Admission reaches the driver.
-    super::super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
+    super::super::signal_fused_cancel(
+        &reservation.scope,
+        control.as_ref(),
+        &reservation.slot,
+        &fused_cancel,
+    );
     assert!(fused_cancel.is_fired());
     assert!(
         crate::runtime::unbounded_mpsc_try_recv(&mut dynamic_event_receiver).is_none(),
@@ -753,7 +924,12 @@ async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_rech
             }
             std::thread::yield_now();
         }
-        super::super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
+        super::super::signal_fused_cancel(
+            &reservation.scope,
+            control.as_ref(),
+            &reservation.slot,
+            &fused_cancel,
+        );
         // Release without unwinding: conversion must proceed into the
         // under-lock re-check, not observe a poisoned identity mutex.
         drop(identity);
@@ -850,7 +1026,12 @@ async fn exercise_double_removal(delivery: DuplicateRemovalDelivery) {
         .get(member.id())
         .and_then(DynamicEntry::key)
         .expect("the admission installs its child key");
-    super::super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
+    super::super::signal_fused_cancel(
+        &reservation.scope,
+        control.as_ref(),
+        &reservation.slot,
+        &fused_cancel,
+    );
     let mut removal_response =
         super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
 
@@ -998,7 +1179,7 @@ async fn double_removal_is_idempotent_during_construction_disposal() {
 }
 
 #[crate::runtime::test]
-async fn fused_only_removal_publishes_removing_from_the_driver() {
+async fn fused_only_removal_commits_phase_and_projection_together() {
     let (
         mut scope,
         mut event_receiver,
@@ -1051,26 +1232,26 @@ async fn fused_only_removal_publishes_removing_from_the_driver() {
         .and_then(DynamicEntry::key)
         .expect("the admission installs its child key");
 
-    // A fused drop is the only removal source in this variant. Unlike an
-    // explicit `remove`, `signal_fused_cancel` marks the control-plane entry
-    // Removing and queues the Removal without touching the member record,
-    // so the driver-side `publish_dynamic_removal` call in `handle_removal`
-    // is the only writer of the public Removing projection on this path.
-    // The projection asserts after `handle_removal` pin that call; the
-    // explicit-remove variants cannot, because `remove_dynamic_impl`
-    // publishes the projection before its request reaches the driver.
+    // A fused drop is the only removal source in this variant. Its dynamic
+    // phase and public projection commit under one observation transaction,
+    // before the deferred driver request is delivered.
     assert_eq!(member.record().membership_status, MembershipStatus::Active);
-    super::super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
+    super::super::signal_fused_cancel(
+        &reservation.scope,
+        control.as_ref(),
+        &reservation.slot,
+        &fused_cancel,
+    );
     assert_eq!(
         member.record().membership_status,
-        MembershipStatus::Active,
-        "the fused source leaves the Removing projection to the driver"
+        MembershipStatus::Removing,
+        "the fused source commits the Removing projection with its phase"
     );
     assert!(matches!(
         root.snapshot()
             .child("worker")
             .map(|child| child.membership_status),
-        Some(MembershipStatus::Active)
+        Some(MembershipStatus::Removing)
     ));
     let removal = match crate::runtime::timeout(
         Duration::from_secs(2),
@@ -1277,12 +1458,12 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
         root.snapshot()
             .child("worker")
             .map(|child| child.membership_status),
-        Some(MembershipStatus::Active)
+        Some(MembershipStatus::Removing)
     ));
     assert_eq!(
         scope.dispatch_membership_status(key),
         MembershipStatus::Removing,
-        "exit dispatch follows the fused-cancel control plane before the public projection"
+        "exit dispatch and the public projection share the fused-cancel commit"
     );
 
     scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);

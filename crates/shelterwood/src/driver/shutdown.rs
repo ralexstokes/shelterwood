@@ -77,13 +77,35 @@ pub(crate) async fn shutdown_scope(
 
 impl ScopeRuntime {
     pub(super) fn begin_drain(&mut self, reason: StopReason) {
+        let startup = self
+            .lifecycle
+            .is_starting()
+            .then_some(Err(StartupError::ShutdownRequested));
+        self.begin_drain_transition(reason, startup);
+    }
+
+    pub(super) fn begin_drain_with_startup(
+        &mut self,
+        reason: StopReason,
+        startup: Result<(), StartupError>,
+    ) {
+        self.begin_drain_transition(reason, Some(startup));
+    }
+
+    fn begin_drain_transition(
+        &mut self,
+        reason: StopReason,
+        startup: Option<Result<(), StartupError>>,
+    ) {
         let Some(effect) = self.lifecycle.begin_drain(reason) else {
             return;
         };
-        if effect.startup_pending {
-            self.root.set_startup(Err(StartupError::ShutdownRequested));
+        if let Some(startup) = startup {
+            self.root.set_state_and_startup(effect.state, startup);
+        } else {
+            debug_assert!(!effect.startup_pending);
+            self.root.set_state(effect.state);
         }
-        self.root.set_state(effect.state);
         match self.root.flavor {
             ScopeFlavor::Ordered => {
                 self.ordered_stop_cursor = self.children.keys().next_back();

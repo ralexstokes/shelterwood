@@ -92,7 +92,12 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     // The fused admission handle drops only now: the cancellation latch
     // fires after the backoff was scheduled, and its Removal edge queues
     // behind the already-due restart deadline.
-    super::super::signal_fused_cancel(control.as_ref(), &reservation.slot, &fused_cancel);
+    super::super::signal_fused_cancel(
+        &reservation.scope,
+        control.as_ref(),
+        &reservation.slot,
+        &fused_cancel,
+    );
     assert!(fused_cancel.is_fired());
 
     let deadline = scope

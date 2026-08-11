@@ -137,34 +137,60 @@ async fn terminal_stop_paths_share_one_complete_observation_transition() {
 }
 
 #[crate::runtime::test]
-async fn no_live_root_fallback_preserves_the_first_stopped_publication() {
+async fn root_driver_panic_mid_drain_preserves_the_first_stopped_publication() {
     let scope = isolated_scope("root", ScopeFlavor::Ordered);
     let epoch = scope
         .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
+    scope
+        .member
+        .update(|record| record.stage = MemberStage::Running);
+    scope.set_state_and_startup(ScopeState::Running, Ok(()));
+
+    let mut lifecycle = ScopeLifecycle::running();
+    assert!(
+        lifecycle.begin_drain(StopReason::Finished).is_some(),
+        "the driver enters its orderly drain before panicking"
+    );
+    scope.set_state(ScopeState::Draining);
+
     let handle = ScopeRef {
         cell: Arc::clone(&scope),
     };
     let mut snapshots = handle.subscribe_snapshots();
     let mut events = handle.subscribe_lifecycle();
 
-    scope.finish_incarnation(epoch, StopReason::Finished);
-    assert!(
-        !matches!(scope.member.record().stage, MemberStage::Terminal(_)),
-        "the driver-drop publication leaves root terminality to the join monitor"
-    );
-
-    let panic_exit = Exit::new(
-        ExitKind::Panicked {
-            message: Some("root driver panicked mid-drain".to_owned()),
-        },
-        Cancellation::NotObserved,
-    );
-    scope.finish_live_root_incarnation(StopReason::ShutdownRequested, panic_exit.clone());
+    let (events_tx, _events_rx) = crate::runtime::unbounded_mpsc();
+    let (disposal_events_tx, _disposal_events_rx) = crate::runtime::unbounded_mpsc();
+    let driver = crate::runtime::spawn({
+        let scope = Arc::clone(&scope);
+        async move {
+            let _runtime = ScopeRuntimeBuilder::new(scope, epoch, events_tx, disposal_events_tx)
+                .with_lifecycle(lifecycle)
+                .build();
+            panic!("root driver panicked mid-drain");
+            #[allow(unreachable_code)]
+            StopReason::Finished
+        }
+    });
+    let panic_exit = super::super::classify_root_driver_join(crate::runtime::join(driver).await)
+        .expect_err("the injected root-driver panic reaches its join monitor");
 
     let stopped = ScopeState::Stopped {
         reason: StopReason::Finished,
     };
+    assert_eq!(
+        scope.record().state,
+        stopped,
+        "ScopeRuntime's unwind epilogue publishes its established drain reason"
+    );
+    assert!(
+        !matches!(scope.member.record().stage, MemberStage::Terminal(_)),
+        "the unwind epilogue leaves root terminality to the join monitor"
+    );
+
+    scope.finish_live_root_incarnation(StopReason::ShutdownRequested, panic_exit.clone());
+
     assert_eq!(scope.record().state, stopped);
     assert!(matches!(
         scope.member.record().stage,

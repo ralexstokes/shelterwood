@@ -121,7 +121,7 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
         .with_lifecycle(ScopeLifecycle::running())
         .with_next_ordered_start(Some(key))
         .build();
-    plan.take_for_runtime().finish_transfer();
+    plan.finish_transfer();
 
     scope.children[key].incarnations =
         IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
@@ -226,7 +226,7 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
         .with_children(children)
         .with_next_ordered_start(Some(key))
         .build();
-    plan.take_for_runtime().finish_transfer();
+    plan.finish_transfer();
 
     // Burn the counter's last usable generation without touching the
     // member record: the child is still an unspawned initial member, so
@@ -324,7 +324,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
         .with_children(children)
         .with_next_ordered_start(Some(key))
         .build();
-    plan.take_for_runtime().finish_transfer();
+    plan.finish_transfer();
 
     assert!(scope.children[key].initial);
     scope.spawn_child(key);

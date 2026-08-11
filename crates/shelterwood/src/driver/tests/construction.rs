@@ -78,7 +78,7 @@ async fn task_aborted_scope_driver_resolves_startup() {
     let scope = Arc::clone(&plan.root);
     let epoch = ScopeEpochGuard::begin(&scope).expect("test scope epoch is available");
     let driver = crate::runtime::spawn(run_scope_incarnation(
-        plan.take_for_runtime(),
+        plan,
         ScopeRole::Nested(NestedScopeLatches {
             parent_ready: CompletionGatedLatch::default(),
             ancestor: AncestorCommandLatches {
@@ -250,7 +250,7 @@ async fn scope_plan_conversion_panic_terminalizes_every_child() {
     );
 
     let mut driver = Box::pin(run_scope_incarnation(
-        plan.take_for_runtime(),
+        plan,
         ScopeRole::Nested(NestedScopeLatches {
             parent_ready: CompletionGatedLatch::default(),
             ancestor: AncestorCommandLatches {
@@ -334,7 +334,7 @@ async fn conversion_unwind_evicts_never_started_child_identities() {
         .is_err()
     );
     let mut driver = Box::pin(run_scope_incarnation(
-        plan.take_for_runtime(),
+        plan,
         ScopeRole::Nested(NestedScopeLatches {
             parent_ready: CompletionGatedLatch::default(),
             ancestor: AncestorCommandLatches {
@@ -451,11 +451,7 @@ async fn initial_added_wake_observes_the_keyed_dynamic_route() {
             .is_pending()
     );
 
-    let driver = crate::runtime::spawn(run_scope_incarnation(
-        plan.take_for_runtime(),
-        ScopeRole::Root,
-        epoch,
-    ));
+    let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
     let abort = driver.abort_handle();
     assert!(matches!(
         crate::runtime::timeout(Duration::from_secs(1), probe.observed.fired()).await,

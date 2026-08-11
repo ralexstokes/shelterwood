@@ -49,8 +49,7 @@ use crate::{
     identity::IncarnationCounter,
     observe::LifecycleEventKind,
     plan::{
-        BuilderCore, ChildConstruction, ChildPlan, LowerError, RuntimeScopePlan, ScopeFactory,
-        ScopePlan, SlotCell,
+        BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
     },
     policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
@@ -591,7 +590,7 @@ async fn run_nested_tree_with_epoch(
             return Err(crate::ExitError::from_startup_failure(failure));
         }
     };
-    run_scope_incarnation(plan.take_for_runtime(), ScopeRole::Nested(latches), epoch)
+    run_scope_incarnation(plan, ScopeRole::Nested(latches), epoch)
         .await
         .into_nested_result()
 }
@@ -604,7 +603,7 @@ async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
         drop(plan);
         return StopReason::NeverStarted;
     };
-    run_scope_incarnation(plan.take_for_runtime(), role, epoch).await
+    run_scope_incarnation(plan, role, epoch).await
 }
 
 /// Derives the membership index and incompleteness count for a freshly
@@ -623,7 +622,7 @@ fn index_children(children: &ChildArena<ChildRuntime>) -> (HashMap<Membership, C
 }
 
 async fn run_scope_incarnation(
-    mut plan: RuntimeScopePlan,
+    mut plan: ScopePlan,
     role: ScopeRole,
     epoch: ScopeEpochGuard,
 ) -> StopReason {
@@ -659,7 +658,7 @@ async fn run_scope_incarnation(
         (None, None)
     };
     // Transfer children one at a time. The not-yet-converted suffix remains
-    // owned by RuntimeScopePlan, while ChildRuntime::from_plan arms the current
+    // owned by ScopePlan, while ChildRuntime::from_plan arms the current
     // child's obligation before fallible setup. Thus a panic at any point has
     // exactly one terminality owner for every child.
     let mut children = ChildArena::default();

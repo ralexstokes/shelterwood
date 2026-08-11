@@ -442,14 +442,6 @@ pub(crate) struct ScopePlan {
 
 struct ScopePlanTerminality;
 
-pub(crate) struct RuntimeScopePlan {
-    pub(crate) root: Arc<ScopeCell>,
-    pub(crate) config: ScopeConfig,
-    pub(crate) defaults: ResolvedDefaults,
-    pub(crate) children: Vec<ChildPlan>,
-    terminality: Option<ScopePlanTerminality>,
-}
-
 fn terminalize_plan(
     root: &ScopeCell,
     children: &[ChildPlan],
@@ -470,27 +462,6 @@ fn terminalize_plan(
 }
 
 impl ScopePlan {
-    /// Consumes declaration ownership and transfers its terminality obligation
-    /// to the runtime plan. There is no independently mutable disarm bit: a
-    /// caller either owns the declaration plan or has consumed it here.
-    pub(crate) fn take_for_runtime(mut self) -> RuntimeScopePlan {
-        RuntimeScopePlan {
-            root: Arc::clone(&self.root),
-            config: self.config.clone(),
-            defaults: self.defaults.clone(),
-            children: std::mem::take(&mut self.children),
-            terminality: self.terminality.take(),
-        }
-    }
-}
-
-impl Drop for ScopePlan {
-    fn drop(&mut self) {
-        terminalize_plan(&self.root, &self.children, &mut self.terminality);
-    }
-}
-
-impl RuntimeScopePlan {
     /// Finishes the transfer after every child has installed its own
     /// terminality obligation. Consuming `self` makes a partial handoff
     /// impossible to mistake for a completed one.
@@ -505,7 +476,7 @@ impl RuntimeScopePlan {
     }
 }
 
-impl Drop for RuntimeScopePlan {
+impl Drop for ScopePlan {
     fn drop(&mut self) {
         terminalize_plan(&self.root, &self.children, &mut self.terminality);
     }

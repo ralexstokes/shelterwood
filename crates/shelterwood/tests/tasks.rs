@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use crate::common::LiveFlag;
 use shelterwood::{
-    BuildError, Cancellation, DynamicTree, Exit, ExitError, ExitKind, GracePhase, Readiness,
-    ReadinessDeadline, RemoveOutcome, PolicyError, ReserveError, Shutdown, StopReason, TaskDef,
+    BuildError, Cancellation, DynamicTree, Exit, ExitError, ExitKind, GracePhase, PolicyError,
+    Readiness, ReadinessDeadline, RemoveOutcome, ReserveError, Shutdown, StopReason, TaskDef,
     TaskOnceDef, Tree,
 };
 

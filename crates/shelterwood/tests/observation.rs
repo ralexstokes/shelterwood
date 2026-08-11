@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -662,6 +662,7 @@ async fn rebuilt_declared_handles_and_incarnations_keep_identity() {
 
     let stash: Arc<Mutex<Vec<(TaskRef, u64, shelterwood::Membership)>>> =
         Arc::new(Mutex::new(Vec::new()));
+    let keyed = Arc::new(Mutex::new(HashSet::<TaskRef>::new()));
     let builds = Arc::new(AtomicUsize::new(0));
     let mut outer = Tree::new();
     let nested = outer
@@ -669,6 +670,7 @@ async fn rebuilt_declared_handles_and_incarnations_keep_identity() {
             "nested",
             SubtreeDef::factory({
                 let stash = Arc::clone(&stash);
+                let keyed = Arc::clone(&keyed);
                 let builds = Arc::clone(&builds);
                 move || {
                     let mut tree = Tree::new();
@@ -682,6 +684,13 @@ async fn rebuilt_declared_handles_and_incarnations_keep_identity() {
                     // Capture identity before lowering. The prior terminal
                     // declaration's lineage was evicted, so this rebuild keeps
                     // its fresh, incomparable identity.
+                    assert!(
+                        keyed
+                            .lock()
+                            .expect("handle set mutex intact")
+                            .insert(handle.clone()),
+                        "each rebuilt declaration has fresh logical identity"
+                    );
                     stash.lock().expect("stash mutex intact").push((
                         handle.clone(),
                         hashed(&handle),
@@ -723,9 +732,23 @@ async fn rebuilt_declared_handles_and_incarnations_keep_identity() {
 
     assert_eq!(first.membership(), first_declared);
     assert_eq!(hashed(&first), first_hash);
+    assert!(
+        keyed
+            .lock()
+            .expect("handle set mutex intact")
+            .contains(&first),
+        "lowering and a later subtree restart preserve the first keyed handle"
+    );
     assert!(!second.membership().supersedes(first.membership()));
     assert!(!first.membership().supersedes(second.membership()));
     assert_eq!(second.membership(), second_declared);
+    assert!(
+        keyed
+            .lock()
+            .expect("handle set mutex intact")
+            .contains(&second),
+        "the rebuilt declaration remains retrievable after its membership rebase"
+    );
     assert_eq!(
         hashed(&second),
         second_hash,

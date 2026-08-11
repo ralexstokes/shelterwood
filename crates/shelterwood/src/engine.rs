@@ -602,6 +602,13 @@ impl ScopeEpochs {
             current,
             last_stopped,
         };
+        // A shutdown wait settles on `finished(target)`, so a freshly minted
+        // epoch must not already read as finished — that would settle a wait
+        // against the incarnation it just started.
+        debug_assert!(
+            !self.finished(current),
+            "a freshly minted epoch is not already finished"
+        );
         Some(current)
     }
 
@@ -635,6 +642,14 @@ impl ScopeEpochs {
                 *self = Self::Idle {
                     last_stopped: last_stopped.max(Some(epoch)),
                 };
+                // Settlement is monotone: once an owner finishes its epoch,
+                // every later `finished(epoch)` — including one asked across a
+                // subsequent incarnation — keeps reporting it. A waiter that
+                // missed the pulse can therefore never park forever.
+                debug_assert!(
+                    self.finished(epoch),
+                    "a finished epoch stays observably finished"
+                );
                 true
             }
             Self::Idle { .. } | Self::Live { .. } | Self::Exhausted { .. } => false,

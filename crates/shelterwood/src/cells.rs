@@ -1614,6 +1614,18 @@ impl ScopeCell {
         self.with_observation_gate(|wakes| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             let epoch = control.epochs.begin()?;
+            // The idle epoch plane pairs only with a settled projection:
+            // `Unstarted` before any mint, `Stopped` after every finish. That
+            // pairing is what lets `scope_settled` treat terminal membership
+            // plus a settled projection as final without stranding a scope
+            // that still owns a live incarnation.
+            debug_assert!(
+                matches!(
+                    self.record().state,
+                    ScopeState::Unstarted | ScopeState::Stopped { .. }
+                ),
+                "an idle scope projection is Unstarted or Stopped before a fresh incarnation mints"
+            );
             self.observation.record.modify_silently(|record| {
                 record.total_restarts = TotalRestarts::ZERO;
                 record.startup = None;
@@ -1863,6 +1875,35 @@ impl ScopeCell {
     pub(crate) fn incarnation_finished(&self, epoch: Epoch) -> bool {
         let control = self.control.lock().expect("scope control mutex poisoned");
         control.epochs.finished(epoch)
+    }
+
+    /// Whether a shutdown wait has crossed the finality fence for its target.
+    ///
+    /// Membership terminality alone is insufficient: parent-driver
+    /// destruction publishes it before the aborted nested driver runs the
+    /// scope epilogue that finishes the incarnation and publishes `Stopped`.
+    /// `None` is used only by the entry check, before a target epoch exists.
+    ///
+    /// This predicate is strictly weaker than membership terminality, so
+    /// shutdown liveness now rests on two structural invariants. First, every
+    /// live epoch has exactly one owner — the pre-driver epoch guard before a
+    /// scope runtime exists, the scope runtime itself afterwards — and both
+    /// finish it from `Drop`, so an unsettled target always has a pending
+    /// finisher. Second, an idle epoch plane implies a settled projection:
+    /// `begin_incarnation` is the only mint and it publishes `Starting`
+    /// under the control guard,
+    /// while [`Self::finish_incarnation`] always publishes `Stopped` under
+    /// that same guard, so `ScopeEpochs::Idle`/`Exhausted` can only pair with
+    /// `Unstarted` (never begun) or `Stopped`. Together they mean the
+    /// terminal-membership arm can never be the *only* reachable settlement
+    /// for a scope that still owns work.
+    pub(crate) fn scope_settled(&self, epoch: Option<Epoch>) -> bool {
+        epoch.is_some_and(|epoch| self.incarnation_finished(epoch))
+            || (matches!(self.member.record().stage, MemberStage::Terminal(_))
+                && matches!(
+                    self.record().state,
+                    ScopeState::Stopped { .. } | ScopeState::Unstarted
+                ))
     }
 
     pub(crate) fn set_admitted_children(self: &Arc<Self>, children: Vec<ResidentProjection>) {

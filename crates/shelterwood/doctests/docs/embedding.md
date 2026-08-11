@@ -60,11 +60,14 @@ each fresh tree or actor incarnation.
 5. Call `system.shutdown(timeout).await` before closing host resources or
    destroying the runtime.
 6. Inspect a structured timeout report if cooperative teardown exceeded its
-   budget; all actor futures are nevertheless joined when the call returns.
+   budget. The root driver is joined on return; a nested framework driver that
+   hits the hard-abort fallback can leave deeper task cancellation finishing
+   asynchronously, as detailed in the shutdown guide.
 7. Build a new tree for another cycle. Builders and `System` are single-use by
    design; durable host state is what crosses cycles.
 
 Dropping `System` also requests graceful shutdown, but awaiting explicit
-shutdown is the only way for the host to know teardown has joined and to receive
+shutdown is the only way for the host to join the root driver and receive
 straggler evidence. See [shutdown and resource ownership](shutdown-and-resources.md)
-for grace, blocking-work, and teardown-notification rules.
+for the recursive hard-abort boundary, grace, blocking-work, and
+teardown-notification rules.

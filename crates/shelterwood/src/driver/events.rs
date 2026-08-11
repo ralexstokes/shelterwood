@@ -91,6 +91,16 @@ impl From<DriverEvent> for Pending {
     }
 }
 
+/// Retains the item that ended a blocking wait. The driver then returns to
+/// its single collection site so this head is arbitrated with every other
+/// input that became eligible before the wake was observed.
+pub(super) fn retain_woken_event(
+    event: DriverEvent,
+    pending: &mut Vec<(ArbitrationClass, Pending)>,
+) {
+    pending.push(Pending::from(event).classified());
+}
+
 /// The three unbounded lanes one driver wake collects from, in collection
 /// order.
 pub(super) struct EventLanes<'a> {

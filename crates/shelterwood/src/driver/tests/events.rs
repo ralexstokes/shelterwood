@@ -11,6 +11,73 @@ fn disposed_child(pending: &Pending) -> ChildKey {
     }
 }
 
+/// Pins the post-blocking-wake gap: removal is queued on the control lane
+/// before readiness reaches the primary lane, but the biased wait returns the
+/// primary head. Retaining that head and re-entering the common collection
+/// site must put both events in one arbitration batch, where removal wins.
+#[crate::runtime::test]
+async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
+    let identity = isolated_scope("identity", ScopeFlavor::Dynamic);
+    let membership = identity.member.membership();
+    let key = ChildKey(1);
+    let incarnation = IncarnationCounter::fixture(membership)
+        .mint()
+        .expect("fixture incarnation is available");
+    let (primary, mut primary_receiver) = crate::runtime::unbounded_mpsc();
+    let (control, mut control_receiver) = crate::runtime::unbounded_mpsc();
+    let (_disposal, mut disposal_receiver) = crate::runtime::unbounded_mpsc();
+
+    let wait = crate::runtime::wait_scope(
+        crate::runtime::ScopeWait {
+            signal: future::pending::<()>(),
+            parent_shutdown: future::pending::<()>(),
+        },
+        &mut primary_receiver,
+        Some(&mut control_receiver),
+        None,
+    );
+    let publisher = crate::runtime::spawn(async move {
+        crate::runtime::yield_now().await;
+        control
+            .send(DriverEvent::Removal(RemovalRequest { membership, key }))
+            .expect("the control lane remains open");
+        primary
+            .send(DriverEvent::Child(ChildEvent::Ready {
+                child: key,
+                incarnation,
+            }))
+            .expect("the primary lane remains open");
+    });
+    let wake = wait.await;
+    assert!(matches!(
+        crate::runtime::join(publisher).await,
+        crate::runtime::JoinOutcome::Ok { value: () }
+    ));
+    let crate::runtime::ScopeWake::Message(Some(event)) = wake else {
+        panic!("the biased blocking wait returns the later primary head");
+    };
+
+    let mut pending = Vec::new();
+    super::super::retain_woken_event(event, &mut pending);
+    assert!(!super::super::collect_event_lanes(
+        super::super::EventLanes {
+            primary: &mut primary_receiver,
+            control: Some(&mut control_receiver),
+            disposal: &mut disposal_receiver,
+        },
+        super::super::MIN_EVENT_BATCH_LIMIT,
+        &mut pending,
+    ));
+    arbitrate(&mut pending);
+
+    assert_eq!(pending.len(), 2);
+    assert!(matches!(pending[0].1, Pending::Removal(_)));
+    assert!(matches!(
+        pending[1].1,
+        Pending::Child(ChildEvent::Ready { .. })
+    ));
+}
+
 /// Pins the wiring the driver's per-wake collection depends on: the disposal
 /// lane is collected last, through the same cap as the other two, and its
 /// saturation reaches the caller so the loop yields a scheduler turn instead

@@ -22,7 +22,7 @@ use child::ChildRuntime;
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
 use events::{
     ChildEvent, DeadlineKind, DriverEvent, EventLanes, MIN_EVENT_BATCH_LIMIT, Pending,
-    collect_event_lanes, restart_shutdown_work,
+    collect_event_lanes, restart_shutdown_work, retain_woken_event,
 };
 use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
@@ -870,11 +870,11 @@ async fn run_scope_incarnation(
                     continue;
                 }
                 runtime::ScopeWake::Message(Some(event)) => {
-                    pending.push(Pending::from(event).classified());
+                    retain_woken_event(event, &mut pending);
                     continue;
                 }
                 runtime::ScopeWake::ControlMessage(Some(event)) => {
-                    pending.push(Pending::from(event).classified());
+                    retain_woken_event(event, &mut pending);
                     continue;
                 }
                 runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {

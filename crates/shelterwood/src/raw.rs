@@ -255,9 +255,10 @@ impl PanicSlot {
 
 /// The one cleanup route for values owned by a raw incarnation.
 ///
-/// Every container stores user payloads in [`Contained`], and offload futures
-/// use the same funnel explicitly when ownership sits behind a mutex. A
-/// destructor panic is retained as cleanup evidence and wakes an idle actor;
+/// Collection drains and offload futures route user payloads through this
+/// funnel. Collections keep their resident elements raw and dispose each one
+/// explicitly when draining, avoiding a cloned disposal handle per element.
+/// A destructor panic is retained as cleanup evidence and wakes an idle actor;
 /// it never unwinds through another user destructor.
 #[derive(Clone)]
 struct RawDisposal {
@@ -307,12 +308,6 @@ impl<T> Contained<T> {
         }
     }
 
-    fn get(&self) -> &T {
-        self.value
-            .as_ref()
-            .expect("contained ownership is consumed once")
-    }
-
     fn into_inner(mut self) -> T {
         self.value
             .take()
@@ -348,7 +343,7 @@ struct EventQueue<M> {
     // Insertion and the snapshot share this lock, so FIFO order itself is the
     // sequence and there is no integer counter whose saturation could blur a
     // boundary.
-    queue: Mutex<VecDeque<Contained<QueuedEvent<M>>>>,
+    queue: Mutex<VecDeque<QueuedEvent<M>>>,
     signal: Signal,
     disposal: RawDisposal,
 }
@@ -370,7 +365,6 @@ impl<M> EventQueue<M> {
     }
 
     fn push(&self, event: QueuedEvent<M>) {
-        let event = Contained::new(event, self.disposal.clone());
         self.queue
             .lock()
             .expect("actor event queue mutex poisoned")
@@ -380,7 +374,6 @@ impl<M> EventQueue<M> {
 
     #[cfg(test)]
     fn insert_with(&self, event: QueuedEvent<M>, before_insert: impl FnOnce()) {
-        let event = Contained::new(event, self.disposal.clone());
         let mut queue = self.queue.lock().expect("actor event queue mutex poisoned");
         before_insert();
         queue.push_back(event);
@@ -406,14 +399,14 @@ impl<M> EventQueue<M> {
     }
 
     #[cfg(test)]
-    fn pop(&self) -> Option<Contained<QueuedEvent<M>>> {
+    fn pop(&self) -> Option<QueuedEvent<M>> {
         self.queue
             .lock()
             .expect("actor event queue mutex poisoned")
             .pop_front()
     }
 
-    fn pop_through(&self, remaining: &mut usize) -> Option<Contained<QueuedEvent<M>>> {
+    fn pop_through(&self, remaining: &mut usize) -> Option<QueuedEvent<M>> {
         if *remaining == 0 {
             None
         } else {
@@ -433,11 +426,25 @@ impl<M> EventQueue<M> {
     }
 
     fn clear(&self) {
-        let queue = {
+        let mut queue = {
             let mut queue = self.queue.lock().expect("actor event queue mutex poisoned");
             std::mem::take(&mut *queue)
         };
-        drop(queue);
+        while let Some(event) = queue.pop_front() {
+            self.disposal.dispose(event);
+        }
+    }
+}
+
+impl<M> Drop for EventQueue<M> {
+    fn drop(&mut self) {
+        let queue = self
+            .queue
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while let Some(event) = queue.pop_front() {
+            self.disposal.dispose(event);
+        }
     }
 }
 
@@ -457,12 +464,12 @@ impl ArmingOrder {
 struct KeyHash(u64);
 
 struct TimerEntry<M> {
-    key: Contained<Box<dyn Any + Send>>,
+    key: Box<dyn Any + Send>,
     /// `None` when the requested delay overflows the clock: a deadline that
     /// never arrives, mirroring the offload path — never "due now".
     deadline: Option<Instant>,
     arming_order: ArmingOrder,
-    message: Contained<TimerMessage<M>>,
+    message: TimerMessage<M>,
     period: Option<Duration>,
 }
 
@@ -510,9 +517,12 @@ impl<M> TimerStore<M> {
     }
 
     fn clear(&mut self) {
-        self.keyed.clear();
+        let keyed = std::mem::take(&mut self.keyed);
         self.armings.clear();
         self.deadlines.clear();
+        for entry in keyed.into_values().flatten() {
+            self.dispose_entry(entry);
+        }
     }
 
     fn replace<K>(
@@ -525,12 +535,10 @@ impl<M> TimerStore<M> {
     ) where
         K: Hash + Eq + Send + 'static,
     {
-        let key = Contained::new(key, self.disposal.clone());
-        let message = Contained::new(message, self.disposal.clone());
-        let _ = self.remove(key.get());
-        let hash = self.hash_key(key.get());
+        self.remove(&key);
+        let hash = self.hash_key(&key);
         self.keyed.entry(hash).or_default().push(TimerEntry {
-            key: Contained::new(Box::new(key.into_inner()), self.disposal.clone()),
+            key: Box::new(key),
             deadline,
             arming_order,
             message,
@@ -543,7 +551,7 @@ impl<M> TimerStore<M> {
         }
     }
 
-    fn remove<K>(&mut self, key: &K) -> Option<TimerEntry<M>>
+    fn take<K>(&mut self, key: &K) -> Option<TimerEntry<M>>
     where
         K: Hash + Eq + 'static,
     {
@@ -557,7 +565,7 @@ impl<M> TimerStore<M> {
                 {
                     probes += 1;
                 }
-                entry.key.get().downcast_ref::<K>() == Some(key)
+                entry.key.downcast_ref::<K>() == Some(key)
             })?;
             #[cfg(test)]
             {
@@ -574,6 +582,23 @@ impl<M> TimerStore<M> {
             self.deadlines.remove(&(deadline, entry.arming_order));
         }
         Some(entry)
+    }
+
+    fn remove<K>(&mut self, key: &K) -> bool
+    where
+        K: Hash + Eq + 'static,
+    {
+        let Some(entry) = self.take(key) else {
+            return false;
+        };
+        self.dispose_entry(entry);
+        true
+    }
+
+    fn dispose_entry(&self, entry: TimerEntry<M>) {
+        let TimerEntry { key, message, .. } = entry;
+        self.disposal.dispose(key);
+        self.disposal.dispose(message);
     }
 
     fn remove_arming(&mut self, arming_order: ArmingOrder) -> Option<TimerEntry<M>> {
@@ -631,6 +656,12 @@ impl<M> TimerStore<M> {
 
     fn next_deadline(&self) -> Option<Instant> {
         self.deadlines.first().map(|(deadline, _)| *deadline)
+    }
+}
+
+impl<M> Drop for TimerStore<M> {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
@@ -871,7 +902,7 @@ impl OffloadResource {
 
 struct RawResources<M> {
     accepting: bool,
-    continuations: VecDeque<Contained<M>>,
+    continuations: VecDeque<M>,
     // Set after returning a continuation and cleared after an external
     // mailbox/offload/timer item. `next_ready` uses it to prohibit two local
     // continuations from leading while an external source remains eligible.
@@ -924,7 +955,9 @@ impl<M> RawResources<M> {
         for offload in &mut self.offloads {
             offload.cancel();
         }
-        self.continuations.clear();
+        while let Some(message) = self.continuations.pop_front() {
+            self.disposal.dispose(message);
+        }
         self.timers.clear();
         self.ready_batch = None;
         self.events.clear();
@@ -1154,9 +1187,7 @@ impl<M: Send + 'static> RawContext<M> {
         if self.is_stopping() || !self.resources.accepting {
             return Err(Rejected::new(message));
         }
-        self.resources
-            .continuations
-            .push_back(Contained::new(message, self.resources.disposal.clone()));
+        self.resources.continuations.push_back(message);
         Ok(())
     }
 
@@ -1192,11 +1223,9 @@ impl<M: Send + 'static> RawContext<M> {
             return Err(Rejected::new((key, message)));
         }
         if period.is_zero() {
-            let key = Contained::new(key, self.resources.disposal.clone());
-            let message = Contained::new(message, self.resources.disposal.clone());
-            let _ = self.clear_timer(key.get());
-            drop(key);
-            drop(message);
+            let _ = self.clear_timer(&key);
+            self.resources.disposal.dispose(key);
+            self.resources.disposal.dispose(message);
             return Ok(());
         }
         self.replace_timer(
@@ -1213,7 +1242,7 @@ impl<M: Send + 'static> RawContext<M> {
     where
         K: Hash + Eq + Send + 'static,
     {
-        self.resources.timers.remove(key).is_some()
+        self.resources.timers.remove(key)
     }
 
     /// Starts incarnation-owned async work with one total deadline budget.
@@ -1491,7 +1520,7 @@ impl<M: Send + 'static> RawContext<M> {
                 batch.record_continuation_delivery();
                 self.resources.continuation_needs_external = true;
                 self.resources.ready_batch = Some(batch);
-                return Some(message.into_inner());
+                return Some(message);
             }
 
             if !batch.mailbox_complete {
@@ -1511,7 +1540,7 @@ impl<M: Send + 'static> RawContext<M> {
                     .events
                     .pop_through(&mut batch.offloads_remaining)
                 {
-                    if let Some(message) = Self::materialize_event(event) {
+                    if let Some(message) = self.materialize_event(event) {
                         self.resources.continuation_needs_external = false;
                         self.resources.ready_batch = Some(batch);
                         return Some(message);
@@ -1542,7 +1571,7 @@ impl<M: Send + 'static> RawContext<M> {
                 batch.record_continuation_delivery();
                 self.resources.continuation_needs_external = true;
                 self.resources.ready_batch = Some(batch);
-                return Some(message.into_inner());
+                return Some(message);
             }
             batch.continuations_remaining = 0;
 
@@ -1572,11 +1601,11 @@ impl<M: Send + 'static> RawContext<M> {
         }
     }
 
-    fn materialize_event(event: Contained<QueuedEvent<M>>) -> Option<M> {
-        if event.get().cancellation.is_fired() {
+    fn materialize_event(&self, event: QueuedEvent<M>) -> Option<M> {
+        if event.cancellation.is_fired() {
+            self.resources.disposal.dispose(event);
             return None;
         }
-        let event = event.into_inner();
         Some((event.make_message)())
     }
 
@@ -1619,7 +1648,7 @@ impl<M: Send + 'static> RawContext<M> {
         if let Some(period) = entry.period {
             let deadline = crate::deadline::Deadline::after(runtime::now(), period).instant();
             entry.deadline = deadline;
-            let TimerMessage::Interval(message, clone_message) = entry.message.get() else {
+            let TimerMessage::Interval(message, clone_message) = &entry.message else {
                 unreachable!("an interval timer must own a message factory")
             };
             let message = clone_message(message);
@@ -1632,7 +1661,9 @@ impl<M: Send + 'static> RawContext<M> {
             .timers
             .remove_arming(arming)
             .expect("a due one-shot timer remains registered");
-        let TimerMessage::Once(message) = entry.message.into_inner() else {
+        let TimerEntry { key, message, .. } = entry;
+        self.resources.disposal.dispose(key);
+        let TimerMessage::Once(message) = message else {
             unreachable!("a non-interval timer must own a one-shot message")
         };
         Some(message)
@@ -1992,8 +2023,8 @@ mod tests {
     };
 
     use super::{
-        Contained, EventQueue, OffloadResource, PanicSlot, QueuedEvent, RawResources,
-        SharedOffloadFuture, SharedOffloadState,
+        ArmingOrder, EventQueue, OffloadResource, PanicSlot, QueuedEvent, RawResources,
+        SharedOffloadFuture, SharedOffloadState, TimerMessage,
     };
     use crate::runtime::{
         Latch, PanicPayload, Signal, UnwindPanics, resume_preferred_panic,
@@ -2007,8 +2038,7 @@ mod tests {
         }
     }
 
-    fn value(event: Contained<QueuedEvent<usize>>) -> usize {
-        let event = event.into_inner();
+    fn value(event: QueuedEvent<usize>) -> usize {
         (event.make_message)()
     }
 
@@ -2301,6 +2331,27 @@ mod tests {
     }
 
     #[test]
+    fn resident_raw_collections_do_not_clone_disposal_per_element() {
+        let mut resources = RawResources::<()>::default();
+        let baseline = Arc::strong_count(&resources.panic);
+
+        resources.continuations.push_back(());
+        resources.events.push(QueuedEvent {
+            cancellation: Latch::default(),
+            make_message: Box::new(|| ()),
+        });
+        resources
+            .timers
+            .replace(7_u8, None, ArmingOrder(1), TimerMessage::Once(()), None);
+
+        assert_eq!(
+            Arc::strong_count(&resources.panic),
+            baseline,
+            "continuations, events, and timers store raw elements without disposal clones"
+        );
+    }
+
+    #[test]
     fn raw_resources_drop_cancels_every_offload_after_one_destructor_panics() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut resources = RawResources::<()>::default();
@@ -2349,21 +2400,35 @@ mod tests {
     }
 
     #[test]
-    fn freeze_contains_each_user_payload_destructor_independently() {
+    fn freeze_drains_each_raw_collection_with_independent_containment() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut resources = RawResources::<PanickingDrop>::default();
         for _ in 0..2 {
-            resources.continuations.push_back(Contained::new(
-                PanickingDrop(Arc::clone(&drops)),
-                resources.disposal.clone(),
-            ));
+            resources
+                .continuations
+                .push_back(PanickingDrop(Arc::clone(&drops)));
         }
+        let event_payload = PanickingDrop(Arc::clone(&drops));
+        resources.events.push(QueuedEvent {
+            cancellation: Latch::default(),
+            make_message: Box::new(move || {
+                drop(event_payload);
+                unreachable!("a disposed event is never materialized")
+            }),
+        });
+        resources.timers.replace(
+            1_u8,
+            None,
+            ArmingOrder(1),
+            TimerMessage::Once(PanickingDrop(Arc::clone(&drops))),
+            None,
+        );
 
         assert_eq!(resources.freeze(), 2);
         assert_eq!(
             drops.load(Ordering::SeqCst),
-            2,
-            "one hostile destructor cannot skip the remaining payloads"
+            4,
+            "one hostile destructor cannot skip later collection elements or drains"
         );
         let payload = resources
             .panic
@@ -2399,7 +2464,7 @@ mod timer_store_tests {
     }
 
     fn once(entry: super::TimerEntry<&'static str>) -> &'static str {
-        let TimerMessage::Once(message) = entry.message.into_inner() else {
+        let TimerMessage::Once(message) = entry.message else {
             panic!("expected a live one-shot timer")
         };
         message
@@ -2476,7 +2541,7 @@ mod timer_store_tests {
         assert_eq!(
             once(
                 timers
-                    .remove(&CollidingKey(2))
+                    .take(&CollidingKey(2))
                     .expect("colliding peer remains registered")
             ),
             "second"
@@ -2484,7 +2549,7 @@ mod timer_store_tests {
         assert_eq!(
             once(
                 timers
-                    .remove(&CollidingKey(1))
+                    .take(&CollidingKey(1))
                     .expect("replacement remains registered")
             ),
             "replacement"
@@ -2519,7 +2584,7 @@ mod timer_store_tests {
             );
         }
         for key in keys.into_iter().rev() {
-            assert!(timers.remove(&key).is_some());
+            assert!(timers.remove(&key));
         }
 
         assert!(timers.is_empty());

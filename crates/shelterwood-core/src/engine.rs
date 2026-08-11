@@ -16,8 +16,11 @@ use crate::{
 };
 
 /// Current state of a scope membership or incarnation.
+///
+/// Exhaustive on purpose: the driver and the observation surface both decide
+/// by matching every state, and pre-release there is no downstream user for
+/// `#[non_exhaustive]` to protect. See [`crate::exit::StopReason`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum ScopeState {
     /// Membership exists but no incarnation has spawned.
     Unstarted,

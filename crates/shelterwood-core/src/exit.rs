@@ -10,8 +10,12 @@ use std::{
 use crate::identity::{ChildId, Membership};
 
 /// The terminal reason for a scope incarnation or root system.
+///
+/// Deliberately exhaustive while the crate is pre-release: matching it across
+/// the crate boundary is how the façade proves it handles every state, and
+/// there is no downstream user for `#[non_exhaustive]` to protect yet. The
+/// attribute is a release-tagging decision, not an implementation one.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum StopReason {
     /// A non-empty ordered workload completed naturally.
     Finished,
@@ -266,14 +270,9 @@ impl Error for StructuredIntensityTrip {}
 /// startup failures through [`ExitError::startup_failure`] rather than
 /// round-tripping the payload through a user conversion.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub struct StartupFailure {
     /// The startup failure's exact cause.
     pub cause: StartupFailureCause,
-}
-
-pub const fn framework_startup_failure(cause: StartupFailureCause) -> StartupFailure {
-    StartupFailure { cause }
 }
 
 impl fmt::Display for StartupFailure {

@@ -2007,7 +2007,6 @@ impl ScopeCell {
                 | ScopeState::Running
                 | ScopeState::StartupFailed
                 | ScopeState::Draining => watcher.changed().await,
-                _ => unreachable!("the linked core exposes a known scope-state set"),
             }
         }
     }

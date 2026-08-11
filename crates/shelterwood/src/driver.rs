@@ -29,7 +29,7 @@ pub(crate) use shutdown::shutdown_scope;
 
 use crate::{
     Cancellation, ChildId, Exit, GracePhase, Incarnation, JitterSample, Membership, Readiness,
-    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailureCause,
+    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
         MemberStage, MemberTransition, ResidentProjection, ScopeCell, ScopeControlEvent,
@@ -44,8 +44,8 @@ use crate::{
     },
     exit::{
         RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
-        framework_startup_failure, reconcile_recorded_outcomes, stop_reason_into_nested_result,
-        stop_reason_root_exit, structured_startup_failure_error,
+        reconcile_recorded_outcomes, stop_reason_into_nested_result, stop_reason_root_exit,
+        structured_startup_failure_error,
     },
     identity::IncarnationCounter,
     mailbox::MailboxControl,
@@ -545,9 +545,11 @@ async fn run_nested_factory(
 
 fn begin_nested_incarnation(scope: &Arc<ScopeCell>) -> Result<ScopeEpochGuard, crate::ExitError> {
     ScopeEpochGuard::begin(scope).ok_or_else(|| {
-        let failure = framework_startup_failure(StartupFailureCause::IdentityExhausted {
-            id: scope.member.id().clone(),
-        });
+        let failure = StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: scope.member.id().clone(),
+            },
+        };
         scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
         structured_startup_failure_error(failure)
     })
@@ -576,7 +578,7 @@ async fn run_nested_tree_with_epoch(
             // they finish; hard-aborting the incarnation still detaches the
             // cancellation-safe disposal jobs.
             disposal.fired().await;
-            let failure = framework_startup_failure(cause);
+            let failure = StartupFailure { cause };
             // A lowering failure occurs before the driver loop exists, but it
             // still belongs to a live incarnation. Resolve every stop source
             // through the same monotone verdict lattice as the loop path.
@@ -618,7 +620,6 @@ async fn run_nested_tree_with_epoch(
                 | StopReason::NeverStarted => {
                     unreachable!("lowering resolves only failure or shutdown verdicts")
                 }
-                _ => unreachable!("the linked core exposes a known stop-reason set"),
             };
             scope.set_startup(startup);
             epoch.finish(reason.clone());

@@ -436,9 +436,13 @@ fn signal_fused_cancel_impl(
     latch: &Latch,
     txn: &mut ObservationTxn<'_>,
 ) {
-    if !latch.fire() {
+    // The fire linearizes inside the transaction so a racing `remove` sees a
+    // decided latch, but the waker-visible wake must not run under the gate.
+    if !latch.fire_silently() {
         return;
     }
+    let latch = latch.clone();
+    txn.defer(move || latch.notify());
     // A fused drop and an explicit `remove` dedup only within their own
     // source (each behind a once-firing latch), not against each other:
     // `mark_removing` also succeeds on an already-Removing entry, so the
@@ -517,7 +521,11 @@ fn remove_dynamic_impl(
     if member.record().membership_status != MembershipStatus::Removing {
         scope.set_child_removing_locked(&member, txn);
     }
-    if member.removal.fire() {
+    // The fire linearizes inside the transaction; the waker-visible wake is
+    // deferred past the gate release.
+    if member.removal.fire_silently() {
+        let removal = member.removal.clone();
+        txn.defer(move || removal.notify());
         // This latch dedups repeated `remove` calls, but not a concurrent
         // fused drop, which queues its own `RemovalRequest` for the same
         // membership (see `signal_fused_cancel_impl`). The driver's stop

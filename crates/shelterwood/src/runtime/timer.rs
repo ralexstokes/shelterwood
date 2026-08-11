@@ -128,7 +128,7 @@ where
 mod tests {
     use std::{
         future::Future,
-        task::{Context, Waker},
+        task::{Context, Poll, Waker},
         time::Duration,
     };
 
@@ -195,6 +195,42 @@ mod tests {
             sleep.as_mut().poll(&mut context).is_pending(),
             "finishing an internal slice must not finish the requested sleep"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multi_slice_absolute_deadline_eventually_fires() {
+        let duration = MAX_TIMER_SLICE * 2 + Duration::from_secs(1);
+        let requested = super::now()
+            .checked_add(duration)
+            .expect("the test duration fits the platform clock");
+        let mut sleep = std::pin::pin!(super::sleep_until_std(requested));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(sleep.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(MAX_TIMER_SLICE).await;
+        assert!(sleep.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(MAX_TIMER_SLICE).await;
+        assert!(sleep.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(sleep.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn multi_slice_timeout_eventually_elapses() {
+        let duration = MAX_TIMER_SLICE * 2 + Duration::from_secs(1);
+        let mut timed = std::pin::pin!(timeout(duration, std::future::pending::<()>()));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(timed.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(MAX_TIMER_SLICE).await;
+        assert!(timed.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(MAX_TIMER_SLICE).await;
+        assert!(timed.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            timed.as_mut().poll(&mut context),
+            Poll::Ready(super::Timeout::Elapsed)
+        ));
     }
 
     #[test]

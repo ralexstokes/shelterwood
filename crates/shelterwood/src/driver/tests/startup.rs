@@ -926,6 +926,7 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
 
     // Retire the authoritative record and runtime resource together, exactly
     // as production reclaim does, without disturbing the child that follows.
+    scope.reduce(SupervisorEvent::DisposalStarted { child: gone });
     scope.reduce(SupervisorEvent::Terminalized { child: gone });
     scope
         .children

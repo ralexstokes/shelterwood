@@ -356,13 +356,21 @@ impl SupervisorState {
             .map(|(key, _)| *key)
     }
 
-    fn transition_incarnation(&mut self, child: ChildKey, next: IncarnationState) {
+    fn transition_incarnation(
+        &mut self,
+        child: ChildKey,
+        expected: &[IncarnationState],
+        next: IncarnationState,
+    ) -> bool {
         if let Some(record) = self.children.get_mut(&child) {
-            if record.state.membership_terminal() {
-                return;
+            if record.state.membership_terminal() || !expected.contains(&record.state.incarnation())
+            {
+                return false;
             }
             record.state = record.state.with_incarnation(next);
+            return true;
         }
+        false
     }
 
     fn mark_removing(&mut self, child: ChildKey) -> Option<IncarnationState> {
@@ -425,6 +433,13 @@ impl SupervisorState {
                         self.next_ordered_start = next;
                         continue;
                     };
+                    if record.state.membership_status() == MembershipStatus::Removing {
+                        // The queued removal transition owns stop and commit.
+                        // Until that commit shrinks the initial set, this
+                        // membership still gates ordered startup but can no
+                        // longer schedule construction.
+                        return;
+                    }
                     if !record.spawned_once {
                         effects.push(Effect::StartChild { child });
                         return;
@@ -440,6 +455,7 @@ impl SupervisorState {
                 for (&child, record) in &self.children {
                     if matches!(record.startup, StartupMembership::Initial { .. })
                         && !record.spawned_once
+                        && record.state.membership_status() == MembershipStatus::Active
                     {
                         effects.push(Effect::StartChild { child });
                     }
@@ -529,7 +545,11 @@ impl SupervisorState {
             } => self.admit(membership, initial, start_immediately, effects),
             Event::Spawned { child } => {
                 if let Some(record) = self.children.get_mut(&child)
-                    && !record.state.membership_terminal()
+                    && matches!(record.state, ChildState::Resident(_))
+                    && matches!(
+                        record.state.incarnation(),
+                        IncarnationState::Unstarted | IncarnationState::RestartPending
+                    )
                 {
                     record.spawned_once = true;
                     record.state = record.state.with_incarnation(IncarnationState::Active);
@@ -559,32 +579,49 @@ impl SupervisorState {
                 }
             }
             Event::IncarnationComplete { child } => {
-                self.transition_incarnation(child, IncarnationState::Complete);
+                self.transition_incarnation(
+                    child,
+                    &[IncarnationState::Active, IncarnationState::Stopping],
+                    IncarnationState::Complete,
+                );
             }
             Event::RestartPending { child } => {
-                if let Some(record) = self.children.get_mut(&child) {
-                    if record.state.membership_terminal() {
-                        return;
-                    }
-                    record.state = record
-                        .state
-                        .with_incarnation(IncarnationState::RestartPending);
-                    if self.lifecycle.is_starting()
-                        && let StartupMembership::Initial { ready } = &mut record.startup
-                    {
-                        *ready = false;
-                    }
+                if self.transition_incarnation(
+                    child,
+                    &[IncarnationState::Complete],
+                    IncarnationState::RestartPending,
+                ) && let Some(record) = self.children.get_mut(&child)
+                    && self.lifecycle.is_starting()
+                    && let StartupMembership::Initial { ready } = &mut record.startup
+                {
+                    *ready = false;
                 }
             }
             Event::StopStarted { child } => {
-                self.transition_incarnation(child, IncarnationState::Stopping);
+                self.transition_incarnation(
+                    child,
+                    &[IncarnationState::Active],
+                    IncarnationState::Stopping,
+                );
             }
             Event::DisposalStarted { child } => {
-                self.transition_incarnation(child, IncarnationState::Disposing);
+                self.transition_incarnation(
+                    child,
+                    &[
+                        IncarnationState::Unstarted,
+                        IncarnationState::Complete,
+                        IncarnationState::RestartPending,
+                    ],
+                    IncarnationState::Disposing,
+                );
             }
             Event::Terminalized { child } => {
-                self.transition_incarnation(child, IncarnationState::Joined);
-                if self.membership_status(child) == MembershipStatus::Removing {
+                if self.transition_incarnation(
+                    child,
+                    &[IncarnationState::Disposing],
+                    IncarnationState::Joined,
+                ) && self.membership_status(child) == MembershipStatus::Removing
+                {
                     effects.push(Effect::FinalizeRemoval { child });
                 }
             }
@@ -799,6 +836,11 @@ mod tests {
                 if mask & (1 << index) != 0 {
                     step(
                         &mut state,
+                        Event::DisposalStarted { child: *child },
+                        &mut Vec::new(),
+                    );
+                    step(
+                        &mut state,
                         Event::Terminalized { child: *child },
                         &mut Vec::new(),
                     );
@@ -814,10 +856,95 @@ mod tests {
     }
 
     #[test]
+    fn sampled_removal_suppresses_start_effects_until_commit() {
+        for flavor in [ScopeFlavor::Ordered, ScopeFlavor::Dynamic] {
+            let membership = memberships(1)[0];
+            let mut state = SupervisorState::new(flavor, ScopeLifecycle::starting());
+            let child = admit(&mut state, membership, true);
+            step(&mut state, Event::RemovalSampled { child }, &mut Vec::new());
+            let mut effects = Vec::new();
+            step(&mut state, Event::Settle, &mut effects);
+            assert!(
+                effects.is_empty(),
+                "{flavor:?} startup cannot schedule an already-latched membership"
+            );
+            assert!(state.lifecycle().is_starting());
+
+            step(&mut state, Event::RemovalLatched { child }, &mut effects);
+            assert_eq!(effects, [Effect::StopChild { child }]);
+            state.check_invariants();
+        }
+    }
+
+    #[test]
+    fn ordered_stop_releases_one_child_per_join_in_reverse_order() {
+        let members = memberships(3);
+        let mut state = SupervisorState::new(ScopeFlavor::Ordered, ScopeLifecycle::running());
+        let keys: Vec<_> = members
+            .iter()
+            .map(|membership| admit(&mut state, *membership, true))
+            .collect();
+        for &child in &keys {
+            step(&mut state, Event::Spawned { child }, &mut Vec::new());
+        }
+
+        let mut effects = Vec::new();
+        step(
+            &mut state,
+            Event::BeginDrain {
+                reason: StopReason::ShutdownRequested,
+            },
+            &mut effects,
+        );
+        assert!(matches!(effects.as_slice(), [Effect::DrainStarted { .. }]));
+        effects.clear();
+
+        for &expected in keys.iter().rev() {
+            step(&mut state, Event::Settle, &mut effects);
+            assert_eq!(effects, [Effect::StopChild { child: expected }]);
+            effects.clear();
+            assert_eq!(state.ordered_stop_waiting(), Some(expected));
+
+            step(
+                &mut state,
+                Event::IncarnationComplete { child: expected },
+                &mut effects,
+            );
+            step(
+                &mut state,
+                Event::DisposalStarted { child: expected },
+                &mut effects,
+            );
+            step(
+                &mut state,
+                Event::Terminalized { child: expected },
+                &mut effects,
+            );
+            assert!(effects.is_empty());
+        }
+
+        step(&mut state, Event::Settle, &mut effects);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Finished {
+                reason: StopReason::ShutdownRequested
+            }]
+        ));
+        assert_eq!(state.ordered_stop_waiting(), None);
+        assert!(state.all_children_joined());
+        state.check_invariants();
+    }
+
+    #[test]
     fn registration_keys_are_monotonic_and_exhaustion_is_fail_closed() {
         let members = memberships(4);
         let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::running());
         let first = admit(&mut state, members[0], false);
+        step(
+            &mut state,
+            Event::DisposalStarted { child: first },
+            &mut Vec::new(),
+        );
         step(
             &mut state,
             Event::Terminalized { child: first },
@@ -876,6 +1003,7 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(state.len(), 1);
 
+        step(&mut state, Event::DisposalStarted { child }, &mut effects);
         step(&mut state, Event::Terminalized { child }, &mut effects);
         let terminal = state.child_state(child);
         for event in [
@@ -900,6 +1028,81 @@ mod tests {
             &mut effects,
         );
         assert_eq!(state.child_state(child), terminal);
+        state.check_invariants();
+    }
+
+    #[test]
+    fn stale_events_cannot_skip_or_regress_incarnation_phases() {
+        let membership = memberships(1)[0];
+        let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::running());
+        let child = admit(&mut state, membership, false);
+
+        for event in [
+            Event::Ready {
+                child,
+                removal_latched: false,
+            },
+            Event::IncarnationComplete { child },
+            Event::RestartPending { child },
+            Event::StopStarted { child },
+            Event::Terminalized { child },
+        ] {
+            step(&mut state, event, &mut Vec::new());
+            assert_eq!(
+                state.child_state(child),
+                Some(ChildState::Resident(IncarnationState::Unstarted)),
+                "an event without its predecessor is a total no-op"
+            );
+        }
+
+        step(&mut state, Event::Spawned { child }, &mut Vec::new());
+        assert_eq!(
+            state.child_state(child),
+            Some(ChildState::Resident(IncarnationState::Active))
+        );
+        for event in [
+            Event::Spawned { child },
+            Event::RestartPending { child },
+            Event::DisposalStarted { child },
+            Event::Terminalized { child },
+        ] {
+            step(&mut state, event, &mut Vec::new());
+            assert_eq!(
+                state.child_state(child),
+                Some(ChildState::Resident(IncarnationState::Active)),
+                "duplicate/future events cannot skip an executing incarnation"
+            );
+        }
+
+        step(&mut state, Event::StopStarted { child }, &mut Vec::new());
+        step(&mut state, Event::Spawned { child }, &mut Vec::new());
+        assert_eq!(
+            state.child_state(child),
+            Some(ChildState::Resident(IncarnationState::Stopping)),
+            "a stale spawn cannot rewind a stop"
+        );
+        step(
+            &mut state,
+            Event::IncarnationComplete { child },
+            &mut Vec::new(),
+        );
+        step(&mut state, Event::StopStarted { child }, &mut Vec::new());
+        assert_eq!(
+            state.child_state(child),
+            Some(ChildState::Resident(IncarnationState::Complete)),
+            "a stale stop cannot rewind completed work"
+        );
+        step(&mut state, Event::RestartPending { child }, &mut Vec::new());
+        step(
+            &mut state,
+            Event::IncarnationComplete { child },
+            &mut Vec::new(),
+        );
+        assert_eq!(
+            state.child_state(child),
+            Some(ChildState::Resident(IncarnationState::RestartPending)),
+            "a duplicate completion cannot cancel pending restart state"
+        );
         state.check_invariants();
     }
 
@@ -943,98 +1146,111 @@ mod tests {
                     SmallEvent::Terminal(index),
                 ]);
             }
-            let mut unique_final = HashSet::new();
-            permutations(&mut schedule, 0, &mut |ordering| {
-                let mut state =
-                    SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::starting());
-                let keys: Vec<_> = members
-                    .iter()
-                    .map(|membership| admit(&mut state, *membership, true))
-                    .collect();
-                let mut published_ready = HashSet::new();
-                let mut removal_seen = HashSet::new();
-                let mut joined_seen = HashSet::new();
-                for event in ordering {
-                    let mut effects = Vec::new();
-                    match *event {
-                        SmallEvent::Spawn(index) => step(
-                            &mut state,
-                            Event::Spawned { child: keys[index] },
-                            &mut effects,
-                        ),
-                        SmallEvent::Ready(index) => {
-                            let removing =
-                                state.membership_status(keys[index]) == MembershipStatus::Removing;
-                            step(
+            for flavor in [ScopeFlavor::Ordered, ScopeFlavor::Dynamic] {
+                let mut unique_final = HashSet::new();
+                permutations(&mut schedule, 0, &mut |ordering| {
+                    let mut state = SupervisorState::new(flavor, ScopeLifecycle::starting());
+                    let keys: Vec<_> = members
+                        .iter()
+                        .map(|membership| admit(&mut state, *membership, true))
+                        .collect();
+                    let mut published_ready = HashSet::new();
+                    let mut removal_seen = HashSet::new();
+                    let mut joined_seen = HashSet::new();
+                    for event in ordering {
+                        let mut effects = Vec::new();
+                        match *event {
+                            SmallEvent::Spawn(index) => step(
                                 &mut state,
-                                Event::Ready {
-                                    child: keys[index],
-                                    removal_latched: removing,
-                                },
+                                Event::Spawned { child: keys[index] },
                                 &mut effects,
-                            );
-                            if !removing && state.initial_ready(keys[index]) {
-                                published_ready.insert(keys[index]);
+                            ),
+                            SmallEvent::Ready(index) => {
+                                let removing = state.membership_status(keys[index])
+                                    == MembershipStatus::Removing;
+                                step(
+                                    &mut state,
+                                    Event::Ready {
+                                        child: keys[index],
+                                        removal_latched: removing,
+                                    },
+                                    &mut effects,
+                                );
+                                if !removing && state.initial_ready(keys[index]) {
+                                    published_ready.insert(keys[index]);
+                                }
+                            }
+                            SmallEvent::Remove(index) => step(
+                                &mut state,
+                                Event::RemovalLatched { child: keys[index] },
+                                &mut effects,
+                            ),
+                            SmallEvent::Terminal(index) => {
+                                // Runtime terminal completion joins retained
+                                // definition disposal before publishing the
+                                // membership edge. Keep that ordered pair atomic
+                                // while permuting it against the other children'
+                                // inputs.
+                                step(
+                                    &mut state,
+                                    Event::DisposalStarted { child: keys[index] },
+                                    &mut effects,
+                                );
+                                step(
+                                    &mut state,
+                                    Event::Terminalized { child: keys[index] },
+                                    &mut effects,
+                                );
                             }
                         }
-                        SmallEvent::Remove(index) => step(
-                            &mut state,
-                            Event::RemovalLatched { child: keys[index] },
-                            &mut effects,
-                        ),
-                        SmallEvent::Terminal(index) => step(
-                            &mut state,
-                            Event::Terminalized { child: keys[index] },
-                            &mut effects,
-                        ),
+                        step(&mut state, Event::Settle, &mut effects);
+                        state.check_invariants();
+                        for child in &keys {
+                            if removal_seen.contains(child) {
+                                assert_eq!(
+                                    state.membership_status(*child),
+                                    MembershipStatus::Removing,
+                                    "removal is a monotone state transition"
+                                );
+                            }
+                            if joined_seen.contains(child) {
+                                assert!(state.joined(*child), "joined state cannot regress");
+                            }
+                            if state.membership_status(*child) == MembershipStatus::Removing {
+                                removal_seen.insert(*child);
+                                assert!(
+                                    !state.initial_ready(*child) || published_ready.contains(child),
+                                    "removal never manufactures a readiness edge"
+                                );
+                            }
+                            if state.joined(*child) {
+                                joined_seen.insert(*child);
+                            }
+                        }
+                        assert_eq!(
+                            state.all_children_joined(),
+                            keys.iter().all(|child| state.joined(*child))
+                        );
+                        for effect in &effects {
+                            match effect {
+                                Effect::StartChild { child }
+                                | Effect::StopChild { child }
+                                | Effect::ForceChild { child }
+                                | Effect::FinalizeRemoval { child } => {
+                                    assert!(state.contains(*child), "effects name a live key");
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                    step(&mut state, Event::Settle, &mut effects);
-                    state.check_invariants();
-                    for child in &keys {
-                        if removal_seen.contains(child) {
-                            assert_eq!(
-                                state.membership_status(*child),
-                                MembershipStatus::Removing,
-                                "removal is a monotone state transition"
-                            );
-                        }
-                        if joined_seen.contains(child) {
-                            assert!(state.joined(*child), "joined state cannot regress");
-                        }
-                        if state.membership_status(*child) == MembershipStatus::Removing {
-                            removal_seen.insert(*child);
-                            assert!(
-                                !state.initial_ready(*child) || published_ready.contains(child),
-                                "removal never manufactures a readiness edge"
-                            );
-                        }
-                        if state.joined(*child) {
-                            joined_seen.insert(*child);
-                        }
-                    }
-                    assert_eq!(
-                        state.all_children_joined(),
-                        keys.iter().all(|child| state.joined(*child))
+                    unique_final.insert(
+                        keys.iter()
+                            .map(|child| state.child_state(*child).expect("resident"))
+                            .collect::<Vec<_>>(),
                     );
-                    for effect in &effects {
-                        match effect {
-                            Effect::StartChild { child }
-                            | Effect::StopChild { child }
-                            | Effect::ForceChild { child }
-                            | Effect::FinalizeRemoval { child } => {
-                                assert!(state.contains(*child), "effects name a live key");
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                unique_final.insert(
-                    keys.iter()
-                        .map(|child| state.child_state(*child).expect("resident"))
-                        .collect::<Vec<_>>(),
-                );
-            });
-            assert!(!unique_final.is_empty());
+                });
+                assert!(!unique_final.is_empty());
+            }
         }
     }
 }

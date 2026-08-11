@@ -72,6 +72,83 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
         .await
         .expect("empty dynamic scope shuts down");
 }
+
+/// The reducer can emit an initial/admission `StartChild` before a concurrent
+/// caller commits removal.  Construction must re-sample the synchronous latch
+/// when that effect is executed: the forwarded `Removal` event is deliberately
+/// left queued here, so arbitration cannot be what suppresses the start.
+#[crate::runtime::test]
+async fn latched_removal_suppresses_a_queued_start_effect() {
+    let (mut scope, _events, mut dynamic_events, _disposal_events, control) =
+        running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let starts = Arc::new(AtomicUsize::new(0));
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new({
+            let starts = Arc::clone(&starts);
+            move |_| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                future::pending()
+            }
+        })));
+    let (definition, resolved) = reservation
+        .slot
+        .resolve_and_take_defined(&scope.defaults)
+        .expect("the slot is defined");
+    let plan =
+        crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
+    let child = ChildRuntime::from_plan(plan, &root);
+    let key = root.with_observation_gate(|txn| {
+        let key = scope
+            .insert_child(child, false)
+            .unwrap_or_else(|_| panic!("the empty arena accepts its first child"));
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entries
+            .get_mut(reservation.slot.member.id())
+            .expect("the reservation remains registered")
+            .promote(key, None, txn);
+        root.admit_child_locked(resident_projection(&reservation.slot), txn);
+        key
+    });
+
+    let _removal = super::super::remove_dynamic(
+        &root,
+        reservation.slot.member.id(),
+        Some(reservation.slot.member.membership()),
+    );
+    assert_eq!(
+        reservation.slot.member.record().membership_status,
+        MembershipStatus::Removing
+    );
+
+    // Model execution of a reducer effect that was emitted before removal
+    // won.  The removal event is still in the control lane at this point.
+    scope.spawn_child(key);
+    for _ in 0..8 {
+        crate::runtime::yield_now().await;
+    }
+    assert!(scope.children[key].active.is_none());
+    assert_eq!(
+        scope.supervisor.membership_status(key),
+        MembershipStatus::Removing
+    );
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        0,
+        "a latch that wins before effect execution suppresses user construction"
+    );
+    assert!(matches!(
+        crate::runtime::unbounded_mpsc_try_recv(&mut dynamic_events),
+        Some(DriverEvent::Removal(RemovalRequest { key: queued })) if queued == key
+    ));
+}
+
 #[test]
 fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
     let mut identity = ScopeIdentity::new();

@@ -544,6 +544,14 @@ impl ScopeRuntime {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
+        // Production terminal publication follows joined construction
+        // disposal.  A few structural test/fallback paths synthesize that
+        // already-joined boundary directly, so normalize them through the
+        // same reducer predecessor instead of allowing `Terminalized` to
+        // skip arbitrary incarnation states.
+        if !self.supervisor.is_disposing(key) && !self.supervisor.membership_terminal(key) {
+            self.reduce(SupervisorEvent::DisposalStarted { child: key });
+        }
         let changed = self
             .children
             .get_mut(key)
@@ -554,6 +562,16 @@ impl ScopeRuntime {
     }
 
     pub(super) fn spawn_child(&mut self, key: ChildKey) {
+        // A queued start effect can outlive the synchronous removal latch
+        // that it was computed against. Re-sample that source at the single
+        // construction funnel so initial and freshly admitted children obey
+        // the same execution-time suppression rule as restart deadlines.
+        // Scope-stop sources remain owned by their ordered control event; this
+        // gate is the membership-local rule from SPEC §7.
+        if self.removal_latched(key) {
+            self.reduce(SupervisorEvent::RemovalSampled { child: key });
+            return;
+        }
         let Some(child) = self.children.get(key) else {
             return;
         };

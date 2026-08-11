@@ -947,3 +947,75 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
         "the live successor still gates the aggregate"
     );
 }
+
+/// A removal response is an observation boundary, not merely a wake. Keep it
+/// pending after membership commit until the batch epilogue has recomputed
+/// startup over the shrunken declared set.
+#[crate::runtime::test]
+async fn startup_removal_response_follows_aggregate_recomputation() {
+    let mut tree = DynamicTree::new();
+    tree.add_task(
+        "gate",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness is valid")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid initial member");
+
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (control_events, _control_event_receiver) = crate::runtime::unbounded_mpsc();
+    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(control_events);
+    let mut children = ChildArena::default();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let key = children
+        .insert(child)
+        .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
+    root.with_observation_gate(|txn| {
+        control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
+    });
+    root.set_dynamic_route(Some(control.clone()));
+    let member = Arc::clone(&children[key].slot.member);
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+        .with_defaults(plan.defaults.clone())
+        .with_children(children)
+        .with_dynamic(Some(control))
+        .build();
+    plan.finish_transfer();
+
+    assert!(scope.terminalize_child(
+        key,
+        Exit::never_started(),
+        None,
+        StartupDisposition::NotAborted,
+    ));
+    let mut removal = super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
+    scope.finalize_removal(key);
+
+    assert_eq!(
+        removal.try_receive(),
+        None,
+        "membership commit alone cannot publish Removed before settlement"
+    );
+    assert!(!scope.lifecycle.startup_complete());
+
+    scope.progress_startup();
+    assert!(scope.lifecycle.startup_complete());
+    assert_eq!(root.record().startup, Some(Ok(())));
+    scope.publish_startup_removals();
+    assert_eq!(removal.try_receive(), Some(RemoveOutcome::Removed));
+}

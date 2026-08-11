@@ -84,8 +84,18 @@ impl ScopeRuntime {
         });
         if let Some(entry) = entry {
             self.reclaim_child(key);
-            drop(entry);
+            if self.lifecycle.is_starting() {
+                self.pending_startup_removals.push(entry);
+            } else {
+                drop(entry);
+            }
         }
+    }
+
+    /// Publishes removal completions whose committed membership shrink had to
+    /// be observed by startup settlement first.
+    pub(super) fn publish_startup_removals(&mut self) {
+        drop(std::mem::take(&mut self.pending_startup_removals));
     }
 
     pub(super) fn prune_terminal(&mut self, key: ChildKey) {

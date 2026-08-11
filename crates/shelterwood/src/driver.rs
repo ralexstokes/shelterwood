@@ -213,6 +213,11 @@ struct ScopeRuntime {
     next_ordered_start: Option<ChildKey>,
     role: ScopeRole,
     dynamic: Option<Arc<DynamicControl>>,
+    // Removing an initial member can complete startup. Hold its response
+    // obligation until the batch epilogue has recomputed that aggregate, so
+    // observing `Removed` implies the declared set already reflects the
+    // committed shrink.
+    pending_startup_removals: Vec<DynamicEntry>,
     epoch: Epoch,
     ancestor_shutdown_seen: bool,
     ancestor_abort_seen: bool,
@@ -722,6 +727,7 @@ async fn run_scope_incarnation(
         next_ordered_start,
         role,
         dynamic,
+        pending_startup_removals: Vec::new(),
         ancestor_shutdown_seen: false,
         ancestor_abort_seen: false,
         hard_forced: false,
@@ -948,6 +954,11 @@ async fn run_scope_incarnation(
         // batch. Any transition that changes the startup aggregate therefore
         // gets the same recomputation point as terminal completion.
         scope.progress_startup();
+        // A removal response is also an observation edge: SPEC §6 promises
+        // that a returned `Removed` has already been incorporated into the
+        // startup aggregate. Finalization retains starting-phase obligations
+        // until the recomputation above establishes that order.
+        scope.publish_startup_removals();
         if let Some(reason) = scope.finish_if_ready() {
             let root_exit = scope.role.is_root().then(|| reason.root_exit());
             // ScopeRuntime's synchronous epilogue clears dynamic state,

@@ -1,6 +1,24 @@
 use super::support::*;
 
 #[test]
+#[should_panic(expected = "resident member options are resolved before snapshot publication")]
+fn snapshot_rejects_a_resident_whose_options_were_never_resolved() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let child_id = ChildId::from("worker");
+    let member = MemberCell::new(
+        child_id.clone(),
+        root.child_identity
+            .lock()
+            .expect("scope identity mutex poisoned")
+            .mint_membership(&child_id)
+            .expect("child membership available"),
+    );
+
+    root.admit_child(ResidentProjection::new(member, None));
+    let _ = root.snapshot();
+}
+
+#[test]
 fn independent_systems_do_not_share_an_observation_critical_section() {
     let first = isolated_scope("first", ScopeFlavor::Ordered);
     let second = isolated_scope("second", ScopeFlavor::Ordered);
@@ -254,6 +272,7 @@ async fn wait_for_child_reloads_after_its_predicate_closes_the_snapshot_stream()
         .mint_membership(&child_id)
         .expect("child membership is available");
     let child = MemberCell::new(child_id, membership);
+    resolve_fixture_options(&child);
     let slot = SlotCell::new(Arc::clone(&child), None);
     scope.set_admitted_children(vec![resident_projection(&slot)]);
     let scope_ref = ScopeRef {
@@ -662,6 +681,8 @@ fn plain_resident_state_is_released_before_recursive_removed_publication() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let first = isolated_scope("first", ScopeFlavor::Dynamic);
     let second = isolated_scope("second", ScopeFlavor::Dynamic);
+    resolve_fixture_options(&first.member);
+    resolve_fixture_options(&second.member);
     let first_slot = SlotCell::new(Arc::clone(&first.member), Some(first));
     let second_slot = SlotCell::new(Arc::clone(&second.member), Some(second));
     let mut events = root.subscribe_lifecycle();
@@ -692,6 +713,7 @@ fn plain_parent_state_preserves_nested_snapshot_propagation() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
     let mut incarnations = IncarnationCounter::near_exhaustion(nested.member.membership());
+    resolve_fixture_options(&nested.member);
     let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
     root.set_admitted_children(vec![resident_projection(&nested_slot)]);
     // Start the nested member along the production admit-then-spawn order so

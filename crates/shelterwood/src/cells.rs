@@ -18,8 +18,7 @@ use std::{
 };
 
 use crate::{
-    ChildId, Exit, Incarnation, Intensity, Membership, Readiness, RestartCount, Strategy,
-    TotalRestarts,
+    ChildId, Exit, Incarnation, Intensity, Membership, RestartCount, Strategy, TotalRestarts,
     admission::{RemoveOutcome, ReserveError},
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason},
@@ -197,6 +196,13 @@ pub(crate) struct MemberCell {
     observation_gate: RwLock<ObservationGate>,
     terminal_disposal_pending: AtomicBool,
     mailbox: Mutex<MemberMailbox>,
+    // Lowering resolves this before residency in both production routes:
+    // `ChildPlan::with_options` runs ahead of the planned
+    // `set_admitted_children` and ahead of the dynamic `admit_child_locked`.
+    // The enforcement point is snapshot construction rather than admission —
+    // that is the only read, and admitting an unresolved member is a useful
+    // fixture shape — so a missing value surfaces there as an internal
+    // admission-order bug.
     options: OnceLock<ResolvedCommonOptions>,
     pub(crate) removal: Latch,
 }
@@ -433,15 +439,10 @@ impl MemberCell {
     }
 
     fn options(&self) -> ResolvedCommonOptions {
-        self.options.get().cloned().unwrap_or_else(|| {
-            crate::policy::resolve_common(
-                &crate::policy::CommonOptions::default(),
-                &crate::policy::ResolvedDefaults::default(),
-                crate::policy::ChildMode::Restartable,
-                Readiness::Immediate,
-            )
-            .expect("library defaults must be valid")
-        })
+        self.options
+            .get()
+            .cloned()
+            .expect("resident member options are resolved before snapshot publication")
     }
 
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {

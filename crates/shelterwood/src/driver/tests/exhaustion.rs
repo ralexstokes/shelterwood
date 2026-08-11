@@ -626,6 +626,7 @@ async fn scope_incarnation_exhaustion_closes_nested_observation() {
 async fn never_started_nested_terminal_publishes_one_final_parent_snapshot() {
     let parent = isolated_scope("parent", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+    resolve_fixture_options(&nested.member);
     let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
     parent.set_admitted_children(vec![resident_projection(&slot)]);
     let mut snapshots = parent.subscribe_snapshots();

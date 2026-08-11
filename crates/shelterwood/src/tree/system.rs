@@ -211,11 +211,15 @@ impl<R> System<R> {
         }
     }
 
-    /// Requests shutdown, escalates at `timeout`, joins, and consumes owner.
+    /// Requests shutdown, escalates at `timeout`, joins the root driver, and
+    /// consumes the owner.
     ///
     /// `timeout` bounds cooperative teardown, not necessarily this method's
-    /// wall-clock return: after escalation every actor future is still joined.
-    /// Blocking threads created by `run_blocking` detach past hard abort.
+    /// wall-clock return. A nested framework driver normally joins its
+    /// children, but its hard-abort fallback can only request their abort from
+    /// its synchronous drop epilogue; deeper task destruction may therefore
+    /// finish after return. Blocking threads created by `run_blocking` detach
+    /// past hard abort independently of that fallback.
     pub async fn shutdown(mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
         self.run.shutdown(timeout).await
     }

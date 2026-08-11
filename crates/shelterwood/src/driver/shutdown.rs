@@ -26,9 +26,7 @@ fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<Shutd
 async fn wait_for_incarnation(scope: &ScopeCell, epoch: Epoch) {
     let mut watcher = scope.signal().watcher();
     loop {
-        if scope.incarnation_finished(epoch)
-            || matches!(scope.member.record().stage, MemberStage::Terminal(_))
-        {
+        if scope.scope_settled(Some(epoch)) {
             return;
         }
         watcher.changed().await;
@@ -39,7 +37,7 @@ pub(crate) async fn shutdown_scope(
     scope: Arc<ScopeCell>,
     timeout: Duration,
 ) -> Result<(), ShutdownTimeout> {
-    if matches!(scope.member.record().stage, MemberStage::Terminal(_)) {
+    if scope.scope_settled(None) {
         return Ok(());
     }
     let Some(epoch) = scope.request_shutdown() else {
@@ -48,9 +46,7 @@ pub(crate) async fn shutdown_scope(
     };
     let mut watcher = scope.signal().watcher();
     loop {
-        if scope.incarnation_finished(epoch)
-            || matches!(scope.member.record().stage, MemberStage::Terminal(_))
-        {
+        if scope.scope_settled(Some(epoch)) {
             return Ok(());
         }
         if matches!(scope.record().state, ScopeState::Draining) {

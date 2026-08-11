@@ -28,10 +28,18 @@ here=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
 # IN_NIX_SHELL is not a sufficient test: it stays set when a shell rooted in
 # another checkout spawns us. Only skip re-entry when the active devshell
 # matches both this checkout and its current flake inputs — a branch switch
-# that changes flake.nix/flake.lock invalidates the marker. .envrc exports the
-# same path:fingerprint format. The marker embeds the checkout path, so one
-# variable name is safe to share across every project using this template.
-want="$here:$(cat "$here/flake.nix" "$here/flake.lock" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+# that changes flake.nix, flake.lock, or rust-toolchain.toml invalidates the
+# marker. .envrc exports the same path:fingerprint format. The marker embeds the
+# checkout path, so one variable name is safe to share across every project.
+# Nix is the one hashing tool guaranteed to exist before the shell is loaded.
+devshell_fingerprint=
+for input in flake.nix flake.lock rust-toolchain.toml; do
+    input="$here/$input"
+    [ -f "$input" ] || continue
+    input_hash=$(nix hash file --type sha256 "$input")
+    devshell_fingerprint="${devshell_fingerprint:+$devshell_fingerprint:}$input_hash"
+done
+want="$here:$devshell_fingerprint"
 if [ "${REPO_DEVSHELL:-}" = "$want" ]; then
     exec "$@"
 fi

@@ -732,7 +732,18 @@ impl<M: Send + 'static> MailboxCell<M> {
 }
 
 impl<M> MailboxCell<M> {
-    pub(super) fn withdraw(&self, operation: &Arc<SendOperation<M>>) -> Withdrawal<M> {
+    /// Withdraws a send operation and releases the waker it had registered.
+    ///
+    /// The waker is returned rather than destroyed here: a `RawWaker` vtable is
+    /// caller code, so only the caller knows whether its destructor may run
+    /// inline. Withdrawal guarantees only that neither core lock is held once
+    /// the waker is handed back, and that the recovered message is handed over
+    /// first, so a hostile waker destructor can neither poison a core mutex nor
+    /// divert the message from the caller's chosen disposal route.
+    pub(super) fn withdraw(
+        &self,
+        operation: &Arc<SendOperation<M>>,
+    ) -> (Withdrawal<M>, Option<Waker>) {
         let mut mailbox = self.state.lock().expect("mailbox mutex poisoned");
         let current_observation = match mailbox.status() {
             BindingStatus::Bound(incarnation) | BindingStatus::Frozen(incarnation) => {
@@ -740,7 +751,7 @@ impl<M> MailboxCell<M> {
             }
             BindingStatus::Unbound | BindingStatus::Terminal(_) => None,
         };
-        let (result, registration) = {
+        let (result, registration, waker) = {
             let mut state = operation
                 .state
                 .lock()
@@ -760,28 +771,40 @@ impl<M> MailboxCell<M> {
                     // (including zero-duration) deadline poll.
                     let observed = (*newest_observed).or(current_observation);
                     state.outcome = OperationOutcome::Withdrawn;
-                    state.waker = None;
                     (
                         Withdrawal::Withdrawn { message, observed },
                         state.registration.take(),
+                        state.waker.take(),
                     )
                 }
-                OperationOutcome::Accepted(incarnation) => (
-                    Withdrawal::Accepted(*incarnation),
-                    state.registration.take(),
-                ),
+                OperationOutcome::Accepted(incarnation) => {
+                    let incarnation = *incarnation;
+                    // Acceptance took the waker in the same critical section
+                    // that published this outcome, so no registration survives
+                    // it for withdrawal to release.
+                    debug_assert!(state.waker.is_none());
+                    (
+                        Withdrawal::Accepted(incarnation),
+                        state.registration.take(),
+                        None,
+                    )
+                }
                 OperationOutcome::Terminated {
                     message,
                     final_incarnation,
-                } => (
-                    Withdrawal::Terminated {
-                        message: message
-                            .take()
-                            .expect("a terminal operation must retain its message"),
-                        observed: *final_incarnation,
-                    },
-                    state.registration.take(),
-                ),
+                } => {
+                    let message = message
+                        .take()
+                        .expect("a terminal operation must retain its message");
+                    let observed = *final_incarnation;
+                    // Termination likewise took the waker before publishing.
+                    debug_assert!(state.waker.is_none());
+                    (
+                        Withdrawal::Terminated { message, observed },
+                        state.registration.take(),
+                        None,
+                    )
+                }
                 OperationOutcome::Withdrawn => {
                     panic!("a send operation was withdrawn more than once")
                 }
@@ -794,7 +817,8 @@ impl<M> MailboxCell<M> {
                 debug_assert!(matches!(mailbox.status(), BindingStatus::Terminal(_)));
             }
         }
-        result
+        drop(mailbox);
+        (result, waker)
     }
 }
 
@@ -1138,7 +1162,7 @@ pub(super) mod tests {
         future::Future,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
-            Arc,
+            Arc, Weak,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll, Wake, Waker},
@@ -1167,6 +1191,52 @@ pub(super) mod tests {
     impl Wake for CountWake {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ReentrantPanicDrop {
+        mailbox: Weak<MailboxCell<u8>>,
+        operation: Weak<super::SendOperation<u8>>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Wake for ReentrantPanicDrop {
+        fn wake(self: Arc<Self>) {
+            panic!("the withdrawal regression only drops its waker")
+        }
+    }
+
+    impl Drop for ReentrantPanicDrop {
+        fn drop(&mut self) {
+            let operation = self
+                .operation
+                .upgrade()
+                .expect("the cancelling send retains its operation");
+            drop(
+                operation
+                    .state
+                    .try_lock()
+                    .expect("waker drop runs after the operation lock is released"),
+            );
+
+            let mailbox = self
+                .mailbox
+                .upgrade()
+                .expect("the cancelling send retains its mailbox");
+            drop(
+                mailbox
+                    .state
+                    .try_lock()
+                    .expect("waker drop runs after the mailbox lock is released"),
+            );
+            let error = mailbox
+                .try_send(2)
+                .expect_err("a reentrant try-send observes the unbound mailbox");
+            assert_eq!(error.kind, SendErrorKind::NotRunning);
+            assert_eq!(error.message, 2);
+
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            panic!("injected waker drop panic");
         }
     }
 
@@ -1252,7 +1322,7 @@ pub(super) mod tests {
 
         assert!(matches!(
             mailbox.withdraw(&operation),
-            super::Withdrawal::Withdrawn { message: 2, .. }
+            (super::Withdrawal::Withdrawn { message: 2, .. }, None)
         ));
         assert!(matches!(
             mailbox.state.lock().expect("mailbox mutex poisoned").binding,
@@ -1306,6 +1376,69 @@ pub(super) mod tests {
         assert_eq!(
             waiters.direct_removals, SENDS,
             "mass cancellation must do one direct unlink per parked send"
+        );
+    }
+
+    #[test]
+    fn withdrawal_releases_its_waker_instead_of_destroying_it_under_the_locks() {
+        let (mailbox, _) = actor();
+        let operation = match mailbox.submit(1) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("an unbound mailbox parks its send")
+            }
+        };
+        let drops = Arc::new(AtomicUsize::new(0));
+        let hostile = Waker::from(Arc::new(ReentrantPanicDrop {
+            mailbox: Arc::downgrade(&mailbox),
+            operation: Arc::downgrade(&operation),
+            drops: Arc::clone(&drops),
+        }));
+        operation
+            .state
+            .lock()
+            .expect("send operation mutex poisoned")
+            .waker = Some(hostile.clone());
+        drop(hostile);
+
+        let (withdrawal, waker) = mailbox.withdraw(&operation);
+        assert!(matches!(
+            withdrawal,
+            super::Withdrawal::Withdrawn { message: 1, .. }
+        ));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "withdrawal releases the waker rather than running its destructor"
+        );
+        let waker = waker.expect("withdrawal releases the waker the operation had registered");
+
+        // Whoever accepts the released waker runs its destructor with neither
+        // core lock held, so the reentrant probe inside it succeeds and its
+        // panic reaches only that owner.
+        let Err(panic) = catch_unwind(AssertUnwindSafe(move || drop(waker))) else {
+            panic!("the hostile waker drop panic reaches whoever destroys it")
+        };
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("injected waker drop panic")
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(
+            operation
+                .state
+                .lock()
+                .expect("hostile waker drop cannot poison the operation lock"),
+        );
+        let state = mailbox
+            .state
+            .lock()
+            .expect("hostile waker drop cannot poison the mailbox lock");
+        assert!(
+            state
+                .waiters()
+                .expect("an unbound mailbox retains its waiter queue")
+                .is_empty()
         );
     }
 

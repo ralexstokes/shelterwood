@@ -293,7 +293,11 @@ async fn scope_plan_conversion_panic_terminalizes_every_child() {
         root.wait_started().await,
         Err(crate::StartupError::ShutdownRequested)
     );
-    assert_eq!(root.wait_stopped().await, StopReason::NeverStarted);
+    assert_eq!(
+        root.wait_stopped().await,
+        StopReason::NeverStarted,
+        "the plan fallback's never-started verdict outranks the epoch guard's"
+    );
     assert!(
         root.snapshot().children.is_empty(),
         "the fallback must release every admitted residency"

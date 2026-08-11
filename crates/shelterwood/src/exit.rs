@@ -53,6 +53,45 @@ impl StopReason {
             Self::NeverStarted => Exit::never_started(),
         }
     }
+
+    pub(crate) fn precedence(&self) -> StopPrecedence {
+        match self {
+            Self::Finished => StopPrecedence::Finished,
+            Self::IntensityTripped(_) => StopPrecedence::IntensityTripped,
+            Self::StartupFailed(_) => StopPrecedence::StartupFailed,
+            Self::ShutdownRequested => StopPrecedence::ShutdownRequested,
+            Self::NeverStarted => StopPrecedence::NeverStarted,
+        }
+    }
+}
+
+/// Total precedence order over stop reasons: the single lattice that resolves
+/// every competing stop verdict for one incarnation.
+///
+/// Two owners can each reach a stop verdict for the same incarnation — a
+/// driver's drain and a later teardown fallback, say — so the resolution rule
+/// must be a property of the reasons themselves rather than of arrival order.
+/// Both consumers join through this order: `ScopeLifecycle::begin_drain`
+/// upgrades an in-progress drain, and `ScopeCell`'s stopped publisher upgrades
+/// an already-published `Stopped` projection. Strictly-greater wins in both,
+/// so equal verdicts are idempotent repeats.
+///
+/// The order is severity-ascending. `Finished` is the weakest claim: a drain
+/// that began on natural completion says nothing about how the teardown
+/// itself ended. `ShutdownRequested` outranks the structured failures because
+/// a requested stop supersedes whatever the incarnation would otherwise have
+/// reported. `NeverStarted` is the top element because it is not a live
+/// incarnation's verdict at all but the membership-terminal twin of §7's
+/// `Exit::never_started()` (SPEC B.6): whenever a membership terminalizes
+/// without ever spawning, the scope-state projection must agree with the
+/// membership exit, in either arrival order.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum StopPrecedence {
+    Finished,
+    IntensityTripped,
+    StartupFailed,
+    ShutdownRequested,
+    NeverStarted,
 }
 
 /// Failure of the root startup barrier.

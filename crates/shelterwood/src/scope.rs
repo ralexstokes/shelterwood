@@ -81,17 +81,33 @@ impl ScopeRef {
     /// Snapshot watches conflate intermediate states, so `pred` should accept
     /// every state at or beyond the desired edge and must remain cheap and
     /// non-blocking.
-    pub async fn wait_for_child<P>(
+    ///
+    /// `id` is converted through `Into<ChildId>` eagerly, on the calling
+    /// thread, before the future exists — so the conversion runs even when the
+    /// returned future is never polled. That is what keeps the future `Send`
+    /// for a non-`Send` `id`; the wait itself still begins at first poll.
+    pub fn wait_for_child<P>(
         &self,
         id: impl Into<ChildId>,
         pred: P,
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<ChildSnapshot, WaitError>> + Send
+    where
+        P: FnMut(&ChildSnapshot) -> bool + Send,
+    {
+        let id = id.into();
+        self.wait_for_child_inner(id, pred, timeout)
+    }
+
+    async fn wait_for_child_inner<P>(
+        &self,
+        id: ChildId,
+        mut pred: P,
         timeout: Duration,
     ) -> Result<ChildSnapshot, WaitError>
     where
         P: FnMut(&ChildSnapshot) -> bool + Send,
     {
-        let id = id.into();
-        let mut pred = pred;
         let expires = crate::deadline::Deadline::after(crate::runtime::now(), timeout);
         let mut snapshots = self.subscribe_snapshots();
 
@@ -249,16 +265,21 @@ impl DynamicScopeRef {
     /// Snapshot watches conflate intermediate states, so `pred` should accept
     /// every state at or beyond the desired edge and must remain cheap and
     /// non-blocking.
-    pub async fn wait_for_child<P>(
+    ///
+    /// `id` is converted through `Into<ChildId>` eagerly, on the calling
+    /// thread, before the future exists — so the conversion runs even when the
+    /// returned future is never polled. That is what keeps the future `Send`
+    /// for a non-`Send` `id`; the wait itself still begins at first poll.
+    pub fn wait_for_child<P>(
         &self,
         id: impl Into<ChildId>,
         pred: P,
         timeout: Duration,
-    ) -> Result<ChildSnapshot, WaitError>
+    ) -> impl std::future::Future<Output = Result<ChildSnapshot, WaitError>> + Send
     where
         P: FnMut(&ChildSnapshot) -> bool + Send,
     {
-        self.0.wait_for_child(id, pred, timeout).await
+        self.0.wait_for_child(id, pred, timeout)
     }
 
     /// Waits for terminal membership state.

@@ -1614,6 +1614,18 @@ impl ScopeCell {
         self.with_observation_gate(|wakes| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             let epoch = control.epochs.begin()?;
+            // The idle epoch plane pairs only with a settled projection:
+            // `Unstarted` before any mint, `Stopped` after every finish. That
+            // pairing is what lets `scope_settled` treat terminal membership
+            // plus a settled projection as final without stranding a scope
+            // that still owns a live incarnation.
+            debug_assert!(
+                matches!(
+                    self.record().state,
+                    ScopeState::Unstarted | ScopeState::Stopped { .. }
+                ),
+                "an idle scope projection is Unstarted or Stopped before a fresh incarnation mints"
+            );
             self.observation.record.modify_silently(|record| {
                 record.total_restarts = TotalRestarts::ZERO;
                 record.startup = None;
@@ -1865,6 +1877,35 @@ impl ScopeCell {
         control.epochs.finished(epoch)
     }
 
+    /// Whether a shutdown wait has crossed the finality fence for its target.
+    ///
+    /// Membership terminality alone is insufficient: parent-driver
+    /// destruction publishes it before the aborted nested driver runs the
+    /// scope epilogue that finishes the incarnation and publishes `Stopped`.
+    /// `None` is used only by the entry check, before a target epoch exists.
+    ///
+    /// This predicate is strictly weaker than membership terminality, so
+    /// shutdown liveness now rests on two structural invariants. First, every
+    /// live epoch has exactly one owner — the pre-driver epoch guard before a
+    /// scope runtime exists, the scope runtime itself afterwards — and both
+    /// finish it from `Drop`, so an unsettled target always has a pending
+    /// finisher. Second, an idle epoch plane implies a settled projection:
+    /// `begin_incarnation` is the only mint and it publishes `Starting`
+    /// under the control guard,
+    /// while [`Self::finish_incarnation`] always publishes `Stopped` under
+    /// that same guard, so `ScopeEpochs::Idle`/`Exhausted` can only pair with
+    /// `Unstarted` (never begun) or `Stopped`. Together they mean the
+    /// terminal-membership arm can never be the *only* reachable settlement
+    /// for a scope that still owns work.
+    pub(crate) fn scope_settled(&self, epoch: Option<Epoch>) -> bool {
+        epoch.is_some_and(|epoch| self.incarnation_finished(epoch))
+            || (matches!(self.member.record().stage, MemberStage::Terminal(_))
+                && matches!(
+                    self.record().state,
+                    ScopeState::Stopped { .. } | ScopeState::Unstarted
+                ))
+    }
+
     pub(crate) fn set_admitted_children(self: &Arc<Self>, children: Vec<ResidentProjection>) {
         self.with_observation_gate(|wakes| {
             self.clear_residents_locked(wakes);
@@ -1993,17 +2034,35 @@ impl ScopeCell {
         }
     }
 
-    /// Commits one stopped-scope projection and its optional member terminal
-    /// edge under the resident-tree observation gate.
+    /// Commits a stopped-scope projection monotonically and applies its
+    /// optional member terminal edge under the resident-tree observation gate.
+    ///
+    /// Several owners can reach a stop verdict for one incarnation — a
+    /// driver's drain epilogue, a join monitor's fallback, a never-started
+    /// terminalization — so competing reasons resolve through
+    /// `StopPrecedence`, never through arrival order. A publication commits
+    /// only when it strictly outranks the recorded reason; equal or weaker
+    /// verdicts are idempotent repeats that mutate nothing. An upgrade
+    /// republishes the record, the snapshot and a corrected `ScopeState` edge,
+    /// so the stream never ends on an event that disagrees with the final
+    /// record (SPEC B.4's non-final-`Stopped` rule admits exactly this step).
     ///
     /// Member terminalization prepares mailbox teardown first; its deferred
     /// discharge is therefore queued before either member or scope pulses.
     /// `epoch_owner` carries a live incarnation's control ownership through
     /// both retained record mutations and is released before snapshot and
     /// lifecycle publication, preserving the stop transition's ownership
-    /// boundary. Observation closure remains a caller decision because a
-    /// nested scope's final event must precede its parent's terminal event and
-    /// only then close the nested streams.
+    /// boundary. A suppressed repeat still terminalizes the member and still
+    /// releases the epoch: only the scope-record mutation, snapshot pulse and
+    /// lifecycle edge are skipped. Because the ancestor snapshot chain is
+    /// republished by `emit_locked`, a suppressed repeat publishes no ancestor
+    /// snapshot either — a caller whose member terminal edge must reach an
+    /// ancestor projection has to publish that itself. Observation closure
+    /// remains a caller decision because a nested scope's final event must
+    /// precede its parent's terminal event and only then close the nested
+    /// streams; a subscriber attaching after the final event and before that
+    /// closure therefore resolves by closure alone, as it already does on the
+    /// stale-epoch path above.
     fn publish_stopped_locked(
         &self,
         wakes: &mut ObservationTxn<'_>,
@@ -2011,12 +2070,20 @@ impl ScopeCell {
         terminal_exit: Option<Exit>,
         epoch_owner: Option<MutexGuard<'_, ScopeControl>>,
     ) {
+        let incoming = reason.precedence();
         let state = ScopeState::Stopped { reason };
+        let mut published = false;
         self.observation.record.modify_silently(|record| {
+            if let ScopeState::Stopped { reason: recorded } = &record.state
+                && incoming <= recorded.precedence()
+            {
+                return;
+            }
             if record.startup.is_none() {
                 record.startup = Some(Err(StartupError::ShutdownRequested));
             }
             record.state = state.clone();
+            published = true;
         });
         if let Some(exit) = terminal_exit {
             self.member
@@ -2026,8 +2093,10 @@ impl ScopeCell {
         wakes.pulse(&self.member.record);
         // `wait_started` must not observe terminal startup until the member
         // and incarnation-control planes are mutually consistent.
-        wakes.pulse(&self.observation.record);
-        self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
+        if published {
+            wakes.pulse(&self.observation.record);
+            self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
+        }
     }
 
     pub(crate) fn terminalize_never_started(&self) {

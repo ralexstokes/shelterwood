@@ -37,12 +37,17 @@ impl ScopeRuntime {
         };
         let root = Arc::clone(&self.root);
         let tracked = root.with_observation_gate(|txn| {
-            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-            let tracked = state
-                .entry_mut(member.id())
-                .filter(|entry| entry.slot.member.membership() == membership)
-                .and_then(|entry| entry.mark_removing(txn))
-                .is_some_and(|tracked| tracked == key);
+            let tracked = {
+                let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
+                state
+                    .entry_mut(member.id())
+                    .filter(|entry| entry.slot.member.membership() == membership)
+                    .and_then(|entry| entry.mark_removing(txn))
+                    .is_some_and(|tracked| tracked == key)
+            };
+            // The Removing projection publishes outside the dynamic-state
+            // mutex, like the sibling writers in `admission_control`; the
+            // observation gate alone serializes the mutation.
             if tracked && member.record().membership_status != MembershipStatus::Removing {
                 root.set_child_removing_locked(&member, txn);
             }

@@ -2023,7 +2023,9 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   as the scope's terminal reason. A nested lowering failure before the
   driver loop follows the same rule: a stop request already latched for
   its epoch, or a fired ancestor-shutdown latch, upgrades the terminal
-  reason and pending startup result to `ShutdownRequested`. Ladder deadlines
+  reason and pending startup result to `ShutdownRequested` — and, like the
+  loop path, records the stop as observed, so the scope still exits at its
+  parent as a cancelled `Completed` (§11). Ladder deadlines
   share the posture: a forced escalation only ever moves a deadline
   *earlier* (`min`), never later. (`NeverStarted` sits outside the order — it
   is the terminal reason of a membership that never had an incarnation to

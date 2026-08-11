@@ -517,7 +517,7 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
         NestedScopeLatches {
             parent_ready: ready.clone(),
             ancestor: AncestorCommandLatches {
-                shutdown: ancestor_shutdown,
+                shutdown: ancestor_shutdown.clone(),
                 abort: Latch::default(),
                 abort_ack: Latch::default(),
             },
@@ -527,6 +527,10 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
     .await;
 
     assert!(result.is_ok());
+    assert!(
+        ancestor_shutdown.is_fired(),
+        "the upgraded verdict fires the latch that reports the exit as cancelled"
+    );
     assert!(matches!(
         scope.record().startup,
         Some(Err(StartupError::ShutdownRequested))

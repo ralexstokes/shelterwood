@@ -601,9 +601,24 @@ async fn run_nested_tree_with_epoch(
             // through the same monotone verdict lattice as the loop path.
             // Peek rather than consume: `finish_incarnation` clears both
             // epoch-tagged request latches after publishing the verdict.
+            // The ancestor *abort* latch needs no separate arm: it is the
+            // framework-abort edge, fired only by `StopAction::AbortFramework`,
+            // and the stop ladder unconditionally passes through
+            // `StopAction::Cancel` — which fires this same ancestor shutdown
+            // latch — before it can reach that phase.
             if scope.has_stop_request(epoch.epoch()) || latches.ancestor.shutdown.is_fired() {
+                // Mirror the loop's `Pending::Shutdown` arm: firing the
+                // ancestor shutdown latch is what makes this scope's exit read
+                // `Cancellation::Observed` at its parent, as a requested stop
+                // must (§11). The latch is level-triggered, so re-firing an
+                // ancestor-driven stop is a no-op.
+                latches.ancestor.shutdown.fire();
                 epoch.lifecycle.begin_drain(StopReason::ShutdownRequested);
             }
+            // Both drain effects are deliberately discarded: this path
+            // publishes no `Draining` edge because nothing was ever started to
+            // drain, matching the pre-lattice behaviour of the `StartupFailed`
+            // verdict it generalizes.
             epoch
                 .lifecycle
                 .begin_drain(StopReason::StartupFailed(failure));

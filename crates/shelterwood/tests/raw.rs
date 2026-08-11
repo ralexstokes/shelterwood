@@ -350,6 +350,115 @@ async fn raw_recv_is_shutdown_biased_and_try_recv_controls_drain_vs_discard() {
     }
 }
 
+struct LiveTryRecvActor {
+    entered: ReleaseGate,
+    release: ReleaseGate,
+    observed: Arc<Mutex<Option<usize>>>,
+}
+
+impl RawActor for LiveTryRecvActor {
+    type Msg = usize;
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        self.entered.release();
+        self.release.wait().await;
+        *self.observed.lock().expect("observation mutex poisoned") = context.try_recv();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn try_recv_delivers_mailbox_input_while_the_incarnation_is_live() {
+    let entered = ReleaseGate::default();
+    let release = ReleaseGate::default();
+    let observed = Arc::new(Mutex::new(None));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "live-try-recv",
+            RawOnceDef::new(LiveTryRecvActor {
+                entered: entered.clone(),
+                release: release.clone(),
+                observed: Arc::clone(&observed),
+            }),
+        )
+        .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("raw actor starts");
+    entered.wait().await;
+    actor.try_send(17).expect("live mailbox accepts");
+    release.release();
+
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(
+        *observed.lock().expect("observation mutex poisoned"),
+        Some(17)
+    );
+}
+
+struct TryRecvPanicActor {
+    panic_queued: Arc<AtomicBool>,
+}
+
+impl RawActor for TryRecvPanicActor {
+    type Msg = ();
+
+    fn readiness() -> Readiness {
+        Readiness::Manual
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        context.mark_ready();
+        let guard = context
+            .offload_scoped(
+                async { panic!("try_recv retained offload panic") },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("offload accepted");
+        guard.finished().await;
+        self.panic_queued.store(true, Ordering::SeqCst);
+        let _ = context.try_recv();
+        unreachable!("live try_recv must resume the retained panic")
+    }
+}
+
+#[tokio::test]
+async fn live_try_recv_resumes_a_retained_offload_panic() {
+    let panic_queued = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "try-recv-panic",
+        RawOnceDef::new(TryRecvPanicActor {
+            panic_queued: Arc::clone(&panic_queued),
+        }),
+    )
+    .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    system.wait_started().await.expect("manual readiness fires");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+
+    let mut observed_exit = None;
+    while let Some(item) = events.recv().await {
+        let shelterwood::LifecycleItem::Event(event) = item else {
+            panic!("small fixture must not lag");
+        };
+        if let shelterwood::LifecycleEventKind::Exited { id, exit, .. } = event.kind
+            && id.as_str() == "try-recv-panic"
+        {
+            observed_exit = Some(exit);
+        }
+    }
+    let exit = observed_exit.expect("panic exit is observable on the lifecycle stream");
+    assert!(matches!(
+        exit.kind(),
+        shelterwood::ExitKind::Panicked { message }
+            if message.as_deref() == Some("try_recv retained offload panic")
+    ));
+    assert!(panic_queued.load(Ordering::SeqCst));
+}
+
 struct DynamicActor {
     values: Arc<Mutex<Vec<usize>>>,
 }

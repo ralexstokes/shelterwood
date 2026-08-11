@@ -145,6 +145,15 @@ impl ScopeRuntimeBuilder {
 /// must time out with a diagnostic rather than hang the test on `recv`.
 pub(super) const CAPTURE_PROBE_WAIT: Duration = Duration::from_secs(10);
 
+/// Bounds every real-clock wait on driver progress in the async driver
+/// tests, on the same reasoning and at the same scale as
+/// [`CAPTURE_PROBE_WAIT`]. Each such wait covers a step an idle machine
+/// reaches immediately, so the bound is a diagnostic rather than a timing
+/// property: sizing it near the expected latency makes scheduler starvation
+/// on a loaded machine indistinguishable from the regression it is meant to
+/// catch.
+pub(super) const DRIVER_PROGRESS_WAIT: Duration = Duration::from_secs(10);
+
 pub(super) fn isolated_scope(id: &'static str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from(id);

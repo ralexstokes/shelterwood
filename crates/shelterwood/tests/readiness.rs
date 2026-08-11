@@ -731,9 +731,13 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
         .await
     );
     initial_release.release();
-    system
-        .wait_started()
+    // The regression this test targets — a runtime addition joining the
+    // aggregate — would park `wait_started` forever behind the unbounded
+    // readiness deadline of a member that never marks ready. Bounding the
+    // wait turns that hang into a diagnostic outside nextest's kill timer.
+    tokio::time::timeout(POLL_TIMEOUT, system.wait_started())
         .await
+        .expect("aggregate readiness does not wait on the runtime addition")
         .expect("only the initial set gates aggregate readiness");
     assert_eq!(
         scope.remove_task(&runtime_task).await,

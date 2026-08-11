@@ -58,10 +58,10 @@ packages=(
   shelterwood-core
   shelterwood-runtime
   shelterwood-mailbox
-  shelterwood
 )
+facade=shelterwood
 members=()
-for package in "${packages[@]}"; do
+for package in "${packages[@]}" "$facade"; do
   package_id="$(cargo pkgid -p "$package")"
   version="${package_id##*#}"
   member="$package-$version"
@@ -85,21 +85,17 @@ done
 
 # Compile every library from the normalized archive manifests and then run the
 # facade's packaged rustdoc tests from those same extracted archives.
-cat > "$stage_root/Cargo.toml" <<EOF
-[workspace]
-members = [
-  "${members[0]}",
-  "${members[1]}",
-  "${members[2]}",
-  "${members[3]}",
-]
-resolver = "3"
-
-[patch.crates-io]
-shelterwood-core = { path = "${members[0]}" }
-shelterwood-runtime = { path = "${members[1]}" }
-shelterwood-mailbox = { path = "${members[2]}" }
-EOF
+# Generated from the package list so a crate added above cannot be packaged
+# but silently left out of the workspace that verifies it. `packages` and
+# `members` stay index-parallel because the façade is appended last.
+{
+  printf '[workspace]\nmembers = [\n'
+  printf '  "%s",\n' "${members[@]}"
+  printf ']\nresolver = "3"\n\n[patch.crates-io]\n'
+  for index in "${!packages[@]}"; do
+    printf '%s = { path = "%s" }\n' "${packages[index]}" "${members[index]}"
+  done
+} > "$stage_root/Cargo.toml"
 
 (
   cd "$stage_root"

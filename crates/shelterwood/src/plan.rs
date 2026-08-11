@@ -253,6 +253,11 @@ pub(crate) struct BuilderCore {
     pub(crate) config: ScopeConfig,
     pub(crate) slots: Vec<Arc<SlotCell>>,
     ids: HashMap<ChildId, Arc<SlotCell>>,
+    /// The stable scope whose identity map `lower(root_override)` adopts the
+    /// slots' lineages into. Eviction must target the map a lineage actually
+    /// entered: before adoption begins the lineages live in `root`'s map,
+    /// afterwards they live here.
+    adopting_root: Option<Arc<ScopeCell>>,
     armed: bool,
 }
 
@@ -281,6 +286,7 @@ impl BuilderCore {
             config: ScopeConfig::default(),
             slots: Vec::new(),
             ids: HashMap::new(),
+            adopting_root: None,
             armed: true,
         }
     }
@@ -327,6 +333,10 @@ impl BuilderCore {
             }
         };
         if !Arc::ptr_eq(&root, &self.root) {
+            // From the first adoption on, a failed or unwound lowering must
+            // evict the terminalized slots from the override's identity map,
+            // not this builder's throwaway root.
+            self.adopting_root = Some(Arc::clone(&root));
             let mut identity = root
                 .child_identity
                 .lock()
@@ -394,8 +404,13 @@ impl BuilderCore {
     }
 
     fn terminalize(&self) {
+        // A failed `lower(root_override)` may have adopted only a prefix of
+        // these lineages into the override's map before the error or unwind.
+        // Slots past the failure point never left `self.root`'s map, so their
+        // eviction from the override is a fence-mismatch no-op (fail closed).
+        let identity_root = self.adopting_root.as_ref().unwrap_or(&self.root);
         for slot in &self.slots {
-            slot.terminalize_never_started(&self.root);
+            slot.terminalize_never_started(identity_root);
         }
         self.root.terminalize_never_started();
     }
@@ -570,9 +585,11 @@ mod tests {
     };
 
     use crate::{
-        Backoff, DefaultsInheritance, ExitError, Readiness, RestartCondition, RestartPolicy,
-        Retention, Shutdown, TaskOnceDef,
+        Backoff, ChildId, DefaultsInheritance, ExitError, Readiness, RestartCondition,
+        RestartPolicy, Retention, Shutdown, TaskOnceDef,
+        cells::{MemberCell, ScopeCell},
         definition::DefinitionSource,
+        identity::ScopeIdentity,
         policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
         raw::RawConstruction,
         runtime::{self, Timeout},
@@ -580,7 +597,7 @@ mod tests {
     };
 
     use super::{
-        BuilderCore, ChildConstruction, ChildPlan, ScopeConstruction, SlotCell,
+        BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeConstruction, SlotCell,
         concrete_dynamic_slot, concrete_dynamic_slot_ref, erase_dynamic_slot,
     };
 
@@ -773,6 +790,69 @@ mod tests {
             "removal cannot claim between policy resolution and admission"
         );
         drop(claim);
+    }
+
+    #[crate::runtime::test]
+    async fn failed_override_lowering_evicts_adopted_lineages_from_the_override() {
+        // A stable scope whose identity domain for "exhausted" has no
+        // generations left, so adoption of that id must fail after the
+        // preceding slot's lineage was already adopted.
+        let root_id = ChildId::from("$root");
+        let mut root_identity = ScopeIdentity::new();
+        let root_membership = root_identity
+            .mint_membership(&root_id)
+            .expect("fresh scope identity must mint its root membership");
+        let member = MemberCell::new(root_id, root_membership);
+        let exhausted_id = ChildId::from("exhausted");
+        let mut child_identity = ScopeIdentity::near_exhaustion(exhausted_id.clone(), 7);
+        let _ = child_identity
+            .mint_membership(&exhausted_id)
+            .expect("the final generation is mintable");
+        let stable = ScopeCell::new(member, ScopeFlavor::Ordered, child_identity);
+
+        let mut builder = BuilderCore::new(ScopeFlavor::Ordered);
+        let adopted = builder
+            .reserve("adopted", None)
+            .expect("reservation succeeds");
+        adopted.define(ChildConstruction::Task(configured_task()));
+        let adopted_membership = adopted.member.membership();
+        let failing = builder
+            .reserve("exhausted", None)
+            .expect("reservation succeeds");
+        failing.define(ChildConstruction::Task(configured_task()));
+
+        let Err(error) = builder.lower(ResolvedDefaults::default(), Some(Arc::clone(&stable)))
+        else {
+            panic!("the exhausted id fails adoption");
+        };
+        let LowerError::IdentityExhausted { id, disposal } = error else {
+            panic!("partial adoption fails with identity exhaustion");
+        };
+        assert_eq!(id.as_str(), "exhausted");
+        disposal.fired().await;
+
+        // A restart-style rebuild reconciles against the same stable scope.
+        // The terminalized slot's lineage must have been evicted from the
+        // override's identity map — not the failed builder's throwaway root —
+        // so the re-added id donates a fresh lineage that is incomparable in
+        // both directions instead of minting an ordered successor.
+        let mut rebuild = BuilderCore::new(ScopeFlavor::Ordered);
+        let readded = rebuild
+            .reserve("adopted", None)
+            .expect("re-added id is reservable");
+        readded.define(ChildConstruction::Task(configured_task()));
+        let replacement = rebuild
+            .lower(ResolvedDefaults::default(), Some(stable))
+            .expect("the rebuild lowers");
+        let readded_membership = replacement.children[0].slot.member.membership();
+        assert!(
+            !readded_membership.supersedes(adopted_membership),
+            "a rebuilt membership must not supersede its terminalized predecessor"
+        );
+        assert!(
+            !adopted_membership.supersedes(readded_membership),
+            "a terminalized predecessor must not order against its replacement"
+        );
     }
 
     struct DropFlag(Arc<AtomicBool>);

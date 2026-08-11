@@ -364,8 +364,8 @@ impl ScopeRuntime {
         }
 
         let (definition, resolved) = match request.slot.resolve_and_take_defined(&self.defaults) {
-            Ok(Some(claimed)) => claimed,
-            Ok(None) => {
+            Some(claimed) => claimed,
+            None => {
                 let (_, removed) = self.root.with_observation_gate(|txn| {
                     cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
                 });
@@ -374,18 +374,6 @@ impl ScopeRuntime {
                     None,
                     removed,
                     ReserveError::NotAdmitting(NotAdmittingCause::ReservationEnded),
-                );
-                return;
-            }
-            Err(invalid) => {
-                let (definition, removed) = self.root.with_observation_gate(|txn| {
-                    cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
-                });
-                reject_admission_after_disposal(
-                    request,
-                    definition,
-                    removed,
-                    ReserveError::InvalidPolicy(invalid),
                 );
                 return;
             }
@@ -575,14 +563,6 @@ async fn run_nested_tree_with_epoch(
                 }
                 LowerError::IdentityExhausted { id, disposal } => {
                     (StartupFailureCause::IdentityExhausted { id }, disposal)
-                }
-                LowerError::InvalidPolicy { invalid, disposal } => {
-                    // `InvalidPolicy::path` is relative to the scope being
-                    // lowered, which here is this nested scope itself. The
-                    // owning child id is already carried by the enclosing
-                    // `StartupFailureCause::Child`, so prepending it here
-                    // would double-count this frame.
-                    (StartupFailureCause::InvalidPolicy(invalid), disposal)
                 }
             };
             // Lowering never created a nested driver to own teardown. Keep

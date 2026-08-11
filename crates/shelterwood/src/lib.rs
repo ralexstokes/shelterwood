@@ -44,9 +44,9 @@ pub use observe::{
 };
 pub use policy::{
     Backoff, BackoffFactor, BoundedReadinessDeadline, DefaultsInheritance, ExponentialBackoff,
-    FixedBackoff, Intensity, InvalidPolicy, Jitter, JitterSample, Mailbox, MailboxShutdown,
-    PolicyError, PolicyField, Readiness, ReadinessDeadline, RestartAttempt, RestartCondition,
-    RestartCount, RestartPolicy, Retention, ScopeDefaults, Shutdown, Strategy, TotalRestarts,
+    FixedBackoff, Intensity, Jitter, JitterSample, Mailbox, MailboxShutdown, PolicyError,
+    Readiness, ReadinessDeadline, RestartAttempt, RestartCondition, RestartCount, RestartPolicy,
+    Retention, ScopeDefaults, Shutdown, Strategy, TotalRestarts,
 };
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,

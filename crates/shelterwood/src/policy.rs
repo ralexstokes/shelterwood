@@ -2,7 +2,7 @@
 
 use std::{fmt, num::NonZeroUsize, time::Duration};
 
-use crate::{Exit, identity::ChildId};
+use crate::Exit;
 
 /// Whether a scope has fixed ordered membership or runtime-dynamic membership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -344,27 +344,6 @@ impl Backoff {
         // with exact Duration ordering after every conversion and jitter.
         delay.min(maximum)
     }
-
-    fn validate(self) -> Result<(), PolicyError> {
-        match self {
-            Self::Immediate => Ok(()),
-            Self::Fixed(fixed) if fixed.delay.is_zero() => Err(PolicyError::ZeroDuration),
-            Self::Fixed(_) => Ok(()),
-            Self::Exponential(exponential) => {
-                let ExponentialBackoff {
-                    base, factor, max, ..
-                } = exponential;
-                if base.is_zero() || max.is_zero() {
-                    return Err(PolicyError::ZeroDuration);
-                }
-                factor.validate()?;
-                if max < base {
-                    return Err(PolicyError::BackoffMaximumBeforeBase);
-                }
-                Ok(())
-            }
-        }
-    }
 }
 
 fn duration_nanos(duration: Duration) -> f64 {
@@ -425,10 +404,6 @@ impl RestartPolicy {
     #[must_use]
     pub const fn is_never(self) -> bool {
         matches!(self.condition, RestartCondition::Never)
-    }
-
-    fn validate(self) -> Result<(), PolicyError> {
-        self.backoff.validate()
     }
 
     pub(crate) fn should_restart(self, exit: &Exit) -> bool {
@@ -511,13 +486,6 @@ impl ReadinessDeadline {
         }
         Ok(Self::Bounded(BoundedReadinessDeadline(duration)))
     }
-
-    fn validate_declared(self) -> Result<(), PolicyError> {
-        match self {
-            Self::Bounded(duration) if duration.0.is_zero() => Err(PolicyError::ZeroDuration),
-            Self::Inherit | Self::Bounded(_) | Self::Unbounded => Ok(()),
-        }
-    }
 }
 
 /// The scope-wide restart budget.
@@ -532,12 +500,13 @@ pub struct Intensity {
 impl Intensity {
     /// Constructs a validated intensity budget.
     pub fn new(max_restarts: u64, within: Duration) -> Result<Self, PolicyError> {
-        let intensity = Self {
+        if within.is_zero() {
+            return Err(PolicyError::ZeroDuration);
+        }
+        Ok(Self {
             max_restarts,
             within,
-        };
-        intensity.validate()?;
-        Ok(intensity)
+        })
     }
 
     /// Returns the maximum restart charges allowed inside the window.
@@ -550,14 +519,6 @@ impl Intensity {
     #[must_use]
     pub const fn within(self) -> Duration {
         self.within
-    }
-
-    pub(crate) fn validate(self) -> Result<(), PolicyError> {
-        if self.within.is_zero() {
-            Err(PolicyError::ZeroDuration)
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -681,56 +642,6 @@ pub enum PolicyError {
     UnsupportedReadiness,
 }
 
-/// Policy field rejected at a trusted lowering or admission boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum PolicyField {
-    /// A scope restart-intensity window.
-    Intensity,
-    /// A default or child restart backoff.
-    RestartBackoff,
-    /// A default or child readiness deadline.
-    ReadinessDeadline,
-}
-
-impl fmt::Display for PolicyField {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Intensity => formatter.write_str("restart intensity"),
-            Self::RestartBackoff => formatter.write_str("restart backoff"),
-            Self::ReadinessDeadline => formatter.write_str("readiness deadline"),
-        }
-    }
-}
-
-/// Structured evidence for a policy value rejected during lowering.
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("invalid {field} at child path {path:?}: {error}")]
-#[non_exhaustive]
-pub struct InvalidPolicy {
-    /// Child-id path relative to the scope being lowered; empty for scope policy.
-    pub path: Vec<ChildId>,
-    /// Policy field whose public representation bypassed validation.
-    pub field: PolicyField,
-    /// Exact validation failure.
-    pub error: PolicyError,
-}
-
-impl InvalidPolicy {
-    pub(crate) fn new(field: PolicyField, error: PolicyError) -> Self {
-        Self {
-            path: Vec::new(),
-            field,
-            error,
-        }
-    }
-
-    pub(crate) fn prepend(mut self, id: &ChildId) -> Self {
-        self.path.insert(0, id.clone());
-        self
-    }
-}
-
 pub(crate) fn tidy_abort_beat(grace: Duration) -> Duration {
     (grace / 10).clamp(Duration::from_millis(1), Duration::from_millis(10))
 }
@@ -785,9 +696,8 @@ impl Default for ResolvedDefaults {
 }
 
 impl ResolvedDefaults {
-    pub(crate) fn overlay(&self, values: &ScopeDefaults) -> Result<Self, InvalidPolicy> {
-        self.validate()?;
-        let resolved = Self {
+    pub(crate) fn overlay(&self, values: &ScopeDefaults) -> Self {
+        Self {
             child_restart: resolve(values.child_restart, self.child_restart),
             child_shutdown: resolve(values.child_shutdown, self.child_shutdown),
             mailbox: resolve_mailbox(values.mailbox, self.mailbox, self.queue_capacity),
@@ -800,22 +710,6 @@ impl ResolvedDefaults {
                 .readiness_deadline
                 .map(|value| resolve_readiness_deadline(value, self.readiness_deadline))
                 .unwrap_or(self.readiness_deadline),
-        };
-        // Validating the resolved value covers every selected override. The
-        // inherited value was checked above even when an override replaces it.
-        resolved.validate()?;
-        Ok(resolved)
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), InvalidPolicy> {
-        self.child_restart
-            .validate()
-            .map_err(|error| InvalidPolicy::new(PolicyField::RestartBackoff, error))?;
-        match self.readiness_deadline {
-            ResolvedReadinessDeadline::Bounded(duration) if duration.is_zero() => Err(
-                InvalidPolicy::new(PolicyField::ReadinessDeadline, PolicyError::ZeroDuration),
-            ),
-            ResolvedReadinessDeadline::Bounded(_) | ResolvedReadinessDeadline::Unbounded => Ok(()),
         }
     }
 }
@@ -869,18 +763,8 @@ pub(crate) fn resolve_common(
     defaults: &ResolvedDefaults,
     mode: ChildMode,
     default_readiness: Readiness,
-) -> Result<ResolvedCommonOptions, InvalidPolicy> {
-    defaults.validate()?;
-    if let Some(restart) = options.restart {
-        restart
-            .validate()
-            .map_err(|error| InvalidPolicy::new(PolicyField::RestartBackoff, error))?;
-    }
-    options
-        .readiness_deadline
-        .validate_declared()
-        .map_err(|error| InvalidPolicy::new(PolicyField::ReadinessDeadline, error))?;
-    Ok(ResolvedCommonOptions {
+) -> ResolvedCommonOptions {
+    ResolvedCommonOptions {
         restart: if mode == ChildMode::OneShot {
             RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
         } else {
@@ -902,7 +786,7 @@ pub(crate) fn resolve_common(
                 Retention::Retain
             },
         ),
-    })
+    }
 }
 
 #[cfg(test)]
@@ -910,19 +794,12 @@ mod tests {
     use std::{num::NonZeroUsize, time::Duration};
 
     use super::{
-        Backoff, BackoffFactor, ChildMode, CommonOptions, Intensity, InvalidPolicy, Jitter,
-        JitterSample, Mailbox, MailboxShutdown, PolicyError, PolicyField, Readiness,
-        ReadinessDeadline, ResolvedDefaults, ResolvedMailbox, ResolvedReadinessDeadline,
-        RestartAttempt, RestartCondition, RestartCount, RestartPolicy, Retention, ScopeDefaults,
-        Shutdown, TotalRestarts, resolve_common, tidy_abort_beat,
+        Backoff, BackoffFactor, ChildMode, CommonOptions, Intensity, Jitter, JitterSample, Mailbox,
+        MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, ResolvedDefaults,
+        ResolvedMailbox, ResolvedReadinessDeadline, RestartAttempt, RestartCondition, RestartCount,
+        RestartPolicy, Retention, ScopeDefaults, Shutdown, TotalRestarts, resolve_common,
+        tidy_abort_beat,
     };
-
-    fn assert_constructor_matches_literal<T>(
-        constructed: Result<T, PolicyError>,
-        validated: Result<(), PolicyError>,
-    ) {
-        assert_eq!(constructed.map(|_| ()), validated);
-    }
 
     #[test]
     fn restart_counters_saturate_at_the_numeric_limit() {
@@ -1121,77 +998,6 @@ mod tests {
     }
 
     #[test]
-    fn constructors_and_literal_validation_are_equivalent_at_every_boundary() {
-        for value in [
-            f64::NAN,
-            f64::NEG_INFINITY,
-            0.0,
-            f64::from_bits(1.0_f64.to_bits() - 1),
-            1.0,
-            f64::MAX,
-        ] {
-            assert_constructor_matches_literal(
-                BackoffFactor::new(value),
-                BackoffFactor(value).validate(),
-            );
-        }
-
-        for delay in [Duration::ZERO, Duration::from_nanos(1), Duration::MAX] {
-            assert_constructor_matches_literal(
-                Backoff::fixed(delay, Jitter::Equal),
-                Backoff::Fixed {
-                    delay,
-                    jitter: Jitter::Equal,
-                }
-                .validate(),
-            );
-            assert_constructor_matches_literal(
-                ReadinessDeadline::bounded(delay),
-                ReadinessDeadline::Bounded(delay).validate_declared(),
-            );
-            assert_constructor_matches_literal(
-                Intensity::new(7, delay),
-                Intensity {
-                    max_restarts: 7,
-                    within: delay,
-                }
-                .validate(),
-            );
-        }
-
-        for (base, factor, max) in [
-            (Duration::ZERO, BackoffFactor(2.0), Duration::from_secs(1)),
-            (Duration::from_secs(1), BackoffFactor(2.0), Duration::ZERO),
-            (
-                Duration::from_secs(1),
-                BackoffFactor(f64::NAN),
-                Duration::from_secs(2),
-            ),
-            (
-                Duration::from_secs(2),
-                BackoffFactor(2.0),
-                Duration::from_secs(1),
-            ),
-            (
-                Duration::from_nanos(1),
-                BackoffFactor(1.0),
-                Duration::from_nanos(1),
-            ),
-        ] {
-            assert_constructor_matches_literal(
-                Backoff::exponential(base, factor, max, Jitter::None),
-                Backoff::Exponential {
-                    base,
-                    factor,
-                    max,
-                    jitter: Jitter::None,
-                }
-                .validate(),
-            );
-        }
-    }
-
-    #[test]
     fn unit_multiplier_backoff_delays_are_exact_beyond_float_precision() {
         // 2^60 + 1 whole nanoseconds cannot survive an f64 round-trip.
         let base = Duration::from_nanos((1 << 60) + 1);
@@ -1357,43 +1163,33 @@ mod tests {
     #[test]
     fn mailbox_capacity_walks_outward_by_kind_across_defaults_overlays() {
         let library = ResolvedDefaults::default();
-        let library_latest = library
-            .overlay(&ScopeDefaults {
-                mailbox: Some(Mailbox::latest()),
-                ..ScopeDefaults::default()
-            })
-            .expect("valid defaults");
-        let library_queue = library_latest
-            .overlay(&ScopeDefaults {
-                mailbox: Some(Mailbox::queue_inherit()),
-                ..ScopeDefaults::default()
-            })
-            .expect("valid defaults");
+        let library_latest = library.overlay(&ScopeDefaults {
+            mailbox: Some(Mailbox::latest()),
+            ..ScopeDefaults::default()
+        });
+        let library_queue = library_latest.overlay(&ScopeDefaults {
+            mailbox: Some(Mailbox::queue_inherit()),
+            ..ScopeDefaults::default()
+        });
         assert_eq!(
             library_queue.mailbox,
             ResolvedMailbox::Queue(NonZeroUsize::new(64).expect("capacity is non-zero"))
         );
 
-        let outer_queue = library
-            .overlay(&ScopeDefaults {
-                mailbox: Some(Mailbox::queue(10).expect("non-zero capacity")),
-                ..ScopeDefaults::default()
-            })
-            .expect("valid defaults");
-        let latest = outer_queue
-            .overlay(&ScopeDefaults {
-                mailbox: Some(Mailbox::latest()),
-                ..ScopeDefaults::default()
-            })
-            .expect("valid defaults");
+        let outer_queue = library.overlay(&ScopeDefaults {
+            mailbox: Some(Mailbox::queue(10).expect("non-zero capacity")),
+            ..ScopeDefaults::default()
+        });
+        let latest = outer_queue.overlay(&ScopeDefaults {
+            mailbox: Some(Mailbox::latest()),
+            ..ScopeDefaults::default()
+        });
         assert_eq!(latest.mailbox, ResolvedMailbox::Latest);
 
-        let deferred_queue = latest
-            .overlay(&ScopeDefaults {
-                mailbox: Some(Mailbox::queue_inherit()),
-                ..ScopeDefaults::default()
-            })
-            .expect("valid defaults");
+        let deferred_queue = latest.overlay(&ScopeDefaults {
+            mailbox: Some(Mailbox::queue_inherit()),
+            ..ScopeDefaults::default()
+        });
         assert_eq!(
             deferred_queue.mailbox,
             ResolvedMailbox::Queue(NonZeroUsize::new(10).expect("capacity is non-zero"))
@@ -1401,12 +1197,10 @@ mod tests {
         assert_eq!(deferred_queue.child_restart, latest.child_restart);
         assert_eq!(deferred_queue.child_shutdown, latest.child_shutdown);
 
-        let reset_queue = ResolvedDefaults::default()
-            .overlay(&ScopeDefaults {
-                mailbox: Some(Mailbox::queue_inherit()),
-                ..ScopeDefaults::default()
-            })
-            .expect("valid reset defaults");
+        let reset_queue = ResolvedDefaults::default().overlay(&ScopeDefaults {
+            mailbox: Some(Mailbox::queue_inherit()),
+            ..ScopeDefaults::default()
+        });
         assert_eq!(
             reset_queue.mailbox,
             ResolvedMailbox::Queue(NonZeroUsize::new(64).expect("capacity is non-zero"))
@@ -1415,32 +1209,23 @@ mod tests {
 
     #[test]
     fn default_overlay_and_child_resolution_share_inheritance_rules() {
-        let inherited = ResolvedDefaults::default()
-            .overlay(&ScopeDefaults {
-                child_restart: Some(RestartPolicy::new(
-                    RestartCondition::Always,
-                    Backoff::Immediate,
-                )),
-                child_shutdown: Some(Shutdown::Abort),
-                mailbox: Some(Mailbox::Latest),
-                mailbox_shutdown: Some(MailboxShutdown::Discard),
-                readiness_deadline: Some(ReadinessDeadline::Unbounded),
-            })
-            .expect("explicit defaults are valid");
+        let inherited = ResolvedDefaults::default().overlay(&ScopeDefaults {
+            child_restart: Some(RestartPolicy::new(
+                RestartCondition::Always,
+                Backoff::Immediate,
+            )),
+            child_shutdown: Some(Shutdown::Abort),
+            mailbox: Some(Mailbox::Latest),
+            mailbox_shutdown: Some(MailboxShutdown::Discard),
+            readiness_deadline: Some(ReadinessDeadline::Unbounded),
+        });
 
+        assert_eq!(inherited.overlay(&ScopeDefaults::default()), inherited);
         assert_eq!(
-            inherited
-                .overlay(&ScopeDefaults::default())
-                .expect("empty overlay is valid"),
-            inherited
-        );
-        assert_eq!(
-            inherited
-                .overlay(&ScopeDefaults {
-                    readiness_deadline: Some(ReadinessDeadline::Inherit),
-                    ..ScopeDefaults::default()
-                })
-                .expect("explicit deadline inheritance is valid"),
+            inherited.overlay(&ScopeDefaults {
+                readiness_deadline: Some(ReadinessDeadline::Inherit),
+                ..ScopeDefaults::default()
+            }),
             inherited
         );
 
@@ -1449,8 +1234,7 @@ mod tests {
             &inherited,
             ChildMode::Restartable,
             Readiness::Manual,
-        )
-        .expect("default child options are valid");
+        );
         assert_eq!(child.restart, inherited.child_restart);
         assert_eq!(child.shutdown, inherited.child_shutdown);
         assert_eq!(child.mailbox, inherited.mailbox);
@@ -1465,15 +1249,15 @@ mod tests {
                 shutdown: Some(Shutdown::default()),
                 mailbox_shutdown: Some(MailboxShutdown::Drain),
                 readiness: Some(Readiness::Immediate),
-                readiness_deadline: ReadinessDeadline::Bounded(Duration::from_nanos(1)),
+                readiness_deadline: ReadinessDeadline::bounded(Duration::from_nanos(1))
+                    .expect("non-zero deadline"),
                 retention: Some(Retention::Remove),
                 ..CommonOptions::default()
             },
             &inherited,
             ChildMode::Restartable,
             Readiness::Manual,
-        )
-        .expect("explicit child options are valid");
+        );
         assert_eq!(overridden.restart, RestartPolicy::default());
         assert_eq!(overridden.shutdown, Shutdown::default());
         assert_eq!(overridden.mailbox, inherited.mailbox);
@@ -1484,174 +1268,5 @@ mod tests {
             ResolvedReadinessDeadline::Bounded(Duration::from_nanos(1))
         );
         assert_eq!(overridden.retention, Retention::Remove);
-    }
-
-    #[test]
-    fn ignored_and_replaced_invalid_inputs_are_still_rejected() {
-        let invalid_restart = RestartPolicy::new(
-            RestartCondition::Always,
-            Backoff::Fixed {
-                delay: Duration::ZERO,
-                jitter: Jitter::None,
-            },
-        );
-        let restart_error =
-            InvalidPolicy::new(PolicyField::RestartBackoff, PolicyError::ZeroDuration);
-
-        assert_eq!(
-            resolve_common(
-                &CommonOptions {
-                    restart: Some(invalid_restart),
-                    ..CommonOptions::default()
-                },
-                &ResolvedDefaults::default(),
-                ChildMode::OneShot,
-                Readiness::Immediate,
-            ),
-            Err(restart_error.clone()),
-            "a one-shot child still rejects its ignored restart literal"
-        );
-
-        let invalid_inherited = ResolvedDefaults {
-            child_restart: invalid_restart,
-            ..ResolvedDefaults::default()
-        };
-        assert_eq!(
-            resolve_common(
-                &CommonOptions {
-                    restart: Some(RestartPolicy::default()),
-                    ..CommonOptions::default()
-                },
-                &invalid_inherited,
-                ChildMode::Restartable,
-                Readiness::Immediate,
-            ),
-            Err(restart_error),
-            "an override cannot hide an invalid inherited value"
-        );
-    }
-
-    #[test]
-    fn public_literal_representations_are_revalidated() {
-        assert_eq!(
-            Backoff::Fixed {
-                delay: Duration::ZERO,
-                jitter: Jitter::None,
-            }
-            .validate(),
-            Err(PolicyError::ZeroDuration)
-        );
-        assert_eq!(
-            Backoff::Exponential {
-                base: Duration::ZERO,
-                factor: BackoffFactor(2.0),
-                max: Duration::from_secs(1),
-                jitter: Jitter::None,
-            }
-            .validate(),
-            Err(PolicyError::ZeroDuration)
-        );
-        assert_eq!(
-            Backoff::Exponential {
-                base: Duration::from_secs(1),
-                factor: BackoffFactor(f64::NAN),
-                max: Duration::from_secs(2),
-                jitter: Jitter::None,
-            }
-            .validate(),
-            Err(PolicyError::InvalidBackoffFactor)
-        );
-        assert_eq!(
-            Backoff::Exponential {
-                base: Duration::from_secs(2),
-                factor: BackoffFactor(2.0),
-                max: Duration::from_secs(1),
-                jitter: Jitter::None,
-            }
-            .validate(),
-            Err(PolicyError::BackoffMaximumBeforeBase)
-        );
-        assert_eq!(
-            ReadinessDeadline::Bounded(Duration::ZERO).validate_declared(),
-            Err(PolicyError::ZeroDuration)
-        );
-        assert_eq!(
-            Intensity {
-                max_restarts: 0,
-                within: Duration::ZERO,
-            }
-            .validate(),
-            Err(PolicyError::ZeroDuration)
-        );
-    }
-
-    #[test]
-    fn inherited_and_resolved_policy_values_are_revalidated() {
-        let invalid_restart = ResolvedDefaults {
-            child_restart: RestartPolicy::new(
-                RestartCondition::Always,
-                Backoff::Fixed {
-                    delay: Duration::ZERO,
-                    jitter: Jitter::None,
-                },
-            ),
-            ..ResolvedDefaults::default()
-        };
-        assert_eq!(
-            invalid_restart.overlay(&ScopeDefaults {
-                child_restart: Some(RestartPolicy::default()),
-                ..ScopeDefaults::default()
-            }),
-            Err(InvalidPolicy::new(
-                PolicyField::RestartBackoff,
-                PolicyError::ZeroDuration
-            ))
-        );
-
-        let unresolved = ResolvedDefaults {
-            readiness_deadline: ResolvedReadinessDeadline::Bounded(Duration::ZERO),
-            ..ResolvedDefaults::default()
-        };
-        assert_eq!(
-            unresolved.overlay(&ScopeDefaults::default()),
-            Err(InvalidPolicy::new(
-                PolicyField::ReadinessDeadline,
-                PolicyError::ZeroDuration
-            ))
-        );
-    }
-
-    #[test]
-    fn minimum_valid_literal_edges_are_accepted() {
-        assert_eq!(
-            Backoff::Fixed {
-                delay: Duration::from_nanos(1),
-                jitter: Jitter::None,
-            }
-            .validate(),
-            Ok(())
-        );
-        assert_eq!(
-            Backoff::Exponential {
-                base: Duration::from_nanos(1),
-                factor: BackoffFactor(1.0),
-                max: Duration::from_nanos(1),
-                jitter: Jitter::Equal,
-            }
-            .validate(),
-            Ok(())
-        );
-        assert_eq!(
-            ReadinessDeadline::Bounded(Duration::from_nanos(1)).validate_declared(),
-            Ok(())
-        );
-        assert_eq!(
-            Intensity {
-                max_restarts: 0,
-                within: Duration::from_nanos(1),
-            }
-            .validate(),
-            Ok(())
-        );
     }
 }

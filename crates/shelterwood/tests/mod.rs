@@ -16,7 +16,6 @@ mod mailbox;
 mod observation;
 mod offloads;
 mod one_shot_resource_ownership;
-mod policy_validation;
 mod raw;
 mod readiness;
 mod rebind;

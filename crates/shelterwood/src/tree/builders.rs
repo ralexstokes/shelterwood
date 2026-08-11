@@ -5,7 +5,7 @@ use crate::{
     admission::ReserveError,
     mailbox::MailboxCell,
     plan::{BuilderCore, LowerError, SlotCell},
-    policy::{InvalidPolicy, ResolvedDefaults, ScopeFlavor},
+    policy::{ResolvedDefaults, ScopeFlavor},
     raw::{RawDef, RawOnceDef},
     runtime,
     scope::{DynamicScopeRef, ScopeRef},
@@ -31,9 +31,6 @@ pub enum BuildError {
         /// Child-id paths of every undefined reservation.
         paths: Vec<Vec<ChildId>>,
     },
-    /// A public policy representation contained an invalid literal value.
-    #[error(transparent)]
-    InvalidPolicy(InvalidPolicy),
 }
 /// Routes a definition rejected before admission through isolated disposal.
 ///
@@ -314,7 +311,6 @@ fn spawn_builder<R>(
             LowerError::IdentityExhausted { .. } => {
                 unreachable!("root lowering does not mint memberships")
             }
-            LowerError::InvalidPolicy { invalid, .. } => BuildError::InvalidPolicy(invalid),
         })?;
     let scope_ref = ScopeRef { cell: root };
     let run = crate::driver::spawn_system(plan);

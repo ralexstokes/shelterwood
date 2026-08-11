@@ -202,7 +202,6 @@ pub(crate) struct MemberCell {
     terminal_disposal_pending: AtomicBool,
     mailbox: Mutex<MemberMailbox>,
     options: OnceLock<ResolvedCommonOptions>,
-    pub(crate) removal: Latch,
 }
 
 #[derive(Default)]
@@ -259,7 +258,6 @@ impl MemberCell {
             terminal_disposal_pending: AtomicBool::new(false),
             mailbox: Mutex::new(MemberMailbox::default()),
             options: OnceLock::new(),
-            removal: Latch::default(),
         })
     }
 

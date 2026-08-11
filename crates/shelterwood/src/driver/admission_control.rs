@@ -528,12 +528,6 @@ fn remove_dynamic_impl(
     if removal.is_some() {
         scope.set_child_removing_locked(&member, txn);
     }
-    // The fire linearizes inside the transaction; the waker-visible wake is
-    // deferred past the gate release.
-    if member.removal.fire_silently() {
-        let removal = member.removal.clone();
-        txn.defer(move || removal.notify());
-    }
     if let Some(removal) = removal {
         defer_driver_event(txn, control, DriverEvent::Removal(removal));
     }

@@ -63,7 +63,10 @@ pub(crate) struct DestructorBlocker(Arc<(Mutex<DestructorState>, Condvar)>);
 
 impl Drop for DestructorBlocker {
     fn drop(&mut self) {
-        const MAX_BLOCK: Duration = Duration::from_secs(5);
+        // A stuck-test backstop, not an assertion: well above any legitimate
+        // wait (POLL_TIMEOUT and every gate driven by it) so a passing test
+        // can never reach it.
+        const MAX_BLOCK: Duration = Duration::from_secs(30);
 
         let (state, changed) = &*self.0;
         let mut state = state.lock().expect("destructor gate mutex poisoned");
@@ -72,18 +75,20 @@ impl Drop for DestructorBlocker {
         let deadline = Instant::now() + MAX_BLOCK;
         while !state.released {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !remaining.is_zero(),
-                "destructor gate was not released within {MAX_BLOCK:?}"
-            );
-            let (next, timeout) = changed
+            if remaining.is_zero() {
+                // This destructor also runs while other panics unwind, where
+                // a nested panic aborts with no diagnostic at all. Report and
+                // abort deliberately instead.
+                eprintln!("destructor gate was not released within {MAX_BLOCK:?}");
+                if std::thread::panicking() {
+                    std::process::abort();
+                }
+                panic!("destructor gate was not released within {MAX_BLOCK:?}");
+            }
+            state = changed
                 .wait_timeout(state, remaining)
-                .expect("destructor gate mutex poisoned while blocking");
-            state = next;
-            assert!(
-                !timeout.timed_out() || state.released,
-                "destructor gate was not released within {MAX_BLOCK:?}"
-            );
+                .expect("destructor gate mutex poisoned while blocking")
+                .0;
         }
     }
 }

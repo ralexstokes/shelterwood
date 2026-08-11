@@ -1739,7 +1739,7 @@ enum SaturateMessage {
 struct SaturatedActor {
     issued: usize,
     delivered: usize,
-    observed_deliveries: Arc<AtomicUsize>,
+    peak_backlog: Arc<AtomicUsize>,
 }
 
 impl Actor for SaturatedActor {
@@ -1751,13 +1751,15 @@ impl Actor for SaturatedActor {
         Ok(Self {
             issued: 0,
             delivered: 0,
-            observed_deliveries: args.1,
+            peak_backlog: args.1,
         })
     }
 
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         match message {
             SaturateMessage::Ping => {
+                self.peak_backlog
+                    .fetch_max(self.issued - self.delivered, Ordering::SeqCst);
                 self.issued += 1;
                 context
                     .offload(
@@ -1772,7 +1774,6 @@ impl Actor for SaturatedActor {
             }
             SaturateMessage::Completed => {
                 self.delivered += 1;
-                self.observed_deliveries.fetch_add(1, Ordering::SeqCst);
                 if self.delivered == SATURATE {
                     context.stop();
                 }
@@ -1783,18 +1784,21 @@ impl Actor for SaturatedActor {
 }
 
 /// A continuously nonempty mailbox cannot starve queued offload completions:
-/// all completions eventually arrive even when the mailbox was already full.
-/// The cross-source interleaving and an exact transient backlog width are not
-/// part of that starvation guarantee.
+/// bounded arbitration turns interleave the captured completion prefix with
+/// mailbox delivery, so the completion backlog tracks the actor's own
+/// in-flight issuance instead of growing with mailbox history. Only that
+/// relation is asserted — a backlog reaching the whole queued history means
+/// completions were starved until the mailbox drained, while the exact
+/// transient width and the cross-source interleaving are unspecified.
 #[tokio::test]
-async fn saturated_mailbox_eventually_delivers_every_completion() {
+async fn saturated_mailbox_does_not_grow_the_completion_backlog() {
     let gate = ReleaseGate::default();
-    let delivered = Arc::new(AtomicUsize::new(0));
+    let peak_backlog = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "saturated",
-            ActorOnceDef::<SaturatedActor>::new((gate.clone(), Arc::clone(&delivered)))
+            ActorOnceDef::<SaturatedActor>::new((gate.clone(), Arc::clone(&peak_backlog)))
                 .mailbox(Mailbox::queue(SATURATE).expect("non-zero capacity")),
         )
         .expect("valid actor");
@@ -1807,8 +1811,13 @@ async fn saturated_mailbox_eventually_delivers_every_completion() {
     }
     gate.release();
     system.wait_started().await.expect("actor starts");
+    // Termination is itself the liveness half: the actor stops only once all
+    // SATURATE completions land.
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    assert_eq!(delivered.load(Ordering::SeqCst), SATURATE);
+    assert!(
+        peak_backlog.load(Ordering::SeqCst) < SATURATE - 1,
+        "the completion backlog must not reach the queued mailbox history"
+    );
 }
 
 /// §5.5's teardown order holds on the error path too: a handler `Err` joins

@@ -577,7 +577,10 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     );
 
     const DELIVERY_ID: u64 = 7;
-    let delivery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // One budget for the whole logical redelivery, not a per-attempt constant
+    // alongside it: every attempt's own acceptance deadline is whatever the
+    // shared budget has left (§3.3 step 1).
+    let delivery_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let first_delivery = gateway
         .ingress
         .call(
@@ -585,8 +588,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                 id: DELIVERY_ID,
                 reply,
             },
-            Duration::from_secs(1)
-                .min(delivery_deadline.saturating_duration_since(tokio::time::Instant::now())),
+            delivery_deadline.saturating_duration_since(tokio::time::Instant::now()),
         )
         .await
         .expect_err("durable write crash loses the first acknowledgement");
@@ -626,7 +628,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                 id: DELIVERY_ID,
                 reply,
             },
-            Duration::from_secs(1).min(remaining),
+            remaining,
         )
         .await
         .expect("redelivery of the same journal id is acknowledged");

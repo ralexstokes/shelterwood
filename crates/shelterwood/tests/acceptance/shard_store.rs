@@ -141,6 +141,20 @@ impl DurableTopology {
             .get(&operation)
             .cloned()
     }
+
+    /// The journal's idempotency keys, so a retry can be shown to reuse the
+    /// key its first attempt wrote rather than minting a fresh one.
+    fn journalled_operations(&self) -> Vec<u64> {
+        let mut operations: Vec<u64> = self
+            .operations
+            .lock()
+            .expect("operation journal mutex poisoned")
+            .keys()
+            .copied()
+            .collect();
+        operations.sort_unstable();
+        operations
+    }
 }
 
 enum RouterMessage {
@@ -389,6 +403,7 @@ async fn replace_with_retry(
     operation: u64,
 ) -> RetryOutcome {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let journalled_before = durable.journalled_operations();
     let mut fault_record = None;
     let mut directory_at_fault = None;
     let mut attempted_operations = Vec::new();
@@ -420,7 +435,19 @@ async fn replace_with_retry(
                         "the retry is accepted only by a superseding incarnation"
                     );
                 }
-                assert!(attempted_operations.iter().all(|id| *id == operation));
+                // Exact idempotency key: however many attempts ran, they all
+                // journalled under this operation's key. A retry that minted
+                // a fresh key would leave a second new journal entry.
+                let journalled_after = durable.journalled_operations();
+                let minted: Vec<u64> = journalled_after
+                    .into_iter()
+                    .filter(|id| *id != operation && !journalled_before.contains(id))
+                    .collect();
+                assert!(
+                    minted.is_empty(),
+                    "retries reuse operation {operation}'s idempotency key, but {minted:?} \
+                     were journalled"
+                );
                 return RetryOutcome {
                     route: reply.value,
                     fault_record,

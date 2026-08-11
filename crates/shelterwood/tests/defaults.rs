@@ -4,7 +4,7 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -13,8 +13,8 @@ use std::{
 use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
     Actor, ActorDef, Backoff, Context, DynamicTree, ExitError, ExitKind, ExitResult, GracePhase,
-    RawActor, RawContext, RawOnceDef, Readiness, RestartCount, Retention, SendErrorKind,
-    StartupError, StopReason, TaskDef, TaskOnceDef, Tree,
+    MailboxShutdown, RawActor, RawContext, RawOnceDef, Readiness, RestartCount, Retention,
+    SendErrorKind, StartupError, StopReason, TaskDef, TaskOnceDef, Tree,
 };
 
 enum CapacityMessage {
@@ -283,8 +283,8 @@ async fn default_restart_backoff_and_retention_follow_definition_ownership() {
 
 struct DefaultDrainActor {
     entered: ReleaseGate,
-    release: ReleaseGate,
     values: Arc<AtomicUsize>,
+    resolved: Arc<Mutex<Option<MailboxShutdown>>>,
 }
 
 impl RawActor for DefaultDrainActor {
@@ -292,12 +292,24 @@ impl RawActor for DefaultDrainActor {
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
         self.entered.release();
-        self.release.wait().await;
-        while context.recv().await.is_some() {
-            self.values.fetch_add(1, Ordering::SeqCst);
-        }
-        while context.try_recv().is_some() {
-            self.values.fetch_add(1, Ordering::SeqCst);
+        // A raw loop implements the frozen-prefix policy itself, so the loop
+        // must both report the resolved default and obey it: parking until
+        // shutdown makes the accepted prefix reachable only through the
+        // policy-gated drain below, never through steady-state `recv`.
+        context.shutdown_token().cancelled().await;
+        let resolved = context.mailbox_shutdown();
+        *self
+            .resolved
+            .lock()
+            .expect("resolved policy mutex poisoned") = Some(resolved);
+        assert!(
+            context.recv().await.is_none(),
+            "recv is shutdown-biased once intake is frozen"
+        );
+        if resolved == MailboxShutdown::Drain {
+            while context.try_recv().is_some() {
+                self.values.fetch_add(1, Ordering::SeqCst);
+            }
         }
         Ok(())
     }
@@ -306,16 +318,16 @@ impl RawActor for DefaultDrainActor {
 #[tokio::test]
 async fn default_mailbox_shutdown_drains_the_frozen_prefix() {
     let entered = ReleaseGate::default();
-    let release = ReleaseGate::default();
     let values = Arc::new(AtomicUsize::new(0));
+    let resolved = Arc::new(Mutex::new(None));
     let mut tree = Tree::new();
     let actor = tree
         .add_raw_once(
             "drain",
             RawOnceDef::new(DefaultDrainActor {
                 entered: entered.clone(),
-                release: release.clone(),
                 values: Arc::clone(&values),
+                resolved: Arc::clone(&resolved),
             }),
         )
         .expect("valid raw actor");
@@ -325,16 +337,19 @@ async fn default_mailbox_shutdown_drains_the_frozen_prefix() {
     actor.try_send(()).expect("first message accepts");
     actor.try_send(()).expect("second message accepts");
 
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1)));
-    release.release();
-    shutdown
+    system
+        .shutdown(Duration::from_secs(1))
         .await
-        .expect("shutdown task joins")
         .expect("implicit drain completes");
+    assert_eq!(
+        *resolved.lock().expect("resolved policy mutex poisoned"),
+        Some(MailboxShutdown::Drain),
+        "MailboxShutdown::Drain is the shipped default"
+    );
     assert_eq!(
         values.load(Ordering::SeqCst),
         2,
-        "MailboxShutdown::Drain is the shipped default"
+        "the shipped default delivers the whole frozen accepted prefix"
     );
 }
 

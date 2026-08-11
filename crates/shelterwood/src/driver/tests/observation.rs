@@ -213,6 +213,17 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
     });
     nested.set_state(ScopeState::Running);
 
+    let nested_ref = ScopeRef {
+        cell: Arc::clone(&nested),
+    };
+    let mut parked_shutdown = Box::pin(nested_ref.shutdown_and_wait(Duration::from_secs(10)));
+    let first_shutdown_poll =
+        std::future::poll_fn(|context| Poll::Ready(parked_shutdown.as_mut().poll(context))).await;
+    assert!(
+        first_shutdown_poll.is_pending(),
+        "the live incarnation accepts its shutdown request before terminality"
+    );
+
     assert!(parent.terminalize_child(
         &nested.member,
         Exit::new(
@@ -225,9 +236,20 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
         StartupDisposition::NotAborted,
     ));
 
-    let nested_ref = ScopeRef {
-        cell: Arc::clone(&nested),
-    };
+    let before_epilogue =
+        std::future::poll_fn(|context| Poll::Ready(parked_shutdown.as_mut().poll(context))).await;
+    assert!(
+        before_epilogue.is_pending(),
+        "a parked shutdown wait must not treat published membership terminality as scope settlement"
+    );
+    let mut fresh_shutdown = Box::pin(nested_ref.shutdown_and_wait(Duration::from_secs(10)));
+    let fresh_before_epilogue =
+        std::future::poll_fn(|context| Poll::Ready(fresh_shutdown.as_mut().poll(context))).await;
+    assert!(
+        fresh_before_epilogue.is_pending(),
+        "a fresh shutdown wait must not short-circuit during the terminal-before-epilogue window"
+    );
+
     let mut snapshot_waiter =
         Box::pin(nested_ref.wait_for_child("missing", |_| false, Duration::from_secs(10)));
     let first_snapshot_poll =
@@ -246,6 +268,12 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
     );
 
     nested.finish_incarnation(epoch, StopReason::ShutdownRequested);
+    parked_shutdown
+        .await
+        .expect("the target incarnation settled");
+    fresh_shutdown
+        .await
+        .expect("the target incarnation settled");
     assert_eq!(waiter.await, StopReason::ShutdownRequested);
     assert!(matches!(
         snapshot_waiter.await,
@@ -255,6 +283,63 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
             }
         })
     ));
+}
+
+#[crate::runtime::test]
+async fn terminal_scope_in_drain_waits_for_its_live_incarnation_to_stop() {
+    let parent = isolated_scope("parent", ScopeFlavor::Ordered);
+    let nested = isolated_scope("nested", ScopeFlavor::Ordered);
+    let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+    parent.set_admitted_children(vec![resident_projection(&slot)]);
+
+    let epoch = nested
+        .begin_incarnation(ScopeState::Starting)
+        .expect("nested scope epoch is available");
+    let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
+    let incarnation = incarnations.mint().expect("child incarnation is available");
+    nested.member.update(|record| {
+        record.stage = MemberStage::Running;
+        record.incarnation = Some(incarnation);
+        record.last_incarnation = Some(incarnation);
+    });
+    nested.set_state(ScopeState::Running);
+
+    let nested_ref = ScopeRef {
+        cell: Arc::clone(&nested),
+    };
+    let mut shutdown = Box::pin(nested_ref.shutdown_and_wait(Duration::from_secs(10)));
+    let accepted =
+        std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+    assert!(accepted.is_pending(), "the live shutdown request parks");
+
+    nested.set_state(ScopeState::Draining);
+    let draining =
+        std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+    assert!(
+        draining.is_pending(),
+        "the shutdown wait enters its incarnation-completion phase"
+    );
+
+    assert!(parent.terminalize_child(
+        &nested.member,
+        Exit::new(
+            ExitKind::Aborted {
+                phase: GracePhase::WithinGrace,
+            },
+            Cancellation::Observed,
+        ),
+        Some(incarnation),
+        StartupDisposition::NotAborted,
+    ));
+    let before_epilogue =
+        std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
+    assert!(
+        before_epilogue.is_pending(),
+        "the completion wait must not treat published membership terminality as scope settlement"
+    );
+
+    nested.finish_incarnation(epoch, StopReason::ShutdownRequested);
+    shutdown.await.expect("the target incarnation settled");
 }
 
 #[crate::runtime::test]

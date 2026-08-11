@@ -1865,6 +1865,21 @@ impl ScopeCell {
         control.epochs.finished(epoch)
     }
 
+    /// Whether a shutdown wait has crossed the finality fence for its target.
+    ///
+    /// Membership terminality alone is insufficient: parent-driver
+    /// destruction publishes it before the aborted nested driver runs the
+    /// scope epilogue that finishes the incarnation and publishes `Stopped`.
+    /// `None` is used only by the entry check, before a target epoch exists.
+    pub(crate) fn scope_settled(&self, epoch: Option<Epoch>) -> bool {
+        epoch.is_some_and(|epoch| self.incarnation_finished(epoch))
+            || (matches!(self.member.record().stage, MemberStage::Terminal(_))
+                && matches!(
+                    self.record().state,
+                    ScopeState::Stopped { .. } | ScopeState::Unstarted
+                ))
+    }
+
     pub(crate) fn set_admitted_children(self: &Arc<Self>, children: Vec<ResidentProjection>) {
         self.with_observation_gate(|wakes| {
             self.clear_residents_locked(wakes);

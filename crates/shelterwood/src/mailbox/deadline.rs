@@ -5,10 +5,19 @@ use std::{
     time::Duration,
 };
 
-/// Whether an operation is being polled before or after its deadline expires.
+/// Which of the two passes an operation is being polled in.
+///
+/// A `Deadlined` future polls its operation twice per wakeup: once optimistic,
+/// and -- once the timer has fired -- again to let the operation arbitrate
+/// between a value that landed concurrently and the timeout it would otherwise
+/// report. The distinction is the pass, not merely whether the clock has
+/// passed the deadline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DeadlinePhase {
+    /// Optimistic pass: the operation may only complete on its own terms.
     InitialAttempt,
+    /// Post-expiry pass: the operation closes its channel and decides between
+    /// a concurrently delivered value and reporting the timeout.
     TimeoutArbitration,
 }
 

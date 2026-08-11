@@ -232,7 +232,12 @@ impl<M> MailboxState<M> {
             | MailboxBinding::Bound(BoundState::Full { waiters, .. }) => std::mem::take(waiters),
             MailboxBinding::Bound(BoundState::Available(_)) => WaiterQueue::default(),
             MailboxBinding::Terminal(_) => {
-                unreachable!("a terminal mailbox has no live transition")
+                // Terminalization takes the waiters exactly once and no live
+                // transition follows it. This runs under the mailbox mutex
+                // with no way to release it first, so diagnose in debug rather
+                // than poisoning the lock for every sender in release.
+                debug_assert!(false, "a terminal mailbox has no live transition");
+                WaiterQueue::default()
             }
         }
     }
@@ -575,17 +580,23 @@ impl<M: Send + 'static> MailboxCell<M> {
                         drop(state);
                         Submission::Accepted(acceptance.finish(&self.changed))
                     }
-                    Err(Rejected {
-                        message,
-                        reason: RejectionReason::Full,
-                    }) => {
+                    Err(Rejected { message, reason }) => {
+                        if !matches!(reason, RejectionReason::Full) {
+                            // `Full` is the only rejection a bound, configured
+                            // mailbox can produce. Follow `bind`'s convention
+                            // and release the lock before panicking, so an
+                            // invariant break stays on this thread instead of
+                            // poisoning the mutex under every other sender --
+                            // and so the rejected payload's destructor does not
+                            // run under it either.
+                            drop(state);
+                            drop(message);
+                            unreachable!("a bound configured mailbox rejected as {reason:?}");
+                        }
                         let operation = SendOperation::new(message);
                         operation.observe(incarnation);
                         state.park(&operation);
                         Submission::Parked(operation)
-                    }
-                    Err(Rejected { reason, .. }) => {
-                        unreachable!("a bound configured mailbox rejected as {reason:?}")
                     }
                 }
             }

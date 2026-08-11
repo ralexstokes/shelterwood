@@ -525,10 +525,10 @@ fn remove_dynamic_impl(
         .mark_removing(txn)
         .map(|key| RemovalRequest { membership, key });
     drop(state);
-    if removal.is_some() {
-        scope.set_child_removing_locked(&member, txn);
-    }
     if let Some(removal) = removal {
+        // Projection first, then the deferred request: the same order the
+        // fused source commits in.
+        scope.set_child_removing_locked(&member, txn);
         defer_driver_event(txn, control, DriverEvent::Removal(removal));
     }
     response

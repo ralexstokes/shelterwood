@@ -359,6 +359,12 @@ impl SnapshotHub {
             .0
         });
         if sender.receiver_count() == 0 {
+            // Publication is skipped while receiverless, so the first
+            // subscriber after a quiet stretch installs current state itself.
+            // A closed hub already holds the authoritative terminal
+            // projection, installed by `close`; leave it, and skip the pulse
+            // that would then wake nobody about nothing.
+            let mut refreshed = false;
             sender.modify_silently(|state| {
                 if state.closed {
                     return;
@@ -368,8 +374,11 @@ impl SnapshotHub {
                     .generation
                     .mint()
                     .expect("snapshot generation space exhausted");
+                refreshed = true;
             });
-            txn.pulse(sender);
+            if refreshed {
+                txn.pulse(sender);
+            }
         }
         let inner = sender.watcher();
         let seen_generation = inner.borrow_cloned().generation.current();
@@ -471,7 +480,7 @@ impl SnapshotHub {
     pub(crate) fn is_closed(&self) -> bool {
         self.sender
             .get()
-            .is_some_and(|sender| sender.read_cloned().closed)
+            .is_some_and(|sender| sender.read_with(|state| state.closed))
     }
 }
 
@@ -611,7 +620,7 @@ impl LifecycleHub {
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.channels.signal.read_cloned().closed
+        self.channels.signal.read_with(|signal| signal.closed)
     }
 
     /// Publishes while the containing scope's observation gate is held.
@@ -675,7 +684,10 @@ impl fmt::Debug for LifecycleHub {
         formatter
             .debug_struct("LifecycleHub")
             .field("receivers", &self.channels.events.receiver_count())
-            .field("closed", &self.channels.signal.read_cloned().closed)
+            .field(
+                "closed",
+                &self.channels.signal.read_with(|signal| signal.closed),
+            )
             .finish()
     }
 }

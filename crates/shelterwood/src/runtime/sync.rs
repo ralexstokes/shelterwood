@@ -485,6 +485,14 @@ impl<T> WatchSender<T> {
         });
         debug_assert!(!notified);
     }
+
+    /// Reads a projection of the retained value without cloning it.
+    ///
+    /// `project` runs under the watch's read guard, so it must stay cheap and
+    /// must not touch the same channel.
+    pub(crate) fn read_with<R>(&self, project: impl FnOnce(&T) -> R) -> R {
+        project(&self.0.borrow())
+    }
 }
 
 impl<T: Clone> WatchSender<T> {

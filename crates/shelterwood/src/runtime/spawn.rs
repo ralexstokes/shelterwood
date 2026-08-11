@@ -260,6 +260,10 @@ pub(crate) struct JitterRng(fastrand::Rng);
 
 impl JitterRng {
     pub(crate) fn new() -> Self {
+        // `fastrand::Rng::new` seeds from the thread-local generator, falling
+        // back to a fixed seed if that is unavailable (during TLS teardown).
+        // Restart jitter would then be deterministic and correlated across
+        // scopes -- degraded spread, never a correctness break.
         Self(fastrand::Rng::new())
     }
 

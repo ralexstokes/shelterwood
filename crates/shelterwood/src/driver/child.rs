@@ -160,6 +160,7 @@ pub(super) struct ChildRuntime {
     pub(super) incarnations: IncarnationCounter,
     pub(super) restarts: RestartState,
     pub(super) restart_deadline: Option<DeadlineHandle>,
+    pub(super) restart_shutdown_pending: Option<Epoch>,
     pub(super) active: Option<ActiveChild>,
     pub(super) initial_ready: bool,
     pub(super) initial: bool,
@@ -208,6 +209,7 @@ impl ChildRuntime {
             incarnations,
             restarts: RestartState::new(),
             restart_deadline: None,
+            restart_shutdown_pending: None,
             active: None,
             initial_ready: false,
             initial: true,
@@ -221,6 +223,14 @@ impl ChildRuntime {
 
     pub(super) fn is_terminal(&self) -> bool {
         matches!(self.slot.member.record().stage, MemberStage::Terminal(_))
+    }
+
+    /// Reports whether this child still counts against scope completeness:
+    /// it has not published a terminal stage, or its terminal disposal is
+    /// still outstanding. Every `incomplete_children` adjustment and the
+    /// `child_keys` index derivation consult exactly this predicate.
+    pub(super) fn is_incomplete(&self) -> bool {
+        !self.is_terminal() || self.is_disposing()
     }
 
     pub(super) fn terminalize(
@@ -536,6 +546,25 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
 }
 
 impl ScopeRuntime {
+    pub(super) fn terminalize_child(
+        &mut self,
+        key: ChildKey,
+        exit: Exit,
+        exited_incarnation: Option<Incarnation>,
+        startup: StartupDisposition,
+    ) -> bool {
+        let changed = self.children[key].terminalize(&self.root, exit, exited_incarnation, startup);
+        debug_assert!(
+            !self.children[key].is_incomplete(),
+            "terminal completion leaves no disposal outstanding"
+        );
+        self.incomplete_children = self
+            .incomplete_children
+            .checked_sub(1)
+            .expect("a child completes terminality exactly once");
+        changed
+    }
+
     pub(super) fn spawn_child(&mut self, key: ChildKey) {
         let Some(child) = self.children.get(key) else {
             return;
@@ -953,6 +982,23 @@ impl ScopeRuntime {
                 }
             }
         }
+        if let Some(target) = self
+            .children
+            .get(key)
+            .and_then(|child| child.restart_shutdown_pending)
+        {
+            // A subject-carrying control event can beat the corresponding
+            // child exit into an earlier driver batch. Retry the retained
+            // fact now that the old incarnation is inactive; otherwise the
+            // one-shot event would be consumed while `spawn_child` still
+            // rejects the active child and the requested expedite is lost.
+            // Queue the retry rather than expediting synchronously: it
+            // re-enters arbitration on the next wake, so a later exit
+            // collected in this same batch first gets the chance to trip
+            // intensity or fail startup, and the execution-time suppression
+            // re-check then observes that drain.
+            self.restart_shutdown_retries.push((key, target));
+        }
     }
 
     pub(super) fn begin_terminal_disposal(
@@ -1040,12 +1086,7 @@ impl ScopeRuntime {
         } else {
             StartupDisposition::NotAborted
         };
-        self.children[key].terminalize(
-            &self.root,
-            exit.clone(),
-            terminal.exited_incarnation,
-            startup,
-        );
+        self.terminalize_child(key, exit.clone(), terminal.exited_incarnation, startup);
         if self.dynamic_membership_is_removing(key) {
             self.finalize_removal(key);
         } else if terminal.startup == StartupDisposition::Aborted && !self.lifecycle.is_draining() {

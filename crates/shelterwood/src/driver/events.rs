@@ -45,7 +45,7 @@ pub(super) enum DeadlineKind {
 }
 pub(super) enum Pending {
     Shutdown,
-    RestartShutdown(ChildKey),
+    RestartShutdown { child: ChildKey, target: Epoch },
     AncestorShutdown,
     AncestorAbort,
     Force,
@@ -59,7 +59,7 @@ impl Pending {
             Self::Shutdown | Self::AncestorShutdown | Self::AncestorAbort | Self::Force => {
                 ArbitrationClass::ScopeShutdown
             }
-            Self::RestartShutdown(_) => ArbitrationClass::BackoffDue,
+            Self::RestartShutdown { .. } => ArbitrationClass::BackoffDue,
             Self::Driver(event) => driver_event_class(event),
             Self::Deadline(DeadlineKind::Readiness { .. }) => ArbitrationClass::ReadinessDeadline,
             Self::Deadline(DeadlineKind::Restart { .. }) => ArbitrationClass::BackoffDue,
@@ -94,12 +94,12 @@ pub(super) fn collect_driver_events(
     true
 }
 
-pub(super) fn restart_shutdown_work(child: ChildKey) -> (ArbitrationClass, Pending) {
+pub(super) fn restart_shutdown_work(child: ChildKey, target: Epoch) -> (ArbitrationClass, Pending) {
     // This starts a pending incarnation, so it is restart work, not a
     // scope-shutdown transition. A child exit collected in the same wake must
     // first get the chance to trip intensity or fail startup; the
     // execution-time suppression check then observes that drain.
-    Pending::RestartShutdown(child).classified()
+    Pending::RestartShutdown { child, target }.classified()
 }
 
 pub(super) fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
@@ -161,33 +161,59 @@ impl ScopeRuntime {
             || self.dispatch_membership_status(key) == MembershipStatus::Removing
     }
 
-    pub(super) fn pending_restart_shutdowns(&self) -> Vec<ChildKey> {
-        self.children
-            .keys()
-            .filter(|key| {
-                let child = &self.children[*key];
-                // Only a nested scope can hold a pending-incarnation stop, and
-                // only its own control plane can answer whether one exists.
-                // Both are cheap, so they gate the dynamic-state lookup.
-                child.active.is_none()
-                    && matches!(child.slot.member.record().stage, MemberStage::Restarting)
-                    && child
-                        .slot
-                        .scope
-                        .as_ref()
-                        .is_some_and(|scope| scope.has_pending_incarnation_shutdown())
-                    && !self.restart_is_suppressed(*key)
-            })
-            .collect()
+    pub(super) fn control_event_work(
+        &self,
+        event: ScopeControlEvent,
+    ) -> Option<(ArbitrationClass, Pending)> {
+        match event {
+            ScopeControlEvent::RestartShutdown { membership, target } => self
+                .child_keys
+                .get(&membership)
+                .copied()
+                .map(|child| restart_shutdown_work(child, target)),
+        }
     }
 
-    pub(super) fn expedite_restart_shutdown(&mut self, key: ChildKey) {
+    pub(super) fn expedite_restart_shutdown(&mut self, key: ChildKey, target: Epoch) {
         // Collection and execution are separated by arbitration. Recheck
         // every level-triggered stop source so teardown/removal latched in the
         // same batch suppresses user construction immediately.
-        if !self.restart_is_suppressed(key) {
-            self.spawn_child(key);
+        if self.restart_is_suppressed(key) {
+            if let Some(child) = self.children.get_mut(key) {
+                child.restart_shutdown_pending = None;
+            }
+            return;
         }
+        let target_is_pending = self
+            .children
+            .get(key)
+            .and_then(|child| child.slot.scope.as_ref())
+            .is_some_and(|scope| scope.has_pending_incarnation_shutdown(target));
+        let Some(child) = self.children.get_mut(key) else {
+            return;
+        };
+        if !target_is_pending || child.is_terminal() || child.is_disposing() {
+            child.restart_shutdown_pending = None;
+            return;
+        }
+        if child.active.is_some() {
+            child.restart_shutdown_pending = Some(target);
+            return;
+        }
+        if !child.spawned_once {
+            // Only a member in the restart gap may be expedited. The wake-start
+            // scan this path replaced required `MemberStage::Restarting`; with
+            // no active incarnation and the terminal/disposing cases excluded
+            // above, `spawned_once` is that stage bit — false means the member
+            // is still `Admitted` and has never run. Expediting it would let a
+            // shutdown request against the first (pending) incarnation start an
+            // ordered child before its in-order turn. Leave the request latched
+            // on the nested cell: the first incarnation claims it when
+            // `progress_startup` reaches the child.
+            return;
+        }
+        child.restart_shutdown_pending = None;
+        self.spawn_child(key);
     }
 
     pub(super) fn handle_deadline(&mut self, deadline: DeadlineKind) {

@@ -29,10 +29,11 @@ pub(super) use super::super::{
     AncestorCommandLatches, ChildArena, ChildEvent, ChildKey, ChildRuntime, ChildTerminality,
     DriverEvent, DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage,
     MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
-    ResidentProjection, RuntimeStorage, ScopeCell, ScopeEpochGuard, ScopeFlavor, ScopeRole,
-    ScopeRuntime, StartupDisposition, cancel_dynamic_reservation, discharge_child_terminality,
-    report_slot, reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
-    run_nested_tree, run_scope_incarnation, storage::Obligation,
+    ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard, ScopeFlavor,
+    ScopeRole, ScopeRuntime, StartupDisposition, cancel_dynamic_reservation,
+    discharge_child_terminality, index_children, report_slot, reserve_dynamic, resident_projection,
+    restart_shutdown_work, run_nested_factory, run_nested_tree, run_scope_incarnation,
+    storage::Obligation,
 };
 
 pub(super) struct ScopeRuntimeBuilder {
@@ -107,11 +108,15 @@ impl ScopeRuntimeBuilder {
     }
 
     pub(super) fn build(self) -> ScopeRuntime {
+        let (child_keys, incomplete_children) = index_children(&self.children);
         ScopeRuntime {
             root: self.root,
             defaults: self.defaults,
             intensity_policy: self.intensity_policy,
             intensity: super::super::IntensityState::default(),
+            child_keys,
+            incomplete_children,
+            restart_shutdown_retries: Vec::new(),
             children: self.children,
             events: self.events,
             disposal_events: self.disposal_events,

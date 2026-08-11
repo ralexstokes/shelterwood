@@ -1116,9 +1116,9 @@ mod tests {
             "forcing after expiry cannot move the deadline later"
         );
         assert_eq!(
-            ladder.advance(due),
+            ladder.advance(due + Duration::from_secs(1)),
             Some(StopAction::Escalate),
-            "the original due instant remains actionable"
+            "the already-due ladder remains actionable at the force instant"
         );
         assert_eq!(
             ladder.advance(ladder.deadline().expect("tidy deadline")),
@@ -1612,6 +1612,7 @@ mod tests {
         assert!(!epochs.request_is_pending(first));
         assert!(!epochs.request_is_pending(unminted));
         assert!(!epochs.finished(first));
+        assert!(!epochs.finished(unminted));
         assert!(!epochs.finish(unminted));
         assert_eq!(epochs.live_epoch(), Some(first));
         assert!(epochs.finish(first));
@@ -1635,8 +1636,10 @@ mod tests {
         assert_eq!(exhausted.live_epoch(), None);
         assert_eq!(exhausted.request_target(), None);
         assert_eq!(exhausted.begin(), None, "poisoning is permanent");
+        assert!(!exhausted.request_is_pending(last));
         assert!(!exhausted.request_is_pending(Epoch(u64::MAX)));
         assert!(exhausted.finished(last));
+        assert!(!exhausted.finished(Epoch(u64::MAX)));
         assert!(!exhausted.finish(Epoch(u64::MAX)));
     }
 

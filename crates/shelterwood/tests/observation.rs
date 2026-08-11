@@ -1323,12 +1323,10 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     assert_eq!(nested_row.membership_status, MembershipStatus::Active);
     assert_eq!(nested_row.restart_count, RestartCount::ZERO);
     assert!(
-        nested_row
-            .restart_policy
-            .is_some_and(RestartPolicy::is_never),
+        nested_row.restart_policy.is_never(),
         "a one-shot subtree cannot restart"
     );
-    assert_eq!(nested_row.retention, Some(Retention::Retain));
+    assert_eq!(nested_row.retention, Retention::Retain);
     assert_eq!(nested_row.restart_at, None);
 
     let recursive = nested_row.nested.as_ref().expect("nested scope is live");
@@ -1343,8 +1341,8 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     let worker_row = running
         .descendant(["nested", "worker"])
         .expect("recursion reaches the nested worker");
-    assert_eq!(worker_row.restart_policy, Some(worker_policy));
-    assert_eq!(worker_row.retention, Some(Retention::Retain));
+    assert_eq!(worker_row.restart_policy, worker_policy);
+    assert_eq!(worker_row.retention, Retention::Retain);
     assert_eq!(worker_row.membership_status, MembershipStatus::Active);
 
     let departing_row = running
@@ -1354,12 +1352,9 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     assert!(matches!(departing_row.state, ChildState::Running));
     assert_eq!(
         departing_row.restart_policy,
-        Some(RestartPolicy::new(
-            RestartCondition::Never,
-            Backoff::Immediate
-        ))
+        RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
     );
-    assert_eq!(departing_row.retention, Some(Retention::Remove));
+    assert_eq!(departing_row.retention, Retention::Remove);
     assert_eq!(departing_row.membership_status, MembershipStatus::Active);
     assert!(departing_row.nested.is_none());
     assert!(departing_row.scope_seq.is_none());

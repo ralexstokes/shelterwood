@@ -372,6 +372,11 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
+    assert_eq!(
+        *events.lock().expect("events mutex poisoned"),
+        ["init", "stop"],
+        "the restartable actor definition completes its full shutdown path"
+    );
 }
 
 struct ResumeProbeDecorator<R> {

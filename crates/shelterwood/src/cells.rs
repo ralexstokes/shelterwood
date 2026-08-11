@@ -196,6 +196,8 @@ pub(crate) struct MemberCell {
     observation_gate: RwLock<ObservationGate>,
     terminal_disposal_pending: AtomicBool,
     mailbox: Mutex<MemberMailbox>,
+    // Lowering resolves this before the member enters resident projection;
+    // snapshots treat a missing value as an internal admission-order bug.
     options: OnceLock<ResolvedCommonOptions>,
     pub(crate) removal: Latch,
 }
@@ -431,8 +433,11 @@ impl MemberCell {
             .expect("member options are resolved exactly once");
     }
 
-    fn options(&self) -> Option<ResolvedCommonOptions> {
-        self.options.get().cloned()
+    fn options(&self) -> ResolvedCommonOptions {
+        self.options
+            .get()
+            .cloned()
+            .expect("resident member options are resolved before snapshot publication")
     }
 
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
@@ -1452,9 +1457,6 @@ impl ScopeCell {
     fn child_snapshot_locked(&self, child: &ResidentProjection) -> ChildSnapshot {
         let record = child.member.record();
         let options = child.member.options();
-        let (restart_policy, retention) = options.map_or((None, None), |options| {
-            (Some(options.restart), Some(options.retention))
-        });
         let terminal = matches!(record.stage, MemberStage::Terminal(_));
         let nested = child.scope.as_ref().and_then(|scope| {
             (record.incarnation.is_some() || terminal).then(|| scope.snapshot_locked())
@@ -1477,8 +1479,8 @@ impl ScopeCell {
             last_exit: record.last_exit,
             membership_status: record.membership_status,
             restart_count: record.restart_count,
-            restart_policy,
-            retention,
+            restart_policy: options.restart,
+            retention: options.retention,
             restart_at: record.restart_at,
             nested,
             scope_seq: child

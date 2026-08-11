@@ -2,10 +2,7 @@
 
 use std::{
     fmt,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -338,7 +335,6 @@ impl fmt::Debug for SnapshotReceiver {
 #[derive(Default)]
 pub(crate) struct SnapshotHub {
     sender: OnceLock<runtime::WatchSender<SnapshotHubState>>,
-    closed: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -354,18 +350,6 @@ impl SnapshotHub {
         initial: Arc<ScopeSnapshot>,
         txn: &mut crate::cells::ObservationTxn<'_>,
     ) -> SnapshotReceiver {
-        if self.closed.load(Ordering::Acquire) {
-            let (sender, inner) = runtime::watch(SnapshotHubState {
-                snapshot: initial,
-                generation: crate::identity::PoisonedCounter::new(),
-                closed: true,
-            });
-            drop(sender);
-            return SnapshotReceiver {
-                inner,
-                seen_generation: 0,
-            };
-        }
         let sender = self.sender.get_or_init(|| {
             runtime::watch(SnapshotHubState {
                 snapshot: Arc::clone(&initial),
@@ -374,15 +358,11 @@ impl SnapshotHub {
             })
             .0
         });
-        // `close` may win between the first atomic check and lazy sender
-        // initialization. Reconcile the channel state after initialization so
-        // that first subscriber still observes closure; once installed,
-        // `close` itself performs this publication and wakeup.
-        if self.closed.load(Ordering::Acquire) {
-            sender.modify_silently(|state| state.closed = true);
-            txn.pulse(sender);
-        } else if sender.receiver_count() == 0 {
+        if sender.receiver_count() == 0 {
             sender.modify_silently(|state| {
+                if state.closed {
+                    return;
+                }
                 state.snapshot = initial;
                 state
                     .generation
@@ -399,41 +379,15 @@ impl SnapshotHub {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn publish(&self, snapshot: impl FnOnce() -> Arc<ScopeSnapshot>) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        let Some(sender) = self.sender.get() else {
-            return;
-        };
-        if sender.receiver_count() > 0 {
-            sender.send_if_modified(|state| {
-                // `close` and publication serialize on the retained watch
-                // state. The atomic is the fast path; this check prevents a
-                // publisher that passed it just before closure from mutating
-                // the terminal value afterward.
-                if state.closed {
-                    return false;
-                }
-                state.snapshot = snapshot();
-                state
-                    .generation
-                    .mint()
-                    .expect("snapshot generation space exhausted");
-                true
-            });
-        }
-    }
-
-    pub(crate) fn publish_deferred(
+    /// Publishes while the containing scope's observation gate is held.
+    ///
+    /// The gate serializes publication, subscription, and closure, so the
+    /// retained watch state is the only hub-local source of terminality.
+    pub(crate) fn publish(
         &self,
-        wakes: &mut crate::cells::ObservationTxn<'_>,
+        txn: &mut crate::cells::ObservationTxn<'_>,
         snapshot: impl FnOnce() -> Arc<ScopeSnapshot>,
     ) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
         let Some(sender) = self.sender.get() else {
             return;
         };
@@ -453,27 +407,23 @@ impl SnapshotHub {
             modified = true;
         });
         if modified {
-            wakes.pulse(sender);
+            txn.pulse(sender);
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
+    /// Closes while the containing scope's observation gate is held.
+    pub(crate) fn close(&self, txn: &mut crate::cells::ObservationTxn<'_>) {
         if let Some(sender) = self.sender.get() {
-            sender.send_modify(|state| state.closed = true);
-        }
-    }
-
-    pub(crate) fn close_deferred(&self, wakes: &mut crate::cells::ObservationTxn<'_>) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if let Some(sender) = self.sender.get() {
-            sender.modify_silently(|state| state.closed = true);
-            wakes.pulse(sender);
+            let mut modified = false;
+            sender.modify_silently(|state| {
+                if !state.closed {
+                    state.closed = true;
+                    modified = true;
+                }
+            });
+            if modified {
+                txn.pulse(sender);
+            }
         }
     }
 }
@@ -489,7 +439,13 @@ impl fmt::Debug for SnapshotHub {
                     .get()
                     .map_or(0, |sender| sender.receiver_count()),
             )
-            .field("closed", &self.closed.load(Ordering::Acquire))
+            .field(
+                "closed",
+                &self
+                    .sender
+                    .get()
+                    .is_some_and(|sender| sender.read_cloned().closed),
+            )
             .finish()
     }
 }
@@ -576,7 +532,6 @@ impl fmt::Debug for LifecycleEvents {
 
 pub(crate) struct LifecycleHub {
     channels: LifecycleChannels,
-    closed: AtomicBool,
 }
 
 struct LifecycleChannels {
@@ -599,7 +554,6 @@ impl Default for LifecycleHub {
         let (signal, _) = runtime::watch(LifecycleSignal::default());
         Self {
             channels: LifecycleChannels { events, signal },
-            closed: AtomicBool::new(false),
         }
     }
 }
@@ -615,24 +569,10 @@ impl LifecycleHub {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn publish(&self, event: LifecycleEvent) {
-        tracing::trace!(
-            scope = ?event.scope,
-            seq = event.seq.get(),
-            path = ?event.scope_path,
-            kind = ?event.kind,
-            "scope lifecycle event"
-        );
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        self.publish_past_fast_path(event);
-    }
-
-    pub(crate) fn publish_deferred(
+    /// Publishes while the containing scope's observation gate is held.
+    pub(crate) fn publish(
         &self,
-        wakes: &mut crate::cells::ObservationTxn<'_>,
+        txn: &mut crate::cells::ObservationTxn<'_>,
         event: LifecycleEvent,
     ) {
         tracing::trace!(
@@ -642,9 +582,6 @@ impl LifecycleHub {
             kind = ?event.kind,
             "scope lifecycle event"
         );
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
         let mut published = false;
         self.channels.signal.modify_silently(|signal| {
             if signal.closed {
@@ -654,52 +591,12 @@ impl LifecycleHub {
             published = true;
         });
         if published {
-            wakes.pulse(&self.channels.signal);
+            txn.pulse(&self.channels.signal);
         }
     }
 
-    /// The enqueue half of [`publish`](Self::publish), after the atomic
-    /// fast-path check. Split out so tests can pin the close race: calling
-    /// this on a closed hub is exactly a publisher that read `closed ==
-    /// false` and then lost the linearization race to `close`.
-    #[cfg(test)]
-    fn publish_past_fast_path(&self, event: LifecycleEvent) {
-        self.channels.signal.send_if_modified(|signal| {
-            // Enqueue and activity notification share the same linearization
-            // point as closure. A publisher that passed the atomic fast-path
-            // check cannot append after receivers have observed `closed`.
-            if signal.closed {
-                return false;
-            }
-            let _ = self.channels.events.send(event);
-            // The watch version is also the no-loss activity notification for
-            // async receivers. Its value changes only for explicit lag.
-            true
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn publish_lagged(&self, dropped: u64) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        self.channels.signal.send_if_modified(|signal| {
-            if signal.closed {
-                return false;
-            }
-            signal.explicit_lag = signal.explicit_lag.saturating_add(dropped);
-            true
-        });
-    }
-
-    pub(crate) fn publish_lagged_deferred(
-        &self,
-        wakes: &mut crate::cells::ObservationTxn<'_>,
-        dropped: u64,
-    ) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
+    /// Publishes an explicit lag marker under the observation gate.
+    pub(crate) fn publish_lagged(&self, txn: &mut crate::cells::ObservationTxn<'_>, dropped: u64) {
         let mut published = false;
         self.channels.signal.modify_silently(|signal| {
             if signal.closed {
@@ -709,27 +606,22 @@ impl LifecycleHub {
             published = true;
         });
         if published {
-            wakes.pulse(&self.channels.signal);
+            txn.pulse(&self.channels.signal);
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn close(&self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            self.channels
-                .signal
-                .send_modify(|signal| signal.closed = true);
+    /// Closes while the containing scope's observation gate is held.
+    pub(crate) fn close(&self, txn: &mut crate::cells::ObservationTxn<'_>) {
+        let mut modified = false;
+        self.channels.signal.modify_silently(|signal| {
+            if !signal.closed {
+                signal.closed = true;
+                modified = true;
+            }
+        });
+        if modified {
+            txn.pulse(&self.channels.signal);
         }
-    }
-
-    pub(crate) fn close_deferred(&self, wakes: &mut crate::cells::ObservationTxn<'_>) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.channels
-            .signal
-            .modify_silently(|signal| signal.closed = true);
-        wakes.pulse(&self.channels.signal);
     }
 }
 
@@ -738,7 +630,7 @@ impl fmt::Debug for LifecycleHub {
         formatter
             .debug_struct("LifecycleHub")
             .field("receivers", &self.channels.events.receiver_count())
-            .field("closed", &self.closed.load(Ordering::Acquire))
+            .field("closed", &self.channels.signal.read_cloned().closed)
             .finish()
     }
 }
@@ -760,10 +652,7 @@ pub enum WaitError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, atomic::Ordering},
-        thread,
-    };
+    use std::sync::Arc;
 
     use crate::{
         Intensity, ScopeState,
@@ -791,41 +680,22 @@ mod tests {
     #[test]
     fn snapshot_projection_is_skipped_without_subscribers() {
         let hub = SnapshotHub::default();
-        hub.publish(|| panic!("projection must be lazy when no receiver exists"));
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.publish(&mut txn, || {
+            panic!("projection must be lazy when no receiver exists")
+        });
     }
 
     #[crate::runtime::test]
-    async fn snapshot_publication_that_linearizes_before_close_is_drained() {
-        let hub = Arc::new(SnapshotHub::default());
+    async fn snapshot_publication_before_close_is_drained() {
+        let hub = SnapshotHub::default();
         let mut txn = crate::cells::ObservationTxn::detached();
         let mut snapshots = hub.subscribe(snapshot(ScopeState::Unstarted), &mut txn);
         drop(txn);
-        let (entered, wait_for_release) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel();
 
-        let publisher = {
-            let hub = Arc::clone(&hub);
-            thread::spawn(move || {
-                hub.publish(|| {
-                    entered.send(()).expect("test remains active");
-                    released.recv().expect("publisher is released");
-                    snapshot(ScopeState::Running)
-                });
-            })
-        };
-        wait_for_release
-            .recv()
-            .expect("publisher reaches the serialized channel update");
-        let closer = {
-            let hub = Arc::clone(&hub);
-            thread::spawn(move || hub.close())
-        };
-        while !hub.closed.load(Ordering::Acquire) {
-            thread::yield_now();
-        }
-        release.send(()).expect("publisher is still waiting");
-        publisher.join().expect("publisher does not panic");
-        closer.join().expect("closer does not panic");
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.publish(&mut txn, || snapshot(ScopeState::Running));
+        drop(txn);
 
         assert_eq!(
             snapshots
@@ -835,8 +705,32 @@ mod tests {
                 .state,
             ScopeState::Running
         );
+
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.publish(&mut txn, || {
+            snapshot(ScopeState::Stopped {
+                reason: crate::StopReason::Finished,
+            })
+        });
+        hub.close(&mut txn);
+        drop(txn);
+
+        assert!(matches!(
+            snapshots
+                .changed()
+                .await
+                .expect("final publication precedes close")
+                .state,
+            ScopeState::Stopped {
+                reason: crate::StopReason::Finished
+            }
+        ));
         assert!(snapshots.changed().await.is_err());
-        hub.publish(|| panic!("publication after close must remain lazy"));
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.publish(&mut txn, || {
+            panic!("publication after close must remain lazy")
+        });
+        drop(txn);
 
         let mut txn = crate::cells::ObservationTxn::detached();
         let mut after_close = hub.subscribe(
@@ -862,13 +756,15 @@ mod tests {
         let waiter = crate::runtime::spawn(async move { events.recv().await });
         crate::runtime::yield_now().await;
 
-        hub.close();
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.close(&mut txn);
+        drop(txn);
 
         assert_eq!(crate::runtime::join_resuming(waiter).await, None);
     }
 
     #[test]
-    fn lifecycle_publication_that_lost_the_close_race_appends_nothing() {
+    fn lifecycle_publication_after_close_appends_nothing() {
         let mut identity = ScopeIdentity::new();
         let membership = identity
             .mint_membership(&crate::ChildId::from("scope"))
@@ -876,18 +772,21 @@ mod tests {
             .membership();
         let hub = LifecycleHub::default();
         let mut events = hub.subscribe();
-        hub.close();
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.close(&mut txn);
 
-        // A publisher that read `closed == false` and then lost the
-        // linearization race to `close` must append nothing.
-        hub.publish_past_fast_path(LifecycleEvent {
-            scope_path: Vec::new(),
-            scope: membership,
-            seq: LifecycleSeq::new(1),
-            kind: LifecycleEventKind::ScopeState {
-                state: ScopeState::Running,
+        hub.publish(
+            &mut txn,
+            LifecycleEvent {
+                scope_path: Vec::new(),
+                scope: membership,
+                seq: LifecycleSeq::new(1),
+                kind: LifecycleEventKind::ScopeState {
+                    state: ScopeState::Running,
+                },
             },
-        });
+        );
+        drop(txn);
 
         assert!(matches!(
             events.try_recv(),
@@ -913,13 +812,17 @@ mod tests {
         let hub = LifecycleHub::default();
         let mut events = hub.subscribe();
 
-        hub.publish_lagged(1);
-        hub.publish(event(1));
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.publish_lagged(&mut txn, 1);
+        hub.publish(&mut txn, event(1));
+        drop(txn);
         assert_eq!(events.try_recv(), Ok(LifecycleItem::Lagged { dropped: 1 }));
 
+        let mut txn = crate::cells::ObservationTxn::detached();
         for seq in 2..=(LIFECYCLE_EVENT_CAPACITY as u64 + 2) {
-            hub.publish(event(seq));
+            hub.publish(&mut txn, event(seq));
         }
+        drop(txn);
         assert_eq!(
             events.try_recv(),
             Ok(LifecycleItem::Lagged { dropped: 2 }),
@@ -951,11 +854,13 @@ mod tests {
         let hub = LifecycleHub::default();
         let mut events = hub.subscribe();
 
-        hub.publish_lagged(2);
-        hub.publish(event(1));
-        hub.close();
-        hub.publish_lagged(3);
-        hub.publish(event(2));
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.publish_lagged(&mut txn, 2);
+        hub.publish(&mut txn, event(1));
+        hub.close(&mut txn);
+        hub.publish_lagged(&mut txn, 3);
+        hub.publish(&mut txn, event(2));
+        drop(txn);
 
         assert_eq!(events.try_recv(), Ok(LifecycleItem::Lagged { dropped: 2 }));
         assert_eq!(events.try_recv(), Ok(LifecycleItem::Event(event(1))));

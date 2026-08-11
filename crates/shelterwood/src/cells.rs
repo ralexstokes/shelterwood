@@ -883,11 +883,6 @@ pub(crate) struct ScopeCell {
     // move removed residents into outer storage before the drop runs.
     current_children: Mutex<Vec<ResidentChild>>,
     parent: Mutex<Option<Weak<ScopeCell>>>,
-    // Guards only a gate-pointer swap, so no torn state is possible; every
-    // access deliberately tolerates poisoning (mirroring
-    // `ObservationGate::lock`) so drop-path shutdown after a panicked assert
-    // cannot itself panic.
-    observation_gate: RwLock<ObservationGate>,
     lifecycle_seq: AtomicPoisonedCounter,
     lifecycle: LifecycleHub,
     snapshots: SnapshotHub,
@@ -936,7 +931,6 @@ impl ScopeCell {
         flavor: ScopeFlavor,
         child_identity: ScopeIdentity,
     ) -> Arc<Self> {
-        let observation_gate = member.current_observation_gate();
         let (record, _) = runtime::watch(ScopeRecord {
             state: ScopeState::Unstarted,
             startup: None,
@@ -952,7 +946,6 @@ impl ScopeCell {
             dynamic_route: Mutex::new(None),
             current_children: Mutex::new(Vec::new()),
             parent: Mutex::new(None),
-            observation_gate: RwLock::new(observation_gate),
             lifecycle_seq: AtomicPoisonedCounter::new(),
             lifecycle: LifecycleHub::default(),
             snapshots: SnapshotHub::default(),
@@ -1067,10 +1060,7 @@ impl ScopeCell {
     }
 
     fn current_observation_gate(&self) -> ObservationGate {
-        self.observation_gate
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.member.current_observation_gate()
     }
 
     fn adopt_observation_gate(
@@ -1104,19 +1094,12 @@ impl ScopeCell {
             // that merely captured this obsolete gate retries after acquiring
             // it and observing the replacement.
             let current_guard = current.lock();
-            let mut installed = self
-                .observation_gate
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if current.same_gate(&installed) {
-                *installed = gate.clone();
+            if current.same_gate(&self.current_observation_gate()) {
                 self.member.install_observation_gate_locked(&current, gate);
-                drop(installed);
                 self.adopt_descendant_observation_gates_locked(&current, gate, txn);
                 drop(current_guard);
                 return;
             }
-            drop(installed);
             drop(current_guard);
         }
     }
@@ -1151,22 +1134,9 @@ impl ScopeCell {
             .collect::<Vec<_>>();
         for descendant in descendants {
             if let Some(scope) = descendant.scope {
-                let mut installed = scope
-                    .observation_gate
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if installed.same_gate(previous) {
-                    *installed = gate.clone();
-                    descendant
-                        .member
-                        .install_observation_gate_locked(previous, gate);
-                } else {
-                    assert!(
-                        installed.same_gate(gate),
-                        "one resident tree must share one observation gate"
-                    );
-                }
-                drop(installed);
+                descendant
+                    .member
+                    .install_observation_gate_locked(previous, gate);
                 scope.adopt_descendant_observation_gates_locked(previous, gate, _txn);
             } else {
                 descendant
@@ -1413,7 +1383,7 @@ impl ScopeCell {
         self.with_observation_gate(|wakes| {
             let receiver = self.snapshots.subscribe(self.snapshot_locked(), wakes);
             if self.observation_closed.load(Ordering::Acquire) {
-                self.snapshots.close_deferred(wakes);
+                self.snapshots.close(wakes);
             }
             receiver
         })
@@ -1423,7 +1393,7 @@ impl ScopeCell {
         self.with_observation_gate(|wakes| {
             let events = self.lifecycle.subscribe();
             if self.observation_closed.load(Ordering::Acquire) {
-                self.lifecycle.close_deferred(wakes);
+                self.lifecycle.close(wakes);
             }
             events
         })
@@ -1505,12 +1475,11 @@ impl ScopeCell {
     }
 
     fn publish_snapshot_chain_locked(&self, wakes: &mut ObservationTxn<'_>) {
-        self.snapshots
-            .publish_deferred(wakes, || self.snapshot_locked());
+        self.snapshots.publish(wakes, || self.snapshot_locked());
         for ancestor in self.ancestors_locked() {
             ancestor
                 .snapshots
-                .publish_deferred(wakes, || ancestor.snapshot_locked());
+                .publish(wakes, || ancestor.snapshot_locked());
         }
     }
 
@@ -1525,9 +1494,9 @@ impl ScopeCell {
             .mint(Ordering::Release, Ordering::Relaxed);
         let Some(seq) = seq.map(LifecycleSeq::new) else {
             self.publish_snapshot_chain_locked(wakes);
-            self.lifecycle.publish_lagged_deferred(wakes, 1);
+            self.lifecycle.publish_lagged(wakes, 1);
             for ancestor in self.ancestors_locked() {
-                ancestor.lifecycle.publish_lagged_deferred(wakes, 1);
+                ancestor.lifecycle.publish_lagged(wakes, 1);
             }
             return;
         };
@@ -1540,12 +1509,12 @@ impl ScopeCell {
             seq,
             kind,
         };
-        self.lifecycle.publish_deferred(wakes, event.clone());
+        self.lifecycle.publish(wakes, event.clone());
         let mut child_id = self.member.id().clone();
         for ancestor in self.ancestors_locked() {
             event.scope_path.insert(0, child_id);
             child_id = ancestor.member.id().clone();
-            ancestor.lifecycle.publish_deferred(wakes, event.clone());
+            ancestor.lifecycle.publish(wakes, event.clone());
         }
     }
 
@@ -1555,13 +1524,14 @@ impl ScopeCell {
         }
         // Closure follows the final state/snapshot/event publication performed
         // by the caller while this same observation gate remains held.
-        self.snapshots.close_deferred(wakes);
-        self.lifecycle.close_deferred(wakes);
+        self.snapshots.close(wakes);
+        self.lifecycle.close(wakes);
     }
 
     #[cfg(test)]
     pub(crate) fn replace_observation_gate(&self, gate: ObservationGate) {
         *self
+            .member
             .observation_gate
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;

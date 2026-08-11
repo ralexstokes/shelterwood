@@ -450,18 +450,6 @@ impl<T> WatchSender<T> {
         self.0.send_modify(|_| {});
     }
 
-    #[cfg(test)]
-    pub(crate) fn send_modify(&self, update: impl FnOnce(&mut T)) {
-        self.0.send_modify(update);
-    }
-
-    /// The remaining production writers pulse or replace whole values; only
-    /// test-side publication needs conditional notification.
-    #[cfg(test)]
-    pub(crate) fn send_if_modified(&self, update: impl FnOnce(&mut T) -> bool) -> bool {
-        self.0.send_if_modified(update)
-    }
-
     /// Mutates the retained value without advancing the watch version.
     ///
     /// This is only for compound publication that must finish another

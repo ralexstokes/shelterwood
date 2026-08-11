@@ -85,6 +85,7 @@ impl ScopeRuntime {
         if let Some(entry) = entry {
             self.reclaim_child(key);
             drop(entry);
+            self.progress_startup();
         }
     }
 

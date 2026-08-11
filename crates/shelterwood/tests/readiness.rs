@@ -668,6 +668,95 @@ async fn dynamic_startup_failure_keeps_other_initial_members_supervised() {
         .expect("owner rolls back sibling");
 }
 
+#[tokio::test(start_paused = true)]
+async fn dynamic_startup_completes_after_removing_sole_unready_initial_member() {
+    let mut tree = DynamicTree::new();
+    tree.add_task(
+        "gate",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid initial member");
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            scope.child("gate").is_some()
+        })
+        .await
+    );
+
+    assert_eq!(
+        scope.remove("gate").await,
+        shelterwood::RemoveOutcome::Removed
+    );
+    tokio::time::timeout(Duration::from_secs(60), system.wait_started())
+        .await
+        .expect("removing the sole initial gate completes startup")
+        .expect("removal is not a startup failure");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("empty root stops");
+}
+
+#[tokio::test(start_paused = true)]
+async fn dynamic_startup_completes_after_removing_last_unready_initial_member() {
+    let mut tree = DynamicTree::new();
+    tree.add_task(
+        "ready",
+        TaskDef::new(|context| async move {
+            context.mark_ready();
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid ready sibling");
+    tree.add_task(
+        "gate",
+        TaskDef::new(|context| async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        })
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid unready member");
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    assert!(
+        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+            scope
+                .child("ready")
+                .is_some_and(|child| matches!(child.state, ChildState::Running))
+                && scope.child("gate").is_some()
+        })
+        .await
+    );
+
+    assert_eq!(
+        scope.remove("gate").await,
+        shelterwood::RemoveOutcome::Removed
+    );
+    tokio::time::timeout(Duration::from_secs(60), system.wait_started())
+        .await
+        .expect("removing the final initial gate completes startup")
+        .expect("removal is not a startup failure");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("ready sibling stops");
+}
+
 #[tokio::test]
 async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
     let initial_release = ReleaseGate::default();

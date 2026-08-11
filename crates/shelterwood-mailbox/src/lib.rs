@@ -26,6 +26,10 @@ mod identity {
     pub(crate) use shelterwood_core::identity::*;
 }
 
+mod panic {
+    pub(crate) use shelterwood_core::panic::*;
+}
+
 mod policy {
     pub(crate) use shelterwood_core::policy::*;
 }

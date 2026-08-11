@@ -11,6 +11,7 @@ pub mod deadline;
 pub mod engine;
 pub mod exit;
 pub mod identity;
+pub mod panic;
 pub mod policy;
 
 pub use deadline::*;

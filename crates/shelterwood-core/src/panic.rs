@@ -1,9 +1,15 @@
+//! Unwind payload capture, precedence, and resumption.
+//!
+//! Built entirely on `std::panic`, so it belongs to the runtime-neutral core
+//! even though every caller reaches it while crossing a runtime boundary. The
+//! adapter re-exports it as one of its own facilities.
+
 use std::{
     any::Any,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
 };
 
-/// Runtime-owned spelling for an unwind payload crossing a framework boundary.
+/// The framework's spelling for an unwind payload crossing a boundary.
 pub type PanicPayload = Box<dyn Any + Send + 'static>;
 
 /// Panic payloads crossing an unwind boundary, named by precedence.

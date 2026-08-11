@@ -9,8 +9,9 @@ use std::{
 use crate::{
     ChildId, Incarnation, MailboxControl, MailboxDisposal, MailboxTermination,
     identity::{AtomicPoisonedCounter, PoisonedCounter},
+    panic::{PanicAccumulator, PanicPayload, resume_panic},
     policy::ResolvedMailbox,
-    runtime::{PanicAccumulator, PanicPayload, Signal, SignalWatcher, resume_panic},
+    runtime::{Signal, SignalWatcher},
 };
 
 use super::{SendError, SendErrorKind};

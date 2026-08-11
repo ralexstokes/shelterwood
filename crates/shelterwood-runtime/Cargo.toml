@@ -1,0 +1,23 @@
+[package]
+name = "shelterwood-runtime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT OR Apache-2.0"
+description = "Tokio runtime adapter for Shelterwood"
+homepage = "https://github.com/ralexstokes/shelterwood"
+repository = "https://github.com/ralexstokes/shelterwood"
+
+[features]
+test-util = ["tokio/test-util"]
+
+[lints]
+workspace = true
+
+[dependencies]
+fastrand.workspace = true
+shelterwood-core.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

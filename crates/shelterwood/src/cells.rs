@@ -26,52 +26,14 @@ use crate::{
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason},
     identity::{AtomicPoisonedCounter, IncarnationCounter, MintedMembership, ScopeIdentity},
+    mailbox::{ActorIdentity, MailboxControl, MailboxTermination},
     observe::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
         LifecycleHub, LifecycleSeq, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
     },
-    policy::{ResolvedCommonOptions, ResolvedMailbox, ScopeFlavor},
+    policy::{ResolvedCommonOptions, ScopeFlavor},
     runtime::{self, Latch},
 };
-
-/// Isolated payload returned after mailbox termination has synchronously
-/// published all waiter outcomes.
-pub(crate) type MailboxDisposal = Box<dyn Send>;
-
-/// Prepared terminal mailbox transition. Finishing it wakes terminal waiters
-/// before returning unread payload ownership for detached disposal.
-pub(crate) trait MailboxTermination: Send {
-    fn finish(self: Box<Self>) -> Option<MailboxDisposal>;
-}
-
-/// Type-erased mailbox lifecycle surface owned by a member cell.
-///
-/// The driver must configure a mailbox before its first bind. Every live
-/// incarnation must then be closed before a later incarnation is bound; if
-/// close is skipped, messages accepted for the prior incarnation can leak
-/// into the replacement. Once termination is prepared, later binds are
-/// intentionally ignored.
-pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
-    /// Installs the declaration-time mailbox policy before the first bind.
-    /// Reconfiguration may only repeat the same resolved policy.
-    fn configure(&self, mailbox: ResolvedMailbox);
-    /// Makes one incarnation live after configuration and prior-close cleanup.
-    /// A bind after terminal preparation is deliberately ignored because
-    /// terminality wins that race permanently.
-    fn bind(&self, incarnation: Incarnation);
-    /// Stops new acceptance for the matching live incarnation.
-    fn freeze(&self, incarnation: Incarnation);
-    /// Unbinds the matching incarnation and returns its unread payload.
-    /// Every successful bind must be followed by this close before a rebind;
-    /// skipping it would deliver the old incarnation's messages to the new.
-    fn close(&self, incarnation: Incarnation) -> Option<MailboxDisposal>;
-    /// Irreversibly terminalizes the membership and prepares synchronous
-    /// waiter completion followed by isolated unread-payload disposal.
-    fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>>;
-    /// Debug-only check for the driver's configure/close-before-bind contract.
-    #[cfg(debug_assertions)]
-    fn bind_order_valid(&self) -> bool;
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum MemberStage {
@@ -211,6 +173,16 @@ pub(crate) struct MemberCell {
     // fixture shape — so a missing value surfaces there as an internal
     // admission-order bug.
     options: OnceLock<ResolvedCommonOptions>,
+}
+
+impl ActorIdentity for MemberCell {
+    fn id(&self) -> &ChildId {
+        self.id()
+    }
+
+    fn membership(&self) -> Membership {
+        self.membership()
+    }
 }
 
 #[derive(Default)]
@@ -649,7 +621,12 @@ pub(crate) trait DynamicRoute: Send + Sync {
 /// lock deliberately tolerates poisoning: a panic in an observation path must
 /// not permanently wedge later observation or a subtree handoff.
 #[derive(Clone, Debug)]
+#[cfg(test)]
 pub(crate) struct ObservationGate(Arc<Mutex<()>>);
+
+#[derive(Clone, Debug)]
+#[cfg(not(test))]
+struct ObservationGate(Arc<Mutex<()>>);
 
 impl ObservationGate {
     fn new() -> Self {
@@ -2030,6 +2007,7 @@ impl ScopeCell {
                 | ScopeState::Running
                 | ScopeState::StartupFailed
                 | ScopeState::Draining => watcher.changed().await,
+                _ => unreachable!("the linked core exposes a known scope-state set"),
             }
         }
     }

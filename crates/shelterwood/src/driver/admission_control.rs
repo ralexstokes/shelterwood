@@ -210,7 +210,7 @@ impl DynamicState {
     }
 }
 
-pub(crate) struct DynamicControl {
+pub(super) struct DynamicControl {
     requests: runtime::UnboundedMpscSender<DriverEvent>,
     pub(super) state: Mutex<DynamicState>,
 }
@@ -326,6 +326,7 @@ pub(super) fn reserve_dynamic_in(
                 NotAdmittingCause::NoLiveIncarnation,
             ));
         }
+        _ => unreachable!("the linked core exposes a known scope-state set"),
     }
     let slot = concrete_dynamic_slot(control.reserve(scope, id, child_scope, txn)?);
     Ok(DynamicReservation {

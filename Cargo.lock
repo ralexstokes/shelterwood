@@ -96,7 +96,9 @@ dependencies = [
 name = "shelterwood"
 version = "0.1.0"
 dependencies = [
- "fastrand",
+ "shelterwood-core",
+ "shelterwood-mailbox",
+ "shelterwood-runtime",
  "thiserror",
  "tokio",
  "tracing",
@@ -107,6 +109,31 @@ name = "shelterwood-api-reachability"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "shelterwood-core"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "shelterwood-mailbox"
+version = "0.1.0"
+dependencies = [
+ "shelterwood-core",
+ "shelterwood-runtime",
+ "tokio",
+]
+
+[[package]]
+name = "shelterwood-runtime"
+version = "0.1.0"
+dependencies = [
+ "fastrand",
+ "shelterwood-core",
+ "tokio",
 ]
 
 [[package]]

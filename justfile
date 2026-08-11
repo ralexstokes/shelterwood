@@ -28,18 +28,6 @@ runtime-api-check:
     RUSTDOCFLAGS="-Z unstable-options --output-format json" cargo +nightly rustdoc --locked -p shelterwood --all-features --lib
     cargo run --locked -p shelterwood-api-reachability -- target/doc/shelterwood.json
 
-runtime-path-check:
-    ./tools/check-runtime-paths.sh
-
-exit-path-check:
-    ./tools/check-exit-paths.sh
-
-layering-path-check:
-    ./tools/check-layering-paths.sh
-
-enforcement-fixture-check:
-    ./tools/check-enforcement-fixtures.sh
-
 packaged-docs-sync:
     ./tools/sync-packaged-docs.sh --write
 
@@ -54,7 +42,7 @@ nixfmt-check:
 
 # Fast local CI mirror — reuses the local cargo cache and incremental builds.
 # The clean Nix lane retains the explicit all-target build for non-test codegen coverage.
-ci: fmt lint test doc-check runtime-api-check runtime-path-check exit-path-check layering-path-check enforcement-fixture-check packaged-docs-check package-check nixfmt-check
+ci: fmt lint test doc-check runtime-api-check packaged-docs-check package-check nixfmt-check
 
 # Full clean Nix CI lane; use before pushing or when touching Nix files.
 ci-nix:

@@ -266,18 +266,20 @@ impl Drop for ScopeRuntime {
         // corresponding members are terminal and no longer resident.
         drop(dynamic_entries);
         self.children.clear();
-        if !matches!(self.root.record().state, ScopeState::Stopped { .. }) {
-            let completion = self.completion.take();
-            let reason = completion
-                .as_ref()
-                .map(|completion| completion.reason.clone())
-                .or_else(|| self.lifecycle.draining_reason().cloned())
-                .unwrap_or(StopReason::ShutdownRequested);
-            if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
-                self.root.finish_root_incarnation(self.epoch, reason, exit);
-            } else {
-                self.root.finish_incarnation(self.epoch, reason);
-            }
+        // Unconditional: the publisher is the idempotence point, joining this
+        // verdict into the stopped-reason lattice, but epoch retirement is not
+        // idempotent and has no other owner. Skipping the call on an
+        // already-`Stopped` record would strand this incarnation's epoch.
+        let completion = self.completion.take();
+        let reason = completion
+            .as_ref()
+            .map(|completion| completion.reason.clone())
+            .or_else(|| self.lifecycle.draining_reason().cloned())
+            .unwrap_or(StopReason::ShutdownRequested);
+        if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
+            self.root.finish_root_incarnation(self.epoch, reason, exit);
+        } else {
+            self.root.finish_incarnation(self.epoch, reason);
         }
     }
 }

@@ -137,7 +137,7 @@ async fn terminal_stop_paths_share_one_complete_observation_transition() {
 }
 
 #[crate::runtime::test]
-async fn root_driver_panic_mid_drain_preserves_the_first_stopped_publication() {
+async fn root_driver_panic_mid_drain_upgrades_to_the_join_monitor_verdict() {
     let scope = isolated_scope("root", ScopeFlavor::Ordered);
     let epoch = scope
         .begin_incarnation(ScopeState::Starting)
@@ -176,22 +176,34 @@ async fn root_driver_panic_mid_drain_preserves_the_first_stopped_publication() {
     let panic_exit = super::super::classify_root_driver_join(crate::runtime::join(driver).await)
         .expect_err("the injected root-driver panic reaches its join monitor");
 
-    let stopped = ScopeState::Stopped {
+    let drained = ScopeState::Stopped {
         reason: StopReason::Finished,
+    };
+    let upgraded = ScopeState::Stopped {
+        reason: StopReason::ShutdownRequested,
     };
     assert_eq!(
         scope.record().state,
-        stopped,
+        drained,
         "ScopeRuntime's unwind epilogue publishes its established drain reason"
     );
     assert!(
         !matches!(scope.member.record().stage, MemberStage::Terminal(_)),
         "the unwind epilogue leaves root terminality to the join monitor"
     );
+    assert!(
+        scope.incarnation_finished(epoch),
+        "the unwind epilogue retires its epoch, so the join monitor must take \
+         the no-live-epoch fallback this test is named for"
+    );
 
     scope.finish_live_root_incarnation(StopReason::ShutdownRequested, panic_exit.clone());
 
-    assert_eq!(scope.record().state, stopped);
+    assert_eq!(
+        scope.record().state,
+        upgraded,
+        "ShutdownRequested strictly outranks the abandoned drain's Finished"
+    );
     assert!(matches!(
         scope.member.record().stage,
         MemberStage::Terminal(ref exit) if exit == &panic_exit
@@ -201,16 +213,154 @@ async fn root_driver_panic_mid_drain_preserves_the_first_stopped_publication() {
         Ok(LifecycleItem::Event(crate::LifecycleEvent {
             kind: LifecycleEventKind::ScopeState { state },
             ..
-        })) if state == stopped
+        })) if state == drained
     ));
+    assert!(
+        matches!(
+            events.try_recv(),
+            Ok(LifecycleItem::Event(crate::LifecycleEvent {
+                kind: LifecycleEventKind::ScopeState { state },
+                ..
+            })) if state == upgraded
+        ),
+        "the corrected verdict reaches the stream before it closes"
+    );
     assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
 
-    assert_eq!(snapshots.borrow_latest().state, stopped);
+    assert_eq!(snapshots.borrow_latest().state, upgraded);
     snapshots
         .changed()
         .await
-        .expect("the first stopped snapshot precedes fallback closure");
+        .expect("the upgraded stopped snapshot precedes fallback closure");
     assert!(snapshots.changed().await.is_err());
+}
+
+/// Drives one pair of competing stopped publications through the shared
+/// publisher and reports the settled record plus every `ScopeState` edge the
+/// lifecycle stream carried.
+async fn resolve_competing_stops(
+    first: StopReason,
+    second: StopReason,
+) -> (ScopeState, Vec<ScopeState>) {
+    let scope = isolated_scope("root", ScopeFlavor::Ordered);
+    let epoch = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    let handle = ScopeRef {
+        cell: Arc::clone(&scope),
+    };
+    let mut events = handle.subscribe_lifecycle();
+
+    scope.finish_incarnation(epoch, first);
+    scope.finish_live_root_incarnation(second, Exit::never_started());
+
+    let mut states = Vec::new();
+    while let Ok(LifecycleItem::Event(event)) = events.try_recv() {
+        if let LifecycleEventKind::ScopeState { state } = event.kind {
+            states.push(state);
+        }
+    }
+    assert_eq!(
+        events.try_recv(),
+        Err(LifecycleTryRecvError::Closed),
+        "the fallback closes observation once its verdict is published"
+    );
+    let settled = scope.record().state;
+    assert_eq!(
+        settled,
+        ScopeState::Stopped {
+            reason: scope.wait_stopped().await
+        },
+        "wait_stopped reports exactly the settled record"
+    );
+    (settled, states)
+}
+
+#[crate::runtime::test]
+async fn a_weaker_first_stop_is_upgraded_by_a_stronger_second() {
+    let (settled, states) =
+        resolve_competing_stops(StopReason::Finished, StopReason::ShutdownRequested).await;
+    assert_eq!(
+        settled,
+        ScopeState::Stopped {
+            reason: StopReason::ShutdownRequested
+        }
+    );
+    assert_eq!(
+        states,
+        vec![
+            ScopeState::Stopped {
+                reason: StopReason::Finished
+            },
+            ScopeState::Stopped {
+                reason: StopReason::ShutdownRequested
+            },
+        ],
+        "an upgrade corrects the stream instead of ending it on a stale verdict"
+    );
+}
+
+#[crate::runtime::test]
+async fn never_started_outranks_an_earlier_shutdown_requested() {
+    let (settled, states) =
+        resolve_competing_stops(StopReason::ShutdownRequested, StopReason::NeverStarted).await;
+    assert_eq!(
+        settled,
+        ScopeState::Stopped {
+            reason: StopReason::NeverStarted
+        },
+        "the scope state must agree with a never-started membership exit"
+    );
+    assert_eq!(
+        states,
+        vec![
+            ScopeState::Stopped {
+                reason: StopReason::ShutdownRequested
+            },
+            ScopeState::Stopped {
+                reason: StopReason::NeverStarted
+            },
+        ]
+    );
+}
+
+#[crate::runtime::test]
+async fn never_started_is_retained_against_a_later_shutdown_requested() {
+    let (settled, states) =
+        resolve_competing_stops(StopReason::NeverStarted, StopReason::ShutdownRequested).await;
+    assert_eq!(
+        settled,
+        ScopeState::Stopped {
+            reason: StopReason::NeverStarted
+        },
+        "the lattice resolves this pair the same way in either arrival order"
+    );
+    assert_eq!(
+        states,
+        vec![ScopeState::Stopped {
+            reason: StopReason::NeverStarted
+        }],
+        "a weaker repeat emits nothing"
+    );
+}
+
+#[crate::runtime::test]
+async fn an_exact_duplicate_stop_publishes_once() {
+    let (settled, states) =
+        resolve_competing_stops(StopReason::ShutdownRequested, StopReason::ShutdownRequested).await;
+    assert_eq!(
+        settled,
+        ScopeState::Stopped {
+            reason: StopReason::ShutdownRequested
+        }
+    );
+    assert_eq!(
+        states,
+        vec![ScopeState::Stopped {
+            reason: StopReason::ShutdownRequested
+        }],
+        "equal verdicts are idempotent repeats, not upgrades"
+    );
 }
 
 impl Wake for ObserveScopeOnStartupWake {

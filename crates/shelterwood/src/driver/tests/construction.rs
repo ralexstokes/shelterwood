@@ -295,8 +295,8 @@ async fn scope_plan_conversion_panic_terminalizes_every_child() {
     );
     assert_eq!(
         root.wait_stopped().await,
-        StopReason::ShutdownRequested,
-        "the epoch guard's first stopped publication survives the plan fallback"
+        StopReason::NeverStarted,
+        "the plan fallback's never-started verdict outranks the epoch guard's"
     );
     assert!(
         root.snapshot().children.is_empty(),

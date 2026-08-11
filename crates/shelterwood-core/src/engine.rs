@@ -10,7 +10,7 @@ use crate::{
     Exit, GracePhase, Intensity, IntensityTrip, JitterSample, Readiness, RestartAttempt,
     RestartCount, RestartPolicy, Shutdown, TotalRestarts,
     deadline::Deadline,
-    exit::StopReason,
+    exit::{StopReason, stop_reason_precedence},
     identity::PoisonedCounter,
     policy::{ScopeFlavor, tidy_abort_beat},
 };
@@ -862,13 +862,13 @@ impl ScopeLifecycle {
             !matches!(reason, StopReason::NeverStarted),
             "NeverStarted is not a live-incarnation drain reason"
         );
-        let incoming_precedence = reason.precedence();
+        let incoming_precedence = stop_reason_precedence(&reason);
         let startup = match &mut self.state {
             ScopeLifecycleState::Starting => StartupPhase::Pending,
             ScopeLifecycleState::Running => StartupPhase::Complete,
             ScopeLifecycleState::StartupFailed => StartupPhase::Failed,
             ScopeLifecycleState::Draining(drain) => {
-                if incoming_precedence > drain.reason.precedence() {
+                if incoming_precedence > stop_reason_precedence(&drain.reason) {
                     drain.reason = reason;
                 }
                 return None;

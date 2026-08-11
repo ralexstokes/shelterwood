@@ -24,7 +24,7 @@ use crate::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartCount, Strategy, TotalRestarts,
     admission::{RemoveOutcome, ReserveError},
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
-    exit::{StartupError, StopReason},
+    exit::{StartupError, StopReason, stop_reason_precedence},
     identity::{AtomicPoisonedCounter, IncarnationCounter, MintedMembership, ScopeIdentity},
     mailbox::{ActorIdentity, MailboxControl, MailboxTermination},
     observe::{
@@ -2048,12 +2048,12 @@ impl ScopeCell {
         terminal_exit: Option<Exit>,
         epoch_owner: Option<MutexGuard<'_, ScopeControl>>,
     ) {
-        let incoming = reason.precedence();
+        let incoming = stop_reason_precedence(&reason);
         let state = ScopeState::Stopped { reason };
         let mut published = false;
         self.observation.record.modify_silently(|record| {
             if let ScopeState::Stopped { reason: recorded } = &record.state
-                && incoming <= recorded.precedence()
+                && incoming <= stop_reason_precedence(recorded)
             {
                 return;
             }

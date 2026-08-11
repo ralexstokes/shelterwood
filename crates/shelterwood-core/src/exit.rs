@@ -25,40 +25,38 @@ pub enum StopReason {
     NeverStarted,
 }
 
-impl StopReason {
-    pub fn into_nested_result(self) -> ExitResult {
-        match self {
-            Self::Finished | Self::ShutdownRequested => Ok(()),
-            Self::IntensityTripped(trip) => Err(ExitError::from_intensity_trip(trip)),
-            Self::StartupFailed(failure) => Err(ExitError::from_startup_failure(failure)),
-            Self::NeverStarted => Err(ExitError::message("nested scope never started")),
-        }
+pub fn stop_reason_into_nested_result(reason: StopReason) -> ExitResult {
+    match reason {
+        StopReason::Finished | StopReason::ShutdownRequested => Ok(()),
+        StopReason::IntensityTripped(trip) => Err(structured_intensity_trip_error(trip)),
+        StopReason::StartupFailed(failure) => Err(structured_startup_failure_error(failure)),
+        StopReason::NeverStarted => Err(ExitError::message("nested scope never started")),
     }
+}
 
-    pub fn root_exit(&self) -> Exit {
-        match self {
-            Self::Finished => Exit::new(ExitKind::Completed, Cancellation::NotObserved),
-            Self::ShutdownRequested => Exit::new(ExitKind::Completed, Cancellation::Observed),
-            Self::IntensityTripped(trip) => Exit::new(
-                ExitKind::Failed(ExitError::from_intensity_trip(trip.clone())),
-                Cancellation::NotObserved,
-            ),
-            Self::StartupFailed(failure) => Exit::new(
-                ExitKind::Failed(ExitError::from_startup_failure(failure.clone())),
-                Cancellation::NotObserved,
-            ),
-            Self::NeverStarted => Exit::never_started(),
-        }
+pub fn stop_reason_root_exit(reason: &StopReason) -> Exit {
+    match reason {
+        StopReason::Finished => Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        StopReason::ShutdownRequested => Exit::new(ExitKind::Completed, Cancellation::Observed),
+        StopReason::IntensityTripped(trip) => Exit::new(
+            ExitKind::Failed(structured_intensity_trip_error(trip.clone())),
+            Cancellation::NotObserved,
+        ),
+        StopReason::StartupFailed(failure) => Exit::new(
+            ExitKind::Failed(structured_startup_failure_error(failure.clone())),
+            Cancellation::NotObserved,
+        ),
+        StopReason::NeverStarted => Exit::never_started(),
     }
+}
 
-    pub fn precedence(&self) -> StopPrecedence {
-        match self {
-            Self::Finished => StopPrecedence::Finished,
-            Self::IntensityTripped(_) => StopPrecedence::IntensityTripped,
-            Self::StartupFailed(_) => StopPrecedence::StartupFailed,
-            Self::ShutdownRequested => StopPrecedence::ShutdownRequested,
-            Self::NeverStarted => StopPrecedence::NeverStarted,
-        }
+pub fn stop_reason_precedence(reason: &StopReason) -> StopPrecedence {
+    match reason {
+        StopReason::Finished => StopPrecedence::Finished,
+        StopReason::IntensityTripped(_) => StopPrecedence::IntensityTripped,
+        StopReason::StartupFailed(_) => StopPrecedence::StartupFailed,
+        StopReason::ShutdownRequested => StopPrecedence::ShutdownRequested,
+        StopReason::NeverStarted => StopPrecedence::NeverStarted,
     }
 }
 
@@ -158,18 +156,18 @@ impl ExitError {
             ExitErrorInner::Application(_) | ExitErrorInner::IntensityTrip(_) => None,
         }
     }
+}
 
-    pub fn from_intensity_trip(value: IntensityTrip) -> Self {
-        Self(Arc::new(ExitErrorInner::IntensityTrip(
-            StructuredIntensityTrip(value),
-        )))
-    }
+pub fn structured_intensity_trip_error(value: IntensityTrip) -> ExitError {
+    ExitError(Arc::new(ExitErrorInner::IntensityTrip(
+        StructuredIntensityTrip(value),
+    )))
+}
 
-    pub fn from_startup_failure(value: StartupFailure) -> Self {
-        Self(Arc::new(ExitErrorInner::StartupFailure(
-            StructuredStartupFailure(value),
-        )))
-    }
+pub fn structured_startup_failure_error(value: StartupFailure) -> ExitError {
+    ExitError(Arc::new(ExitErrorInner::StartupFailure(
+        StructuredStartupFailure(value),
+    )))
 }
 
 /// Wraps any error as an application-classified [`ExitError`].
@@ -178,7 +176,8 @@ impl ExitError {
 /// [`StartupFailure`] through this impl yields an unauthenticated application
 /// error for which [`ExitError::intensity_trip`] and
 /// [`ExitError::startup_failure`] return `None`. The structured,
-/// framework-authenticated variants cannot be produced by user code.
+/// framework-authenticated variants cannot be produced through the supported
+/// `shelterwood` façade.
 impl<E> From<E> for ExitError
 where
     E: Error + Send + Sync + 'static,
@@ -219,9 +218,10 @@ impl Error for MessageError {}
 /// This type implements [`std::error::Error`], so `ExitError::from(trip)` or
 /// `?` compiles via the blanket application-error conversion — but that path
 /// produces an ordinary, *unauthenticated* application error for which
-/// [`ExitError::intensity_trip`] returns `None`. Only the framework mints the
-/// structured variant; observe trips through [`ExitError::intensity_trip`]
-/// rather than round-tripping the payload through a user conversion.
+/// [`ExitError::intensity_trip`] returns `None`. Only the framework's
+/// cross-crate implementation seam mints the structured variant; observe trips
+/// through [`ExitError::intensity_trip`] rather than round-tripping the payload
+/// through a user conversion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct IntensityTrip {
@@ -261,10 +261,10 @@ impl Error for StructuredIntensityTrip {}
 /// This type implements [`std::error::Error`], so `ExitError::from(failure)`
 /// or `?` compiles via the blanket application-error conversion — but that
 /// path produces an ordinary, *unauthenticated* application error for which
-/// [`ExitError::startup_failure`] returns `None`. Only the framework mints
-/// the structured variant; observe startup failures through
-/// [`ExitError::startup_failure`] rather than round-tripping the payload
-/// through a user conversion.
+/// [`ExitError::startup_failure`] returns `None`. Only the framework's
+/// cross-crate implementation seam mints the structured variant; observe
+/// startup failures through [`ExitError::startup_failure`] rather than
+/// round-tripping the payload through a user conversion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct StartupFailure {
@@ -272,12 +272,8 @@ pub struct StartupFailure {
     pub cause: StartupFailureCause,
 }
 
-impl StartupFailure {
-    /// Constructs a framework-authenticated startup failure at the façade seam.
-    #[doc(hidden)]
-    pub const fn framework(cause: StartupFailureCause) -> Self {
-        Self { cause }
-    }
+pub const fn framework_startup_failure(cause: StartupFailureCause) -> StartupFailure {
+    StartupFailure { cause }
 }
 
 impl fmt::Display for StartupFailure {
@@ -669,7 +665,8 @@ mod tests {
         Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, IntensityTrip,
         JoinVerdict as JoinOutcome, RecordedOutcome, StartupError, StartupFailure,
         StartupFailureCause, StopReason, classify_disposal_panic, classify_exit, exit_kind_eq,
-        prefer_earlier, reconcile_recorded_outcomes,
+        prefer_earlier, reconcile_recorded_outcomes, stop_reason_into_nested_result,
+        stop_reason_root_exit, structured_intensity_trip_error, structured_startup_failure_error,
     };
 
     #[test]
@@ -1048,24 +1045,26 @@ mod tests {
 
     #[test]
     fn stop_reasons_own_nested_and_root_exit_projection() {
-        assert!(StopReason::Finished.into_nested_result().is_ok());
-        assert!(StopReason::ShutdownRequested.into_nested_result().is_ok());
+        assert!(stop_reason_into_nested_result(StopReason::Finished).is_ok());
+        assert!(stop_reason_into_nested_result(StopReason::ShutdownRequested).is_ok());
         assert_eq!(
-            StopReason::ShutdownRequested.root_exit(),
+            stop_reason_root_exit(&StopReason::ShutdownRequested),
             Exit::new(ExitKind::Completed, Cancellation::Observed)
         );
-        assert_eq!(StopReason::NeverStarted.root_exit(), Exit::never_started());
+        assert_eq!(
+            stop_reason_root_exit(&StopReason::NeverStarted),
+            Exit::never_started()
+        );
 
         let trip = IntensityTrip {
             max_restarts: 2,
             observed_restarts: 3,
             within: Duration::from_secs(10),
         };
-        let nested = StopReason::IntensityTripped(trip.clone())
-            .into_nested_result()
+        let nested = stop_reason_into_nested_result(StopReason::IntensityTripped(trip.clone()))
             .expect_err("an intensity trip fails a nested scope");
         assert_eq!(nested.intensity_trip(), Some(&trip));
-        let root = StopReason::IntensityTripped(trip.clone()).root_exit();
+        let root = stop_reason_root_exit(&StopReason::IntensityTripped(trip.clone()));
         let ExitKind::Failed(error) = root.kind() else {
             panic!("an intensity trip fails the root")
         };
@@ -1076,18 +1075,16 @@ mod tests {
                 id: ChildId::from("nested"),
             },
         };
-        let nested = StopReason::StartupFailed(failure.clone())
-            .into_nested_result()
+        let nested = stop_reason_into_nested_result(StopReason::StartupFailed(failure.clone()))
             .expect_err("startup failure fails a nested scope");
         assert_eq!(nested.startup_failure(), Some(&failure));
-        let root = StopReason::StartupFailed(failure.clone()).root_exit();
+        let root = stop_reason_root_exit(&StopReason::StartupFailed(failure.clone()));
         let ExitKind::Failed(error) = root.kind() else {
             panic!("startup failure fails the root")
         };
         assert_eq!(error.startup_failure(), Some(&failure));
 
-        let never_started = StopReason::NeverStarted
-            .into_nested_result()
+        let never_started = stop_reason_into_nested_result(StopReason::NeverStarted)
             .expect_err("a never-started nested scope fails closed");
         assert_eq!(
             never_started.as_error().to_string(),
@@ -1127,7 +1124,7 @@ mod tests {
     #[test]
     fn forced_outcomes_do_not_erase_stronger_recorded_evidence() {
         let deadline = Instant::now() + Duration::from_secs(1);
-        let failure = ExitError::from_startup_failure(StartupFailure {
+        let failure = structured_startup_failure_error(StartupFailure {
             cause: StartupFailureCause::IdentityExhausted {
                 id: ChildId::from("nested"),
             },
@@ -1208,7 +1205,7 @@ mod tests {
             observed_restarts: 3,
             within: Duration::from_secs(10),
         };
-        let error = ExitError::from_intensity_trip(trip.clone());
+        let error = structured_intensity_trip_error(trip.clone());
         assert_eq!(error.intensity_trip(), Some(&trip));
         assert_eq!(
             error.as_error().to_string(),
@@ -1220,7 +1217,7 @@ mod tests {
                 id: ChildId::from("nested"),
             },
         };
-        let error = ExitError::from_startup_failure(failure.clone());
+        let error = structured_startup_failure_error(failure.clone());
         assert_eq!(error.startup_failure(), Some(&failure));
         assert_eq!(
             error.as_error().to_string(),

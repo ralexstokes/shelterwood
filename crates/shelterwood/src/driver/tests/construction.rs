@@ -19,7 +19,7 @@ fn handle_identity_is_stable_across_membership_rebase() {
         identity.mint_membership(&id).expect("membership available"),
     );
     let mailbox: Arc<MailboxCell<u8>> = MailboxCell::new(member.id().clone());
-    let actor = ActorRef::new(Arc::clone(&member), mailbox);
+    let actor = actor_ref_from_parts(Arc::clone(&member), mailbox);
     let peer = actor.clone();
     let task = crate::TaskRef::new(Arc::clone(&member));
     let declared = actor.membership();
@@ -57,7 +57,7 @@ async fn attaching_after_terminality_closes_the_mailbox() {
         identity.mint_membership(&id).expect("membership available"),
     );
     let mailbox = MailboxCell::new(member.id().clone());
-    let actor = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+    let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     let mut parked = Box::pin(actor.send(1));
     let first_poll =
         std::future::poll_fn(|context| Poll::Ready(parked.as_mut().poll(context))).await;

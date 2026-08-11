@@ -294,7 +294,7 @@ impl ScopeRuntime {
         child: ChildRuntime,
     ) -> Result<ChildKey, Box<ChildRuntime>> {
         let membership = child.slot.member.membership();
-        let incomplete = !child.is_terminal() || child.is_disposing();
+        let incomplete = child.is_incomplete();
         let key = self.children.insert(child)?;
         let replaced = self.child_keys.insert(membership, key);
         assert!(
@@ -612,6 +612,21 @@ async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
     run_scope_incarnation(plan, role, epoch).await
 }
 
+/// Derives the membership index and incompleteness count for a freshly
+/// assembled child arena. Production construction and the test builder both
+/// call this, so the derived state cannot drift between them.
+fn index_children(children: &ChildArena<ChildRuntime>) -> (HashMap<Membership, ChildKey>, usize) {
+    let child_keys = children
+        .iter()
+        .map(|(key, child)| (child.slot.member.membership(), key))
+        .collect();
+    let incomplete_children = children
+        .values()
+        .filter(|child| child.is_incomplete())
+        .count();
+    (child_keys, incomplete_children)
+}
+
 async fn run_scope_incarnation(
     mut plan: ScopePlan,
     role: ScopeRole,
@@ -666,14 +681,7 @@ async fn run_scope_incarnation(
         });
     }
     let next_ordered_start = children.keys().next();
-    let child_keys = children
-        .iter()
-        .map(|(key, child)| (child.slot.member.membership(), key))
-        .collect();
-    let incomplete_children = children
-        .values()
-        .filter(|child| !child.is_terminal() || child.is_disposing())
-        .count();
+    let (child_keys, incomplete_children) = index_children(&children);
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
         defaults: plan.defaults.clone(),

@@ -225,6 +225,14 @@ impl ChildRuntime {
         matches!(self.slot.member.record().stage, MemberStage::Terminal(_))
     }
 
+    /// Reports whether this child still counts against scope completeness:
+    /// it has not published a terminal stage, or its terminal disposal is
+    /// still outstanding. Every `incomplete_children` adjustment and the
+    /// `child_keys` index derivation consult exactly this predicate.
+    pub(super) fn is_incomplete(&self) -> bool {
+        !self.is_terminal() || self.is_disposing()
+    }
+
     pub(super) fn terminalize(
         &mut self,
         root: &ScopeCell,
@@ -547,7 +555,7 @@ impl ScopeRuntime {
     ) -> bool {
         let changed = self.children[key].terminalize(&self.root, exit, exited_incarnation, startup);
         debug_assert!(
-            self.children[key].is_terminal() && !self.children[key].is_disposing(),
+            !self.children[key].is_incomplete(),
             "terminal completion leaves no disposal outstanding"
         );
         self.incomplete_children = self

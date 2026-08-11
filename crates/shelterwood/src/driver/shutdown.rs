@@ -132,7 +132,7 @@ impl ScopeRuntime {
             let waiting = self
                 .children
                 .get(key)
-                .is_some_and(|child| !child.is_terminal() || child.is_disposing());
+                .is_some_and(ChildRuntime::is_incomplete);
             if waiting {
                 self.ordered_stop_progressing = false;
                 return;
@@ -150,7 +150,7 @@ impl ScopeRuntime {
             let Some(child) = self.children.get(key) else {
                 continue;
             };
-            if child.is_terminal() && !child.is_disposing() {
+            if !child.is_incomplete() {
                 continue;
             }
             self.begin_stop_child(key, None);

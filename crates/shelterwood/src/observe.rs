@@ -412,6 +412,11 @@ impl SnapshotHub {
     }
 
     /// Closes while the containing scope's observation gate is held.
+    ///
+    /// The retained watch state is the hub's only record of closure, so an
+    /// unsubscribed hub is materialized here rather than left empty: a later
+    /// subscriber must be able to learn that the scope is terminal, and there
+    /// is no longer a separate closed flag for it to read.
     pub(crate) fn close(
         &self,
         txn: &mut crate::cells::ObservationTxn<'_>,
@@ -434,15 +439,26 @@ impl SnapshotHub {
             return;
         }
         let mut modified = false;
-        let receiverless = sender.receiver_count() == 0;
         sender.modify_silently(|state| {
             if !state.closed {
-                if receiverless {
-                    state.snapshot = final_snapshot
-                        .take()
-                        .expect("final snapshot is built exactly once")(
-                    );
-                }
+                // Install the caller's authoritative terminal projection
+                // unconditionally, whether or not receivers are attached.
+                // Publication is skipped entirely while receiverless, and one
+                // close site (`finish_incarnation_with_terminal`'s stale-epoch
+                // branch) deliberately closes without publishing a `Stopped`
+                // projection first, so the retained value is not otherwise
+                // reliably terminal -- and it is what every later subscriber
+                // reads, since a closed hub declines to install their
+                // recomputed snapshot.
+                //
+                // The install is silent: no generation mint, so live receivers
+                // see exactly the closure they saw before rather than an extra
+                // conflated event. A closed hub delivers no further changes,
+                // so this only corrects what `borrow_latest` reports.
+                state.snapshot = final_snapshot
+                    .take()
+                    .expect("final snapshot is built exactly once")(
+                );
                 state.closed = true;
                 modified = true;
             }
@@ -831,6 +847,40 @@ mod tests {
             }
         ));
         assert!(receiver.changed().await.is_err());
+    }
+
+    #[crate::runtime::test]
+    async fn snapshot_close_installs_the_terminal_state_even_with_live_receivers() {
+        // A close site may terminalize without publishing a `Stopped`
+        // projection first; the retained value is what every later subscriber
+        // reads, so closure must install the authoritative one regardless of
+        // who is currently attached.
+        let hub = SnapshotHub::default();
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let mut live = hub.subscribe(snapshot(ScopeState::Running), &mut txn);
+        drop(txn);
+
+        let mut txn = crate::cells::ObservationTxn::detached();
+        hub.close(&mut txn, || {
+            snapshot(ScopeState::Stopped {
+                reason: crate::StopReason::Finished,
+            })
+        });
+        drop(txn);
+
+        assert!(live.changed().await.is_err());
+        drop(live);
+
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let mut later = hub.subscribe(snapshot(ScopeState::Running), &mut txn);
+        drop(txn);
+        assert!(matches!(
+            later.borrow_latest().state,
+            ScopeState::Stopped {
+                reason: crate::StopReason::Finished
+            }
+        ));
+        assert!(later.changed().await.is_err());
     }
 
     #[crate::runtime::test]

@@ -2,68 +2,46 @@ use super::*;
 
 #[derive(Clone, Copy)]
 pub(super) struct RemovalRequest {
-    pub(super) membership: Membership,
     pub(super) key: ChildKey,
 }
 
 impl ScopeRuntime {
-    pub(super) fn dynamic_membership_is_removing(&self, key: ChildKey) -> bool {
-        let Some(child) = self.children.get(key) else {
-            return false;
-        };
-        self.dynamic.as_ref().is_some_and(|control| {
-            control
-                .state
-                .lock()
-                .expect("dynamic-state mutex poisoned")
-                .entry(child.slot.member.id())
-                .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
-                .is_some_and(|entry| entry.is_removing() && entry.matches_key(key))
-        })
+    pub(super) fn with_dynamic_entry<R>(
+        &self,
+        key: ChildKey,
+        inspect: impl FnOnce(&DynamicEntry) -> R,
+    ) -> Option<R> {
+        let child = self.children.get(key)?;
+        let control = self.dynamic.as_ref()?;
+        let state = control.state.lock().expect("dynamic-state mutex poisoned");
+        state
+            .entry(child.slot.member.id())
+            .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
+            .filter(|entry| entry.matches_key(key))
+            .map(inspect)
+    }
+
+    pub(super) fn removal_latched(&self, key: ChildKey) -> bool {
+        self.supervisor.membership_status(key) == MembershipStatus::Removing
+            || self
+                .with_dynamic_entry(key, DynamicEntry::removal_latched)
+                .unwrap_or(false)
     }
 
     pub(super) fn handle_removal(&mut self, removal: RemovalRequest) {
-        let RemovalRequest { membership, key } = removal;
-        let Some(member) = self
-            .children
-            .get(key)
-            .map(|child| Arc::clone(&child.slot.member))
-            .filter(|member| member.membership() == membership)
-        else {
-            return;
-        };
-        let Some(control) = &self.dynamic else {
-            return;
-        };
-        let tracked = control
-            .state
-            .lock()
-            .expect("dynamic-state mutex poisoned")
-            .entry(member.id())
-            .filter(|entry| entry.slot.member.membership() == membership)
-            .is_some_and(|entry| entry.is_removing() && entry.matches_key(key));
-        if !tracked {
+        let key = removal.key;
+        if !self.removal_latched(key) {
             return;
         }
-        if self.children[key].is_terminal() {
-            self.finalize_removal(key);
-        } else {
-            self.begin_stop_child(key, None);
-            if self
-                .children
-                .get(key)
-                .is_some_and(ChildRuntime::is_terminal)
-            {
-                self.finalize_removal(key);
-            }
-        }
+        self.reduce(SupervisorEvent::RemovalLatched { child: key });
+        self.flush_supervisor_effects();
     }
 
     pub(super) fn finalize_removal(&mut self, key: ChildKey) {
         let Some(control) = &self.dynamic else {
             return;
         };
-        let member = Arc::clone(&self.children[key].slot.member);
+        let member = Arc::clone(&self.children[&key].slot.member);
         let id = member.id().clone();
         let root = Arc::clone(&self.root);
         let entry = root.with_observation_gate(|txn| {
@@ -95,7 +73,7 @@ impl ScopeRuntime {
     /// ordering is what makes a returned `RemoveOutcome::Removed` imply
     /// startup already saw the shrunken set (SPEC §6).
     fn release_removed_entry(&mut self, entry: DynamicEntry) {
-        if self.lifecycle.is_starting() {
+        if self.supervisor.lifecycle().is_starting() {
             self.pending_startup_removals.push(entry);
         } else {
             drop(entry);
@@ -109,7 +87,7 @@ impl ScopeRuntime {
     }
 
     pub(super) fn prune_terminal(&mut self, key: ChildKey) {
-        let member = Arc::clone(&self.children[key].slot.member);
+        let member = Arc::clone(&self.children[&key].slot.member);
         let root = Arc::clone(&self.root);
         let removed = root.with_observation_gate(|txn| {
             let mut state = self
@@ -148,19 +126,9 @@ impl ScopeRuntime {
         let Some(mut child) = self.children.remove(key) else {
             return;
         };
-        // Reclaim never adjusts `incomplete_children`: every reclaim path runs
-        // after terminal completion, which already decremented the count. An
-        // early reclaim would leak the count and stall scope completion, so
-        // fail loudly instead.
         debug_assert!(
-            !child.is_incomplete(),
-            "reclaim runs only after terminal completion"
-        );
-        let removed = self.child_keys.remove(&child.slot.member.membership());
-        debug_assert_eq!(
-            removed,
-            Some(key),
-            "reclaimed memberships leave the key index"
+            self.supervisor.joined(key),
+            "reclaim runs only after joined terminal completion"
         );
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);
@@ -173,6 +141,7 @@ impl ScopeRuntime {
                 self.deadlines.cancel(deadline);
             }
         }
+        self.reduce(SupervisorEvent::Reclaim { child: key });
         #[cfg(test)]
         self.record_storage();
     }

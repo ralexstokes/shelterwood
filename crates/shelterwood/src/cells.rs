@@ -1588,7 +1588,7 @@ impl ScopeCell {
             let epoch = control.epochs.begin()?;
             // The idle epoch plane pairs only with a settled projection:
             // `Unstarted` before any mint, `Stopped` after every finish. That
-            // pairing is what lets `scope_settled` treat terminal membership
+            // pairing is what lets `settled` treat terminal membership
             // plus a settled projection as final without stranding a scope
             // that still owns a live incarnation.
             debug_assert!(
@@ -1844,9 +1844,20 @@ impl ScopeCell {
         })
     }
 
-    pub(crate) fn incarnation_finished(&self, epoch: Epoch) -> bool {
+    fn incarnation_complete(&self, epoch: Epoch) -> bool {
         let control = self.control.lock().expect("scope control mutex poisoned");
         control.epochs.finished(epoch)
+    }
+
+    fn membership_terminal(&self) -> bool {
+        matches!(self.member.record().stage, MemberStage::Terminal(_))
+    }
+
+    fn joined(&self) -> bool {
+        matches!(
+            self.record().state,
+            ScopeState::Stopped { .. } | ScopeState::Unstarted
+        )
     }
 
     /// Whether a shutdown wait has crossed the finality fence for its target.
@@ -1869,13 +1880,9 @@ impl ScopeCell {
     /// `Unstarted` (never begun) or `Stopped`. Together they mean the
     /// terminal-membership arm can never be the *only* reachable settlement
     /// for a scope that still owns work.
-    pub(crate) fn scope_settled(&self, epoch: Option<Epoch>) -> bool {
-        epoch.is_some_and(|epoch| self.incarnation_finished(epoch))
-            || (matches!(self.member.record().stage, MemberStage::Terminal(_))
-                && matches!(
-                    self.record().state,
-                    ScopeState::Stopped { .. } | ScopeState::Unstarted
-                ))
+    pub(crate) fn settled(&self, epoch: Option<Epoch>) -> bool {
+        epoch.is_some_and(|epoch| self.incarnation_complete(epoch))
+            || (self.membership_terminal() && self.joined())
     }
 
     pub(crate) fn set_admitted_children(self: &Arc<Self>, children: Vec<ResidentProjection>) {

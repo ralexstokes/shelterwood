@@ -19,7 +19,7 @@ fn disposed_child(pending: &Pending) -> ChildKey {
 async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
     let identity = isolated_scope("identity", ScopeFlavor::Dynamic);
     let membership = identity.member.membership();
-    let key = ChildKey(1);
+    let key = ChildKey::fixture(1);
     let incarnation = IncarnationCounter::fixture(membership)
         .mint()
         .expect("fixture incarnation is available");
@@ -39,7 +39,7 @@ async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
     let publisher = crate::runtime::spawn(async move {
         crate::runtime::yield_now().await;
         control
-            .send(DriverEvent::Removal(RemovalRequest { membership, key }))
+            .send(DriverEvent::Removal(RemovalRequest { key }))
             .expect("the control lane remains open");
         primary
             .send(DriverEvent::Child(ChildEvent::Ready {
@@ -87,9 +87,9 @@ async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
 #[test]
 fn every_event_lane_is_capped_and_a_saturated_lane_forces_a_yield() {
     let limit = super::super::MIN_EVENT_BATCH_LIMIT;
-    let primary_key = ChildKey(1);
-    let control_key = ChildKey(2);
-    let disposal_key = ChildKey(3);
+    let primary_key = ChildKey::fixture(1);
+    let control_key = ChildKey::fixture(2);
+    let disposal_key = ChildKey::fixture(3);
     let (primary, mut primary_receiver) = crate::runtime::unbounded_mpsc();
     let (control, mut control_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal, mut disposal_receiver) = crate::runtime::unbounded_mpsc();
@@ -176,7 +176,6 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     let starts = Arc::new(AtomicUsize::new(0));
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
-    let member = Arc::clone(&reservation.slot.member);
     reservation
         .slot
         .define(ChildConstruction::Task(TaskDef::new({
@@ -192,7 +191,6 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
                 }
             }
         })));
-    let membership = member.membership();
     let fused_cancel = Latch::default();
     let mut response = super::super::start_admission(
         Arc::clone(&reservation.control),
@@ -280,7 +278,6 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     let DriverEvent::Removal(removal) = forwarded else {
         panic!("the queued event is the fused removal");
     };
-    assert_eq!(removal.membership, membership);
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =

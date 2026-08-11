@@ -42,7 +42,12 @@ impl ScopeRuntime {
                 // terminal routes through `finalize_removal`, and its exit
                 // classification must not mistake a post-ready stop for a
                 // pre-ready failure.
-                let removing = self.dispatch_membership_status(key) == MembershipStatus::Removing;
+                let removal_latched = self.removal_latched(key);
+                self.reduce(SupervisorEvent::Ready {
+                    child: key,
+                    removal_latched,
+                });
+                let removing = self.supervisor.membership_status(key) == MembershipStatus::Removing;
                 let Some(child) = self.children.get_mut(key) else {
                     return false;
                 };
@@ -58,9 +63,6 @@ impl ScopeRuntime {
                 active.ready_signal.fire();
                 if removing {
                     return false;
-                }
-                if !self.lifecycle.startup_complete() {
-                    child.initial_ready = true;
                 }
                 self.root.transition_child_stage(
                     &child.slot.member,
@@ -82,61 +84,10 @@ impl ScopeRuntime {
     }
 
     pub(super) fn progress_startup(&mut self) {
-        if !self.lifecycle.is_starting() {
-            return;
-        }
-        match self.root.flavor {
-            ScopeFlavor::Ordered => {
-                while let Some(key) = self.next_ordered_start {
-                    // The cursor is held across `spawn_child`, and every
-                    // reclaim path (`finalize_removal`, `prune_terminal`) can
-                    // vacate a slot, so never index the arena with it: a
-                    // reclaimed slot is treated as already gone, the same
-                    // discipline `stop_next_ordered` follows for its own
-                    // cursor. `keys_after` ranges over the arena's ordered
-                    // key domain, so it still advances past a vacated key.
-                    if self
-                        .children
-                        .get(key)
-                        .is_some_and(|child| !child.spawned_once)
-                    {
-                        self.spawn_child(key);
-                    }
-                    if self
-                        .children
-                        .get(key)
-                        .is_some_and(|child| !child.initial_ready)
-                    {
-                        return;
-                    }
-                    self.next_ordered_start = self.children.keys_after(key).next();
-                }
-                if self
-                    .children
-                    .values()
-                    .filter(|child| child.initial)
-                    .all(|child| child.initial_ready)
-                {
-                    self.complete_startup();
-                }
-            }
-            ScopeFlavor::Dynamic => {
-                if self
-                    .children
-                    .values()
-                    .filter(|child| child.initial)
-                    .all(|child| child.initial_ready)
-                {
-                    self.complete_startup();
-                }
-            }
-        }
+        self.settle_supervisor();
     }
 
-    pub(super) fn complete_startup(&mut self) {
-        let Some(state) = self.lifecycle.complete_startup() else {
-            return;
-        };
+    pub(super) fn publish_startup_complete(&mut self, state: ScopeState) {
         self.root.set_state_and_startup(state, Ok(()));
         if let Some(parent_ready) = self.role.parent_ready() {
             parent_ready.fire();
@@ -173,15 +124,20 @@ impl ScopeRuntime {
                 exit,
             },
         };
-        let Some(state) = self.lifecycle.fail_startup() else {
+        let before = self.supervisor_effects.len();
+        self.reduce(SupervisorEvent::FailStartup);
+        let Some(SupervisorEffect::StartupFailed { state }) =
+            self.supervisor_effects.get(before).cloned()
+        else {
             return;
         };
+        self.supervisor_effects.remove(before);
         if self.root.flavor == ScopeFlavor::Ordered {
-            let later_children: Vec<_> = self.children.keys_after(key).collect();
+            let later_children: Vec<_> = self.supervisor.keys_after(key).collect();
             for later in later_children {
-                if !self.children[later].spawned_once
-                    && !self.children[later].is_disposing()
-                    && !self.children[later].is_terminal()
+                if !self.supervisor.spawned_once(later)
+                    && !self.supervisor.is_disposing(later)
+                    && !self.supervisor.membership_terminal(later)
                 {
                     self.begin_terminal_disposal(
                         later,

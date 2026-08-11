@@ -186,7 +186,6 @@ async fn expedited_restart_progresses_synchronous_readiness() {
     // restart must still release ordered startup when configuration produces
     // an immediate readiness effect.
     child.options.readiness = Readiness::Immediate;
-    child.spawned_once = true;
     let mut children = ChildArena::default();
     let key = children
         .insert(child)
@@ -196,6 +195,7 @@ async fn expedited_restart_progresses_synchronous_readiness() {
         .with_children(children)
         .with_next_ordered_start(Some(key))
         .build();
+    scope.reduce(SupervisorEvent::Spawned { child: key });
     plan.finish_transfer();
     let target = nested_cell
         .request_shutdown()
@@ -203,9 +203,9 @@ async fn expedited_restart_progresses_synchronous_readiness() {
 
     scope.expedite_restart_shutdown(key, target);
 
-    assert!(scope.children[key].initial_ready);
+    assert!(scope.supervisor.initial_ready(key));
     assert!(
-        scope.lifecycle.startup_complete(),
+        scope.supervisor.lifecycle().startup_complete(),
         "synchronous readiness from an expedited spawn advances aggregate startup"
     );
     assert_eq!(root.record().startup, Some(Ok(())));
@@ -285,7 +285,7 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
     // Ordered startup spawns "a" and parks on its (never-fired) readiness.
     scope.progress_startup();
     assert!(scope.children[first].active.is_some());
-    assert!(!scope.children[first].initial_ready);
+    assert!(!scope.supervisor.initial_ready(first));
 
     let event = root
         .take_control_events()
@@ -314,7 +314,7 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
         "a never-started ordered child must not be expedite-spawned before its turn"
     );
     assert!(scope.children[nested].active.is_none());
-    assert!(!scope.children[nested].spawned_once);
+    assert!(!scope.supervisor.spawned_once(nested));
     assert!(scope.children[nested].restart_shutdown_pending.is_none());
     assert_eq!(
         nested_cell.begin_incarnation(ScopeState::Starting),
@@ -557,7 +557,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
     crate::runtime::yield_now().await;
     crate::runtime::yield_now().await;
 
-    assert!(scope.lifecycle.is_draining());
+    assert!(scope.supervisor.lifecycle().is_draining());
     assert_eq!(
         factories.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -720,7 +720,7 @@ async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
 
     // The nested exit deferred its retry through arbitration, so the trip
     // exit from the same batch drained the scope first.
-    assert!(scope.lifecycle.is_draining());
+    assert!(scope.supervisor.lifecycle().is_draining());
     let retries = std::mem::take(&mut scope.restart_shutdown_retries);
     assert_eq!(retries, vec![(nested, target)]);
     for (child, target) in retries {
@@ -850,7 +850,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
     scope.handle_construction_disposed(child, panic);
 
     assert!(
-        scope.lifecycle.startup_complete(),
+        scope.supervisor.lifecycle().startup_complete(),
         "the ready-before-stop child completes startup"
     );
     assert!(
@@ -870,7 +870,7 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
 }
 
 /// `next_ordered_start` is held across `spawn_child` and is never cleared by
-/// `reclaim_child`, so `progress_startup` must treat a vacated slot the way
+/// `reclaim_child`, so `progress_startup` must treat a reclaimed key the way
 /// `stop_next_ordered` treats its own cursor: already gone, advance past it.
 /// Ordered scopes carry no dynamic control today and so never reclaim, which
 /// is exactly why this is pinned here — the arena is a monotonic key domain,
@@ -924,17 +924,19 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
         .build();
     plan.finish_transfer();
 
-    // Vacate the slot the cursor points at, exactly as a reclaim would leave
-    // it, without disturbing the child that follows.
+    // Retire the authoritative record and runtime resource together, exactly
+    // as production reclaim does, without disturbing the child that follows.
+    scope.reduce(SupervisorEvent::Terminalized { child: gone });
     scope
         .children
         .remove(gone)
         .expect("the cursor's child is live before the reclaim");
+    scope.reduce(SupervisorEvent::Reclaim { child: gone });
 
     scope.progress_startup();
 
     assert_eq!(
-        scope.next_ordered_start,
+        scope.supervisor.next_ordered_start(),
         Some(next),
         "a vacated cursor advances to the next live child instead of panicking"
     );
@@ -943,7 +945,7 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
         "the following child starts at its ordered turn"
     );
     assert!(
-        !scope.lifecycle.startup_complete(),
+        !scope.supervisor.lifecycle().startup_complete(),
         "the live successor still gates the aggregate"
     );
 }
@@ -1011,10 +1013,10 @@ async fn startup_removal_response_follows_aggregate_recomputation() {
         None,
         "membership commit alone cannot publish Removed before settlement"
     );
-    assert!(!scope.lifecycle.startup_complete());
+    assert!(!scope.supervisor.lifecycle().startup_complete());
 
     scope.progress_startup();
-    assert!(scope.lifecycle.startup_complete());
+    assert!(scope.supervisor.lifecycle().startup_complete());
     assert_eq!(root.record().startup, Some(Ok(())));
     scope.publish_startup_removals();
     assert_eq!(removal.try_receive(), Some(RemoveOutcome::Removed));
@@ -1133,13 +1135,13 @@ async fn queued_removal_suppresses_replayed_self_stop_readiness() {
         member.record().stage
     );
     assert!(
-        !scope.children[key].initial_ready,
+        !scope.supervisor.initial_ready(key),
         "a leaving membership is not credited to the startup aggregate"
     );
-    assert!(!scope.lifecycle.startup_complete());
+    assert!(!scope.supervisor.lifecycle().startup_complete());
     scope.progress_startup();
     assert!(
-        !scope.lifecycle.startup_complete(),
+        !scope.supervisor.lifecycle().startup_complete(),
         "startup waits for the removal to shrink the declared set"
     );
     assert_eq!(root.record().state, ScopeState::Starting);

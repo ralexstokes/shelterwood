@@ -122,6 +122,23 @@ struct ChildRecord {
     spawned_once: bool,
 }
 
+impl ChildRecord {
+    /// Whether a [`Effect::StartChild`] can still produce a [`Event::Spawned`]
+    /// edge, deliberately spelled as this event's own acceptance set.
+    ///
+    /// Settlement is level-triggered and its driver re-enters [`Event::Settle`]
+    /// until a pass emits nothing, so an effect the shell would decline is not
+    /// merely wasted — it is re-derived from unchanged state forever. Every
+    /// start emission is therefore gated on this predicate, and the reducer
+    /// never asks for construction it could not observe the result of.
+    fn startable(self) -> bool {
+        matches!(
+            self.state,
+            ChildState::Resident(IncarnationState::Unstarted | IncarnationState::RestartPending)
+        )
+    }
+}
+
 /// One input to the structural reducer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
@@ -441,7 +458,14 @@ impl SupervisorState {
                         return;
                     }
                     if !record.spawned_once {
-                        effects.push(Effect::StartChild { child });
+                        // A never-spawned membership can still be terminalized
+                        // in place — incarnation exhaustion is the reachable
+                        // case. It gates ordered startup exactly as an
+                        // unstarted one does, but asking for construction that
+                        // `Event::Spawned` would reject would spin settlement.
+                        if record.startable() {
+                            effects.push(Effect::StartChild { child });
+                        }
                         return;
                     }
                     if matches!(record.startup, StartupMembership::Initial { ready: false }) {
@@ -453,9 +477,11 @@ impl SupervisorState {
             }
             ScopeFlavor::Dynamic => {
                 for (&child, record) in &self.children {
+                    // `startable` subsumes the membership check: a `Removing`
+                    // record is never `Resident`.
                     if matches!(record.startup, StartupMembership::Initial { .. })
                         && !record.spawned_once
-                        && record.state.membership_status() == MembershipStatus::Active
+                        && record.startable()
                     {
                         effects.push(Effect::StartChild { child });
                     }
@@ -1106,6 +1132,66 @@ mod tests {
         state.check_invariants();
     }
 
+    /// Settlement is level-triggered and its driver re-enters [`Event::Settle`]
+    /// until a pass emits nothing, so a start effect the shell declines is
+    /// re-derived from unchanged state forever rather than merely wasted. Pin
+    /// the emission set to [`Event::Spawned`]'s acceptance set across every
+    /// child state, in both flavors and both membership statuses.
+    #[test]
+    fn start_effects_are_confined_to_the_spawn_transition() {
+        let phases = [
+            IncarnationState::Unstarted,
+            IncarnationState::Active,
+            IncarnationState::Stopping,
+            IncarnationState::Complete,
+            IncarnationState::RestartPending,
+            IncarnationState::Disposing,
+            IncarnationState::Joined,
+        ];
+        for flavor in [ScopeFlavor::Ordered, ScopeFlavor::Dynamic] {
+            for removing in [false, true] {
+                for phase in phases {
+                    let membership = memberships(1)[0];
+                    let mut state = SupervisorState::new(flavor, ScopeLifecycle::starting());
+                    let child = admit(&mut state, membership, true);
+                    state.children.get_mut(&child).expect("child").state = if removing {
+                        ChildState::Removing(phase)
+                    } else {
+                        ChildState::Resident(phase)
+                    };
+
+                    let mut effects = Vec::new();
+                    step(&mut state, Event::Settle, &mut effects);
+                    let started = effects.contains(&Effect::StartChild { child });
+
+                    // `spawned_once` is still false in every arm, so the flag
+                    // reports exactly whether the transition was accepted —
+                    // unlike the resulting state, which already reads `Active`
+                    // in the arm a stale spawn must not rewind.
+                    let mut spawned = state.clone();
+                    step(&mut spawned, Event::Spawned { child }, &mut Vec::new());
+                    assert_eq!(
+                        started,
+                        spawned.spawned_once(child),
+                        "{flavor:?} removing={removing} {phase:?}: a start effect must be one \
+                         accepted `Spawned` away from executing"
+                    );
+
+                    if !started {
+                        let mut again = Vec::new();
+                        step(&mut state, Event::Settle, &mut again);
+                        assert!(
+                            again.is_empty(),
+                            "{flavor:?} removing={removing} {phase:?}: settlement with no start \
+                             effect to honour must already be at its fixed point, got {again:?}"
+                        );
+                    }
+                    state.check_invariants();
+                }
+            }
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
     enum SmallEvent {
         Spawn(usize),
@@ -1240,6 +1326,13 @@ mod tests {
                                     assert!(state.contains(*child), "effects name a live key");
                                 }
                                 _ => {}
+                            }
+                            if let Effect::StartChild { child } = effect {
+                                assert!(
+                                    state.children[child].startable(),
+                                    "a start effect the shell would decline re-derives from \
+                                     unchanged state and never lets settlement terminate"
+                                );
                             }
                         }
                     }

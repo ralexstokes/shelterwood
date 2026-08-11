@@ -883,7 +883,7 @@ impl ScopeRuntime {
                 started_at: active.started_at,
                 stopped_at: runtime::now(),
             },
-            self.intensity_policy.within,
+            self.intensity_policy.within(),
         );
 
         // Fused cancellation is a level-triggered source. It can linearize

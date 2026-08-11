@@ -191,31 +191,80 @@ pub enum Backoff {
     /// Restart without a delay.
     Immediate,
     /// Use a fixed non-zero delay.
-    Fixed {
-        /// The fixed delay.
-        delay: Duration,
-        /// Optional equal jitter.
-        jitter: Jitter,
-    },
+    Fixed(FixedBackoff),
     /// Increase the delay exponentially, clamped to `max`.
-    Exponential {
-        /// The first delay.
-        base: Duration,
-        /// The per-attempt multiplier.
-        factor: BackoffFactor,
-        /// The maximum derived delay.
-        max: Duration,
-        /// Optional equal jitter.
-        jitter: Jitter,
-    },
+    Exponential(ExponentialBackoff),
+}
+
+/// Validated payload of a fixed [`Backoff`].
+///
+/// Values are created by [`Backoff::fixed`], which guarantees a non-zero
+/// delay. The private representation prevents invalid fixed-backoff literals.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct FixedBackoff {
+    delay: Duration,
+    jitter: Jitter,
+}
+
+impl FixedBackoff {
+    /// Returns the fixed non-zero delay.
+    #[must_use]
+    pub const fn delay(self) -> Duration {
+        self.delay
+    }
+
+    /// Returns the configured jitter mode.
+    #[must_use]
+    pub const fn jitter(self) -> Jitter {
+        self.jitter
+    }
+}
+
+/// Validated payload of an exponential [`Backoff`].
+///
+/// Values are created by [`Backoff::exponential`], which guarantees non-zero
+/// delays, a valid factor, and a maximum no shorter than the base.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ExponentialBackoff {
+    base: Duration,
+    factor: BackoffFactor,
+    max: Duration,
+    jitter: Jitter,
+}
+
+impl ExponentialBackoff {
+    /// Returns the non-zero initial delay.
+    #[must_use]
+    pub const fn base(self) -> Duration {
+        self.base
+    }
+
+    /// Returns the validated per-attempt multiplier.
+    #[must_use]
+    pub const fn factor(self) -> BackoffFactor {
+        self.factor
+    }
+
+    /// Returns the non-zero maximum delay.
+    #[must_use]
+    pub const fn max(self) -> Duration {
+        self.max
+    }
+
+    /// Returns the configured jitter mode.
+    #[must_use]
+    pub const fn jitter(self) -> Jitter {
+        self.jitter
+    }
 }
 
 impl Backoff {
     /// Constructs a validated fixed backoff.
     pub fn fixed(delay: Duration, jitter: Jitter) -> Result<Self, PolicyError> {
-        let backoff = Self::Fixed { delay, jitter };
-        backoff.validate()?;
-        Ok(backoff)
+        if delay.is_zero() {
+            return Err(PolicyError::ZeroDuration);
+        }
+        Ok(Self::Fixed(FixedBackoff { delay, jitter }))
     }
 
     /// Constructs a validated exponential backoff.
@@ -225,14 +274,19 @@ impl Backoff {
         max: Duration,
         jitter: Jitter,
     ) -> Result<Self, PolicyError> {
-        let backoff = Self::Exponential {
+        if base.is_zero() || max.is_zero() {
+            return Err(PolicyError::ZeroDuration);
+        }
+        factor.validate()?;
+        if max < base {
+            return Err(PolicyError::BackoffMaximumBeforeBase);
+        }
+        Ok(Self::Exponential(ExponentialBackoff {
             base,
             factor,
             max,
             jitter,
-        };
-        backoff.validate()?;
-        Ok(backoff)
+        }))
     }
 
     /// Derives the delay for a one-origin restart attempt.
@@ -243,13 +297,14 @@ impl Backoff {
         let attempt = attempt.get().max(1);
         let (delay, jitter, maximum) = match self {
             Self::Immediate => return Duration::ZERO,
-            Self::Fixed { delay, jitter } => (delay, jitter, delay),
-            Self::Exponential {
-                base,
-                factor,
-                max,
-                jitter,
-            } => {
+            Self::Fixed(fixed) => (fixed.delay, fixed.jitter, fixed.delay),
+            Self::Exponential(exponential) => {
+                let ExponentialBackoff {
+                    base,
+                    factor,
+                    max,
+                    jitter,
+                } = exponential;
                 let delay = if attempt == 1 || factor.get() == 1.0 {
                     // The multiplier is exactly one, so the product is the
                     // base itself. Skipping the float round-trip keeps the
@@ -293,11 +348,12 @@ impl Backoff {
     fn validate(self) -> Result<(), PolicyError> {
         match self {
             Self::Immediate => Ok(()),
-            Self::Fixed { delay, .. } if delay.is_zero() => Err(PolicyError::ZeroDuration),
-            Self::Fixed { .. } => Ok(()),
-            Self::Exponential {
-                base, factor, max, ..
-            } => {
+            Self::Fixed(fixed) if fixed.delay.is_zero() => Err(PolicyError::ZeroDuration),
+            Self::Fixed(_) => Ok(()),
+            Self::Exponential(exponential) => {
+                let ExponentialBackoff {
+                    base, factor, max, ..
+                } = exponential;
                 if base.is_zero() || max.is_zero() {
                     return Err(PolicyError::ZeroDuration);
                 }
@@ -428,22 +484,37 @@ pub enum ReadinessDeadline {
     #[default]
     Inherit,
     /// Apply a non-zero bound.
-    Bounded(Duration),
+    Bounded(BoundedReadinessDeadline),
     /// Wait without a deadline.
     Unbounded,
+}
+
+/// Validated non-zero payload of a bounded [`ReadinessDeadline`].
+///
+/// Values are created by [`ReadinessDeadline::bounded`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BoundedReadinessDeadline(Duration);
+
+impl BoundedReadinessDeadline {
+    /// Returns the non-zero deadline duration.
+    #[must_use]
+    pub const fn duration(self) -> Duration {
+        self.0
+    }
 }
 
 impl ReadinessDeadline {
     /// Constructs a validated bounded deadline.
     pub fn bounded(duration: Duration) -> Result<Self, PolicyError> {
-        let deadline = Self::Bounded(duration);
-        deadline.validate_declared()?;
-        Ok(deadline)
+        if duration.is_zero() {
+            return Err(PolicyError::ZeroDuration);
+        }
+        Ok(Self::Bounded(BoundedReadinessDeadline(duration)))
     }
 
     fn validate_declared(self) -> Result<(), PolicyError> {
         match self {
-            Self::Bounded(duration) if duration.is_zero() => Err(PolicyError::ZeroDuration),
+            Self::Bounded(duration) if duration.0.is_zero() => Err(PolicyError::ZeroDuration),
             Self::Inherit | Self::Bounded(_) | Self::Unbounded => Ok(()),
         }
     }
@@ -453,9 +524,9 @@ impl ReadinessDeadline {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Intensity {
     /// Maximum restart charges allowed inside the rolling window.
-    pub max_restarts: u64,
+    max_restarts: u64,
     /// The rolling-window duration.
-    pub within: Duration,
+    within: Duration,
 }
 
 impl Intensity {
@@ -467,6 +538,18 @@ impl Intensity {
         };
         intensity.validate()?;
         Ok(intensity)
+    }
+
+    /// Returns the maximum restart charges allowed inside the window.
+    #[must_use]
+    pub const fn max_restarts(self) -> u64 {
+        self.max_restarts
+    }
+
+    /// Returns the non-zero rolling-window duration.
+    #[must_use]
+    pub const fn within(self) -> Duration {
+        self.within
     }
 
     pub(crate) fn validate(self) -> Result<(), PolicyError> {
@@ -747,7 +830,9 @@ fn resolve_readiness_deadline(
 ) -> ResolvedReadinessDeadline {
     match value {
         ReadinessDeadline::Inherit => inherited,
-        ReadinessDeadline::Bounded(duration) => ResolvedReadinessDeadline::Bounded(duration),
+        ReadinessDeadline::Bounded(duration) => {
+            ResolvedReadinessDeadline::Bounded(duration.duration())
+        }
         ReadinessDeadline::Unbounded => ResolvedReadinessDeadline::Unbounded,
     }
 }

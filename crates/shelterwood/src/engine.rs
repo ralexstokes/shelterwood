@@ -278,11 +278,11 @@ pub(crate) struct IntensityCharge {
 
 impl IntensityTrip {
     pub(crate) fn new(policy: Intensity, charge: IntensityCharge) -> Self {
-        debug_assert_eq!(charge.tripped, charge.in_window > policy.max_restarts);
+        debug_assert_eq!(charge.tripped, charge.in_window > policy.max_restarts());
         Self {
-            max_restarts: policy.max_restarts,
+            max_restarts: policy.max_restarts(),
             observed_restarts: charge.in_window,
-            within: policy.within,
+            within: policy.within(),
         }
     }
 }
@@ -291,7 +291,7 @@ impl IntensityState {
     pub(crate) fn charge(&mut self, policy: Intensity, now: Instant) -> IntensityCharge {
         while self.charges.front().is_some_and(|charge| {
             now.checked_duration_since(*charge)
-                .is_some_and(|age| age > policy.within)
+                .is_some_and(|age| age > policy.within())
         }) {
             self.charges.pop_front();
         }
@@ -301,7 +301,7 @@ impl IntensityState {
         IntensityCharge {
             in_window,
             total_restarts: self.total_restarts,
-            tripped: in_window > policy.max_restarts,
+            tripped: in_window > policy.max_restarts(),
         }
     }
 }
@@ -1223,9 +1223,9 @@ mod tests {
         assert_eq!(trip.in_window, 2);
         assert_eq!(trip.total_restarts, TotalRestarts::ZERO.bump().bump());
         let trip_payload = crate::IntensityTrip::new(policy, trip);
-        assert_eq!(trip_payload.max_restarts, policy.max_restarts);
+        assert_eq!(trip_payload.max_restarts, policy.max_restarts());
         assert_eq!(trip_payload.observed_restarts, trip.in_window);
-        assert_eq!(trip_payload.within, policy.within);
+        assert_eq!(trip_payload.within, policy.within());
 
         let aged = state.charge(policy, start + Duration::from_secs(21));
         assert!(!aged.tripped);

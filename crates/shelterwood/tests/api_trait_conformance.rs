@@ -1,15 +1,15 @@
-use std::{cell::Cell, error::Error, hash::Hash, ops::Deref, time::Duration};
+use std::{cell::Cell, error::Error, hash::Hash, ops::Deref, rc::Rc, time::Duration};
 
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ActorSlot, Admission, Blocking, BuildError, CallError,
-    CallFuture, Cancellation, CancellationToken, Context, DeadlineElapsed, DefaultsInheritance,
-    DynamicActorSlot, DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot, DynamicTree, ExitError,
-    ExitResult, GracePhase, Guard, Handler, Incarnation, Intensity, LifecycleEvents,
-    LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, MembershipStatus, OneShotTaskRef,
-    RawActor, RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, Removal, Reply,
-    ReplyReceive, ReplyReceiver, ReserveError, RestartAttempt, RestartCount, RestartPolicy,
-    Retention, ScopeDefaults, ScopeRef, SendError, SendFuture, SendTimeout, Shutdown,
-    SnapshotClosed, SnapshotReceiver, StopContext, Strategy, SubtreeDef, SubtreeOnceDef,
+    CallFuture, Cancellation, CancellationToken, ChildId, Context, DeadlineElapsed,
+    DefaultsInheritance, DynamicActorSlot, DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot,
+    DynamicTree, ExitError, ExitResult, GracePhase, Guard, Handler, Incarnation, Intensity,
+    LifecycleEvents, LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, MembershipStatus,
+    OneShotTaskRef, RawActor, RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline,
+    Removal, Reply, ReplyReceive, ReplyReceiver, ReserveError, RestartAttempt, RestartCount,
+    RestartPolicy, Retention, ScopeDefaults, ScopeRef, SendError, SendFuture, SendTimeout,
+    Shutdown, SnapshotClosed, SnapshotReceiver, StopContext, Strategy, SubtreeDef, SubtreeOnceDef,
     SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, TotalRestarts, Tree, WaitError,
 };
 
@@ -59,6 +59,16 @@ assert_not_impl!(Incarnation: Ord);
 
 #[test]
 fn documented_identity_handle_token_and_owned_value_bounds_compile() {
+    struct RcId(Rc<()>, String);
+
+    impl From<RcId> for ChildId {
+        fn from(value: RcId) -> Self {
+            let RcId(not_send, id) = value;
+            drop(not_send);
+            id.into()
+        }
+    }
+
     assert_copy_eq_hash_send_sync::<Membership>();
     assert_copy_eq_hash_send_sync::<Incarnation>();
     assert_copy_eq_hash_send_sync::<Cancellation>();
@@ -121,7 +131,11 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     let _assert_scope_futures = |scope: &ScopeRef| {
         assert_send(scope.wait_stopped());
         assert_send(scope.shutdown_and_wait(Duration::ZERO));
-        assert_send(scope.wait_for_child("child", |_| true, Duration::ZERO));
+        assert_send(scope.wait_for_child(
+            RcId(Rc::new(()), "child".into()),
+            |_| true,
+            Duration::ZERO,
+        ));
     };
     let _assert_dynamic_scope_futures = |scope: &DynamicScopeRef| {
         assert_send(scope.wait_stopped());

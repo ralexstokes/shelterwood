@@ -20,7 +20,21 @@ use super::{
 };
 
 impl ScopeRef {
-    /// Requests shutdown and waits for this scope to stop.
+    /// Requests shutdown and waits for this scope's incarnation to finish its
+    /// scope epilogue.
+    ///
+    /// `timeout` bounds cooperative teardown, not this call's return: it arms
+    /// when the targeted incarnation enters its drain and, once expired,
+    /// escalates and reports stragglers while the wait continues to
+    /// completion. Membership terminality published by an ancestor's teardown
+    /// does not resolve the call while that incarnation is still running its
+    /// epilogue.
+    ///
+    /// A scheduled scope driver joins its children before completing. If an
+    /// ancestor hard-aborts a framework driver at the tidy-abort backstop, its
+    /// synchronous drop epilogue can only *request* abort for active children,
+    /// so cancellation and user-future destruction below that boundary may
+    /// finish after this call returns.
     pub async fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
         crate::driver::shutdown_scope(Arc::clone(&self.cell), timeout).await
     }
@@ -78,7 +92,11 @@ impl DynamicScopeRef {
             })
     }
 
-    /// Requests shutdown and waits for this scope to stop.
+    /// Requests shutdown and waits for this scope's incarnation to finish its
+    /// scope epilogue.
+    ///
+    /// See [`ScopeRef::shutdown_and_wait`] for the timeout's arming edge and
+    /// the hard-abort join boundary.
     pub async fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
         self.0.shutdown_and_wait(timeout).await
     }

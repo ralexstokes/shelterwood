@@ -1194,7 +1194,10 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   per policy and holds the aggregate open (the latch rule below),
   exactly as an ordered gate does. A **terminal** pre-ready exit of an
   initial member before the aggregate fires is the scope's terminal
-  startup failure — and because every initial member was spawned at
+  startup failure — *unless* that exit is the commit of an
+  owner-initiated removal, in which case the member simply leaves
+  the declared set under the aggregate rule below and startup
+  continues — and because every initial member was spawned at
   lowering, there is no not-yet-started suffix: **no sibling
   terminalizes `NeverStarted`**. The transition is pinned: the scope
   leaves `Starting` the moment the exit funnel dispatches that terminal
@@ -1218,9 +1221,24 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   lowered with — its declared initial set; runtime additions to a
   dynamic scope never join the aggregate, whether they are admitted
   before or after it fires (their per-child `Ready` events, B.4, are
-  the observation surface). The aggregate fires at most once per scope
-  incarnation and is latched: an already-ready child that fails and
-  restarts afterwards does not rewind it — readiness is a
+  the observation surface). Removing an initial member while the scope
+  is `Starting` shrinks that declared set, and the aggregate may
+  complete when the remaining initial members are ready — including
+  the empty case, where removing every initial member completes
+  startup. The shrink is **commit-time, not request-time**: the member
+  leaves the declared set when its removal commits (residency
+  withdrawn, `Removed` published), so a slow-stopping member holds the
+  aggregate open for its whole stop ladder, and the recomputation is
+  ordered ahead of the removal response — a returned `Removed` implies
+  the aggregate has already seen the shrunken set. That commit point
+  pins the race against the member's own pre-ready failure: a terminal
+  pre-ready exit or readiness timeout whose terminal routing observes
+  the membership *not yet* marked removing fails startup under the
+  rule above, while once the mark is in place removal outranks it and
+  the aggregate simply shrinks. Both orders are legal; which one a
+  given run takes is not specified. The aggregate fires at most once
+  per scope incarnation and is latched: an already-ready child that
+  fails and restarts afterwards does not rewind it — readiness is a
   startup-phase edge, not a liveness signal (snapshots carry liveness,
   B.6). The same latch decides the pre-fire race: a gated child that
   restarts *before* the aggregate has fired holds it open until the
@@ -2227,26 +2245,36 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   the funnel, but the draining parent schedules nothing — §10's mode
   dispatch.)
 - The owner has two further consuming awaits. `shutdown(timeout)` requests
-  the §10 ladder and waits until every descendant is stopped *and joined*.
+  the §10 ladder and waits for the root driver's terminal epilogue. While a
+  framework driver remains scheduled, it joins each child before completing.
   The timeout bounds the **cooperative** phase, not the return: at expiry
-  the stragglers are hard-aborted recursively and joined, and the call
-  returns the structured shutdown-timeout error (§7) naming them. That
-  final join is the one unbounded remainder — a hard-aborted future can
-  block arbitrarily in `Drop`, and returning before the join would leave
-  teardown running concurrently with the caller, the worse contract;
-  `run_blocking` threads detach past abort (§5.5) and are never joined.
+  the stragglers owned by scheduled drivers are hard-aborted and joined, and
+  the call returns the structured shutdown-timeout error (§7) naming them.
+  There is one recursive-join exception: if a framework driver misses its
+  abort acknowledgement and its ancestor hard-aborts it at the tidy-beat
+  backstop, the driver's synchronous `Drop` epilogue requests abort for its
+  active children but cannot await their join handles. Those deeper tasks
+  may finish cancellation and destroy their user futures after the owner's
+  call returns. The return still joins the root driver and completes the
+  target scope epilogue; that epilogue has requested stop or abort for each
+  directly owned child. It does not claim either a recursive join or completed
+  abort propagation through deeper fallback boundaries.
+  `run_blocking` threads are a separate, unconditional detach-past-abort
+  exception (§5.5) and are never joined.
   Expiry does not bypass the single ladder: the stragglers are driven
   through its abort tail — abort token, one tidy-abort beat, hard abort
-  (§10) — concurrently, then joined. A
+  (§10) — concurrently, then joined while their scope driver remains
+  scheduled. A
   zero timeout skips only the cooperative *wait*: every descendant is
   escalated immediately through that same abort tail (tokens still fire
   in order, the tidy beat still runs — `shutdown(0)` means "every child
   under `Abort` policy", §10, not a second mechanism), then the same
-  joins. The zero form is exempt from Appendix B's
+  driver-owned joins. The zero form is exempt from Appendix B's
   zero-budget-fails-immediately rule (stated there): this timeout is an
-  escalation bound, not a failure deadline. Nothing continues tearing
-  down after it returns, and consuming the owner is what makes the wait
-  explicit. `wait()` awaits natural termination without requesting
+  escalation bound, not a failure deadline. Except for the documented
+  hard-abort fallback and `run_blocking` detach boundaries, no teardown
+  remains after return; consuming the owner makes that wait explicit.
+  `wait()` awaits natural termination without requesting
   shutdown, and resolves with the root's terminal reason (B.6:
   `Finished`, `IntensityTripped`, or `ShutdownRequested` when teardown
   was requested concurrently elsewhere);
@@ -2534,6 +2562,16 @@ integration toolkit for the driver shell and the end-to-end invariants.
    while a gated runtime member sits unready); an already-ready child
    restarting before the aggregate fires holds it open, and one
    restarting after it fires does not rewind it.
+   Removal shrinks the declared set (§6), pinned by public-API repros
+   that hang the unfixed driver for a full virtual timeout: removing
+   the sole unready initial member completes startup; so does removing
+   the last unready one beside a ready sibling, removing every initial
+   member concurrently (the empty declared set), and removing the sole
+   unready member of a *nested* dynamic scope — which must publish the
+   aggregate up to an ordered parent and release its gated sibling.
+   The negative pins the guard: removing an *already-ready* initial
+   member while an unready one remains leaves the scope quietly
+   `Starting`.
 7. **Exactly one published exit report per incarnation, on every path
    including panic and abort; publication is post-join (§7's two-phase
    rule); one runner, one exit type.** The two hard provocations: an
@@ -3301,7 +3339,11 @@ Ordering and delivery contract:
   descendant memberships). `Stopped` is an incarnation edge, not a
   closure signal: only membership terminality ends the stream (closure
   rule below), so every non-final `Stopped` is followed on the same
-  sequence by the next incarnation's `Starting`, and the positive
+  sequence either by the next incarnation's `Starting` or by a
+  strictly-higher-precedence `Stopped` for the *same* incarnation
+  (B.6's stop-reason lattice — a bounded, monotone correction, never a
+  repeat of an equal verdict), and the final `Stopped` is the one
+  followed by neither. The positive
   terminality signals are the membership edges — the parent's `Removed`
   for this scope child, or this stream's own closure, always preceded
   by the final event. Snapshot receivers hold the last published snapshot through the
@@ -3350,7 +3392,8 @@ Ordering and delivery contract:
   scope's final event — closure is always preceded by one (under
   sequence exhaustion, by the final `Lagged`), and per the restart
   rule above a `Stopped` alone is not closure: the final `Stopped` is
-  the one no restart follows. For a scope membership that never spawns
+  the one no restart and no precedence upgrade follows. For a scope
+  membership that never spawns
   (a declaring tree dropped unspawned, a withdrawn or rejected
   insertion, §3.2), that terminal event is
   `ScopeState { Stopped { reason: NeverStarted } }` (B.6), published at
@@ -3480,7 +3523,9 @@ ScopeSnapshot   { state: Unstarted                              // membership ex
                                                                 //   tree, rejected/withdrawn insertion,
                                                                 //   removal before first spawn, startup-
                                                                 //   aborted ordered sibling (§6) — the
-                                                                //   scope-state twin of §7's exit
+                                                                //   scope-state twin of §7's exit, an
+                                                                //   invariant the stop-reason lattice
+                                                                //   below preserves in either order
                   kind: Ordered | Dynamic, strategy (ordered only), intensity,
                   total_restarts: TotalRestarts,         // charges per §9.2 — group respawns count
                   lifecycle_seq: LifecycleSeq,           // aligns events with snapshots (§12)
@@ -3489,6 +3534,28 @@ ScopeSnapshot   { state: Unstarted                              // membership ex
                                                          //   pre-admission reserved cells are
                                                          //   absent (§3.2)
                 + child(id), descendant(path) traversal helpers
+
+**Stop-reason lattice.** Several owners can independently reach a stop verdict
+for one incarnation — a driver's drain epilogue, a join monitor's fallback
+after that driver panicked or was cancelled, a never-started terminalization —
+so a scope's published `Stopped { reason }` resolves competing verdicts by
+**precedence, never by arrival order**. The total order is
+`Finished < IntensityTripped < StartupFailed < ShutdownRequested <
+NeverStarted`. A later verdict replaces the published reason — and emits a
+corrected `ScopeState` edge, per B.4's non-final-`Stopped` rule — iff it
+strictly outranks the recorded one; equal or weaker verdicts are idempotent
+repeats that publish nothing. The order is severity-ascending: `Finished` is
+the weakest claim, since a drain that began on natural completion says nothing
+about how the teardown itself ended; `ShutdownRequested` supersedes the
+structured failures, matching §11's drain-upgrade rule, which joins through
+this same lattice; and `NeverStarted` is the top element because it is not a
+live incarnation's verdict but the membership-terminal twin of §7's
+`NeverStarted` exit, so the scope-state projection and the membership exit
+agree whichever publication lands first. The consequences are that
+`wait_stopped()`, the final snapshot, and the stream's last `ScopeState` event
+always report the same, highest-precedence verdict, and that a root driver
+that dies mid-drain reports the join monitor's `ShutdownRequested` rather than
+the abandoned drain's `Finished`.
 
 ActorStats (II §20)
                 { messages_received, messages_accepted, messages_conflated,
@@ -3617,7 +3684,10 @@ implied on all; error/outcome types are B.3 and B.8):
   landing in a restart window is held by §10's pending-incarnation
   stop latch and armed onto the next incarnation, which
   starts and immediately begins teardown), and the call resolves once
-  *that incarnation* is stopped and joined. Under a parent `Always`
+  *that incarnation* has finished its scope epilogue. On the ordinary
+  teardown path that includes joining its children; §11 defines the
+  recursive-join exception when an ancestor hard-aborts a framework driver.
+  Under a parent `Always`
   policy (§11's nested-shutdown rule) a fresh incarnation may already
   be running at resolution — the contract is about the incarnation the
   latch stopped, deliberately not about the membership. A **pre-spawn**
@@ -3625,17 +3695,45 @@ implied on all; error/outcome types are B.3 and B.8):
   incarnation has ever existed, so the request arms §10's pending
   latch and waits for the first incarnation, which starts and
   immediately begins teardown. The timeout is an escalation bound on a
-  live teardown and **arms only when the latch begins acting** — at
-  that incarnation's start — never at the call: pre-spawn there is
+  live teardown and **arms only when the latch begins acting** — at that
+  incarnation's *drain entry*, never at the call: pre-spawn there is
   nothing to escalate, and the call waits exactly as a parked send
   does, bounded by §3.2's no-hang rule — a membership terminalized
   with no incarnation ever spawned (tree dropped unspawned, rejected
   or withdrawn insertion) resolves the call immediately as
-  already-stopped. Concurrent
-  callers ride one latch and observe one teardown; a scope whose
-  membership is already terminal resolves immediately (`Ok` — its
-  terminal state is `wait_stopped()`'s and the snapshot's to report,
-  not this call's). `wait_stopped()` is the membership-level await — the scope
+  already-stopped. Drain entry is the precise arming edge because the
+  budget bounds the **cooperative** phase: the incarnation must first get
+  the wake in which it consumes the latch, enters `Draining`, and starts
+  each child's stop ladder, or a zero budget would report every child that
+  cooperates on that wake — and every child sitting in a restart backoff
+  window — as a straggler, which §7's report explicitly is not for. One
+  consequence is normative: when an ancestor hard-aborts the incarnation
+  **before** it reaches drain entry, the latch never acts and the budget
+  never arms, so there is no cooperative phase to bound and no straggler
+  report to make. The call then waits on that incarnation's drop epilogue
+  — synchronous, awaiting nothing (§11's fallback boundary) — and resolves
+  `Ok`. A caller therefore cannot use this timeout to bound its own
+  return; the return is bounded by the epilogue, as it is on the ordinary
+  path once the budget expires (§11's unbounded join remainder).
+  Concurrent
+  callers ride one latch and observe one teardown. A scope whose
+  membership is already terminal resolves immediately only when its scope
+  projection is `Unstarted` or `Stopped`; if parent teardown published
+  terminal membership before a live incarnation's epilogue, the call still
+  waits for that incarnation to finish (`Ok` — the terminal state is
+  `wait_stopped()`'s and the snapshot's to report, not this call's).
+  That settlement test reads membership and scope projection as two
+  planes, not one atomic fact: a nested driver already inside its first
+  poll when its ancestor publishes terminal membership still reaches
+  `begin_incarnation`, so a wait can settle a hair before that epoch
+  becomes visible. The window is sanctioned rather than closed — the
+  incarnation publishes `Starting` from `begin_incarnation`, superseding
+  the stale `Unstarted`/`Stopped` projection under the same observation
+  gate *before* any of that incarnation's user code runs, and its epoch
+  owner still publishes the final `Stopped` projection — so the settled
+  call reports the state that held at its own resolution and the later
+  incarnation remains `wait_stopped()`'s and the snapshot's to report.
+  `wait_stopped()` is the membership-level await — the scope
   analogue of `TaskRef::wait()`: it rides restarts and resolves at
   membership terminality with the scope's terminal state
   (`Stopped { reason: NeverStarted }` for a scope membership that
@@ -3685,14 +3783,16 @@ enums are non-exhaustive.
 - `shutdown(self, timeout) -> Result<(), ShutdownTimeout>` — `Ok` iff
   every descendant stopped within the cooperative phase;
   `ShutdownTimeout` is §7's structured straggler report (child-id
-  paths with membership tokens). Fully joined on return either way
-  (§11).
+  paths with membership tokens). The root driver is joined on return either
+  way; recursive joining is subject to §11's hard-abort fallback boundary.
 - `wait(self) -> StopReason` — infallible; `StopReason` is B.6's
   `Stopped { reason }` payload (`IntensityTripped` and `StartupFailed`
   carrying their structured data).
 - `shutdown_and_wait(&self, timeout) -> Result<(), ShutdownTimeout>` —
   the owner's `shutdown` shapes on the non-owning handle (semantics
-  above); an already-terminal scope resolves `Ok` immediately.
+  above); an already-terminal scope resolves `Ok` immediately only after any
+  live incarnation has finished its scope epilogue. Descendant joining is
+  subject to §11's hard-abort fallback boundary.
 - `wait_stopped(&self) -> StopReason` — the membership's terminal
   reason, `NeverStarted` included (§3.2).
 

@@ -602,6 +602,13 @@ impl ScopeEpochs {
             current,
             last_stopped,
         };
+        // A shutdown wait settles on `finished(target)`, so a freshly minted
+        // epoch must not already read as finished — that would settle a wait
+        // against the incarnation it just started.
+        debug_assert!(
+            !self.finished(current),
+            "a freshly minted epoch is not already finished"
+        );
         Some(current)
     }
 
@@ -635,6 +642,14 @@ impl ScopeEpochs {
                 *self = Self::Idle {
                     last_stopped: last_stopped.max(Some(epoch)),
                 };
+                // Settlement is monotone: once an owner finishes its epoch,
+                // every later `finished(epoch)` — including one asked across a
+                // subsequent incarnation — keeps reporting it. A waiter that
+                // missed the pulse can therefore never park forever.
+                debug_assert!(
+                    self.finished(epoch),
+                    "a finished epoch stays observably finished"
+                );
                 true
             }
             Self::Idle { .. } | Self::Live { .. } | Self::Exhausted { .. } => false,
@@ -665,28 +680,6 @@ enum StartupPhase {
     Pending,
     Complete,
     Failed,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum DrainReasonPrecedence {
-    Finished,
-    IntensityTripped,
-    StartupFailed,
-    ShutdownRequested,
-}
-
-impl DrainReasonPrecedence {
-    fn of(reason: &StopReason) -> Self {
-        match reason {
-            StopReason::Finished => Self::Finished,
-            StopReason::IntensityTripped(_) => Self::IntensityTripped,
-            StopReason::StartupFailed(_) => Self::StartupFailed,
-            StopReason::ShutdownRequested => Self::ShutdownRequested,
-            StopReason::NeverStarted => {
-                unreachable!("NeverStarted is not a live-incarnation drain reason")
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -809,16 +802,23 @@ impl ScopeLifecycle {
 
     /// Begins draining or monotonically upgrades an in-progress drain.
     ///
-    /// The returned effect exists only for the initial transition: upgrades
-    /// change the eventual verdict without repeating teardown side effects.
+    /// Upgrades join through `StopPrecedence`, the same lattice the stopped
+    /// publisher uses, so a drain verdict and a published verdict can never
+    /// resolve competing reasons in opposite directions. The returned effect
+    /// exists only for the initial transition: upgrades change the eventual
+    /// verdict without repeating teardown side effects.
     pub(crate) fn begin_drain(&mut self, reason: StopReason) -> Option<DrainEffect> {
-        let incoming_precedence = DrainReasonPrecedence::of(&reason);
+        debug_assert!(
+            !matches!(reason, StopReason::NeverStarted),
+            "NeverStarted is not a live-incarnation drain reason"
+        );
+        let incoming_precedence = reason.precedence();
         let startup = match &mut self.state {
             ScopeLifecycleState::Starting => StartupPhase::Pending,
             ScopeLifecycleState::Running => StartupPhase::Complete,
             ScopeLifecycleState::StartupFailed => StartupPhase::Failed,
             ScopeLifecycleState::Draining(drain) => {
-                if incoming_precedence > DrainReasonPrecedence::of(&drain.reason) {
+                if incoming_precedence > drain.reason.precedence() {
                     drain.reason = reason;
                 }
                 return None;

@@ -1265,6 +1265,14 @@ mod tests {
         );
     }
 
+    /// Pins the observable behaviour of a charge dated before one already in
+    /// the window; it cannot discriminate `charge`'s `checked_duration_since`
+    /// from the saturating `duration_since`. That guard is defence in depth:
+    /// the saturating form yields `Duration::ZERO` for a regressed clock, and
+    /// `Intensity::validate` rejects a zero `within`, so `ZERO > within` is
+    /// already false for every constructible policy. Replacing the checked
+    /// call with the saturating one leaves this assertion — and the rest of
+    /// the suite — green.
     #[test]
     fn intensity_clock_regression_retains_future_charges() {
         let start = Instant::now();
@@ -1280,7 +1288,7 @@ mod tests {
         let regressed = state.charge(policy, start);
         assert_eq!(
             regressed.in_window, 2,
-            "a regressed clock cannot age a charge from the apparent future"
+            "a charge from the apparent future stays in the window"
         );
         assert_eq!(regressed.total_restarts, TotalRestarts::ZERO.bump().bump());
     }

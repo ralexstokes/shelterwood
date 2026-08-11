@@ -196,8 +196,13 @@ pub(crate) struct MemberCell {
     observation_gate: RwLock<ObservationGate>,
     terminal_disposal_pending: AtomicBool,
     mailbox: Mutex<MemberMailbox>,
-    // Lowering resolves this before the member enters resident projection;
-    // snapshots treat a missing value as an internal admission-order bug.
+    // Lowering resolves this before residency in both production routes:
+    // `ChildPlan::with_options` runs ahead of the planned
+    // `set_admitted_children` and ahead of the dynamic `admit_child_locked`.
+    // The enforcement point is snapshot construction rather than admission —
+    // that is the only read, and admitting an unresolved member is a useful
+    // fixture shape — so a missing value surfaces there as an internal
+    // admission-order bug.
     options: OnceLock<ResolvedCommonOptions>,
     pub(crate) removal: Latch,
 }

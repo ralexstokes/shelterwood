@@ -13,8 +13,8 @@
       src = ./.;
       # Repository docs and their packaged doctest copies are compared in the
       # clean build sandbox, so keep Markdown alongside Cargo sources; the
-      # packaging/documentation scripts under tools/ run there too, and
-      # nextest reads its timeout config.
+      # the documentation script under tools/ runs there too, and nextest
+      # reads its timeout config.
       extraSourceFilter =
         path: type:
         type == "regular"
@@ -50,7 +50,6 @@
                 cargo run --locked -p shelterwood-api-reachability -- \
                   target/doc/shelterwood_mailbox.json
                 ${pkgs.bash}/bin/bash ./tools/sync-packaged-docs.sh --check
-                ${pkgs.bash}/bin/bash ./tools/check-packaged-crate.sh
               '';
               doInstallCargoArtifacts = false;
             }

@@ -31,7 +31,7 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
         .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.config.intensity)
+        .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .build();
@@ -104,7 +104,7 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
         .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.config.intensity)
+        .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .build();
@@ -179,7 +179,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
     let keys = children.keys().collect::<Vec<_>>();
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
         .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.config.intensity)
+        .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .build();
@@ -294,7 +294,7 @@ fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
     }
     let mut scope = ScopeRuntimeBuilder::new(root, epoch, events, disposal_events)
         .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.config.intensity)
+        .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .with_hard_forced(true)

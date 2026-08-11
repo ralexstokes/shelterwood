@@ -16,10 +16,10 @@ use crate::{
     ActorRef, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
     cancellation::{CancellationToken, ParentCancellationToken},
-    cells::{MailboxControl, MemberCell},
+    cells::MemberCell,
     definition::DefinitionSource,
     identity::PoisonedCounter,
-    mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
+    mailbox::{AcceptedSequence, MailboxCell, MailboxControl, MailboxReceiver},
     policy::{ChildMode, CommonOptions},
     runtime::{
         self, ActorWork, CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, Signal,
@@ -1385,7 +1385,7 @@ impl<M: Send + 'static> RawContext<M> {
         let token = self.shutdown.child(cancellation.clone());
         let work = runtime::spawn_blocking_work(move || operation(token));
         Blocking {
-            future: Box::pin(async move { work.join().await }),
+            future: Box::pin(work),
             cancellation,
             completed: false,
         }
@@ -1908,10 +1908,10 @@ impl<R: RawActor> RawOnceDef<R> {
     }
 }
 
-pub(crate) type RawFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
+type RawFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
 type RawFactory = Arc<dyn Fn() -> Box<dyn ErasedRawInstance> + Send + Sync + 'static>;
 
-pub(crate) trait ErasedRawInstance: Send {
+trait ErasedRawInstance: Send {
     fn run(self: Box<Self>, context: RawRunContext, readiness: Readiness) -> RawFuture;
 }
 
@@ -2034,12 +2034,20 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
 }
 
 pub(crate) struct RawConstruction {
-    pub(crate) source: DefinitionSource<RawFactory, Box<dyn ErasedRawInstance>>,
-    pub(crate) options: CommonOptions,
-    pub(crate) readiness: Readiness,
+    source: DefinitionSource<RawFactory, Box<dyn ErasedRawInstance>>,
+    options: CommonOptions,
+    readiness: Readiness,
 }
 
 impl RawConstruction {
+    pub(crate) fn options(&self) -> &CommonOptions {
+        &self.options
+    }
+
+    pub(crate) fn readiness(&self) -> Readiness {
+        self.readiness
+    }
+
     pub(crate) fn mode(&self) -> ChildMode {
         if self.source.is_one_shot() {
             ChildMode::OneShot
@@ -2054,28 +2062,40 @@ impl RawConstruction {
 
     pub(crate) fn take_spawn(&mut self) -> RawSpawn {
         if let Some(factory) = self.source.restartable() {
-            RawSpawn::Restartable(Arc::clone(factory))
+            RawSpawn(RawSpawnKind::Restartable(Arc::clone(factory)))
         } else {
-            RawSpawn::OneShot(
-                self.source
-                    .take_one_shot()
-                    .expect("one-shot raw actor construction invoked more than once"),
-            )
+            RawSpawn(RawSpawnKind::OneShot(self.source.take_one_shot().expect(
+                "one-shot raw actor construction invoked more than once",
+            )))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_policy_test(options: CommonOptions, readiness: Readiness) -> Self {
+        Self {
+            source: DefinitionSource::Restartable(Arc::new(|| {
+                unreachable!("policy resolution never constructs the actor")
+            })),
+            options,
+            readiness,
         }
     }
 }
 
-pub(crate) enum RawSpawn {
+pub(crate) struct RawSpawn(RawSpawnKind);
+
+enum RawSpawnKind {
     Restartable(RawFactory),
     OneShot(Box<dyn ErasedRawInstance>),
 }
 
 impl RawSpawn {
-    pub(crate) fn construct(self) -> Box<dyn ErasedRawInstance> {
-        match self {
-            Self::Restartable(factory) => factory(),
-            Self::OneShot(instance) => instance,
-        }
+    pub(crate) async fn run(self, context: RawRunContext, readiness: Readiness) -> ExitResult {
+        let instance = match self.0 {
+            RawSpawnKind::Restartable(factory) => factory(),
+            RawSpawnKind::OneShot(instance) => instance,
+        };
+        instance.run(context, readiness).await
     }
 }
 
@@ -2112,9 +2132,9 @@ mod tests {
     };
     use crate::{
         ChildId, MailboxShutdown, Readiness,
-        cells::{MailboxControl, MemberCell, ScopeCell},
+        cells::{MemberCell, ScopeCell},
         identity::ScopeIdentity,
-        mailbox::{ActorRef, MailboxCell},
+        mailbox::{ActorRef, MailboxCell, MailboxControl},
         policy::{ResolvedDefaults, ScopeFlavor},
         runtime::{
             CompletionGatedLatch, Latch, PanicPayload, Signal, UnwindPanics,

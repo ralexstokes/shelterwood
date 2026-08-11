@@ -116,7 +116,7 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
         .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.config.intensity)
+        .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .with_next_ordered_start(Some(key))
@@ -222,7 +222,7 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
         .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.config.intensity)
+        .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
         .with_next_ordered_start(Some(key))
         .build();
@@ -320,7 +320,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
         .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.config.intensity)
+        .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
         .with_next_ordered_start(Some(key))
         .build();

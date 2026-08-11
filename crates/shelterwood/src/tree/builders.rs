@@ -65,13 +65,13 @@ macro_rules! impl_common_builder_surface {
     (@methods $member_note:literal) => {
         /// Sets the scope restart-intensity budget.
         pub fn intensity(&mut self, intensity: Intensity) -> &mut Self {
-            self.core.config.intensity = intensity;
+            self.core.set_intensity(intensity);
             self
         }
 
         /// Sets child policy defaults for this scope.
         pub fn defaults(&mut self, defaults: ScopeDefaults) -> &mut Self {
-            self.core.config.defaults = defaults;
+            self.core.set_defaults(defaults);
             self
         }
 
@@ -221,7 +221,7 @@ impl fmt::Debug for Tree {
         formatter
             .debug_struct("Tree")
             .field("children", &self.core.slots.len())
-            .field("config", &self.core.config)
+            .field("config", &self.core.config_debug())
             .finish_non_exhaustive()
     }
 }
@@ -243,7 +243,7 @@ impl Tree {
 
     /// Sets the ordered scope's fate-sharing strategy.
     pub fn strategy(&mut self, strategy: Strategy) -> &mut Self {
-        self.core.config.strategy = strategy;
+        self.core.set_strategy(strategy);
         self
     }
 
@@ -263,7 +263,7 @@ impl fmt::Debug for DynamicTree {
         formatter
             .debug_struct("DynamicTree")
             .field("children", &self.core.slots.len())
-            .field("config", &self.core.config)
+            .field("config", &self.core.config_debug())
             .finish_non_exhaustive()
     }
 }

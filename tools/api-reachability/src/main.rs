@@ -8,7 +8,7 @@ use std::{
 
 use serde_json::Value;
 
-const FORBIDDEN_ROOTS: &[&str] = &["tokio", "tokio_util"];
+const FORBIDDEN_ROOTS: &[&str] = &["fastrand", "tokio", "tokio_util"];
 const SUPPORTED_FORMAT_VERSION: u64 = 61;
 
 fn main() -> Result<(), Box<dyn Error>> {

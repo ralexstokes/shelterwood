@@ -166,13 +166,11 @@ impl ScopeRuntime {
         // later exits are still terminalized, but cannot republish the scope
         // transition or replace the authoritative cause.
         let child = &self.children[key];
-        let failure = StartupFailure {
-            cause: StartupFailureCause::Child {
-                id: child.slot.member.id().clone(),
-                membership: child.slot.member.membership(),
-                exit,
-            },
-        };
+        let failure = StartupFailure::framework(StartupFailureCause::Child {
+            id: child.slot.member.id().clone(),
+            membership: child.slot.member.membership(),
+            exit,
+        });
         let Some(state) = self.lifecycle.fail_startup() else {
             return;
         };

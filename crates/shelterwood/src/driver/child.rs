@@ -13,11 +13,11 @@ struct ReportCompletion {
     readiness: CompletionGatedLatch,
 }
 
-pub(crate) struct ReportToken {
+pub(super) struct ReportToken {
     completion: Obligation<ReportCompletion>,
 }
 
-pub(crate) struct ReportClaim(Arc<OnceLock<RecordedReport>>);
+pub(super) struct ReportClaim(Arc<OnceLock<RecordedReport>>);
 
 /// Couples the child task's outcome report to its join verdict without an
 /// asynchronous handoff race.
@@ -31,7 +31,7 @@ pub(crate) struct ReportClaim(Arc<OnceLock<RecordedReport>>);
 /// and cancellation edge. The shutdown/local-stop and readiness latches are
 /// sampled by that same initialization, making the report and its
 /// completion-boundary evidence one ordered observation.
-pub(crate) fn report_slot(
+pub(super) fn report_slot(
     shutdown: Latch,
     local_stop: Option<Latch>,
     readiness: CompletionGatedLatch,
@@ -74,7 +74,7 @@ impl ReportCompletion {
 }
 
 impl ReportToken {
-    pub(crate) fn record(mut self, outcome: RecordedOutcome) {
+    pub(super) fn record(mut self, outcome: RecordedOutcome) {
         self.completion
             .complete(|completion| completion.fill(Some(outcome)));
     }
@@ -456,10 +456,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                     spawn,
                     context,
                     readiness,
-                } => {
-                    let instance = spawn.construct();
-                    instance.run(context, readiness).await
-                }
+                } => spawn.run(context, readiness).await,
                 SpawnBody::TaskRestartable { factory, context } => factory(context).await,
                 SpawnBody::TaskOnce { body, context } => body(context).await,
                 SpawnBody::ScopeRestartable {
@@ -643,8 +640,7 @@ impl ScopeRuntime {
         let mut readiness = ReadinessGate::new();
         let deadline = child
             .options
-            .readiness_deadline
-            .duration()
+            .readiness_deadline()
             .and_then(|duration| Deadline::after(now, duration).instant());
         let readiness_effect = readiness.step(ReadinessEvent::Configure {
             readiness: declared_readiness,
@@ -940,14 +936,14 @@ impl ScopeRuntime {
                 );
                 self.root.publish_child_restart(
                     &child.slot.member,
-                    decision.charge.total_restarts,
+                    decision.total_restarts(),
                     MemberTransition::RestartScheduled {
                         exit: exit.clone(),
-                        restart_count: decision.restart_count,
+                        restart_count: decision.restart_count(),
                         // Publish the derived schedule even when intensity prevents spawning it.
                         // `None` means the exact clock point cannot be represented and armed; no
                         // substitute restart is scheduled.
-                        restart_at: decision.restart_at,
+                        restart_at: decision.restart_at(),
                     },
                     LifecycleEventKind::Exited {
                         id: child.slot.member.id().clone(),
@@ -958,12 +954,11 @@ impl ScopeRuntime {
                     LifecycleEventKind::RestartScheduled {
                         id: child.slot.member.id().clone(),
                         membership: child.slot.member.membership(),
-                        attempt: decision.attempt,
-                        delay: decision.delay,
+                        attempt: decision.attempt(),
+                        delay: decision.delay(),
                     },
                 );
-                if decision.charge.tripped {
-                    let trip = IntensityTrip::new(self.intensity_policy, decision.charge);
+                if let Some(trip) = decision.intensity_trip(self.intensity_policy) {
                     if self.lifecycle.is_starting() {
                         self.begin_drain_with_startup(
                             StopReason::IntensityTripped(trip.clone()),
@@ -973,7 +968,7 @@ impl ScopeRuntime {
                         self.begin_drain(StopReason::IntensityTripped(trip));
                     }
                 } else {
-                    if let Some(restart_at) = decision.restart_at {
+                    if let Some(restart_at) = decision.restart_at() {
                         child.restart_deadline = Some(
                             self.deadlines
                                 .push(restart_at, DeadlineKind::Restart { child: key }),

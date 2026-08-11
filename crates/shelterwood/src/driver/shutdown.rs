@@ -97,10 +97,10 @@ impl ScopeRuntime {
             return;
         };
         if let Some(startup) = startup {
-            self.root.set_state_and_startup(effect.state, startup);
+            self.root.set_state_and_startup(effect.state(), startup);
         } else {
-            debug_assert!(!effect.startup_pending);
-            self.root.set_state(effect.state);
+            debug_assert!(!effect.startup_pending());
+            self.root.set_state(effect.state());
         }
         match self.root.flavor {
             ScopeFlavor::Ordered => {

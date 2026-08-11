@@ -28,12 +28,12 @@ use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
 
 use crate::{
-    Cancellation, ChildId, Exit, GracePhase, Incarnation, IntensityTrip, JitterSample, Membership,
-    Readiness, ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    Cancellation, ChildId, Exit, GracePhase, Incarnation, JitterSample, Membership, Readiness,
+    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
-        MailboxControl, MemberStage, MemberTransition, ResidentProjection, ScopeCell,
-        ScopeControlEvent, StartupDisposition,
+        MemberStage, MemberTransition, ResidentProjection, ScopeCell, ScopeControlEvent,
+        StartupDisposition,
     },
     deadline::Deadline,
     engine::{
@@ -47,6 +47,7 @@ use crate::{
         reconcile_recorded_outcomes,
     },
     identity::IncarnationCounter,
+    mailbox::MailboxControl,
     observe::LifecycleEventKind,
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
@@ -543,11 +544,9 @@ async fn run_nested_factory(
 
 fn begin_nested_incarnation(scope: &Arc<ScopeCell>) -> Result<ScopeEpochGuard, crate::ExitError> {
     ScopeEpochGuard::begin(scope).ok_or_else(|| {
-        let failure = StartupFailure {
-            cause: StartupFailureCause::IdentityExhausted {
-                id: scope.member.id().clone(),
-            },
-        };
+        let failure = StartupFailure::framework(StartupFailureCause::IdentityExhausted {
+            id: scope.member.id().clone(),
+        });
         scope.set_startup(Err(StartupError::StartupFailed(failure.clone())));
         crate::ExitError::from_startup_failure(failure)
     })
@@ -576,7 +575,7 @@ async fn run_nested_tree_with_epoch(
             // they finish; hard-aborting the incarnation still detaches the
             // cancellation-safe disposal jobs.
             disposal.fired().await;
-            let failure = StartupFailure { cause };
+            let failure = StartupFailure::framework(cause);
             // A lowering failure occurs before the driver loop exists, but it
             // still belongs to a live incarnation. Resolve every stop source
             // through the same monotone verdict lattice as the loop path.
@@ -618,6 +617,7 @@ async fn run_nested_tree_with_epoch(
                 | StopReason::NeverStarted => {
                     unreachable!("lowering resolves only failure or shutdown verdicts")
                 }
+                _ => unreachable!("the linked core exposes a known stop-reason set"),
             };
             scope.set_startup(startup);
             epoch.finish(reason.clone());
@@ -713,7 +713,7 @@ async fn run_scope_incarnation(
     let mut scope = ScopeRuntime {
         root: Arc::clone(&root),
         defaults: plan.defaults.clone(),
-        intensity_policy: plan.config.intensity,
+        intensity_policy: plan.intensity_policy(),
         intensity: IntensityState::default(),
         children,
         child_keys,
@@ -862,7 +862,7 @@ async fn run_scope_incarnation(
                 },
                 &mut event_receiver,
                 dynamic_event_receiver.as_mut(),
-                scope.deadlines.next(),
+                scope.deadlines.next_deadline(),
             )
             .await
             {

@@ -13,9 +13,19 @@ use shelterwood::{
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+// Every real-clock bound in the control-plane test below is the suite's one
+// `POLL_TIMEOUT`: observation waits, the in-actor call and offload deadlines
+// its fixtures use, and the closing stop grace alike. None of them is a
+// property under test — each covers a step an idle machine reaches
+// immediately, so the bound exists only to fail with a diagnostic instead of
+// hanging. A machine loaded enough to stretch one stretches all of them, so a
+// tighter bound anywhere only relocates the flake rather than removing it.
+// The idle-eviction test further down runs on `start_paused` and keeps its
+// virtual durations, which are load-bearing rather than defensive.
+
 async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
     loop {
-        let item = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        let item = tokio::time::timeout(POLL_TIMEOUT, events.recv())
             .await
             .expect("lifecycle wait is bounded")
             .expect("lifecycle stream remains open");
@@ -69,7 +79,7 @@ impl Actor for IngressActor {
                             id,
                             reply: journal_reply,
                         },
-                        Duration::from_secs(1),
+                        POLL_TIMEOUT,
                     )
                     .await
                     .map_err(|error| {
@@ -306,11 +316,7 @@ impl Actor for ToolActor {
             }
             ToolMessage::Work => {
                 context
-                    .offload(
-                        async { 7_u64 },
-                        ToolMessage::Completed,
-                        Duration::from_secs(1),
-                    )
+                    .offload(async { 7_u64 }, ToolMessage::Completed, POLL_TIMEOUT)
                     .expect("live tool accepts incarnation-owned offload");
             }
             ToolMessage::Completed(Ok(7)) => {
@@ -427,10 +433,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     system.wait_started().await.expect("control plane starts");
     gateway
         .bridge
-        .call(
-            |reply| BridgeMessage::Begin { reply },
-            Duration::from_secs(1),
-        )
+        .call(|reply| BridgeMessage::Begin { reply }, POLL_TIMEOUT)
         .await
         .expect("bridge holds and later acknowledges a Reply");
 
@@ -466,7 +469,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .wait_for_child(
             "session",
             |child| matches!(child.state, ChildState::Running),
-            Duration::from_secs(1),
+            POLL_TIMEOUT,
         )
         .await
         .expect("session aggregate readiness completes");
@@ -539,7 +542,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .wait_for_child(
             "temporary-tool",
             |child| matches!(child.state, ChildState::Running),
-            Duration::from_secs(1),
+            POLL_TIMEOUT,
         )
         .await
         .expect("tool becomes ready");
@@ -580,7 +583,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     // One budget for the whole logical redelivery, not a per-attempt constant
     // alongside it: every attempt's own acceptance deadline is whatever the
     // shared budget has left (§3.3 step 1).
-    let delivery_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let delivery_deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
     let first_delivery = gateway
         .ingress
         .call(
@@ -617,6 +620,10 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .expect("running replacement has an incarnation");
     assert!(replacement_incarnation.supersedes(accepting_incarnation));
     let remaining = delivery_deadline.saturating_duration_since(tokio::time::Instant::now());
+    // An exhausted budget short-circuits the retry into `AcceptanceTimedOut`
+    // (`Deadlined` never attempts a zero-duration operation), so without this
+    // the failure would surface below as "redelivery is not acknowledged" and
+    // name the wrong cause.
     assert!(
         !remaining.is_zero(),
         "one overall redelivery budget remains"
@@ -633,7 +640,6 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .await
         .expect("redelivery of the same journal id is acknowledged");
     assert_eq!(acknowledgement.incarnation, replacement_incarnation);
-    assert!(tokio::time::Instant::now() <= delivery_deadline);
     assert_eq!(
         gateway.processed.try_recv().ok(),
         Some(DELIVERY_ID),
@@ -690,7 +696,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .wait_for_child(
             "session",
             |child| matches!(child.state, ChildState::Running),
-            Duration::from_secs(1),
+            POLL_TIMEOUT,
         )
         .await
         .expect("replacement session becomes ready");
@@ -711,7 +717,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         gateway_scope.membership()
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(POLL_TIMEOUT)
         .await
         .expect("staged control-plane shutdown completes");
 }

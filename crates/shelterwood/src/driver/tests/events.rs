@@ -139,7 +139,7 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     scope.handle_admission(request);
     assert!(matches!(response.try_receive(), Some(Ok(()))));
 
-    let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+    let exit = match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, event_receiver.recv()).await {
         crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
             child,
             incarnation,
@@ -204,12 +204,12 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
         "the restart deadline arm rechecks level-triggered stop sources"
     );
 
-    let forwarded =
-        match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
-            crate::runtime::Timeout::Completed(Some(event)) => event,
-            crate::runtime::Timeout::Completed(None) => panic!("the driver lane remains open"),
-            crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
-        };
+    let forwarded = match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, event_receiver.recv()).await
+    {
+        crate::runtime::Timeout::Completed(Some(event)) => event,
+        crate::runtime::Timeout::Completed(None) => panic!("the driver lane remains open"),
+        crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
+    };
     let DriverEvent::Removal(removal) = forwarded else {
         panic!("the queued event is the fused removal");
     };
@@ -227,7 +227,14 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
 
 #[crate::runtime::test]
 async fn queued_admissions_yield_to_shutdown_without_forwarder_tasks() {
-    const ADMISSIONS: usize = super::super::MIN_EVENT_BATCH_LIMIT * 8 + 1;
+    // The backlog is sized in whole batches because the ordering asserted
+    // below is only observable while it lasts: the driver yields once per
+    // batch, and each yield is a window in which the cancelled task can run
+    // and publish its exit. One batch would make the assertion a coin flip on
+    // whether that task happens to be scheduled in the single window; a
+    // starved machine can miss many consecutive windows, so the count buys
+    // margin rather than certainty.
+    const ADMISSIONS: usize = super::super::MIN_EVENT_BATCH_LIMIT * 64 + 1;
 
     let release_holder = Latch::default();
     let mut tree = DynamicTree::new();
@@ -283,7 +290,7 @@ async fn queued_admissions_yield_to_shutdown_without_forwarder_tasks() {
     // Latch shutdown without yielding to the already-woken driver. Its first
     // batch begins draining and rejects one control prefix; the full-batch
     // yield must then let `exiting` run and publish its primary-lane exit.
-    let mut shutdown = Box::pin(scope.shutdown_and_wait(Duration::from_secs(2)));
+    let mut shutdown = Box::pin(scope.shutdown_and_wait(DRIVER_PROGRESS_WAIT));
     assert!(
         shutdown
             .as_mut()
@@ -291,20 +298,42 @@ async fn queued_admissions_yield_to_shutdown_without_forwarder_tasks() {
             .is_pending(),
         "shutdown waits for both declared children"
     );
-    assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(1), exiting.wait()).await,
-        crate::runtime::Timeout::Completed(_)
-    ));
-    assert!(
-        Pin::new(admissions.last_mut().expect("an admission exists"))
+    // Step the runtime rather than awaiting a timer for the exit. A timed
+    // await hands the driver every turn it wants before this task is
+    // rescheduled, and on a loaded machine the whole control suffix can drain
+    // inside that one window. Yielding samples once per scheduler turn
+    // instead, and the suffix is read in the same synchronous step that sees
+    // the exit — no await between the two polls — so the pair is one
+    // consistent snapshot rather than two readings of a moving target.
+    let mut exit = Box::pin(exiting.wait());
+    let give_up = crate::runtime::now() + DRIVER_PROGRESS_WAIT;
+    let suffix_pending = loop {
+        let exited = exit
+            .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
-            .is_pending(),
+            .is_ready();
+        let suffix_pending = Pin::new(admissions.last_mut().expect("an admission exists"))
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending();
+        if exited {
+            break suffix_pending;
+        }
+        // Wall clock appears only as the hang backstop, never as the sampling
+        // interval: the loop still samples once per scheduler turn.
+        assert!(
+            crate::runtime::now() < give_up,
+            "the cancelled task publishes its exit"
+        );
+        crate::runtime::yield_now().await;
+    };
+    assert!(
+        suffix_pending,
         "the primary exit is handled before the control suffix is drained"
     );
 
     release_holder.fire();
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(1), shutdown.as_mut()).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, shutdown.as_mut()).await,
         crate::runtime::Timeout::Completed(Ok(()))
     ));
     drop(shutdown);
@@ -318,7 +347,7 @@ async fn queued_admissions_yield_to_shutdown_without_forwarder_tasks() {
     let tail = admissions.pop().expect("the backlog has a tail");
     let head = admissions.swap_remove(0);
     for (position, admission) in [("head", head), ("tail", tail)] {
-        let outcome = match crate::runtime::timeout(Duration::from_secs(2), admission).await {
+        let outcome = match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, admission).await {
             crate::runtime::Timeout::Completed(outcome) => outcome,
             crate::runtime::Timeout::Elapsed => {
                 panic!("the {position}-of-queue admission obligation completes at teardown")

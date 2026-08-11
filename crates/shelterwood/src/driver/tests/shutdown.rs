@@ -108,8 +108,7 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
         .with_children(children)
         .with_lifecycle(ScopeLifecycle::running())
         .build();
-    plan.armed = false;
-    drop(plan);
+    plan.take_for_runtime().finish_transfer();
 
     scope.spawn_child(key);
     let active = scope.children[key]

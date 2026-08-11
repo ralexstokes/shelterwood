@@ -204,8 +204,7 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
         .with_children(children)
         .with_next_ordered_start(Some(first))
         .build();
-    plan.armed = false;
-    drop(plan);
+    plan.take_for_runtime().finish_transfer();
 
     // Ordered startup spawns "a" and parks on its (never-fired) readiness.
     scope.progress_startup();
@@ -555,8 +554,7 @@ async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
         .with_lifecycle(ScopeLifecycle::running())
         .with_next_ordered_start(next_ordered_start)
         .build();
-    plan.armed = false;
-    drop(plan);
+    plan.take_for_runtime().finish_transfer();
 
     let target = scope.children[nested]
         .slot

@@ -667,28 +667,6 @@ enum StartupPhase {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum DrainReasonPrecedence {
-    Finished,
-    IntensityTripped,
-    StartupFailed,
-    ShutdownRequested,
-}
-
-impl DrainReasonPrecedence {
-    fn of(reason: &StopReason) -> Self {
-        match reason {
-            StopReason::Finished => Self::Finished,
-            StopReason::IntensityTripped(_) => Self::IntensityTripped,
-            StopReason::StartupFailed(_) => Self::StartupFailed,
-            StopReason::ShutdownRequested => Self::ShutdownRequested,
-            StopReason::NeverStarted => {
-                unreachable!("NeverStarted is not a live-incarnation drain reason")
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScopeDrain {
     reason: StopReason,
@@ -809,16 +787,23 @@ impl ScopeLifecycle {
 
     /// Begins draining or monotonically upgrades an in-progress drain.
     ///
-    /// The returned effect exists only for the initial transition: upgrades
-    /// change the eventual verdict without repeating teardown side effects.
+    /// Upgrades join through `StopPrecedence`, the same lattice the stopped
+    /// publisher uses, so a drain verdict and a published verdict can never
+    /// resolve competing reasons in opposite directions. The returned effect
+    /// exists only for the initial transition: upgrades change the eventual
+    /// verdict without repeating teardown side effects.
     pub(crate) fn begin_drain(&mut self, reason: StopReason) -> Option<DrainEffect> {
-        let incoming_precedence = DrainReasonPrecedence::of(&reason);
+        debug_assert!(
+            !matches!(reason, StopReason::NeverStarted),
+            "NeverStarted is not a live-incarnation drain reason"
+        );
+        let incoming_precedence = reason.precedence();
         let startup = match &mut self.state {
             ScopeLifecycleState::Starting => StartupPhase::Pending,
             ScopeLifecycleState::Running => StartupPhase::Complete,
             ScopeLifecycleState::StartupFailed => StartupPhase::Failed,
             ScopeLifecycleState::Draining(drain) => {
-                if incoming_precedence > DrainReasonPrecedence::of(&drain.reason) {
+                if incoming_precedence > drain.reason.precedence() {
                     drain.reason = reason;
                 }
                 return None;

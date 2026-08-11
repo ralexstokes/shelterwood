@@ -152,7 +152,9 @@ impl BackoffFactor {
         Ok(factor)
     }
 
-    fn get(self) -> f64 {
+    /// Returns the validated multiplier.
+    #[must_use]
+    pub const fn get(self) -> f64 {
         self.0
     }
 
@@ -187,9 +189,12 @@ impl std::hash::Hash for BackoffFactor {
 
 /// Delay policy for a scheduled restart.
 ///
-/// A fixed-backoff payload cannot be forged as a literal:
+/// A fixed-backoff payload cannot be forged as a literal. `E0451` records the
+/// privacy failure this proof depends on, and the payload types are kept
+/// nameable by a companion test, so a rename cannot make the fence pass
+/// vacuously:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use std::time::Duration;
 /// use shelterwood::{Backoff, FixedBackoff, Jitter};
 ///
@@ -201,7 +206,7 @@ impl std::hash::Hash for BackoffFactor {
 ///
 /// An exponential-backoff payload is sealed independently:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use std::time::Duration;
 /// use shelterwood::{Backoff, BackoffFactor, ExponentialBackoff, Jitter};
 ///
@@ -294,6 +299,12 @@ impl Backoff {
     }
 
     /// Constructs a validated exponential backoff.
+    ///
+    /// Only [`PolicyError::ZeroDuration`] and
+    /// [`PolicyError::BackoffMaximumBeforeBase`] are reachable here: the
+    /// multiplier carries its own invariant, so
+    /// [`PolicyError::InvalidBackoffFactor`] is spent at
+    /// [`BackoffFactor::new`] before this call can be written.
     pub fn exponential(
         base: Duration,
         factor: BackoffFactor,
@@ -303,7 +314,6 @@ impl Backoff {
         if base.is_zero() || max.is_zero() {
             return Err(PolicyError::ZeroDuration);
         }
-        factor.validate()?;
         if max < base {
             return Err(PolicyError::BackoffMaximumBeforeBase);
         }
@@ -492,9 +502,10 @@ pub enum ReadinessDeadline {
 
 /// Validated non-zero payload of a bounded [`ReadinessDeadline`].
 ///
-/// Values are created by [`ReadinessDeadline::bounded`].
+/// Values are created by [`ReadinessDeadline::bounded`]. `E0423` records the
+/// privacy failure this proof depends on:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0423
 /// use std::time::Duration;
 /// use shelterwood::{BoundedReadinessDeadline, ReadinessDeadline};
 ///
@@ -524,9 +535,10 @@ impl ReadinessDeadline {
 /// The scope-wide restart budget.
 ///
 /// Values are created by [`Intensity::new`], and cannot be forged with an
-/// invalid zero-length window.
+/// invalid zero-length window. `E0451` records the privacy failure this proof
+/// depends on:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use std::time::Duration;
 /// use shelterwood::Intensity;
 ///
@@ -537,9 +549,9 @@ impl ReadinessDeadline {
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Intensity {
-    /// Maximum restart charges allowed inside the rolling window.
+    // Maximum restart charges allowed inside the rolling window.
     max_restarts: u64,
-    /// The rolling-window duration.
+    // The rolling-window duration.
     within: Duration,
 }
 
@@ -570,10 +582,9 @@ impl Intensity {
 
 impl Default for Intensity {
     fn default() -> Self {
-        Self {
-            max_restarts: 5,
-            within: Duration::from_secs(30),
-        }
+        // The library default is minted through the validating constructor, so
+        // no in-crate literal can install a window the public API rejects.
+        Self::new(5, Duration::from_secs(30)).expect("the library default window is non-zero")
     }
 }
 
@@ -762,15 +773,21 @@ impl Default for ResolvedDefaults {
     fn default() -> Self {
         let queue_capacity = NonZeroUsize::new(DEFAULT_MAILBOX_CAPACITY)
             .expect("the library mailbox capacity is non-zero");
+        // The library deadline is minted through the validating constructor, so
+        // no in-crate literal can install a payload the public API rejects.
+        let ReadinessDeadline::Bounded(readiness_deadline) =
+            ReadinessDeadline::bounded(DEFAULT_READINESS_DEADLINE)
+                .expect("the library readiness deadline is non-zero")
+        else {
+            unreachable!("the bounded constructor returns the bounded variant")
+        };
         Self {
             child_restart: RestartPolicy::default(),
             child_shutdown: Shutdown::default(),
             mailbox: ResolvedMailbox::Queue(queue_capacity),
             queue_capacity,
             mailbox_shutdown: MailboxShutdown::default(),
-            readiness_deadline: ResolvedReadinessDeadline::Bounded(BoundedReadinessDeadline(
-                DEFAULT_READINESS_DEADLINE,
-            )),
+            readiness_deadline: ResolvedReadinessDeadline::Bounded(readiness_deadline),
         }
     }
 }
@@ -884,10 +901,7 @@ mod tests {
         );
         assert_eq!(
             Intensity::default(),
-            Intensity {
-                max_restarts: 5,
-                within: Duration::from_secs(30),
-            }
+            Intensity::new(5, Duration::from_secs(30)).expect("the default window is non-zero")
         );
 
         assert_eq!(tidy_abort_beat(Duration::ZERO), Duration::from_millis(1));

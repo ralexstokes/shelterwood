@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use shelterwood::{
-    Backoff, BackoffFactor, Intensity, Jitter, Mailbox, PolicyError, ReadinessDeadline,
+    Backoff, BackoffFactor, BoundedReadinessDeadline, ExponentialBackoff, FixedBackoff, Intensity,
+    Jitter, Mailbox, PolicyError, ReadinessDeadline,
 };
 
 #[test]
@@ -56,6 +57,11 @@ fn other_policy_constructors_reject_zero_values() {
     );
 }
 
+/// Every binding here is type-annotated on purpose. The sealing proofs in
+/// `policy.rs` are `compile_fail` fences, which pass for *any* compilation
+/// error; naming each payload type in a test that must compile keeps them
+/// exported and nameable, so the only failure those fences can be resting on
+/// is the private-field one they claim.
 #[test]
 fn sealed_payloads_expose_only_constructor_validated_values() {
     let fixed_delay = Duration::from_millis(10);
@@ -64,6 +70,7 @@ fn sealed_payloads_expose_only_constructor_validated_values() {
     else {
         panic!("fixed constructor returned another variant");
     };
+    let fixed: FixedBackoff = fixed;
     assert_eq!(fixed.delay(), fixed_delay);
     assert_eq!(fixed.jitter(), Jitter::Equal);
     assert!(!fixed.delay().is_zero());
@@ -77,8 +84,10 @@ fn sealed_payloads_expose_only_constructor_validated_values() {
     else {
         panic!("exponential constructor returned another variant");
     };
+    let exponential: ExponentialBackoff = exponential;
     assert_eq!(exponential.base(), base);
     assert_eq!(exponential.factor(), factor);
+    assert_eq!(exponential.factor().get(), 1.5);
     assert_eq!(exponential.max(), maximum);
     assert_eq!(exponential.jitter(), Jitter::None);
     assert!(!exponential.base().is_zero());
@@ -90,6 +99,7 @@ fn sealed_payloads_expose_only_constructor_validated_values() {
     else {
         panic!("bounded constructor returned another variant");
     };
+    let bounded: BoundedReadinessDeadline = bounded;
     assert_eq!(bounded.duration(), deadline);
     assert!(!bounded.duration().is_zero());
 

@@ -1096,6 +1096,10 @@ impl ScopeCell {
             if current.same_gate(gate) {
                 return;
             }
+            debug_assert!(
+                self.dynamic_route_in(txn).is_none(),
+                "a scope with a live dynamic route is never re-homed"
+            );
 
             #[cfg(test)]
             self.report_gate_capture(GateCapture::Adoption);
@@ -1138,7 +1142,10 @@ impl ScopeCell {
 
     /// Re-homes a resident subtree while its prior tree gate is held. The
     /// destination gate is also held, so observers cannot enter either tree
-    /// while the handoff is installed recursively.
+    /// while the handoff is installed recursively. Walking residents is
+    /// exhaustive here: a reserved dynamic slot requires the live route that
+    /// only a started driver installs, while gate adoption happens before
+    /// that driver can run, and no running scope is subsequently re-homed.
     fn adopt_descendant_observation_gates_locked(
         &self,
         previous: &ObservationGate,

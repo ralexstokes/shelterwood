@@ -383,6 +383,59 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
     );
 }
 
+#[crate::runtime::test]
+async fn removal_tolerates_synchronous_reclaim_from_the_stop_funnel() {
+    let (mut scope, _events, _dynamic_events, _disposal_events, control) =
+        running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    let (definition, resolved) = reservation
+        .slot
+        .resolve_and_take_defined(&scope.defaults)
+        .expect("the definition has not been claimed")
+        .expect("the slot is defined");
+    let plan =
+        crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
+    let mut child = ChildRuntime::from_plan(plan, &root);
+    child.initial = false;
+    // Model the latent restart-gap shape: there is no active incarnation and
+    // no retained construction, so a hard-force stop can terminalize and
+    // reclaim this Removing member synchronously from `begin_stop_child`.
+    drop(child.construction.take());
+    let key = root.with_observation_gate(|txn| {
+        let key = scope
+            .insert_child(child)
+            .unwrap_or_else(|_| panic!("the empty arena accepts its first child"));
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entries
+            .get_mut(member.id())
+            .expect("the reservation remains registered")
+            .promote(key, None, txn);
+        root.admit_child_locked(resident_projection(&reservation.slot), txn);
+        key
+    });
+    scope.hard_forced = true;
+
+    scope.handle_removal(RemovalRequest {
+        membership: member.membership(),
+        key,
+    });
+
+    assert!(
+        scope.children.get(key).is_none(),
+        "the stop funnel may reclaim the member before handle_removal returns"
+    );
+    assert!(root.snapshot().child("worker").is_none());
+}
+
 #[test]
 fn draining_cannot_publish_across_an_inflight_reservation_transaction() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);

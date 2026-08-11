@@ -954,7 +954,17 @@ impl<M> RawResources<M> {
     async fn join_offloads(&mut self) {
         for offload in &mut self.offloads {
             if let Some(task) = offload.task.take() {
-                task.join().await;
+                match task.join().await {
+                    runtime::JoinOutcome::Ok { value: () } | runtime::JoinOutcome::Cancelled => {}
+                    runtime::JoinOutcome::Panic { message } => {
+                        let message = message.unwrap_or_else(|| {
+                            "library-owned offload task panicked without a string payload"
+                                .to_owned()
+                        });
+                        tracing::error!(%message, "library-owned offload task panicked");
+                        self.panic.record(Box::new(message));
+                    }
+                }
             }
         }
         self.events.clear();
@@ -2314,6 +2324,30 @@ mod tests {
             "reclamation retains exactly the unfinished offloads"
         );
         assert!(!resources.offloads[0].finished.is_fired());
+    }
+
+    #[crate::runtime::test]
+    async fn joining_offloads_retains_a_framework_task_panic() {
+        let mut resources = RawResources::<()>::default();
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished: Latch::default(),
+            state: None,
+            task: Some(crate::runtime::spawn_actor_work(async {
+                panic!("unit framework offload panic");
+            })),
+        });
+
+        resources.join_offloads().await;
+
+        let payload = resources
+            .panic
+            .take()
+            .expect("the framework panic is retained for incarnation teardown");
+        assert_eq!(
+            panic_message(&payload),
+            Some("unit framework offload panic")
+        );
     }
 
     #[test]

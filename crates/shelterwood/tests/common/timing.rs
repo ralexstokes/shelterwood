@@ -37,7 +37,8 @@ pub(crate) async fn poll_until(
     .is_ok()
 }
 
-/// Asserts that a predicate remains false for a bounded quiet window.
+/// Asserts that a predicate is false at 1 ms samples across a bounded quiet
+/// window; it does not observe continuous truth between samples.
 pub(crate) async fn assert_quiet(duration: Duration, mut predicate: impl FnMut() -> bool) {
     const POLL_INTERVAL: Duration = Duration::from_millis(1);
 

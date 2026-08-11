@@ -98,18 +98,27 @@ async fn default_child_shutdown_grace_is_five_seconds() {
         .await
         .expect("immediate task readiness");
 
+    let shutdown_started = tokio::time::Instant::now();
     let mut shutdown = Box::pin(system.shutdown(Duration::from_secs(60)));
     assert_quiet(Duration::from_millis(50), || {
         poll_once(shutdown.as_mut()).is_ready()
     })
     .await;
-    advance_time(Duration::from_millis(4500)).await;
-    // ~4.55s elapsed: still inside the shipped 5s grace.
+    advance_time(
+        (shutdown_started + Duration::from_millis(4500))
+            .saturating_duration_since(tokio::time::Instant::now()),
+    )
+    .await;
+    // 4.5s elapsed from the captured baseline: still inside the shipped 5s grace.
     assert_quiet(Duration::from_millis(50), || {
         poll_once(shutdown.as_mut()).is_ready()
     })
     .await;
-    advance_time(Duration::from_millis(600)).await;
+    advance_time(
+        (shutdown_started + Duration::from_millis(5100))
+            .saturating_duration_since(tokio::time::Instant::now()),
+    )
+    .await;
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             poll_once(shutdown.as_mut()).is_ready()

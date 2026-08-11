@@ -214,6 +214,10 @@ impl ScopeRuntime {
         }
         child.restart_shutdown_pending = None;
         self.spawn_child(key);
+        // This path runs outside the ordered-startup loop. Revisit the
+        // aggregate in case the spawn became ready synchronously, just like a
+        // restart-deadline spawn below.
+        self.progress_startup();
     }
 
     pub(super) fn handle_deadline(&mut self, deadline: DeadlineKind) {

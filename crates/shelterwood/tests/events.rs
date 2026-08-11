@@ -989,7 +989,6 @@ enum OverflowMessage {
 
 struct OverflowTimerActor {
     fired: Arc<AtomicUsize>,
-    interval: bool,
 }
 
 impl Actor for OverflowTimerActor {
@@ -1007,7 +1006,7 @@ impl Actor for OverflowTimerActor {
                 .set_timeout("never", OverflowMessage::Fired, Duration::MAX)
                 .expect("live actor arms its timeout");
         }
-        Ok(Self { fired, interval })
+        Ok(Self { fired })
     }
 
     async fn handle(
@@ -1016,7 +1015,6 @@ impl Actor for OverflowTimerActor {
         _: &mut Context<'_, Self>,
     ) -> ExitResult {
         self.fired.fetch_add(1, Ordering::SeqCst);
-        let _ = self.interval;
         Ok(())
     }
 }

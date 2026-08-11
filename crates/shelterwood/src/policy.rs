@@ -332,7 +332,8 @@ fn duration_from_nanos(nanos: f64) -> Duration {
         Duration::MAX
     } else {
         let nanos = rounded.max(0.0) as u128;
-        let seconds = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
+        let seconds = u64::try_from(nanos / 1_000_000_000)
+            .expect("a bounded nanosecond count fits the duration range");
         let subsecond = u32::try_from(nanos % 1_000_000_000)
             .expect("nanosecond remainder is below one billion");
         Duration::new(seconds, subsecond)
@@ -520,7 +521,10 @@ impl Mailbox {
 
 impl Default for Mailbox {
     fn default() -> Self {
-        Self::Queue(NonZeroUsize::new(DEFAULT_MAILBOX_CAPACITY))
+        Self::Queue(Some(
+            NonZeroUsize::new(DEFAULT_MAILBOX_CAPACITY)
+                .expect("the library mailbox capacity is non-zero"),
+        ))
     }
 }
 

@@ -466,8 +466,14 @@ async fn nested_membership_exhaustion_is_structured_and_fail_closed() {
     assert!(matches!(worker.wait().await.kind(), ExitKind::NeverStarted));
 }
 
-#[crate::runtime::test]
-async fn pre_loop_shutdown_upgrades_a_nested_lowering_failure() {
+#[derive(Clone, Copy)]
+enum PreLoopStopSource {
+    ScopeShutdown,
+    ScopeForce,
+    AncestorShutdown,
+}
+
+async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoopStopSource) {
     let nested_id = ChildId::from("nested");
     let mut parent_identity = ScopeIdentity::new();
     let nested_membership = parent_identity
@@ -489,22 +495,34 @@ async fn pre_loop_shutdown_upgrades_a_nested_lowering_failure() {
             TaskDef::new(|_| future::pending::<crate::ExitResult>()),
         )
         .expect("provisional declaration succeeds");
-    let _target = scope
-        .request_shutdown()
-        .expect("declaration-time shutdown targets the first epoch");
+    let epoch = ScopeEpochGuard::begin(&scope).expect("the first nested epoch is available");
+    let ancestor_shutdown = Latch::default();
+    match source {
+        PreLoopStopSource::ScopeShutdown => {
+            let target = scope
+                .request_shutdown()
+                .expect("declaration-time shutdown targets the live epoch");
+            assert_eq!(target, epoch.epoch());
+        }
+        PreLoopStopSource::ScopeForce => scope.force_shutdown(epoch.epoch()),
+        PreLoopStopSource::AncestorShutdown => {
+            ancestor_shutdown.fire();
+        }
+    }
     let ready = CompletionGatedLatch::default();
-    let result = run_nested_tree(
+    let result = super::super::run_nested_tree_with_epoch(
         tree.into_core_for_test(),
         Arc::clone(&scope),
         crate::policy::ResolvedDefaults::default(),
         NestedScopeLatches {
             parent_ready: ready.clone(),
             ancestor: AncestorCommandLatches {
-                shutdown: Latch::default(),
+                shutdown: ancestor_shutdown,
                 abort: Latch::default(),
                 abort_ack: Latch::default(),
             },
         },
+        epoch,
     )
     .await;
 
@@ -521,6 +539,22 @@ async fn pre_loop_shutdown_upgrades_a_nested_lowering_failure() {
     ));
     assert!(!ready.is_fired());
     assert!(matches!(worker.wait().await.kind(), ExitKind::NeverStarted));
+}
+
+#[crate::runtime::test]
+async fn pre_loop_shutdown_upgrades_a_nested_lowering_failure() {
+    assert_pre_loop_stop_upgrades_a_nested_lowering_failure(PreLoopStopSource::ScopeShutdown).await;
+}
+
+#[crate::runtime::test]
+async fn pre_loop_force_upgrades_a_nested_lowering_failure() {
+    assert_pre_loop_stop_upgrades_a_nested_lowering_failure(PreLoopStopSource::ScopeForce).await;
+}
+
+#[crate::runtime::test]
+async fn pre_loop_ancestor_shutdown_upgrades_a_nested_lowering_failure() {
+    assert_pre_loop_stop_upgrades_a_nested_lowering_failure(PreLoopStopSource::AncestorShutdown)
+        .await;
 }
 
 #[crate::runtime::test]

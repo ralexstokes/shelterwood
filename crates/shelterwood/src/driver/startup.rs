@@ -71,14 +71,28 @@ impl ScopeRuntime {
         match self.root.flavor {
             ScopeFlavor::Ordered => {
                 while let Some(key) = self.next_ordered_start {
-                    if !self.children[key].spawned_once {
+                    // The cursor is held across `spawn_child`, and every
+                    // reclaim path (`finalize_removal`, `prune_terminal`) can
+                    // vacate a slot, so never index the arena with it: a
+                    // reclaimed slot is treated as already gone, the same
+                    // discipline `stop_next_ordered` follows for its own
+                    // cursor. `keys_after` ranges over the arena's ordered
+                    // key domain, so it still advances past a vacated key.
+                    if self
+                        .children
+                        .get(key)
+                        .is_some_and(|child| !child.spawned_once)
+                    {
                         self.spawn_child(key);
                     }
-                    if self.children[key].initial_ready {
-                        self.next_ordered_start = self.children.keys_after(key).next();
-                    } else {
+                    if self
+                        .children
+                        .get(key)
+                        .is_some_and(|child| !child.initial_ready)
+                    {
                         return;
                     }
+                    self.next_ordered_start = self.children.keys_after(key).next();
                 }
                 if self
                     .children

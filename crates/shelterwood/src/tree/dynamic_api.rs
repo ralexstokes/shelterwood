@@ -27,6 +27,20 @@ impl ScopeRef {
 }
 
 impl DynamicScopeRef {
+    fn define_or_reject<D, S, H>(
+        definition: D,
+        slot: Result<S, ReserveError>,
+        define: impl FnOnce(S, D) -> Admission<H>,
+    ) -> Admission<H>
+    where
+        D: Send + 'static,
+    {
+        match slot {
+            Ok(slot) => define(slot, definition),
+            Err(error) => Admission::error(dispose_rejected(definition, error)),
+        }
+    }
+
     fn reserve_actor_with<M: Send + 'static>(
         &self,
         id: impl Into<ChildId>,
@@ -85,10 +99,11 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: ActorDef<A>,
     ) -> Admission<ActorRef<A::Msg>> {
-        match self.reserve_actor_with(id, AdmissionOwnership::Fused) {
-            Ok(slot) => slot.core.define_raw(definition.into_raw()),
-            Err(error) => Admission::error(dispose_rejected(definition, error)),
-        }
+        Self::define_or_reject(
+            definition,
+            self.reserve_actor_with(id, AdmissionOwnership::Fused),
+            |slot, definition| slot.core.define_raw(definition.into_raw()),
+        )
     }
 
     /// Adds a consuming one-shot callback-oriented actor, resolving at admission.
@@ -97,10 +112,11 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: ActorOnceDef<A>,
     ) -> Admission<ActorRef<A::Msg>> {
-        match self.reserve_actor_with(id, AdmissionOwnership::Fused) {
-            Ok(slot) => slot.core.define_once_raw(definition.into_raw()),
-            Err(error) => Admission::error(dispose_rejected(definition, error)),
-        }
+        Self::define_or_reject(
+            definition,
+            self.reserve_actor_with(id, AdmissionOwnership::Fused),
+            |slot, definition| slot.core.define_once_raw(definition.into_raw()),
+        )
     }
 
     /// Adds a restartable raw actor, resolving at admission.
@@ -109,10 +125,11 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: RawDef<R>,
     ) -> Admission<ActorRef<R::Msg>> {
-        match self.reserve_actor_with(id, AdmissionOwnership::Fused) {
-            Ok(slot) => slot.core.define_raw(definition),
-            Err(error) => Admission::error(dispose_rejected(definition, error)),
-        }
+        Self::define_or_reject(
+            definition,
+            self.reserve_actor_with(id, AdmissionOwnership::Fused),
+            |slot, definition| slot.core.define_raw(definition),
+        )
     }
 
     /// Adds a consuming one-shot raw actor, resolving at admission.
@@ -121,10 +138,11 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: RawOnceDef<R>,
     ) -> Admission<ActorRef<R::Msg>> {
-        match self.reserve_actor_with(id, AdmissionOwnership::Fused) {
-            Ok(slot) => slot.core.define_once_raw(definition),
-            Err(error) => Admission::error(dispose_rejected(definition, error)),
-        }
+        Self::define_or_reject(
+            definition,
+            self.reserve_actor_with(id, AdmissionOwnership::Fused),
+            |slot, definition| slot.core.define_once_raw(definition),
+        )
     }
 
     /// Reserves a task id synchronously and exposes its exact handle.
@@ -136,10 +154,11 @@ impl DynamicScopeRef {
 
     /// Adds a restartable task, resolving at admission rather than startup.
     pub fn add_task(&self, id: impl Into<ChildId>, definition: TaskDef) -> Admission<TaskRef> {
-        match self.reserve_task_with(id, AdmissionOwnership::Fused) {
-            Ok(slot) => slot.core.define(definition),
-            Err(error) => Admission::error(dispose_rejected(definition, error)),
-        }
+        Self::define_or_reject(
+            definition,
+            self.reserve_task_with(id, AdmissionOwnership::Fused),
+            |slot, definition| slot.core.define(definition),
+        )
     }
 
     /// Adds a consuming one-shot task, resolving at admission.
@@ -148,10 +167,11 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
-        match self.reserve_task_with(id, AdmissionOwnership::Fused) {
-            Ok(slot) => slot.core.define_once(definition),
-            Err(error) => Admission::error(dispose_rejected(definition, error)),
-        }
+        Self::define_or_reject(
+            definition,
+            self.reserve_task_with(id, AdmissionOwnership::Fused),
+            |slot, definition| slot.core.define_once(definition),
+        )
     }
 
     /// Reserves a typed subtree id synchronously.
@@ -170,10 +190,11 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: SubtreeDef<T>,
     ) -> Admission<T::Ref> {
-        match self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused) {
-            Ok(slot) => slot.core.define(definition),
-            Err(error) => Admission::error(dispose_rejected(definition, error)),
-        }
+        Self::define_or_reject(
+            definition,
+            self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused),
+            |slot, definition| slot.core.define(definition),
+        )
     }
 
     /// Adds a consuming one-shot subtree, resolving at admission.
@@ -182,10 +203,11 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: SubtreeOnceDef<T>,
     ) -> Admission<T::Ref> {
-        match self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused) {
-            Ok(slot) => slot.core.define_once(definition),
-            Err(error) => Admission::error(dispose_rejected(definition, error)),
-        }
+        Self::define_or_reject(
+            definition,
+            self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused),
+            |slot, definition| slot.core.define_once(definition),
+        )
     }
 
     /// Latches id-based removal synchronously; the returned future only

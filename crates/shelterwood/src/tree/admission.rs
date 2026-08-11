@@ -66,6 +66,25 @@ impl<H> PendingAdmission<H> {
             &self.reservation.slot,
         );
     }
+
+    fn annul(&self) {
+        let signal_panic = self.fused_cancel.as_ref().and_then(|cancel| {
+            crate::runtime::catch_panic(|| {
+                crate::driver::signal_fused_cancel(
+                    &self.reservation.scope,
+                    self.reservation.control.as_ref(),
+                    &self.reservation.slot,
+                    cancel,
+                );
+            })
+            .err()
+        });
+        let cleanup_panic = crate::runtime::catch_panic(|| self.cancel_reservation()).err();
+        crate::runtime::resume_preferred_panic(crate::runtime::UnwindPanics {
+            primary: signal_panic,
+            cleanup: cleanup_panic,
+        });
+    }
 }
 
 enum AdmissionState<H> {
@@ -174,41 +193,11 @@ impl<H> Drop for Admission<H> {
                 // polled or not. Firing the latch before cancelling keeps the
                 // scope's control-plane wake and the cancellation evidence in
                 // the same order the in-flight path uses.
-                let signal_panic = pending.fused_cancel.as_ref().and_then(|cancel| {
-                    crate::runtime::catch_panic(|| {
-                        crate::driver::signal_fused_cancel(
-                            &pending.reservation.scope,
-                            pending.reservation.control.as_ref(),
-                            &pending.reservation.slot,
-                            cancel,
-                        );
-                    })
-                    .err()
-                });
-                let cleanup_panic =
-                    crate::runtime::catch_panic(|| pending.cancel_reservation()).err();
-                crate::runtime::resume_preferred_panic(crate::runtime::UnwindPanics {
-                    primary: signal_panic,
-                    cleanup: cleanup_panic,
-                });
+                pending.annul();
             }
             AdmissionState::InFlight { pending, .. } => {
-                if let Some(cancel) = &pending.fused_cancel {
-                    let signal_panic = crate::runtime::catch_panic(|| {
-                        crate::driver::signal_fused_cancel(
-                            &pending.reservation.scope,
-                            pending.reservation.control.as_ref(),
-                            &pending.reservation.slot,
-                            cancel,
-                        );
-                    })
-                    .err();
-                    let cleanup_panic =
-                        crate::runtime::catch_panic(|| pending.cancel_reservation()).err();
-                    crate::runtime::resume_preferred_panic(crate::runtime::UnwindPanics {
-                        primary: signal_panic,
-                        cleanup: cleanup_panic,
-                    });
+                if pending.fused_cancel.is_some() {
+                    pending.annul();
                 }
             }
             AdmissionState::Immediate(_) | AdmissionState::Done => {}
@@ -231,10 +220,6 @@ impl fmt::Debug for Removal {
     }
 }
 
-fn lost_removal_response_outcome() -> RemoveOutcome {
-    RemoveOutcome::Removed
-}
-
 impl Removal {
     pub(super) fn new(response: crate::driver::RemovalResponse) -> Self {
         Self {
@@ -246,7 +231,7 @@ impl Removal {
                     // preserve the removal goal, but flag the invariant break
                     // in debug builds just as admission does above.
                     debug_assert!(false, "removal response obligation must complete");
-                    lost_removal_response_outcome()
+                    RemoveOutcome::Removed
                 })
             }),
         }
@@ -305,14 +290,6 @@ mod tests {
             panic!("hostile observation waker");
         }
     }
-    #[test]
-    fn lost_removal_response_policy_fails_closed() {
-        assert_eq!(
-            super::lost_removal_response_outcome(),
-            crate::RemoveOutcome::Removed
-        );
-    }
-
     #[test]
     fn closed_removal_response_fails_closed_after_debug_diagnostic() {
         let (sender, response) = crate::runtime::oneshot();

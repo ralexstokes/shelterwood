@@ -656,8 +656,8 @@ impl<'a> ObservationTxn<'a> {
         }
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn detached() -> Self {
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
         Self {
             guard: None,
             pulses: Vec::new(),

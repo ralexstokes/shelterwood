@@ -777,20 +777,23 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         if matches!(state.status(), BindingStatus::Terminal(_)) {
             return;
         }
-        debug_assert!(
-            state.kind.is_some(),
-            "mailbox must be configured before its first bind"
-        );
-        debug_assert!(
-            matches!(state.status(), BindingStatus::Unbound),
-            "mailbox must close the prior incarnation before rebinding"
-        );
+        // Driver-contract violations release the lock before panicking so the
+        // failure stays on the driver thread instead of poisoning the mutex
+        // under every sender.
+        let Some(kind) = state.kind else {
+            drop(state);
+            panic!("mailbox must be configured before its first bind");
+        };
+        if !matches!(state.status(), BindingStatus::Unbound) {
+            drop(state);
+            panic!("mailbox must close the prior incarnation before rebinding");
+        }
         let binding = std::mem::replace(
             &mut state.binding,
             MailboxBinding::Bound(BoundState::Available(incarnation)),
         );
         let MailboxBinding::Unbound(mut waiters) = binding else {
-            unreachable!("the bind-order contract requires an unbound mailbox")
+            unreachable!("the bind-order contract was checked above")
         };
         state.last_bound = Some(incarnation);
         // Binding is an observation edge for every operation that remained
@@ -799,7 +802,6 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         // the operation lock, so a concurrent timeout sees either the prior
         // evidence or this incarnation consistently with which edge won.
         waiters.observe_all(incarnation);
-        let kind = state.kind.expect("a bound mailbox is configured");
         let promotion = {
             let MailboxState { queue, latest, .. } = &mut *state;
             promote_waiter_queue(
@@ -1152,7 +1154,6 @@ pub(super) mod tests {
         assert!(future.as_mut().poll(&mut context).is_pending());
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "mailbox must be configured before its first bind")]
     fn binding_before_configuration_trips_the_driver_contract() {
@@ -1167,7 +1168,6 @@ pub(super) mod tests {
         MailboxControl::bind(&*mailbox, incarnation);
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "mailbox must close the prior incarnation before rebinding")]
     fn rebinding_before_close_trips_the_driver_contract() {

@@ -814,3 +814,33 @@ fn gate_handoff_waits_for_an_in_flight_observation_edge() {
             .same_gate(&nested.observation_gate())
     );
 }
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a scope with a live dynamic route is never re-homed")]
+fn gate_handoff_rejects_a_scope_with_an_unadmitted_dynamic_reservation() {
+    let root = isolated_scope("root", ScopeFlavor::Ordered);
+    let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+    nested
+        .member
+        .update(|record| record.stage = MemberStage::Running);
+    nested.set_state(ScopeState::Running);
+    let (events, _receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(events);
+    nested.set_dynamic_route(Some(control));
+    let _reservation = nested
+        .with_observation_gate(|txn| {
+            super::super::admission_control::reserve_dynamic_in(
+                &nested,
+                ChildId::from("reserved"),
+                None,
+                txn,
+            )
+        })
+        .expect("the synthetic running scope reserves a child");
+    let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
+
+    // Public layering cannot reach this adoption: a reservation requires a
+    // started driver, while a scope is parented before its driver starts.
+    root.set_admitted_children(vec![resident_projection(&slot)]);
+}

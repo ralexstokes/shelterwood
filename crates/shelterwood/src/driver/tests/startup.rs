@@ -451,7 +451,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
     });
     let mut pending = [
         restart_shutdown_work(nested, target),
-        Pending::Driver(exit).classified(),
+        Pending::from(exit).classified(),
     ];
     arbitrate(&mut pending);
     for (_, event) in pending {
@@ -459,14 +459,14 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
             Pending::RestartShutdown { child, target } => {
                 scope.expedite_restart_shutdown(child, target);
             }
-            Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+            Pending::Child(ChildEvent::Exited {
                 child,
                 incarnation,
                 recorded,
                 join,
                 cancellation,
                 readiness_signal_seen,
-            })) => scope.handle_exit(
+            }) => scope.handle_exit(
                 child,
                 incarnation,
                 recorded,
@@ -617,20 +617,20 @@ async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
         readiness_signal_seen: false,
     });
     let mut pending = [
-        Pending::Driver(nested_exit).classified(),
-        Pending::Driver(trip_exit).classified(),
+        Pending::from(nested_exit).classified(),
+        Pending::from(trip_exit).classified(),
     ];
     arbitrate(&mut pending);
     for (_, event) in pending {
         match event {
-            Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+            Pending::Child(ChildEvent::Exited {
                 child,
                 incarnation,
                 recorded,
                 join,
                 cancellation,
                 readiness_signal_seen,
-            })) => scope.handle_exit(
+            }) => scope.handle_exit(
                 child,
                 incarnation,
                 recorded,
@@ -719,42 +719,39 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
     active.abort_handle.abort();
 
     let mut pending = [
-        Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+        Pending::Child(ChildEvent::Exited {
             child: key,
             incarnation,
             recorded: Some(RecordedOutcome::returned(Ok(()))),
             join: crate::runtime::JoinOutcome::Ok { value: () },
             cancellation: Cancellation::NotObserved,
             readiness_signal_seen: true,
-        }))
+        })
         .classified(),
-        Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop {
+        Pending::Child(ChildEvent::SelfStop {
             child: key,
             incarnation,
-        }))
+        })
         .classified(),
     ];
     arbitrate(&mut pending);
     assert!(
-        matches!(
-            pending[0].1,
-            Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop { .. }))
-        ),
+        matches!(pending[0].1, Pending::Child(ChildEvent::SelfStop { .. })),
         "the regression premise: arbitration orders the stop ahead of the exit"
     );
     for (_, event) in pending {
         match event {
-            Pending::Driver(DriverEvent::Child(ChildEvent::SelfStop { child, incarnation })) => {
+            Pending::Child(ChildEvent::SelfStop { child, incarnation }) => {
                 scope.handle_self_stop(child, incarnation)
             }
-            Pending::Driver(DriverEvent::Child(ChildEvent::Exited {
+            Pending::Child(ChildEvent::Exited {
                 child,
                 incarnation,
                 recorded,
                 join,
                 cancellation,
                 readiness_signal_seen,
-            })) => scope.handle_exit(
+            }) => scope.handle_exit(
                 child,
                 incarnation,
                 recorded,

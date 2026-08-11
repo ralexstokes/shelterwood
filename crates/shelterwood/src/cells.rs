@@ -1224,6 +1224,9 @@ impl ScopeCell {
         member: &MemberCell,
         txn: &mut ObservationTxn<'_>,
     ) {
+        if member.record().membership_status == MembershipStatus::Removing {
+            return;
+        }
         member.update_locked(txn, |record| {
             record.membership_status = MembershipStatus::Removing;
         });

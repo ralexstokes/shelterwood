@@ -1,7 +1,7 @@
 //! Declaration lowering and its owned construction plan.
 
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     sync::{Arc, Mutex},
 };
 
@@ -10,7 +10,7 @@ use crate::{
     admission::ReserveError,
     cells::{ErasedDynamicSlot, MemberCell, ObservationTxn, ScopeCell},
     definition::DefinitionSource,
-    identity::{IdError, ScopeIdentity},
+    identity::ScopeIdentity,
     policy::{
         ChildMode, CommonOptions, InvalidPolicy, PolicyField, ResolvedCommonOptions,
         ResolvedDefaults, ScopeFlavor, resolve_common,
@@ -259,7 +259,7 @@ pub(crate) struct BuilderCore {
     pub(crate) root: Arc<ScopeCell>,
     pub(crate) config: ScopeConfig,
     pub(crate) slots: Vec<Arc<SlotCell>>,
-    ids: HashMap<ChildId, Arc<SlotCell>>,
+    ids: HashSet<ChildId>,
     /// The stable scope whose identity map `lower(root_override)` adopts the
     /// slots' lineages into. Eviction must target the map a lineage actually
     /// entered: before adoption begins the lineages live in `root`'s map,
@@ -292,7 +292,7 @@ impl BuilderCore {
             root,
             config: ScopeConfig::default(),
             slots: Vec::new(),
-            ids: HashMap::new(),
+            ids: HashSet::new(),
             adopting_root: None,
             armed: true,
         }
@@ -304,11 +304,11 @@ impl BuilderCore {
         scope: Option<ScopeFlavor>,
     ) -> Result<Arc<SlotCell>, ReserveError> {
         let id = checked_id(id)?;
-        if self.ids.contains_key(&id) {
+        if self.ids.contains(&id) {
             return Err(ReserveError::DuplicateId(id));
         }
         let slot = mint_reserved_slot(&self.root, &id, scope)?;
-        self.ids.insert(id, Arc::clone(&slot));
+        self.ids.insert(id);
         self.slots.push(Arc::clone(&slot));
         Ok(slot)
     }
@@ -576,9 +576,11 @@ impl ScopeConstruction {
 
 pub(crate) fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError> {
     let id = id.into();
-    ChildId::validate(id.as_str().to_owned()).map_err(|error| match error {
-        IdError::Empty => ReserveError::EmptyId,
-    })
+    if id.as_str().is_empty() {
+        Err(ReserveError::EmptyId)
+    } else {
+        Ok(id)
+    }
 }
 
 #[cfg(test)]

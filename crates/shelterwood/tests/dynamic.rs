@@ -10,7 +10,7 @@ use crate::common::{
     POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet,
     policy::never,
     poll_once, poll_until,
-    waiting::{task as waiting_task, tree as waiting_tree},
+    waiting::{signalled_waiting_task, task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicScopeRef,
@@ -687,20 +687,10 @@ async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
         .reserve_task("split-timeout")
         .expect("split reservation");
     let task = slot.task_ref();
-    let mut split = Box::pin(slot.define(TaskDef::new({
-        let split_started = Arc::clone(&split_started);
-        let split_cancelled = Arc::clone(&split_cancelled);
-        move |context| {
-            let split_started = Arc::clone(&split_started);
-            let split_cancelled = Arc::clone(&split_cancelled);
-            async move {
-                split_started.store(true, Ordering::SeqCst);
-                context.shutdown_token().cancelled().await;
-                split_cancelled.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-        }
-    })));
+    let mut split = Box::pin(slot.define(signalled_waiting_task(
+        Arc::clone(&split_started),
+        Arc::clone(&split_cancelled),
+    )));
     assert!(poll_once(split.as_mut()).is_pending());
     let timed_admission = async move {
         let _split = split;
@@ -752,20 +742,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     let fused_cancelled = Arc::new(AtomicBool::new(false));
     let mut fused = Box::pin(scope.add_task(
         "fused-after-admission",
-        TaskDef::new({
-            let fused_started = Arc::clone(&fused_started);
-            let fused_cancelled = Arc::clone(&fused_cancelled);
-            move |context| {
-                let fused_started = Arc::clone(&fused_started);
-                let fused_cancelled = Arc::clone(&fused_cancelled);
-                async move {
-                    fused_started.store(true, Ordering::SeqCst);
-                    context.shutdown_token().cancelled().await;
-                    fused_cancelled.store(true, Ordering::SeqCst);
-                    Ok(())
-                }
-            }
-        }),
+        signalled_waiting_task(Arc::clone(&fused_started), Arc::clone(&fused_cancelled)),
     ));
     assert!(poll_once(fused.as_mut()).is_pending());
     assert!(
@@ -792,20 +769,10 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     let split_cancelled = Arc::new(AtomicBool::new(false));
     let slot = scope.reserve_task("split").expect("split reservation");
     let split_task = slot.task_ref();
-    let mut split = Box::pin(slot.define(TaskDef::new({
-        let split_started = Arc::clone(&split_started);
-        let split_cancelled = Arc::clone(&split_cancelled);
-        move |context| {
-            let split_started = Arc::clone(&split_started);
-            let split_cancelled = Arc::clone(&split_cancelled);
-            async move {
-                split_started.store(true, Ordering::SeqCst);
-                context.shutdown_token().cancelled().await;
-                split_cancelled.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-        }
-    })));
+    let mut split = Box::pin(slot.define(signalled_waiting_task(
+        Arc::clone(&split_started),
+        Arc::clone(&split_cancelled),
+    )));
     assert!(poll_once(split.as_mut()).is_pending());
     drop(split);
     assert!(
@@ -826,20 +793,10 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         .reserve_task("split-after-admission")
         .expect("split reservation");
     let split_after_task = slot.task_ref();
-    let mut split_after = Box::pin(slot.define(TaskDef::new({
-        let split_after_started = Arc::clone(&split_after_started);
-        let split_after_cancelled = Arc::clone(&split_after_cancelled);
-        move |context| {
-            let split_after_started = Arc::clone(&split_after_started);
-            let split_after_cancelled = Arc::clone(&split_after_cancelled);
-            async move {
-                split_after_started.store(true, Ordering::SeqCst);
-                context.shutdown_token().cancelled().await;
-                split_after_cancelled.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-        }
-    })));
+    let mut split_after = Box::pin(slot.define(signalled_waiting_task(
+        Arc::clone(&split_after_started),
+        Arc::clone(&split_after_cancelled),
+    )));
     assert!(poll_once(split_after.as_mut()).is_pending());
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {

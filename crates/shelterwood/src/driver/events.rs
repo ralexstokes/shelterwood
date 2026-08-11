@@ -49,7 +49,9 @@ pub(super) enum Pending {
     AncestorShutdown,
     AncestorAbort,
     Force,
-    Driver(DriverEvent),
+    Child(ChildEvent),
+    Admission(AdmissionRequest),
+    Removal(RemovalRequest),
     Deadline(DeadlineKind),
 }
 
@@ -60,7 +62,14 @@ impl Pending {
                 ArbitrationClass::ScopeShutdown
             }
             Self::RestartShutdown { .. } => ArbitrationClass::BackoffDue,
-            Self::Driver(event) => driver_event_class(event),
+            Self::Child(ChildEvent::SelfStop { .. }) | Self::Removal(_) => {
+                ArbitrationClass::MembershipRemoval
+            }
+            Self::Child(ChildEvent::Ready { .. }) => ArbitrationClass::ReadinessSignal,
+            Self::Child(ChildEvent::Exited { .. } | ChildEvent::ConstructionDisposed { .. }) => {
+                ArbitrationClass::ChildExit
+            }
+            Self::Admission(_) => ArbitrationClass::Admission,
             Self::Deadline(DeadlineKind::Readiness { .. }) => ArbitrationClass::ReadinessDeadline,
             Self::Deadline(DeadlineKind::Restart { .. }) => ArbitrationClass::BackoffDue,
             Self::Deadline(DeadlineKind::Stop { .. }) => ArbitrationClass::StopDeadline,
@@ -69,6 +78,16 @@ impl Pending {
 
     pub(super) fn classified(self) -> (ArbitrationClass, Self) {
         (self.class(), self)
+    }
+}
+
+impl From<DriverEvent> for Pending {
+    fn from(event: DriverEvent) -> Self {
+        match event {
+            DriverEvent::Child(event) => Self::Child(event),
+            DriverEvent::Admission(request) => Self::Admission(request),
+            DriverEvent::Removal(request) => Self::Removal(request),
+        }
     }
 }
 
@@ -81,7 +100,7 @@ pub(super) fn collect_driver_events(
         let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
             return false;
         };
-        pending.push(Pending::Driver(event).classified());
+        pending.push(Pending::from(event).classified());
     }
     // Collecting exactly `limit` events does not by itself show a capped
     // lane. Probe once more so a lane that drained right at the limit skips
@@ -90,7 +109,7 @@ pub(super) fn collect_driver_events(
     let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
         return false;
     };
-    pending.push(Pending::Driver(event).classified());
+    pending.push(Pending::from(event).classified());
     true
 }
 
@@ -100,18 +119,6 @@ pub(super) fn restart_shutdown_work(child: ChildKey, target: Epoch) -> (Arbitrat
     // first get the chance to trip intensity or fail startup; the
     // execution-time suppression check then observes that drain.
     Pending::RestartShutdown { child, target }.classified()
-}
-
-pub(super) fn driver_event_class(event: &DriverEvent) -> ArbitrationClass {
-    match event {
-        DriverEvent::Child(ChildEvent::SelfStop { .. }) => ArbitrationClass::MembershipRemoval,
-        DriverEvent::Removal(_) => ArbitrationClass::MembershipRemoval,
-        DriverEvent::Child(ChildEvent::Ready { .. }) => ArbitrationClass::ReadinessSignal,
-        DriverEvent::Child(ChildEvent::Exited { .. } | ChildEvent::ConstructionDisposed { .. }) => {
-            ArbitrationClass::ChildExit
-        }
-        DriverEvent::Admission(_) => ArbitrationClass::Admission,
-    }
 }
 
 impl ScopeRuntime {

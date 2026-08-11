@@ -58,11 +58,11 @@ impl<T: Send + 'static> Reply<T> {
 }
 
 /// The owned, non-cloneable receive half of [`Reply::channel`].
-pub struct ReplyReceiver<T> {
+pub struct ReplyReceiver<T: Send + 'static> {
     pub(super) receiver: DisposingReceiver<T>,
 }
 
-impl<T> fmt::Debug for ReplyReceiver<T> {
+impl<T: Send + 'static> fmt::Debug for ReplyReceiver<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ReplyReceiver")
@@ -84,7 +84,7 @@ impl<T: Send + 'static> ReplyReceiver<T> {
     }
 }
 
-pub(super) struct ReplyOperation<T> {
+pub(super) struct ReplyOperation<T: Send + 'static> {
     receiver: DisposingReceiver<T>,
 }
 
@@ -94,16 +94,16 @@ pub(super) enum ReplyPoll<T> {
     TimedOut,
 }
 
-pub(super) fn poll_reply<T>(
+pub(super) fn poll_reply<T: Send + 'static>(
     receiver: &mut DisposingReceiver<T>,
     context: &mut Context<'_>,
     phase: DeadlinePhase,
 ) -> Poll<ReplyPoll<T>> {
-    match receiver.inner.poll_receive(context) {
+    match receiver.poll_receive(context) {
         Poll::Ready(Some(value)) => Poll::Ready(ReplyPoll::Value(value)),
         Poll::Ready(None) => Poll::Ready(ReplyPoll::SenderClosed),
         Poll::Pending if phase == DeadlinePhase::TimeoutArbitration => {
-            match receiver.inner.close_and_poll_receive(context) {
+            match receiver.close_and_poll_receive(context) {
                 OneShotClose::Value(value) => Poll::Ready(ReplyPoll::Value(value)),
                 OneShotClose::SenderClosed => Poll::Ready(ReplyPoll::SenderClosed),
                 OneShotClose::Empty => Poll::Ready(ReplyPoll::TimedOut),
@@ -114,7 +114,7 @@ pub(super) fn poll_reply<T>(
     }
 }
 
-impl<T> DeadlineOperation for ReplyOperation<T> {
+impl<T: Send + 'static> DeadlineOperation for ReplyOperation<T> {
     type Output = Result<T, ReplyError>;
 
     fn poll_deadlined(
@@ -132,7 +132,7 @@ impl<T> DeadlineOperation for ReplyOperation<T> {
     }
 
     fn short_circuit(&mut self) -> Self::Output {
-        self.receiver.inner.close();
+        self.receiver.close();
         Err(ReplyError::Timeout)
     }
 }

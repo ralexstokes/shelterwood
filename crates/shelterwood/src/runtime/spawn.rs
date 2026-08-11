@@ -259,8 +259,8 @@ where
 pub(crate) struct JitterRng(fastrand::Rng);
 
 impl JitterRng {
-    pub(crate) fn from_system_entropy() -> Self {
-        Self(fastrand::Rng::with_seed(fastrand::u64(..)))
+    pub(crate) fn new() -> Self {
+        Self(fastrand::Rng::new())
     }
 
     pub(crate) fn sample<R>(&mut self, range: R) -> u64

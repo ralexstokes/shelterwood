@@ -23,11 +23,11 @@ use super::{
 
 /// Future returned by [`ReplyReceiver::recv`](crate::ReplyReceiver::recv).
 #[must_use]
-pub struct ReplyReceive<T> {
+pub struct ReplyReceive<T: Send + 'static> {
     pub(super) deadlined: Deadlined<ReplyOperation<T>>,
 }
 
-impl<T> fmt::Debug for ReplyReceive<T> {
+impl<T: Send + 'static> fmt::Debug for ReplyReceive<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ReplyReceive")
@@ -411,13 +411,13 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
 
 /// Cancellation-safe future returned by [`ActorRef::call`].
 #[must_use]
-pub struct CallFuture<M, T> {
+pub struct CallFuture<M, T: Send + 'static> {
     deadlined: Deadlined<CallOperation<M, T>>,
 }
 
 type MessageConstructor<M, T> = Box<dyn FnOnce(Reply<T>) -> M + Send + 'static>;
 
-struct CallOperation<M, T> {
+struct CallOperation<M, T: Send + 'static> {
     actor: ActorRef<M>,
     make_msg: Option<MessageConstructor<M, T>>,
     send: Option<SendFuture<M>>,
@@ -429,7 +429,7 @@ struct CallOperation<M, T> {
     dispose_constructor: fn(MessageConstructor<M, T>),
 }
 
-impl<M, T> Drop for CallOperation<M, T> {
+impl<M, T: Send + 'static> Drop for CallOperation<M, T> {
     fn drop(&mut self) {
         if let Some(make_msg) = self.make_msg.take() {
             // An unstarted or short-circuited call discards its constructor
@@ -441,7 +441,7 @@ impl<M, T> Drop for CallOperation<M, T> {
     }
 }
 
-impl<M, T> fmt::Debug for CallFuture<M, T> {
+impl<M, T: Send + 'static> fmt::Debug for CallFuture<M, T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CallFuture")
@@ -451,7 +451,7 @@ impl<M, T> fmt::Debug for CallFuture<M, T> {
     }
 }
 
-impl<M, T> CallOperation<M, T> {
+impl<M, T: Send + 'static> CallOperation<M, T> {
     fn poll_reply(
         &mut self,
         context: &mut Context<'_>,
@@ -480,7 +480,7 @@ impl<M, T> CallOperation<M, T> {
 
     fn close_reply(&mut self) {
         if let Some(reply) = &mut self.reply {
-            reply.inner.close();
+            reply.close();
         }
     }
 }

@@ -91,11 +91,11 @@ pub(crate) enum ChildMode {
 }
 
 /// The default bounded FIFO mailbox capacity.
-pub const DEFAULT_MAILBOX_CAPACITY: usize = 64;
+pub(crate) const DEFAULT_MAILBOX_CAPACITY: usize = 64;
 /// The default child shutdown grace.
-pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// The default gated-readiness deadline.
-pub const DEFAULT_READINESS_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_READINESS_DEADLINE: Duration = Duration::from_secs(30);
 
 /// The condition under which an exited child is restarted.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

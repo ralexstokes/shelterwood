@@ -38,7 +38,6 @@ impl Signal {
     pub(crate) fn watcher(&self) -> SignalWatcher {
         SignalWatcher {
             inner: self.inner.watcher(),
-            _signal: self.clone(),
         }
     }
 
@@ -50,9 +49,6 @@ impl Signal {
 
 pub(crate) struct SignalWatcher {
     inner: WatchReceiver<()>,
-    // Retain the source through every watcher so channel closure cannot turn
-    // into a spurious pulse.
-    _signal: Signal,
 }
 
 impl SignalWatcher {
@@ -395,27 +391,40 @@ impl<T> OneShotReceiver<T> {
 ///
 /// A value stored before the receive side is cancelled is user-owned:
 /// destroying it inline could block or panic whoever dropped the holder. The
-/// disposal function is captured at construction, where the value type's
-/// `Send + 'static` bounds hold, so unbounded holders can still route an
-/// unclaimed stored value through isolated disposal on drop.
-pub(crate) struct DisposingReceiver<T> {
-    pub(crate) inner: OneShotReceiver<T>,
-    dispose: fn(T),
+/// value type stays `Send + 'static`, so drop can route an unclaimed stored
+/// value through isolated disposal directly.
+pub(crate) struct DisposingReceiver<T: Send + 'static> {
+    inner: OneShotReceiver<T>,
 }
 
 impl<T: Send + 'static> DisposingReceiver<T> {
     pub(crate) fn new(inner: OneShotReceiver<T>) -> Self {
-        Self {
-            inner,
-            dispose: dispose_detached::<T>,
-        }
+        Self { inner }
+    }
+
+    pub(crate) fn poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<T>> {
+        self.inner.poll_receive(context)
+    }
+
+    pub(crate) fn close_and_poll_receive(
+        &mut self,
+        context: &mut std::task::Context<'_>,
+    ) -> OneShotClose<T> {
+        self.inner.close_and_poll_receive(context)
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.inner.close();
     }
 }
 
-impl<T> Drop for DisposingReceiver<T> {
+impl<T: Send + 'static> Drop for DisposingReceiver<T> {
     fn drop(&mut self) {
         if let Some(value) = self.inner.close_and_take() {
-            (self.dispose)(value);
+            dispose_detached(value);
         }
     }
 }

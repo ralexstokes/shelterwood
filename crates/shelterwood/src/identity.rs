@@ -27,15 +27,6 @@ thread_local! {
 pub struct ChildId(Arc<str>);
 
 impl ChildId {
-    pub(crate) fn validate(value: impl Into<String>) -> Result<Self, IdError> {
-        let value = value.into();
-        if value.is_empty() {
-            Err(IdError::Empty)
-        } else {
-            Ok(Self(Arc::from(value)))
-        }
-    }
-
     /// Returns the identifier as text.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -59,11 +50,6 @@ impl From<String> for ChildId {
     fn from(value: String) -> Self {
         Self(Arc::from(value))
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum IdError {
-    Empty,
 }
 
 /// A child's identity within one supervising scope.

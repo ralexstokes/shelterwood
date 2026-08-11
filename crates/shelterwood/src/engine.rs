@@ -332,7 +332,7 @@ impl RestartState {
         (self.attempt, self.cumulative)
     }
 
-    pub(crate) fn settled(&mut self) {
+    fn settled(&mut self) {
         self.attempt = RestartAttempt::ZERO;
     }
 
@@ -385,7 +385,6 @@ pub(crate) fn schedule_restart(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadinessState {
     Unconfigured,
-    Immediate,
     Waiting { deadline: Option<Instant> },
     Ready,
     Disarmed,
@@ -453,7 +452,7 @@ impl ReadinessGate {
                     ..
                 },
             ) => {
-                self.state = ReadinessState::Immediate;
+                self.state = ReadinessState::Ready;
                 Some(ReadinessEffect::BecameReady)
             }
             (
@@ -510,7 +509,7 @@ impl ReadinessGate {
                     signal_seen: false, ..
                 },
             )
-            | (ReadinessState::Immediate | ReadinessState::Ready | ReadinessState::Disarmed, _)
+            | (ReadinessState::Ready | ReadinessState::Disarmed, _)
             | (
                 ReadinessState::Unconfigured,
                 ReadinessEvent::Signal | ReadinessEvent::Deadline { .. },

@@ -35,31 +35,16 @@ impl ScopeRuntime {
         let Some(control) = &self.dynamic else {
             return;
         };
-        let root = Arc::clone(&self.root);
-        let tracked = root.with_observation_gate(|txn| {
-            let tracked = {
-                let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-                state
-                    .entry_mut(member.id())
-                    .filter(|entry| entry.slot.member.membership() == membership)
-                    .and_then(|entry| entry.mark_removing(txn))
-                    .is_some_and(|tracked| tracked == key)
-            };
-            // The Removing projection publishes outside the dynamic-state
-            // mutex, like the sibling writers in `admission_control`; the
-            // observation gate alone serializes the mutation.
-            if tracked && member.record().membership_status != MembershipStatus::Removing {
-                root.set_child_removing_locked(&member, txn);
-            }
-            tracked
-        });
+        let tracked = control
+            .state
+            .lock()
+            .expect("dynamic-state mutex poisoned")
+            .entry(member.id())
+            .filter(|entry| entry.slot.member.membership() == membership)
+            .is_some_and(|entry| entry.is_removing() && entry.matches_key(key));
         if !tracked {
             return;
         }
-        // A fused drop and an explicit `remove` can each queue one request for
-        // the same membership. The phase/projection transaction above,
-        // `begin_stop_child`'s ladder guards, and `finalize_removal`'s exact
-        // match keep that duplicate delivery idempotent.
         if self.children[key].is_terminal() {
             self.finalize_removal(key);
         } else {

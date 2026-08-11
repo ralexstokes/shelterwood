@@ -258,12 +258,12 @@ impl Hash for TaskRef {
 
 /// The sole claim to a one-shot task's typed completion value.
 #[must_use]
-pub struct OneShotTaskRef<T> {
+pub struct OneShotTaskRef<T: Send + 'static> {
     completion: runtime::DisposingReceiver<T>,
     task: TaskRef,
 }
 
-impl<T> fmt::Debug for OneShotTaskRef<T> {
+impl<T: Send + 'static> fmt::Debug for OneShotTaskRef<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OneShotTaskRef")
@@ -303,7 +303,7 @@ impl<T: Send + 'static> OneShotTaskRef<T> {
         // with a closed, empty channel is therefore a framework invariant
         // violation, not an application exit that can be reported as `Err`.
         Ok(
-            std::future::poll_fn(|context| self.completion.inner.poll_receive(context))
+            std::future::poll_fn(|context| self.completion.poll_receive(context))
                 .await
                 .expect("completed one-shot task must publish its typed value"),
         )

@@ -9,7 +9,7 @@ fmt:
     cargo +nightly fmt --all --check
 
 lint:
-    cargo +nightly clippy --locked --workspace --all-targets --all-features -- -D warnings
+    cargo +nightly clippy --locked --workspace --all-targets --all-features -- -D warnings -W unreachable-pub
 
 check:
     cargo check --locked --workspace --all-targets --all-features

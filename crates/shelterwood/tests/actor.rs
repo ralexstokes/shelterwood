@@ -8,14 +8,15 @@ use std::{
 
 use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
 use shelterwood::{
-    Actor, ActorDef, ActorOnceDef, ActorRef, Context, DynamicTree, ExitError, ExitResult, Handler,
-    Mailbox, RawActor, RawContext, RawOnceDef, Readiness, ScopeRef, SendErrorKind, StopContext,
-    TaskDef, Tree,
+    Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DynamicTree, ExitError, ExitKind,
+    ExitResult, Handler, Mailbox, RawActor, RawContext, RawOnceDef, Readiness, Retention, ScopeRef,
+    SendErrorKind, StopContext, TaskDef, Tree,
 };
 
 #[derive(Clone)]
 struct BasicArgs {
     events: Arc<Mutex<Vec<&'static str>>>,
+    expected_id: &'static str,
 }
 
 enum BasicMessage {
@@ -24,6 +25,7 @@ enum BasicMessage {
 
 struct BasicActor {
     events: Arc<Mutex<Vec<&'static str>>>,
+    expected_id: &'static str,
 }
 
 impl Actor for BasicActor {
@@ -38,6 +40,7 @@ impl Actor for BasicActor {
             .push("init");
         Ok(Self {
             events: args.events,
+            expected_id: args.expected_id,
         })
     }
 
@@ -55,7 +58,7 @@ impl Actor for BasicActor {
     }
 
     async fn on_stop(&mut self, context: &mut StopContext<'_, Self>) {
-        assert_eq!(context.id().as_str(), "actor");
+        assert_eq!(context.id().as_str(), self.expected_id);
         self.events
             .lock()
             .expect("events mutex poisoned")
@@ -112,6 +115,7 @@ async fn handler_actor_runs_init_handle_and_stop_through_the_raw_wrapper() {
             "actor",
             ActorOnceDef::<BasicActor>::new(BasicArgs {
                 events: Arc::clone(&events),
+                expected_id: "actor",
             }),
         )
         .expect("valid actor");
@@ -135,6 +139,7 @@ async fn handler_decorator_reenters_the_inner_actor_context_across_callbacks() {
             ActorOnceDef::<Audited<BasicActor>>::new((
                 BasicArgs {
                     events: Arc::clone(&events),
+                    expected_id: "actor",
                 },
                 Arc::clone(&events),
             )),
@@ -310,6 +315,7 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
             count.fetch_add(1, Ordering::SeqCst);
             BasicArgs {
                 events: Arc::clone(&events_for_args),
+                expected_id: "initial",
             }
         }),
     )
@@ -317,6 +323,11 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("initial actor starts");
     assert_eq!(inits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *events.lock().expect("events mutex poisoned"),
+        ["init"],
+        "the restartable actor definition runs its actor initializer"
+    );
 
     let dynamic_events = Arc::new(Mutex::new(Vec::new()));
     let dynamic = system.scope();
@@ -325,7 +336,9 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
             "dynamic",
             ActorOnceDef::<BasicActor>::new(BasicArgs {
                 events: Arc::clone(&dynamic_events),
-            }),
+                expected_id: "dynamic",
+            })
+            .retention(Retention::Retain),
         )
         .await
         .expect("dynamic actor admitted");
@@ -342,6 +355,19 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         .send(BasicMessage::Stop)
         .await
         .expect("dynamic actor live");
+    let stopped = dynamic
+        .wait_for_child("dynamic", |child| child.state.is_terminal(), POLL_TIMEOUT)
+        .await
+        .expect("the dynamic actor's requested stop reaches terminal publication");
+    assert!(matches!(
+        stopped.state,
+        ChildState::Stopped { ref exit } if matches!(exit.kind(), ExitKind::Completed)
+    ));
+    assert_eq!(
+        *dynamic_events.lock().expect("events mutex poisoned"),
+        ["init", "handle", "stop"],
+        "the dynamic actor completes its full stop path before the test proceeds"
+    );
     system
         .shutdown(Duration::from_secs(1))
         .await

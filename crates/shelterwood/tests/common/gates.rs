@@ -1,20 +1,47 @@
 use std::sync::{Arc, Condvar, Mutex};
 
-use tokio::sync::Notify;
+use tokio::sync::Semaphore;
+
+#[derive(Debug)]
+struct ReleaseState {
+    permits: Semaphore,
+    releases: Mutex<()>,
+}
+
+impl Default for ReleaseState {
+    fn default() -> Self {
+        Self {
+            permits: Semaphore::new(0),
+            releases: Mutex::new(()),
+        }
+    }
+}
 
 /// A one-permit asynchronous gate used to sequence child progress.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ReleaseGate(Arc<Notify>);
+pub(crate) struct ReleaseGate(Arc<ReleaseState>);
 
 impl ReleaseGate {
     /// Waits until the gate is released.
     pub(crate) async fn wait(&self) {
-        self.0.notified().await;
+        self.0
+            .permits
+            .acquire()
+            .await
+            .expect("test release gates are never closed")
+            .forget();
     }
 
     /// Releases one current or future waiter.
+    #[track_caller]
     pub(crate) fn release(&self) {
-        self.0.notify_one();
+        let _release = self.0.releases.lock().expect("release gate mutex poisoned");
+        assert_eq!(
+            self.0.permits.available_permits(),
+            0,
+            "a ReleaseGate cannot store more than one unclaimed release"
+        );
+        self.0.permits.add_permits(1);
     }
 }
 
@@ -81,5 +108,13 @@ mod tests {
         let gate = ReleaseGate::default();
         gate.release();
         gate.wait().await;
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot store more than one unclaimed release")]
+    fn release_gate_rejects_a_collapsed_double_release() {
+        let gate = ReleaseGate::default();
+        gate.release();
+        gate.release();
     }
 }

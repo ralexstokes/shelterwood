@@ -8,9 +8,14 @@ use std::{
 
 use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
 use shelterwood::{
-    CallErrorKind, ExitResult, Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, Reply,
-    ReplyError, SendErrorKind, Tree,
+    CallErrorKind, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor, RawContext, RawDef,
+    Reply, ReplyError, SendErrorKind, Tree,
 };
+
+#[test]
+fn zero_capacity_queue_is_rejected_at_the_integration_surface() {
+    assert_eq!(Mailbox::queue(0), Err(PolicyError::ZeroCapacity));
+}
 
 #[derive(Debug)]
 enum Message {

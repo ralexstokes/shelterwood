@@ -454,6 +454,55 @@ impl<M> Drop for EventQueue<M> {
     }
 }
 
+/// Incarnation-owned storage for `continue_with` messages.
+///
+/// Elements are stored raw — the queue owns one disposal handle instead of one
+/// per element — so every drain must route its payloads through that funnel.
+/// `Drop` re-drains unconditionally: a `freeze` that never ran, or that failed
+/// partway through an earlier cleanup step, must not leave queued user
+/// messages to be destroyed outside the disposal boundary.
+struct ContinuationQueue<M> {
+    queue: VecDeque<M>,
+    disposal: RawDisposal,
+}
+
+impl<M> ContinuationQueue<M> {
+    fn new(disposal: RawDisposal) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            disposal,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn push_back(&mut self, message: M) {
+        self.queue.push_back(message);
+    }
+
+    fn pop_front(&mut self) -> Option<M> {
+        self.queue.pop_front()
+    }
+
+    fn clear(&mut self) {
+        while let Some(message) = self.queue.pop_front() {
+            self.disposal.dispose(message);
+        }
+    }
+}
+
+impl<M> Drop for ContinuationQueue<M> {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 enum TimerMessage<M> {
     Once(M),
     Interval(M, fn(&M) -> M),
@@ -926,7 +975,7 @@ impl OffloadResource {
 
 struct RawResources<M> {
     accepting: bool,
-    continuations: VecDeque<M>,
+    continuations: ContinuationQueue<M>,
     // Set after returning a continuation and cleared after an external
     // mailbox/offload/timer item. `next_ready` uses it to prohibit two local
     // continuations from leading while an external source remains eligible.
@@ -953,7 +1002,7 @@ impl<M> Default for RawResources<M> {
         let event_watcher = events.signal.watcher();
         Self {
             accepting: true,
-            continuations: VecDeque::new(),
+            continuations: ContinuationQueue::new(disposal.clone()),
             continuation_needs_external: false,
             timers: TimerStore::new(disposal.clone()),
             timer_orders: PoisonedCounter::new(),
@@ -979,9 +1028,7 @@ impl<M> RawResources<M> {
         for offload in &mut self.offloads {
             offload.cancel();
         }
-        while let Some(message) = self.continuations.pop_front() {
-            self.disposal.dispose(message);
-        }
+        self.continuations.clear();
         self.timers.clear();
         self.ready_batch = None;
         self.events.clear();
@@ -993,12 +1040,13 @@ impl<M> RawResources<M> {
     /// O(offloads-ever-issued). Invoked when a new offload starts, before each
     /// ready-selection turn, and when the loop goes idle. The selection point
     /// is what bounds retention for an actor whose mailbox never empties.
+    ///
+    /// The scan is therefore O(in-flight offloads) per delivered input, by
+    /// design: the ledger is already bounded by the caller's own in-flight
+    /// count, so a per-turn walk of it is proportional to work the actor
+    /// itself has outstanding.
     fn reclaim_finished(&mut self) {
         self.offloads.retain(|offload| !offload.finished.is_fired());
-    }
-
-    fn begin_ready_selection(&mut self) {
-        self.reclaim_finished();
     }
 
     fn resume_pending_panic(&self) {
@@ -1525,8 +1573,9 @@ impl<M: Send + 'static> RawContext<M> {
     fn next_ready(&mut self) -> Option<M> {
         // A permanently busy actor never reaches `wait_for_event`; reclaim at
         // its other guaranteed re-entry point so completed task handles do not
-        // accumulate for the lifetime of the incarnation.
-        self.resources.begin_ready_selection();
+        // accumulate for the lifetime of the incarnation. This is the point
+        // that bounds ledger retention.
+        self.resources.reclaim_finished();
         loop {
             self.resources.resume_pending_panic();
             self.begin_ready_batch();
@@ -1696,8 +1745,10 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     async fn wait_for_event(&mut self) {
-        // The loop is about to go idle: reclaim finished offload bookkeeping
-        // now so steady-state retention never waits for the next offload.
+        // Retention is already bounded by the reclaim in `next_ready`, which
+        // ran on this task with no await in between. This is a same-instant
+        // backstop for the one case that reclaim could not have seen: an
+        // offload finishing on another thread between the two calls.
         self.resources.reclaim_finished();
         let sleep = self.next_timer_deadline().map_or_else(
             || Box::pin(std::future::pending()) as runtime::BoxedSleep,
@@ -2045,13 +2096,69 @@ mod tests {
     };
 
     use super::{
-        ArmingOrder, EventQueue, OffloadResource, PanicSlot, QueuedEvent, RawResources,
-        SharedOffloadFuture, SharedOffloadState, TimerMessage,
+        ArmingOrder, EventQueue, OffloadResource, PanicSlot, QueuedEvent, RawContext, RawResources,
+        RawRunContext, SharedOffloadFuture, SharedOffloadState, TimerMessage,
     };
-    use crate::runtime::{
-        Latch, PanicPayload, Signal, UnwindPanics, resume_preferred_panic,
-        resume_preferred_panic_outside_unwind,
+    use crate::{
+        ChildId, MailboxShutdown, Readiness,
+        cells::{MailboxControl, MemberCell, ScopeCell},
+        identity::ScopeIdentity,
+        mailbox::{ActorRef, MailboxCell},
+        policy::{ResolvedDefaults, ScopeFlavor},
+        runtime::{
+            CompletionGatedLatch, Latch, PanicPayload, Signal, UnwindPanics,
+            resume_preferred_panic, resume_preferred_panic_outside_unwind,
+        },
+        scope::ScopeRef,
     };
+
+    /// Builds a live raw incarnation context whose mailbox is configured and
+    /// bound, so `next_ready` can take the busy path without a driver.
+    fn bound_raw_context() -> (RawContext<u8>, ActorRef<u8>) {
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("raw-actor");
+        let member = MemberCell::new(
+            id.clone(),
+            identity.mint_membership(&id).expect("membership available"),
+        );
+        let mailbox = MailboxCell::new(id.clone());
+        member.attach_mailbox(mailbox.clone());
+        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox);
+        let incarnation = member
+            .take_incarnation_counter()
+            .mint()
+            .expect("incarnation available");
+        MailboxControl::bind(&*mailbox, incarnation);
+
+        let mut scope_identity = ScopeIdentity::new();
+        let scope_id = ChildId::from("scope");
+        let scope_member = MemberCell::new(
+            scope_id.clone(),
+            scope_identity
+                .mint_membership(&scope_id)
+                .expect("membership available"),
+        );
+        let scope = ScopeCell::new(scope_member, ScopeFlavor::Ordered, ScopeIdentity::new());
+
+        let myself = ActorRef::new(Arc::clone(&member), Arc::clone(&mailbox));
+        let context = RawContext::new(
+            RawRunContext {
+                id,
+                incarnation,
+                member,
+                scope: ScopeRef { cell: scope },
+                shutdown: Latch::default(),
+                abort: Latch::default(),
+                ready: CompletionGatedLatch::default(),
+                local_stop: Latch::default(),
+                mailbox_shutdown: MailboxShutdown::Drain,
+            },
+            myself.clone(),
+            mailbox,
+            Readiness::Immediate,
+        );
+        (context, myself)
+    }
 
     fn marker(value: usize) -> QueuedEvent<usize> {
         QueuedEvent {
@@ -2122,6 +2229,20 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
             panic!("contained raw payload destructor panic");
+        }
+    }
+
+    struct CountedDrop {
+        drops: Arc<AtomicUsize>,
+        panic_on_drop: bool,
+    }
+
+    impl Drop for CountedDrop {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            if self.panic_on_drop {
+                panic!("queued continuation destructor panic");
+            }
         }
     }
 
@@ -2327,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn ready_selection_reclaims_finished_offload_ledger_entries() {
+    fn finished_offload_ledger_entries_are_reclaimed() {
         let mut resources = RawResources::<()>::default();
         for finished in [true, false, true] {
             let completion = Latch::default();
@@ -2342,7 +2463,7 @@ mod tests {
             });
         }
 
-        resources.begin_ready_selection();
+        resources.reclaim_finished();
 
         assert_eq!(
             resources.offloads.len(),
@@ -2350,6 +2471,81 @@ mod tests {
             "reclamation retains exactly the unfinished offloads"
         );
         assert!(!resources.offloads[0].finished.is_fired());
+    }
+
+    /// `freeze` is the drain that normally empties the continuation queue, but
+    /// it is not a guaranteed one: `Drop for RawResources` skips it once the
+    /// incarnation is already frozen, and runs it under `catch_panic` so an
+    /// earlier cleanup step failing can cut it short. Either way the queue's
+    /// own destructor must still route its payloads through the disposal
+    /// funnel instead of letting them unwind out of incarnation cleanup.
+    #[test]
+    fn a_skipped_freeze_still_contains_queued_continuation_destructors() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut resources = RawResources::<CountedDrop>::default();
+        let panic = Arc::clone(&resources.panic);
+        resources.accepting = false;
+        for panic_on_drop in [true, false] {
+            resources.continuations.push_back(CountedDrop {
+                drops: Arc::clone(&drops),
+                panic_on_drop,
+            });
+        }
+
+        catch_unwind(AssertUnwindSafe(|| drop(resources)))
+            .expect("a hostile continuation destructor never escapes incarnation cleanup");
+
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "one hostile destructor cannot skip the rest of the queue"
+        );
+        assert_eq!(
+            panic.take().as_ref().and_then(panic_message),
+            Some("queued continuation destructor panic"),
+            "the contained destructor panic is retained as cleanup evidence"
+        );
+    }
+
+    /// The ledger's retention bound rests on the reclaim point inside
+    /// `next_ready`, not on the one in `wait_for_event`: an actor whose
+    /// mailbox never empties returns from every receive without going idle,
+    /// so the idle reclaim never runs and finished task handles would
+    /// otherwise accumulate for the lifetime of the incarnation.
+    #[test]
+    fn a_busy_receive_turn_reclaims_finished_offload_ledger_entries() {
+        let (mut context, actor) = bound_raw_context();
+        actor
+            .try_send(1)
+            .expect("a bound mailbox accepts the message");
+        actor
+            .try_send(2)
+            .expect("a bound mailbox keeps the actor busy");
+        for finished in [true, false, true] {
+            let completion = Latch::default();
+            if finished {
+                completion.fire();
+            }
+            context.resources.offloads.push(OffloadResource {
+                cancellation: Latch::default(),
+                finished: completion,
+                state: None,
+                task: None,
+            });
+        }
+
+        assert_eq!(
+            context.try_recv(),
+            Some(1),
+            "a readable mailbox returns from ready selection without going idle"
+        );
+
+        assert_eq!(
+            context.resources.offloads.len(),
+            1,
+            "the ready-selection turn reclaimed both finished ledger entries"
+        );
+        assert!(!context.resources.offloads[0].finished.is_fired());
     }
 
     #[test]

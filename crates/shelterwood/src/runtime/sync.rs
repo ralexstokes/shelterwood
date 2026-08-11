@@ -391,17 +391,31 @@ impl<T> OneShotReceiver<T> {
 ///
 /// A value stored before the receive side is cancelled is user-owned:
 /// destroying it inline could block or panic whoever dropped the holder. The
-/// value type stays `Send + 'static`, so drop can route an unclaimed stored
-/// value through isolated disposal directly.
-pub(crate) struct DisposingReceiver<T: Send + 'static> {
+/// disposal function is captured at construction, where the value type's
+/// `Send + 'static` bounds hold, so unbounded holders can still route an
+/// unclaimed stored value through isolated disposal on drop.
+///
+/// The erasure is load-bearing API design, not incidental: `Drop` must repeat
+/// whatever bounds the struct declares, so bounding this type would push
+/// `T: Send + 'static` onto the *definitions* of the public wrappers that hold
+/// it (`ReplyReceiver`, `ReplyReceive`, `CallFuture`, `OneShotTaskRef`) and
+/// force downstream generic declarations to carry a bound they never asked
+/// for. Execution bounds belong on constructors and operational impls here.
+pub(crate) struct DisposingReceiver<T> {
     inner: OneShotReceiver<T>,
+    dispose: fn(T),
 }
 
 impl<T: Send + 'static> DisposingReceiver<T> {
     pub(crate) fn new(inner: OneShotReceiver<T>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            dispose: dispose_detached::<T>,
+        }
     }
+}
 
+impl<T> DisposingReceiver<T> {
     pub(crate) fn poll_receive(
         &mut self,
         context: &mut std::task::Context<'_>,
@@ -421,10 +435,10 @@ impl<T: Send + 'static> DisposingReceiver<T> {
     }
 }
 
-impl<T: Send + 'static> Drop for DisposingReceiver<T> {
+impl<T> Drop for DisposingReceiver<T> {
     fn drop(&mut self) {
         if let Some(value) = self.inner.close_and_take() {
-            dispose_detached(value);
+            (self.dispose)(value);
         }
     }
 }

@@ -58,11 +58,11 @@ impl<T: Send + 'static> Reply<T> {
 }
 
 /// The owned, non-cloneable receive half of [`Reply::channel`].
-pub struct ReplyReceiver<T: Send + 'static> {
+pub struct ReplyReceiver<T> {
     pub(super) receiver: DisposingReceiver<T>,
 }
 
-impl<T: Send + 'static> fmt::Debug for ReplyReceiver<T> {
+impl<T> fmt::Debug for ReplyReceiver<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ReplyReceiver")
@@ -84,7 +84,7 @@ impl<T: Send + 'static> ReplyReceiver<T> {
     }
 }
 
-pub(super) struct ReplyOperation<T: Send + 'static> {
+pub(super) struct ReplyOperation<T> {
     receiver: DisposingReceiver<T>,
 }
 
@@ -94,7 +94,7 @@ pub(super) enum ReplyPoll<T> {
     TimedOut,
 }
 
-pub(super) fn poll_reply<T: Send + 'static>(
+pub(super) fn poll_reply<T>(
     receiver: &mut DisposingReceiver<T>,
     context: &mut Context<'_>,
     phase: DeadlinePhase,
@@ -114,7 +114,7 @@ pub(super) fn poll_reply<T: Send + 'static>(
     }
 }
 
-impl<T: Send + 'static> DeadlineOperation for ReplyOperation<T> {
+impl<T> DeadlineOperation for ReplyOperation<T> {
     type Output = Result<T, ReplyError>;
 
     fn poll_deadlined(

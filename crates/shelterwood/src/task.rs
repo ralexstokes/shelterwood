@@ -258,12 +258,12 @@ impl Hash for TaskRef {
 
 /// The sole claim to a one-shot task's typed completion value.
 #[must_use]
-pub struct OneShotTaskRef<T: Send + 'static> {
+pub struct OneShotTaskRef<T> {
     completion: runtime::DisposingReceiver<T>,
     task: TaskRef,
 }
 
-impl<T: Send + 'static> fmt::Debug for OneShotTaskRef<T> {
+impl<T> fmt::Debug for OneShotTaskRef<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OneShotTaskRef")

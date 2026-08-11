@@ -3632,10 +3632,13 @@ implied on all; error/outcome types are B.3 and B.8):
   with no incarnation ever spawned (tree dropped unspawned, rejected
   or withdrawn insertion) resolves the call immediately as
   already-stopped. Concurrent
-  callers ride one latch and observe one teardown; a scope whose
-  membership is already terminal resolves immediately (`Ok` — its
-  terminal state is `wait_stopped()`'s and the snapshot's to report,
-  not this call's). `wait_stopped()` is the membership-level await — the scope
+  callers ride one latch and observe one teardown. A scope whose
+  membership is already terminal resolves immediately only when its scope
+  projection is `Unstarted` or `Stopped`; if parent teardown published
+  terminal membership before a live incarnation's epilogue, the call still
+  waits for that incarnation to finish (`Ok` — the terminal state is
+  `wait_stopped()`'s and the snapshot's to report, not this call's).
+  `wait_stopped()` is the membership-level await — the scope
   analogue of `TaskRef::wait()`: it rides restarts and resolves at
   membership terminality with the scope's terminal state
   (`Stopped { reason: NeverStarted }` for a scope membership that
@@ -3692,7 +3695,8 @@ enums are non-exhaustive.
   carrying their structured data).
 - `shutdown_and_wait(&self, timeout) -> Result<(), ShutdownTimeout>` —
   the owner's `shutdown` shapes on the non-owning handle (semantics
-  above); an already-terminal scope resolves `Ok` immediately.
+  above); an already-terminal scope resolves `Ok` immediately only after any
+  live incarnation has finished its scope epilogue.
 - `wait_stopped(&self) -> StopReason` — the membership's terminal
   reason, `NeverStarted` included (§3.2).
 

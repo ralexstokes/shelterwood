@@ -641,12 +641,11 @@ impl ScopeRuntime {
         );
 
         let mut readiness = ReadinessGate::new();
-        let deadline = match child.options.readiness_deadline {
-            crate::policy::ResolvedReadinessDeadline::Bounded(duration) => {
-                Deadline::after(now, duration).instant()
-            }
-            crate::policy::ResolvedReadinessDeadline::Unbounded => None,
-        };
+        let deadline = child
+            .options
+            .readiness_deadline
+            .duration()
+            .and_then(|duration| Deadline::after(now, duration).instant());
         let readiness_effect = readiness.step(ReadinessEvent::Configure {
             readiness: declared_readiness,
             deadline,
@@ -883,7 +882,7 @@ impl ScopeRuntime {
                 started_at: active.started_at,
                 stopped_at: runtime::now(),
             },
-            self.intensity_policy.within,
+            self.intensity_policy.within(),
         );
 
         // Fused cancellation is a level-triggered source. It can linearize

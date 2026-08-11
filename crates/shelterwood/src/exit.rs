@@ -269,7 +269,6 @@ impl fmt::Display for StartupFailure {
                     "membership identity space is exhausted for child `{id}`"
                 )
             }
-            StartupFailureCause::InvalidPolicy(invalid) => invalid.fmt(formatter),
         }
     }
 }
@@ -277,7 +276,6 @@ impl fmt::Display for StartupFailure {
 impl Error for StartupFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.cause {
-            StartupFailureCause::InvalidPolicy(invalid) => Some(invalid),
             StartupFailureCause::Child { exit, .. } => match exit.kind() {
                 ExitKind::Failed(error) => Some(error.as_error()),
                 ExitKind::Completed
@@ -315,8 +313,6 @@ pub enum StartupFailureCause {
         /// Child whose stable membership could not be minted.
         id: ChildId,
     },
-    /// A produced subtree contained an invalid public policy literal.
-    InvalidPolicy(crate::policy::InvalidPolicy),
 }
 
 #[derive(Debug)]

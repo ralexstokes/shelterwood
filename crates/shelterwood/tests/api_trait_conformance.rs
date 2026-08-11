@@ -131,6 +131,9 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     let _assert_scope_futures = |scope: &ScopeRef| {
         assert_send(scope.wait_stopped());
         assert_send(scope.shutdown_and_wait(Duration::ZERO));
+        // The ordinary `&str` id, then a deliberately non-`Send` one: the
+        // conversion happens before the future exists, so both are `Send`.
+        assert_send(scope.wait_for_child("child", |_| true, Duration::ZERO));
         assert_send(scope.wait_for_child(
             RcId(Rc::new(()), "child".into()),
             |_| true,
@@ -140,6 +143,7 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     let _assert_dynamic_scope_futures = |scope: &DynamicScopeRef| {
         assert_send(scope.wait_stopped());
         assert_send(scope.shutdown_and_wait(Duration::ZERO));
+        assert_send(scope.wait_for_child("child", |_| true, Duration::ZERO));
         assert_send(scope.wait_for_child(
             RcId(Rc::new(()), "child".into()),
             |_| true,

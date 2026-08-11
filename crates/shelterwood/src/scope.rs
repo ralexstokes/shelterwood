@@ -81,6 +81,11 @@ impl ScopeRef {
     /// Snapshot watches conflate intermediate states, so `pred` should accept
     /// every state at or beyond the desired edge and must remain cheap and
     /// non-blocking.
+    ///
+    /// `id` is converted through `Into<ChildId>` eagerly, on the calling
+    /// thread, before the future exists — so the conversion runs even when the
+    /// returned future is never polled. That is what keeps the future `Send`
+    /// for a non-`Send` `id`; the wait itself still begins at first poll.
     pub fn wait_for_child<P>(
         &self,
         id: impl Into<ChildId>,
@@ -260,6 +265,11 @@ impl DynamicScopeRef {
     /// Snapshot watches conflate intermediate states, so `pred` should accept
     /// every state at or beyond the desired edge and must remain cheap and
     /// non-blocking.
+    ///
+    /// `id` is converted through `Into<ChildId>` eagerly, on the calling
+    /// thread, before the future exists — so the conversion runs even when the
+    /// returned future is never polled. That is what keeps the future `Send`
+    /// for a non-`Send` `id`; the wait itself still begins at first poll.
     pub fn wait_for_child<P>(
         &self,
         id: impl Into<ChildId>,

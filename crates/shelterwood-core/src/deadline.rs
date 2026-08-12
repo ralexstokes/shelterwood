@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 ///
 /// The value deliberately permits zero. Zero is not interpreted by the
 /// caller: each operation selects one of the three library-defined behaviors
-/// through [`ZeroBudgetBehavior`]—no attempt, one observation pass, or
-/// immediate escalation. Keeping the value nominal prevents a bare
-/// `Duration::ZERO` from acquiring undocumented semantics at a new API site.
+/// in its implementation—no attempt, one observation pass, or immediate
+/// escalation. Keeping the value nominal prevents a bare `Duration::ZERO`
+/// from acquiring undocumented semantics at a new API site.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeadlineBudget(Duration);
 
@@ -32,17 +32,6 @@ impl DeadlineBudget {
     #[must_use]
     pub const fn is_zero(self) -> bool {
         self.0.is_zero()
-    }
-
-    /// Selects and reports the operation's zero-width behavior.
-    ///
-    /// Every public API consuming a budget calls this at the point where its
-    /// clock starts. A non-zero budget returns `None`; a zero budget returns
-    /// the behavior selected by that API.
-    #[doc(hidden)]
-    #[must_use]
-    pub const fn zero_behavior(self, behavior: ZeroBudgetBehavior) -> Option<ZeroBudgetBehavior> {
-        if self.is_zero() { Some(behavior) } else { None }
     }
 }
 
@@ -72,6 +61,26 @@ pub enum ZeroBudgetBehavior {
     PollOnce,
     /// Skip cooperative waiting and enter the escalation tail immediately.
     ImmediateEscalation,
+}
+
+/// Selects and reports one operation's zero-width behavior.
+///
+/// This is a free function rather than an inherent [`DeadlineBudget`] method:
+/// the budget is re-exported by the supported façade, while this cross-crate
+/// selector and [`ZeroBudgetBehavior`] are implementation seams. Keeping the
+/// seam off the inherent method set prevents it from leaking through that
+/// re-export.
+#[doc(hidden)]
+#[must_use]
+pub const fn select_zero_budget_behavior(
+    budget: DeadlineBudget,
+    behavior: ZeroBudgetBehavior,
+) -> Option<ZeroBudgetBehavior> {
+    if budget.is_zero() {
+        Some(behavior)
+    } else {
+        None
+    }
 }
 
 /// An absolute deadline, or one too distant for the clock to represent.
@@ -156,18 +165,21 @@ impl Deadline {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{Deadline, DeadlineBudget, ZeroBudgetBehavior};
+    use super::{Deadline, DeadlineBudget, ZeroBudgetBehavior, select_zero_budget_behavior};
 
     #[test]
-    fn zero_budget_behavior_is_selected_by_each_api() {
+    fn zero_budget_selector_is_total_over_the_behavior_inventory() {
         for behavior in [
             ZeroBudgetBehavior::NoAttempt,
             ZeroBudgetBehavior::PollOnce,
             ZeroBudgetBehavior::ImmediateEscalation,
         ] {
-            assert_eq!(DeadlineBudget::ZERO.zero_behavior(behavior), Some(behavior));
             assert_eq!(
-                DeadlineBudget::new(Duration::from_nanos(1)).zero_behavior(behavior),
+                select_zero_budget_behavior(DeadlineBudget::ZERO, behavior),
+                Some(behavior)
+            );
+            assert_eq!(
+                select_zero_budget_behavior(DeadlineBudget::new(Duration::from_nanos(1)), behavior),
                 None
             );
         }

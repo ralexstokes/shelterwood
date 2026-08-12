@@ -55,9 +55,11 @@ pub(crate) async fn shutdown_scope(
         watcher.changed().await;
     }
 
-    let outcome = if timeout
-        .zero_behavior(crate::deadline::ZeroBudgetBehavior::ImmediateEscalation)
-        .is_some()
+    let outcome = if crate::deadline::select_zero_budget_behavior(
+        timeout,
+        crate::deadline::ZeroBudgetBehavior::ImmediateEscalation,
+    )
+    .is_some()
     {
         // Zero is an escalation budget, not an observation opportunity: the
         // cooperative request above is still delivered, but its wait is

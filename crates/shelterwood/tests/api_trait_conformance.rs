@@ -6,11 +6,12 @@ use shelterwood::{
     DefaultsInheritance, DynamicActorSlot, DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot,
     DynamicTree, ExitError, ExitResult, GracePhase, Guard, Handler, Incarnation, Intensity,
     LifecycleEvents, LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, MembershipStatus,
-    OneShotTaskRef, RawActor, RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline,
-    Removal, Reply, ReplyReceive, ReplyReceiver, ReserveError, RestartAttempt, RestartCount,
-    RestartPolicy, Retention, ScopeDefaults, ScopeRef, SendError, SendFuture, SendTimeout,
-    Shutdown, SnapshotClosed, SnapshotReceiver, StopContext, Strategy, SubtreeDef, SubtreeOnceDef,
-    SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, TotalRestarts, Tree, WaitError,
+    NonZeroDuration, OneShotTaskRef, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
+    ReadinessDeadline, Removal, Reply, ReplyReceive, ReplyReceiver, ReserveError, RestartAttempt,
+    RestartCount, RestartPolicy, Retention, ScopeDefaults, ScopeRef, SendError, SendFuture,
+    SendTimeout, Shutdown, SnapshotClosed, SnapshotReceiver, StopContext, Strategy, SubtreeDef,
+    SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, TotalRestarts,
+    Tree, WaitError,
 };
 
 fn assert_error<T: Error>() {}
@@ -73,9 +74,16 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     assert_copy_eq_hash_send_sync::<RestartCount>();
     assert_copy_eq_hash_send_sync::<TotalRestarts>();
     assert_copy_eq_hash_send_sync::<DeadlineBudget>();
+    assert_copy_eq_hash_send_sync::<NonZeroDuration>();
     assert_eq!(RestartAttempt::ZERO.bump().get(), 1);
     assert_eq!(RestartCount::ZERO.bump().get(), 1);
     assert_eq!(TotalRestarts::ZERO.bump().get(), 1);
+    let grace = NonZeroDuration::new(Duration::from_nanos(1)).expect("non-zero public grace");
+    assert_eq!(grace.get(), Duration::from_nanos(1));
+    assert_eq!(
+        Shutdown::Graceful { grace },
+        Shutdown::graceful(grace.get()).expect("validated grace remains accepted")
+    );
 
     assert_clone_eq_hash_send_sync::<ActorRef<Cell<()>>>();
     assert_clone_eq_hash_send_sync::<TaskRef>();
@@ -149,10 +157,10 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
         ));
     };
     let _assert_start_future = |system: System<ScopeRef>| {
-        assert_send(system.start_or_shutdown(Duration::ZERO.into()));
+        assert_send(system.start_or_shutdown(DeadlineBudget::ZERO));
     };
     let _assert_shutdown_future = |system: System<ScopeRef>| {
-        assert_send(system.shutdown(Duration::ZERO.into()));
+        assert_send(system.shutdown(DeadlineBudget::ZERO));
     };
     let _assert_wait_future = |system: System<ScopeRef>| assert_send(system.wait());
 }
@@ -379,18 +387,20 @@ fn raw_types_obey_error_and_future_trait_contracts() {
         )
         .expect("valid actor");
     assert_send(actor.send(Cell::new(())));
-    assert_send(actor.send_timeout(Cell::new(()), Duration::from_secs(1).into()));
+    assert_send(actor.send_timeout(Cell::new(()), DeadlineBudget::new(Duration::from_secs(1))));
     let call_state = Cell::new(());
     assert_send(actor.call(
         move |_reply: Reply<()>| {
             call_state.set(());
             Cell::new(())
         },
-        Duration::from_secs(1).into(),
+        DeadlineBudget::new(Duration::from_secs(1)),
     ));
     let (reply, receiver) = Reply::<Cell<()>>::channel();
     assert_send(reply);
     assert_send(receiver);
+    let (_reply, receiver) = Reply::<Cell<()>>::channel();
+    assert_send(receiver.recv(DeadlineBudget::new(Duration::from_secs(1))));
 }
 
 #[test]

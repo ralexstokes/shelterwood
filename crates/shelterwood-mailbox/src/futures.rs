@@ -102,7 +102,7 @@ impl<M: Send + 'static> ActorRef<M> {
     /// message with [`SendErrorKind::TimedOut`].
     pub fn send_timeout(&self, message: M, deadline: DeadlineBudget) -> SendTimeout<M> {
         SendTimeout {
-            deadlined: Deadlined::new(
+            deadlined: Deadlined::no_attempt(
                 TimedSend {
                     send: self.send(message),
                 },
@@ -134,7 +134,7 @@ impl<M: Send + 'static> ActorRef<M> {
         deadline: DeadlineBudget,
     ) -> CallFuture<M, T> {
         CallFuture {
-            deadlined: Deadlined::new(
+            deadlined: Deadlined::no_attempt(
                 CallOperation {
                     actor: self.clone(),
                     make_msg: Some(Box::new(make_msg)),

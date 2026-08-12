@@ -4,7 +4,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use shelterwood_core::{DeadlineBudget, ZeroBudgetBehavior};
+use shelterwood_core::{DeadlineBudget, ZeroBudgetBehavior, select_zero_budget_behavior};
 
 pub(crate) use shelterwood_core::deadline::Deadline;
 
@@ -60,7 +60,9 @@ pub(super) struct Deadlined<F> {
 }
 
 impl<F> Deadlined<F> {
-    pub(super) fn new(operation: F, budget_width: DeadlineBudget) -> Self {
+    /// Constructs the shared no-attempt deadline policy used by public
+    /// mailbox operations.
+    pub(super) fn no_attempt(operation: F, budget_width: DeadlineBudget) -> Self {
         Self {
             operation,
             budget_width,
@@ -81,9 +83,7 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             this.started = true;
             let budget = crate::runtime::deadline(this.budget_width.duration());
             this.budget = Some(budget);
-            if this
-                .budget_width
-                .zero_behavior(ZeroBudgetBehavior::NoAttempt)
+            if select_zero_budget_behavior(this.budget_width, ZeroBudgetBehavior::NoAttempt)
                 .is_none()
             {
                 this.timer = Some(crate::runtime::sleep_deadline(budget));
@@ -93,11 +93,7 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
         // nothing is submitted and no completion is observed. The expiry
         // boundary below governs only non-zero budgets, and the two rules
         // therefore never compete.
-        if this
-            .budget_width
-            .zero_behavior(ZeroBudgetBehavior::NoAttempt)
-            .is_some()
-        {
+        if select_zero_budget_behavior(this.budget_width, ZeroBudgetBehavior::NoAttempt).is_some() {
             return Poll::Ready(this.operation.short_circuit());
         }
         let budget = this
@@ -173,7 +169,7 @@ mod tests {
     #[crate::runtime::test(start_paused = true)]
     async fn an_expired_deadline_future_never_repolls_its_resolved_timer() {
         let width = std::time::Duration::from_secs(1);
-        let mut future = Box::pin(super::Deadlined::new(
+        let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             width.into(),
         ));
@@ -191,7 +187,7 @@ mod tests {
 
     #[test]
     fn a_zero_budget_short_circuits_without_polling_the_operation() {
-        let mut future = Box::pin(super::Deadlined::new(
+        let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             shelterwood_core::DeadlineBudget::ZERO,
         ));

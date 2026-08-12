@@ -3440,22 +3440,28 @@ names a concrete additive axis: `Mailbox` (§16), `Strategy` (§19),
 This decision covers every public type; release tagging may deliberately
 revisit it, never inherit it accidentally.
 
-One cross-cutting shape rule: where a surface takes a
-deadline budget over other arguments (`offload`, `send_timeout`, `call`,
-`call_idempotent`, `shutdown`), the deadline is the trailing parameter.
-Deadline parameters are `DeadlineBudget` values; the budget's clock starts when
-the operation's returned future is first polled — except
-`offload`/`offload_scoped`, which return no future to poll (§5.5): their
-clock starts when the actor loop registers the offload, at the call
-itself. `DeadlineBudget` permits zero and is the single home for the following
+One cross-cutting shape rule: where a surface takes a deadline budget over
+other arguments, the deadline is the trailing parameter. Every such parameter
+is a `DeadlineBudget`; its clock origin follows the operation family rather
+than the representation. Mailbox futures and `wait_for_child` capture it on
+first poll. `offload`/`offload_scoped` return no future, so they start it when
+the actor loop registers the offload at the call (§5.5). The shutdown family
+uses the value as an escalation budget: `System::shutdown` and
+`ScopeRef::shutdown_and_wait` arm it only when the targeted incarnation enters
+drain, while `start_or_shutdown` does not spend it during startup and arms it
+only if rollback reaches that same drain edge (B.9;
+`integration::pre_spawn_shutdown_waits_for_teardown_to_exist`,
+`driver::observation::hard_aborted_incarnation_fences_shutdown_and_wait_without_arming_its_budget`,
+`integration::start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stragglers`).
+`DeadlineBudget` permits zero and is the single home for the following
 exhaustive zero-width semantics; each API selects one behavior in its
 implementation rather than interpreting a bare duration locally:
 
 | behavior | APIs | zero-width transition | checked evidence |
 |---|---|---|---|
-| no attempt | `send_timeout`, `call`, `ReplyReceiver::recv`, `offload`, `offload_scoped` | do not submit/poll work or observe completion; return/deliver the timeout result | `deadline::zero_budget_behavior_is_selected_by_each_api`, `mailbox::deadline::a_zero_budget_short_circuits_without_polling_the_operation`, `integration::zero_deadlines_short_circuit_without_acceptance_or_message_construction`, offload zero-budget tests |
-| poll once | `wait_for_child` | evaluate the current snapshot once with precedence match → terminal scope → timeout; never await | `deadline::zero_budget_behavior_is_selected_by_each_api`, `integration::zero_duration_wait_observes_an_already_satisfied_child`, observation closed-beats-zero test |
-| immediate escalation | `System::shutdown`, `ScopeRef::shutdown_and_wait`, `start_or_shutdown` rollback | request cooperative cancellation, skip only the cooperative wait, then run the ordinary abort tail | `deadline::zero_budget_behavior_is_selected_by_each_api`, `integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`, rollback zero-timeout tests |
+| no attempt | `send_timeout`, `call`, `ReplyReceiver::recv`, `offload`, `offload_scoped` | do not submit/poll work or observe completion; return/deliver the timeout result | `mailbox::deadline::a_zero_budget_short_circuits_without_polling_the_operation`, `integration::zero_deadlines_short_circuit_without_acceptance_or_message_construction`, `integration::reply_receiver_reports_drop_and_is_safe_to_abandon`, `integration::zero_budget_offload_never_polls_work_and_times_out_on_actor_task` |
+| poll once | `wait_for_child` | evaluate the current snapshot once with precedence match → terminal scope → timeout; never await | `integration::zero_duration_wait_observes_an_already_satisfied_child`, `integration::wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_termination` |
+| immediate escalation | `System::shutdown`, `ScopeRef::shutdown_and_wait`, `start_or_shutdown` rollback | request cooperative cancellation, skip only the cooperative wait, then run the ordinary abort tail | `integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`, `integration::start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stragglers` |
 
 For a no-attempt offload, whose timeout outcome is a delivery rather than a
 call failure, the work future is never polled and the total continuation

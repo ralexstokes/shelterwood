@@ -78,7 +78,7 @@ impl<T: Send + 'static> ReplyReceiver<T> {
     /// this receive capability and reports [`ReplyError::Timeout`].
     pub fn recv(self, deadline: DeadlineBudget) -> ReplyReceive<T> {
         ReplyReceive {
-            deadlined: Deadlined::new(
+            deadlined: Deadlined::no_attempt(
                 ReplyOperation {
                     receiver: self.receiver,
                 },

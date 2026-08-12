@@ -109,9 +109,11 @@ impl ScopeRef {
     where
         P: FnMut(&ChildSnapshot) -> bool + Send,
     {
-        let poll_once = timeout
-            .zero_behavior(crate::deadline::ZeroBudgetBehavior::PollOnce)
-            .is_some();
+        let poll_once = crate::deadline::select_zero_budget_behavior(
+            timeout,
+            crate::deadline::ZeroBudgetBehavior::PollOnce,
+        )
+        .is_some();
         let expires = crate::deadline::Deadline::after_budget(crate::runtime::now(), timeout);
         let mut snapshots = self.subscribe_snapshots();
 

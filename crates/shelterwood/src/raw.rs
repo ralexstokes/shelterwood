@@ -1498,9 +1498,11 @@ impl<M: Send + 'static> RawContext<M> {
         });
         let events = Arc::clone(&self.resources.events);
         let disposal = self.resources.disposal.clone();
-        if deadline
-            .zero_behavior(crate::deadline::ZeroBudgetBehavior::NoAttempt)
-            .is_some()
+        if crate::deadline::select_zero_budget_behavior(
+            deadline,
+            crate::deadline::ZeroBudgetBehavior::NoAttempt,
+        )
+        .is_some()
         {
             drop(work);
             events.push(QueuedEvent {

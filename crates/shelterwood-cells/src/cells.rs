@@ -555,7 +555,9 @@ impl MemberCell {
 pub struct ScopeRecord {
     pub state: ScopeState,
     pub startup: Option<Result<(), StartupError>>,
-    pub total_restarts: TotalRestarts,
+    /// Read only by this crate's snapshot publication; the driver takes its
+    /// restart totals from the decision that produced them.
+    pub(crate) total_restarts: TotalRestarts,
 }
 
 /// Type-erased declaration slot carried by the restart-stable cell layer.
@@ -668,7 +670,9 @@ impl<'a> ObservationTxn<'a> {
         self.pulses.push(Box::new(operation));
     }
 
-    pub fn pulse<T: 'static>(&mut self, sender: &runtime::WatchSender<T>) {
+    /// Defers a watch-channel wake. The driver reaches its own senders
+    /// through [`Self::defer`], so this stays inside the cell layer.
+    pub(crate) fn pulse<T: 'static>(&mut self, sender: &runtime::WatchSender<T>) {
         let sender = sender.clone();
         self.defer(move || sender.pulse());
     }

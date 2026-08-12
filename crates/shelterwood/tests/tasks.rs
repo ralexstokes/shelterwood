@@ -86,7 +86,7 @@ async fn dynamic_reservation_validates_ids_at_the_driver_boundary() {
 
     assert!(matches!(scope.reserve_task(""), Err(ReserveError::EmptyId)));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("dynamic root stops");
 
@@ -156,7 +156,7 @@ async fn dynamic_add_resolves_at_admission_and_removal_is_exact() {
         RemoveOutcome::AlreadyAbsent
     );
     assert_eq!(scope.remove_task(&second).await, RemoveOutcome::Removed);
-    assert_eq!(system.shutdown(Duration::from_secs(1)).await, Ok(()));
+    assert_eq!(system.shutdown(Duration::from_secs(1).into()).await, Ok(()));
 }
 
 #[tokio::test]
@@ -248,7 +248,7 @@ async fn one_shot_completion_reports_abort_verdict() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("task starts");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("forced shutdown joins the task");
 
@@ -297,7 +297,7 @@ async fn one_shot_value_cannot_override_readiness_timeout_verdict() {
     ));
     assert!(system.wait_started().await.is_err());
     system
-        .shutdown(Duration::ZERO)
+        .shutdown(Duration::ZERO.into())
         .await
         .expect("terminal task leaves no straggler");
 }

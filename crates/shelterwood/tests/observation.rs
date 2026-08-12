@@ -30,7 +30,6 @@ async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
     match next_item(events).await {
         LifecycleItem::Event(event) => event,
         LifecycleItem::Lagged { dropped } => panic!("unexpected lag marker dropping {dropped}"),
-        _ => panic!("unexpected future lifecycle item"),
     }
 }
 
@@ -85,7 +84,8 @@ async fn event_woken_pull_snapshots_are_consistent_at_first_start_and_final_stop
             .membership,
         nested_membership
     );
-    let shutdown = tokio::spawn(async move { system.shutdown(Duration::from_secs(1)).await });
+    let shutdown =
+        tokio::spawn(async move { system.shutdown(Duration::from_secs(1).into()).await });
     let mut saw_final_stop = false;
     while let Some(item) = tokio::time::timeout(Duration::from_secs(2), events.recv())
         .await
@@ -145,8 +145,8 @@ async fn lifecycle_lag_is_exact_coalesced_per_episode_and_subscribers_are_isolat
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
-    let mut slow = scope.subscribe_lifecycle();
-    let mut fast = scope.subscribe_lifecycle();
+    let mut slow = scope.as_scope().subscribe_lifecycle();
+    let mut fast = scope.as_scope().subscribe_lifecycle();
 
     let admissions_per_episode = LIFECYCLE_EVENT_CAPACITY.div_ceil(EVENTS_PER_ADMISSION) + 1;
     let emitted_per_episode = admissions_per_episode * EVENTS_PER_ADMISSION;
@@ -158,7 +158,7 @@ async fn lifecycle_lag_is_exact_coalesced_per_episode_and_subscribers_are_isolat
             drain_added_started_ready(&mut fast).await;
         }
 
-        let watermark = scope.snapshot().lifecycle_seq;
+        let watermark = scope.as_scope().snapshot().lifecycle_seq;
         assert_eq!(
             next_item(&mut slow).await,
             LifecycleItem::Lagged {
@@ -179,7 +179,7 @@ async fn lifecycle_lag_is_exact_coalesced_per_episode_and_subscribers_are_isolat
     drop(slow);
     drop(fast);
     system
-        .shutdown(Duration::from_secs(2))
+        .shutdown(Duration::from_secs(2).into())
         .await
         .expect("all waiting tasks shut down");
 }
@@ -189,8 +189,8 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let root = system.scope();
-    let mut events = root.subscribe_lifecycle();
-    let before = root.snapshot();
+    let mut events = root.as_scope().subscribe_lifecycle();
+    let before = root.as_scope().snapshot();
     assert!(before.child("nested").is_none());
 
     let nested = root
@@ -199,7 +199,8 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
         .expect("subtree admitted");
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            root.snapshot()
+            root.as_scope()
+                .snapshot()
                 .child("nested")
                 .is_some_and(|child| matches!(child.state, ChildState::Running))
         })
@@ -208,10 +209,10 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
 
     // Prescribed acquisition order: subscribe first, snapshot second. Every
     // item already queued is reflected by the recursive watermark.
-    let caught_up = root.snapshot();
+    let caught_up = root.as_scope().snapshot();
     let mut initial = Vec::new();
     while let Ok(LifecycleItem::Event(event)) = events.try_recv() {
-        let watermark = if event.scope == root.membership() {
+        let watermark = if event.scope == root.as_scope().membership() {
             Some(caught_up.lifecycle_seq)
         } else {
             caught_up.watermark(event.scope)
@@ -228,7 +229,7 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
     }));
 
     assert_eq!(root.remove_scope(&nested).await, RemoveOutcome::Removed);
-    let after_removal = root.snapshot();
+    let after_removal = root.as_scope().snapshot();
     assert!(after_removal.child("nested").is_none());
     let mut saw_stale_descendant = false;
     while let Ok(LifecycleItem::Event(event)) = events.try_recv() {
@@ -251,7 +252,7 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
     let mut introduced = false;
     loop {
         let event = next_event(&mut events).await;
-        if event.scope == root.membership()
+        if event.scope == root.as_scope().membership()
             && matches!(
                 event.kind,
                 LifecycleEventKind::Added { membership, .. }
@@ -271,7 +272,7 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
         RemoveOutcome::Removed
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root shuts down");
 }
@@ -281,7 +282,7 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let root = system.scope();
-    let mut events = root.subscribe_lifecycle();
+    let mut events = root.as_scope().subscribe_lifecycle();
     let (task, completion) = root
         .add_task_once(
             "retained",
@@ -294,7 +295,8 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     task.wait().await;
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            root.snapshot()
+            root.as_scope()
+                .snapshot()
                 .child("retained")
                 .is_some_and(|child| child.state.is_terminal())
         })
@@ -349,8 +351,8 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
             break event;
         }
     };
-    assert_eq!(removed.scope, root.membership());
-    assert!(root.snapshot().child("retained").is_none());
+    assert_eq!(removed.scope, root.as_scope().membership());
+    assert!(root.as_scope().snapshot().child("retained").is_none());
 
     let (teardown_task, teardown_completion) = root
         .add_task_once(
@@ -364,14 +366,15 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     teardown_task.wait().await;
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            root.snapshot()
+            root.as_scope()
+                .snapshot()
                 .child("teardown-tombstone")
                 .is_some_and(|child| child.state.is_terminal())
         })
         .await
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root shuts down");
     let mut saw_teardown_prune = false;
@@ -400,7 +403,12 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
         }
     }
     assert!(saw_scope_stop);
-    assert!(root.snapshot().child("teardown-tombstone").is_none());
+    assert!(
+        root.as_scope()
+            .snapshot()
+            .child("teardown-tombstone")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -408,14 +416,14 @@ async fn descendant_events_forward_with_origin_identity_path_and_causal_order() 
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let root = system.scope();
-    let mut events = root.subscribe_lifecycle();
+    let mut events = root.as_scope().subscribe_lifecycle();
 
     let nested = root
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
         .expect("subtree admitted");
     let nested_membership = nested.membership();
-    let root_membership = root.membership();
+    let root_membership = root.as_scope().membership();
 
     let mut seen = Vec::new();
     loop {
@@ -470,7 +478,7 @@ async fn descendant_events_forward_with_origin_identity_path_and_causal_order() 
             );
         }
     }
-    let snapshot = root.snapshot();
+    let snapshot = root.as_scope().snapshot();
     let nested_child = snapshot.child("nested").expect("nested child is resident");
     let recursive = nested_child.nested.as_ref().expect("nested scope is live");
     assert_eq!(nested_child.scope_seq, Some(recursive.lifecycle_seq));
@@ -504,7 +512,7 @@ async fn descendant_events_forward_with_origin_identity_path_and_causal_order() 
     assert_eq!(removal.await, RemoveOutcome::Removed);
     while nested_events.recv().await.is_some() {}
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root shuts down");
 }
@@ -646,7 +654,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     );
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("tree shuts down");
 }
@@ -736,7 +744,7 @@ async fn rebuilt_declared_handles_and_incarnations_keep_identity() {
     assert_eq!(starts[1].1.membership(), second.membership());
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("tree shuts down");
 }
@@ -750,10 +758,11 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
     let waiting_scope = scope.clone();
     let waiter = tokio::spawn(async move {
         waiting_scope
+            .as_scope()
             .wait_for_child(
                 "later",
                 |child| matches!(child.state, ChildState::Running),
-                Duration::from_secs(1),
+                Duration::from_secs(1).into(),
             )
             .await
     });
@@ -769,13 +778,15 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
 
     assert_eq!(
         scope
-            .wait_for_child("missing", |_| true, Duration::ZERO)
+            .as_scope()
+            .wait_for_child("missing", |_| true, Duration::ZERO.into())
             .await,
         Err(WaitError::TimedOut)
     );
     assert_eq!(
         scope
-            .wait_for_child("still-missing", |_| true, Duration::from_millis(5))
+            .as_scope()
+            .wait_for_child("still-missing", |_| true, Duration::from_millis(5).into())
             .await,
         Err(WaitError::TimedOut)
     );
@@ -789,21 +800,23 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
         .expect("one-shot task admitted")
         .0;
     let terminal_snapshot = scope
+        .as_scope()
         .wait_for_child(
             "terminal",
             |child| child.state.is_terminal(),
-            Duration::from_secs(1),
+            Duration::from_secs(1).into(),
         )
         .await
         .expect("terminal child is delivered to the predicate");
     assert_eq!(terminal_snapshot.membership, terminal.membership());
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root shuts down");
     let after_shutdown = scope
-        .wait_for_child("missing", |_| false, Duration::ZERO)
+        .as_scope()
+        .wait_for_child("missing", |_| false, Duration::ZERO.into())
         .await;
     assert!(
         matches!(
@@ -822,7 +835,7 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
     drop(declaration);
     assert!(matches!(
         never_spawned
-            .wait_for_child("missing", |_| false, Duration::from_secs(1))
+            .wait_for_child("missing", |_| false, Duration::from_secs(1).into())
             .await,
         Err(WaitError::ScopeTerminated {
             state: ScopeState::Stopped {
@@ -837,17 +850,17 @@ async fn undefined_dynamic_reservations_are_absent_and_emit_no_membership_edges(
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let root = system.scope();
-    let mut events = root.subscribe_lifecycle();
+    let mut events = root.as_scope().subscribe_lifecycle();
 
     let reserved = root.reserve_task("reserved").expect("id is reserved");
-    assert!(root.snapshot().child("reserved").is_none());
+    assert!(root.as_scope().snapshot().child("reserved").is_none());
     assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
     drop(reserved);
-    assert!(root.snapshot().child("reserved").is_none());
+    assert!(root.as_scope().snapshot().child("reserved").is_none());
     assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root shuts down");
 }
@@ -857,7 +870,7 @@ async fn withdrawn_queued_admission_never_publishes_an_added_child() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let root = system.scope();
-    let mut events = root.subscribe_lifecycle();
+    let mut events = root.as_scope().subscribe_lifecycle();
     let slot = root
         .reserve_task("withdrawn")
         .expect("reservation succeeds");
@@ -872,7 +885,7 @@ async fn withdrawn_queued_admission_never_publishes_an_added_child() {
             shelterwood::NotAdmittingCause::ReservationEnded
         ))
     ));
-    assert!(root.snapshot().child("withdrawn").is_none());
+    assert!(root.as_scope().snapshot().child("withdrawn").is_none());
     while let Ok(item) = events.try_recv() {
         if let LifecycleItem::Event(event) = item {
             assert!(!matches!(
@@ -886,7 +899,7 @@ async fn withdrawn_queued_admission_never_publishes_an_added_child() {
     }
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root stops");
 }
@@ -938,9 +951,10 @@ async fn hard_aborted_scope_pairs_added_with_exited_and_removed() {
     let stuck = nested
         .add_task(
             "stuck",
-            TaskDef::new(|_| std::future::pending()).shutdown(shelterwood::Shutdown::Graceful {
-                grace: Duration::from_secs(30),
-            }),
+            TaskDef::new(|_| std::future::pending()).shutdown(
+                shelterwood::Shutdown::graceful(Duration::from_secs(30))
+                    .expect("grace is non-zero"),
+            ),
         )
         .expect("valid stuck task");
     let mut root = Tree::new();
@@ -954,7 +968,7 @@ async fn hard_aborted_scope_pairs_added_with_exited_and_removed() {
     system.wait_started().await.expect("tree starts");
     let mut events = sub.subscribe_lifecycle();
     system
-        .shutdown(Duration::from_secs(5))
+        .shutdown(Duration::from_secs(5).into())
         .await
         .expect("the subtree's abort policy bounds teardown");
 
@@ -1026,7 +1040,7 @@ async fn never_ran_members_stop_rather_than_report_startup_abort() {
         .wait_for_child(
             "never-ran",
             |child| matches!(child.state, ChildState::Stopped { .. }),
-            Duration::from_secs(1),
+            Duration::from_secs(1).into(),
         )
         .await
         .expect("joined suffix disposal publishes terminality");
@@ -1095,7 +1109,7 @@ async fn descendant_resolves_leaf_and_scope_path_endings() {
     assert!(snapshot.descendant(["nested", "missing"]).is_none());
     assert!(snapshot.descendant(["direct", "too-deep"]).is_none());
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("tree shuts down");
 }
@@ -1129,7 +1143,7 @@ async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
     let mut waiter = Box::pin(scope.wait_for_child(
         "gated",
         |child| matches!(child.state, ChildState::Running),
-        Duration::MAX,
+        Duration::MAX.into(),
     ));
     assert!(
         poll_once(waiter.as_mut()).is_pending(),
@@ -1140,7 +1154,7 @@ async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
         .await
         .expect("a far-future deadline waits for the condition instead of expiring");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("tree shuts down");
 }
@@ -1150,7 +1164,7 @@ async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_va
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
-    let mut snapshots = scope.subscribe_snapshots();
+    let mut snapshots = scope.as_scope().subscribe_snapshots();
 
     let task = scope
         .add_task(
@@ -1167,7 +1181,7 @@ async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_va
     task.wait().await;
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            scope.child("ephemeral").is_none()
+            scope.as_scope().child("ephemeral").is_none()
         })
         .await,
         "terminal removal reaches the latest snapshot"
@@ -1185,7 +1199,7 @@ async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_va
     .await;
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root stops");
 }
@@ -1195,7 +1209,7 @@ async fn cloned_snapshot_receivers_observe_independently_and_inherit_the_seen_ge
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
-    let mut original = scope.subscribe_snapshots();
+    let mut original = scope.as_scope().subscribe_snapshots();
     let mut peer = original.clone();
 
     let task = scope
@@ -1203,10 +1217,11 @@ async fn cloned_snapshot_receivers_observe_independently_and_inherit_the_seen_ge
         .await
         .expect("worker is admitted");
     scope
+        .as_scope()
         .wait_for_child(
             "worker",
             |child| matches!(child.state, ChildState::Running),
-            POLL_TIMEOUT,
+            POLL_TIMEOUT.into(),
         )
         .await
         .expect("worker starts");
@@ -1239,7 +1254,7 @@ async fn cloned_snapshot_receivers_observe_independently_and_inherit_the_seen_ge
     assert!(removed_from_original.child("worker").is_none());
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root stops");
 }
@@ -1255,7 +1270,7 @@ async fn lifecycle_subscriptions_start_now_without_replaying_prior_history() {
         .expect("old membership is admitted");
     assert_eq!(scope.remove_task(&old).await, RemoveOutcome::Removed);
 
-    let mut events = scope.subscribe_lifecycle();
+    let mut events = scope.as_scope().subscribe_lifecycle();
     assert_quiet(Duration::from_secs(1), || {
         !matches!(events.try_recv(), Err(LifecycleTryRecvError::Empty))
     })
@@ -1274,7 +1289,7 @@ async fn lifecycle_subscriptions_start_now_without_replaying_prior_history() {
 
     assert_eq!(scope.remove_task(&new).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root stops");
 }
@@ -1336,22 +1351,24 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
                 Backoff::Immediate,
             ))
             .retention(Retention::Remove)
-            .shutdown(shelterwood::Shutdown::Graceful {
-                grace: Duration::from_secs(30),
-            }),
+            .shutdown(
+                shelterwood::Shutdown::graceful(Duration::from_secs(30))
+                    .expect("grace is non-zero"),
+            ),
         )
         .await
         .expect("departing task is admitted");
     scope
+        .as_scope()
         .wait_for_child(
             "departing",
             |child| matches!(child.state, ChildState::Running),
-            POLL_TIMEOUT,
+            POLL_TIMEOUT.into(),
         )
         .await
         .expect("departing child runs");
 
-    let running = scope.snapshot();
+    let running = scope.as_scope().snapshot();
     assert_eq!(running.state, ScopeState::Running);
     assert_eq!(running.kind, ScopeKind::Dynamic);
     assert_eq!(
@@ -1420,13 +1437,14 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     let removal = scope.remove_task(&departing);
     stop_entered.wait().await;
     let removing = scope
+        .as_scope()
         .wait_for_child(
             "departing",
             |child| {
                 child.membership_status == MembershipStatus::Removing
                     && matches!(child.state, ChildState::Stopping)
             },
-            POLL_TIMEOUT,
+            POLL_TIMEOUT.into(),
         )
         .await
         .expect("planned removal projects a removing, stopping child");
@@ -1440,7 +1458,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     release_stop.release();
     assert_eq!(removal.await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root stops");
     assert!(nested_scope.snapshot().state.is_stopped());
@@ -1463,7 +1481,7 @@ async fn state_predicates_hold_only_for_terminal_projections() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
-    assert!(!scope.snapshot().state.is_stopped());
+    assert!(!scope.as_scope().snapshot().state.is_stopped());
 
     let runner = scope
         .add_task("runner", waiting_task())
@@ -1479,21 +1497,29 @@ async fn state_predicates_hold_only_for_terminal_projections() {
     drop(completion);
     done.wait().await;
     let terminal = scope
-        .wait_for_child("done", |child| child.state.is_terminal(), POLL_TIMEOUT)
+        .as_scope()
+        .wait_for_child(
+            "done",
+            |child| child.state.is_terminal(),
+            POLL_TIMEOUT.into(),
+        )
         .await
         .expect("finished child projects terminal state");
     assert!(matches!(terminal.state, ChildState::Stopped { .. }));
 
-    let running = scope.child("runner").expect("waiting child is resident");
+    let running = scope
+        .as_scope()
+        .child("runner")
+        .expect("waiting child is resident");
     assert!(matches!(running.state, ChildState::Running));
     assert!(!running.state.is_terminal());
 
     assert_eq!(scope.remove_task(&runner).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("root stops");
-    let stopped = scope.snapshot().state.clone();
+    let stopped = scope.as_scope().snapshot().state.clone();
     assert!(matches!(stopped, ScopeState::Stopped { .. }));
     assert!(stopped.is_stopped());
 }

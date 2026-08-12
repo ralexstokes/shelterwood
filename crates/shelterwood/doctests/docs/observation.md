@@ -70,10 +70,11 @@ restart wait should accept any incarnation that `supersedes` the saved one.
 Pin the returned `membership` when a same-id replacement would not satisfy the
 logical wait.
 
-Use a finite deadline for operational waits. `Duration::ZERO` still examines
-the current snapshot once, so an already-satisfied predicate succeeds. A
-duration too large for the platform clock to represent (including
-`Duration::MAX`) behaves as an unbounded wait rather than an immediate timeout.
+Use a finite `DeadlineBudget` for operational waits. `DeadlineBudget::ZERO`
+still examines the current snapshot once, so an already-satisfied predicate
+succeeds. A budget whose duration is too large for the platform clock to
+represent (including `DeadlineBudget::new(Duration::MAX)`) behaves as an
+unbounded wait rather than an immediate timeout.
 A missing child does not match yet because a future `Added` under that label may
 satisfy the wait. If the containing scope terminalizes first, `wait_for_child`
 returns its terminal scope state.

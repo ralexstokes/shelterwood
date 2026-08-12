@@ -82,7 +82,7 @@ impl Actor for DrainActor {
                                 ran.store(true, Ordering::SeqCst);
                             },
                             |_| Message::Offload,
-                            Duration::from_secs(1),
+                            Duration::from_secs(1).into(),
                         )
                         .expect_err("drain rejects offloads");
                     drop(offload);
@@ -94,7 +94,7 @@ impl Actor for DrainActor {
                                 scoped_ran.store(true, Ordering::SeqCst);
                             },
                             |_| Message::Offload,
-                            Duration::from_secs(1),
+                            Duration::from_secs(1).into(),
                         )
                         .expect_err("drain rejects scoped offloads");
                     // The rejected payload is recovered whole: the work
@@ -360,7 +360,7 @@ async fn run_fault_fixture(
                 blocking_result: Arc::clone(&blocking_result),
             })
             .mailbox_shutdown(mailbox_shutdown)
-            .shutdown(Shutdown::Graceful { grace }),
+            .shutdown(Shutdown::graceful(grace).expect("grace is non-zero")),
         )
         .expect("valid fault actor");
     let system = tree.spawn().expect("runtime is available");
@@ -379,7 +379,7 @@ async fn run_fault_fixture(
     }
 
     let started_at = tokio::time::Instant::now();
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(30)));
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(30).into()));
     shutdown_seen.wait().await;
     hold_release.release();
     if matches!(mode, FaultMode::SharedGrace) {

@@ -4,7 +4,6 @@ use crate::{ChildId, Incarnation};
 
 /// The kind of a failed actor send.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[non_exhaustive]
 pub enum SendErrorKind {
     /// The membership has no accepting incarnation right now.
     NotRunning,
@@ -61,7 +60,6 @@ impl fmt::Display for SendErrorKind {
 
 /// The kind of a failed request/reply call.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[non_exhaustive]
 pub enum CallErrorKind {
     /// The membership terminalized before acceptance.
     Terminated,
@@ -132,7 +130,6 @@ impl<T> fmt::Debug for Replied<T> {
 
 /// Failure of a standalone reply receiver.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[non_exhaustive]
 pub enum ReplyError {
     /// The reply capability was dropped unanswered.
     Dropped,

@@ -180,7 +180,7 @@ impl RouterActor {
             .directory
             .call(
                 |reply| DirectoryMessage::Lookup { reply },
-                Duration::from_secs(1),
+                Duration::from_secs(1).into(),
             )
             .await
             .map(|reply| reply.value)
@@ -204,7 +204,7 @@ impl RouterActor {
                         let route = candidate.route.clone();
                         move |reply| DirectoryMessage::Cutover { route, reply }
                     },
-                    Duration::from_secs(1),
+                    Duration::from_secs(1).into(),
                 )
                 .await
                 .map_err(|error| {
@@ -244,10 +244,11 @@ impl RouterActor {
         let ready = self
             .0
             .ranges
+            .as_scope()
             .wait_for_child(
                 id,
                 |child| matches!(child.state, shelterwood::ChildState::Running),
-                Duration::from_secs(1),
+                Duration::from_secs(1).into(),
             )
             .await
             .map_err(|error| ExitError::message(format!("range readiness failed: {error}")))?;
@@ -341,7 +342,7 @@ impl RouterActor {
                     let route = candidate.route.clone();
                     move |reply| DirectoryMessage::Cutover { route, reply }
                 },
-                Duration::from_secs(1),
+                Duration::from_secs(1).into(),
             )
             .await
             .map_err(|error| ExitError::message(format!("directory cutover failed: {error}")))?;
@@ -420,7 +421,7 @@ async fn replace_with_retry(
         match router
             .call(
                 move |reply| RouterMessage::Replace { operation, reply },
-                Duration::from_secs(1).min(remaining),
+                Duration::from_secs(1).min(remaining).into(),
             )
             .await
         {
@@ -484,7 +485,7 @@ async fn replace_with_retry(
                                     .incarnation
                                     .is_some_and(|current| current.supersedes(observed))
                             },
-                            remaining,
+                            remaining.into(),
                         )
                         .await
                         .expect("a superseding router incarnation runs");
@@ -516,7 +517,7 @@ async fn lookup(directory: &ActorRef<DirectoryMessage>) -> Option<Route> {
     directory
         .call(
             |reply| DirectoryMessage::Lookup { reply },
-            Duration::from_secs(1),
+            Duration::from_secs(1).into(),
         )
         .await
         .expect("directory lookup replies")
@@ -636,7 +637,7 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
                 value: 41,
                 reply,
             },
-            Duration::from_secs(1),
+            Duration::from_secs(1).into(),
         )
         .await
         .expect("new route accepts a write");
@@ -644,7 +645,7 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
     assert_eq!(failed_candidate.durable.get("alpha"), None);
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("store shuts down");
 }
@@ -723,7 +724,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
                         value: 7,
                         reply,
                     },
-                    Duration::from_secs(4),
+                    Duration::from_secs(4).into(),
                 )
                 .await
         }
@@ -741,6 +742,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
         async move { ranges.remove_scope(&scope).await }
     });
     ranges
+        .as_scope()
         .wait_for_child(
             "range-live",
             |child| {
@@ -749,7 +751,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
                     shelterwood::MembershipStatus::Removing
                 )
             },
-            Duration::from_secs(1),
+            Duration::from_secs(1).into(),
         )
         .await
         .expect("removal is underway");
@@ -766,7 +768,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
     );
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("store shuts down");
 }

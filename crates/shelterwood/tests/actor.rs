@@ -213,7 +213,7 @@ async fn manual_handler_readiness_is_not_released_automatically_after_init() {
     system.wait_started().await.expect("manual mark opens gate");
     assert!(sibling_started.load(Ordering::SeqCst));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("tree shuts down");
 }
@@ -297,7 +297,7 @@ async fn raw_decorator_await_before_handler_delegate_preserves_declared_readines
         .expect("decorated actor becomes ready");
     assert!(sibling_started.load(Ordering::SeqCst));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("tree shuts down");
 }
@@ -356,7 +356,12 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         .await
         .expect("dynamic actor live");
     let stopped = dynamic
-        .wait_for_child("dynamic", |child| child.state.is_terminal(), POLL_TIMEOUT)
+        .as_scope()
+        .wait_for_child(
+            "dynamic",
+            |child| child.state.is_terminal(),
+            POLL_TIMEOUT.into(),
+        )
         .await
         .expect("the dynamic actor's requested stop reaches terminal publication");
     assert!(matches!(
@@ -369,7 +374,7 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         "the dynamic actor completes its full stop path before the test proceeds"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("tree shuts down");
     assert_eq!(
@@ -445,7 +450,7 @@ impl Actor for OffloadThenFailActor {
                     std::future::pending::<()>().await;
                 },
                 |_| OffloadThenFailMessage::Start,
-                Duration::MAX,
+                Duration::MAX.into(),
             )
             .expect("live offload accepted");
         Err(ExitError::message("injected handler failure"))
@@ -487,7 +492,7 @@ async fn handler_error_joins_offloads_before_returning_to_a_raw_decorator() {
         ["offload-destroyed", "decorator-resumed"]
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("tree shuts down");
 }
@@ -537,7 +542,7 @@ async fn manual_readiness_override_on_a_wrapped_handler_stays_gated() {
         .await
         .expect("an explicit mark_ready releases the gate");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("tree shuts down");
 }

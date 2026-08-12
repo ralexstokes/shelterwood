@@ -142,9 +142,9 @@ async fn rebind_refreshes_all_overflow_waiter_incarnation_evidence() {
         .expect("first incarnation queue fills");
     let width = Duration::from_secs(10);
 
-    let mut promoted = Box::pin(actor.send_timeout(EvidenceMessage::Value, width));
-    let mut overflow = Box::pin(actor.send_timeout(EvidenceMessage::Value, width));
-    let mut call = Box::pin(actor.call(EvidenceMessage::Ask, width));
+    let mut promoted = Box::pin(actor.send_timeout(EvidenceMessage::Value, width.into()));
+    let mut overflow = Box::pin(actor.send_timeout(EvidenceMessage::Value, width.into()));
+    let mut call = Box::pin(actor.call(EvidenceMessage::Ask, width.into()));
     assert!(poll_once(promoted.as_mut()).is_pending());
     assert!(poll_once(overflow.as_mut()).is_pending());
     assert!(poll_once(call.as_mut()).is_pending());
@@ -182,7 +182,7 @@ async fn rebind_refreshes_all_overflow_waiter_incarnation_evidence() {
 
     hold_replacement.release();
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("actor stops");
 }
@@ -241,7 +241,7 @@ async fn send_rides_the_frozen_destructor_and_rebind_window() {
         "only one replacement starts"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("actor stops");
 }
@@ -310,7 +310,7 @@ async fn timed_send_withdraws_while_replacement_is_in_backoff() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     let first = actor.try_send(1).expect("first incarnation accepts");
-    let mut timed = Box::pin(actor.send_timeout(42, timeout));
+    let mut timed = Box::pin(actor.send_timeout(42, timeout.into()));
     assert!(poll_once(timed.as_mut()).is_pending());
     fail_first.release();
     let mut observed_rebind = None;
@@ -332,7 +332,10 @@ async fn timed_send_withdraws_while_replacement_is_in_backoff() {
     assert_eq!(error.kind, SendErrorKind::TimedOut);
     assert_eq!(error.incarnation_observed, Some(first));
     assert_eq!(error.message, 42);
-    system.shutdown(Duration::ZERO).await.expect("root stops");
+    system
+        .shutdown(Duration::ZERO.into())
+        .await
+        .expect("root stops");
 }
 
 /// Dropping a parked send while the mailbox is unbound (the rebind window)
@@ -388,7 +391,7 @@ async fn dropping_a_parked_send_in_the_rebind_window_withdraws_it() {
         deliveries.lock().expect("deliveries mutex poisoned")
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("actor stops");
 }

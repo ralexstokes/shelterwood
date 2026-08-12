@@ -5,8 +5,9 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll, Waker},
-    time::Duration,
 };
+
+use shelterwood_core::DeadlineBudget;
 
 use crate::{
     ActorIdentity, ChildId, Incarnation, Membership,
@@ -97,7 +98,9 @@ impl<M: Send + 'static> ActorRef<M> {
     /// Live latest-value displacement follows [`send`](Self::send): the
     /// displaced message is dropped inline on the task polling this send,
     /// after acceptance of the replacement is visible.
-    pub fn send_timeout(&self, message: M, deadline: Duration) -> SendTimeout<M> {
+    /// A zero budget makes no acceptance attempt and returns the unaccepted
+    /// message with [`SendErrorKind::TimedOut`].
+    pub fn send_timeout(&self, message: M, deadline: DeadlineBudget) -> SendTimeout<M> {
         SendTimeout {
             deadlined: Deadlined::new(
                 TimedSend {
@@ -116,6 +119,8 @@ impl<M: Send + 'static> ActorRef<M> {
     /// distinguishes a guaranteed-unaccepted timeout from an accepted request
     /// with an unknown outcome. See [`CallError`] for the required retry
     /// discipline.
+    /// A zero budget constructs or submits no message and reports
+    /// [`CallErrorKind::AcceptanceTimedOut`].
     ///
     /// On a latest-value mailbox, a newer accepted message can replace this
     /// request. Dropping the replaced request's [`Reply`] reports
@@ -126,7 +131,7 @@ impl<M: Send + 'static> ActorRef<M> {
     pub fn call<T: Send + 'static>(
         &self,
         make_msg: impl FnOnce(Reply<T>) -> M + Send + 'static,
-        deadline: Duration,
+        deadline: DeadlineBudget,
     ) -> CallFuture<M, T> {
         CallFuture {
             deadlined: Deadlined::new(

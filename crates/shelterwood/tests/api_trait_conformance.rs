@@ -1,8 +1,8 @@
-use std::{cell::Cell, error::Error, hash::Hash, ops::Deref, rc::Rc, time::Duration};
+use std::{cell::Cell, error::Error, hash::Hash, rc::Rc, time::Duration};
 
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ActorSlot, Admission, Blocking, BuildError, CallError,
-    CallFuture, Cancellation, CancellationToken, ChildId, Context, DeadlineElapsed,
+    CallFuture, Cancellation, CancellationToken, ChildId, Context, DeadlineBudget, DeadlineElapsed,
     DefaultsInheritance, DynamicActorSlot, DynamicScopeRef, DynamicSubtreeSlot, DynamicTaskSlot,
     DynamicTree, ExitError, ExitResult, GracePhase, Guard, Handler, Incarnation, Intensity,
     LifecycleEvents, LifecycleTryRecvError, Mailbox, MailboxShutdown, Membership, MembershipStatus,
@@ -19,11 +19,6 @@ fn assert_send_type<T: Send>() {}
 fn assert_send_sync<T: Send + Sync>() {}
 fn assert_copy_eq_hash_send_sync<T: Copy + Eq + Hash + Send + Sync>() {}
 fn assert_clone_eq_hash_send_sync<T: Clone + Eq + Hash + Send + Sync>() {}
-fn assert_deref<T, U: ?Sized>()
-where
-    T: Deref<Target = U>,
-{
-}
 fn assert_static<T: 'static>() {}
 
 macro_rules! assert_not_impl {
@@ -56,6 +51,7 @@ assert_not_impl!(Guard: Clone);
 assert_not_impl!(OneShotTaskRef<Cell<()>>: Clone);
 assert_not_impl!(Membership: Ord);
 assert_not_impl!(Incarnation: Ord);
+assert_not_impl!(DynamicScopeRef: std::ops::Deref);
 
 #[test]
 fn documented_identity_handle_token_and_owned_value_bounds_compile() {
@@ -76,6 +72,7 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     assert_copy_eq_hash_send_sync::<RestartAttempt>();
     assert_copy_eq_hash_send_sync::<RestartCount>();
     assert_copy_eq_hash_send_sync::<TotalRestarts>();
+    assert_copy_eq_hash_send_sync::<DeadlineBudget>();
     assert_eq!(RestartAttempt::ZERO.bump().get(), 1);
     assert_eq!(RestartCount::ZERO.bump().get(), 1);
     assert_eq!(TotalRestarts::ZERO.bump().get(), 1);
@@ -84,14 +81,11 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     assert_clone_eq_hash_send_sync::<TaskRef>();
     assert_clone_eq_hash_send_sync::<ScopeRef>();
     assert_clone_eq_hash_send_sync::<DynamicScopeRef>();
-    // Dynamic scope handles inherit every observation/control method through
-    // this relationship, so adding a ScopeRef method cannot omit it here.
-    assert_deref::<DynamicScopeRef, ScopeRef>();
-    // Existing inherent methods remain addressable through UFCS as well as
-    // ordinary method syntax.
-    let _ = DynamicScopeRef::id;
+    // Shared scope operations are available through one explicit capability
+    // boundary; DynamicScopeRef neither mirrors them nor dereferences.
     let _assert_dynamic_scope_method = |scope: &DynamicScopeRef| {
-        let _ = scope.id();
+        let _: &ScopeRef = scope.as_scope();
+        let _ = scope.as_scope().id();
     };
     assert_send_sync::<SnapshotReceiver>();
     assert_send_sync::<LifecycleEvents>();
@@ -130,31 +124,35 @@ fn documented_identity_handle_token_and_owned_value_bounds_compile() {
     let _assert_lifecycle_future = |events: &mut LifecycleEvents| assert_send(events.recv());
     let _assert_scope_futures = |scope: &ScopeRef| {
         assert_send(scope.wait_stopped());
-        assert_send(scope.shutdown_and_wait(Duration::ZERO));
+        assert_send(scope.shutdown_and_wait(DeadlineBudget::ZERO));
         // The ordinary `&str` id, then a deliberately non-`Send` one: the
         // conversion happens before the future exists, so both are `Send`.
-        assert_send(scope.wait_for_child("child", |_| true, Duration::ZERO));
+        assert_send(scope.wait_for_child("child", |_| true, DeadlineBudget::ZERO));
         assert_send(scope.wait_for_child(
             RcId(Rc::new(()), "child".into()),
             |_| true,
-            Duration::ZERO,
+            DeadlineBudget::ZERO,
         ));
     };
     let _assert_dynamic_scope_futures = |scope: &DynamicScopeRef| {
-        assert_send(scope.wait_stopped());
-        assert_send(scope.shutdown_and_wait(Duration::ZERO));
-        assert_send(scope.wait_for_child("child", |_| true, Duration::ZERO));
-        assert_send(scope.wait_for_child(
+        assert_send(scope.as_scope().wait_stopped());
+        assert_send(scope.as_scope().shutdown_and_wait(DeadlineBudget::ZERO));
+        assert_send(
+            scope
+                .as_scope()
+                .wait_for_child("child", |_| true, DeadlineBudget::ZERO),
+        );
+        assert_send(scope.as_scope().wait_for_child(
             RcId(Rc::new(()), "child".into()),
             |_| true,
-            Duration::ZERO,
+            DeadlineBudget::ZERO,
         ));
     };
     let _assert_start_future = |system: System<ScopeRef>| {
-        assert_send(system.start_or_shutdown(Duration::ZERO));
+        assert_send(system.start_or_shutdown(Duration::ZERO.into()));
     };
     let _assert_shutdown_future = |system: System<ScopeRef>| {
-        assert_send(system.shutdown(Duration::ZERO));
+        assert_send(system.shutdown(Duration::ZERO.into()));
     };
     let _assert_wait_future = |system: System<ScopeRef>| assert_send(system.wait());
 }
@@ -381,14 +379,14 @@ fn raw_types_obey_error_and_future_trait_contracts() {
         )
         .expect("valid actor");
     assert_send(actor.send(Cell::new(())));
-    assert_send(actor.send_timeout(Cell::new(()), Duration::from_secs(1)));
+    assert_send(actor.send_timeout(Cell::new(()), Duration::from_secs(1).into()));
     let call_state = Cell::new(());
     assert_send(actor.call(
         move |_reply: Reply<()>| {
             call_state.set(());
             Cell::new(())
         },
-        Duration::from_secs(1),
+        Duration::from_secs(1).into(),
     ));
     let (reply, receiver) = Reply::<Cell<()>>::channel();
     assert_send(reply);

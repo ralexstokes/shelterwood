@@ -216,7 +216,8 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
     let nested_ref = ScopeRef {
         cell: Arc::clone(&nested),
     };
-    let mut parked_shutdown = Box::pin(nested_ref.shutdown_and_wait(Duration::from_secs(10)));
+    let mut parked_shutdown =
+        Box::pin(nested_ref.shutdown_and_wait(Duration::from_secs(10).into()));
     let first_shutdown_poll =
         std::future::poll_fn(|context| Poll::Ready(parked_shutdown.as_mut().poll(context))).await;
     assert!(
@@ -242,7 +243,7 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
         before_epilogue.is_pending(),
         "a parked shutdown wait must not treat published membership terminality as scope settlement"
     );
-    let mut fresh_shutdown = Box::pin(nested_ref.shutdown_and_wait(Duration::from_secs(10)));
+    let mut fresh_shutdown = Box::pin(nested_ref.shutdown_and_wait(Duration::from_secs(10).into()));
     let fresh_before_epilogue =
         std::future::poll_fn(|context| Poll::Ready(fresh_shutdown.as_mut().poll(context))).await;
     assert!(
@@ -251,7 +252,7 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
     );
 
     let mut snapshot_waiter =
-        Box::pin(nested_ref.wait_for_child("missing", |_| false, Duration::from_secs(10)));
+        Box::pin(nested_ref.wait_for_child("missing", |_| false, Duration::from_secs(10).into()));
     let first_snapshot_poll =
         std::future::poll_fn(|context| Poll::Ready(snapshot_waiter.as_mut().poll(context))).await;
     assert!(
@@ -307,7 +308,7 @@ async fn terminal_scope_in_drain_waits_for_its_live_incarnation_to_stop() {
     let nested_ref = ScopeRef {
         cell: Arc::clone(&nested),
     };
-    let mut shutdown = Box::pin(nested_ref.shutdown_and_wait(Duration::from_secs(10)));
+    let mut shutdown = Box::pin(nested_ref.shutdown_and_wait(Duration::from_secs(10).into()));
     let accepted =
         std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
     assert!(accepted.is_pending(), "the live shutdown request parks");
@@ -416,7 +417,7 @@ impl AbortedNestedDriverFixture {
 async fn aborted_nested_driver_epilogue_settles_a_shutdown_wait() {
     let fixture = AbortedNestedDriverFixture::new();
     let scope = fixture.scope_ref();
-    let mut shutdown = Box::pin(scope.shutdown_and_wait(Duration::from_secs(10)));
+    let mut shutdown = Box::pin(scope.shutdown_and_wait(Duration::from_secs(10).into()));
     assert!(
         std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context)))
             .await
@@ -454,10 +455,11 @@ async fn aborted_nested_driver_epilogue_wakes_a_parked_shutdown_task() {
     // task: it can only resolve if the epilogue actually wakes it.
     let fixture = AbortedNestedDriverFixture::new();
     let scope = fixture.scope_ref();
-    let waiter =
-        crate::runtime::spawn(
-            async move { scope.shutdown_and_wait(Duration::from_secs(30)).await },
-        );
+    let waiter = crate::runtime::spawn(async move {
+        scope
+            .shutdown_and_wait(Duration::from_secs(30).into())
+            .await
+    });
     crate::runtime::yield_now().await;
     fixture.terminalize_from_parent();
     crate::runtime::yield_now().await;
@@ -485,7 +487,7 @@ async fn terminal_unstarted_scope_is_already_settled() {
     assert_eq!(scope.record().state, ScopeState::Unstarted);
 
     let scope_ref = ScopeRef { cell: scope };
-    let mut shutdown = Box::pin(scope_ref.shutdown_and_wait(Duration::from_secs(10)));
+    let mut shutdown = Box::pin(scope_ref.shutdown_and_wait(Duration::from_secs(10).into()));
     let first_poll =
         std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
     assert!(
@@ -504,7 +506,7 @@ async fn shutdown_wait_settles_its_epoch_after_a_newer_incarnation_starts() {
     let scope_ref = ScopeRef {
         cell: Arc::clone(&scope),
     };
-    let mut shutdown = Box::pin(scope_ref.shutdown_and_wait(Duration::from_secs(10)));
+    let mut shutdown = Box::pin(scope_ref.shutdown_and_wait(Duration::from_secs(10).into()));
     let accepted =
         std::future::poll_fn(|context| Poll::Ready(shutdown.as_mut().poll(context))).await;
     assert!(
@@ -570,7 +572,7 @@ async fn wait_for_child_reloads_after_its_predicate_closes_the_snapshot_stream()
                 }
                 false
             },
-            Duration::from_secs(1),
+            Duration::from_secs(1).into(),
         )
         .await;
 
@@ -724,7 +726,7 @@ async fn hard_aborted_incarnation_fences_shutdown_and_wait_without_arming_its_bu
     // A budget far shorter than the blocked epilogue. It never arms: the
     // incarnation was hard-aborted before drain entry, so there is no
     // cooperative phase to escalate and no straggler report to make.
-    let mut shutdown = Box::pin(nested.shutdown_and_wait(Duration::from_millis(10)));
+    let mut shutdown = Box::pin(nested.shutdown_and_wait(Duration::from_millis(10).into()));
     let inside_window =
         crate::runtime::timeout(Duration::from_millis(250), shutdown.as_mut()).await;
     gate.release();

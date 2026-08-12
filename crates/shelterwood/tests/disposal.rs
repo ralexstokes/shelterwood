@@ -175,7 +175,7 @@ async fn blocking_unread_message_does_not_hold_bounded_shutdown() {
         .await
         .expect("message is accepted without being read");
 
-    let mut shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1)));
+    let mut shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1).into()));
     wait_for_destructor(&gate).await;
     let bounded = tokio::time::timeout(Duration::from_secs(1), &mut shutdown).await;
     gate.release();
@@ -231,7 +231,7 @@ async fn panicking_unread_messages_are_all_disposed_without_reclassifying_the_ac
         .expect("second message is accepted");
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("payload panics do not unwind the scope driver");
     assert!(
@@ -354,7 +354,7 @@ async fn factory_capture_destructor_panic_is_classified_during_shutdown() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("task starts");
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("factory destruction stays off the scope driver");
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -457,7 +457,7 @@ fn latest_prebind_conflation_is_destroyed_outside_the_current_thread_driver() {
         assert!(first.await.is_ok());
         assert!(second.await.is_ok());
         system
-            .shutdown(Duration::from_secs(1))
+            .shutdown(Duration::from_secs(1).into())
             .await
             .expect("latest actor shuts down");
         displaced_thread
@@ -494,7 +494,7 @@ async fn non_runtime_reservation_cancellation_contains_destructor_panic() {
     assert_ne!(disposal_thread, cancellation_thread);
     assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("dynamic root shuts down");
 }
@@ -606,7 +606,7 @@ async fn non_runtime_disposals_run_off_callers_and_contain_panics() {
     assert_ne!(late_disposal_thread, late_dropper_thread);
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("dynamic root shuts down");
 }
@@ -643,7 +643,7 @@ async fn unadmitted_removal_completes_after_blocking_definition_disposal() {
     assert_eq!(removal.await, RemoveOutcome::Removed);
     drop(admission);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("dynamic root shuts down");
 }
@@ -676,10 +676,11 @@ async fn restart_window_removal_joins_factory_disposal_before_terminality() {
         .await
         .expect("first incarnation starts");
     scope
+        .as_scope()
         .wait_for_child(
             "restarting",
             |child| matches!(child.state, ChildState::Restarting),
-            Duration::from_secs(1),
+            Duration::from_secs(1).into(),
         )
         .await
         .expect("task enters restart backoff");
@@ -705,7 +706,7 @@ async fn restart_window_removal_joins_factory_disposal_before_terminality() {
     ));
     assert_eq!(removal.await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("dynamic root shuts down");
 }
@@ -735,7 +736,7 @@ async fn unadmitted_removal_completes_when_the_panic_payload_destructor_panics()
     assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     drop(admission);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("dynamic root shuts down");
 }
@@ -786,7 +787,7 @@ async fn ordered_shutdown_waits_for_later_unstarted_definition_disposal() {
 
     let system = tree.spawn().expect("runtime is available");
     let shutdown_token = starts.recv().await.expect("earlier task starts");
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1)));
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1).into()));
     wait_for_destructor(&gate).await;
     assert!(
         !shutdown_token.is_cancelled(),
@@ -810,7 +811,7 @@ async fn ordered_shutdown_waits_for_later_unstarted_definition_disposal() {
 }
 
 #[tokio::test]
-async fn hard_shutdown_detaches_a_blocking_factory_disposal() {
+async fn zero_shutdown_reports_the_live_child_but_detaches_blocking_factory_disposal() {
     let gate = DestructorGate::default();
     let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
     let mut tree = Tree::new();
@@ -832,7 +833,7 @@ async fn hard_shutdown_detaches_a_blocking_factory_disposal() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("task starts");
 
-    let mut shutdown = tokio::spawn(system.shutdown(Duration::ZERO));
+    let mut shutdown = tokio::spawn(system.shutdown(Duration::ZERO.into()));
     wait_for_destructor(&gate).await;
     assert_ne!(
         drops
@@ -846,7 +847,9 @@ async fn hard_shutdown_detaches_a_blocking_factory_disposal() {
     let result = bounded
         .expect("hard escalation is not held by factory disposal")
         .expect("shutdown task joins");
-    result.expect("post-exit disposal is not an actor straggler");
+    let timeout = result.expect_err("zero skips the cooperative wait for the live child");
+    assert_eq!(timeout.stragglers.len(), 1);
+    assert_eq!(timeout.stragglers[0].path[0].as_str(), "blocked-factory");
     let exit = task.wait().await;
     assert!(matches!(exit.kind(), ExitKind::Completed));
     assert_eq!(exit.cancellation(), Cancellation::Observed);
@@ -879,7 +882,7 @@ async fn startup_rollback_detaches_never_started_one_shot_state_after_escalation
         .expect("valid one-shot suffix");
 
     let system = tree.spawn().expect("runtime is available");
-    let mut rollback = tokio::spawn(system.start_or_shutdown(Duration::ZERO));
+    let mut rollback = tokio::spawn(system.start_or_shutdown(Duration::ZERO.into()));
     wait_for_destructor(&gate).await;
     assert_ne!(
         drops
@@ -931,7 +934,7 @@ async fn startup_rollback_joins_never_started_disposal_before_terminality() {
         .expect("valid one-shot suffix");
 
     let system = tree.spawn().expect("runtime is available");
-    let mut rollback = Box::pin(system.start_or_shutdown(Duration::from_secs(5)));
+    let mut rollback = Box::pin(system.start_or_shutdown(Duration::from_secs(5).into()));
     poll_pending(&mut rollback).await;
     wait_for_destructor(&gate).await;
     assert_ne!(
@@ -987,7 +990,7 @@ async fn hard_shutdown_detaches_failed_nested_lowering_disposal() {
             .expect("failed definition disposal reports its thread"),
         thread::current().id()
     );
-    let mut shutdown = tokio::spawn(system.shutdown(Duration::ZERO));
+    let mut shutdown = tokio::spawn(system.shutdown(Duration::ZERO.into()));
     let bounded = tokio::time::timeout(Duration::from_secs(1), &mut shutdown).await;
     gate.release();
     let result = bounded
@@ -1026,12 +1029,12 @@ async fn restart_window_cleanup_is_isolated_without_reclassifying_the_recorded_e
         .wait_for_child(
             "restarting",
             |child| matches!(child.state, ChildState::Restarting),
-            Duration::from_secs(1),
+            Duration::from_secs(1).into(),
         )
         .await
         .expect("task enters restart backoff");
     system
-        .shutdown(Duration::ZERO)
+        .shutdown(Duration::ZERO.into())
         .await
         .expect("restart-window cleanup does not become a shutdown straggler");
     assert_ne!(
@@ -1200,7 +1203,7 @@ async fn dynamic_duplicate_rejection_disposes_definition_before_admission() {
     let error = admission.await.expect_err("duplicate id is rejected");
     assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("dynamic root shuts down");
 }
@@ -1295,7 +1298,7 @@ async fn cancelled_call_disposes_stored_reply_off_the_caller() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
 
-    let mut call = Box::pin(actor.call(|reply| reply, Duration::from_secs(5)));
+    let mut call = Box::pin(actor.call(|reply| reply, Duration::from_secs(5).into()));
     poll_pending(&mut call).await;
     // The first poll must establish the cancellation window before the actor
     // can publish a reply; otherwise a fast second worker can complete the
@@ -1311,7 +1314,7 @@ async fn cancelled_call_disposes_stored_reply_off_the_caller() {
     gate.release();
     assert_ne!(disposal_thread, thread::current().id());
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("replier shuts down");
 }
@@ -1425,7 +1428,7 @@ async fn terminated_call_disposes_recovered_message_off_the_caller() {
                 _reply: reply,
                 _probe: probe,
             },
-            Duration::from_secs(1),
+            Duration::from_secs(1).into(),
         )
         .await
         .expect_err("terminated actor rejects the call");
@@ -1458,7 +1461,7 @@ async fn acceptance_timed_out_call_disposes_recovered_message_off_the_caller() {
                 _reply: reply,
                 _probe: probe,
             },
-            Duration::from_millis(50),
+            Duration::from_millis(50).into(),
         )
         .await
         .expect_err("unbound mailbox never accepts within the deadline");
@@ -1501,7 +1504,7 @@ async fn overdue_call_construction_disposes_message_off_constructor_task_and_con
                     _probe: probe,
                 }
             },
-            Duration::from_millis(1),
+            Duration::from_millis(1).into(),
         )
         .await
         .expect_err("overdue construction times out before mailbox submission");
@@ -1532,7 +1535,7 @@ async fn dropped_unstarted_call_disposes_constructor_off_the_caller() {
         move |_reply: Reply<()>| {
             let _ = &capture;
         },
-        Duration::from_secs(1),
+        Duration::from_secs(1).into(),
     );
     drop(call);
     assert_ne!(

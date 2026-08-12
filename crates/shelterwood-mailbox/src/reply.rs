@@ -1,8 +1,9 @@
 use std::{
     fmt,
     task::{Context, Poll},
-    time::Duration,
 };
+
+use shelterwood_core::DeadlineBudget;
 
 use crate::runtime::{DisposingReceiver, OneShotClose, OneShotSender, dispose_detached};
 
@@ -72,7 +73,10 @@ impl<T> fmt::Debug for ReplyReceiver<T> {
 
 impl<T: Send + 'static> ReplyReceiver<T> {
     /// Consumes the receiver and waits within one response-only budget.
-    pub fn recv(self, deadline: Duration) -> ReplyReceive<T> {
+    ///
+    /// A zero budget does not observe an already-published response; it closes
+    /// this receive capability and reports [`ReplyError::Timeout`].
+    pub fn recv(self, deadline: DeadlineBudget) -> ReplyReceive<T> {
         ReplyReceive {
             deadlined: Deadlined::new(
                 ReplyOperation {
@@ -159,12 +163,12 @@ mod tests {
 
         let (reply, receiver) = super::Reply::channel();
         reply.send(7_u8);
-        assert_eq!(receiver.recv(deadline).await, Ok(7));
+        assert_eq!(receiver.recv(deadline.into()).await, Ok(7));
 
         let (reply, receiver) = super::Reply::<u8>::channel();
         drop(reply);
         assert_eq!(
-            receiver.recv(deadline).await,
+            receiver.recv(deadline.into()).await,
             Err(super::ReplyError::Dropped)
         );
 

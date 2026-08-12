@@ -87,7 +87,7 @@ async fn accepted_but_undelivered_prefix_never_crosses_an_incarnation() {
         .await
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("actor stops");
     // The final history is authoritative: after synchronized shutdown no
@@ -144,7 +144,7 @@ async fn accepted_then_killed_call_reports_reply_dropped_with_accepting_identity
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     let accepting = actor.try_send(CallMessage::Marker).expect("marker accepts");
-    let mut call = Box::pin(actor.call(CallMessage::Ask, Duration::from_secs(1)));
+    let mut call = Box::pin(actor.call(CallMessage::Ask, Duration::from_secs(1).into()));
     assert!(
         poll_once(call.as_mut()).is_pending(),
         "the call is registered behind the marker before the actor is released"
@@ -263,7 +263,7 @@ async fn queue_preserves_per_sender_fifo_under_interleaved_senders() {
     assert_eq!(a, [1, 2]);
     assert_eq!(b, [1, 2]);
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("actor stops");
 }
@@ -308,7 +308,7 @@ async fn latest_conflation_drops_replaced_call_and_keeps_newest_value() {
     let accepting = actor
         .try_send(CallMessage::Value)
         .expect("identity probe accepts");
-    let mut call = Box::pin(actor.call(CallMessage::Ask, Duration::from_secs(1)));
+    let mut call = Box::pin(actor.call(CallMessage::Ask, Duration::from_secs(1).into()));
     assert!(poll_once(call.as_mut()).is_pending());
     assert_eq!(
         actor
@@ -324,7 +324,7 @@ async fn latest_conflation_drops_replaced_call_and_keeps_newest_value() {
     assert_eq!(error.incarnation_observed, Some(accepting));
     gate.release();
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("actor stops");
     // The replaced call envelope was destroyed at conflation time — the
@@ -376,7 +376,7 @@ async fn send_cancellation_withdraws_before_acceptance_but_not_after() {
         .await
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("actor stops");
     // The complete post-shutdown history proves the pre-acceptance
@@ -409,7 +409,7 @@ async fn call_cancellation_withdraws_before_acceptance_but_processes_after() {
         if !accepted_before_drop {
             actor.try_send(CallMessage::Value).expect("queue fills");
         }
-        let mut call = Box::pin(actor.call(CallMessage::Ask, Duration::from_secs(1)));
+        let mut call = Box::pin(actor.call(CallMessage::Ask, Duration::from_secs(1).into()));
         assert!(poll_once(call.as_mut()).is_pending());
         if accepted_before_drop {
             let full = actor
@@ -429,7 +429,7 @@ async fn call_cancellation_withdraws_before_acceptance_but_processes_after() {
             );
         }
         system
-            .shutdown(Duration::from_secs(1))
+            .shutdown(Duration::from_secs(1).into())
             .await
             .expect("actor stops");
         // The complete post-shutdown history is exact in both directions:
@@ -477,7 +477,7 @@ async fn undelivered_call_killed_at_incarnation_close_reports_reply_dropped() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     let accepting = actor.try_send(CallMessage::Marker).expect("marker accepts");
-    let mut call = Box::pin(actor.call(CallMessage::Ask, Duration::from_secs(1)));
+    let mut call = Box::pin(actor.call(CallMessage::Ask, Duration::from_secs(1).into()));
     assert!(
         poll_once(call.as_mut()).is_pending(),
         "the accepted call is queued before the marker terminates the incarnation"
@@ -510,9 +510,8 @@ async fn forced_teardown_terminalizes_nested_mailboxes() {
     let actor = nested
         .add_raw(
             "stubborn",
-            RawDef::factory(|| StubbornActor).shutdown(Shutdown::Graceful {
-                grace: Duration::from_secs(30),
-            }),
+            RawDef::factory(|| StubbornActor)
+                .shutdown(Shutdown::graceful(Duration::from_secs(30)).expect("grace is non-zero")),
         )
         .expect("valid actor");
     let mut root = Tree::new();
@@ -521,7 +520,7 @@ async fn forced_teardown_terminalizes_nested_mailboxes() {
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     let timeout = system
-        .shutdown(Duration::from_millis(50))
+        .shutdown(Duration::from_millis(50).into())
         .await
         .expect_err("the stubborn grace outlives the shutdown budget");
     assert!(!timeout.stragglers.is_empty());

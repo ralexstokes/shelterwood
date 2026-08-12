@@ -81,7 +81,7 @@ async fn default_mailbox_is_a_queue_of_sixty_four_messages() {
 
     release.release();
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("drained actor shuts down");
 }
@@ -99,7 +99,7 @@ async fn default_child_shutdown_grace_is_five_seconds() {
         .expect("immediate task readiness");
 
     let shutdown_started = tokio::time::Instant::now();
-    let mut shutdown = Box::pin(system.shutdown(Duration::from_secs(60)));
+    let mut shutdown = Box::pin(system.shutdown(Duration::from_secs(60).into()));
     assert_quiet(Duration::from_millis(50), || {
         poll_once(shutdown.as_mut()).is_ready()
     })
@@ -183,7 +183,7 @@ async fn default_readiness_deadline_is_thirty_seconds() {
     };
     assert!(*deadline >= before + Duration::from_secs(30));
     system
-        .shutdown(Duration::ZERO)
+        .shutdown(Duration::ZERO.into())
         .await
         .expect("terminal child leaves no straggler");
 }
@@ -253,13 +253,14 @@ async fn default_restart_backoff_and_retention_follow_definition_ownership() {
         .await
         .expect("restartable task is admitted");
     let running = scope
+        .as_scope()
         .wait_for_child(
             "restartable",
             |child| {
                 child.restart_count == RestartCount::ZERO.bump()
                     && matches!(child.state, shelterwood::ChildState::Running)
             },
-            POLL_TIMEOUT,
+            POLL_TIMEOUT.into(),
         )
         .await
         .expect("the immediate default backoff starts the replacement");
@@ -278,14 +279,14 @@ async fn default_restart_backoff_and_retention_follow_definition_ownership() {
     one_shot.wait().await;
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            scope.child("one-shot").is_none()
+            scope.as_scope().child("one-shot").is_none()
         })
         .await,
         "the default one-shot retention removes the terminal membership"
     );
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("dynamic root stops");
 }
@@ -347,7 +348,7 @@ async fn default_mailbox_shutdown_drains_the_frozen_prefix() {
     actor.try_send(()).expect("second message accepts");
 
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("implicit drain completes");
     assert_eq!(
@@ -384,7 +385,7 @@ async fn exit_after_default_tidy_cleanup(cleanup: Duration) -> shelterwood::Exit
         .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("task starts");
-    let mut shutdown = Box::pin(system.shutdown(Duration::from_secs(60)));
+    let mut shutdown = Box::pin(system.shutdown(Duration::from_secs(60).into()));
     assert!(poll_once(shutdown.as_mut()).is_pending());
     advance_time(Duration::from_secs(5)).await;
     abort_seen.wait().await;

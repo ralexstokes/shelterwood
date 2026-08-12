@@ -79,7 +79,7 @@ impl Actor for IngressActor {
                             id,
                             reply: journal_reply,
                         },
-                        POLL_TIMEOUT,
+                        POLL_TIMEOUT.into(),
                     )
                     .await
                     .map_err(|error| {
@@ -316,7 +316,7 @@ impl Actor for ToolActor {
             }
             ToolMessage::Work => {
                 context
-                    .offload(async { 7_u64 }, ToolMessage::Completed, POLL_TIMEOUT)
+                    .offload(async { 7_u64 }, ToolMessage::Completed, POLL_TIMEOUT.into())
                     .expect("live tool accepts incarnation-owned offload");
             }
             ToolMessage::Completed(Ok(7)) => {
@@ -433,7 +433,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     system.wait_started().await.expect("control plane starts");
     gateway
         .bridge
-        .call(|reply| BridgeMessage::Begin { reply }, POLL_TIMEOUT)
+        .call(|reply| BridgeMessage::Begin { reply }, POLL_TIMEOUT.into())
         .await
         .expect("bridge holds and later acknowledges a Reply");
 
@@ -466,10 +466,11 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     stream.send(3).await.expect("third stream update accepted");
     stream_gate.release();
     sessions
+        .as_scope()
         .wait_for_child(
             "session",
             |child| matches!(child.state, ChildState::Running),
-            POLL_TIMEOUT,
+            POLL_TIMEOUT.into(),
         )
         .await
         .expect("session aggregate readiness completes");
@@ -539,10 +540,11 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .await
         .expect("temporary tool admitted");
     tools
+        .as_scope()
         .wait_for_child(
             "temporary-tool",
             |child| matches!(child.state, ChildState::Running),
-            POLL_TIMEOUT,
+            POLL_TIMEOUT.into(),
         )
         .await
         .expect("tool becomes ready");
@@ -553,6 +555,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             tools
+                .as_scope()
                 .snapshot()
                 .child("temporary-tool")
                 .is_some_and(|child| {
@@ -591,7 +594,9 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                 id: DELIVERY_ID,
                 reply,
             },
-            delivery_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            delivery_deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .into(),
         )
         .await
         .expect_err("durable write crash loses the first acknowledgement");
@@ -611,7 +616,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                     .incarnation
                     .is_some_and(|current| current.supersedes(accepting_incarnation))
             },
-            remaining,
+            remaining.into(),
         )
         .await
         .expect("redelivery waits for a superseding ingress incarnation");
@@ -635,7 +640,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                 id: DELIVERY_ID,
                 reply,
             },
-            remaining,
+            remaining.into(),
         )
         .await
         .expect("redelivery of the same journal id is acknowledged");
@@ -693,14 +698,16 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     assert!(!replacement.membership().supersedes(session_membership));
     assert!(!session_membership.supersedes(replacement.membership()));
     sessions
+        .as_scope()
         .wait_for_child(
             "session",
             |child| matches!(child.state, ChildState::Running),
-            POLL_TIMEOUT,
+            POLL_TIMEOUT.into(),
         )
         .await
         .expect("replacement session becomes ready");
     let replacement_snapshot = sessions
+        .as_scope()
         .snapshot()
         .child("session")
         .expect("replacement is resident")
@@ -717,7 +724,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         gateway_scope.membership()
     );
     system
-        .shutdown(POLL_TIMEOUT)
+        .shutdown(POLL_TIMEOUT.into())
         .await
         .expect("staged control-plane shutdown completes");
 }
@@ -850,7 +857,7 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
         "no value leaks past cancellation"
     );
     system
-        .shutdown(Duration::from_secs(1))
+        .shutdown(Duration::from_secs(1).into())
         .await
         .expect("the remaining root joins teardown before the runtime drops");
 }

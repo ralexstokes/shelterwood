@@ -2,6 +2,78 @@
 
 use std::time::{Duration, Instant};
 
+/// A relative time budget supplied to a public deadline-bearing operation.
+///
+/// The value deliberately permits zero. Zero is not interpreted by the
+/// caller: each operation selects one of the three library-defined behaviors
+/// through [`ZeroBudgetBehavior`]—no attempt, one observation pass, or
+/// immediate escalation. Keeping the value nominal prevents a bare
+/// `Duration::ZERO` from acquiring undocumented semantics at a new API site.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DeadlineBudget(Duration);
+
+impl DeadlineBudget {
+    /// A zero-width budget.
+    pub const ZERO: Self = Self(Duration::ZERO);
+
+    /// Creates a budget from a duration.
+    #[must_use]
+    pub const fn new(duration: Duration) -> Self {
+        Self(duration)
+    }
+
+    /// Returns the represented duration.
+    #[must_use]
+    pub const fn duration(self) -> Duration {
+        self.0
+    }
+
+    /// Reports whether this budget has zero width.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.0.is_zero()
+    }
+
+    /// Selects and reports the operation's zero-width behavior.
+    ///
+    /// Every public API consuming a budget calls this at the point where its
+    /// clock starts. A non-zero budget returns `None`; a zero budget returns
+    /// the behavior selected by that API.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn zero_behavior(self, behavior: ZeroBudgetBehavior) -> Option<ZeroBudgetBehavior> {
+        if self.is_zero() { Some(behavior) } else { None }
+    }
+}
+
+impl From<Duration> for DeadlineBudget {
+    fn from(duration: Duration) -> Self {
+        Self::new(duration)
+    }
+}
+
+impl From<DeadlineBudget> for Duration {
+    fn from(budget: DeadlineBudget) -> Self {
+        budget.duration()
+    }
+}
+
+/// The complete zero-width behavior inventory for deadline-bearing APIs.
+///
+/// This is a cross-crate implementation seam; the supported façade exports
+/// [`DeadlineBudget`], while individual operations fix one behavior in their
+/// contract rather than accepting this enum from callers.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ZeroBudgetBehavior {
+    /// Finish with the timeout result without attempting the operation.
+    NoAttempt,
+    /// Evaluate currently observable state once, then time out.
+    PollOnce,
+    /// Skip cooperative waiting and enter the escalation tail immediately.
+    ImmediateEscalation,
+}
+
 /// An absolute deadline, or one too distant for the clock to represent.
 ///
 /// Overflow consistently means that the deadline never arrives. In
@@ -45,6 +117,11 @@ impl Deadline {
         }
     }
 
+    /// Captures a nominal public budget relative to `started_at`.
+    pub fn after_budget(started_at: Instant, budget: DeadlineBudget) -> Self {
+        Self::after(started_at, budget.duration())
+    }
+
     /// Returns the representable absolute deadline, if there is one.
     pub fn instant(self) -> Option<Instant> {
         self.0
@@ -79,7 +156,22 @@ impl Deadline {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::Deadline;
+    use super::{Deadline, DeadlineBudget, ZeroBudgetBehavior};
+
+    #[test]
+    fn zero_budget_behavior_is_selected_by_each_api() {
+        for behavior in [
+            ZeroBudgetBehavior::NoAttempt,
+            ZeroBudgetBehavior::PollOnce,
+            ZeroBudgetBehavior::ImmediateEscalation,
+        ] {
+            assert_eq!(DeadlineBudget::ZERO.zero_behavior(behavior), Some(behavior));
+            assert_eq!(
+                DeadlineBudget::new(Duration::from_nanos(1)).zero_behavior(behavior),
+                None
+            );
+        }
+    }
 
     fn latest_representable(started_at: Instant) -> Instant {
         let mut low = Duration::ZERO;

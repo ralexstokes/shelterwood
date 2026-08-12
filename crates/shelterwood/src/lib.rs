@@ -26,6 +26,7 @@ mod tree;
 pub use actor::{Actor, ActorDef, ActorOnceDef, Context, Handler, StopContext};
 pub use admission::{NotAdmittingCause, RemoveOutcome, ReserveError};
 pub use cancellation::CancellationToken;
+pub use deadline::DeadlineBudget;
 pub use engine::{MembershipStatus, ScopeState};
 pub use exit::{
     Cancellation, Exit, ExitError, ExitKind, ExitResult, GracePhase, IntensityTrip,
@@ -44,9 +45,9 @@ pub use observe::{
 };
 pub use policy::{
     Backoff, BackoffFactor, BoundedReadinessDeadline, DefaultsInheritance, ExponentialBackoff,
-    FixedBackoff, Intensity, Jitter, JitterSample, Mailbox, MailboxShutdown, PolicyError,
-    Readiness, ReadinessDeadline, RestartAttempt, RestartCondition, RestartCount, RestartPolicy,
-    Retention, ScopeDefaults, Shutdown, Strategy, TotalRestarts,
+    FixedBackoff, Intensity, Jitter, JitterSample, Mailbox, MailboxShutdown, NonZeroDuration,
+    PolicyError, Readiness, ReadinessDeadline, RestartAttempt, RestartCondition, RestartCount,
+    RestartPolicy, Retention, ScopeDefaults, Shutdown, Strategy, TotalRestarts,
 };
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,

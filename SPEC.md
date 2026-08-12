@@ -313,8 +313,8 @@ publication, child-event handling, attachment/metadata publication.
   not scheduled — the membership terminalizes exactly as under `Never`,
   its last published exit standing as the terminal state; an unmintable
   **membership** fails the reservation or admission with a distinct,
-  enumerated exhaustion rejection (the non-exhaustive reserve/admission
-  errors carry it, B.8). Unreachable at `u64` scale either way — the
+  enumerated exhaustion rejection (the exhaustive reserve/admission errors
+  carry it, B.8). Unreachable at `u64` scale either way — the
   rule exists so identity stays exact even in the theory, and so
   §13.4's fail-closed property has no duplicate-token counterexample.
 - Inside a scope's runtime, the child address is a versioned handle whose
@@ -430,8 +430,8 @@ API, and projecting its owning membership (`membership()`, §3.2).
 - `ActorRef::send`/`call` results and errors expose the incarnation that
   accepted (or was observed at failure). **This lands in core** even though
   the pinning refinements are Part II: retrofitting a token into every
-  non-exhaustive error type later is exactly the origin's mistake with bare
-  integers, repeated.
+  result/error type later is exactly the origin's mistake with bare integers,
+  repeated.
 - Membership addressing remains the default everywhere. Snapshot generation
   comparisons use `supersedes`/ordering, and documentation MUST teach
   ordering, not equality-with-increment (a restart storm can advance an
@@ -761,7 +761,7 @@ Delivery is at-most-once (§1 principle 6). Send flavors on `ActorRef`
 - `try_send` — fail-fast: distinct outcomes for unbound-right-now (rebind
   window), full, and terminal. The documented choice for teardown-window
   notifications (§10).
-- `send_timeout` — `send` with a deadline; a zero deadline fails
+- `send_timeout` — `send` with a `DeadlineBudget`; a zero budget fails
   immediately. `TimedOut` is reported only once withdrawal has
   succeeded, so it always means guaranteed-not-accepted — the
   recovered message (B.3) is safe to re-send. The deadline tie has one
@@ -777,7 +777,7 @@ Delivery is at-most-once (§1 principle 6). Send flavors on `ActorRef`
   fn call<T: Send + 'static>(
       &self,
       make_msg: impl FnOnce(Reply<T>) -> M,
-      deadline: Duration,                    // trailing, per Appendix B
+      deadline: DeadlineBudget,              // trailing, per Appendix B
   ) -> impl Future<Output = Result<Replied<T>, CallError>>;
   // Replied<T>: the reply value plus the accepting Incarnation (§3.3)
   ```
@@ -1111,6 +1111,69 @@ handlers non-blocking. Contracts:
 Readiness is **declared data, read before the child's future is first
 polled** — never inferred from poll order.
 
+### 6.1 Reducer invariants and transitions
+
+These rules are normative over `SupervisorState`, `Event`, and `Effect`.
+Bracketed names are the checked evidence; `integration::…` names the public
+integration suite and `supervisor::…` names the pure reducer suite.
+
+1. **R1 — initial-only aggregate.** Only an `Initial { ready }` membership
+   gates scope startup. A runtime admission never enters the aggregate.
+   (`integration::runtime_dynamic_additions_never_join_aggregate_readiness`.)
+2. **R2 — readiness is incarnation-local and monotone until restart.** An
+   accepted `Ready` transition changes an initial member's bit `false → true`;
+   duplicate readiness is a no-op. An accepted `RestartPending` transition
+   resets that bit only while startup is incomplete. Once the aggregate has
+   fired it never rewinds. (`integration::earliest_mark_ready_wins_and_later_readiness_edges_are_no_ops`,
+   `integration::restart_before_aggregate_readiness_rearms_the_gate`,
+   `integration::aggregate_readiness_stays_monotonic_after_a_ready_child_restarts`.)
+3. **R3 — removal is sampled at the publication transition.** `Event::Ready`
+   carries the synchronous removal-latch sample. A true sample first marks
+   the membership `Removing`; readiness is then rejected. A committed removal
+   shrinks the initial set only at `Reclaim`, after `Removed` publication and
+   before the removal response resolves. (`supervisor::sampled_removal_suppresses_start_effects_until_commit`,
+   `integration::queued_removal_suppresses_replayed_self_stop_readiness`,
+   `integration::startup_removal_response_follows_aggregate_recomputation`.)
+4. **R4 — ordered start is one accepted edge at a time.** `Settle` emits
+   `StartChild` only for the current initial cursor, and advances the cursor
+   only past a spawned-and-ready member or a reclaimed key. Dynamic startup
+   may emit one accepted start per unspawned initial member. (`supervisor::start_effects_are_confined_to_the_spawn_transition`,
+   `integration::ordered_startup_advances_past_a_reclaimed_cursor`.)
+5. **R5 — settlement effects must be acknowledgeable.** Every
+   `StartChild { child }` names a resident `Unstarted | RestartPending` child,
+   exactly the acceptance set of `Event::Spawned`; a settlement pass that
+   emits no acknowledgeable work is already at a fixed point. This prevents
+   the driver’s level-triggered settle loop from spinning. (`supervisor::start_effects_are_confined_to_the_spawn_transition`,
+   `supervisor::exhaustive_small_scope_interleavings_preserve_reducer_invariants`.)
+6. **R6 — aggregate completion is derived.** `Settle` emits
+   `StartupCompleted` at most once, iff no resident initial record remains
+   unready. The empty initial set satisfies the predicate. (`integration::dynamic_startup_completes_after_removing_sole_unready_initial_member`,
+   `integration::dynamic_startup_completes_after_removing_every_initial_member`.)
+7. **R7 — terminal pre-ready failure is flavor-independent, rollback is
+   position-dependent.** The exit funnel applies restart policy first. A
+   terminal pre-ready failure emits `FailStartup`; an ordered suffix becomes
+   `NeverStarted`, while a dynamic scope has no unstarted suffix. Root failure
+   parks in `StartupFailed`; nested failure begins ordinary rollback.
+   (`integration::ordered_terminal_pre_ready_exit_parks_the_root_and_marks_suffix_never_started`,
+   `integration::dynamic_startup_failure_keeps_other_initial_members_supervised`,
+   `integration::nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause`.)
+
+No rule above is flagged unverified: each has direct checked evidence. The
+remaining prose in this section specifies declaration defaults, user-facing
+classification, and observation shape derived from these transitions.
+
+**Normative prose coverage.** Declaration/mode resolution and eager invalid
+mode rejection are checked by `integration::task_families_reject_after_init_readiness_eagerly`,
+`integration::raw_readiness_override_rejects_after_init_eagerly`, and
+`integration::subtree_readiness_deadline_defaults_inherit_or_reset_end_to_end`.
+Immediate-before-first-poll and ready-at-deadline behavior are checked by
+`integration::immediate_raw_construction_panic_classifies_post_ready` and
+`integration::ready_at_deadline_wins_and_shutdown_disarms_the_gate`.
+Ordered/dynamic failure and aggregate prose maps to R1–R7. Public `mark_ready`
+reachability and decorator propagation are compile/runtime conformance in
+`api_trait_conformance` and `integration::raw_manual_readiness_gates_ordered_startup_but_not_mailbox_acceptance`.
+No normative readiness paragraph remains unmapped.
+
 ```rust
 enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline is a child option (§8)
 ```
@@ -1281,6 +1344,62 @@ startup — the sibling MUST NOT start until the inner init returns.
 ## 7. Exits [#364]
 
 One classification, produced at one point, used by every consumer.
+
+### 7.1 Exit invariants and transition rules
+
+1. **E1 — record, destroy, join, publish.** One owned report token records the
+   run outcome; dropping it records the fallback. No consumer sees an exit
+   until the incarnation is destroyed and joined, and exactly one report is
+   then published. (`integration::raw_run_panic_with_panicking_destructor_publishes_one_report`,
+   `integration::terminal_stop_paths_share_one_complete_observation_transition`.)
+2. **E2 — total verdict precedence.** Classification orders `Panicked >
+   ReadinessTimedOut > Failed > Aborted > Completed`; `NeverStarted` is a
+   membership fact outside incarnation arbitration. A recorded `Failed`
+   survives later abort, while a recorded `Completed` does not.
+   (`exit::classification_precedence_is_table_driven`,
+   `exit::forced_outcomes_do_not_erase_stronger_recorded_evidence`,
+   `integration::one_shot_value_cannot_override_readiness_timeout_verdict`.)
+3. **E3 — cancellation is orthogonal sampled state.** The exit records
+   `Observed` iff the incarnation cancellation latch had fired when the
+   outcome was recorded. Restart eligibility never inspects this field.
+   (`engine::funnel_dispatch_depends_on_mode_and_membership_state`,
+   `integration::locally_requested_subtree_shutdown_reads_cancelled`.)
+4. **E4 — one authoritative membership/incarnation state.** Incarnation
+   phases advance only through `Unstarted → Active → Stopping? → Complete →
+   RestartPending | Disposing → Joined`; stale or out-of-order events are
+   total no-ops. Removal changes the enclosing membership state monotonically
+   to `Removing`, never a parallel flag. (`supervisor::transition_table_keeps_removal_in_the_authoritative_state`,
+   `supervisor::stale_events_cannot_skip_or_regress_incarnation_phases`,
+   `supervisor::exhaustive_small_scope_interleavings_preserve_reducer_invariants`.)
+5. **E5 — restart suppression is state-derived.** Exits schedule restart only
+   while the scope is running and the membership is resident. Draining or
+   `Removing` records schedule nothing and charge no intensity.
+   (`engine::funnel_dispatch_depends_on_mode_and_membership_state`,
+   `integration::same_batch_removal_suppresses_pending_restart_shutdown`.)
+6. **E6 — publication fences replacement.** A replacement spawn follows the
+   predecessor’s terminal publication; stale incarnation evidence cannot
+   affect the replacement. (`integration::restartable_raw_factory_runs_inside_the_incarnation_task`,
+   §13.7’s stale-event race probes.)
+
+No rule above is flagged unverified. User destructor double-panic behavior is
+a documented Rust process precondition rather than a state transition and is
+therefore not claimed as an in-process checked property.
+
+**Normative prose coverage.** Typed framework/user channels and structured
+provenance are checked by `exit::application_errors_cannot_forge_structured_provenance`
+and `exit::framework_errors_expose_structured_provenance_and_erased_views`.
+The complete variant/display/source inventory is checked by
+`exit::child_startup_failure_display_summarizes_every_exit_kind`,
+`exit::recorded_outcomes_are_canonical_exit_kinds`, and
+`exit::startup_errors_chain_their_structured_detail`. Precedence and
+cancellation map to E1–E5. Single-runner and publish-after-join prose maps to
+E1/E6 and the raw/task integration tests named there. Structured shutdown
+straggler paths are checked by
+`integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`.
+The in-process half of double-panic containment is checked by
+`integration::raw_run_panic_with_panicking_destructor_publishes_one_report`;
+the process-aborting half is explicitly **UNVERIFIED in process** because Rust
+terminates the process by contract.
 
 - The actor/task's own failure type and the framework's verdict are
   **separate channels**: user code returns its error; the runner constructs
@@ -1709,9 +1828,11 @@ Rules (normative):
   admission*: the call claims the id and mints the cell synchronously
   before returning — for the fused form too, whose future exists only
   to carry the two steps' outcome — while the admission command rides
-  the bounded command channel (§10), driven by the caller's polling;
-  that awaiting caller is the channel's backpressure. Drop cannot await
-  that channel, so the drop rules above are enacted through a
+  the unified unbounded event lane (§10), driven by the caller's polling.
+  The small request record is batched at the consumer; the reservation and
+  user payload remain owned by the producer, so a channel capacity would
+  bound ingest rate rather than memory. Drop cannot await that lane, so the
+  drop rules above are enacted through a
   **level-triggered cancellation latch** owned by the fused future and
   registered on the cell: dropping the future flips the latch
   synchronously (a token edge that always succeeds, like §10's shutdown
@@ -1913,8 +2034,10 @@ Two separated concerns:
 ### 9.3 Defaults [#369]
 
 **The scope-defaults record is enumerated, not elided.** `ScopeDefaults`
-is one plain-data record (§1) with exactly these fields, each optional
-(unset = resolve outward):
+is one plain-data record (§1) with exactly these fields. The first four are
+optional (`None` = resolve outward); readiness uses its own explicit
+`ReadinessDeadline::Inherit` unset state, so an `Option` cannot represent the
+same meaning twice:
 
 - `child_restart: RestartPolicy` — condition + backoff;
 - `child_shutdown: Shutdown`;
@@ -1922,7 +2045,7 @@ is one plain-data record (§1) with exactly these fields, each optional
   library default is `queue` at Appendix A's capacity; a scope may
   default its actors to `latest()`);
 - `mailbox_shutdown: MailboxShutdown`;
-- `readiness_deadline: ReadinessDeadline` (§6).
+- `readiness_deadline: ReadinessDeadline` (§6), default `Inherit`.
 
 Deliberately *not* in the record: readiness mode (per instance, §6),
 terminal-membership retention (decided by the child's §4.2 mode with a
@@ -1986,6 +2109,65 @@ One escalation ladder, one state machine, everywhere:
 cooperative cancel → grace expiry → tidy-abort beat → hard abort
 ```
 
+### 10.1 Shutdown invariants and transitions
+
+1. **S1 — one ladder.** Every stop owns exactly one `StopLadder`. Its accepted
+   transitions are `Idle --advance→ Cooperative/Cancel`, due cooperative
+   deadline `→ Escalated/Escalate`, due tidy deadline `→ Finished/HardAbort`.
+   `force(now)` only moves the current deadline earlier and never skips the
+   tidy beat. (`engine::ladder_uses_cancel_escalate_and_hard_abort_for_every_policy`,
+   `engine::repeated_force_expedites_without_rewinding_the_ladder`,
+   `engine::force_preserves_an_already_due_deadline`.)
+2. **S2 — stop policy has no zero-grace branch.** `Shutdown::Graceful`
+   contains `NonZeroDuration`; `Shutdown::graceful(Duration::ZERO)` is a
+   construction error. `Abort` is the sole immediate-escalation policy and
+   records `WithinGrace`; expiry of a graceful policy records `AfterGrace`.
+   (`policy::graceful_shutdown_rejects_the_zero_duration_branch`,
+   `engine::ladder_uses_cancel_escalate_and_hard_abort_for_every_policy`.)
+3. **S3 — flavor owns sequencing, not mechanism.** `BeginDrain` initializes a
+   reverse cursor for ordered scopes and emits `StopChild` for every incomplete
+   child of a dynamic scope. Ordered `Settle` exposes at most one incomplete
+   child and does not advance until it joins. (`supervisor::ordered_stop_releases_one_child_per_join_in_reverse_order`,
+   `integration::ordered_graces_sum_while_dynamic_graces_overlap`.)
+4. **S4 — drain reason is a monotone lattice.** A later transition may upgrade
+   `Finished < IntensityTripped < StartupFailed < ShutdownRequested`, never
+   downgrade it. Forced shutdown also sets the hard-force fact and emits one
+   `ForceChild` per incomplete child. (`engine::scope_lifecycle_upgrades_drain_reasons_monotonically`,
+   `integration::latched_shutdown_upgrades_an_intensity_drain`,
+   `integration::force_uses_the_stop_funnel_for_every_ordered_child`.)
+5. **S5 — completion is derived and level-triggered.** `all_children_joined`
+   is derived from child states. `Settle` emits `Finished` once iff the
+   lifecycle’s flavor-specific finish predicate accepts that derived value.
+   (`supervisor::derived_completion_property_matches_the_child_states`,
+   `supervisor::exhaustive_small_scope_interleavings_preserve_reducer_invariants`.)
+6. **S6 — shutdown requests are sampled latches.** Scope shutdown and removal
+   are synchronous, idempotent latches sampled into reducer events at step
+   entry. A request consumed by incarnation N does not reach N+1; a request
+   accepted with no live incarnation is owned by the membership until the next
+   incarnation begins. (`integration::pre_spawn_shutdown_waits_for_teardown_to_exist`,
+   `integration::pending_restart_shutdown_expedites_finite_and_unrepresentable_backoff`.)
+7. **S7 — driver death discharges owned obligations.** Destroying a driver
+   terminalizes active memberships, resolves admission/removal/shutdown
+   completions, and closes observation only after terminal publication. The
+   synchronous fallback may sacrifice post-join precision but may not leave a
+   promise parked. (§13.17’s fault provocations,
+   `integration::ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal`,
+   `integration::hard_aborted_subtree_descendants_still_publish_exits`.)
+
+No transition-system rule above is flagged unverified. The documented
+recursive-join exception after an ancestor destroys a driver is intentionally
+an ownership boundary, not a stronger join claim.
+
+**Normative prose coverage.** Mailbox freeze/drain policy is checked by
+`integration::queue_drain_is_the_exact_frozen_accepted_prefix_and_rejects_deferred_work`
+and its `latest` twin. Local-stop reuse of the ladder is checked by
+`integration::handler_drain_and_on_stop_share_one_grace_budget`. The latch,
+pending-incarnation, ordering, reason, and driver-death paragraphs map to
+S1–S7. Resource-teardown guidance is operational advice; the checkable
+blocking detach behavior is covered by offload/drain integration tests, while
+application resource integrity is explicitly **UNVERIFIED and outside the
+framework contract**. No other normative shutdown paragraph is unmapped.
+
 - Per-child stop state is a single owned ladder value (policy, phase,
   deadline) advanced by the engine — conceptually
   `StopLadder { policy, phase, deadline }` with
@@ -1995,8 +2177,9 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   differ only in *when ladders start*, never in how a ladder runs.
 - The tidy-abort beat (the pause between escalation and hard abort, letting
   a cancelled child finish a final cleanup step) is defined in Appendix A.
-- `Shutdown` policy per child: `Graceful { grace }` (default: Appendix A) or
-  `Abort`. `Abort` is the zero-grace point on the same ladder, not a second
+- `Shutdown` policy per child: `Shutdown::graceful(nonzero_grace)` (stored as
+  `Graceful { grace: NonZeroDuration }`; default: Appendix A) or `Abort`.
+  `Abort` is the immediate-escalation point on the same ladder, not a second
   mechanism: the shutdown token fires and the ladder escalates
   immediately — no grace wait — so the `abort_token` fires in the same
   engine step but strictly *after* the shutdown token (the B.2 ordering
@@ -2097,10 +2280,10 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   `request_shutdown()` / `request_scope_shutdown()`, and parent
   escalation each set an idempotent per-scope latch (a token edge, like
   the cancellation tokens themselves), which always succeeds
-  synchronously. The bounded command channel (Appendix A) carries only
-  awaited *insertion* operations (`add_*`/`define`), whose
-  callers hold futures and absorb backpressure — so fire-and-forget
-  shutdown is lossless by construction, not by queue-capacity luck.
+  synchronously. The unified event lane (Appendix A) is unbounded and
+  processed in capped batches; awaited *insertion* operations
+  (`add_*`/`define`) retain their payloads in producer-owned reservations.
+  Fire-and-forget shutdown is lossless because it does not ride that lane.
   `remove` rides no channel either: removal is a forced stop, and it
   latches like one (§11's remove rule). The
   latch is **per-incarnation** state: it stops the scope incarnation it
@@ -2159,6 +2342,61 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
     repair.
 
 ## 11. Trees, spawning, and lifetime
+
+### 11.1 Tree and lifetime transition rules
+
+1. **T1 — declaration consumes into one typed root.** `Tree` lowers to
+   `System<ScopeRef>` and `DynamicTree` to `System<DynamicScopeRef>`; subtree
+   flavor likewise determines the returned handle. `System` is the sole
+   non-cloneable owner and its drop latches shutdown. (`api_trait_conformance`,
+   `system::subtree_conversion_moves_without_minting_a_phantom_scope`.)
+2. **T2 — root and nested startup failure diverge only after the same reducer
+   transition.** Root failure parks `StartupFailed` and keeps the started
+   prefix supervised; nested failure drains through S1–S5 and reports a
+   structured failed child exit. (`integration::dynamic_startup_failure_keeps_other_initial_members_supervised`,
+   `integration::nested_ordered_startup_failure_rolls_back_only_the_started_prefix`.)
+3. **T3 — natural completion is flavor-policy derived.** Ordered scopes may
+   finish after every membership joins; dynamic scopes and ordered scopes with
+   a perpetually restartable member do not finish merely because their current
+   resident set is empty/terminal. (`integration::dynamic_and_always_members_do_not_finish_naturally`,
+   §13.16.)
+4. **T4 — dynamic admission has one linearization path.** Reservation owns id
+   uniqueness and payload; an admission event inserts one authoritative child
+   record and resolves independently of child readiness. Cancellation chooses
+   withdrawal or removal by whether admission won. (`integration::dynamic_actor_add_resolves_at_admission_without_awaiting_init`,
+   `integration::fused_drop_withdraws_or_removes_while_split_drop_detaches`.)
+5. **T5 — removal is exact, idempotent, and monotone.** Exact-handle removal
+   compares membership; id-only removal names the current resident. Once
+   sampled, the reducer state stays `Removing` through stop, terminalization,
+   finalization, and reclaim. (`supervisor::transition_table_keeps_removal_in_the_authoritative_state`,
+   `integration::exact_handles_reject_cross_scope_and_same_id_successors`.)
+6. **T6 — non-owning scope shutdown targets an incarnation.** A live request
+   resolves after that incarnation’s scope epilogue; a restart-window request
+   arms the next incarnation; a membership that never spawns resolves at
+   terminality. (`integration::pre_spawn_shutdown_waits_for_teardown_to_exist`,
+   `integration::pre_spawn_shutdown_resolves_if_the_tree_is_dropped_unspawned`,
+   `integration::shutdown_and_wait_wakes_when_a_parent_drain_terminalizes_a_restarting_subtree`.)
+7. **T7 — dynamic capability is explicit.** `DynamicScopeRef` exposes only
+   dynamic operations inherently. Shared observation/control is reached via
+   `as_scope() -> &ScopeRef`; there is no mirrored forwarding block and no
+   `Deref` conversion. (`api_trait_conformance`.)
+
+All rules above have checked evidence. Process runtime and panic-mode
+preconditions remain documented host obligations and are not marked verified
+by the reducer suite.
+
+**Normative prose coverage.** Builder inventory, typed subtree dispatch, and
+trait/resource bounds are compile-checked in `api_trait_conformance` and tree
+unit tests. Startup parks/rollback, natural completion, nested shutdown,
+admission/removal, pending-incarnation shutdown, and terminal pruning map to
+T1–T7 plus the named integration tests. `shutdown`/`start_or_shutdown`
+straggler shapes are checked by
+`integration::start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stragglers`
+and `integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`.
+The Tokio/time-enabled and `panic = "unwind"` requirements are explicitly
+**UNVERIFIED host preconditions**; the no-runtime error path is checked by
+`integration::spawn_without_runtime_is_a_build_error`. No other normative tree
+or lifetime paragraph is unmapped.
 
 - `Tree` / `DynamicTree` are the declaration layer; `spawn()` lowers into
   the engine and returns `System` (sole owner; drop = graceful
@@ -2787,13 +3025,36 @@ integration toolkit for the driver shell and the end-to-end invariants.
 
 ## 14. Core-spike decisions
 
-Both questions are resolved:
+Both questions are resolved.
 
-1. **`init`/`Args` threading through the raw-actor layer — resolved in M3.**
+### 14.1 `init`/`Args` threading through the raw-actor layer
+
+Resolved in M3.
+
    The public `Handler<A>` wrapper and same-message context re-entry design
    described in §4.3 passed the shard-store and assistant-control-plane
    executable spikes, including a raw decorator that awaits before delegation.
-2. **Engine event arbitration — resolved in M1.** When one driver wake makes
+
+### 14.2 Engine event arbitration
+
+Resolved in M1. The transition rule is a stable total order. Every pending
+item derives its class from its variant; callers cannot provide a conflicting
+class. Within one wake, the driver first collects all currently eligible
+inputs, stable-sorts them by this table, then reduces them one by one before
+flushing effects:
+
+| rank | class | transition obligation | checked evidence |
+|---:|---|---|---|
+| 1 | scope shutdown | enter/upgrade drain before any child policy decision | `engine::arbitration_order_is_explicit_and_stable`, `driver::events::blocking_primary_wake_recollects_control_removal_before_arbitration` |
+| 2 | membership removal | mark the child `Removing` before exit/readiness dispatch | same arbitration test; `supervisor::sampled_removal_suppresses_start_effects_until_commit` |
+| 3 | child exit | record and route terminal outcome before readiness/deadline artifacts | arbitration test; E1–E5 |
+| 4 | readiness signal | accept an already-fired signal at the exact deadline | `engine::readiness_configuration_and_signal_deadline_race_are_engine_owned` |
+| 5 | readiness deadline | terminalize only if readiness did not win | same readiness test |
+| 6 | backoff due | spawn only after newly observed terminal facts | arbitration test; R5 |
+| 7 | stop deadline | advance only ladders not completed/disarmed above | arbitration test; S1 |
+| 8 | queued admission | reject after every same-wake terminal fact is applied | arbitration test; `driver::events::queued_admissions_yield_to_shutdown_without_forwarder_tasks` |
+
+No arbitration row is flagged unverified. When one driver wake makes
    several events eligible, the engine processes them in this order:
    scope shutdown, membership removal, child exit, readiness signal,
    readiness deadline, backoff-due restart, stop-ladder deadline, queued
@@ -3147,7 +3408,7 @@ marked *(II)* ship with the named Part II feature.
 | `latest()` slot | **1** | Structural, not configurable |
 | `latest_by_key` capacity *(II §16)* | defers to scope/library mailbox default | Full key set evicts oldest key |
 | Mailbox shutdown policy | **Drain** | Two variants: `Drain` delivers the frozen prefix, `Discard` drops it (destruction venue per §5.1; disposal faults per §7); the intake freeze is unconditional either way (§5.2, §10) |
-| Child shutdown policy | **`Graceful { grace: 5 s }`** | `Abort` opt-in |
+| Child shutdown policy | **`Graceful { grace: NonZeroDuration(5 s) }`** | construct with `Shutdown::graceful`; zero is rejected; `Abort` is the sole immediate-escalation policy |
 | Tidy-abort beat | **`grace / 10`, clamped to [1 ms, 10 ms]** | §10 |
 | Restart condition | **`OnFailure`** | Failure = any non-`Completed` exit (§7) |
 | Backoff | **none** (immediate restart) | Exponential: `base × factor^(n−1)` clamped to `max`; `factor` a validated-finite newtype `≥ 1.0` with bit-`Eq` (§9.2); nanosecond rounding per §9.2; equal jitter uniform in `[d/2, d]`; all durations non-zero, validated at construction, with the fixed and exponential payloads sealed behind their constructors (§1); attempt origin/reset per §9.2 |
@@ -3157,9 +3418,9 @@ marked *(II)* ship with the named Part II feature.
 | Terminal-membership retention | **retain** (restartable) / **remove** (one-shot) | One name, one polarity, stated once (§8) |
 | Monitor per-watch queue *(II §18)* | **128** events, minimum 2 | Drop-oldest; coalesced leading `Lagged`; terminal `Removed` never dropped |
 | Lifecycle event buffer | **128** events, minimum 2 | Same overflow shape; per subscriber |
-| Control/command channel | **64**, floored to 1 | Internal; awaited insertion commands (`add_*`/`define`) only — shutdown requests and `remove` ride level latches (§10, §11), lossless |
+| Unified event lane | **unbounded; capped per-wake drain** | Requests are small; insertion payloads remain in producer-owned reservations. The batch cap bounds driver monopolization, not channel memory. Shutdown and `remove` ride level latches (§10, §11) |
 | Snapshot channel | conflating watch, capacity 1 | Structural |
-| `call` / `send_timeout` deadline | **none — always explicit** | One budget per call (§5.1); zero deadline fails immediately |
+| `call` / `send_timeout` deadline | **none — always explicit** | One `DeadlineBudget` per call (§5.1); zero selects the no-attempt behavior |
 | Identity counters | `u64`, saturating | Fail-closed overflow, decided once in the fencing primitive (§3.1); lifecycle `seq`/`lifecycle_seq` mint through the same primitive (B.4's exhaustion rule) |
 | Unrepresentable deadline | **never arrives** | `Instant + Duration` overflow or an exact point the runtime cannot arm produces no deadline; it MUST NOT substitute the budget's start or any other instant |
 
@@ -3169,25 +3430,36 @@ marked *(II)* ship with the named Part II feature.
 
 Shapes here are normative in *content* (which operations/fields/variants
 exist, with which semantics); exact names may vary if the documentation maps
-them clearly. One cross-cutting shape rule: where a surface takes a
+them clearly.
+
+**Exhaustiveness decision.** Pre-release, public state, outcome, error, and
+reason inventories are exhaustive so adding semantics breaks every match at
+compile time. `#[non_exhaustive]` remains only where the specification already
+names a concrete additive axis: `Mailbox` (§16), `Strategy` (§19),
+`LifecycleEventKind` (§20), and `PolicyError` (future sealed policy payloads).
+This decision covers every public type; release tagging may deliberately
+revisit it, never inherit it accidentally.
+
+One cross-cutting shape rule: where a surface takes a
 deadline budget over other arguments (`offload`, `send_timeout`, `call`,
 `call_idempotent`, `shutdown`), the deadline is the trailing parameter.
-Deadline parameters are `Duration` budgets; the budget's clock starts when
+Deadline parameters are `DeadlineBudget` values; the budget's clock starts when
 the operation's returned future is first polled — except
 `offload`/`offload_scoped`, which return no future to poll (§5.5): their
 clock starts when the actor loop registers the offload, at the call
-itself. A zero budget fails
-immediately with the operation's timeout outcome (Appendix A) —
-`shutdown` is the one exemption: its timeout is an escalation bound, not
-a failure deadline, and zero means immediate escalation (§11). Zero is a
-short-circuit, not a raced deadline: the operation is never attempted —
-nothing is sent, no completion is observed — so the expiry-boundary rule
-below governs only nonzero budgets and the two rules never compete (a
-zero-deadline `call` reports `AcceptanceTimedOut` without a message ever
-existing to withdraw). For offload, whose timeout outcome is by contract
-a delivery rather than a call failure, the zero short-circuit reads: the
-work future is never polled, and the total continuation receives
-`DeadlineElapsed` through the normal completion path (§5.5).
+itself. `DeadlineBudget` permits zero and is the single home for the following
+exhaustive zero-width semantics; each API selects one behavior in its
+implementation rather than interpreting a bare duration locally:
+
+| behavior | APIs | zero-width transition | checked evidence |
+|---|---|---|---|
+| no attempt | `send_timeout`, `call`, `ReplyReceiver::recv`, `offload`, `offload_scoped` | do not submit/poll work or observe completion; return/deliver the timeout result | `deadline::zero_budget_behavior_is_selected_by_each_api`, `mailbox::deadline::a_zero_budget_short_circuits_without_polling_the_operation`, `integration::zero_deadlines_short_circuit_without_acceptance_or_message_construction`, offload zero-budget tests |
+| poll once | `wait_for_child` | evaluate the current snapshot once with precedence match → terminal scope → timeout; never await | `deadline::zero_budget_behavior_is_selected_by_each_api`, `integration::zero_duration_wait_observes_an_already_satisfied_child`, observation closed-beats-zero test |
+| immediate escalation | `System::shutdown`, `ScopeRef::shutdown_and_wait`, `start_or_shutdown` rollback | request cooperative cancellation, skip only the cooperative wait, then run the ordinary abort tail | `deadline::zero_budget_behavior_is_selected_by_each_api`, `integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`, rollback zero-timeout tests |
+
+For a no-attempt offload, whose timeout outcome is a delivery rather than a
+call failure, the work future is never polled and the total continuation
+receives `DeadlineElapsed` through the normal completion path (§5.5).
 
 Expiry boundary, uniform: completion observed at exactly the deadline
 instant counts as within budget (§6's ready-at-deadline rule is this rule
@@ -3316,7 +3588,8 @@ is composed by choosing a longer deadline, not by a second `recv`.
 Dropping the receiver unawaited discards the value only; `Reply::send`
 stays infallible either way (§5.1).
 
-All error enums are non-exhaustive. `send` ↔ flavor mapping is normative:
+These exact error inventories are exhaustive pre-release so new behavior
+cannot hide behind wildcard arms. `send` ↔ flavor mapping is normative:
 `send` fails only `Terminated`; `try_send` never `TimedOut`. The
 payload-recovery clause is scoped to unmapped refs: a contramapped ref
 *(II §17)* always surfaces the boxed projection — the wrap consumed the
@@ -3502,8 +3775,8 @@ routing on "this subtree churned out / never came up" (a breaker, an
 operator surface) is one compile-checked call. Both are matches on
 `ExitError`'s private provenance structure (§7) — no downcast, and
 non-forgeable: only the library can construct the payloads, so an
-imitating application error yields `None`. Both payload types are
-public and non-exhaustive.
+imitating application error yields `None`. Both payload types are public and
+exhaustive pre-release; adding a cause or field must update every façade match.
 Scope-level shutdown-timeout errors carry the affected children as
 structured data: child-id paths plus membership tokens (§7) — never
 bare ids, which sibling scopes may reuse (§2).
@@ -3661,7 +3934,7 @@ closed: admission observes `NotAdmitting(Terminal)` and a latched removal
 observes `Removed`, since its route becoming terminal satisfies the
 removal goal. Debug builds MAY instead assert and panic at that boundary
 to expose the internal regression instead of returning an outcome. The public
-`ReserveError` enum is non-exhaustive and includes `NoRuntime`: it names
+`ReserveError` is exhaustive and includes `NoRuntime`: it names
 the absent ambient runtime at dynamic reservation or first poll, with
 the cleanup and precedence pinned in §8. Dynamic `add_*`
 fails with exactly the union of its two halves (§8): `EmptyId`,
@@ -3689,7 +3962,7 @@ poll or `NotAdmitting`; declaration builders share the reserve id errors
 (`EmptyId`, `DuplicateId`), require no runtime for reservation or define,
 and their defines cannot fail (§8).
 
-`BuildError` (spawn-time, §11) is enumerated and non-exhaustive:
+`BuildError` (spawn-time, §11) is enumerated and exhaustive pre-release:
 `NoRuntime` (no ambient async runtime reachable through the private façade
 over `shelterwood-runtime`) and `UnfilledReservations` (the child-id paths of
 every undefined reserved slot, §8). Nothing else lives there by design:
@@ -3799,7 +4072,9 @@ implied on all; error/outcome types are B.3 and B.8):
   incarnation's transient stop is the event stream's job (B.4
   `ScopeState`), not this helper's. `dynamic()` as the runtime
   downgrade query (§11).
-- **`DynamicScopeRef`**: everything on `ScopeRef`, plus the eight add
+- **`DynamicScopeRef`**: `as_scope() -> &ScopeRef` is the single explicit
+  access path to the shared observation/control surface; there are no mirrored
+  forwards and no `Deref`. Its inherent dynamic-only surface is the eight add
   entry points (§8, the raw pair included; resolving at admission, B.8),
   the `reserve_*`
   slot family (§8 — `add_*` is reserve-plus-define sugar), and `remove` — by
@@ -3824,8 +4099,9 @@ implied on all; error/outcome types are B.3 and B.8):
 
 **Pinned result shapes for the wait/stop surface.** Names carry
 Appendix B's latitude; the shapes and payloads are content-normative,
-enumerated here exactly as `BuildError` is in B.8. All error/reason
-enums are non-exhaustive.
+enumerated here exactly as `BuildError` is in B.8. Error and reason enums are
+exhaustive pre-release so every semantic addition forces downstream matches to
+be reconsidered.
 
 - `wait_started(&self) -> Result<(), StartupError>` — `StartupError`
   carries the structured cause of terminal startup failure:
@@ -3864,9 +4140,9 @@ fn wait_for_child(
     &self,
     id: impl Into<ChildId>,
     pred: impl FnMut(&ChildSnapshot) -> bool + Send,
-    timeout: Duration,                        // trailing, per Appendix B
+    timeout: DeadlineBudget,                  // trailing, per Appendix B
 ) -> impl Future<Output = Result<ChildSnapshot, WaitError>> + Send;
-// WaitError { TimedOut, ScopeTerminated { state } } — non-exhaustive;
+// WaitError { TimedOut, ScopeTerminated { state } } — exhaustive pre-release;
 // ScopeTerminated carries the scope's terminal B.6 state
 ```
 
@@ -3885,8 +4161,9 @@ in a terminal state is not an error: the predicate sees it and decides
 (retained tombstones included, §8). The predicate runs on the
 observation path: it MUST be cheap and non-blocking, and it is a plain
 `FnMut` — no `Sync` needed, it is not shared. Errors: `TimedOut` per
-Appendix B's deadline rules (zero fails immediately; a match observed
-exactly at the deadline wins); `ScopeTerminated` when the subscribed
+Appendix B's deadline rules (zero evaluates the current snapshot exactly once
+with match → terminal scope → timeout precedence; a match observed exactly at
+the deadline wins); `ScopeTerminated` when the subscribed
 scope's membership terminalizes before a match, carrying its terminal
 state.
 

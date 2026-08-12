@@ -1,7 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use crate::{
-    ActorDef, ActorOnceDef, ActorRef, ChildId, ShutdownTimeout,
+    ActorDef, ActorOnceDef, ActorRef, ChildId,
     admission::ReserveError,
     mailbox::MailboxCell,
     raw::{RawDef, RawOnceDef},
@@ -35,7 +35,12 @@ impl ScopeRef {
     /// synchronous drop epilogue can only *request* abort for active children,
     /// so cancellation and user-future destruction below that boundary may
     /// finish after this call returns.
-    pub async fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
+    /// A zero budget still requests cooperative cancellation, then skips its
+    /// wait and enters the ordinary escalation tail immediately.
+    pub async fn shutdown_and_wait(
+        &self,
+        timeout: crate::DeadlineBudget,
+    ) -> Result<(), crate::ShutdownTimeout> {
         crate::driver::shutdown_scope(Arc::clone(&self.cell), timeout).await
     }
 }
@@ -90,15 +95,6 @@ impl DynamicScopeRef {
             .map(|reservation| DynamicSubtreeSlot {
                 core: SubtreeSlotCore::new(DynamicSlotEndpoint::new(reservation, ownership)),
             })
-    }
-
-    /// Requests shutdown and waits for this scope's incarnation to finish its
-    /// scope epilogue.
-    ///
-    /// See [`ScopeRef::shutdown_and_wait`] for the timeout's arming edge and
-    /// the hard-abort join boundary.
-    pub async fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), ShutdownTimeout> {
-        self.0.shutdown_and_wait(timeout).await
     }
 
     /// Reserves an actor id synchronously and exposes its exact handle.

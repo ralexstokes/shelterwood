@@ -6,7 +6,6 @@ use crate::identity::ChildId;
 
 /// A child reservation or dynamic admission error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
 pub enum ReserveError {
     /// No ambient supported async runtime exists.
     #[error("no ambient Tokio runtime is available")]
@@ -30,7 +29,6 @@ pub enum ReserveError {
 
 /// Exact reason an admission operation could not proceed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum NotAdmittingCause {
     /// The scope membership is terminal.
     Terminal,

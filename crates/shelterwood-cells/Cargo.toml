@@ -1,20 +1,20 @@
 [package]
-name = "shelterwood"
+name = "shelterwood-cells"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
 license = "MIT OR Apache-2.0"
-description = "A structured-supervision and actor runtime for asynchronous Rust"
-documentation = "https://docs.rs/shelterwood"
+description = "Restart-stable state and observation projections for Shelterwood"
 homepage = "https://github.com/ralexstokes/shelterwood"
 repository = "https://github.com/ralexstokes/shelterwood"
-autotests = false
+
+[features]
+test-util = ["shelterwood-core/test-util", "shelterwood-runtime/test-util"]
 
 [lints]
 workspace = true
 
 [dependencies]
-shelterwood-cells.workspace = true
 shelterwood-core.workspace = true
 shelterwood-mailbox.workspace = true
 shelterwood-runtime.workspace = true
@@ -22,11 +22,6 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-shelterwood-cells = { workspace = true, features = ["test-util"] }
 shelterwood-core = { workspace = true, features = ["test-util"] }
 shelterwood-runtime = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
-
-[[test]]
-name = "integration"
-path = "tests/mod.rs"

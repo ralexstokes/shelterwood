@@ -1,0 +1,90 @@
+//! Dynamic membership admission errors and removal outcomes.
+
+use std::fmt;
+
+use crate::identity::ChildId;
+
+/// A child reservation or dynamic admission error.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReserveError {
+    /// No ambient supported async runtime exists.
+    #[error("no ambient Tokio runtime is available")]
+    NoRuntime,
+    /// The child id was empty.
+    #[error("child id must not be empty")]
+    EmptyId,
+    /// A resident membership already occupies the id.
+    #[error("child id `{0}` is already resident")]
+    DuplicateId(ChildId),
+    /// A same-id membership is currently being removed.
+    #[error("child id `{0}` is being removed")]
+    RemovalInProgress(ChildId),
+    /// The target dynamic scope is not admitting.
+    #[error("scope is not admitting: {0}")]
+    NotAdmitting(NotAdmittingCause),
+    /// The scope can mint no further membership identities.
+    #[error("membership identity space is exhausted")]
+    IdentityExhausted,
+}
+
+/// Exact reason an admission operation could not proceed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum NotAdmittingCause {
+    /// The scope membership is terminal.
+    Terminal,
+    /// The live scope incarnation is draining.
+    Draining,
+    /// The dynamic root is parked after startup failure.
+    StartupFailed,
+    /// No scope incarnation is currently live.
+    NoLiveIncarnation,
+    /// This operation's reservation ended before admission.
+    ReservationEnded,
+}
+
+impl fmt::Display for NotAdmittingCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Terminal => "terminal",
+            Self::Draining => "draining",
+            Self::StartupFailed => "startup failed",
+            Self::NoLiveIncarnation => "no live incarnation",
+            Self::ReservationEnded => "reservation ended",
+        })
+    }
+}
+
+/// Outcome of an idempotent dynamic removal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveOutcome {
+    /// A reservation or resident membership was removed.
+    Removed,
+    /// No matching membership remained to remove.
+    AlreadyAbsent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NotAdmittingCause, ReserveError};
+
+    #[test]
+    fn not_admitting_display_is_stable_and_does_not_delegate_to_debug() {
+        let cases = [
+            (NotAdmittingCause::Terminal, "terminal"),
+            (NotAdmittingCause::Draining, "draining"),
+            (NotAdmittingCause::StartupFailed, "startup failed"),
+            (NotAdmittingCause::NoLiveIncarnation, "no live incarnation"),
+            (NotAdmittingCause::ReservationEnded, "reservation ended"),
+        ];
+
+        for (cause, expected) in cases {
+            assert_eq!(cause.to_string(), expected);
+            assert_eq!(
+                ReserveError::NotAdmitting(cause).to_string(),
+                format!("scope is not admitting: {expected}")
+            );
+        }
+    }
+}

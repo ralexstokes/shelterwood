@@ -2707,19 +2707,35 @@ integration toolkit for the driver shell and the end-to-end invariants.
     `shelterwood-runtime`; `shelterwood-core` has neither dependency, so no
     core item can name one. The mailbox state machines still reach the adapter
     for the clock, sleeps, and detached disposal, so their contribution to the
-    public surface is checked rather than implied. CI's rustdoc-JSON walk
-    rejects public reachability of `shelterwood_runtime`, `tokio`,
-    `tokio_util`, or `fastrand`, and runs once per crate that contributes
-    public façade items — cross-crate re-exports are absent from the façade's
-    own document, so a single walk over it would not see them. The former
-    regex/awk source-path checks and their fixtures are retired by the crate
-    split; removing them does not relax either architectural requirement.
-    What the crate boundary does *not* yet carry is the intra-façade module
-    layering the retired checks also policed — `cells`, `plan`, `observe`, and
-    `cancellation` still sit alongside `driver`, and the exit path's
-    no-downcast rule now holds by construction only inside `shelterwood-core`.
-    Those lapse until the reducer consolidation moves the driver's decision
-    state into core; the requirements themselves are unchanged.
+    public surface is checked rather than implied. The state and projection
+    layer lives in `shelterwood-cells`, structurally below the mutable driver;
+    its supported observation and cancellation types are re-exported by the
+    façade. Cross-crate implementation seams are necessarily `pub` in that
+    implementation crate (and hidden from its generated API), while helpers
+    that do not cross the boundary retain narrower visibility. CI's
+    rustdoc-JSON walk rejects public reachability of `shelterwood_runtime`,
+    `tokio`, `tokio_util`, or `fastrand`, and runs once per crate that
+    contributes public façade items — cross-crate re-exports are absent from
+    the façade's own document, so a single walk over it would not see them.
+    The restart-stable cell seam is `#[doc(hidden)]` and therefore outside
+    that walk, which sees only documented items; its signatures name runtime
+    watch channels and latches by construction. What holds it out of the
+    public surface is the façade's `pub(crate)` shim over it, under which a
+    public re-export is a compile error rather than a check failure. The
+    former regex/awk source-path checks and their fixtures are retired by the
+    crate split; removing them does not relax either architectural
+    requirement.
+    The boundary now compiler-enforces the state/projection direction:
+    `shelterwood-cells` depends only on core, mailbox, and runtime substrate,
+    while the façade's `driver`, `tree`, and definition machinery depend on
+    it. The definition layer deliberately remains convention-only: `plan`
+    stays in the façade because it consumes `definition`, `raw`, and `task`;
+    extracting it would require a separate `shelterwood-plan` boundary and is
+    not justified by the narrower residue. The former driver-path no-downcast
+    source rule is retired separately. Exit classification now lives in core
+    behind typed verdicts, and the property that matters at the remaining
+    façade boundary — blanket user error conversion cannot mint an
+    authenticated structured payload — is pinned by its conformance probe.
 14. **Event-woken observers see consistent-or-newer snapshots.** Subscribe
    to lifecycle events; *synchronously inside the event arm*, read the
    snapshot and assert it already reflects the event — at both ends of the

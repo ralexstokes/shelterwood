@@ -2713,13 +2713,18 @@ integration toolkit for the driver shell and the end-to-end invariants.
     façade. Cross-crate implementation seams are necessarily `pub` in that
     implementation crate (and hidden from its generated API), while helpers
     that do not cross the boundary retain narrower visibility. CI's
-    rustdoc-JSON walk
-    rejects public reachability of `shelterwood_runtime`, `tokio`,
-    `tokio_util`, or `fastrand`, and runs once per crate that contributes
-    public façade items — cross-crate re-exports are absent from the façade's
-    own document, so a single walk over it would not see them. The former
-    regex/awk source-path checks and their fixtures are retired by the crate
-    split; removing them does not relax either architectural requirement.
+    rustdoc-JSON walk rejects public reachability of `shelterwood_runtime`,
+    `tokio`, `tokio_util`, or `fastrand`, and runs once per crate that
+    contributes public façade items — cross-crate re-exports are absent from
+    the façade's own document, so a single walk over it would not see them.
+    The restart-stable cell seam is `#[doc(hidden)]` and therefore outside
+    that walk, which sees only documented items; its signatures name runtime
+    watch channels and latches by construction. What holds it out of the
+    public surface is the façade's `pub(crate)` shim over it, under which a
+    public re-export is a compile error rather than a check failure. The
+    former regex/awk source-path checks and their fixtures are retired by the
+    crate split; removing them does not relax either architectural
+    requirement.
     The boundary now compiler-enforces the state/projection direction:
     `shelterwood-cells` depends only on core, mailbox, and runtime substrate,
     while the façade's `driver`, `tree`, and definition machinery depend on

@@ -346,10 +346,16 @@ struct SnapshotHubState {
 }
 
 impl SnapshotHub {
+    /// Subscribes while the containing scope's observation gate is held.
+    ///
+    /// The transaction is taken but unused: the gate is what makes the
+    /// receiverless refresh below safe, and no wake can be owed, because the
+    /// only receiver that could observe the refresh is the one minted here —
+    /// and it captures the refreshed generation as already seen.
     pub(crate) fn subscribe(
         &self,
         initial: Arc<ScopeSnapshot>,
-        txn: &mut crate::cells::ObservationTxn<'_>,
+        _txn: &mut crate::cells::ObservationTxn<'_>,
     ) -> SnapshotReceiver {
         let sender = self.sender.get_or_init(|| {
             runtime::watch(SnapshotHubState {
@@ -363,9 +369,7 @@ impl SnapshotHub {
             // Publication is skipped while receiverless, so the first
             // subscriber after a quiet stretch installs current state itself.
             // A closed hub already holds the authoritative terminal
-            // projection, installed by `close`; leave it, and skip the pulse
-            // that would then wake nobody about nothing.
-            let mut refreshed = false;
+            // projection installed by `close`; leave it unchanged.
             sender.modify_silently(|state| {
                 if state.closed {
                     return;
@@ -375,11 +379,7 @@ impl SnapshotHub {
                     .generation
                     .mint()
                     .expect("snapshot generation space exhausted");
-                refreshed = true;
             });
-            if refreshed {
-                txn.pulse(sender);
-            }
         }
         let inner = sender.watcher();
         let seen_generation = inner.borrow_cloned().generation.current();

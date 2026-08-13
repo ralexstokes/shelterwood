@@ -2077,3 +2077,37 @@ impl ScopeCell {
         self.close_observation_locked(txn);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::Arc,
+    };
+
+    use crate::{ChildId, MemberCell, ScopeCell, identity::ScopeIdentity, policy::ScopeFlavor};
+
+    #[test]
+    fn destructor_shutdown_tolerates_a_poisoned_control_mutex() {
+        let id = ChildId::from("root");
+        let mut identity = ScopeIdentity::new();
+        let member = MemberCell::new(
+            id.clone(),
+            identity
+                .mint_membership(&id)
+                .expect("root membership is available"),
+        );
+        let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
+
+        let poison = Arc::clone(&scope);
+        assert!(
+            catch_unwind(AssertUnwindSafe(move || {
+                let _control = poison.control.lock().expect("control starts healthy");
+                panic!("inject control poison");
+            }))
+            .is_err()
+        );
+
+        assert!(scope.request_shutdown_ignoring_poison().is_some());
+    }
+}

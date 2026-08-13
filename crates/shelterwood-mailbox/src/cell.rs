@@ -761,6 +761,12 @@ impl<M> MailboxCell<M> {
                     message,
                     newest_observed,
                 } => {
+                    // Mailbox terminality linearizes in the binding, while a
+                    // parked operation linearizes when its own outcome leaves
+                    // `Waiting`. A terminal teardown may therefore have
+                    // detached this waiter without discharging it yet; an
+                    // already-expired withdrawal legitimately wins that
+                    // operation-local race.
                     let message = message
                         .take()
                         .expect("a waiting operation must retain its message");
@@ -930,6 +936,10 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }
         let final_incarnation = state.last_bound;
         let waiters = state.take_waiters();
+        // This binding transition linearizes mailbox terminality. Each
+        // detached waiter is decided separately by its `Waiting ->` outcome
+        // transition, so an already-expired withdrawal may beat the deferred
+        // discharge even after this mailbox-wide transition.
         state.binding = MailboxBinding::Terminal(final_incarnation);
         let queue = std::mem::take(&mut state.queue);
         let latest = state.latest.take();
@@ -1166,10 +1176,11 @@ pub(super) mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll, Wake, Waker},
+        time::Duration,
     };
 
     use crate::{
-        ActorIdentity, ActorRef, ChildId, MailboxControl, SendErrorKind,
+        ActorIdentity, ActorRef, ChildId, MailboxControl, MailboxReceiver, SendErrorKind,
         identity::ScopeIdentity,
         policy::{ResolvedDefaults, ResolvedMailbox},
     };
@@ -1353,6 +1364,54 @@ pub(super) mod tests {
             super::MailboxBinding::Bound(super::BoundState::Available(bound))
                 if bound == incarnation
         ));
+    }
+
+    #[test]
+    fn receive_promotes_multiple_parked_senders_in_fifo_order() {
+        let (mailbox, actor) = actor();
+        MailboxControl::configure(
+            &*mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ),
+        );
+        let mut identity = ScopeIdentity::new();
+        let (_, mut incarnations) = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available")
+            .into_pair();
+        let incarnation = incarnations.mint().expect("incarnation available");
+        MailboxControl::bind(&*mailbox, incarnation);
+        let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+
+        assert!(matches!(actor.try_send(0), Ok(bound) if bound == incarnation));
+        let mut sends: Vec<_> = (1_u8..=3)
+            .map(|message| Box::pin(actor.send(message)))
+            .collect();
+        for send in &mut sends {
+            park_with(send, Waker::noop());
+        }
+
+        let send_count = sends.len();
+        for (delivered, send) in sends.iter_mut().enumerate() {
+            assert_eq!(receiver.try_recv(), Some(delivered as u8));
+            assert!(matches!(
+                send.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Ok(bound)) if bound == incarnation
+            ));
+
+            let remaining = send_count - delivered - 1;
+            if remaining > 0 {
+                assert!(matches!(
+                    &mailbox.state.lock().expect("mailbox mutex poisoned").binding,
+                    super::MailboxBinding::Bound(super::BoundState::Full { waiters, .. })
+                        if waiters.len() == remaining
+                ));
+            }
+        }
+
+        assert_eq!(receiver.try_recv(), Some(3));
+        assert_eq!(receiver.try_recv(), None);
     }
 
     #[test]
@@ -1566,6 +1625,31 @@ pub(super) mod tests {
                 .waiters()
                 .is_none()
         );
+    }
+
+    #[crate::runtime::test(start_paused = true)]
+    async fn expired_timeout_can_race_detached_terminal_teardown() {
+        let (mailbox, actor) = actor();
+        let width = Duration::from_secs(1);
+        let mut send = Box::pin(actor.send_timeout(1, width));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        crate::runtime::advance(width * 2).await;
+
+        let teardown = MailboxControl::prepare_termination(&*mailbox)
+            .expect("live mailbox prepares terminal teardown");
+        // Teardown remains retained: timeout sees terminal binding after the
+        // waiter queue was detached but before its waiter was discharged.
+        let Poll::Ready(Err(error)) = send.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("the expired send withdraws before deferred discharge");
+        };
+        assert_eq!(error.kind, SendErrorKind::TimedOut);
+        assert_eq!(error.message, 1);
+        drop(teardown);
     }
 
     #[test]

@@ -36,9 +36,9 @@ pub(super) use super::super::{
     MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
     ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard, ScopeFlavor,
     ScopeRole, ScopeRuntime, StartupDisposition, cancel_dynamic_reservation,
-    discharge_child_terminality, report_slot, reserve_dynamic, resident_projection,
-    restart_shutdown_work, run_nested_factory, run_nested_tree, run_scope_incarnation,
-    storage::Obligation,
+    discharge_child_terminality, monitor_root_driver, report_slot, reserve_dynamic,
+    resident_projection, restart_shutdown_work, run_nested_factory, run_nested_tree, run_scope,
+    run_scope_incarnation, storage::Obligation,
 };
 
 pub(super) struct ChildArena<T> {

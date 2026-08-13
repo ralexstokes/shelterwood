@@ -39,9 +39,9 @@ impl ScopeRef {
     /// wait and enters the ordinary escalation tail immediately.
     pub async fn shutdown_and_wait(
         &self,
-        timeout: crate::DeadlineBudget,
+        timeout: impl Into<crate::DeadlineBudget>,
     ) -> Result<(), crate::ShutdownTimeout> {
-        crate::driver::shutdown_scope(Arc::clone(&self.cell), timeout).await
+        crate::driver::shutdown_scope(Arc::clone(&self.cell), timeout.into()).await
     }
 }
 

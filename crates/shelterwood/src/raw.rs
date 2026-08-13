@@ -1345,14 +1345,14 @@ impl<M: Send + 'static> RawContext<M> {
         &mut self,
         work: F,
         continuation: C,
-        deadline: DeadlineBudget,
+        deadline: impl Into<DeadlineBudget>,
     ) -> Result<(), Rejected<(F, C)>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> M + Send + 'static,
     {
-        self.start_offload(work, continuation, deadline, OffloadScope::Unscoped)
+        self.start_offload(work, continuation, deadline.into(), OffloadScope::Unscoped)
             .map(|_| ())
     }
 
@@ -1367,14 +1367,14 @@ impl<M: Send + 'static> RawContext<M> {
         &mut self,
         work: F,
         continuation: C,
-        deadline: DeadlineBudget,
+        deadline: impl Into<DeadlineBudget>,
     ) -> Result<Guard, Rejected<(F, C)>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> M + Send + 'static,
     {
-        self.start_offload(work, continuation, deadline, OffloadScope::Scoped)
+        self.start_offload(work, continuation, deadline.into(), OffloadScope::Scoped)
             .map(|guard| guard.expect("scoped offload must produce a guard"))
     }
 
@@ -1498,12 +1498,10 @@ impl<M: Send + 'static> RawContext<M> {
         });
         let events = Arc::clone(&self.resources.events);
         let disposal = self.resources.disposal.clone();
-        if crate::deadline::select_zero_budget_behavior(
-            deadline,
-            crate::deadline::ZeroBudgetBehavior::NoAttempt,
-        )
-        .is_some()
-        {
+        // Zero selects no attempt (SPEC Appendix B): the work future is never
+        // polled, and the continuation still travels the ordinary completion
+        // path so its venue and ordering are unchanged.
+        if deadline.is_zero() {
             drop(work);
             events.push(QueuedEvent {
                 cancellation: cancellation.clone(),

@@ -62,7 +62,7 @@ impl Actor for ZeroDeadlineActor {
                     assert_eq!(format!("{:?}", tokio::task::id()), actor_task);
                     ZeroMessage::Done
                 },
-                Duration::ZERO.into(),
+                Duration::ZERO,
             )
             .expect("live offload accepted");
         Ok(Self)
@@ -90,7 +90,7 @@ impl Actor for ZeroDeadlinePanickingDropActor {
             .offload(
                 ZeroDeadlinePanickingDrop { polled, drops },
                 |_| ZeroMessage::Done,
-                Duration::ZERO.into(),
+                Duration::ZERO,
             )
             .expect("live offload accepted");
         Ok(Self)
@@ -148,7 +148,7 @@ async fn zero_budget_offload_contains_and_classifies_its_work_destructor_panic()
     assert!(!polled.load(Ordering::SeqCst));
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root shuts down");
 }
@@ -184,11 +184,7 @@ impl Actor for RestartActor {
                     .set_timeout("stale", RestartMessage::StaleTimer, Duration::ZERO)
                     .expect("timer accepted");
                 context
-                    .offload(
-                        async {},
-                        |_| RestartMessage::StaleOffload,
-                        Duration::MAX.into(),
-                    )
+                    .offload(async {}, |_| RestartMessage::StaleOffload, Duration::MAX)
                     .expect("offload accepted");
                 Err(ExitError::message("poisoned incarnation"))
             }
@@ -347,7 +343,7 @@ impl Actor for DetachedBlockingActor {
                                 DetachedBlockingMessage::StaleCompletion
                             }
                         },
-                        Duration::MAX.into(),
+                        Duration::MAX,
                     )
                     .expect("blocking future is accepted before failure");
                 Err(ExitError::message("poisoned incarnation"))
@@ -495,7 +491,7 @@ impl Actor for ExactDeadlineActor {
                             42usize
                         },
                         DeadlineMessage::Completed,
-                        Duration::from_secs(10).into(),
+                        Duration::from_secs(10),
                     )
                     .expect("offload accepted");
                 self.armed.store(true, Ordering::SeqCst);
@@ -572,7 +568,7 @@ impl Actor for GuardedActor {
                     .offload_scoped(
                         async { 1usize },
                         |_| GuardMessage::Unexpected,
-                        Duration::MAX.into(),
+                        Duration::MAX,
                     )
                     .expect("guarded offload accepted");
                 drop(guard);
@@ -631,7 +627,7 @@ impl Actor for ExportGuardActor {
         context: &mut Context<'_, Self>,
     ) -> Result<Self, ExitError> {
         let guard = context
-            .offload_scoped(std::future::pending::<()>(), |_| (), Duration::MAX.into())
+            .offload_scoped(std::future::pending::<()>(), |_| (), Duration::MAX)
             .expect("scoped offload accepted");
         guard_sender
             .send(guard)
@@ -659,7 +655,7 @@ async fn guard_reports_incarnation_cancellation() {
     assert!(!guard.is_cancelled());
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
     assert!(guard.is_cancelled());
@@ -718,7 +714,7 @@ impl Actor for TeardownActor {
                     std::future::pending::<()>().await;
                 },
                 |_| TeardownMessage::Start,
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("offload accepted");
         context.stop();
@@ -932,7 +928,7 @@ impl Actor for ExternallyCancelledOffloadActor {
                     dropped: None,
                 },
                 |_| (),
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("offload accepted");
         guard_sender
@@ -993,7 +989,7 @@ async fn cancellation_destructor_panic_wakes_an_otherwise_idle_actor() {
     );
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed actor scope shuts down");
 }
@@ -1019,7 +1015,7 @@ impl Actor for CancellationDropActor {
                     dropped: Some(Arc::clone(&dropped)),
                 },
                 |_| (),
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("first offload accepted");
         let second = context
@@ -1031,7 +1027,7 @@ impl Actor for CancellationDropActor {
                     dropped: None,
                 },
                 |_| (),
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("second offload accepted");
 
@@ -1090,14 +1086,14 @@ impl Actor for PanicActor {
                         ()
                     },
                     |_| PanicMessage::Delivery,
-                    Duration::MAX.into(),
+                    Duration::MAX,
                 )
                 .expect("offload accepted"),
             PanicMode::Continuation => context
                 .offload(
                     async {},
                     |_| panic!("offload continuation panic"),
-                    Duration::MAX.into(),
+                    Duration::MAX,
                 )
                 .expect("offload accepted"),
             PanicMode::Blocking | PanicMode::HandlerAndDrop => {}
@@ -1157,7 +1153,7 @@ async fn assert_pre_ready_panic(mode: PanicMode, expected: &str, trigger: bool) 
     );
     assert_eq!(message.as_deref(), Some(expected));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root shuts down");
 }
@@ -1192,7 +1188,7 @@ async fn assert_cancellation_drop_panic(mode: CancellationDropMode, expected: &s
         );
     }
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root shuts down");
 }
@@ -1258,7 +1254,7 @@ impl Actor for QueuedPanicActor {
                     ()
                 },
                 |_| PanicMessage::Delivery,
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("offload accepted");
         guard.finished().await;
@@ -1298,7 +1294,7 @@ async fn assert_queued_panic_beats_orderly_exit(mode: QueuedPanicMode) {
     assert_eq!(message.as_deref(), Some("owned offload panic"));
     assert!(queued.load(Ordering::SeqCst));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root shuts down");
 }
@@ -1338,7 +1334,7 @@ async fn queued_offload_panic_survives_hard_abort() {
         "offload panic is queued before hard abort"
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("hard abort bounds shutdown");
 
@@ -1376,7 +1372,7 @@ impl Actor for HandlerOffloadDoublePanicActor {
                     panic!("handler owned offload panic");
                 },
                 |_| (),
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("offload accepted");
         guard.finished().await;
@@ -1414,7 +1410,7 @@ async fn hard_abort_preserves_owned_offload_panic_over_handler_destructor() {
         "offload panic is owned before hard abort"
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("the two panics remain contained");
 
@@ -1485,7 +1481,7 @@ impl Actor for CrashTeardownActor {
                     std::future::pending::<()>().await;
                 },
                 |_| CrashTeardownMessage::Start,
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("offload accepted");
         panic!("injected handle panic");
@@ -1521,7 +1517,7 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_panic() {
         ["offload", "actor"]
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
 }
@@ -1565,7 +1561,7 @@ impl Actor for FailTeardownActor {
                     std::future::pending::<()>().await;
                 },
                 |_| FailTeardownMessage::Start,
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("offload accepted");
         Err(ExitError::message("injected handler failure"))
@@ -1615,7 +1611,7 @@ impl Actor for FloodActor {
                                     result.expect("flooded offload completes within its budget"),
                                 )
                             },
-                            Duration::MAX.into(),
+                            Duration::MAX,
                         )
                         .expect("live offload accepted");
                 }
@@ -1686,7 +1682,7 @@ impl CycleActor {
             .offload(
                 async move { value },
                 move |result| CycleMessage::Completed(result.expect("cycle offload completes")),
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("live offload accepted");
     }
@@ -1772,7 +1768,7 @@ impl Actor for SaturatedActor {
                             assert_eq!(result, Err(DeadlineElapsed));
                             SaturateMessage::Completed
                         },
-                        Duration::ZERO.into(),
+                        Duration::ZERO,
                     )
                     .expect("live offload accepted");
             }
@@ -1853,7 +1849,7 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_error() {
         ["offload", "actor"]
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
 }

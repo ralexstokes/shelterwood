@@ -91,13 +91,13 @@ impl ScopeRef {
         &self,
         id: impl Into<ChildId>,
         pred: P,
-        timeout: DeadlineBudget,
+        timeout: impl Into<DeadlineBudget>,
     ) -> impl std::future::Future<Output = Result<ChildSnapshot, WaitError>> + Send
     where
         P: FnMut(&ChildSnapshot) -> bool + Send,
     {
         let id = id.into();
-        self.wait_for_child_inner(id, pred, timeout)
+        self.wait_for_child_inner(id, pred, timeout.into())
     }
 
     async fn wait_for_child_inner<P>(
@@ -109,11 +109,9 @@ impl ScopeRef {
     where
         P: FnMut(&ChildSnapshot) -> bool + Send,
     {
-        let poll_once = crate::deadline::select_zero_budget_behavior(
-            timeout,
-            crate::deadline::ZeroBudgetBehavior::PollOnce,
-        )
-        .is_some();
+        // Zero selects poll-once (SPEC Appendix B), and the capture below is
+        // how: a zero budget's deadline is its own start instant, so the
+        // due-check in the loop is already true on the first pass.
         let expires = crate::deadline::Deadline::after_budget(crate::runtime::now(), timeout);
         let mut snapshots = self.subscribe_snapshots();
 
@@ -134,7 +132,7 @@ impl ScopeRef {
             }
             // Precedence is predicate, final termination, then deadline on
             // both the fast and awaited paths.
-            if poll_once || expires.is_due(crate::runtime::now()) {
+            if expires.is_due(crate::runtime::now()) {
                 return Err(WaitError::TimedOut);
             }
             match crate::runtime::select_two(snapshots.changed(), async {

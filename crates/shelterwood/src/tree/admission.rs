@@ -384,7 +384,7 @@ mod tests {
                 .expect("reentrant second reservation was released"),
         );
         system
-            .shutdown(Duration::from_secs(1).into())
+            .shutdown(Duration::from_secs(1))
             .await
             .expect("cancelled reservations leave no stragglers");
     }

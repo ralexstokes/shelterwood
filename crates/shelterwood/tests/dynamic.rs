@@ -197,7 +197,7 @@ async fn scope_dynamic_conversion_and_exact_dynamic_scope_removal_are_publicly_u
     let ordered_scope: ScopeRef = ordered.scope();
     assert!(ordered_scope.dynamic().is_none());
     ordered
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("ordered root stops");
 
@@ -217,7 +217,7 @@ async fn scope_dynamic_conversion_and_exact_dynamic_scope_removal_are_publicly_u
         RemoveOutcome::Removed
     );
     dynamic
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("dynamic root stops");
 }
@@ -245,7 +245,7 @@ async fn restartable_dynamic_surfaces_are_parallel_across_all_three_child_kinds(
     assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
     assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -280,7 +280,7 @@ async fn consuming_dynamic_surfaces_are_parallel_across_all_three_child_kinds() 
     assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
     assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -307,7 +307,7 @@ async fn dynamic_actor_add_resolves_at_admission_without_awaiting_init() {
     actor.send(()).await.expect("admitted mailbox is usable");
     assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
 }
@@ -385,7 +385,7 @@ async fn task_raw_and_subtree_admissions_resolve_before_manual_startup() {
     assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
     assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -408,7 +408,7 @@ async fn successful_admission_is_fused_after_returning_its_handle() {
 
     assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -456,11 +456,11 @@ async fn exact_handles_reject_cross_scope_and_same_id_successors() {
         right_scope.remove_task(&right_task).await,
         RemoveOutcome::Removed
     );
-    left.shutdown(Duration::from_secs(1).into())
+    left.shutdown(Duration::from_secs(1))
         .await
         .expect("left stops");
     right
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("right stops");
 }
@@ -528,7 +528,7 @@ async fn nested_declared_membership_is_incomparable_with_its_runtime_replacement
     );
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
 }
@@ -575,7 +575,7 @@ async fn nested_actor_replacement_keeps_mailbox_evidence_in_each_exact_membershi
     );
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
 }
@@ -612,7 +612,7 @@ async fn exact_scope_removal_does_not_touch_a_same_id_successor() {
         RemoveOutcome::Removed
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -646,7 +646,7 @@ async fn tombstones_occupy_ids_until_explicit_removal() {
         RemoveOutcome::Removed
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -710,7 +710,7 @@ async fn removal_is_synchronous_detached_and_shared() {
     assert_eq!(left, RemoveOutcome::Removed);
     assert_eq!(right, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -755,7 +755,7 @@ async fn reserved_cell_removal_wins_a_queued_split_definition() {
         .expect("scope remains admitting");
     assert_eq!(scope.remove_task(&survivor).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -809,7 +809,7 @@ fn admission_runtime_guards_leave_reservation_ids_reusable() {
             assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
         }
         system
-            .shutdown(Duration::from_secs(1).into())
+            .shutdown(Duration::from_secs(1))
             .await
             .expect("root stops");
     });
@@ -882,7 +882,7 @@ async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
     assert!(split_cancelled.load(Ordering::SeqCst));
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -986,7 +986,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         RemoveOutcome::Removed
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1129,7 +1129,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
     assert!(subtree_cancelled.load(Ordering::SeqCst));
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1170,7 +1170,7 @@ async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
     assert!(factory_dropped.load(Ordering::SeqCst));
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1198,7 +1198,7 @@ async fn pre_spawn_shutdown_waits_for_teardown_to_exist() {
     let mut root = Tree::new();
     let slot = root.reserve_subtree::<Tree>("nested").expect("reservation");
     let scope = slot.scope_ref();
-    let mut waiter = Box::pin(scope.shutdown_and_wait(Duration::from_millis(10).into()));
+    let mut waiter = Box::pin(scope.shutdown_and_wait(Duration::from_millis(10)));
     assert!(
         poll_once(waiter.as_mut()).is_pending(),
         "the pre-spawn shutdown request registers without completing"
@@ -1215,7 +1215,7 @@ async fn pre_spawn_shutdown_waits_for_teardown_to_exist() {
     gate.release();
     assert_eq!(scope.wait_stopped().await, StopReason::ShutdownRequested);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1226,11 +1226,8 @@ async fn pre_spawn_shutdown_resolves_if_the_tree_is_dropped_unspawned() {
     let slot = root.reserve_subtree::<Tree>("nested").expect("reservation");
     let scope = slot.scope_ref();
     let wait_scope = scope.clone();
-    let waiter = tokio::spawn(async move {
-        wait_scope
-            .shutdown_and_wait(Duration::from_millis(1).into())
-            .await
-    });
+    let waiter =
+        tokio::spawn(async move { wait_scope.shutdown_and_wait(Duration::from_millis(1)).await });
     drop(slot);
     drop(root);
     waiter
@@ -1315,7 +1312,7 @@ async fn dropping_undefined_dynamic_slots_terminalizes_cells_and_frees_ids() {
         .expect("subtree id was released");
     assert_eq!(scope.remove_scope(&nested).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1371,7 +1368,7 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
         .wait_for_child(
             "dynamic",
             |child| matches!(child.state, ChildState::Restarting),
-            Duration::MAX.into(),
+            Duration::MAX,
         )
         .await
         .expect("the failed incarnation enters its explicit restart window");
@@ -1398,7 +1395,7 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
         RemoveOutcome::Removed
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1461,7 +1458,7 @@ async fn await_first_restart_window(root: &ScopeRef, starts: &Arc<AtomicUsize>) 
     root.wait_for_child(
         "nested",
         |child| matches!(child.state, ChildState::Restarting),
-        Duration::MAX.into(),
+        Duration::MAX,
     )
     .await
     .expect("the first incarnation enters its explicit restart window");
@@ -1527,7 +1524,7 @@ async fn assert_pending_restart_shutdown_is_expedited<R: Clone>(
 ) {
     tokio::time::timeout(
         Duration::from_secs(1),
-        nested.shutdown_and_wait(Duration::from_secs(1).into()),
+        nested.shutdown_and_wait(Duration::from_secs(1)),
     )
     .await
     .expect("shutdown does not wait for the pending restart deadline")
@@ -1548,10 +1545,7 @@ async fn assert_pending_restart_shutdown_is_expedited<R: Clone>(
             2,
             "an unrepresentable deadline must not resurrect the stopped incarnation"
         );
-        system
-            .shutdown(Duration::ZERO.into())
-            .await
-            .expect("root stops");
+        system.shutdown(Duration::ZERO).await.expect("root stops");
         return;
     }
 
@@ -1583,7 +1577,7 @@ async fn assert_pending_restart_shutdown_is_expedited<R: Clone>(
     })
     .await;
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1622,10 +1616,7 @@ async fn same_batch_removal_suppresses_pending_restart_shutdown() {
     );
     assert_eq!(factories.load(Ordering::SeqCst), 1);
     assert_eq!(starts.load(Ordering::SeqCst), 1);
-    system
-        .shutdown(Duration::ZERO.into())
-        .await
-        .expect("root stops");
+    system.shutdown(Duration::ZERO).await.expect("root stops");
 }
 
 #[tokio::test]
@@ -1655,7 +1646,7 @@ async fn draining_scopes_reject_admission_and_treat_removal_as_absent() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2).into()));
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             cancelled.load(Ordering::SeqCst)
@@ -1712,7 +1703,7 @@ async fn removal_of_a_polled_split_definition_keeps_the_scope_admitting() {
         .expect("the scope keeps admitting and the id is free");
     assert_eq!(scope.remove_task(&survivor).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1780,7 +1771,7 @@ async fn ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal()
         "first poll owns a queued admission request before yielding"
     );
 
-    let mut shutdown = Box::pin(system.shutdown(Duration::from_secs(1).into()));
+    let mut shutdown = Box::pin(system.shutdown(Duration::from_secs(1)));
     assert!(
         poll_once(shutdown.as_mut()).is_pending(),
         "ancestor shutdown is armed before queued work gets a scheduler turn"
@@ -1862,7 +1853,7 @@ async fn admissions_return_kind_specific_handles_directly() {
     assert_eq!(scope.remove_task(&one_shot).await, RemoveOutcome::Removed);
     assert_eq!(scope.remove_scope(&subtree).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1907,7 +1898,7 @@ async fn startup_failed_roots_reject_reservation_and_admission_with_startup_fail
     ));
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed startup rolls back");
 }
@@ -1921,7 +1912,7 @@ async fn terminal_scopes_reject_reservation_and_admission_with_terminal() {
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
     assert_eq!(

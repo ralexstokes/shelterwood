@@ -208,7 +208,7 @@ async fn sidecar_runs_two_host_owned_cycles_with_readiness_and_policy_exact_shut
 
         fixture.readiness.release();
         let system = system
-            .start_or_shutdown(Duration::from_secs(1).into())
+            .start_or_shutdown(Duration::from_secs(1))
             .await
             .expect("host keeps a successfully started sidecar");
         assert!(
@@ -219,7 +219,7 @@ async fn sidecar_runs_two_host_owned_cycles_with_readiness_and_policy_exact_shut
                 .all(|child| { matches!(child.state, ChildState::Running | ChildState::Starting) })
         );
         system
-            .shutdown(Duration::from_secs(1).into())
+            .shutdown(Duration::from_secs(1))
             .await
             .expect("host resolves shutdown before dropping its runtime");
 
@@ -348,7 +348,7 @@ async fn sidecar_startup_failure_leaves_prefix_supervised_until_host_rolls_it_ba
         startup: rollback_startup,
         rollback_timeout,
     } = system
-        .start_or_shutdown(Duration::from_secs(1).into())
+        .start_or_shutdown(Duration::from_secs(1))
         .await
         .expect_err("host requests rollback after failed startup");
     assert_eq!(rollback_startup, startup);

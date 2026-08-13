@@ -55,16 +55,11 @@ pub(crate) async fn shutdown_scope(
         watcher.changed().await;
     }
 
-    let outcome = if crate::deadline::select_zero_budget_behavior(
-        timeout,
-        crate::deadline::ZeroBudgetBehavior::ImmediateEscalation,
-    )
-    .is_some()
-    {
-        // Zero is an escalation budget, not an observation opportunity: the
-        // cooperative request above is still delivered, but its wait is
-        // skipped even when the incarnation could settle on an immediate
-        // poll.
+    // Zero selects immediate escalation (SPEC Appendix B): it is an escalation
+    // budget, not an observation opportunity, so the cooperative request above
+    // is still delivered but its wait is skipped even when the incarnation
+    // could settle on an immediate poll.
+    let outcome = if timeout.is_zero() {
         runtime::Timeout::Elapsed
     } else {
         runtime::timeout(timeout.duration(), wait_for_incarnation(&scope, epoch)).await

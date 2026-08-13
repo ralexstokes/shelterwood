@@ -76,7 +76,7 @@ impl<T: Send + 'static> ReplyReceiver<T> {
     ///
     /// A zero budget does not observe an already-published response; it closes
     /// this receive capability and reports [`ReplyError::Timeout`].
-    pub fn recv(self, deadline: DeadlineBudget) -> ReplyReceive<T> {
+    pub fn recv(self, deadline: impl Into<DeadlineBudget>) -> ReplyReceive<T> {
         ReplyReceive {
             deadlined: Deadlined::no_attempt(
                 ReplyOperation {
@@ -163,12 +163,12 @@ mod tests {
 
         let (reply, receiver) = super::Reply::channel();
         reply.send(7_u8);
-        assert_eq!(receiver.recv(deadline.into()).await, Ok(7));
+        assert_eq!(receiver.recv(deadline).await, Ok(7));
 
         let (reply, receiver) = super::Reply::<u8>::channel();
         drop(reply);
         assert_eq!(
-            receiver.recv(deadline.into()).await,
+            receiver.recv(deadline).await,
             Err(super::ReplyError::Dropped)
         );
 

@@ -28,7 +28,7 @@ A task-first application needs no actor merely to obtain supervision:
 ```rust
 use std::time::Duration;
 
-use shelterwood::{DeadlineBudget, ExitError, TaskOnceDef, Tree};
+use shelterwood::{ExitError, TaskOnceDef, Tree};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,9 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     system.wait_started().await?;
 
     // The owner drives bounded teardown and waits for every child to join.
-    system
-        .shutdown(DeadlineBudget::new(Duration::from_secs(5)))
-        .await?;
+    system.shutdown(Duration::from_secs(5)).await?;
     Ok(())
 }
 ```

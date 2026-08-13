@@ -334,7 +334,7 @@ async fn system_shutdown_joins_root_driver_teardown() {
     drop(control);
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("empty dynamic root shuts down");
 

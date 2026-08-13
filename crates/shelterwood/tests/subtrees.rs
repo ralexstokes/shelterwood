@@ -63,7 +63,7 @@ async fn a_restartable_subtree_can_heal_an_unfilled_lowering_failure() {
         ExitKind::NeverStarted
     ));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -133,7 +133,7 @@ async fn one_shot_subtree_lowering_failure_retains_structured_provenance() {
             if undefined.len() == 1 && undefined[0][0].as_str() == "missing"
     ));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root rolls back");
 }
@@ -187,7 +187,7 @@ async fn subtree_intensity_trip_retains_structured_provenance() {
         "as_error exposes the same erased failure that Display renders"
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root rolls back");
 }
@@ -388,7 +388,7 @@ async fn intensity_window_ages_out_between_restart_schedules() {
         .await
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("budget did not trip");
 }
@@ -419,7 +419,7 @@ async fn recursive_shutdown_reaches_nested_descendants() {
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("recursive shutdown joins");
     assert!(cancelled.load(Ordering::SeqCst));
@@ -461,7 +461,7 @@ async fn zero_timeout_reports_recursive_straggler_paths_and_joins_them() {
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     let timeout = system
-        .shutdown(Duration::ZERO.into())
+        .shutdown(Duration::ZERO)
         .await
         .expect_err("zero timeout escalates live descendants");
     assert_eq!(timeout.stragglers.len(), 1);
@@ -493,7 +493,7 @@ async fn ordered_graces_sum_while_dynamic_graces_overlap() {
     ordered.wait_started().await.expect("ordered starts");
     let started = tokio::time::Instant::now();
     ordered
-        .shutdown(Duration::from_secs(60).into())
+        .shutdown(Duration::from_secs(60))
         .await
         .expect("child policies bound shutdown");
     let ordered_elapsed = tokio::time::Instant::now() - started;
@@ -506,7 +506,7 @@ async fn ordered_graces_sum_while_dynamic_graces_overlap() {
     dynamic.wait_started().await.expect("dynamic starts");
     let started = tokio::time::Instant::now();
     dynamic
-        .shutdown(Duration::from_secs(60).into())
+        .shutdown(Duration::from_secs(60))
         .await
         .expect("child policies bound shutdown");
     let dynamic_elapsed = tokio::time::Instant::now() - started;
@@ -533,7 +533,7 @@ async fn dynamic_and_always_members_do_not_finish_naturally() {
     .await;
     drop(dynamic_stopped);
     dynamic
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("dynamic stops by owner");
 
@@ -579,7 +579,7 @@ async fn dynamic_and_always_members_do_not_finish_naturally() {
     .await;
     drop(ordered_stopped);
     ordered
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("owner stops always member");
 }
@@ -603,7 +603,7 @@ async fn hard_aborted_subtree_descendants_still_publish_exits() {
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     system
-        .shutdown(Duration::from_secs(5).into())
+        .shutdown(Duration::from_secs(5))
         .await
         .expect("the subtree's abort policy bounds teardown");
     let exit = tokio::time::timeout(Duration::from_secs(1), leaf.wait())
@@ -666,7 +666,7 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
         .await,
         "leaf starts polling"
     );
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(5).into()));
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(5)));
     let returned_before_leaf_released =
         poll_until(Duration::from_millis(50), Duration::from_millis(1), || {
             shutdown.is_finished()
@@ -749,11 +749,11 @@ async fn shutdown_and_wait_wakes_when_a_parent_drain_terminalizes_a_restarting_s
         .wait_for_child(
             "nested",
             |child| matches!(child.state, ChildState::Restarting),
-            Duration::from_secs(1).into(),
+            Duration::from_secs(1),
         )
         .await
         .expect("the parent publishes the subtree restart window");
-    let mut waiter = Box::pin(sub.shutdown_and_wait(Duration::from_secs(1).into()));
+    let mut waiter = Box::pin(sub.shutdown_and_wait(Duration::from_secs(1)));
     assert!(
         poll_once(waiter.as_mut()).is_pending(),
         "the restart-window stop request is registered before parent teardown"
@@ -861,7 +861,7 @@ async fn shutdown_latched_before_a_subtree_lowering_failure_reads_cancelled() {
         "a pre-loop stop request is still a stop request: {exit:?}"
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("the stopped root rolls back");
 }
@@ -935,7 +935,7 @@ async fn restart_attempt_resets_after_a_ready_incarnation_settles() {
     );
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1043,7 +1043,7 @@ async fn subtree_defaults_inherit_or_reset_end_to_end() {
     inherited_release.release();
     reset_release.release();
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1136,7 +1136,7 @@ async fn three_level_mailbox_capacity_walk_honors_inherit_and_reset() {
     inherited_release.release();
     reset_release.release();
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1241,7 +1241,7 @@ async fn subtree_restart_defaults_inherit_or_reset_end_to_end() {
     drop(reset_wait);
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1293,11 +1293,11 @@ async fn subtree_shutdown_defaults_inherit_or_reset_end_to_end() {
     reset_started.wait().await;
 
     inherited_scope
-        .shutdown_and_wait(Duration::from_secs(30).into())
+        .shutdown_and_wait(Duration::from_secs(30))
         .await
         .expect("inherited abort policy stops immediately");
     reset_scope
-        .shutdown_and_wait(Duration::from_secs(30).into())
+        .shutdown_and_wait(Duration::from_secs(30))
         .await
         .expect("reset library grace eventually escalates");
     assert!(matches!(
@@ -1314,7 +1314,7 @@ async fn subtree_shutdown_defaults_inherit_or_reset_end_to_end() {
     ));
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1443,7 +1443,7 @@ async fn subtree_mailbox_shutdown_defaults_inherit_or_reset_end_to_end() {
     assert_eq!(reset_handled.load(Ordering::SeqCst), 1);
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1514,7 +1514,7 @@ async fn subtree_readiness_deadline_defaults_inherit_or_reset_end_to_end() {
     drop(inherited_wait);
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }

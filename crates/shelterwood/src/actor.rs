@@ -220,7 +220,7 @@ impl<'a, A: Actor> Context<'a, A> {
         &mut self,
         work: F,
         continuation: C,
-        deadline: DeadlineBudget,
+        deadline: impl Into<DeadlineBudget>,
     ) -> Result<(), Rejected<(F, C)>>
     where
         F: Future<Output = T> + Send + 'static,
@@ -241,7 +241,7 @@ impl<'a, A: Actor> Context<'a, A> {
         &mut self,
         work: F,
         continuation: C,
-        deadline: DeadlineBudget,
+        deadline: impl Into<DeadlineBudget>,
     ) -> Result<Guard, Rejected<(F, C)>>
     where
         F: Future<Output = T> + Send + 'static,

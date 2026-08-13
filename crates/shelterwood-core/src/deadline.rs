@@ -5,10 +5,11 @@ use std::time::{Duration, Instant};
 /// A relative time budget supplied to a public deadline-bearing operation.
 ///
 /// The value deliberately permits zero. Zero is not interpreted by the
-/// caller: each operation selects one of the three library-defined behaviors
-/// in its implementation—no attempt, one observation pass, or immediate
-/// escalation. Keeping the value nominal prevents a bare `Duration::ZERO`
-/// from acquiring undocumented semantics at a new API site.
+/// caller: each operation fixes one of the three library-defined behaviors in
+/// its own contract—no attempt, one observation pass, or immediate
+/// escalation—and SPEC Appendix B tabulates which operation takes which.
+/// Public surfaces accept `impl Into<DeadlineBudget>`, so a plain `Duration`
+/// still reads naturally at the call site while the semantics have one name.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeadlineBudget(Duration);
 
@@ -44,42 +45,6 @@ impl From<Duration> for DeadlineBudget {
 impl From<DeadlineBudget> for Duration {
     fn from(budget: DeadlineBudget) -> Self {
         budget.duration()
-    }
-}
-
-/// The complete zero-width behavior inventory for deadline-bearing APIs.
-///
-/// This is a cross-crate implementation seam; the supported façade exports
-/// [`DeadlineBudget`], while individual operations fix one behavior in their
-/// contract rather than accepting this enum from callers.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ZeroBudgetBehavior {
-    /// Finish with the timeout result without attempting the operation.
-    NoAttempt,
-    /// Evaluate currently observable state once, then time out.
-    PollOnce,
-    /// Skip cooperative waiting and enter the escalation tail immediately.
-    ImmediateEscalation,
-}
-
-/// Selects and reports one operation's zero-width behavior.
-///
-/// This is a free function rather than an inherent [`DeadlineBudget`] method:
-/// the budget is re-exported by the supported façade, while this cross-crate
-/// selector and [`ZeroBudgetBehavior`] are implementation seams. Keeping the
-/// seam off the inherent method set prevents it from leaking through that
-/// re-export.
-#[doc(hidden)]
-#[must_use]
-pub const fn select_zero_budget_behavior(
-    budget: DeadlineBudget,
-    behavior: ZeroBudgetBehavior,
-) -> Option<ZeroBudgetBehavior> {
-    if budget.is_zero() {
-        Some(behavior)
-    } else {
-        None
     }
 }
 
@@ -165,24 +130,17 @@ impl Deadline {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{Deadline, DeadlineBudget, ZeroBudgetBehavior, select_zero_budget_behavior};
+    use super::{Deadline, DeadlineBudget};
 
     #[test]
-    fn zero_budget_selector_is_total_over_the_behavior_inventory() {
-        for behavior in [
-            ZeroBudgetBehavior::NoAttempt,
-            ZeroBudgetBehavior::PollOnce,
-            ZeroBudgetBehavior::ImmediateEscalation,
-        ] {
-            assert_eq!(
-                select_zero_budget_behavior(DeadlineBudget::ZERO, behavior),
-                Some(behavior)
-            );
-            assert_eq!(
-                select_zero_budget_behavior(DeadlineBudget::new(Duration::from_nanos(1)), behavior),
-                None
-            );
-        }
+    fn a_zero_budget_deadline_is_already_due_at_its_own_start() {
+        let started_at = Instant::now();
+        let expires = Deadline::after_budget(started_at, DeadlineBudget::ZERO);
+        assert_eq!(expires.instant(), Some(started_at));
+        assert!(
+            expires.is_due(started_at),
+            "the poll-once surfaces read their zero budget through this rule"
+        );
     }
 
     fn latest_representable(started_at: Instant) -> Instant {

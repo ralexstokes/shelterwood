@@ -200,8 +200,9 @@ impl<R> System<R> {
     /// enters the ordinary escalation tail without a cooperative wait.
     pub async fn start_or_shutdown(
         mut self,
-        timeout: DeadlineBudget,
+        timeout: impl Into<DeadlineBudget>,
     ) -> Result<Self, StartOrShutdownError> {
+        let timeout: DeadlineBudget = timeout.into();
         match self.wait_started().await {
             Ok(()) => Ok(self),
             Err(startup) => {
@@ -225,8 +226,11 @@ impl<R> System<R> {
     /// past hard abort independently of that fallback.
     /// A zero budget still requests cooperative cancellation, then skips its
     /// wait and enters the ordinary escalation tail immediately.
-    pub async fn shutdown(mut self, timeout: DeadlineBudget) -> Result<(), ShutdownTimeout> {
-        self.run.shutdown(timeout).await
+    pub async fn shutdown(
+        mut self,
+        timeout: impl Into<DeadlineBudget>,
+    ) -> Result<(), ShutdownTimeout> {
+        self.run.shutdown(timeout.into()).await
     }
 
     /// Waits for natural or externally requested terminal state.

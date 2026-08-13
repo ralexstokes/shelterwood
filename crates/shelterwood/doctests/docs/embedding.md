@@ -23,11 +23,11 @@ decision, but most embeddings want rollback:
 
 ```rust,no_run
 # use std::time::Duration;
-# use shelterwood::{DeadlineBudget, System, Tree};
+# use shelterwood::{System, Tree};
 # async fn start(tree: Tree) -> Result<System, Box<dyn std::error::Error>> {
 let system = tree.spawn()?;
 let system = system
-    .start_or_shutdown(DeadlineBudget::new(Duration::from_secs(5)))
+    .start_or_shutdown(Duration::from_secs(5))
     .await?;
 # Ok(system)
 # }

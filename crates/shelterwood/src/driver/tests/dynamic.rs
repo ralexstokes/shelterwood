@@ -68,7 +68,7 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
     }
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("empty dynamic scope shuts down");
 }
@@ -286,7 +286,7 @@ async fn retained_unadmitted_slot_does_not_block_driver_teardown() {
         .reserve_task("retained")
         .expect("unadmitted reservation is retained");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("driver teardown completes");
 

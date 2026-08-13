@@ -777,7 +777,7 @@ Delivery is at-most-once (§1 principle 6). Send flavors on `ActorRef`
   fn call<T: Send + 'static>(
       &self,
       make_msg: impl FnOnce(Reply<T>) -> M,
-      deadline: DeadlineBudget,              // trailing, per Appendix B
+      deadline: impl Into<DeadlineBudget>,   // trailing, per Appendix B
   ) -> impl Future<Output = Result<Replied<T>, CallError>>;
   // Replied<T>: the reply value plus the accepting Incarnation (§3.3)
   ```
@@ -3442,8 +3442,9 @@ revisit it, never inherit it accidentally.
 
 One cross-cutting shape rule: where a surface takes a deadline budget over
 other arguments, the deadline is the trailing parameter. Every such parameter
-is a `DeadlineBudget`; its clock origin follows the operation family rather
-than the representation. Mailbox futures and `wait_for_child` capture it on
+accepts `impl Into<DeadlineBudget>`, so a plain `Duration` reads naturally at
+the call site while the semantics below have exactly one name; its clock origin
+follows the operation family rather than the representation. Mailbox futures and `wait_for_child` capture it on
 first poll. `offload`/`offload_scoped` return no future, so they start it when
 the actor loop registers the offload at the call (§5.5). The shutdown family
 uses the value as an escalation budget: `System::shutdown` and
@@ -3461,7 +3462,7 @@ implementation rather than interpreting a bare duration locally:
 |---|---|---|---|
 | no attempt | `send_timeout`, `call`, `ReplyReceiver::recv`, `offload`, `offload_scoped` | do not submit/poll work or observe completion; return/deliver the timeout result | `mailbox::deadline::a_zero_budget_short_circuits_without_polling_the_operation`, `integration::zero_deadlines_short_circuit_without_acceptance_or_message_construction`, `integration::reply_receiver_reports_drop_and_is_safe_to_abandon`, `integration::zero_budget_offload_never_polls_work_and_times_out_on_actor_task` |
 | poll once | `wait_for_child` | evaluate the current snapshot once with precedence match → terminal scope → timeout; never await | `integration::zero_duration_wait_observes_an_already_satisfied_child`, `integration::wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_termination` |
-| immediate escalation | `System::shutdown`, `ScopeRef::shutdown_and_wait`, `start_or_shutdown` rollback | request cooperative cancellation, skip only the cooperative wait, then run the ordinary abort tail | `integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`, `integration::start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stragglers` |
+| immediate escalation | `System::shutdown`, `ScopeRef::shutdown_and_wait`, `start_or_shutdown` rollback | request cooperative cancellation, skip only the cooperative wait, then run the ordinary abort tail | `integration::zero_shutdown_reports_the_live_child_but_detaches_blocking_factory_disposal` (the discriminating pin: a child that *could* settle on the skipped poll is still reported as a straggler), `integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`, `integration::start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stragglers` |
 
 For a no-attempt offload, whose timeout outcome is a delivery rather than a
 call failure, the work future is never polled and the total continuation
@@ -3780,9 +3781,13 @@ reserved slots' child-id paths — §11's lowering rule). They exist so
 routing on "this subtree churned out / never came up" (a breaker, an
 operator surface) is one compile-checked call. Both are matches on
 `ExitError`'s private provenance structure (§7) — no downcast, and
-non-forgeable: only the library can construct the payloads, so an
-imitating application error yields `None`. Both payload types are public and
-exhaustive pre-release; adding a cause or field must update every façade match.
+non-forgeable: only the library can *authenticate* a payload into an
+`ExitError`, so an imitating application error routed through the blanket
+conversion yields `None`. Both payload types are public and exhaustive
+pre-release, which does make the payload values themselves constructible by
+an application; that is deliberate and costs nothing, because authentication
+lives in the provenance structure rather than in the payload's privacy.
+Adding a cause or field must update every façade match.
 Scope-level shutdown-timeout errors carry the affected children as
 structured data: child-id paths plus membership tokens (§7) — never
 bare ids, which sibling scopes may reuse (§2).
@@ -4146,7 +4151,7 @@ fn wait_for_child(
     &self,
     id: impl Into<ChildId>,
     pred: impl FnMut(&ChildSnapshot) -> bool + Send,
-    timeout: DeadlineBudget,                  // trailing, per Appendix B
+    timeout: impl Into<DeadlineBudget>,       // trailing, per Appendix B
 ) -> impl Future<Output = Result<ChildSnapshot, WaitError>> + Send;
 // WaitError { TimedOut, ScopeTerminated { state } } — exhaustive pre-release;
 // ScopeTerminated carries the scope's terminal B.6 state

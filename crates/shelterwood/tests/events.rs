@@ -126,7 +126,7 @@ impl Actor for BatchTraceActor {
                             assert!(result.is_err(), "zero-budget work reports its deadline");
                             BatchMessage::Offload
                         },
-                        Duration::ZERO.into(),
+                        Duration::ZERO,
                     )
                     .expect("offload accepted");
                 if self.fire_timer {
@@ -291,14 +291,14 @@ impl Actor for LiveContinuationActor {
                     .offload(
                         async {},
                         |_| LiveContinuationMessage::FirstOffload,
-                        Duration::ZERO.into(),
+                        Duration::ZERO,
                     )
                     .expect("first completion accepted");
                 context
                     .offload(
                         async {},
                         |_| LiveContinuationMessage::SecondOffload,
-                        Duration::ZERO.into(),
+                        Duration::ZERO,
                     )
                     .expect("second completion accepted");
                 "start"
@@ -656,7 +656,7 @@ impl Actor for TimerBatchFairnessActor {
             .offload(
                 async {},
                 |_| TimerBatchFairnessMessage::SeedCompletion,
-                Duration::ZERO.into(),
+                Duration::ZERO,
             )
             .expect("seed completion accepted");
         args.0.wait().await;
@@ -676,7 +676,7 @@ impl Actor for TimerBatchFairnessActor {
                     .offload(
                         async {},
                         |_| TimerBatchFairnessMessage::DuringBatchCompletion,
-                        Duration::ZERO.into(),
+                        Duration::ZERO,
                     )
                     .expect("completion accepted during the timer batch");
                 context
@@ -1035,7 +1035,7 @@ async fn overflowing_timer_deadlines_never_fire() {
         system.wait_started().await.expect("actor starts");
         assert_quiet(Duration::from_secs(1), || fired.load(Ordering::SeqCst) != 0).await;
         system
-            .shutdown(Duration::from_secs(1).into())
+            .shutdown(Duration::from_secs(1))
             .await
             .expect("tree shuts down");
         // The complete post-shutdown history seals the negative: the

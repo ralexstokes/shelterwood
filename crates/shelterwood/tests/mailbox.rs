@@ -155,7 +155,7 @@ async fn queue_backpressure_and_send_error_identity_are_exact() {
     );
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
     let terminal = actor
@@ -198,7 +198,7 @@ async fn latest_mailbox_keeps_only_the_newest_accepted_value() {
         .await
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
     // The complete post-shutdown history proves conflation destroyed the
@@ -233,7 +233,7 @@ async fn timed_send_withdraws_and_recovers_the_message() {
     let accepting = actor.try_send(Message::Value(1)).expect("queue fills");
 
     let width = Duration::from_secs(10);
-    let mut timed = Box::pin(actor.send_timeout(Message::Value(2), width.into()));
+    let mut timed = Box::pin(actor.send_timeout(Message::Value(2), width));
     assert!(poll_once(timed.as_mut()).is_pending());
     advance_time(width).await;
     let error = timed.await.expect_err("send withdraws");
@@ -261,7 +261,7 @@ async fn timed_send_withdraws_and_recovers_the_message() {
         .await
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
     // The complete post-shutdown history proves the cancelled send was
@@ -296,11 +296,10 @@ async fn call_distinguishes_success_drop_and_response_timeout() {
             .expect("identity probe accepts");
         let width = Duration::from_secs(10);
         let call_actor = actor.clone();
-        let call = tokio::spawn(async move {
-            call_actor
-                .call(|reply| Message::Ask(7, reply), width.into())
-                .await
-        });
+        let call =
+            tokio::spawn(
+                async move { call_actor.call(|reply| Message::Ask(7, reply), width).await },
+            );
         assert!(
             poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
                 asks.load(Ordering::SeqCst) == 1
@@ -324,7 +323,7 @@ async fn call_distinguishes_success_drop_and_response_timeout() {
             }
         }
         system
-            .shutdown(Duration::from_secs(1).into())
+            .shutdown(Duration::from_secs(1))
             .await
             .expect("actor stops");
     }
@@ -334,7 +333,7 @@ async fn call_distinguishes_success_drop_and_response_timeout() {
 async fn reply_receiver_is_consuming_and_late_replies_are_discarded() {
     let width = Duration::from_secs(10);
     let (reply, receiver) = Reply::channel();
-    let mut waiter = Box::pin(receiver.recv(width.into()));
+    let mut waiter = Box::pin(receiver.recv(width));
     assert!(poll_once(waiter.as_mut()).is_pending());
     advance_time(width).await;
     assert_eq!(waiter.await, Err(ReplyError::Timeout));

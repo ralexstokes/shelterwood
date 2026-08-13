@@ -84,8 +84,7 @@ async fn event_woken_pull_snapshots_are_consistent_at_first_start_and_final_stop
             .membership,
         nested_membership
     );
-    let shutdown =
-        tokio::spawn(async move { system.shutdown(Duration::from_secs(1).into()).await });
+    let shutdown = tokio::spawn(async move { system.shutdown(Duration::from_secs(1)).await });
     let mut saw_final_stop = false;
     while let Some(item) = tokio::time::timeout(Duration::from_secs(2), events.recv())
         .await
@@ -179,7 +178,7 @@ async fn lifecycle_lag_is_exact_coalesced_per_episode_and_subscribers_are_isolat
     drop(slow);
     drop(fast);
     system
-        .shutdown(Duration::from_secs(2).into())
+        .shutdown(Duration::from_secs(2))
         .await
         .expect("all waiting tasks shut down");
 }
@@ -272,7 +271,7 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
         RemoveOutcome::Removed
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root shuts down");
 }
@@ -374,7 +373,7 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
         .await
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root shuts down");
     let mut saw_teardown_prune = false;
@@ -512,7 +511,7 @@ async fn descendant_events_forward_with_origin_identity_path_and_causal_order() 
     assert_eq!(removal.await, RemoveOutcome::Removed);
     while nested_events.recv().await.is_some() {}
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root shuts down");
 }
@@ -654,7 +653,7 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     );
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
 }
@@ -744,7 +743,7 @@ async fn rebuilt_declared_handles_and_incarnations_keep_identity() {
     assert_eq!(starts[1].1.membership(), second.membership());
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
 }
@@ -762,7 +761,7 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
             .wait_for_child(
                 "later",
                 |child| matches!(child.state, ChildState::Running),
-                Duration::from_secs(1).into(),
+                Duration::from_secs(1),
             )
             .await
     });
@@ -779,14 +778,14 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
     assert_eq!(
         scope
             .as_scope()
-            .wait_for_child("missing", |_| true, Duration::ZERO.into())
+            .wait_for_child("missing", |_| true, Duration::ZERO)
             .await,
         Err(WaitError::TimedOut)
     );
     assert_eq!(
         scope
             .as_scope()
-            .wait_for_child("still-missing", |_| true, Duration::from_millis(5).into())
+            .wait_for_child("still-missing", |_| true, Duration::from_millis(5))
             .await,
         Err(WaitError::TimedOut)
     );
@@ -804,19 +803,19 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
         .wait_for_child(
             "terminal",
             |child| child.state.is_terminal(),
-            Duration::from_secs(1).into(),
+            Duration::from_secs(1),
         )
         .await
         .expect("terminal child is delivered to the predicate");
     assert_eq!(terminal_snapshot.membership, terminal.membership());
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root shuts down");
     let after_shutdown = scope
         .as_scope()
-        .wait_for_child("missing", |_| false, Duration::ZERO.into())
+        .wait_for_child("missing", |_| false, Duration::ZERO)
         .await;
     assert!(
         matches!(
@@ -835,7 +834,7 @@ async fn wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_t
     drop(declaration);
     assert!(matches!(
         never_spawned
-            .wait_for_child("missing", |_| false, Duration::from_secs(1).into())
+            .wait_for_child("missing", |_| false, Duration::from_secs(1))
             .await,
         Err(WaitError::ScopeTerminated {
             state: ScopeState::Stopped {
@@ -860,7 +859,7 @@ async fn undefined_dynamic_reservations_are_absent_and_emit_no_membership_edges(
     assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root shuts down");
 }
@@ -899,7 +898,7 @@ async fn withdrawn_queued_admission_never_publishes_an_added_child() {
     }
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -968,7 +967,7 @@ async fn hard_aborted_scope_pairs_added_with_exited_and_removed() {
     system.wait_started().await.expect("tree starts");
     let mut events = sub.subscribe_lifecycle();
     system
-        .shutdown(Duration::from_secs(5).into())
+        .shutdown(Duration::from_secs(5))
         .await
         .expect("the subtree's abort policy bounds teardown");
 
@@ -1040,7 +1039,7 @@ async fn never_ran_members_stop_rather_than_report_startup_abort() {
         .wait_for_child(
             "never-ran",
             |child| matches!(child.state, ChildState::Stopped { .. }),
-            Duration::from_secs(1).into(),
+            Duration::from_secs(1),
         )
         .await
         .expect("joined suffix disposal publishes terminality");
@@ -1109,7 +1108,7 @@ async fn descendant_resolves_leaf_and_scope_path_endings() {
     assert!(snapshot.descendant(["nested", "missing"]).is_none());
     assert!(snapshot.descendant(["direct", "too-deep"]).is_none());
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
 }
@@ -1143,7 +1142,7 @@ async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
     let mut waiter = Box::pin(scope.wait_for_child(
         "gated",
         |child| matches!(child.state, ChildState::Running),
-        Duration::MAX.into(),
+        Duration::MAX,
     ));
     assert!(
         poll_once(waiter.as_mut()).is_pending(),
@@ -1154,7 +1153,7 @@ async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
         .await
         .expect("a far-future deadline waits for the condition instead of expiring");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
 }
@@ -1199,7 +1198,7 @@ async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_va
     .await;
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1221,7 +1220,7 @@ async fn cloned_snapshot_receivers_observe_independently_and_inherit_the_seen_ge
         .wait_for_child(
             "worker",
             |child| matches!(child.state, ChildState::Running),
-            POLL_TIMEOUT.into(),
+            POLL_TIMEOUT,
         )
         .await
         .expect("worker starts");
@@ -1254,7 +1253,7 @@ async fn cloned_snapshot_receivers_observe_independently_and_inherit_the_seen_ge
     assert!(removed_from_original.child("worker").is_none());
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1289,7 +1288,7 @@ async fn lifecycle_subscriptions_start_now_without_replaying_prior_history() {
 
     assert_eq!(scope.remove_task(&new).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1363,7 +1362,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
         .wait_for_child(
             "departing",
             |child| matches!(child.state, ChildState::Running),
-            POLL_TIMEOUT.into(),
+            POLL_TIMEOUT,
         )
         .await
         .expect("departing child runs");
@@ -1444,7 +1443,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
                 child.membership_status == MembershipStatus::Removing
                     && matches!(child.state, ChildState::Stopping)
             },
-            POLL_TIMEOUT.into(),
+            POLL_TIMEOUT,
         )
         .await
         .expect("planned removal projects a removing, stopping child");
@@ -1458,7 +1457,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     release_stop.release();
     assert_eq!(removal.await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
     assert!(nested_scope.snapshot().state.is_stopped());
@@ -1498,11 +1497,7 @@ async fn state_predicates_hold_only_for_terminal_projections() {
     done.wait().await;
     let terminal = scope
         .as_scope()
-        .wait_for_child(
-            "done",
-            |child| child.state.is_terminal(),
-            POLL_TIMEOUT.into(),
-        )
+        .wait_for_child("done", |child| child.state.is_terminal(), POLL_TIMEOUT)
         .await
         .expect("finished child projects terminal state");
     assert!(matches!(terminal.state, ChildState::Stopped { .. }));
@@ -1516,7 +1511,7 @@ async fn state_predicates_hold_only_for_terminal_projections() {
 
     assert_eq!(scope.remove_task(&runner).await, RemoveOutcome::Removed);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
     let stopped = scope.as_scope().snapshot().state.clone();

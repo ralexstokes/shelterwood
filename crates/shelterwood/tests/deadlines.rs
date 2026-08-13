@@ -98,9 +98,9 @@ async fn prebind_overflow_timeouts_observe_the_bound_incarnation() {
         )
         .expect("valid actor");
     let width = Duration::from_secs(10);
-    let mut accepted = Box::pin(actor.send_timeout(Message::Value(1), width.into()));
-    let mut overflow = Box::pin(actor.send_timeout(Message::Value(2), width.into()));
-    let mut call = Box::pin(actor.call(Message::Ask, width.into()));
+    let mut accepted = Box::pin(actor.send_timeout(Message::Value(1), width));
+    let mut overflow = Box::pin(actor.send_timeout(Message::Value(2), width));
+    let mut call = Box::pin(actor.call(Message::Ask, width));
     assert!(poll_once(accepted.as_mut()).is_pending());
     assert!(poll_once(overflow.as_mut()).is_pending());
     assert!(poll_once(call.as_mut()).is_pending());
@@ -127,7 +127,7 @@ async fn prebind_overflow_timeouts_observe_the_bound_incarnation() {
 
     gate.release();
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
 }
@@ -144,10 +144,10 @@ async fn maximum_mailbox_deadlines_are_unbounded_waits() {
         )
         .expect("valid actor");
 
-    let mut send = Box::pin(actor.send_timeout(Message::Value(1), Duration::MAX.into()));
-    let mut call = Box::pin(actor.call(Message::Ask, Duration::MAX.into()));
+    let mut send = Box::pin(actor.send_timeout(Message::Value(1), Duration::MAX));
+    let mut call = Box::pin(actor.call(Message::Ask, Duration::MAX));
     let (reply, receiver) = Reply::channel();
-    let mut receive = Box::pin(receiver.recv(Duration::MAX.into()));
+    let mut receive = Box::pin(receiver.recv(Duration::MAX));
     assert!(poll_once(send.as_mut()).is_pending());
     assert!(poll_once(call.as_mut()).is_pending());
     assert!(poll_once(receive.as_mut()).is_pending());
@@ -173,7 +173,7 @@ async fn maximum_mailbox_deadlines_are_unbounded_waits() {
     assert_eq!(*values.lock().expect("values mutex poisoned"), [1]);
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
 }
@@ -195,7 +195,7 @@ async fn acceptance_winning_the_deadline_withdrawal_race_succeeds() {
     system.wait_started().await.expect("actor starts");
     let accepting = actor.try_send(Message::Value(1)).expect("queue fills");
     let deadline = Duration::from_secs(10);
-    let mut timed = Box::pin(actor.send_timeout(Message::Value(2), deadline.into()));
+    let mut timed = Box::pin(actor.send_timeout(Message::Value(2), deadline));
     assert!(poll_once(timed.as_mut()).is_pending());
 
     advance_time(deadline).await;
@@ -217,7 +217,7 @@ async fn acceptance_winning_the_deadline_withdrawal_race_succeeds() {
         .await
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
 }
@@ -239,7 +239,7 @@ async fn call_promotion_winning_the_deadline_race_reports_response_timeout() {
     system.wait_started().await.expect("actor starts");
     let accepting = actor.try_send(Message::Value(1)).expect("queue fills");
     let deadline = Duration::from_secs(10);
-    let mut call = Box::pin(actor.call(Message::Ask, deadline.into()));
+    let mut call = Box::pin(actor.call(Message::Ask, deadline));
     assert!(poll_once(call.as_mut()).is_pending());
 
     advance_time(deadline).await;
@@ -256,7 +256,7 @@ async fn call_promotion_winning_the_deadline_race_reports_response_timeout() {
     assert_eq!(error.kind, CallErrorKind::ResponseTimedOut);
     assert_eq!(error.incarnation_observed, Some(accepting));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
 }
@@ -284,7 +284,7 @@ async fn zero_deadlines_short_circuit_without_acceptance_or_message_construction
     // The mailbox has room, so only the zero-budget short-circuit keeps this
     // send from being attempted at all.
     let timed = actor
-        .send_timeout(Message::Value(2), Duration::ZERO.into())
+        .send_timeout(Message::Value(2), Duration::ZERO)
         .await
         .expect_err("zero send deadline short-circuits");
     assert_eq!(timed.kind, SendErrorKind::TimedOut);
@@ -296,7 +296,7 @@ async fn zero_deadlines_short_circuit_without_acceptance_or_message_construction
                 constructed_in_call.store(true, Ordering::SeqCst);
                 Message::Ask(reply)
             },
-            Duration::ZERO.into(),
+            Duration::ZERO,
         )
         .await
         .expect_err("zero call deadline short-circuits");
@@ -318,7 +318,7 @@ async fn zero_deadlines_short_circuit_without_acceptance_or_message_construction
     .await;
     assert!(matches!(timed.message, Message::Value(2)));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
 }
@@ -336,14 +336,14 @@ async fn preacceptance_expiry_and_terminality_follow_the_identity_table() {
         .expect("valid actor");
     let width = Duration::from_secs(10);
 
-    let mut timed = Box::pin(actor.send_timeout(Message::Value(1), width.into()));
+    let mut timed = Box::pin(actor.send_timeout(Message::Value(1), width));
     assert!(poll_once(timed.as_mut()).is_pending());
     advance_time(width).await;
     let timed = timed.await.expect_err("unbound send expires");
     assert_eq!(timed.kind, SendErrorKind::TimedOut);
     assert_eq!(timed.incarnation_observed, None);
 
-    let mut call = Box::pin(actor.call(Message::Ask, width.into()));
+    let mut call = Box::pin(actor.call(Message::Ask, width));
     assert!(poll_once(call.as_mut()).is_pending());
     advance_time(width).await;
     let call = call.await.expect_err("unbound call expires");
@@ -358,7 +358,7 @@ async fn preacceptance_expiry_and_terminality_follow_the_identity_table() {
     assert_eq!(terminal_send.kind, SendErrorKind::Terminated);
     assert_eq!(terminal_send.incarnation_observed, None);
     let terminal_call = actor
-        .call(Message::Ask, width.into())
+        .call(Message::Ask, width)
         .await
         .expect_err("never-started call is terminal");
     assert_eq!(terminal_call.kind, CallErrorKind::Terminated);
@@ -384,7 +384,7 @@ async fn call_uses_one_budget_across_acceptance_and_response() {
     system.wait_started().await.expect("actor starts");
     let accepting = actor.try_send(Message::Value(1)).expect("queue fills");
     let budget = Duration::from_secs(10);
-    let mut call = Box::pin(actor.call(Message::Ask, budget.into()));
+    let mut call = Box::pin(actor.call(Message::Ask, budget));
     assert!(poll_once(call.as_mut()).is_pending());
 
     advance_time(Duration::from_secs(6)).await;
@@ -400,7 +400,7 @@ async fn call_uses_one_budget_across_acceptance_and_response() {
     assert_eq!(error.kind, CallErrorKind::ResponseTimedOut);
     assert_eq!(error.incarnation_observed, Some(accepting));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
 }
@@ -430,7 +430,7 @@ async fn message_construction_consumes_the_call_budget() {
             assert!(poll_once(advance.as_mut()).is_pending());
             Message::Ask(reply)
         },
-        budget.into(),
+        budget,
     ));
 
     let Poll::Ready(result) = poll_once(call.as_mut()) else {
@@ -442,7 +442,7 @@ async fn message_construction_consumes_the_call_budget() {
     assert_quiet(Duration::from_secs(1), || calls.load(Ordering::SeqCst) != 0).await;
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
 }
@@ -485,7 +485,7 @@ async fn overflowing_readiness_deadline_remains_pending() {
     drop(startup);
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("cooperative task stops");
 }
@@ -521,7 +521,7 @@ async fn overflowing_shutdown_grace_does_not_escalate() {
     shutdown_seen.wait().await;
     assert_quiet(Duration::from_secs(1), || dropped.load(Ordering::SeqCst)).await;
 
-    let shutdown = system.shutdown(Duration::ZERO.into()).await;
+    let shutdown = system.shutdown(Duration::ZERO).await;
     assert!(shutdown.is_err(), "forced cleanup reports the straggler");
     assert!(dropped.load(Ordering::SeqCst));
 }
@@ -578,7 +578,7 @@ async fn overflowing_restart_delay_has_no_substitute_and_never_restarts() {
     .await;
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("restart window shuts down");
 }
@@ -602,14 +602,14 @@ async fn zero_duration_wait_observes_an_already_satisfied_child() {
         .wait_for_child(
             "ready",
             |child| matches!(child.state, ChildState::Running),
-            Duration::ZERO.into(),
+            Duration::ZERO,
         )
         .await
         .expect("the current snapshot satisfies the predicate");
     assert_eq!(child.id.as_str(), "ready");
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("task stops");
 }
@@ -619,7 +619,7 @@ async fn reply_receiver_reports_drop_and_is_safe_to_abandon() {
     let (reply, receiver) = Reply::<usize>::channel();
     drop(reply);
     assert_eq!(
-        receiver.recv(Duration::from_secs(1).into()).await,
+        receiver.recv(Duration::from_secs(1)).await,
         Err(ReplyError::Dropped)
     );
 
@@ -630,7 +630,7 @@ async fn reply_receiver_reports_drop_and_is_safe_to_abandon() {
     let (reply, receiver) = Reply::channel();
     reply.send(2);
     assert_eq!(
-        receiver.recv(Duration::ZERO.into()).await,
+        receiver.recv(Duration::ZERO).await,
         Err(ReplyError::Timeout),
         "a zero budget short-circuits instead of observing a completed reply"
     );
@@ -640,7 +640,7 @@ async fn reply_receiver_reports_drop_and_is_safe_to_abandon() {
 async fn reply_completion_wins_at_the_exact_deadline() {
     let width = Duration::from_secs(10);
     let (reply, receiver) = Reply::channel();
-    let mut receive = Box::pin(receiver.recv(width.into()));
+    let mut receive = Box::pin(receiver.recv(width));
     assert!(poll_once(receive.as_mut()).is_pending());
 
     advance_time(width).await;

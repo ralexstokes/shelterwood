@@ -100,8 +100,10 @@ pub const DEFAULT_READINESS_DEADLINE: Duration = Duration::from_secs(30);
 /// A duration statically known to be non-zero.
 ///
 /// Policy variants use this sealed value when zero would otherwise create a
-/// second semantic branch. Construct it with [`NonZeroDuration::new`]; the
-/// private representation prevents zero-valued literals:
+/// second semantic branch: [`Shutdown::Graceful`] (whose zero grace would
+/// duplicate `Abort` with different recorded provenance) and
+/// [`BoundedReadinessDeadline`]. Construct it with [`NonZeroDuration::new`];
+/// the private representation prevents zero-valued literals:
 ///
 /// ```compile_fail,E0423
 /// use std::time::Duration;
@@ -544,8 +546,10 @@ pub enum ReadinessDeadline {
 
 /// Validated non-zero payload of a bounded [`ReadinessDeadline`].
 ///
-/// Values are created by [`ReadinessDeadline::bounded`]. `E0423` records the
-/// privacy failure this proof depends on:
+/// Values are created by [`ReadinessDeadline::bounded`]. The invariant is
+/// carried by [`NonZeroDuration`] rather than re-checked here, so the policy
+/// surface has one non-zero-duration type. `E0423` records the privacy failure
+/// this proof depends on:
 ///
 /// ```compile_fail,E0423
 /// use std::time::Duration;
@@ -554,23 +558,22 @@ pub enum ReadinessDeadline {
 /// let _ = ReadinessDeadline::Bounded(BoundedReadinessDeadline(Duration::ZERO));
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct BoundedReadinessDeadline(Duration);
+pub struct BoundedReadinessDeadline(NonZeroDuration);
 
 impl BoundedReadinessDeadline {
     /// Returns the non-zero deadline duration.
     #[must_use]
     pub const fn duration(self) -> Duration {
-        self.0
+        self.0.get()
     }
 }
 
 impl ReadinessDeadline {
     /// Constructs a validated bounded deadline.
     pub fn bounded(duration: Duration) -> Result<Self, PolicyError> {
-        if duration.is_zero() {
-            return Err(PolicyError::ZeroDuration);
-        }
-        Ok(Self::Bounded(BoundedReadinessDeadline(duration)))
+        Ok(Self::Bounded(BoundedReadinessDeadline(
+            NonZeroDuration::new(duration)?,
+        )))
     }
 }
 

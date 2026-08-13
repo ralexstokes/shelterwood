@@ -173,7 +173,7 @@ async fn raw_readiness_override_does_not_evaluate_actor_readiness() {
     system.wait_started().await.expect("actor becomes ready");
     assert_eq!(OVERRIDE_READINESS_CALLS.load(Ordering::SeqCst), 0);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops cooperatively");
 }
@@ -269,7 +269,7 @@ async fn raw_manual_readiness_gates_ordered_startup_but_not_mailbox_acceptance()
         .await
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
 }
@@ -326,8 +326,7 @@ async fn raw_recv_is_shutdown_biased_and_try_recv_controls_drain_vs_discard() {
         system.wait_started().await.expect("actor starts");
         let accepting = actor.try_send(1).expect("one accepts");
         actor.try_send(2).expect("two accepts");
-        let shutdown =
-            tokio::spawn(async move { system.shutdown(Duration::from_secs(1).into()).await });
+        let shutdown = tokio::spawn(async move { system.shutdown(Duration::from_secs(1)).await });
         assert!(
             poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
                 matches!(
@@ -414,7 +413,7 @@ impl RawActor for TryRecvPanicActor {
             .offload_scoped(
                 async { panic!("try_recv retained offload panic") },
                 |_| (),
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("offload accepted");
         guard.finished().await;
@@ -512,7 +511,7 @@ async fn dynamic_scope_admits_uses_and_exactly_removes_a_raw_actor() {
     let terminal = actor.send(10).await.expect_err("removed actor is terminal");
     assert_eq!(terminal.kind, SendErrorKind::Terminated);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -554,7 +553,7 @@ async fn deferred_queue_capacity_ignores_a_latest_scope_default() {
         .await
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
 }
@@ -632,7 +631,7 @@ impl RawActor for OffloadDoublePanicActor {
                     panic!("injected offload panic");
                 },
                 |_| (),
-                Duration::MAX.into(),
+                Duration::MAX,
             )
             .expect("offload accepted");
         guard.finished().await;
@@ -670,7 +669,7 @@ async fn hard_abort_offload_panic_with_panicking_raw_destructor_is_contained() {
         "offload panic is queued before hard abort"
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("the two panics remain contained");
 
@@ -743,7 +742,7 @@ async fn raw_context_scope_shutdown_request_stops_only_the_supervising_scope() {
         Some(shelterwood::ChildState::Running)
     ));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root shuts down after the nested scope stopped");
 }
@@ -797,7 +796,7 @@ impl RawActor for StoppingRejectionRaw {
             .offload_scoped(
                 async { 3u8 },
                 |result| result.expect("recovered continuation sees its value"),
-                Duration::from_secs(1).into(),
+                Duration::from_secs(1),
             )
             .expect_err("a stopping context rejects scoped offloads");
         // Recovery is total: the caller still owns the work future and the

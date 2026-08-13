@@ -180,7 +180,7 @@ impl RouterActor {
             .directory
             .call(
                 |reply| DirectoryMessage::Lookup { reply },
-                Duration::from_secs(1).into(),
+                Duration::from_secs(1),
             )
             .await
             .map(|reply| reply.value)
@@ -204,7 +204,7 @@ impl RouterActor {
                         let route = candidate.route.clone();
                         move |reply| DirectoryMessage::Cutover { route, reply }
                     },
-                    Duration::from_secs(1).into(),
+                    Duration::from_secs(1),
                 )
                 .await
                 .map_err(|error| {
@@ -248,7 +248,7 @@ impl RouterActor {
             .wait_for_child(
                 id,
                 |child| matches!(child.state, shelterwood::ChildState::Running),
-                Duration::from_secs(1).into(),
+                Duration::from_secs(1),
             )
             .await
             .map_err(|error| ExitError::message(format!("range readiness failed: {error}")))?;
@@ -342,7 +342,7 @@ impl RouterActor {
                     let route = candidate.route.clone();
                     move |reply| DirectoryMessage::Cutover { route, reply }
                 },
-                Duration::from_secs(1).into(),
+                Duration::from_secs(1),
             )
             .await
             .map_err(|error| ExitError::message(format!("directory cutover failed: {error}")))?;
@@ -421,7 +421,7 @@ async fn replace_with_retry(
         match router
             .call(
                 move |reply| RouterMessage::Replace { operation, reply },
-                Duration::from_secs(1).min(remaining).into(),
+                Duration::from_secs(1).min(remaining),
             )
             .await
         {
@@ -485,7 +485,7 @@ async fn replace_with_retry(
                                     .incarnation
                                     .is_some_and(|current| current.supersedes(observed))
                             },
-                            remaining.into(),
+                            remaining,
                         )
                         .await
                         .expect("a superseding router incarnation runs");
@@ -517,7 +517,7 @@ async fn lookup(directory: &ActorRef<DirectoryMessage>) -> Option<Route> {
     directory
         .call(
             |reply| DirectoryMessage::Lookup { reply },
-            Duration::from_secs(1).into(),
+            Duration::from_secs(1),
         )
         .await
         .expect("directory lookup replies")
@@ -637,7 +637,7 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
                 value: 41,
                 reply,
             },
-            Duration::from_secs(1).into(),
+            Duration::from_secs(1),
         )
         .await
         .expect("new route accepts a write");
@@ -645,7 +645,7 @@ async fn shard_store_reconciles_both_crash_windows_with_exact_idempotent_retries
     assert_eq!(failed_candidate.durable.get("alpha"), None);
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("store shuts down");
 }
@@ -724,7 +724,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
                         value: 7,
                         reply,
                     },
-                    Duration::from_secs(4).into(),
+                    Duration::from_secs(4),
                 )
                 .await
         }
@@ -751,7 +751,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
                     shelterwood::MembershipStatus::Removing
                 )
             },
-            Duration::from_secs(1).into(),
+            Duration::from_secs(1),
         )
         .await
         .expect("removal is underway");
@@ -768,7 +768,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
     );
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("store shuts down");
 }

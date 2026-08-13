@@ -79,7 +79,7 @@ impl Actor for IngressActor {
                             id,
                             reply: journal_reply,
                         },
-                        POLL_TIMEOUT.into(),
+                        POLL_TIMEOUT,
                     )
                     .await
                     .map_err(|error| {
@@ -316,7 +316,7 @@ impl Actor for ToolActor {
             }
             ToolMessage::Work => {
                 context
-                    .offload(async { 7_u64 }, ToolMessage::Completed, POLL_TIMEOUT.into())
+                    .offload(async { 7_u64 }, ToolMessage::Completed, POLL_TIMEOUT)
                     .expect("live tool accepts incarnation-owned offload");
             }
             ToolMessage::Completed(Ok(7)) => {
@@ -433,7 +433,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     system.wait_started().await.expect("control plane starts");
     gateway
         .bridge
-        .call(|reply| BridgeMessage::Begin { reply }, POLL_TIMEOUT.into())
+        .call(|reply| BridgeMessage::Begin { reply }, POLL_TIMEOUT)
         .await
         .expect("bridge holds and later acknowledges a Reply");
 
@@ -470,7 +470,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .wait_for_child(
             "session",
             |child| matches!(child.state, ChildState::Running),
-            POLL_TIMEOUT.into(),
+            POLL_TIMEOUT,
         )
         .await
         .expect("session aggregate readiness completes");
@@ -544,7 +544,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .wait_for_child(
             "temporary-tool",
             |child| matches!(child.state, ChildState::Running),
-            POLL_TIMEOUT.into(),
+            POLL_TIMEOUT,
         )
         .await
         .expect("tool becomes ready");
@@ -594,9 +594,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                 id: DELIVERY_ID,
                 reply,
             },
-            delivery_deadline
-                .saturating_duration_since(tokio::time::Instant::now())
-                .into(),
+            delivery_deadline.saturating_duration_since(tokio::time::Instant::now()),
         )
         .await
         .expect_err("durable write crash loses the first acknowledgement");
@@ -616,7 +614,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                     .incarnation
                     .is_some_and(|current| current.supersedes(accepting_incarnation))
             },
-            remaining.into(),
+            remaining,
         )
         .await
         .expect("redelivery waits for a superseding ingress incarnation");
@@ -640,7 +638,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                 id: DELIVERY_ID,
                 reply,
             },
-            remaining.into(),
+            remaining,
         )
         .await
         .expect("redelivery of the same journal id is acknowledged");
@@ -702,7 +700,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .wait_for_child(
             "session",
             |child| matches!(child.state, ChildState::Running),
-            POLL_TIMEOUT.into(),
+            POLL_TIMEOUT,
         )
         .await
         .expect("replacement session becomes ready");
@@ -724,7 +722,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         gateway_scope.membership()
     );
     system
-        .shutdown(POLL_TIMEOUT.into())
+        .shutdown(POLL_TIMEOUT)
         .await
         .expect("staged control-plane shutdown completes");
 }
@@ -857,7 +855,7 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
         "no value leaks past cancellation"
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("the remaining root joins teardown before the runtime drops");
 }

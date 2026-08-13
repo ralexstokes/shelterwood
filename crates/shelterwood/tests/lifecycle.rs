@@ -31,7 +31,7 @@ async fn non_owners_are_quiet_and_an_empty_root_needs_its_owner() {
         "a zero-child root must not finish naturally"
     );
     empty
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("empty root shuts down");
 
@@ -63,7 +63,7 @@ async fn non_owners_are_quiet_and_an_empty_root_needs_its_owner() {
     })
     .await;
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("owner shuts down");
 }
@@ -112,7 +112,7 @@ async fn framework_task_verdicts_remain_typed() {
         ExitKind::ReadinessTimedOut { .. }
     ));
     timeout_system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed startup can be rolled back");
 
@@ -127,7 +127,7 @@ async fn framework_task_verdicts_remain_typed() {
     let abort_system = abort_tree.spawn().expect("runtime is available");
     abort_system.wait_started().await.expect("tree starts");
     abort_system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("child grace bounds shutdown");
     assert!(matches!(
@@ -236,7 +236,7 @@ async fn actor_destructor_panic_supersedes_the_completed_run_outcome() {
         ExitKind::Panicked { message } if message.as_deref() == Some("actor destructor panic")
     ));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root shuts down");
 }
@@ -298,7 +298,7 @@ async fn replacement_starts_only_after_the_old_future_is_destroyed() {
         ["start-1", "drop-1", "start-2"]
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
 }
@@ -331,7 +331,7 @@ async fn ordered_teardown_is_reverse_and_joins_before_advancing() {
     }
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2).into()));
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
 
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
@@ -437,7 +437,7 @@ async fn grace_expiry_mid_ladder_joins_the_abort_before_advancing() {
 
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(30).into()));
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(30)));
     last_stopping.wait().await;
     assert!(!last_dropped.load(Ordering::SeqCst));
 
@@ -517,7 +517,7 @@ async fn ordered_teardown_keeps_its_frontier_when_an_earlier_child_exits() {
 
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2).into()));
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
     tokio::time::timeout(POLL_TIMEOUT, last_stopping.wait())
         .await
         .expect("the reverse-order frontier starts stopping");
@@ -566,7 +566,7 @@ async fn dynamic_teardown_cancels_children_concurrently() {
     }
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
-    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2).into()));
+    let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             cancelled.iter().all(|flag| flag.load(Ordering::SeqCst))
@@ -647,7 +647,7 @@ async fn concurrent_initial_failures_publish_one_startup_failed_scope_edge() {
     );
     assert!(system.wait_started().await.is_err());
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed dynamic root shuts down");
 }
@@ -720,7 +720,7 @@ async fn plain_restart_publishes_exited_old_before_started_new() {
     assert!(second.supersedes(first));
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("replacement stops");
 }
@@ -777,7 +777,7 @@ async fn abort_policy_task_exits_aborted_without_grace() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("abort policy bounds teardown");
     let exit = task.wait().await;
@@ -809,7 +809,7 @@ async fn completion_during_the_tidy_beat_is_not_reclassified_as_abort() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("completion within the tidy beat bounds teardown");
     let exit = task.wait().await;

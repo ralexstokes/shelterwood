@@ -100,7 +100,7 @@ impl<M: Send + 'static> ActorRef<M> {
     /// after acceptance of the replacement is visible.
     /// A zero budget makes no acceptance attempt and returns the unaccepted
     /// message with [`SendErrorKind::TimedOut`].
-    pub fn send_timeout(&self, message: M, deadline: DeadlineBudget) -> SendTimeout<M> {
+    pub fn send_timeout(&self, message: M, deadline: impl Into<DeadlineBudget>) -> SendTimeout<M> {
         SendTimeout {
             deadlined: Deadlined::no_attempt(
                 TimedSend {
@@ -131,7 +131,7 @@ impl<M: Send + 'static> ActorRef<M> {
     pub fn call<T: Send + 'static>(
         &self,
         make_msg: impl FnOnce(Reply<T>) -> M + Send + 'static,
-        deadline: DeadlineBudget,
+        deadline: impl Into<DeadlineBudget>,
     ) -> CallFuture<M, T> {
         CallFuture {
             deadlined: Deadlined::no_attempt(

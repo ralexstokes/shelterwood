@@ -71,8 +71,9 @@ pub struct LifecycleEvent {
 }
 
 /// Core lifecycle event inventory.
+///
+/// Non-exhaustive deliberately: Part II observation extensions add event kinds.
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Kept non-exhaustive because Part II observation extensions add event kinds.
 #[non_exhaustive]
 pub enum LifecycleEventKind {
     /// A child membership was admitted.

@@ -99,7 +99,7 @@ async fn readiness_fired_before_failure_makes_the_failure_post_ready() {
         .await
         .expect("post-ready failure does not abort or re-gate startup");
     system
-        .shutdown(Duration::ZERO.into())
+        .shutdown(Duration::ZERO)
         .await
         .expect("a child in backoff has no straggler");
 }
@@ -150,7 +150,7 @@ async fn readiness_fired_after_task_completion_cannot_reclassify_the_exit() {
     ));
     assert!(matches!(task.wait().await.kind(), ExitKind::Completed));
     system
-        .shutdown(Duration::ZERO.into())
+        .shutdown(Duration::ZERO)
         .await
         .expect("the completed child has no straggler");
 }
@@ -232,7 +232,7 @@ async fn immediate_restart_deadline_rechecks_aggregate_startup() {
         .await
         .expect("immediate restart releases the last aggregate gate");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("restarted task cooperates");
 }
@@ -301,7 +301,7 @@ async fn ordered_startup_waits_for_manual_readiness() {
         ["gated", "later"]
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("clean shutdown");
 }
@@ -386,7 +386,7 @@ async fn readiness_deadline_is_typed_and_absolute() {
             if matches!(failure.cause, StartupFailureCause::Child { ref id, .. } if id.as_str() == "gated")
     ));
     system
-        .shutdown(Duration::ZERO.into())
+        .shutdown(Duration::ZERO)
         .await
         .expect("terminal child leaves no straggler");
 }
@@ -435,7 +435,7 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
         .await
         .expect("readiness signal wins the deadline tie");
     ready_system
-        .shutdown(Duration::ZERO.into())
+        .shutdown(Duration::ZERO)
         .await
         .expect("ready task cooperates");
     assert!(!matches!(
@@ -458,7 +458,7 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
         .expect("valid task");
     let shutdown_system = shutdown_tree.spawn().expect("runtime is available");
     shutdown_system
-        .shutdown(Duration::ZERO.into())
+        .shutdown(Duration::ZERO)
         .await
         .expect("shutdown disarms readiness");
     advance_time(width).await;
@@ -552,7 +552,7 @@ async fn restart_before_aggregate_readiness_rearms_the_gate() {
         .await
         .expect("replacement becomes ready");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("clean shutdown");
 }
@@ -611,7 +611,7 @@ async fn ordered_terminal_pre_ready_exit_parks_the_root_and_marks_suffix_never_s
     })
     .await;
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("owner rolls back live prefix");
 }
@@ -663,7 +663,7 @@ async fn dynamic_startup_failure_keeps_other_initial_members_supervised() {
     })
     .await;
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("owner rolls back sibling");
 }
@@ -715,7 +715,7 @@ async fn dynamic_startup_completes_after_removing_sole_unready_initial_member() 
         .expect("removing the sole initial gate completes startup")
         .expect("removal is not a startup failure");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("empty root stops");
 }
@@ -749,7 +749,7 @@ async fn dynamic_startup_completes_after_removing_last_unready_initial_member() 
         .expect("removing the final initial gate completes startup")
         .expect("removal is not a startup failure");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("ready sibling stops");
 }
@@ -780,7 +780,7 @@ async fn dynamic_startup_completes_after_removing_every_initial_member() {
         .expect("an emptied declared set completes startup")
         .expect("removal is not a startup failure");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("empty root stops");
 }
@@ -831,7 +831,7 @@ async fn removal_completed_nested_startup_releases_the_ordered_sibling() {
         "the gated sibling starts once removal completes the nested aggregate"
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -868,7 +868,7 @@ async fn removing_a_ready_initial_member_leaves_startup_pending() {
     })
     .await;
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("the still-gated root stops");
 }
@@ -949,7 +949,7 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
         shelterwood::RemoveOutcome::Removed
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1043,7 +1043,7 @@ async fn nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause() {
         shelterwood::StopReason::StartupFailed(_)
     ));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root rolls back");
 }
@@ -1116,7 +1116,7 @@ async fn nested_ordered_startup_failure_rolls_back_only_the_started_prefix() {
         shelterwood::StopReason::StartupFailed(_)
     ));
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root rolls back");
 }
@@ -1184,7 +1184,7 @@ async fn earliest_mark_ready_wins_and_later_readiness_edges_are_no_ops() {
         .await
         .expect("automatic and duplicate readiness signals are harmless no-ops");
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("tree stops");
 }
@@ -1218,7 +1218,7 @@ async fn start_or_shutdown_preserves_startup_error_and_rolls_back_the_prefix() {
     .expect("valid failure");
     let system = tree.spawn().expect("runtime is available");
     let error = system
-        .start_or_shutdown(Duration::from_secs(1).into())
+        .start_or_shutdown(Duration::from_secs(1))
         .await
         .expect_err("startup failure is returned after rollback");
     assert!(matches!(error.startup, StartupError::StartupFailed(_)));
@@ -1248,7 +1248,7 @@ async fn start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stra
     let error = tree
         .spawn()
         .expect("runtime is available")
-        .start_or_shutdown(Duration::ZERO.into())
+        .start_or_shutdown(Duration::ZERO)
         .await
         .expect_err("startup fails and zero-budget rollback reports its live prefix");
 
@@ -1330,7 +1330,7 @@ async fn aggregate_readiness_stays_monotonic_after_a_ready_child_restarts() {
         .expect("published aggregate readiness never regresses");
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
 }
@@ -1408,7 +1408,7 @@ async fn nested_startup_rollback_includes_runtime_added_members() {
     ));
 
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root rolls back");
 }
@@ -1472,7 +1472,7 @@ async fn immediate_raw_construction_panic_classifies_post_ready() {
         "the terminal panic is an ordinary post-ready stop, not a startup abort"
     );
     system
-        .shutdown(Duration::from_secs(1).into())
+        .shutdown(Duration::from_secs(1))
         .await
         .expect("clean shutdown");
 }

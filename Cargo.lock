@@ -121,7 +121,6 @@ dependencies = [
  "shelterwood-runtime",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]

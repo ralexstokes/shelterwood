@@ -64,10 +64,6 @@ impl ErasedOneShotSender for TokioOneShotSender {
     fn send(self: Box<Self>, value: ErasedValue) -> Result<(), ErasedValue> {
         self.0.send(value)
     }
-
-    fn is_closed(&self) -> bool {
-        self.0.is_closed()
-    }
 }
 
 struct TokioOneShotReceiver(OneShotReceiver<ErasedValue>);

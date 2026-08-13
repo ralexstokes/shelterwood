@@ -15,7 +15,6 @@ pub type ErasedValue = Box<dyn Any + Send + 'static>;
 #[doc(hidden)]
 pub trait ErasedOneShotSender: Send {
     fn send(self: Box<Self>, value: ErasedValue) -> Result<(), ErasedValue>;
-    fn is_closed(&self) -> bool;
 }
 
 /// Runtime-neutral single-delivery receive capability.
@@ -112,11 +111,6 @@ pub(crate) fn oneshot<T: Send + 'static>(
 impl<T: Send + 'static> OneShotSender<T> {
     pub(crate) fn send(self, value: T) -> Result<(), T> {
         self.inner.send(Box::new(value)).map_err(downcast::<T>)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_closed(&self) -> bool {
-        self.inner.is_closed()
     }
 }
 
@@ -268,10 +262,6 @@ pub(crate) mod tests {
     impl ErasedOneShotSender for AdapterOneShotSender {
         fn send(self: Box<Self>, value: ErasedValue) -> Result<(), ErasedValue> {
             self.0.send(value)
-        }
-
-        fn is_closed(&self) -> bool {
-            self.0.is_closed()
         }
     }
 

@@ -19,7 +19,6 @@ shelterwood-core.workspace = true
 shelterwood-mailbox.workspace = true
 shelterwood-runtime.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 shelterwood-core = { workspace = true, features = ["test-util"] }

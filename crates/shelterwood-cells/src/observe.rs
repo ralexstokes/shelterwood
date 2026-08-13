@@ -627,13 +627,6 @@ impl LifecycleHub {
         txn: &mut crate::cells::ObservationTxn<'_>,
         event: LifecycleEvent,
     ) {
-        tracing::trace!(
-            scope = ?event.scope,
-            seq = event.seq.get(),
-            path = ?event.scope_path,
-            kind = ?event.kind,
-            "scope lifecycle event"
-        );
         let mut published = false;
         self.channels.signal.modify_silently(|signal| {
             if signal.closed {

@@ -1231,3 +1231,165 @@ fn gate_handoff_rejects_a_scope_with_an_unadmitted_dynamic_reservation() {
     // started driver, while a scope is parented before its driver starts.
     root.set_admitted_children(vec![resident_projection(&slot)]);
 }
+
+/// SPEC §1's lock rule: nothing user-owned is destroyed inside a framework
+/// critical section. `Exit`'s type-erased application error is the cell
+/// layer's only user-owned value, and the tests below cover the paths that
+/// retire one under the resident-tree observation gate: a losing
+/// terminalization, a superseded snapshot (on subscription and on closure),
+/// and the member record's `last_exit` slot (on a restart schedule and on
+/// terminalization). The one remaining retirement is the lifecycle ring's
+/// eviction, which the hub cannot intercept — see #244.
+#[test]
+fn a_losing_terminal_exit_payload_is_destroyed_outside_the_gate() {
+    let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+    scope.member.terminalize(
+        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        StartupDisposition::Unchanged,
+    );
+
+    let (losing, held_at_drop) = gate_probe_exit(&scope);
+    scope
+        .member
+        .terminalize(losing, StartupDisposition::Unchanged);
+
+    assert_eq!(
+        gate_probe_verdict(&held_at_drop),
+        Some(false),
+        "a competing terminalizer's exit payload must outlive the gate"
+    );
+}
+
+#[test]
+fn a_retired_snapshot_payload_is_destroyed_outside_the_gate() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let child_id = ChildId::from("worker");
+    let member = MemberCell::new(
+        child_id.clone(),
+        root.mint_membership(&child_id)
+            .expect("child membership available"),
+    );
+    resolve_fixture_options(&member);
+    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    let subscription = root.subscribe_snapshots();
+
+    let (exit, held_at_drop) = gate_probe_exit(&root);
+    root.terminalize_child(&member, exit, None, StartupDisposition::Unchanged);
+    // Publication is skipped while receiverless, so the retained projection
+    // goes stale and outlives both residency and the member cell whose record
+    // holds the other clone. It is then the payload's last owner, and the next
+    // subscription's refresh is what destroys it.
+    drop(subscription);
+    root.prune_child(&member);
+    drop(member);
+    assert_eq!(
+        gate_probe_verdict(&held_at_drop),
+        None,
+        "the stale retained snapshot still owns the payload"
+    );
+
+    let _resubscribed = root.subscribe_snapshots();
+    assert_eq!(
+        gate_probe_verdict(&held_at_drop),
+        Some(false),
+        "a superseded snapshot's payload must outlive the gate"
+    );
+}
+
+/// The same rule on the member record's `last_exit` slot: a restart schedule
+/// overwrites the previous incarnation's exit while the record's watch lock
+/// and the observation gate are both held.
+#[test]
+fn a_superseded_restart_exit_payload_is_destroyed_outside_the_gate() {
+    let (root, member, mut incarnations) = restarting_member_fixture();
+
+    let (probe, held_at_drop) = gate_probe_exit(&root);
+    member.transition(MemberTransition::RestartScheduled {
+        exit: probe,
+        restart_count: RestartCount::ZERO.bump(),
+        restart_at: None,
+    });
+    assert_eq!(
+        gate_probe_verdict(&held_at_drop),
+        None,
+        "the record still owns the scheduled restart's exit"
+    );
+
+    let second = incarnations.mint().expect("restart incarnation available");
+    member.transition(MemberTransition::Starting {
+        incarnation: second,
+    });
+    member.transition(MemberTransition::RestartScheduled {
+        exit: Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        restart_count: RestartCount::ZERO.bump().bump(),
+        restart_at: None,
+    });
+    assert_eq!(
+        gate_probe_verdict(&held_at_drop),
+        Some(false),
+        "a superseded restart exit payload must outlive the gate"
+    );
+}
+
+/// Terminalization writes the same slot, so it retires a prior restart's
+/// payload on a path distinct from the losing-terminalizer one above.
+#[test]
+fn a_restart_exit_payload_superseded_by_terminalization_outlives_the_gate() {
+    let (root, member, _incarnations) = restarting_member_fixture();
+
+    let (probe, held_at_drop) = gate_probe_exit(&root);
+    member.transition(MemberTransition::RestartScheduled {
+        exit: probe,
+        restart_count: RestartCount::ZERO.bump(),
+        restart_at: None,
+    });
+    assert_eq!(
+        gate_probe_verdict(&held_at_drop),
+        None,
+        "the record still owns the scheduled restart's exit"
+    );
+
+    member.terminalize(
+        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        StartupDisposition::Unchanged,
+    );
+    assert_eq!(
+        gate_probe_verdict(&held_at_drop),
+        Some(false),
+        "a terminalized member's superseded exit payload must outlive the gate"
+    );
+}
+
+/// `SnapshotHub::close` retires the same slot as `subscribe`, on the path a
+/// scope takes when it terminalizes after its last observer left.
+#[test]
+fn a_snapshot_retired_by_observation_closure_is_destroyed_outside_the_gate() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let child_id = ChildId::from("worker");
+    let member = MemberCell::new(
+        child_id.clone(),
+        root.mint_membership(&child_id)
+            .expect("child membership available"),
+    );
+    resolve_fixture_options(&member);
+    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    let subscription = root.subscribe_snapshots();
+
+    let (exit, held_at_drop) = gate_probe_exit(&root);
+    root.terminalize_child(&member, exit, None, StartupDisposition::Unchanged);
+    drop(subscription);
+    root.prune_child(&member);
+    drop(member);
+    assert_eq!(
+        gate_probe_verdict(&held_at_drop),
+        None,
+        "the stale retained snapshot still owns the payload"
+    );
+
+    root.terminalize_never_started();
+    assert_eq!(
+        gate_probe_verdict(&held_at_drop),
+        Some(false),
+        "the projection a closing hub supersedes must outlive the gate"
+    );
+}

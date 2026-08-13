@@ -338,6 +338,17 @@ pub(crate) struct SnapshotHub {
     sender: OnceLock<runtime::WatchSender<SnapshotHubState>>,
 }
 
+/// Destroys a superseded snapshot after the observation gate is released.
+///
+/// A published projection carries every resident child's `Exit`, and an
+/// `ExitKind::Failed` payload owns a type-erased user error. The retained
+/// state is the payload's last owner whenever the member cell it was cloned
+/// from has already been reclaimed, so replacing it in place would run a user
+/// destructor under the gate *and* under the watch channel's own lock.
+fn retire_snapshot(txn: &mut crate::cells::ObservationTxn<'_>, retired: Arc<ScopeSnapshot>) {
+    txn.defer(move || drop(retired));
+}
+
 #[derive(Clone, Debug)]
 struct SnapshotHubState {
     snapshot: Arc<ScopeSnapshot>,
@@ -348,14 +359,16 @@ struct SnapshotHubState {
 impl SnapshotHub {
     /// Subscribes while the containing scope's observation gate is held.
     ///
-    /// The transaction is taken but unused: the gate is what makes the
-    /// receiverless refresh below safe, and no wake can be owed, because the
-    /// only receiver that could observe the refresh is the one minted here —
-    /// and it captures the refreshed generation as already seen.
+    /// No wake is owed for the receiverless refresh below: the gate is what
+    /// makes it safe, and the only receiver that could observe the refresh is
+    /// the one minted here — which captures the refreshed generation as
+    /// already seen. The transaction is still needed, for the one thing the
+    /// refresh does owe: retiring the projection it displaces, whose child
+    /// exits carry user payloads (§1's lock rule).
     pub(crate) fn subscribe(
         &self,
         initial: Arc<ScopeSnapshot>,
-        _txn: &mut crate::cells::ObservationTxn<'_>,
+        txn: &mut crate::cells::ObservationTxn<'_>,
     ) -> SnapshotReceiver {
         let sender = self.sender.get_or_init(|| {
             runtime::watch(SnapshotHubState {
@@ -370,16 +383,20 @@ impl SnapshotHub {
             // subscriber after a quiet stretch installs current state itself.
             // A closed hub already holds the authoritative terminal
             // projection installed by `close`; leave it unchanged.
+            let mut retired = None;
             sender.modify_silently(|state| {
                 if state.closed {
                     return;
                 }
-                state.snapshot = initial;
+                retired = Some(std::mem::replace(&mut state.snapshot, initial));
                 state
                     .generation
                     .mint()
                     .expect("snapshot generation space exhausted");
             });
+            if let Some(retired) = retired {
+                retire_snapshot(txn, retired);
+            }
         }
         let inner = sender.watcher();
         let seen_generation = inner.borrow_cloned().generation.current();
@@ -404,19 +421,19 @@ impl SnapshotHub {
         if sender.receiver_count() == 0 {
             return;
         }
-        let mut modified = false;
+        let mut retired = None;
         sender.modify_silently(|state| {
             if state.closed {
                 return;
             }
-            state.snapshot = snapshot();
+            retired = Some(std::mem::replace(&mut state.snapshot, snapshot()));
             state
                 .generation
                 .mint()
                 .expect("snapshot generation space exhausted");
-            modified = true;
         });
-        if modified {
+        if let Some(retired) = retired {
+            retire_snapshot(txn, retired);
             txn.pulse(sender);
         }
     }
@@ -448,7 +465,7 @@ impl SnapshotHub {
         if initialized {
             return;
         }
-        let mut modified = false;
+        let mut retired = None;
         sender.modify_silently(|state| {
             if !state.closed {
                 // Install the caller's authoritative terminal projection
@@ -465,15 +482,17 @@ impl SnapshotHub {
                 // see exactly the closure they saw before rather than an extra
                 // conflated event. A closed hub delivers no further changes,
                 // so this only corrects what `borrow_latest` reports.
-                state.snapshot = final_snapshot
-                    .take()
-                    .expect("final snapshot is built exactly once")(
-                );
+                retired = Some(std::mem::replace(
+                    &mut state.snapshot,
+                    final_snapshot
+                        .take()
+                        .expect("final snapshot is built exactly once")(),
+                ));
                 state.closed = true;
-                modified = true;
             }
         });
-        if modified {
+        if let Some(retired) = retired {
+            retire_snapshot(txn, retired);
             txn.pulse(sender);
         }
     }
@@ -628,13 +647,27 @@ impl LifecycleHub {
         event: LifecycleEvent,
     ) {
         let mut published = false;
+        // An event carrying an `Exit` owns a type-erased user error, so the
+        // two paths that decline to retain one -- a closed hub, and a
+        // broadcast with no live receiver -- hand the undelivered value out of
+        // the critical section rather than destroying it under the observation
+        // gate. Neither is the payload's last owner today (the emitting
+        // member's record retains the same exit), so this holds the rule by
+        // construction rather than by that refcount argument. The bounded
+        // ring's *eviction* is the one retirement this hub cannot intercept,
+        // and it is reachable: see #244.
+        let mut undelivered = None;
         self.channels.signal.modify_silently(|signal| {
             if signal.closed {
+                undelivered = Some(event);
                 return;
             }
-            let _ = self.channels.events.send(event);
+            undelivered = self.channels.events.send(event).err();
             published = true;
         });
+        if let Some(undelivered) = undelivered {
+            txn.defer(move || drop(undelivered));
+        }
         if published {
             txn.pulse(&self.channels.signal);
         }

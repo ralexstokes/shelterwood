@@ -1,5 +1,85 @@
 # Project instructions
 
+## The lock rule
+
+**Code holding a framework mutex may only manipulate plain framework-owned
+data.** Wakes, drops of user values, formatting, user callbacks, and panic
+resumption happen after unlock.
+
+The framework runs arbitrary user code at moments it does not choose: waker
+`wake`/`clone`/`drop` vtable functions, destructors of user messages, actor
+state, construction closures and the type-erased error inside an `Exit`,
+`Debug`/`Display` on user errors, `Hash`/`Eq` on user timer keys. All of it is
+safe Rust that may panic, block, or re-enter. Under a framework mutex each of
+those becomes poisoning, an ABBA deadlock, or — during an unwind — a double
+panic and a process abort.
+
+Two types implement the rule and are the shapes to reach for:
+
+- **`ObservationTxn`** (`shelterwood-cells/src/cells.rs`) holds the
+  observation-gate guard plus a deferred-effect list. `defer`/`pulse` queue
+  work; `commit` drops the guard *then* runs the queue through a
+  `PanicAccumulator`. Its `Drop` runs the same path during an unwind, so a
+  poisoned transaction cannot strand already-committed wakes. Every retained
+  control-plane writer takes the token, which makes an out-of-transaction
+  mutation unavailable by construction.
+- **`Promotion`** (`shelterwood-mailbox/src/cell.rs`) is the same idea for the
+  mailbox promotion path: wakers and displaced messages accumulate inside the
+  critical section and `Drop` flushes them after it, panic-contained.
+  `Acceptance`, `Termination` and `MailboxPayload` are its single-purpose
+  siblings.
+
+What the rule does *not* forbid — the exemptions every remaining lock site
+rests on:
+
+- **Framework-owned data.** Counters, epochs, arena keys, binding state,
+  registration ids, request flags, identity maps. Locks held only over these
+  need no ceremony.
+- **Moving a user value out.** `take`/`mem::replace`/returning by value is not
+  a drop. What must be outside the critical section is the *destination*:
+  `Acceptance`'s `#[must_use]`, `withdraw`'s `(result, waker)` tuple, and
+  `SnapshotHub`'s deferred retirement all encode that.
+- **`Arc` traffic that cannot reach zero.** Cloning an `Arc` under a lock is
+  refcount work; dropping one is only refcount work while another owner is
+  provable. Prefer restructuring over the proof — every violation the #235
+  audit confirmed was a drop that *looked* like refcount traffic. One
+  exemption still rests on such a proof: `ScopeCell::clear_residents_locked`
+  and `prune_child_locked` drop `Arc<MemberCell>`s under the gate, and a
+  member record owns an `Exit`. They are safe only because the driver's own
+  child map outlives residency (`ScopeRuntime`'s `Drop` clears residents
+  before `self.children`), which is an ordering nothing enforces.
+- **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination` and
+  `DynamicRoute` are cross-crate implementation seams with framework-only
+  impls, not user traits; calling them under a lock runs no caller code.
+- **Nested framework locks in one direction.** The resident-tree observation
+  gate is outermost: everything else is taken under it or standalone, never
+  around it. Inside, the documented orders are cells' member mailbox →
+  `MailboxCell::state`, and `MailboxCell::state` → `SendOperation::state`.
+  Gate-to-gate is the one exception to "outermost": `adopt_observation_gate`
+  takes the adoptee's *current* gate while the adopting parent's is held, in
+  the parent-to-child direction only, and re-reads the installed pointer
+  under the acquired guard so a concurrent handoff retries rather than
+  deadlocks.
+
+Two conventions that are not the rule itself but travel with it: panicking
+while holding a mutex the codebase `.expect()`s poisons it for every later
+caller, so compute the verdict, release, *then* panic (`MailboxCell::bind` is
+the pattern; where releasing is impossible, `debug_assert!` instead, as
+`MailboxState::take_waiters` does). And a value that may block on destruction
+goes to `runtime::dispose_detached`, not merely past the unlock. That second
+convention is currently met for mailbox payloads, construction closures and
+offloads, and *not* met for an `Exit`'s application error: no site in the
+workspace routes an `Exit` through isolated disposal, while the driver
+destroys exits inline on its own thread on several paths that hold no lock at
+all. Treat that as a known gap to close as a class, not by detaching whichever
+site a review happens to land on — a half-detached class reads as if the
+whole class were handled.
+
+Reviewing a new `.lock()` is one pass: name every value the critical section
+can destroy, every callback it can invoke, and every panic it can raise. If
+any of those is user code, hand it to a transaction (`txn.defer`), an effects
+struct, or the caller.
+
 ## Running anything
 
 All tooling (`cargo`, `just`, `nextest`, `nixfmt`) comes from the Nix

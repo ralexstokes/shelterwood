@@ -174,6 +174,22 @@ any single design rule:
   and timer retraction): decide the next action as a function of observed
   loop state, then await it. User code — actor bodies — is of course
   effectful; the constraint binds the engine.
+- **Locks hold framework data only.** A critical section over a framework
+  mutex manipulates plain framework-owned state and nothing else: wakes,
+  destruction of user-owned values, formatting of user types, user
+  callbacks, and panic resumption all happen after the guard is released.
+  The framework runs user code it did not schedule — waker vtable
+  functions, destructors of messages, actor state and the type-erased
+  error inside an `Exit`, `Hash` on a timer key — and every one of those
+  may panic, block, or re-enter, which under a lock is a poisoned mutex, a
+  deadlock, or an abort during unwind. The mechanism is an effects value
+  that accumulates the user-visible work inside the critical section and
+  discharges it, panic-contained, from `Drop` — the observation
+  transaction and the mailbox promotion are the two reference
+  implementations, and moving a value out (rather than dropping it in
+  place) is the degenerate case. What the rule buys is that a hostile
+  waker or destructor is an ordinary, testable outcome instead of a
+  liveness failure (§13.18).
 - **Promises are owned completions.** Every cross-task promise — an
   admission or removal awaiting resolution, an exit report awaiting
   publication, a resident child awaiting its `Removed` edge, a member
@@ -3022,6 +3038,28 @@ integration toolkit for the driver shell and the end-to-end invariants.
     rule). Where a fault-injection harness can destroy the driver at
     arbitrary await points, run the same assertions there; the fixed
     provocations above are the floor, not the ceiling.
+18. **User code never runs inside a framework critical section (§1's lock
+    rule).** The provocation is a hostile implementation of each seam the
+    framework invokes without scheduling it, driven through the path that
+    would run it under a lock. A waker whose `wake`/`clone`/`drop` panics
+    or re-enters the framework: park a send and complete it, cancel a
+    parked send during an unwind, and wake a snapshot or lifecycle
+    subscription from a publication — each must observe a released lock
+    (re-entering `snapshot()` from the waker succeeds; the mutex is
+    unpoisoned afterwards). A message, actor-state, or exit payload whose
+    destructor blocks or panics: displace it by conflation, recover it by
+    withdrawal, retire it by terminalization, supersede it by a restart
+    schedule, and retire the projection that carried it — every one must
+    be destroyed after the guard. The gate-held probe is the direct
+    oracle: a payload destructor that asks whether the observation gate is
+    held must answer no, on every path that retires one. What this item
+    does *not* assert is where the destructor then runs: a mailbox
+    payload reaches isolated disposal, an `Exit`'s application error is
+    destroyed on the framework thread that released the guard. Moving the
+    second to isolated disposal is a separate rule about blocking
+    destructors on framework threads, tracked outside this item, because
+    the same thread already destroys exits on paths that hold no lock at
+    all.
 
 ## 14. Core-spike decisions
 

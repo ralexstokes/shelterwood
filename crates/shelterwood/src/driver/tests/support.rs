@@ -400,6 +400,73 @@ pub(super) fn finished_tree() -> Tree {
     tree
 }
 
+/// A user error payload that records whether the observation gate was held
+/// when its destructor ran.
+///
+/// The lock rule's probe for `Exit`: an `ExitKind::Failed` carries a
+/// type-erased application error, so wherever the cell layer destroys an exit
+/// it is running caller code. `ObservationGate::is_held` answers from inside
+/// that destructor without the reentrant acquisition that would deadlock.
+pub(super) struct GateProbeError {
+    gate: crate::cells::ObservationGate,
+    held_at_drop: Arc<Mutex<Option<bool>>>,
+}
+
+/// Builds a failed exit whose payload reports where it was destroyed.
+pub(super) fn gate_probe_exit(scope: &Arc<ScopeCell>) -> (Exit, Arc<Mutex<Option<bool>>>) {
+    let held_at_drop = Arc::new(Mutex::new(None));
+    let exit = Exit::new(
+        ExitKind::Failed(ExitError::from(GateProbeError {
+            gate: scope.observation_gate(),
+            held_at_drop: Arc::clone(&held_at_drop),
+        })),
+        Cancellation::NotObserved,
+    );
+    (exit, held_at_drop)
+}
+
+/// A dynamic root with one admitted, started child, plus the child's
+/// incarnation counter — the shape a restart schedule needs.
+pub(super) fn restarting_member_fixture() -> (Arc<ScopeCell>, Arc<MemberCell>, IncarnationCounter) {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let child_id = ChildId::from("worker");
+    let member = MemberCell::new(
+        child_id.clone(),
+        root.mint_membership(&child_id)
+            .expect("child membership available"),
+    );
+    resolve_fixture_options(&member);
+    let mut incarnations = member.take_incarnation_counter();
+    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    let first = incarnations.mint().expect("incarnation available");
+    member.transition(MemberTransition::Starting { incarnation: first });
+    (root, member, incarnations)
+}
+
+pub(super) fn gate_probe_verdict(held_at_drop: &Arc<Mutex<Option<bool>>>) -> Option<bool> {
+    *held_at_drop.lock().expect("gate probe mutex poisoned")
+}
+
+impl std::fmt::Debug for GateProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GateProbeError")
+    }
+}
+
+impl std::fmt::Display for GateProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("gate probe")
+    }
+}
+
+impl std::error::Error for GateProbeError {}
+
+impl Drop for GateProbeError {
+    fn drop(&mut self) {
+        *self.held_at_drop.lock().expect("gate probe mutex poisoned") = Some(self.gate.is_held());
+    }
+}
+
 pub(super) struct SnapshotReentryWake {
     scope: ScopeRef,
     observed: std::sync::mpsc::Sender<ScopeState>,

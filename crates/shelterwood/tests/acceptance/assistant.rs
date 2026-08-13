@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DeadlineElapsed, DynamicScopeRef,
     DynamicTree, ExitError, ExitResult, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
@@ -420,12 +420,13 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     let root = system.scope();
     let mut lifecycle = root.subscribe_lifecycle();
 
-    crate::common::assert_eventually!(|| {
-            gateway_scope
-                .snapshot()
-                .child("bridge")
-                .is_some_and(|child| matches!(child.state, ChildState::Starting))
-        }).await;
+    assert_eventually!(|| {
+        gateway_scope
+            .snapshot()
+            .child("bridge")
+            .is_some_and(|child| matches!(child.state, ChildState::Starting))
+    })
+    .await;
     gateway.bridge_gate.release();
     system.wait_started().await.expect("control plane starts");
     gateway
@@ -449,12 +450,13 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .expect("session admitted");
     let session_membership = session.membership();
 
-    crate::common::assert_eventually!(|| {
-            session
-                .snapshot()
-                .child("stream")
-                .is_some_and(|child| matches!(child.state, ChildState::Starting))
-        }).await;
+    assert_eventually!(|| {
+        session
+            .snapshot()
+            .child("stream")
+            .is_some_and(|child| matches!(child.state, ChildState::Starting))
+    })
+    .await;
     stream.send(1).await.expect("first stream update accepted");
     stream.send(2).await.expect("second stream update accepted");
     stream.send(3).await.expect("third stream update accepted");
@@ -511,7 +513,8 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .send(SessionControlMessage::Crash)
         .await
         .expect("control panic request accepted");
-    crate::common::assert_eventually!(|| {
+    assert_eventually!(
+        || {
             session.snapshot().child("control").is_some_and(|child| {
                 matches!(child.state, ChildState::Running)
                     && child.restart_count == RestartCount::ZERO.bump()
@@ -519,7 +522,10 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                         incarnation.supersedes(first_control_incarnation)
                     })
             })
-        }, "session actor panic is isolated and restarted").await;
+        },
+        "session actor panic is isolated and restarted"
+    )
+    .await;
 
     let (completions, mut completed) = unbounded_channel();
     let tool = tools
@@ -542,7 +548,8 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .send(ToolMessage::Crash)
         .await
         .expect("tool panic request accepted");
-    crate::common::assert_eventually!(|| {
+    assert_eventually!(
+        || {
             tools
                 .as_scope()
                 .snapshot()
@@ -554,7 +561,10 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
                             incarnation.supersedes(first_tool_incarnation)
                         })
                 })
-        }, "nested tool panic is isolated one scope level deeper").await;
+        },
+        "nested tool panic is isolated one scope level deeper"
+    )
+    .await;
     tool.send(ToolMessage::Work)
         .await
         .expect("offload request accepted");

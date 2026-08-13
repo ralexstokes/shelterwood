@@ -11,7 +11,8 @@ use std::{
 };
 
 use crate::common::{
-    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, policy::never,
+    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually,
+    policy::never,
 };
 use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult,
@@ -258,9 +259,11 @@ async fn panicking_unread_messages_are_all_disposed_without_reclassifying_the_ac
         .shutdown(Duration::from_secs(1))
         .await
         .expect("payload panics do not unwind the scope driver");
-    crate::common::assert_eventually!(|| {
-            drops.load(Ordering::SeqCst) == 2
-        }, "one payload panic must not strand the remaining unread messages").await;
+    assert_eventually!(
+        || drops.load(Ordering::SeqCst) == 2,
+        "one payload panic must not strand the remaining unread messages"
+    )
+    .await;
     let exit = loop {
         let Some(item) = lifecycle.recv().await else {
             panic!("actor exit was not published")

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, assert_quiet, poll_until};
+use crate::common::{ReleaseGate, assert_eventually, assert_quiet, poll_until};
 use shelterwood::{
     Actor, ActorOnceDef, Cancellation, Context, Exit, ExitError, ExitKind, ExitResult, GracePhase,
     LifecycleEventKind, LifecycleEvents, LifecycleItem, Mailbox, MailboxShutdown, SendErrorKind,
@@ -142,9 +142,7 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
     system.wait_started().await.expect("actor starts");
 
     let accepting_incarnation = actor.send(Message::Stop).await.expect("stop accepted");
-    crate::common::assert_eventually!(|| {
-            stop_entered.load(Ordering::SeqCst)
-        }).await;
+    assert_eventually!(|| stop_entered.load(Ordering::SeqCst)).await;
     actor
         .send(Message::Value(1))
         .await
@@ -155,9 +153,7 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
         .expect("prefix accepted");
     allow_stop.release();
 
-    crate::common::assert_eventually!(|| {
-            drain_entered.load(Ordering::SeqCst)
-        }).await;
+    assert_eventually!(|| drain_entered.load(Ordering::SeqCst)).await;
     let rejection = actor
         .try_send(Message::Value(3))
         .expect_err("frozen intake rejects fail-fast sends");

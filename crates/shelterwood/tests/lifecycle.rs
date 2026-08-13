@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_quiet, policy::never, poll_once,
+    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, policy::never, poll_once,
     waiting::task as waiting_task,
 };
 use shelterwood::{
@@ -285,9 +285,7 @@ async fn replacement_starts_only_after_the_old_future_is_destroyed() {
         .wait_started()
         .await
         .expect("initial incarnation starts");
-    crate::common::assert_eventually!(|| {
-            starts.load(Ordering::SeqCst) >= 2
-        }).await;
+    assert_eventually!(|| starts.load(Ordering::SeqCst) >= 2).await;
     assert_eq!(
         *order.lock().expect("order mutex poisoned"),
         ["start-1", "drop-1", "start-2"]
@@ -328,21 +326,18 @@ async fn ordered_teardown_is_reverse_and_joins_before_advancing() {
     system.wait_started().await.expect("tree starts");
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
 
-    crate::common::assert_eventually!(|| {
-            order.lock().expect("order mutex poisoned").as_slice() == [2]
-        }).await;
+    assert_eventually!(|| order.lock().expect("order mutex poisoned").as_slice() == [2]).await;
     assert_quiet(Duration::from_millis(15), || {
         order.lock().expect("order mutex poisoned").len() > 1
     })
     .await;
     gates[2].release();
-    crate::common::assert_eventually!(|| {
-            order.lock().expect("order mutex poisoned").as_slice() == [2, 1]
-        }).await;
+    assert_eventually!(|| order.lock().expect("order mutex poisoned").as_slice() == [2, 1]).await;
     gates[1].release();
-    crate::common::assert_eventually!(|| {
-            order.lock().expect("order mutex poisoned").as_slice() == [2, 1, 0]
-        }).await;
+    assert_eventually!(|| {
+        order.lock().expect("order mutex poisoned").as_slice() == [2, 1, 0]
+    })
+    .await;
     gates[0].release();
     shutdown
         .await
@@ -553,9 +548,7 @@ async fn dynamic_teardown_cancels_children_concurrently() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
-    crate::common::assert_eventually!(|| {
-            cancelled.iter().all(|flag| flag.load(Ordering::SeqCst))
-        }).await;
+    assert_eventually!(|| cancelled.iter().all(|flag| flag.load(Ordering::SeqCst))).await;
     gate.release();
     gate.release();
     shutdown

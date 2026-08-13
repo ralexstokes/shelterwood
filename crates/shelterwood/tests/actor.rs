@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_quiet, waiting::task as waiting_task,
+    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, waiting::task as waiting_task,
 };
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DynamicTree, ExitError, ExitKind,
@@ -344,12 +344,13 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         )
         .await
         .expect("dynamic actor admitted");
-    crate::common::assert_eventually!(|| {
-            dynamic_events
-                .lock()
-                .expect("events mutex poisoned")
-                .contains(&"init")
-        }).await;
+    assert_eventually!(|| {
+        dynamic_events
+            .lock()
+            .expect("events mutex poisoned")
+            .contains(&"init")
+    })
+    .await;
     actor
         .send(BasicMessage::Stop)
         .await
@@ -476,9 +477,7 @@ async fn handler_error_joins_offloads_before_returning_to_a_raw_decorator() {
         .send(OffloadThenFailMessage::Start)
         .await
         .expect("actor live");
-    crate::common::assert_eventually!(|| {
-            log.lock().expect("teardown log mutex poisoned").len() == 2
-        }).await;
+    assert_eventually!(|| log.lock().expect("teardown log mutex poisoned").len() == 2).await;
     assert_eq!(
         *log.lock().expect("teardown log mutex poisoned"),
         ["offload-destroyed", "decorator-resumed"]

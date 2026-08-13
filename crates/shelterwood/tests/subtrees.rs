@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until,
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet, poll_once, poll_until,
     waiting::task as waiting_task,
 };
 use shelterwood::{
@@ -374,13 +374,9 @@ async fn intensity_window_ages_out_between_restart_schedules() {
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     advance_time(Duration::from_secs(11)).await;
-    crate::common::assert_eventually!(|| {
-            starts.load(Ordering::SeqCst) >= 2
-        }).await;
+    assert_eventually!(|| starts.load(Ordering::SeqCst) >= 2).await;
     advance_time(Duration::from_secs(11)).await;
-    crate::common::assert_eventually!(|| {
-            starts.load(Ordering::SeqCst) >= 3
-        }).await;
+    assert_eventually!(|| starts.load(Ordering::SeqCst) >= 3).await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -560,9 +556,7 @@ async fn dynamic_and_always_members_do_not_finish_naturally() {
         .expect("valid task");
     let ordered = ordered.spawn().expect("runtime is available");
     ordered.wait_started().await.expect("ordered starts");
-    crate::common::assert_eventually!(|| {
-            starts.load(Ordering::SeqCst) >= 2
-        }).await;
+    assert_eventually!(|| starts.load(Ordering::SeqCst) >= 2).await;
     let ordered_scope = ordered.scope();
     let mut ordered_stopped = Box::pin(ordered_scope.wait_stopped());
     assert_quiet(Duration::from_millis(20), || {
@@ -651,9 +645,7 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
 
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
-    crate::common::assert_eventually!(|| {
-            started.load(Ordering::Acquire)
-        }, "leaf starts polling").await;
+    assert_eventually!(|| started.load(Ordering::Acquire), "leaf starts polling").await;
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(5)));
     let returned_before_leaf_released =
         poll_until(Duration::from_millis(50), Duration::from_millis(1), || {
@@ -784,9 +776,7 @@ async fn locally_requested_subtree_shutdown_reads_cancelled() {
         .add_subtree_once("nested", SubtreeOnceDef::new(nested))
         .expect("valid subtree");
     let system = root.spawn().expect("runtime is available");
-    crate::common::assert_eventually!(|| {
-            started.load(Ordering::SeqCst)
-        }).await;
+    assert_eventually!(|| started.load(Ordering::SeqCst)).await;
     // The stop request comes from the subtree's own handle, not an
     // ancestor's ladder.
     sub.request_shutdown();

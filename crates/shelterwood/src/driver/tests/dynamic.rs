@@ -930,12 +930,17 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
                 scope.handle_admission(request);
                 scope
             });
+            // Both contenders are running before the dynamic-state mutex is
+            // released, so neither can finish ahead of the other: the guard,
+            // not the rendezvous, is what forces them to overlap. The
+            // rendezvous only proves each thread reached its send — the
+            // channel is shared, so neither receive names a contender.
             contenders_ready
                 .recv()
-                .expect("the annulment contender reaches the mutex boundary");
+                .expect("a contender starts before the mutex is released");
             contenders_ready
                 .recv()
-                .expect("the admission contender reaches the mutex boundary");
+                .expect("both contenders start before the mutex is released");
             drop(state);
             let annul = annul.join();
             let scope = admission.join().expect("the admission contender completes");

@@ -8,10 +8,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_once,
-    waiting::{
-        gate_released_manual_ready_task, task as waiting_task, tree as waiting_tree,
-    },
+    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, poll_once,
+    waiting::{gate_released_manual_ready_task, task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
     Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LIFECYCLE_EVENT_CAPACITY,
@@ -198,12 +196,13 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
         .expect("subtree admitted");
-    crate::common::assert_eventually!(|| {
-            root.as_scope()
-                .snapshot()
-                .child("nested")
-                .is_some_and(|child| matches!(child.state, ChildState::Running))
-        }).await;
+    assert_eventually!(|| {
+        root.as_scope()
+            .snapshot()
+            .child("nested")
+            .is_some_and(|child| matches!(child.state, ChildState::Running))
+    })
+    .await;
 
     // Prescribed acquisition order: subscribe first, snapshot second. Every
     // item already queued is reflected by the recursive watermark.
@@ -291,12 +290,13 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     drop(completion);
     let membership = task.membership();
     task.wait().await;
-    crate::common::assert_eventually!(|| {
-            root.as_scope()
-                .snapshot()
-                .child("retained")
-                .is_some_and(|child| child.state.is_terminal())
-        }).await;
+    assert_eventually!(|| {
+        root.as_scope()
+            .snapshot()
+            .child("retained")
+            .is_some_and(|child| child.state.is_terminal())
+    })
+    .await;
 
     let mut saw_exit = false;
     let mut saw_restart = false;
@@ -359,12 +359,13 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     drop(teardown_completion);
     let teardown_membership = teardown_task.membership();
     teardown_task.wait().await;
-    crate::common::assert_eventually!(|| {
-            root.as_scope()
-                .snapshot()
-                .child("teardown-tombstone")
-                .is_some_and(|child| child.state.is_terminal())
-        }).await;
+    assert_eventually!(|| {
+        root.as_scope()
+            .snapshot()
+            .child("teardown-tombstone")
+            .is_some_and(|child| child.state.is_terminal())
+    })
+    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -577,11 +578,12 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
         }
     };
 
-    crate::common::assert_eventually!(|| {
-            root.snapshot()
-                .child("nested")
-                .is_some_and(|child| matches!(child.state, ChildState::Restarting))
-        }).await;
+    assert_eventually!(|| {
+        root.snapshot()
+            .child("nested")
+            .is_some_and(|child| matches!(child.state, ChildState::Restarting))
+    })
+    .await;
     let restart_window = root.snapshot();
     let child = restart_window
         .child("nested")
@@ -633,11 +635,12 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     assert_eq!(nested.membership(), scope_membership);
     assert_eq!(nested.snapshot().total_restarts, TotalRestarts::ZERO);
     assert!(nested.snapshot().lifecycle_seq >= starting.seq);
-    crate::common::assert_eventually!(|| {
-            root.snapshot().child("nested").is_some_and(|child| {
-                matches!(child.state, ChildState::Running) && child.restart_at.is_none()
-            })
-        }).await;
+    assert_eventually!(|| {
+        root.snapshot().child("nested").is_some_and(|child| {
+            matches!(child.state, ChildState::Running) && child.restart_at.is_none()
+        })
+    })
+    .await;
 
     system
         .shutdown(Duration::from_secs(1))
@@ -1152,9 +1155,11 @@ async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_va
         .await
         .expect("ephemeral task is admitted");
     task.wait().await;
-    crate::common::assert_eventually!(|| {
-            scope.as_scope().child("ephemeral").is_none()
-        }, "terminal removal reaches the latest snapshot").await;
+    assert_eventually!(
+        || scope.as_scope().child("ephemeral").is_none(),
+        "terminal removal reaches the latest snapshot"
+    )
+    .await;
 
     let latest = snapshots
         .changed()

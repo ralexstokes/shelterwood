@@ -24,7 +24,10 @@ use crate::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartCount, Strategy, TotalRestarts,
     admission::{RemoveOutcome, ReserveError},
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
-    exit::{ExitKind, StartupError, StopReason, stop_reason_precedence},
+    exit::{
+        ExitKind, StartupError, StartupFailure, StartupFailureCause, StopReason,
+        stop_reason_precedence,
+    },
     identity::{AtomicPoisonedCounter, IncarnationCounter, MintedMembership, ScopeIdentity},
     mailbox::{ActorIdentity, MailboxControl, MailboxTermination},
     observe::{
@@ -65,6 +68,46 @@ impl RetainedExit {
     pub fn cancellation(&self) -> crate::exit::Cancellation {
         self.as_exit().cancellation()
     }
+
+    pub(crate) fn retain_scope_state(exits: &mut Vec<Self>, state: &ScopeState) {
+        if let ScopeState::Stopped { reason } = state {
+            Self::retain_stop_reason(exits, reason);
+        }
+    }
+
+    pub(crate) fn retain_startup_result(exits: &mut Vec<Self>, startup: &Result<(), StartupError>) {
+        if let Err(StartupError::StartupFailed(failure)) = startup {
+            Self::retain_startup_failure(exits, failure);
+        }
+    }
+
+    pub fn retain_stop_reason(exits: &mut Vec<Self>, reason: &StopReason) {
+        if let StopReason::StartupFailed(failure) = reason {
+            Self::retain_startup_failure(exits, failure);
+        }
+    }
+
+    fn retain_startup_failure(exits: &mut Vec<Self>, failure: &StartupFailure) {
+        if let StartupFailureCause::Child { exit, .. } = &failure.cause {
+            Self::retain_exit(exits, exit);
+        }
+    }
+
+    pub(crate) fn retain_exit(exits: &mut Vec<Self>, exit: &Exit) {
+        if !exits.iter().any(|retained| retained.as_exit() == exit) {
+            exits.push(Self::new(exit.clone()));
+        }
+    }
+
+    pub(crate) fn retain_owned(exits: &mut Vec<Self>, exit: Self) {
+        if exits.iter().any(|retained| retained == &exit) {
+            // An existing retained copy keeps the raw clone alive while it is
+            // released. Avoid submitting a duplicate disposal job.
+            drop(exit.into_exit());
+        } else {
+            exits.push(exit);
+        }
+    }
 }
 
 impl From<Exit> for RetainedExit {
@@ -101,6 +144,45 @@ impl Drop for RetainedExit {
         if matches!(exit.kind(), ExitKind::Failed(_)) {
             runtime::dispose_detached(exit);
         }
+    }
+}
+
+/// A stop reason retained by driver state or a runtime completion.
+///
+/// Structured startup reasons recursively contain the triggering child's
+/// `Exit`. Keeping the public reason before its guards gives the same
+/// raw-projection-first retirement order as `RetainedScopeSnapshot`.
+#[derive(Clone, Debug)]
+pub struct RetainedStopReason {
+    reason: Option<StopReason>,
+    retained_exits: Vec<RetainedExit>,
+}
+
+impl RetainedStopReason {
+    pub fn new(reason: StopReason) -> Self {
+        let mut retained_exits = Vec::new();
+        RetainedExit::retain_stop_reason(&mut retained_exits, &reason);
+        Self {
+            reason: Some(reason),
+            retained_exits,
+        }
+    }
+
+    pub fn as_reason(&self) -> &StopReason {
+        self.reason
+            .as_ref()
+            .expect("retained stop reason was already taken")
+    }
+
+    pub fn into_public(mut self) -> StopReason {
+        let reason = self
+            .reason
+            .take()
+            .expect("retained stop reason was already taken");
+        for exit in std::mem::take(&mut self.retained_exits) {
+            drop(exit.into_exit());
+        }
+        reason
     }
 }
 
@@ -658,6 +740,36 @@ pub struct ScopeRecord {
     /// Read only by this crate's snapshot publication; the driver takes its
     /// restart totals from the decision that produced them.
     pub(crate) total_restarts: TotalRestarts,
+    // Keep this field after every public projection that can contain a child
+    // exit. ScopeRecord clones share the guard allocation, so read-only
+    // observation does not submit one disposal job per read.
+    retained_exits: Arc<Vec<RetainedExit>>,
+}
+
+impl ScopeRecord {
+    fn refresh_retained_exits(&mut self) {
+        let mut retained = Vec::new();
+        RetainedExit::retain_scope_state(&mut retained, &self.state);
+        if let Some(startup) = &self.startup {
+            RetainedExit::retain_startup_result(&mut retained, startup);
+        }
+        if retained.len() == self.retained_exits.len()
+            && retained.iter().all(|incoming| {
+                self.retained_exits
+                    .iter()
+                    .any(|current| current == incoming)
+            })
+        {
+            // The record already owns the same guard set. Release these
+            // probe copies as plain refcount traffic rather than submitting
+            // disposal work for an exit that remains retained.
+            for exit in retained {
+                drop(exit.into_exit());
+            }
+            return;
+        }
+        self.retained_exits = Arc::new(retained);
+    }
 }
 
 /// Type-erased declaration slot carried by the restart-stable cell layer.
@@ -1016,6 +1128,7 @@ impl ScopeCell {
             state: ScopeState::Unstarted,
             startup: None,
             total_restarts: TotalRestarts::ZERO,
+            retained_exits: Arc::new(Vec::new()),
         });
         Arc::new(Self {
             member,
@@ -1282,6 +1395,8 @@ impl ScopeCell {
     }
 
     fn set_state_locked(&self, state: ScopeState, txn: &mut ObservationTxn<'_>) {
+        let mut transient_retained = Vec::new();
+        RetainedExit::retain_scope_state(&mut transient_retained, &state);
         if matches!(state, ScopeState::Draining | ScopeState::StartupFailed)
             && let Some(route) = self.dynamic_route_in(txn)
         {
@@ -1289,7 +1404,14 @@ impl ScopeCell {
         }
         self.observation.record.modify_silently(|record| {
             record.state = state.clone();
+            record.refresh_retained_exits();
         });
+        // The scope record and emitted lifecycle event each install their own
+        // guards. Avoid an extra disposal submission for this call-local
+        // unwind guard.
+        for exit in transient_retained {
+            drop(exit.into_exit());
+        }
         txn.pulse(&self.observation.record);
         txn.pulse(&self.member.record);
         self.emit_locked(txn, LifecycleEventKind::ScopeState { state });
@@ -1520,10 +1642,13 @@ impl ScopeCell {
         let children = self.current_children();
         let mut projected = Vec::with_capacity(children.len());
         let mut retained_exits = Vec::new();
+        RetainedExit::retain_scope_state(&mut retained_exits, &record.state);
         for resident in children.iter() {
             let (child, exits) = self.child_snapshot_locked(&resident.projection);
             projected.push(child);
-            retained_exits.extend(exits);
+            for exit in exits {
+                RetainedExit::retain_owned(&mut retained_exits, exit);
+            }
         }
         let snapshot = Arc::new(ScopeSnapshot {
             state: record.state,
@@ -1565,7 +1690,9 @@ impl ScopeCell {
             .and_then(|scope| (incarnation.is_some() || terminal).then(|| scope.snapshot_locked()))
             .map(|nested| {
                 let (snapshot, exits) = nested.into_parts();
-                retained_exits.extend(exits);
+                for exit in exits {
+                    RetainedExit::retain_owned(&mut retained_exits, exit);
+                }
                 snapshot
             });
         let state = match stage {
@@ -1576,18 +1703,18 @@ impl ScopeCell {
             MemberStage::Stopping => ChildState::Stopping,
             MemberStage::Terminal(exit) if startup_aborted => {
                 let public = exit.as_exit().clone();
-                retained_exits.push(exit);
+                RetainedExit::retain_owned(&mut retained_exits, exit);
                 ChildState::StartupAborted { exit: public }
             }
             MemberStage::Terminal(exit) => {
                 let public = exit.as_exit().clone();
-                retained_exits.push(exit);
+                RetainedExit::retain_owned(&mut retained_exits, exit);
                 ChildState::Stopped { exit: public }
             }
         };
         let last_exit = last_exit.map(|exit| {
             let public = exit.as_exit().clone();
-            retained_exits.push(exit);
+            RetainedExit::retain_owned(&mut retained_exits, exit);
             public
         });
         let snapshot = ChildSnapshot {
@@ -1713,13 +1840,30 @@ impl ScopeCell {
     }
 
     fn set_startup_locked(&self, startup: Result<(), StartupError>, txn: &mut ObservationTxn<'_>) {
+        let mut retained = Vec::new();
+        RetainedExit::retain_startup_result(&mut retained, &startup);
+        let mut incoming = Some((startup, retained));
         let mut published = false;
         self.observation.record.modify_silently(|record| {
             if record.startup.is_none() {
+                let (startup, retained) = incoming
+                    .take()
+                    .expect("startup result is installed at most once");
                 record.startup = Some(startup);
+                record.refresh_retained_exits();
+                // The record now owns an equivalent retained copy. Convert
+                // these transient guards back to raw refcount traffic rather
+                // than submitting duplicate disposal jobs under the gate.
+                for exit in retained {
+                    drop(exit.into_exit());
+                }
                 published = true;
             }
         });
+        // Tuple field order is intentional: a rejected raw startup result is
+        // released while its retained guards still exist, then those guards
+        // transfer failed destruction to isolated disposal.
+        drop(incoming);
         if published {
             txn.pulse(&self.member.record);
             txn.pulse(&self.observation.record);
@@ -1750,6 +1894,7 @@ impl ScopeCell {
                 record.total_restarts = TotalRestarts::ZERO;
                 record.startup = None;
                 record.state = state.clone();
+                record.refresh_retained_exits();
             });
             // Hold epoch ownership through its observation projection. A
             // stale finish and a newer begin can no longer cross these two
@@ -2196,6 +2341,8 @@ impl ScopeCell {
     ) {
         let incoming = stop_reason_precedence(&reason);
         let state = ScopeState::Stopped { reason };
+        let mut transient_retained = Vec::new();
+        RetainedExit::retain_scope_state(&mut transient_retained, &state);
         let mut published = false;
         self.observation.record.modify_silently(|record| {
             if let ScopeState::Stopped { reason: recorded } = &record.state
@@ -2207,6 +2354,7 @@ impl ScopeCell {
                 record.startup = Some(Err(StartupError::ShutdownRequested));
             }
             record.state = state.clone();
+            record.refresh_retained_exits();
             published = true;
         });
         if let Some(exit) = terminal_exit {
@@ -2218,8 +2366,19 @@ impl ScopeCell {
         // `wait_started` must not observe terminal startup until the member
         // and incarnation-control planes are mutually consistent.
         if published {
+            // The record and lifecycle event now retain the raw projection.
+            // Surrender the transient guards without scheduling duplicate
+            // disposal jobs.
+            for exit in transient_retained {
+                drop(exit.into_exit());
+            }
             wakes.pulse(&self.observation.record);
             self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
+        } else {
+            // Release the rejected raw projection before its guards. This is
+            // the same field order used by retained framework state.
+            drop(state);
+            drop(transient_retained);
         }
     }
 
@@ -2247,10 +2406,13 @@ mod tests {
         time::Duration,
     };
 
-    use shelterwood_core::{Cancellation, Exit, ExitError, ExitKind};
+    use shelterwood_core::{
+        Cancellation, Exit, ExitError, ExitKind, StartupFailure, StartupFailureCause, StopReason,
+    };
 
     use crate::{
-        ChildId, MemberCell, RetainedExit, ScopeCell, identity::ScopeIdentity, policy::ScopeFlavor,
+        ChildId, MemberCell, RetainedExit, RetainedStopReason, ScopeCell, identity::ScopeIdentity,
+        policy::ScopeFlavor,
     };
 
     struct ThreadProbe(mpsc::SyncSender<std::thread::ThreadId>);
@@ -2292,6 +2454,60 @@ mod tests {
         assert_ne!(
             disposal_thread, retiring_thread,
             "a retained failed exit must not run its user destructor inline"
+        );
+    }
+
+    #[test]
+    fn retained_exit_conversion_preserves_the_callers_drop_thread() {
+        let caller = std::thread::current().id();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retained = RetainedExit::new(Exit::new(
+            ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+            Cancellation::NotObserved,
+        ));
+
+        drop(retained.into_exit());
+
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("converted exit destruction completes"),
+            caller,
+            "a converted public exit keeps ordinary caller-owned drop timing"
+        );
+    }
+
+    #[test]
+    fn retained_stop_reason_isolates_its_nested_exit() {
+        let retiring_thread = std::thread::current().id();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let id = ChildId::from("worker");
+        let mut identity = ScopeIdentity::new();
+        let member = MemberCell::new(
+            id.clone(),
+            identity
+                .mint_membership(&id)
+                .expect("membership is available"),
+        );
+        let retained = RetainedStopReason::new(StopReason::StartupFailed(StartupFailure {
+            cause: StartupFailureCause::Child {
+                id,
+                membership: member.membership(),
+                exit: Exit::new(
+                    ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+                    Cancellation::NotObserved,
+                ),
+            },
+        }));
+
+        drop(retained);
+
+        assert_ne!(
+            observed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("nested exit disposal completes"),
+            retiring_thread,
+            "a retained driver completion must isolate its nested exit"
         );
     }
 

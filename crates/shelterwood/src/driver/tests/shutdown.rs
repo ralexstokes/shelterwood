@@ -20,11 +20,12 @@ async fn runtime_teardown_finishes_the_cancelled_root_driver() {
 
     hosted.shutdown().await;
 
+    let monitored =
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(monitor)).await;
     assert!(matches!(
-        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(monitor)).await,
-        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok {
-            value: StopReason::ShutdownRequested,
-        })
+        monitored,
+        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { ref value })
+            if value.as_reason() == &StopReason::ShutdownRequested
     ));
     assert!(
         wakes.load(Ordering::SeqCst) > 0,

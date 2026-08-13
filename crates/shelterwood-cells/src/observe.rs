@@ -134,6 +134,7 @@ enum RetainedLifecycleEventKind {
     },
     ScopeState {
         state: ScopeState,
+        retained_exits: Vec<RetainedExit>,
     },
 }
 
@@ -190,7 +191,14 @@ impl RetainedLifecycleEventKind {
                 membership,
                 last_incarnation,
             },
-            LifecycleEventKind::ScopeState { state } => Self::ScopeState { state },
+            LifecycleEventKind::ScopeState { state } => {
+                let mut retained_exits = Vec::new();
+                RetainedExit::retain_scope_state(&mut retained_exits, &state);
+                Self::ScopeState {
+                    state,
+                    retained_exits,
+                }
+            }
         }
     }
 
@@ -246,7 +254,18 @@ impl RetainedLifecycleEventKind {
                 membership,
                 last_incarnation,
             },
-            Self::ScopeState { state } => LifecycleEventKind::ScopeState { state },
+            Self::ScopeState {
+                state,
+                retained_exits,
+            } => {
+                // The public state now owns the raw copies. Converting the
+                // guards back to ordinary exits preserves caller-controlled
+                // last-drop timing at this read boundary.
+                for exit in retained_exits {
+                    drop(exit.into_exit());
+                }
+                LifecycleEventKind::ScopeState { state }
+            }
         }
     }
 }

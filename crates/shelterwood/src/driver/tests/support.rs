@@ -17,8 +17,8 @@ pub(super) use crate::{
     GracePhase, Incarnation, Intensity, LIFECYCLE_EVENT_CAPACITY, LifecycleEventKind,
     LifecycleItem, LifecycleTryRecvError, Mailbox, MembershipStatus, RawOnceDef, Readiness,
     ReadinessDeadline, RemoveOutcome, ReserveError, RestartCondition, RestartCount, RestartPolicy,
-    Retention, ScopeRef, ScopeState, SendErrorKind, StartupError, StartupFailureCause, StopReason,
-    SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+    Retention, ScopeRef, ScopeState, SendErrorKind, StartupError, StartupFailure,
+    StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
     engine::{
         ChildKey, Effect as SupervisorEffect, Epoch, Event as SupervisorEvent, ScopeLifecycle,
         StopLadder, SupervisorState, arbitrate, step as supervisor_step,
@@ -280,6 +280,7 @@ impl ScopeRuntimeBuilder {
             ancestor_abort_seen: false,
             completion: None,
             finished: None,
+            retained_exits: Vec::new(),
         }
     }
 }

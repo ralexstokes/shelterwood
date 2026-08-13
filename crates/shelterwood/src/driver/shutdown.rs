@@ -103,6 +103,12 @@ impl ScopeRuntime {
         reason: StopReason,
         startup: Option<Result<(), StartupError>>,
     ) {
+        // `ScopeLifecycle`, its emitted effects, and the driver's completion
+        // slots all retain this reason as ordinary core data. A structured
+        // startup failure recursively owns the triggering child's raw Exit,
+        // so keep one cells-layer guard until every one of those slots has
+        // retired.
+        RetainedExit::retain_stop_reason(&mut self.retained_exits, &reason);
         let before = self.supervisor_effects.len();
         self.reduce(SupervisorEvent::BeginDrain { reason });
         let Some(position) = self.supervisor_effects[before..]

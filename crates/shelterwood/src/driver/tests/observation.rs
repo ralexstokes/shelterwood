@@ -1417,6 +1417,84 @@ fn lifecycle_ring_eviction_isolates_a_failed_exit_payload() {
 }
 
 #[test]
+fn lifecycle_ring_eviction_isolates_an_exit_nested_in_scope_state() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let _events = root.subscribe_lifecycle();
+    let (exit, held_at_drop) = gate_probe_exit(&root);
+
+    root.emit(LifecycleEventKind::ScopeState {
+        state: ScopeState::Stopped {
+            reason: StopReason::StartupFailed(StartupFailure {
+                cause: StartupFailureCause::Child {
+                    id: ChildId::from("worker"),
+                    membership: root.member.membership(),
+                    exit,
+                },
+            }),
+        },
+    });
+    for _ in 0..LIFECYCLE_EVENT_CAPACITY {
+        root.emit(LifecycleEventKind::ScopeState {
+            state: ScopeState::Running,
+        });
+    }
+
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
+        "an evicted structured startup exit must not run under the observation gate"
+    );
+}
+
+#[test]
+fn scope_record_retirement_isolates_an_exit_nested_in_startup_result() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let (exit, held_at_drop) = gate_probe_exit(&root);
+    root.set_startup(Err(StartupError::StartupFailed(StartupFailure {
+        cause: StartupFailureCause::Child {
+            id: ChildId::from("worker"),
+            membership: root.member.membership(),
+            exit,
+        },
+    })));
+
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("the fixture has an unused scope epoch");
+
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
+        "clearing the retained startup result must isolate its nested exit"
+    );
+    root.finish_incarnation(epoch, StopReason::ShutdownRequested);
+}
+
+#[test]
+fn snapshot_retirement_isolates_an_exit_nested_in_scope_state() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let _snapshots = root.subscribe_snapshots();
+    let (exit, held_at_drop) = gate_probe_exit(&root);
+    root.set_state(ScopeState::Stopped {
+        reason: StopReason::StartupFailed(StartupFailure {
+            cause: StartupFailureCause::Child {
+                id: ChildId::from("worker"),
+                membership: root.member.membership(),
+                exit,
+            },
+        }),
+    });
+
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("the fixture has an unused scope epoch");
+
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
+        "retiring a structured startup snapshot must isolate its nested exit"
+    );
+    root.finish_incarnation(epoch, StopReason::ShutdownRequested);
+}
+
+#[test]
 fn residency_can_release_the_last_member_arc_with_a_failed_exit() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");

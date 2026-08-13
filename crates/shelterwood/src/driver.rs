@@ -33,8 +33,8 @@ use crate::{
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
-        MemberStage, MemberTransition, ResidentProjection, RetainedExit, ScopeCell,
-        ScopeControlEvent, StartupDisposition,
+        MemberStage, MemberTransition, ResidentProjection, RetainedExit, RetainedStopReason,
+        ScopeCell, ScopeControlEvent, StartupDisposition,
     },
     deadline::Deadline,
     engine::{
@@ -77,7 +77,7 @@ use admission_control::RemovalResponses;
 
 pub(crate) struct SystemRun {
     pub(crate) root: Arc<ScopeCell>,
-    driver: Option<runtime::JoinHandle<StopReason>>,
+    driver: Option<runtime::JoinHandle<RetainedStopReason>>,
 }
 
 fn resident_projection(slot: &SlotCell) -> ResidentProjection {
@@ -104,16 +104,33 @@ impl SystemRun {
         let Some(driver) = self.driver.take() else {
             return;
         };
-        if let Err(exit) = classify_root_driver_join(runtime::join(driver).await) {
+        if let Err(exit) = classify_retained_root_driver_join(runtime::join(driver).await) {
             self.root
                 .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
         }
     }
 }
 
+#[cfg(test)]
 fn classify_root_driver_join(
     outcome: runtime::JoinOutcome<StopReason>,
 ) -> Result<StopReason, Exit> {
+    let (join, cancellation) = match outcome {
+        runtime::JoinOutcome::Ok { value } => return Ok(value),
+        runtime::JoinOutcome::Panic { message } => (
+            runtime::JoinOutcome::Panic { message },
+            Cancellation::NotObserved,
+        ),
+        runtime::JoinOutcome::Cancelled => {
+            (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
+        }
+    };
+    Err(classify_exit(None, join, None, cancellation))
+}
+
+fn classify_retained_root_driver_join(
+    outcome: runtime::JoinOutcome<RetainedStopReason>,
+) -> Result<RetainedStopReason, Exit> {
     let (join, cancellation) = match outcome {
         runtime::JoinOutcome::Ok { value } => return Ok(value),
         runtime::JoinOutcome::Panic { message } => (
@@ -153,14 +170,14 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
 
 fn monitor_root_driver(
     monitor_root: Arc<ScopeCell>,
-    driver: runtime::JoinHandle<StopReason>,
-) -> runtime::JoinHandle<StopReason> {
+    driver: runtime::JoinHandle<RetainedStopReason>,
+) -> runtime::JoinHandle<RetainedStopReason> {
     runtime::spawn(async move {
-        match classify_root_driver_join(runtime::join(driver).await) {
+        match classify_retained_root_driver_join(runtime::join(driver).await) {
             Ok(reason) => reason,
             Err(exit) => {
                 monitor_root.finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
-                StopReason::ShutdownRequested
+                RetainedStopReason::new(StopReason::ShutdownRequested)
             }
         }
     })
@@ -234,6 +251,11 @@ struct ScopeRuntime {
     ancestor_abort_seen: bool,
     completion: Option<ScopeCompletion>,
     finished: Option<StopReason>,
+    // Last by design: the supervisor, queued effects, completion, and
+    // finished result can all retain a structured startup reason containing
+    // a child's raw Exit. Their fields retire before these guards detach the
+    // corresponding failed payloads.
+    retained_exits: Vec<RetainedExit>,
 }
 
 struct ChildResources<T>(BTreeMap<ChildKey, T>);
@@ -333,7 +355,7 @@ impl<T> IndexMut<&ChildKey> for ChildResources<T> {
 }
 
 struct ScopeCompletion {
-    reason: StopReason,
+    reason: RetainedStopReason,
     root_exit: Option<RetainedExit>,
 }
 
@@ -380,7 +402,7 @@ impl Drop for ScopeRuntime {
         let completion = self.completion.take();
         let reason = completion
             .as_ref()
-            .map(|completion| completion.reason.clone())
+            .map(|completion| completion.reason.as_reason().clone())
             .or_else(|| self.supervisor.lifecycle().draining_reason().cloned())
             .unwrap_or(StopReason::ShutdownRequested);
         if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
@@ -621,6 +643,10 @@ struct ScopeEpochGuard {
     scope: Arc<ScopeCell>,
     epoch: Option<Epoch>,
     lifecycle: ScopeLifecycle,
+    // The core lifecycle retains raw structured stop reasons. Keep the
+    // cells-layer guards last so unwind retires the reasons before detaching
+    // their nested failed exits.
+    retained_exits: Vec<RetainedExit>,
 }
 
 impl ScopeEpochGuard {
@@ -631,6 +657,7 @@ impl ScopeEpochGuard {
             scope: Arc::clone(scope),
             epoch: Some(epoch),
             lifecycle,
+            retained_exits: Vec::new(),
         })
     }
 
@@ -751,9 +778,11 @@ async fn run_nested_tree_with_epoch(
             // publishes no `Draining` edge because nothing was ever started to
             // drain, matching the pre-lattice behaviour of the `StartupFailed`
             // verdict it generalizes.
-            epoch
-                .lifecycle
-                .begin_drain(StopReason::StartupFailed(failure));
+            epoch.lifecycle.begin_drain({
+                let reason = StopReason::StartupFailed(failure);
+                RetainedExit::retain_stop_reason(&mut epoch.retained_exits, &reason);
+                reason
+            });
             let reason = epoch
                 .lifecycle
                 .draining_reason()
@@ -780,15 +809,15 @@ async fn run_nested_tree_with_epoch(
     )
 }
 
-async fn run_scope(plan: ScopePlan, role: ScopeRole) -> StopReason {
+async fn run_scope(plan: ScopePlan, role: ScopeRole) -> RetainedStopReason {
     let root = Arc::clone(&plan.root);
     let Some(epoch) = ScopeEpochGuard::begin(&root) else {
         // Dropping the still-owned plan terminalizes every never-started
         // declaration and the root; no aliased driver epoch is created.
         drop(plan);
-        return StopReason::NeverStarted;
+        return RetainedStopReason::new(StopReason::NeverStarted);
     };
-    run_scope_incarnation(plan, role, epoch).await
+    RetainedStopReason::new(run_scope_incarnation(plan, role, epoch).await)
 }
 
 async fn run_scope_incarnation(
@@ -878,6 +907,7 @@ async fn run_scope_incarnation(
         ancestor_abort_seen: false,
         completion: None,
         finished: None,
+        retained_exits: Vec::new(),
         // Transfer last: every fallible setup expression above remains
         // covered by the pre-driver guard, and completed construction moves
         // the raw epoch directly into ScopeRuntime's synchronous epilogue.
@@ -1098,7 +1128,7 @@ async fn run_scope_incarnation(
             // discharges child obligations and residency, and only then
             // publishes the scope's terminal state.
             scope.completion = Some(ScopeCompletion {
-                reason: reason.clone(),
+                reason: RetainedStopReason::new(reason.clone()),
                 root_exit,
             });
             return reason;

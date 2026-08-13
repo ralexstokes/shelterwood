@@ -819,14 +819,39 @@ Delivery is at-most-once (§1 principle 6). Send flavors on `ActorRef`
   a pending acknowledgement; dropping it is observable to the caller as
   `ReplyDropped`. A successful `call` exposes the accepting incarnation
   alongside the reply value — §3.3's retry discipline needs it on success
-  as much as on failure. `Reply::channel()` exists as the split escape
+  as much as on failure. `ActorRef::reply_channel()` exists as the split escape
   hatch when the reply must be awaited elsewhere: it yields the `Reply`
   plus a `ReplyReceiver<T>`, whose `recv(deadline)` (trailing deadline
   covering only the response wait — acceptance evidence is the
   accompanying send's result) resolves per B.3. Awaiting `call` on
   `myself()` inside `handle` is a guaranteed deadlock — the reply needs
   the very handler being blocked; use `continue_with`, or
-  `Reply::channel()` with an offload (documented hazard).
+  `ActorRef::reply_channel()` with an offload (documented hazard).
+
+**Mailbox transition boundary.** Mailbox and send-operation mutexes protect
+only synchronous state transitions. A transition records signal pulses,
+waker wake/drop actions, displaced payloads, and isolated disposal requests in
+an effects sink paired with its guard; the guard is released before that sink
+can flush. On every path a transition can complete — acceptance, rejection,
+withdrawal, terminal teardown, and an unwind out of any of them — no `RawWaker`
+vtable, message destructor, signal callback, or runtime-disposal capability
+runs under either mutex. The one carve-out is a framework invariant break
+(identity-space exhaustion or an unreachable binding state): those unwind with
+the payload still under the guard, and they poison the mutex regardless, so the
+transition is abandoned rather than completed.
+The registered-waker slot exposes no operation that returns or replaces a
+`Waker` without an effects sink, making the #202 failure shape structurally
+unrepresentable rather than a call-site convention. Cancellation returns one
+withdrawal outcome plus its post-unlock effects object, never a tuple carrying
+a raw waker across the boundary.
+
+The mailbox crate is runtime-neutral in its production dependency graph. Each
+mailbox receives one type-erased runtime capability object from the public
+façade; it supplies one-shot delivery, change signals, isolated disposal, and
+the clock/timer pair. The same object flows through reply channels and deadline
+futures, so virtual-time and disposal semantics cannot silently switch
+adapters. Runtime choice is deliberately absent from `ActorRef<M>`'s type
+parameters.
 
 **Binding.** The mailbox binding is membership-owned: created at insertion,
 outliving incarnations and actor destruction (§5.5). *Bound* — accepting
@@ -4063,7 +4088,8 @@ implied on all; error/outcome types are B.3 and B.8):
   graceful shutdown.
 - **`ActorRef<M>`**: cheap `Clone`, membership-addressed (§2); `send` /
   `try_send` / `send_timeout` (each resolving to the accepting
-  `Incarnation`) and `call` per §5.1, error and success shapes per B.3;
+  `Incarnation`), `call`, and `reply_channel` per §5.1, error and success
+  shapes per B.3;
   `contramap` *(II §17)*, `pinned` *(II §15)*.
 - **`ScopeRef`**: `snapshot()`, `subscribe_snapshots()` (conflating
   watch), `subscribe_lifecycle()` (B.4), the `wait_for_child` helper

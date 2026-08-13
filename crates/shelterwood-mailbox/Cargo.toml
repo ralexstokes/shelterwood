@@ -13,9 +13,10 @@ workspace = true
 
 [dependencies]
 shelterwood-core.workspace = true
-shelterwood-runtime.workspace = true
 
 [dev-dependencies]
 shelterwood-core = { workspace = true, features = ["test-util"] }
 shelterwood-runtime = { workspace = true, features = ["test-util"] }
-tokio = { workspace = true, features = ["test-util"] }
+# The adapter's re-exported `#[test]` attribute expands to unqualified `tokio`
+# paths, so the macro's own crate must be linkable. No source here names it.
+tokio.workspace = true

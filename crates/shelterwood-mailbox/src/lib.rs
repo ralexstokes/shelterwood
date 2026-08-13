@@ -2,21 +2,28 @@
 
 //! Mailbox state machines and public messaging primitives.
 //!
-//! Tokio details remain behind `shelterwood-runtime`; this crate names only
-//! the adapter operations its futures need. Cross-crate lifecycle and identity
-//! capabilities are public implementation seams, not supported façade API.
+//! Tokio details remain behind `shelterwood-runtime`: this crate declares the
+//! runtime capabilities its futures need and never names an executor, in tests
+//! as well as in production. Cross-crate lifecycle and identity capabilities
+//! are public implementation seams, not supported façade API.
 
 use std::{fmt, sync::Arc};
 
 use shelterwood_core::policy::ResolvedMailbox;
 pub use shelterwood_core::{ChildId, Incarnation, Membership};
 
+mod capability;
 mod cell;
 mod deadline;
 mod errors;
 mod futures;
 mod reply;
 
+#[doc(hidden)]
+pub use capability::{
+    BoxedSleep, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
+    MailboxRuntime, MailboxSignal, MailboxSignalWatcher,
+};
 pub use cell::*;
 pub use errors::*;
 pub use futures::*;
@@ -32,10 +39,6 @@ mod panic {
 
 mod policy {
     pub(crate) use shelterwood_core::policy::*;
-}
-
-mod runtime {
-    pub(crate) use shelterwood_runtime::*;
 }
 
 /// Isolated payload returned after mailbox termination has synchronously
@@ -57,7 +60,8 @@ pub trait MailboxTermination: Send {
 /// intentionally ignored.
 pub trait MailboxControl: fmt::Debug + Send + Sync {
     /// Installs the declaration-time mailbox policy before the first bind.
-    /// Reconfiguration may only repeat the same resolved policy.
+    /// Reconfiguration may only repeat the same resolved policy; a mismatch
+    /// panics after the mailbox lock has been released.
     fn configure(&self, mailbox: ResolvedMailbox);
     /// Makes one incarnation live after configuration and prior-close cleanup.
     /// A bind after terminal preparation is deliberately ignored because
@@ -92,4 +96,16 @@ impl<T: ActorIdentity + ?Sized> ActorIdentity for Arc<T> {
     fn membership(&self) -> Membership {
         (**self).membership()
     }
+}
+
+/// The Tokio adapter, reachable only as a dev-dependency.
+///
+/// `shelterwood-runtime` depends on this crate, so this is a dev-only cycle
+/// that leaves the production graph inverted (`cargo tree -e normal` shows
+/// `shelterwood-core` alone). Tests take their capability object and their
+/// runtime attribute from the real adapter rather than a stand-in, keeping
+/// tokio unnamed here.
+#[cfg(test)]
+mod runtime {
+    pub(crate) use shelterwood_runtime::*;
 }

@@ -23,11 +23,16 @@ Two types implement the rule and are the shapes to reach for:
   poisoned transaction cannot strand already-committed wakes. Every retained
   control-plane writer takes the token, which makes an out-of-transaction
   mutation unavailable by construction.
-- **`Promotion`** (`shelterwood-mailbox/src/cell.rs`) is the same idea for the
-  mailbox promotion path: wakers and displaced messages accumulate inside the
-  critical section and `Drop` flushes them after it, panic-contained.
-  `Acceptance`, `Termination` and `MailboxPayload` are its single-purpose
-  siblings.
+- **`MailboxTxn`** (`shelterwood-mailbox/src/cell.rs`) is the same idea for
+  every mutable mailbox transition. It owns the state guard beside a
+  `MailboxEffects` sink that collects signal pulses, waker wake/drop actions,
+  displaced payloads and isolated-disposal requests; its `Drop` empties the
+  guard field before Rust drops the sink, so the flush necessarily runs with no
+  mailbox mutex held, unwind included. `WakerSlot` makes the waker half
+  structural rather than conventional: its storage is private even from the
+  parent module, and no operation returns or replaces a `Waker` without an
+  effects sink. `Withdrawal`, `Termination` and `MailboxPayload` are its
+  single-purpose siblings.
 
 What the rule does *not* forbid — the exemptions every remaining lock site
 rests on:
@@ -37,8 +42,10 @@ rests on:
   need no ceremony.
 - **Moving a user value out.** `take`/`mem::replace`/returning by value is not
   a drop. What must be outside the critical section is the *destination*:
-  `Acceptance`'s `#[must_use]`, `withdraw`'s `(result, waker)` tuple, and
-  `SnapshotHub`'s deferred retirement all encode that.
+  `MailboxTxn::finish`/`finish_returned` handing the value back only after
+  releasing the guard, `withdraw`'s `Withdrawal` carrying its outcome and
+  post-unlock effects together, and `SnapshotHub`'s deferred retirement all
+  encode that.
 - **`Arc` traffic that cannot reach zero.** Cloning an `Arc` under a lock is
   refcount work; dropping one is only refcount work while another owner is
   provable. Prefer restructuring over the proof — every violation the #235
@@ -48,9 +55,12 @@ rests on:
   member record owns an `Exit`. They are safe only because the driver's own
   child map outlives residency (`ScopeRuntime`'s `Drop` clears residents
   before `self.children`), which is an ordering nothing enforces.
-- **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination` and
-  `DynamicRoute` are cross-crate implementation seams with framework-only
-  impls, not user traits; calling them under a lock runs no caller code.
+- **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination`,
+  `MailboxRuntime` and `DynamicRoute` are cross-crate implementation seams with
+  framework-only impls, not user traits; calling them under a lock runs no
+  caller code. `MailboxRuntime` is nonetheless kept off every locked path: its
+  disposal capability hands work to a blocking worker, so it belongs to the
+  effects flush like the user code it carries.
 - **Nested framework locks in one direction.** The resident-tree observation
   gate is outermost: everything else is taken under it or standalone, never
   around it. Inside, the documented orders are cells' member mailbox →

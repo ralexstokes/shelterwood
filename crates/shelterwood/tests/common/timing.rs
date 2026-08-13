@@ -45,14 +45,14 @@ pub(crate) async fn poll_until(
 pub(crate) fn assert_eventually_predicate(
     expression: &'static str,
     predicate: impl FnMut() -> bool,
-    context: Option<String>,
+    context: impl FnOnce() -> Option<String>,
 ) -> impl Future<Output = ()> {
     let caller = Location::caller();
     async move {
         if poll_until(POLL_TIMEOUT, POLL_INTERVAL, predicate).await {
             return;
         }
-        match context {
+        match context() {
             Some(context) => panic!(
                 "predicate `{expression}` did not become true within {POLL_TIMEOUT:?} at {caller}: {context}"
             ),
@@ -79,7 +79,7 @@ pub(crate) async fn assert_quiet(duration: Duration, mut predicate: impl FnMut()
 
 #[cfg(test)]
 mod tests {
-    use std::{future, task::Poll, time::Duration};
+    use std::{cell::Cell, future, task::Poll, time::Duration};
 
     use super::{assert_quiet, poll_once};
 
@@ -97,5 +97,18 @@ mod tests {
         assert_quiet(duration, || false).await;
 
         assert_eq!(tokio::time::Instant::now() - started_at, duration);
+    }
+
+    #[tokio::test]
+    async fn eventual_assertion_context_is_evaluated_only_on_failure() {
+        let evaluated = Cell::new(false);
+
+        crate::common::assert_eventually!(|| true, "{}", {
+            evaluated.set(true);
+            "unexpected context evaluation"
+        })
+        .await;
+
+        assert!(!evaluated.get());
     }
 }

@@ -173,7 +173,13 @@ async fn assert_disposed_off_current(
     drops: &mut tokio::sync::mpsc::UnboundedReceiver<ThreadId>,
     description: &str,
 ) {
-    assert_disposed_off(drops, thread::current().id(), description).await;
+    let actual = drops
+        .recv()
+        .await
+        .unwrap_or_else(|| panic!("{description}"));
+    // The test task may migrate while `recv` is pending, so sample its worker
+    // only after the disposal report wakes it.
+    assert_ne!(actual, thread::current().id(), "{description}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

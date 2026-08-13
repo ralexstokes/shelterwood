@@ -15,13 +15,13 @@ pub(crate) use timing::{
 
 macro_rules! assert_eventually {
     ($predicate:expr $(,)?) => {
-        $crate::common::assert_eventually_predicate(stringify!($predicate), $predicate, None)
+        $crate::common::assert_eventually_predicate(stringify!($predicate), $predicate, || None)
     };
     ($predicate:expr, $($context:tt)+) => {
         $crate::common::assert_eventually_predicate(
             stringify!($predicate),
             $predicate,
-            Some(format!($($context)+)),
+            || Some(format!($($context)+)),
         )
     };
 }

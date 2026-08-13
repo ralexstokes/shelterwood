@@ -4,29 +4,7 @@ use super::support::*;
 async fn runtime_teardown_finishes_the_cancelled_root_driver() {
     let plan = DynamicTree::new().lower_for_test();
     let root = Arc::clone(&plan.root);
-    let (driver_sender, driver_receiver) = std::sync::mpsc::sync_channel(1);
-    let (teardown_sender, teardown_receiver) = std::sync::mpsc::sync_channel(0);
-    let runtime_thread = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("dedicated driver runtime");
-        let guard = runtime.enter();
-        let driver = crate::runtime::spawn(async move { run_scope(plan, ScopeRole::Root).await });
-        drop(guard);
-        driver_sender
-            .send(driver)
-            .expect("the monitor receives the root driver");
-        teardown_receiver
-            .recv()
-            .expect("the test requests runtime teardown");
-        drop(runtime);
-    });
-
-    let driver = driver_receiver
-        .recv()
-        .expect("dedicated runtime publishes the driver handle");
+    let (hosted, driver) = DedicatedRuntime::spawn(run_scope(plan, ScopeRole::Root));
     let monitor = monitor_root_driver(Arc::clone(&root), driver);
     root.wait_started().await.expect("root starts");
     let wakes = Arc::new(AtomicUsize::new(0));
@@ -40,10 +18,7 @@ async fn runtime_teardown_finishes_the_cancelled_root_driver() {
         "the live root observer parks before runtime teardown"
     );
 
-    teardown_sender
-        .send(())
-        .expect("dedicated runtime remains live");
-    runtime_thread.join().expect("runtime teardown completes");
+    hosted.shutdown().await;
 
     assert!(matches!(
         crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(monitor)).await,

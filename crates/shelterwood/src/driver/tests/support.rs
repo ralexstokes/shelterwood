@@ -27,7 +27,7 @@ pub(super) use crate::{
     mailbox::{MailboxCell, actor_ref_from_parts},
     plan::{BuilderCore, ChildConstruction, SlotCell, resolve_fixture_options},
     policy::ResolvedDefaults,
-    runtime::{CompletionGatedLatch, Latch},
+    runtime::{CompletionGatedLatch, DedicatedRuntime, Latch},
 };
 
 pub(super) use super::super::{

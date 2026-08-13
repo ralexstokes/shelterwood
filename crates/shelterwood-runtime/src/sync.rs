@@ -191,6 +191,14 @@ impl CompletionGatedLatch {
         )
     }
 
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn is_completed(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            COMPLETION_GATE_CLOSED | COMPLETION_GATE_CLOSED_FIRED
+        )
+    }
+
     pub async fn fired(&self) {
         self.fired.fired().await;
     }

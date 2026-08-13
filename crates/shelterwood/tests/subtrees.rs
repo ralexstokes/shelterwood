@@ -7,13 +7,16 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
+use crate::common::{
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until,
+    waiting::task as waiting_task,
+};
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DefaultsInheritance,
     DynamicTree, ExitError, ExitKind, ExitResult, GracePhase, Intensity, LifecycleEventKind,
     LifecycleItem, LifecycleTryRecvError, Mailbox, MailboxShutdown, Readiness, ReadinessDeadline,
-    RestartAttempt, RestartCondition, RestartPolicy, ScopeDefaults, SendErrorKind, Shutdown,
-    StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
+    RestartAttempt, RestartCondition, RestartPolicy, ScopeDefaults, ScopeRef, SendErrorKind,
+    Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
     TaskOnceDef, TaskRef, Tree,
 };
 
@@ -33,10 +36,7 @@ async fn a_restartable_subtree_can_heal_an_unfilled_lowering_failure() {
             } else {
                 tree.add_task(
                     "healthy",
-                    TaskDef::new(|context| async move {
-                        context.shutdown_token().cancelled().await;
-                        Ok(())
-                    }),
+                    waiting_task(),
                 )
                 .expect("valid task");
             }
@@ -374,19 +374,13 @@ async fn intensity_window_ages_out_between_restart_schedules() {
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     advance_time(Duration::from_secs(11)).await;
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             starts.load(Ordering::SeqCst) >= 2
-        })
-        .await
-    );
+        }).await;
     advance_time(Duration::from_secs(11)).await;
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             starts.load(Ordering::SeqCst) >= 3
-        })
-        .await
-    );
+        }).await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -498,6 +492,7 @@ async fn ordered_graces_sum_while_dynamic_graces_overlap() {
         .expect("child policies bound shutdown");
     let ordered_elapsed = tokio::time::Instant::now() - started;
     assert!(ordered_elapsed >= Duration::from_secs(20));
+    assert!(ordered_elapsed < Duration::from_secs(25));
 
     let mut dynamic = DynamicTree::new();
     dynamic.add_task("one", stubborn()).expect("valid task");
@@ -565,12 +560,9 @@ async fn dynamic_and_always_members_do_not_finish_naturally() {
         .expect("valid task");
     let ordered = ordered.spawn().expect("runtime is available");
     ordered.wait_started().await.expect("ordered starts");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             starts.load(Ordering::SeqCst) >= 2
-        })
-        .await
-    );
+        }).await;
     let ordered_scope = ordered.scope();
     let mut ordered_stopped = Box::pin(ordered_scope.wait_stopped());
     assert_quiet(Duration::from_millis(20), || {
@@ -659,13 +651,9 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
 
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             started.load(Ordering::Acquire)
-        })
-        .await,
-        "leaf starts polling"
-    );
+        }, "leaf starts polling").await;
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(5)));
     let returned_before_leaf_released =
         poll_until(Duration::from_millis(50), Duration::from_millis(1), || {
@@ -796,12 +784,9 @@ async fn locally_requested_subtree_shutdown_reads_cancelled() {
         .add_subtree_once("nested", SubtreeOnceDef::new(nested))
         .expect("valid subtree");
     let system = root.spawn().expect("runtime is available");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+        }).await;
     // The stop request comes from the subtree's own handle, not an
     // ancestor's ladder.
     sub.request_shutdown();
@@ -971,6 +956,26 @@ impl Actor for CapacityActor {
     }
 }
 
+fn add_inherit_reset_subtrees(
+    root: &mut Tree,
+    inherited: Tree,
+    reset: Tree,
+) -> (ScopeRef, ScopeRef) {
+    let inherited = root
+        .add_subtree_once(
+            "inherited",
+            SubtreeOnceDef::new(inherited).defaults(DefaultsInheritance::Inherit),
+        )
+        .expect("valid inherited subtree");
+    let reset = root
+        .add_subtree_once(
+            "reset",
+            SubtreeOnceDef::new(reset).defaults(DefaultsInheritance::Reset),
+        )
+        .expect("valid reset subtree");
+    (inherited, reset)
+}
+
 #[tokio::test]
 async fn subtree_defaults_inherit_or_reset_end_to_end() {
     let inherited_entered = ReleaseGate::default();
@@ -1001,16 +1006,7 @@ async fn subtree_defaults_inherit_or_reset_end_to_end() {
         mailbox: Some(Mailbox::queue(1).expect("valid inherited capacity")),
         ..ScopeDefaults::default()
     });
-    root.add_subtree_once(
-        "inherited",
-        SubtreeOnceDef::new(inherited_tree).defaults(DefaultsInheritance::Inherit),
-    )
-    .expect("valid inherited subtree");
-    root.add_subtree_once(
-        "reset",
-        SubtreeOnceDef::new(reset_tree).defaults(DefaultsInheritance::Reset),
-    )
-    .expect("valid reset subtree");
+    add_inherit_reset_subtrees(&mut root, inherited_tree, reset_tree);
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("both subtrees start");
 
@@ -1080,18 +1076,7 @@ async fn three_level_mailbox_capacity_walk_honors_inherit_and_reset() {
         mailbox: Some(Mailbox::latest()),
         ..ScopeDefaults::default()
     });
-    middle
-        .add_subtree_once(
-            "inherited",
-            SubtreeOnceDef::new(inherited_leaf).defaults(DefaultsInheritance::Inherit),
-        )
-        .expect("valid inherited leaf");
-    middle
-        .add_subtree_once(
-            "reset",
-            SubtreeOnceDef::new(reset_leaf).defaults(DefaultsInheritance::Reset),
-        )
-        .expect("valid reset leaf");
+    add_inherit_reset_subtrees(&mut middle, inherited_leaf, reset_leaf);
 
     let mut root = Tree::new();
     root.defaults(ScopeDefaults {
@@ -1211,16 +1196,7 @@ async fn subtree_restart_defaults_inherit_or_reset_end_to_end() {
         )),
         ..ScopeDefaults::default()
     });
-    root.add_subtree_once(
-        "inherited",
-        SubtreeOnceDef::new(inherited_tree).defaults(DefaultsInheritance::Inherit),
-    )
-    .expect("valid inherited subtree");
-    root.add_subtree_once(
-        "reset",
-        SubtreeOnceDef::new(reset_tree).defaults(DefaultsInheritance::Reset),
-    )
-    .expect("valid reset subtree");
+    add_inherit_reset_subtrees(&mut root, inherited_tree, reset_tree);
     let system = root.spawn().expect("runtime is available");
     system
         .wait_started()
@@ -1275,18 +1251,8 @@ async fn subtree_shutdown_defaults_inherit_or_reset_end_to_end() {
         child_shutdown: Some(Shutdown::Abort),
         ..ScopeDefaults::default()
     });
-    let inherited_scope = root
-        .add_subtree_once(
-            "inherited",
-            SubtreeOnceDef::new(inherited_tree).defaults(DefaultsInheritance::Inherit),
-        )
-        .expect("valid inherited subtree");
-    let reset_scope = root
-        .add_subtree_once(
-            "reset",
-            SubtreeOnceDef::new(reset_tree).defaults(DefaultsInheritance::Reset),
-        )
-        .expect("valid reset subtree");
+    let (inherited_scope, reset_scope) =
+        add_inherit_reset_subtrees(&mut root, inherited_tree, reset_tree);
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("both workers start");
     inherited_started.wait().await;
@@ -1398,18 +1364,8 @@ async fn subtree_mailbox_shutdown_defaults_inherit_or_reset_end_to_end() {
         mailbox_shutdown: Some(MailboxShutdown::Discard),
         ..ScopeDefaults::default()
     });
-    let inherited_scope = root
-        .add_subtree_once(
-            "inherited",
-            SubtreeOnceDef::new(inherited_tree).defaults(DefaultsInheritance::Inherit),
-        )
-        .expect("valid inherited subtree");
-    let reset_scope = root
-        .add_subtree_once(
-            "reset",
-            SubtreeOnceDef::new(reset_tree).defaults(DefaultsInheritance::Reset),
-        )
-        .expect("valid reset subtree");
+    let (inherited_scope, reset_scope) =
+        add_inherit_reset_subtrees(&mut root, inherited_tree, reset_tree);
     let system = root.spawn().expect("runtime is available");
     system.wait_started().await.expect("both actors start");
     inherited_actor

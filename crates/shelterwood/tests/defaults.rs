@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, poll_once};
 use shelterwood::{
     Actor, ActorDef, Backoff, Context, DynamicTree, ExitError, ExitKind, ExitResult, GracePhase,
     MailboxShutdown, RawActor, RawContext, RawOnceDef, Readiness, RestartCount, Retention,
@@ -119,13 +119,9 @@ async fn default_child_shutdown_grace_is_five_seconds() {
             .saturating_duration_since(tokio::time::Instant::now()),
     )
     .await;
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             poll_once(shutdown.as_mut()).is_ready()
-        })
-        .await,
-        "grace elapses at 5s and the abort ladder completes"
-    );
+        }, "grace elapses at 5s and the abort ladder completes").await;
     drop(shutdown);
 
     let exit = task.wait().await;
@@ -277,13 +273,9 @@ async fn default_restart_backoff_and_retention_follow_definition_ownership() {
         .expect("one-shot task is admitted");
     completion.wait().await.expect("one-shot task completes");
     one_shot.wait().await;
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             scope.as_scope().child("one-shot").is_none()
-        })
-        .await,
-        "the default one-shot retention removes the terminal membership"
-    );
+        }, "the default one-shot retention removes the terminal membership").await;
 
     system
         .shutdown(Duration::from_secs(1))

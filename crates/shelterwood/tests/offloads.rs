@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
     Guard, LifecycleEventKind, LifecycleItem, Mailbox, Readiness, Shutdown, StartupError,
@@ -224,12 +224,9 @@ async fn timers_and_offload_completions_never_cross_an_incarnation_boundary() {
         .send(RestartMessage::Poison)
         .await
         .expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             generations.load(Ordering::SeqCst) >= 2
-        })
-        .await
-    );
+        }).await;
     actor
         .send(RestartMessage::Fresh)
         .await
@@ -409,13 +406,9 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
         .send(DetachedBlockingMessage::Poison)
         .await
         .expect("actor accepts poison");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             generations.load(Ordering::SeqCst) >= 2
-        })
-        .await,
-        "replacement starts while the old blocking thread remains detached"
-    );
+        }, "replacement starts while the old blocking thread remains detached").await;
 
     thread_release.release();
     // The gate only witnesses that the result's destructor ran somewhere; the
@@ -527,13 +520,9 @@ async fn offload_completion_wins_at_the_exact_deadline() {
         .send(DeadlineMessage::Start)
         .await
         .expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             armed.load(Ordering::SeqCst) && offload_started.load(Ordering::SeqCst)
-        })
-        .await,
-        "the offload is polled and its deadline is registered before time moves"
-    );
+        }, "the offload is polled and its deadline is registered before time moves").await;
     tokio::time::advance(Duration::from_secs(10)).await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(*result.lock().expect("result mutex poisoned"), Some(Ok(42)));
@@ -600,13 +589,9 @@ async fn dropping_scoped_guard_suppresses_the_continuation() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     actor.send(GuardMessage::Start).await.expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             guard_dropped.load(Ordering::SeqCst)
-        })
-        .await,
-        "the actor drops the guard before the negative window begins"
-    );
+        }, "the actor drops the guard before the negative window begins").await;
     assert_quiet(Duration::from_secs(1), || {
         deliveries.load(Ordering::SeqCst) != 0
     })
@@ -766,11 +751,13 @@ impl Actor for BlockingActor {
         BlockingMessage::Run: Self::Msg,
         context: &mut Context<'_, Self>,
     ) -> ExitResult {
+        let actor_task = tokio::task::id();
         let value = context.run_blocking(|token| {
             assert!(!token.is_cancelled());
             73usize
         });
         self.observed.store(value.await, Ordering::SeqCst);
+        assert_eq!(tokio::task::id(), actor_task);
         context.stop();
         Ok(())
     }
@@ -844,12 +831,9 @@ async fn dropping_run_blocking_future_cancels_and_detaches_its_thread() {
         .await
         .expect("actor live");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             cancelled.load(Ordering::SeqCst)
-        })
-        .await
-    );
+        }).await;
 }
 
 #[derive(Clone, Copy)]
@@ -965,7 +949,7 @@ async fn cancellation_destructor_panic_wakes_an_otherwise_idle_actor() {
 
     guard.cancel();
 
-    let exit = tokio::time::timeout(Duration::from_secs(1), async {
+    let exit = tokio::time::timeout(POLL_TIMEOUT, async {
         loop {
             let item = events.recv().await.expect("lifecycle remains open");
             let LifecycleItem::Event(event) = item else {
@@ -1326,13 +1310,9 @@ async fn queued_offload_panic_survives_hard_abort() {
         .send(PanicMessage::Trigger)
         .await
         .expect("mailbox accepts before readiness");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             queued.load(Ordering::SeqCst)
-        })
-        .await,
-        "offload panic is queued before hard abort"
-    );
+        }, "offload panic is queued before hard abort").await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -1402,13 +1382,9 @@ async fn hard_abort_preserves_owned_offload_panic_over_handler_destructor() {
     let mut events = system.scope().subscribe_lifecycle();
     system.wait_started().await.expect("actor starts");
     actor.send(()).await.expect("actor accepts trigger");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             queued.load(Ordering::SeqCst)
-        })
-        .await,
-        "offload panic is owned before hard abort"
-    );
+        }, "offload panic is owned before hard abort").await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -1506,12 +1482,9 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_panic() {
         .send(CrashTeardownMessage::Start)
         .await
         .expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             log.lock().expect("drop log mutex poisoned").len() == 2
-        })
-        .await
-    );
+        }).await;
     assert_eq!(
         *log.lock().expect("drop log mutex poisoned"),
         ["offload", "actor"]
@@ -1654,12 +1627,9 @@ async fn offload_completion_flood_is_absorbed_and_fully_delivered() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     actor.send(FloodMessage::Start).await.expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             completed_work.load(Ordering::SeqCst) == FLOOD
-        })
-        .await
-    );
+        }).await;
     release.release();
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 }
@@ -1838,12 +1808,9 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_error() {
         .send(FailTeardownMessage::Start)
         .await
         .expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             log.lock().expect("drop log mutex poisoned").len() == 2
-        })
-        .await
-    );
+        }).await;
     assert_eq!(
         *log.lock().expect("drop log mutex poisoned"),
         ["offload", "actor"]

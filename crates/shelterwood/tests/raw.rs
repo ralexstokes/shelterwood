@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until, waiting::task as waiting_task,
+    ReleaseGate, assert_quiet, waiting::task as waiting_task,
 };
 use shelterwood::{
     DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
@@ -241,12 +241,9 @@ async fn raw_manual_readiness_gates_ordered_startup_but_not_mailbox_acceptance()
         )
         .expect("valid sibling");
     let system = tree.spawn().expect("runtime is available");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             entered.load(Ordering::SeqCst)
-        })
-        .await
-    );
+        }).await;
     assert_quiet(Duration::from_millis(20), || {
         sibling_started.load(Ordering::SeqCst)
     })
@@ -258,16 +255,13 @@ async fn raw_manual_readiness_gates_ordered_startup_but_not_mailbox_acceptance()
     release_ready.release();
     system.wait_started().await.expect("manual gate releases");
     assert!(sibling_started.load(Ordering::SeqCst));
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             values
                 .lock()
                 .expect("manual values mutex poisoned")
                 .as_slice()
                 == [7]
-        })
-        .await
-    );
+        }).await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -327,17 +321,14 @@ async fn raw_recv_is_shutdown_biased_and_try_recv_controls_drain_vs_discard() {
         let accepting = actor.try_send(1).expect("one accepts");
         actor.try_send(2).expect("two accepts");
         let shutdown = tokio::spawn(async move { system.shutdown(Duration::from_secs(1)).await });
-        assert!(
-            poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+        crate::common::assert_eventually!(|| {
                 matches!(
                     actor.try_send(3),
                     Err(ref error)
                         if error.kind == SendErrorKind::NotRunning
                             && error.incarnation_observed == Some(accepting)
                 )
-            })
-            .await
-        );
+            }).await;
         enter_loop.release();
         shutdown
             .await
@@ -497,16 +488,13 @@ async fn dynamic_scope_admits_uses_and_exactly_removes_a_raw_actor() {
         .await
         .expect("raw actor is admitted");
     actor.send(9).await.expect("dynamic actor accepts");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             values
                 .lock()
                 .expect("dynamic values mutex poisoned")
                 .as_slice()
                 == [9]
-        })
-        .await
-    );
+        }).await;
     assert_eq!(scope.remove_actor(&actor).await, RemoveOutcome::Removed);
     let terminal = actor.send(10).await.expect_err("removed actor is terminal");
     assert_eq!(terminal.kind, SendErrorKind::Terminated);
@@ -542,16 +530,13 @@ async fn deferred_queue_capacity_ignores_a_latest_scope_default() {
         .try_send(2)
         .expect("second value proves queue capacity did not become latest");
     gate.release();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             values
                 .lock()
                 .expect("default values mutex poisoned")
                 .as_slice()
                 == [1, 2]
-        })
-        .await
-    );
+        }).await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -661,13 +646,9 @@ async fn hard_abort_offload_panic_with_panicking_raw_destructor_is_contained() {
     let system = tree.spawn().expect("runtime is available");
     let mut events = system.scope().subscribe_lifecycle();
     system.wait_started().await.expect("actor starts");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             queued.load(Ordering::SeqCst)
-        })
-        .await,
-        "offload panic is queued before hard abort"
-    );
+        }, "offload panic is queued before hard abort").await;
     system
         .shutdown(Duration::from_secs(1))
         .await

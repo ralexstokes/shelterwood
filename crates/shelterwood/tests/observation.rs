@@ -8,8 +8,10 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_once, poll_until,
-    waiting::{task as waiting_task, tree as waiting_tree},
+    POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_once,
+    waiting::{
+        gate_released_manual_ready_task, task as waiting_task, tree as waiting_tree,
+    },
 };
 use shelterwood::{
     Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LIFECYCLE_EVENT_CAPACITY,
@@ -196,15 +198,12 @@ async fn catch_up_watermarks_dedupe_initial_events_discard_stale_scopes_and_intr
         .add_subtree_once("nested", SubtreeOnceDef::new(waiting_tree()))
         .await
         .expect("subtree admitted");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             root.as_scope()
                 .snapshot()
                 .child("nested")
                 .is_some_and(|child| matches!(child.state, ChildState::Running))
-        })
-        .await
-    );
+        }).await;
 
     // Prescribed acquisition order: subscribe first, snapshot second. Every
     // item already queued is reflected by the recursive watermark.
@@ -292,15 +291,12 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     drop(completion);
     let membership = task.membership();
     task.wait().await;
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             root.as_scope()
                 .snapshot()
                 .child("retained")
                 .is_some_and(|child| child.state.is_terminal())
-        })
-        .await
-    );
+        }).await;
 
     let mut saw_exit = false;
     let mut saw_restart = false;
@@ -363,15 +359,12 @@ async fn removed_is_the_pruning_edge_not_the_retained_terminal_edge() {
     drop(teardown_completion);
     let teardown_membership = teardown_task.membership();
     teardown_task.wait().await;
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             root.as_scope()
                 .snapshot()
                 .child("teardown-tombstone")
                 .is_some_and(|child| child.state.is_terminal())
-        })
-        .await
-    );
+        }).await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -584,14 +577,11 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
         }
     };
 
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             root.snapshot()
                 .child("nested")
                 .is_some_and(|child| matches!(child.state, ChildState::Restarting))
-        })
-        .await
-    );
+        }).await;
     let restart_window = root.snapshot();
     let child = restart_window
         .child("nested")
@@ -643,14 +633,11 @@ async fn subtree_restart_keeps_scope_stream_and_sequence_but_refreshes_descendan
     assert_eq!(nested.membership(), scope_membership);
     assert_eq!(nested.snapshot().total_restarts, TotalRestarts::ZERO);
     assert!(nested.snapshot().lifecycle_seq >= starting.seq);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             root.snapshot().child("nested").is_some_and(|child| {
                 matches!(child.state, ChildState::Running) && child.restart_at.is_none()
             })
-        })
-        .await
-    );
+        }).await;
 
     system
         .shutdown(Duration::from_secs(1))
@@ -1004,7 +991,7 @@ async fn hard_aborted_scope_pairs_added_with_exited_and_removed() {
             "a stopped scope never shows a live incarnation: {child:?}"
         );
     }
-    let exit = tokio::time::timeout(Duration::from_secs(1), stuck.wait())
+    let exit = tokio::time::timeout(POLL_TIMEOUT, stuck.wait())
         .await
         .expect("hard-aborted descendants terminalize");
     assert!(matches!(exit.kind(), shelterwood::ExitKind::Aborted { .. }));
@@ -1121,20 +1108,7 @@ async fn wait_for_child_with_a_far_future_deadline_stays_pending() {
     let mut tree = Tree::new();
     tree.add_task(
         "gated",
-        TaskDef::new({
-            let gate = gate.clone();
-            move |context| {
-                let gate = gate.clone();
-                async move {
-                    gate.wait().await;
-                    context.mark_ready();
-                    context.shutdown_token().cancelled().await;
-                    Ok(())
-                }
-            }
-        })
-        .readiness(shelterwood::Readiness::Manual)
-        .expect("manual readiness"),
+        gate_released_manual_ready_task(gate.clone(), || {}),
     )
     .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
@@ -1178,13 +1152,9 @@ async fn snapshot_subscriptions_conflate_unobserved_transitions_to_the_latest_va
         .await
         .expect("ephemeral task is admitted");
     task.wait().await;
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             scope.as_scope().child("ephemeral").is_none()
-        })
-        .await,
-        "terminal removal reaches the latest snapshot"
-    );
+        }, "terminal removal reaches the latest snapshot").await;
 
     let latest = snapshots
         .changed()

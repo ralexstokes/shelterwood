@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
+use crate::common::{
+    POLL_TIMEOUT, ReleaseGate, assert_quiet, waiting::task as waiting_task,
+};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DynamicTree, ExitError, ExitKind,
     ExitResult, Handler, Mailbox, RawActor, RawContext, RawOnceDef, Readiness, Retention, ScopeRef,
@@ -342,15 +344,12 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         )
         .await
         .expect("dynamic actor admitted");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             dynamic_events
                 .lock()
                 .expect("events mutex poisoned")
                 .contains(&"init")
-        })
-        .await
-    );
+        }).await;
     actor
         .send(BasicMessage::Stop)
         .await
@@ -477,12 +476,9 @@ async fn handler_error_joins_offloads_before_returning_to_a_raw_decorator() {
         .send(OffloadThenFailMessage::Start)
         .await
         .expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             log.lock().expect("teardown log mutex poisoned").len() == 2
-        })
-        .await
-    );
+        }).await;
     assert_eq!(
         *log.lock().expect("teardown log mutex poisoned"),
         ["offload-destroyed", "decorator-resumed"]
@@ -493,23 +489,6 @@ async fn handler_error_joins_offloads_before_returning_to_a_raw_decorator() {
         .expect("tree shuts down");
 }
 
-struct InertActor;
-
-impl Actor for InertActor {
-    type Msg = ();
-    type Args = ReleaseGate;
-
-    async fn init(entered: ReleaseGate, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
-        entered.release();
-        Ok(Self)
-    }
-
-    async fn handle(&mut self, (): Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
-        context.mark_ready();
-        Ok(())
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn manual_readiness_override_on_a_wrapped_handler_stays_gated() {
     let init_entered = ReleaseGate::default();
@@ -517,7 +496,7 @@ async fn manual_readiness_override_on_a_wrapped_handler_stays_gated() {
     let actor = tree
         .add_raw_once(
             "gated",
-            RawOnceDef::new(Handler::<InertActor>::new(init_entered.clone()))
+            RawOnceDef::new(Handler::<ManualActor>::new(init_entered.clone()))
                 .readiness(Readiness::Manual)
                 .expect("manual readiness override"),
         )
@@ -686,10 +665,7 @@ async fn handler_context_scope_shutdown_request_stops_the_tree() {
         .expect("valid actor");
     tree.add_task(
         "parked",
-        TaskDef::new(|context| async move {
-            context.shutdown_token().cancelled().await;
-            Ok(())
-        }),
+        waiting_task(),
     )
     .expect("valid parked task");
     let system = tree.spawn().expect("runtime is available");
@@ -732,10 +708,7 @@ async fn stop_context_scope_shutdown_request_escalates_a_local_stop() {
         .expect("valid actor");
     tree.add_task(
         "parked",
-        TaskDef::new(|context| async move {
-            context.shutdown_token().cancelled().await;
-            Ok(())
-        }),
+        waiting_task(),
     )
     .expect("valid parked task");
     let system = tree.spawn().expect("runtime is available");

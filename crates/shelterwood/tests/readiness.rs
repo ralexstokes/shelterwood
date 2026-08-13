@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, policy::never, poll_until,
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet, policy::never,
+    waiting::{gate_released_manual_ready_task, task as waiting_task},
 };
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DynamicTree, ExitError,
@@ -80,15 +81,12 @@ async fn readiness_fired_before_failure_makes_the_failure_post_ready() {
     .expect("valid task");
 
     let system = tree.spawn().expect("runtime is available");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             system
                 .scope()
                 .child("ready-then-fail")
                 .is_some_and(|child| matches!(child.state, ChildState::Restarting))
-        })
-        .await
-    );
+        }).await;
     assert_eq!(
         system.scope().snapshot().state,
         ScopeState::Running,
@@ -207,26 +205,20 @@ async fn immediate_restart_deadline_rechecks_aggregate_startup() {
     .expect("valid manual sibling");
 
     let system = tree.spawn().expect("runtime is available");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             system
                 .scope()
                 .child("restarting-immediate")
                 .is_some_and(|child| matches!(child.state, ChildState::Restarting))
-        })
-        .await
-    );
+        }).await;
     release_manual.release();
     manual_ready.wait().await;
     assert_eq!(system.scope().snapshot().state, ScopeState::Starting);
 
     advance_time(backoff).await;
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             incarnations.load(Ordering::SeqCst) == 2
-        })
-        .await
-    );
+        }).await;
     system
         .wait_started()
         .await
@@ -244,23 +236,10 @@ async fn ordered_startup_waits_for_manual_readiness() {
     let mut tree = Tree::new();
     tree.add_task(
         "gated",
-        TaskDef::new({
+        gate_released_manual_ready_task(release_ready.clone(), {
             let order = Arc::clone(&order);
-            let release_ready = release_ready.clone();
-            move |context| {
-                let order = Arc::clone(&order);
-                let release_ready = release_ready.clone();
-                async move {
-                    order.lock().expect("order mutex poisoned").push("gated");
-                    release_ready.wait().await;
-                    context.mark_ready();
-                    context.shutdown_token().cancelled().await;
-                    Ok(())
-                }
-            }
+            move || order.lock().expect("order mutex poisoned").push("gated")
         })
-        .readiness(Readiness::Manual)
-        .expect("manual readiness")
         .readiness_deadline(ReadinessDeadline::Unbounded),
     )
     .expect("valid task");
@@ -281,12 +260,9 @@ async fn ordered_startup_waits_for_manual_readiness() {
     .expect("valid task");
 
     let system = tree.spawn().expect("runtime is available");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             order.lock().expect("order mutex poisoned").as_slice() == ["gated"]
-        })
-        .await
-    );
+        }).await;
     assert_quiet(Duration::from_millis(20), || {
         order.lock().expect("order mutex poisoned").len() > 1
     })
@@ -422,12 +398,9 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
         )
         .expect("valid task");
     let ready_system = ready_tree.spawn().expect("runtime is available");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             ready_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+        }).await;
     advance_time(width).await;
     ready_marked.wait().await;
     ready_system
@@ -447,10 +420,7 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
     let shutdown_task = shutdown_tree
         .add_task(
             "edge",
-            TaskDef::new(|context| async move {
-                context.shutdown_token().cancelled().await;
-                Ok(())
-            })
+            waiting_task()
             .readiness(Readiness::Manual)
             .expect("manual readiness")
             .readiness_deadline(ReadinessDeadline::bounded(width).expect("non-zero deadline")),
@@ -505,40 +475,21 @@ async fn restart_before_aggregate_readiness_rearms_the_gate() {
     .expect("valid task");
     tree.add_task(
         "later",
-        TaskDef::new({
+        gate_released_manual_ready_task(release_second.clone(), {
             let later_started = Arc::clone(&later_started);
-            let release_second = release_second.clone();
-            move |context| {
-                let later_started = Arc::clone(&later_started);
-                let release_second = release_second.clone();
-                async move {
-                    later_started.store(true, Ordering::SeqCst);
-                    release_second.wait().await;
-                    context.mark_ready();
-                    context.shutdown_token().cancelled().await;
-                    Ok(())
-                }
-            }
+            move || later_started.store(true, Ordering::SeqCst)
         })
-        .readiness(Readiness::Manual)
-        .expect("manual readiness")
         .readiness_deadline(ReadinessDeadline::Unbounded),
     )
     .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             later_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+        }).await;
     fail_first.release();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             incarnation.load(Ordering::SeqCst) == 2
-        })
-        .await
-    );
+        }).await;
     release_second.release();
     assert!(
         tokio::time::timeout(Duration::from_millis(20), system.wait_started())
@@ -671,13 +622,10 @@ async fn dynamic_startup_failure_keeps_other_initial_members_supervised() {
 /// A `Manual` member that never marks ready, so it gates its scope's
 /// aggregate until it is removed.
 fn unbounded_manual_gate() -> TaskDef {
-    TaskDef::new(|context| async move {
-        context.shutdown_token().cancelled().await;
-        Ok(())
-    })
-    .readiness(Readiness::Manual)
-    .expect("manual readiness")
-    .readiness_deadline(ReadinessDeadline::Unbounded)
+    waiting_task()
+        .readiness(Readiness::Manual)
+        .expect("manual readiness")
+        .readiness_deadline(ReadinessDeadline::Unbounded)
 }
 
 /// A `Manual` member that marks ready immediately and then parks.
@@ -699,12 +647,9 @@ async fn dynamic_startup_completes_after_removing_sole_unready_initial_member() 
         .expect("valid initial member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             scope.as_scope().child("gate").is_some()
-        })
-        .await
-    );
+        }).await;
 
     assert_eq!(
         scope.remove("gate").await,
@@ -729,16 +674,13 @@ async fn dynamic_startup_completes_after_removing_last_unready_initial_member() 
         .expect("valid unready member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             scope
                 .as_scope()
                 .child("ready")
                 .is_some_and(|child| matches!(child.state, ChildState::Running))
                 && scope.as_scope().child("gate").is_some()
-        })
-        .await
-    );
+        }).await;
 
     assert_eq!(
         scope.remove("gate").await,
@@ -765,12 +707,9 @@ async fn dynamic_startup_completes_after_removing_every_initial_member() {
         .expect("valid unready member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             scope.as_scope().child("first").is_some() && scope.as_scope().child("second").is_some()
-        })
-        .await
-    );
+        }).await;
 
     let (first, second) = tokio::join!(scope.remove("first"), scope.remove("second"));
     assert_eq!(first, shelterwood::RemoveOutcome::Removed);
@@ -803,12 +742,9 @@ async fn removal_completed_nested_startup_releases_the_ordered_sibling() {
 
     let system = root.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             nested_scope.as_scope().child("gate").is_some()
-        })
-        .await
-    );
+        }).await;
     assert_quiet(Duration::from_secs(5), || {
         scope
             .child("after")
@@ -848,16 +784,13 @@ async fn removing_a_ready_initial_member_leaves_startup_pending() {
         .expect("valid unready member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             scope
                 .as_scope()
                 .child("ready")
                 .is_some_and(|child| matches!(child.state, ChildState::Running))
                 && scope.as_scope().child("gate").is_some()
-        })
-        .await
-    );
+        }).await;
 
     assert_eq!(
         scope.remove("ready").await,
@@ -881,34 +814,18 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
     let mut tree = DynamicTree::new();
     tree.add_task(
         "initial",
-        TaskDef::new({
-            let initial_release = initial_release.clone();
+        gate_released_manual_ready_task(initial_release.clone(), {
             let initial_started = Arc::clone(&initial_started);
-            move |context| {
-                let initial_release = initial_release.clone();
-                let initial_started = Arc::clone(&initial_started);
-                async move {
-                    initial_started.store(true, Ordering::SeqCst);
-                    initial_release.wait().await;
-                    context.mark_ready();
-                    context.shutdown_token().cancelled().await;
-                    Ok(())
-                }
-            }
+            move || initial_started.store(true, Ordering::SeqCst)
         })
-        .readiness(Readiness::Manual)
-        .expect("manual readiness")
         .readiness_deadline(ReadinessDeadline::Unbounded),
     )
     .expect("valid initial member");
     let system = tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             initial_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+        }).await;
     let runtime_task = scope
         .add_task(
             "runtime",
@@ -929,12 +846,9 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
         )
         .await
         .expect("runtime member is admitted");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             runtime_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+        }).await;
     initial_release.release();
     // The regression this test targets — a runtime addition joining the
     // aggregate — would park `wait_started` forever behind the unbounded
@@ -1458,8 +1372,7 @@ async fn immediate_raw_construction_panic_classifies_post_ready() {
         .await
         .expect("spawn-time readiness classifies the construction panic post-ready");
     assert!(sibling_started.load(Ordering::SeqCst));
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             system
                 .scope()
                 .child("constructs-never")
@@ -1467,10 +1380,7 @@ async fn immediate_raw_construction_panic_classifies_post_ready() {
                     &child.state,
                     ChildState::Stopped { exit } if matches!(exit.kind(), ExitKind::Panicked { .. })
                 ))
-        })
-        .await,
-        "the terminal panic is an ordinary post-ready stop, not a startup abort"
-    );
+        }, "the terminal panic is an ordinary post-ready stop, not a startup abort").await;
     system
         .shutdown(Duration::from_secs(1))
         .await

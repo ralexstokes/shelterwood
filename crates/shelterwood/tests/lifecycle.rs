@@ -10,7 +10,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_quiet, policy::never, poll_once, poll_until,
+    POLL_TIMEOUT, ReleaseGate, assert_quiet, policy::never, poll_once,
+    waiting::task as waiting_task,
 };
 use shelterwood::{
     Actor, ActorOnceDef, Cancellation, Context, DynamicTree, ExitError, ExitKind, ExitResult,
@@ -74,14 +75,11 @@ async fn fire_and_forget_owner_drop_still_tears_down() {
     let task = tree
         .add_task(
             "worker",
-            TaskDef::new(|context| async move {
-                context.shutdown_token().cancelled().await;
-                Ok(())
-            }),
+            waiting_task(),
         )
         .expect("valid task");
     drop(tree.spawn().expect("runtime is available"));
-    let exit = tokio::time::timeout(Duration::from_secs(1), task.wait())
+    let exit = tokio::time::timeout(POLL_TIMEOUT, task.wait())
         .await
         .expect("owner drop completes teardown");
     assert!(matches!(exit.kind(), ExitKind::Completed));
@@ -287,12 +285,9 @@ async fn replacement_starts_only_after_the_old_future_is_destroyed() {
         .wait_started()
         .await
         .expect("initial incarnation starts");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             starts.load(Ordering::SeqCst) >= 2
-        })
-        .await
-    );
+        }).await;
     assert_eq!(
         *order.lock().expect("order mutex poisoned"),
         ["start-1", "drop-1", "start-2"]
@@ -333,30 +328,21 @@ async fn ordered_teardown_is_reverse_and_joins_before_advancing() {
     system.wait_started().await.expect("tree starts");
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
 
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             order.lock().expect("order mutex poisoned").as_slice() == [2]
-        })
-        .await
-    );
+        }).await;
     assert_quiet(Duration::from_millis(15), || {
         order.lock().expect("order mutex poisoned").len() > 1
     })
     .await;
     gates[2].release();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             order.lock().expect("order mutex poisoned").as_slice() == [2, 1]
-        })
-        .await
-    );
+        }).await;
     gates[1].release();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             order.lock().expect("order mutex poisoned").as_slice() == [2, 1, 0]
-        })
-        .await
-    );
+        }).await;
     gates[0].release();
     shutdown
         .await
@@ -567,12 +553,9 @@ async fn dynamic_teardown_cancels_children_concurrently() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    crate::common::assert_eventually!(|| {
             cancelled.iter().all(|flag| flag.load(Ordering::SeqCst))
-        })
-        .await
-    );
+        }).await;
     gate.release();
     gate.release();
     shutdown

@@ -192,39 +192,23 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
             }
         })));
     let fused_cancel = Latch::default();
-    let mut response = super::super::start_admission(
-        Arc::clone(&reservation.control),
-        Arc::clone(&reservation.slot),
+    let (mut response, request) = begin_admission(
+        &reservation,
+        &mut event_receiver,
         Some(fused_cancel.clone()),
     )
-    .expect("the running scope accepts the admission");
-    let Some(DriverEvent::Admission(request)) = event_receiver.recv().await else {
-        panic!("admission enqueueing submits the request")
-    };
+    .await;
     scope.handle_admission(request);
     assert!(matches!(response.try_receive(), Some(Ok(()))));
 
-    let exit = match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, event_receiver.recv()).await {
-        crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
-            child,
-            incarnation,
-            recorded,
-            join,
-            cancellation,
-            readiness_signal_seen,
-        }))) => (
-            child,
-            incarnation,
-            recorded,
-            join,
-            cancellation,
-            readiness_signal_seen,
-        ),
-        crate::runtime::Timeout::Completed(_) => panic!("the first incarnation reports exit"),
-        crate::runtime::Timeout::Elapsed => panic!("the first incarnation exit must arrive"),
-    };
-    let key = exit.0;
-    scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);
+    let exit = recv_child_exit(
+        &mut event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the first incarnation exit",
+    )
+    .await;
+    let key = exit.child;
+    exit.dispatch(&mut scope);
     assert!(
         scope.children[key].restart_deadline.is_some(),
         "a live fused admission does not suppress the restart at exit dispatch"

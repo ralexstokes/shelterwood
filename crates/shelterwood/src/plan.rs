@@ -40,9 +40,6 @@ pub(crate) fn mint_reserved_slot(
     child_scope: Option<ScopeFlavor>,
 ) -> Result<Arc<SlotCell>, ReserveError> {
     let membership = parent
-        .child_identity
-        .lock()
-        .expect("scope identity mutex poisoned")
         .mint_membership(id)
         .ok_or(ReserveError::IdentityExhausted)?;
     let member = MemberCell::new(id.clone(), membership);
@@ -111,15 +108,28 @@ impl SlotCell {
     }
 
     pub(crate) fn define(&self, definition: ChildConstruction) {
-        let mut state = self.definition.lock().expect("definition mutex poisoned");
-        match *state {
-            DefinitionState::Undefined => {
-                *state = DefinitionState::Defined(Isolated::new(definition));
+        // A rejected definition owns user construction closures, and the
+        // panic below is a caller-contract violation rather than a broken
+        // slot. Release the lock before either destroys anything, so a hostile
+        // closure destructor cannot poison the definition mutex for every
+        // later lowering step. `Isolated` keeps the destruction itself off
+        // this thread.
+        let rejected = {
+            let mut state = self.definition.lock().expect("definition mutex poisoned");
+            match *state {
+                DefinitionState::Undefined => {
+                    *state = DefinitionState::Defined(Isolated::new(definition));
+                    None
+                }
+                DefinitionState::Defined(_) | DefinitionState::Lowered => {
+                    Some(Isolated::new(definition))
+                }
             }
-            DefinitionState::Defined(_) | DefinitionState::Lowered => {
-                panic!("a child slot was defined more than once")
-            }
-        }
+        };
+        assert!(
+            rejected.is_none(),
+            "a child slot was defined more than once"
+        );
     }
 
     pub(crate) fn is_undefined(&self) -> bool {
@@ -166,13 +176,14 @@ impl SlotCell {
         owner: &ScopeCell,
         txn: &mut ObservationTxn<'_>,
     ) {
-        self.member.terminalize_locked(
-            Exit::never_started(),
-            crate::cells::StartupDisposition::Unchanged,
-            txn,
-        );
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started_locked(txn);
+        } else {
+            self.member.terminalize_locked(
+                Exit::never_started(),
+                crate::cells::StartupDisposition::Unchanged,
+                txn,
+            );
         }
         owner.evict_child_identity(&self.member);
     }
@@ -360,16 +371,11 @@ impl BuilderCore {
             // evict the terminalized slots from the override's identity map,
             // not this builder's throwaway root.
             self.adopting_root = Some(Arc::clone(&root));
-            let mut identity = root
-                .child_identity
-                .lock()
-                .expect("scope identity mutex poisoned");
             for slot in &self.slots {
                 let Some(rebased) =
-                    identity.adopt_or_mint_membership(slot.member.id(), slot.member.membership())
+                    root.adopt_or_mint_membership(slot.member.id(), slot.member.membership())
                 else {
                     let id = slot.member.id().clone();
-                    drop(identity);
                     let disposal = self.begin_failed_disposal();
                     return Err(LowerError::IdentityExhausted { id, disposal });
                 };

@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::common::{
-    ConsumeCount, ConsumeGuard, POLL_TIMEOUT, ReleaseGate, policy::never, poll_once, poll_until,
+    ConsumeCount, ConsumeGuard, ReleaseGate, assert_eventually, policy::never, poll_once,
 };
 use shelterwood::{
     Actor, ActorOnceDef, Context, DynamicTree, ExitError, ExitResult, RawActor, RawContext,
@@ -545,10 +545,11 @@ async fn cancelling_inflight_one_shot_adds_drops_every_kind_resource_once() {
         ("raw actor", &raw_count, &raw_started),
         ("subtree", &subtree_count, &subtree_started),
     ] {
-        assert!(
-            poll_until(POLL_TIMEOUT, Duration::from_millis(1), || count.get() == 1).await,
+        assert_eventually!(
+            || count.get() == 1,
             "cancelled {kind} admission disposes its resource"
-        );
+        )
+        .await;
         count.assert_once();
         assert!(
             !started.load(Ordering::SeqCst),

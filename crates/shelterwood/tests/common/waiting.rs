@@ -3,7 +3,37 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use shelterwood::{TaskDef, Tree};
+use shelterwood::{CancellationToken, Readiness, TaskDef, Tree};
+
+pub(crate) async fn liveness_probe(
+    shutdown: CancellationToken,
+    gate: super::ReleaseGate,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => false,
+        () = gate.wait() => true,
+    }
+}
+
+pub(crate) fn gate_released_manual_ready_task(
+    gate: super::ReleaseGate,
+    on_start: impl Fn() + Clone + Send + Sync + 'static,
+) -> TaskDef {
+    TaskDef::new(move |context| {
+        let gate = gate.clone();
+        let on_start = on_start.clone();
+        async move {
+            on_start();
+            gate.wait().await;
+            context.mark_ready();
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        }
+    })
+    .readiness(Readiness::Manual)
+    .expect("manual readiness is supported for tasks")
+}
 
 pub(crate) fn task() -> TaskDef {
     TaskDef::new(|context| async move {
@@ -48,17 +78,11 @@ pub(crate) fn liveness_probed_waiting_task(
         let liveness_seen = Arc::clone(&liveness_seen);
         async move {
             started.store(true, Ordering::SeqCst);
-            let shutdown = context.shutdown_token();
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => {
-                    cancelled.store(true, Ordering::SeqCst);
-                    return Ok(());
-                }
-                () = liveness_gate.wait() => {
-                    liveness_seen.store(true, Ordering::SeqCst);
-                }
+            if !liveness_probe(context.shutdown_token(), liveness_gate).await {
+                cancelled.store(true, Ordering::SeqCst);
+                return Ok(());
             }
+            liveness_seen.store(true, Ordering::SeqCst);
             context.shutdown_token().cancelled().await;
             cancelled.store(true, Ordering::SeqCst);
             Ok(())

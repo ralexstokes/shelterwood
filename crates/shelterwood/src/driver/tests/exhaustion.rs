@@ -329,25 +329,12 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
     assert!(scope.supervisor.is_initial(key));
     scope.spawn_child(key);
     assert!(!scope.supervisor.initial_ready(key));
-    let exit = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
-        crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
-            child,
-            incarnation,
-            recorded,
-            join,
-            cancellation,
-            readiness_signal_seen,
-        }))) => (
-            child,
-            incarnation,
-            recorded,
-            join,
-            cancellation,
-            readiness_signal_seen,
-        ),
-        crate::runtime::Timeout::Completed(_) => panic!("the pre-ready failure reports exit"),
-        crate::runtime::Timeout::Elapsed => panic!("the pre-ready failure exit must arrive"),
-    };
+    let exit = recv_child_exit(
+        &mut event_receiver,
+        Duration::from_secs(2),
+        "the pre-ready failure exit",
+    )
+    .await;
 
     // The stop request latches after this batch was collected: it is
     // visible to `has_stop_request`, but its `Pending::Shutdown` follow-up
@@ -355,7 +342,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
     assert!(root.request_shutdown().is_some());
     assert!(root.has_stop_request(scope.epoch));
 
-    scope.handle_exit(exit.0, exit.1, exit.2, exit.3, exit.4, exit.5);
+    exit.dispatch(&mut scope);
     assert!(
         scope.children[key].restart_deadline.is_some(),
         "a latched scope stop does not reclassify exit dispatch"

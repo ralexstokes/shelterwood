@@ -100,6 +100,6 @@ fn owned_report_token_records_readiness_at_completion() {
     let (token, claim) = report_slot(Latch::default(), None, readiness.clone());
     readiness.fire();
     token.record(RecordedOutcome::returned(Ok(())));
-    assert!(!readiness.fire(), "completion closes retained capabilities");
+    assert!(readiness.is_completed());
     assert!(claim.receive().readiness_signal_seen);
 }

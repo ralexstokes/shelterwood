@@ -778,6 +778,8 @@ mod tests {
 
     use super::*;
 
+    mod exploration;
+
     fn memberships(count: usize) -> Vec<Membership> {
         let mut identity = ScopeIdentity::new();
         (0..count)

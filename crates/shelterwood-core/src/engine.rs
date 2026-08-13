@@ -796,6 +796,32 @@ impl ScopeLifecycle {
         }
     }
 
+    /// A hashable projection of the whole lifecycle, for the reducer's
+    /// reachable-state walk.
+    ///
+    /// Exhaustive on purpose: a new lifecycle state or drain field has to
+    /// choose its projection here or fail to compile, because the walk treats
+    /// equal fingerprints as the same state and would otherwise stop exploring
+    /// successors it has never seen. Drain reasons project through their
+    /// precedence, which is injective over the walk's alphabet of unit reasons
+    /// and is also the only part of a reason the reducer branches on.
+    #[cfg(test)]
+    pub(crate) fn fingerprint(&self) -> (u8, u8) {
+        match &self.state {
+            ScopeLifecycleState::Starting => (0, 0),
+            ScopeLifecycleState::Running => (1, 0),
+            ScopeLifecycleState::StartupFailed => (2, 0),
+            ScopeLifecycleState::Draining(ScopeDrain { reason, startup }) => (
+                3 + match startup {
+                    StartupPhase::Pending => 0,
+                    StartupPhase::Complete => 1,
+                    StartupPhase::Failed => 2,
+                },
+                stop_reason_precedence(reason) as u8,
+            ),
+        }
+    }
+
     pub fn is_starting(&self) -> bool {
         matches!(self.state, ScopeLifecycleState::Starting)
     }

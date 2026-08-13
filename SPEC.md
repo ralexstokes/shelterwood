@@ -1095,14 +1095,18 @@ handlers non-blocking. Contracts:
   closure's return value; a panic in the closure is captured and resumes
   where the future is awaited — on the actor task, the ordinary
   actor-panic path (§7) — while a future dropped before completion
-  discards a later panic along with the detached thread (documented). A
+  discards a later panic along with the detached thread (documented); a
+  return value or panic payload that already arrived is discarded through
+  detached disposal rather than in the awaiting task's drop glue. A
   submission synchronously rejected by Tokio during blocking-pool shutdown
   moves to a detached Shelterwood-owned thread; the operation and destruction
   of its captured state stay off the submitting runtime thread while an
-  isolation worker can be created. If the dedicated fallback thread cannot
-  start, the captured state transfers to detached disposal and awaiting the
-  future panics with a runtime-teardown cancellation diagnostic rather than an
-  internal task-invariant claim. If the system cannot create the disposal
+  isolation worker can be created. An operation that never runs at all —
+  Tokio discarded an already-accepted submission during runtime teardown, or
+  the dedicated fallback thread could not start — transfers its captured
+  state to detached disposal, and awaiting the future panics with a
+  runtime-teardown cancellation diagnostic rather than an internal
+  task-invariant claim. If the system cannot create the disposal
   worker either, disposal's final no-loss fallback destroys the state
   synchronously; thread exhaustion is the sole exception to the isolation
   guarantee.

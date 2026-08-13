@@ -135,21 +135,8 @@ pub fn spawn_blocking_work<T: Send + 'static>(
 ) -> impl Future<Output = T> + Send {
     let (completion, receiver) = oneshot();
     let job = BlockingJob::new(operation, completion);
-    let worker = Arc::clone(&job);
 
-    let mut needs_fallback = true;
-    match catch_panic(|| task::spawn_blocking(move || worker.run())) {
-        Ok(handle) => {
-            drop(handle);
-            // Tokio returns a handle even when the blocking pool is already
-            // shutting down. In that case it synchronously destroys the
-            // closure, leaving `job` as the only reference with pending work.
-            needs_fallback = blocking_spawn_needs_fallback(&job);
-        }
-        Err(payload) => discard_panic(Some(payload)),
-    }
-
-    if needs_fallback {
+    if !submit_blocking_job(&job) {
         // A blocking operation cannot share disposal's single fallback queue:
         // one legitimately long operation would strand every later job. This
         // path exists only for runtime teardown, so one detached thread per
@@ -165,12 +152,23 @@ pub fn spawn_blocking_work<T: Send + 'static>(
     receive_blocking(receiver)
 }
 
-async fn receive_blocking<T: Send + 'static>(receiver: OneShotReceiver<BlockingOutcome<T>>) -> T {
-    let mut receiver = DisposingReceiver::new(receiver);
-    match poll_fn(|context| receiver.poll_receive(context)).await {
-        Some(Ok(value)) => value,
-        Some(Err(payload)) => resume_unwind(payload),
-        None => panic!("blocking operation was cancelled during runtime teardown"),
+/// Awaits one blocking outcome, disposing it if the awaiting future is dropped.
+///
+/// The disposing wrapper is taken here rather than inside the returned future
+/// because a future dropped before its first poll never runs its own body: the
+/// operation can still have stored a user value by then, and reclaiming it
+/// would run that user destructor in the awaiting task's drop glue.
+fn receive_blocking<T: Send + 'static>(
+    receiver: OneShotReceiver<BlockingOutcome<T>>,
+) -> impl Future<Output = T> + Send {
+    let receiver = DisposingReceiver::new(receiver);
+    async move {
+        let mut receiver = receiver;
+        match poll_fn(|context| receiver.poll_receive(context)).await {
+            Some(Ok(value)) => value,
+            Some(Err(payload)) => resume_unwind(payload),
+            None => panic!("blocking operation was cancelled during runtime teardown"),
+        }
     }
 }
 
@@ -224,7 +222,13 @@ where
             pending: Mutex::new(Some((operation, completion))),
         })
     }
+}
 
+impl<F, T> BlockingPoolJob for BlockingJob<F, T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
     fn run(&self) {
         let Some((operation, completion)) = self
             .pending
@@ -282,17 +286,54 @@ where
     }
 }
 
-/// Returns whether Tokio synchronously rejected a blocking work submission.
+/// Work held behind a shared owner so its submitter can tell whether Tokio
+/// took it.
+pub(crate) trait BlockingPoolJob: Send + Sync + 'static {
+    /// Runs the pending work, if this job still holds any.
+    fn run(&self);
+
+    /// Reports whether the work is still waiting to be run.
+    fn is_pending(&self) -> bool;
+}
+
+/// Submits `job` to Tokio's blocking pool, reporting whether Tokio took it.
 ///
-/// Sole ownership proves that Tokio no longer holds the submitted closure;
-/// the pending check distinguishes rejection from a fast task that completed
-/// before the submitter sampled the reference count.
-fn blocking_spawn_needs_fallback<F, T>(job: &Arc<BlockingJob<F, T>>) -> bool
-where
-    F: FnOnce() -> T + Send + 'static,
-    T: Send + 'static,
-{
-    Arc::strong_count(job) == 1 && job.is_pending()
+/// On `false` the caller is the sole owner of still-pending work and must
+/// place it elsewhere.
+pub(crate) fn submit_blocking_job<J: BlockingPoolJob>(job: &Arc<J>) -> bool {
+    if !is_available() {
+        return false;
+    }
+    let worker = Arc::clone(job);
+    match catch_panic(|| task::spawn_blocking(move || worker.run())) {
+        Ok(handle) => {
+            drop(handle);
+            blocking_pool_accepted(job)
+        }
+        Err(payload) => {
+            discard_panic(Some(payload));
+            false
+        }
+    }
+}
+
+/// Returns whether Tokio took ownership of a submitted blocking job.
+///
+/// Tokio returns a join handle even when the blocking pool is already shutting
+/// down, having synchronously destroyed the submitted closure. Ownership, not
+/// the handle, is therefore the acceptance signal: sole ownership proves Tokio
+/// no longer holds the closure, and the pending check distinguishes that
+/// rejection from a job that ran to completion before the submitter sampled
+/// the reference count — rerouting the latter would place already-empty jobs
+/// behind live ones.
+///
+/// This pins Tokio's `spawn_task` shutdown path: a rejected closure is
+/// destroyed synchronously, before `spawn_blocking` returns. A future Tokio
+/// that deferred that drop would leave the count at two and degrade fail-safe
+/// to the old inline behavior rather than misroute a live closure. The
+/// end-to-end regressions in this crate pin the behavior we rely on.
+pub(crate) fn blocking_pool_accepted<J: BlockingPoolJob>(job: &Arc<J>) -> bool {
+    Arc::strong_count(job) > 1 || !job.is_pending()
 }
 
 /// A spawned operation owned by the library.
@@ -516,6 +557,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use super::BlockingPoolJob;
+
     const WAIT: Duration = Duration::from_secs(5);
 
     type ThreadDescription = (ThreadId, Option<String>);
@@ -647,7 +690,7 @@ mod tests {
         let accepted = super::BlockingJob::new(|| 1_u8, accepted_completion);
         let accepted_worker = Arc::clone(&accepted);
         assert!(
-            !super::blocking_spawn_needs_fallback(&accepted),
+            super::blocking_pool_accepted(&accepted),
             "an accepted closure still owned by Tokio must stay on its blocking pool"
         );
         drop(accepted_worker);
@@ -657,7 +700,7 @@ mod tests {
         let rejected_worker = Arc::clone(&rejected);
         drop(rejected_worker);
         assert!(
-            super::blocking_spawn_needs_fallback(&rejected),
+            !super::blocking_pool_accepted(&rejected),
             "a synchronously dropped closure must move to the fallback thread"
         );
 
@@ -667,7 +710,7 @@ mod tests {
         completed_worker.run();
         drop(completed_worker);
         assert!(
-            !super::blocking_spawn_needs_fallback(&completed),
+            super::blocking_pool_accepted(&completed),
             "a fast completed closure must not enqueue an empty job"
         );
     }
@@ -723,6 +766,32 @@ mod tests {
         payload_dropped_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("the unclaimed panic payload is destroyed");
+    }
+
+    #[test]
+    fn dropping_an_unpolled_future_isolates_a_stored_outcome() {
+        let waiter_thread = thread::current().id();
+        let (result_dropped, result_dropped_rx) = mpsc::channel();
+        let (completion, receiver) = super::oneshot();
+        let job = super::BlockingJob::new(move || RecordingDrop(result_dropped), completion);
+        let worker = Arc::clone(&job);
+        drop(job);
+
+        // The awaiting future is built but never polled, so only its own
+        // construction can decide who destroys an outcome that lands first.
+        let future = super::receive_blocking(receiver);
+        worker.run();
+        drop(future);
+
+        let (destructor_thread, destructor_name) = result_dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the unclaimed result is destroyed");
+        assert_ne!(destructor_thread, waiter_thread);
+        assert_eq!(
+            destructor_name.as_deref(),
+            Some("shelterwood-disposal"),
+            "an unclaimed result must not be destroyed on the awaiting task's thread"
+        );
     }
 
     #[test]

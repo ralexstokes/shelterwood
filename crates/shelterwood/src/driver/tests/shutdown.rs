@@ -1,5 +1,47 @@
 use super::support::*;
 
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_teardown_finishes_the_cancelled_root_driver() {
+    let plan = DynamicTree::new().lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let (hosted, driver) = DedicatedRuntime::spawn(run_scope(plan, ScopeRole::Root));
+    let monitor = monitor_root_driver(Arc::clone(&root), driver);
+    root.wait_started().await.expect("root starts");
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let stopped_waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+    let mut stopped = Box::pin(root.wait_stopped());
+    assert!(
+        stopped
+            .as_mut()
+            .poll(&mut Context::from_waker(&stopped_waker))
+            .is_pending(),
+        "the live root observer parks before runtime teardown"
+    );
+
+    hosted.shutdown().await;
+
+    assert!(matches!(
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(monitor)).await,
+        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok {
+            value: StopReason::ShutdownRequested,
+        })
+    ));
+    assert!(
+        wakes.load(Ordering::SeqCst) > 0,
+        "the join monitor wakes an observer parked before cancellation"
+    );
+    assert!(matches!(
+        stopped
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(StopReason::ShutdownRequested)
+    ));
+    assert!(matches!(
+        root.member.record().stage,
+        MemberStage::Terminal(ref exit) if exit.cancellation() == Cancellation::Observed
+    ));
+}
+
 #[crate::runtime::test]
 async fn latched_shutdown_upgrades_an_intensity_drain() {
     let mut tree = Tree::new();

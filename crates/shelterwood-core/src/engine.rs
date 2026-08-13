@@ -1521,6 +1521,17 @@ mod tests {
             Some(ReadinessEffect::BecameReady)
         );
 
+        let mut unsignaled_exit = ReadinessGate::new();
+        unsignaled_exit.step(ReadinessEvent::Configure {
+            readiness: crate::Readiness::Manual,
+            deadline: None,
+        });
+        assert_eq!(
+            unsignaled_exit.step(ReadinessEvent::Exit { signal_seen: false }),
+            Some(ReadinessEffect::Disarmed)
+        );
+        assert!(!unsignaled_exit.needs_signal_watch());
+
         let mut timed_out = ReadinessGate::new();
         assert_eq!(
             timed_out.step(ReadinessEvent::Configure {

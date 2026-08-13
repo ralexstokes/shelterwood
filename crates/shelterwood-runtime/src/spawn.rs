@@ -19,6 +19,70 @@ pub fn is_available() -> bool {
     tokio::runtime::Handle::try_current().is_ok()
 }
 
+/// One task hosted on a runtime the test can destroy underneath it.
+///
+/// Runtime teardown is the only way to produce a genuinely cancelled spawned
+/// task, and it cannot be staged from inside the runtime being torn down:
+/// dropping a runtime blocks until its workers stop, and a test awaiting the
+/// consequences of that teardown is itself a task on some runtime. So the task
+/// under test gets its own runtime on its own thread, while the assertions stay
+/// on the caller's runtime, and the cancellation edge between them is real.
+///
+/// The teardown signal is the request channel closing, which covers explicit
+/// [`shutdown`](Self::shutdown) and dropping this handle alike — a test that
+/// panics before tearing down still releases the thread.
+#[cfg(any(test, feature = "test-util"))]
+pub struct DedicatedRuntime {
+    teardown: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl DedicatedRuntime {
+    /// Two workers: one for the hosted task, one so a task it spawns or wakes
+    /// still makes progress while the first is parked.
+    const WORKER_THREADS: usize = 2;
+
+    /// Spawns `task` onto a fresh dedicated runtime.
+    pub fn spawn<F>(task: F) -> (Self, JoinHandle<F::Output>)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(Self::WORKER_THREADS)
+            .enable_all()
+            .build()
+            .expect("a dedicated runtime builds");
+        let handle = JoinHandle {
+            inner: runtime.spawn(task),
+        };
+        let (teardown, request) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            // Both teardown edges arrive as this receive returning: a request
+            // to shut down, or the disconnect from a dropped handle.
+            let _ = request.recv();
+            drop(runtime);
+        });
+        (Self { teardown, thread }, handle)
+    }
+
+    /// Destroys the runtime, cancelling the hosted task, and waits for the
+    /// teardown to finish.
+    ///
+    /// The wait is offloaded because a dropping runtime blocks its thread until
+    /// every worker has stopped; awaiting that here keeps the caller's own
+    /// worker free.
+    pub async fn shutdown(self) {
+        let Self { teardown, thread } = self;
+        drop(teardown);
+        join_resuming(spawn_blocking(move || {
+            thread.join().expect("dedicated runtime teardown completes")
+        }))
+        .await;
+    }
+}
+
 pub struct ActorWork {
     handle: Option<JoinHandle<()>>,
     abort: AbortHandle,

@@ -1042,6 +1042,7 @@ mod tests {
         assert_eq!(JitterSample::new(f64::NAN).0, 0.0);
         assert_eq!(JitterSample::new(f64::INFINITY).0, 0.0);
         assert_eq!(JitterSample::new(1.0).0, 1.0 - f64::EPSILON);
+        assert_eq!(JitterSample::from_u64_ratio(1, 0).0, 0.0);
         assert_eq!(JitterSample::from_u64_ratio(0, u64::MAX).0, 0.0);
         assert_eq!(
             JitterSample::from_u64_ratio(u64::MAX, u64::MAX).0,

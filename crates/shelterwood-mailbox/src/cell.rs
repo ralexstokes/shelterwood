@@ -554,7 +554,10 @@ impl<M: Send + 'static> Drop for MailboxEffects<M> {
         if self.pulse {
             panics.run(|| self.changed.pulse());
         }
-        self.wakers.flush(&mut panics);
+        // Binding a latest-value mailbox historically handed displaced
+        // payloads to isolated disposal before accepted senders were woken.
+        // Preserve that observable ownership edge: a woken sender may run
+        // immediately and must not race ahead of disposal submission.
         if self.isolate_displaced && !self.displaced.is_empty() {
             let displaced = std::mem::take(&mut self.displaced);
             panics.run(|| {
@@ -567,7 +570,9 @@ impl<M: Send + 'static> Drop for MailboxEffects<M> {
                     },
                 );
             });
-        } else {
+        }
+        self.wakers.flush(&mut panics);
+        if !self.isolate_displaced {
             for displaced in self.displaced.drain(..) {
                 panics.run(|| drop(displaced));
             }
@@ -1403,12 +1408,13 @@ pub(super) mod tests {
     use std::{
         future::Future,
         panic::{AssertUnwindSafe, catch_unwind},
+        pin::Pin,
         sync::{
-            Arc, Weak,
+            Arc, Mutex, Weak,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll, Wake, Waker},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use crate::{
@@ -1432,6 +1438,82 @@ pub(super) mod tests {
     impl Wake for CountWake {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BindEffectEvent {
+        SignalPulsed,
+        DisposalSubmitted,
+        SenderWoken,
+    }
+
+    struct BindOrderingRuntime {
+        inner: Arc<dyn crate::MailboxRuntime>,
+        events: Arc<Mutex<Vec<BindEffectEvent>>>,
+    }
+
+    impl crate::MailboxRuntime for BindOrderingRuntime {
+        fn oneshot(
+            &self,
+        ) -> (
+            Box<dyn crate::ErasedOneShotSender>,
+            Pin<Box<dyn crate::ErasedOneShotReceiver>>,
+        ) {
+            self.inner.oneshot()
+        }
+
+        fn signal(&self) -> Arc<dyn crate::MailboxSignal> {
+            Arc::new(BindOrderingSignal {
+                inner: self.inner.signal(),
+                events: Arc::clone(&self.events),
+            })
+        }
+
+        fn dispose(&self, value: Box<dyn Send + 'static>) {
+            self.events
+                .lock()
+                .expect("bind effect recorder mutex")
+                .push(BindEffectEvent::DisposalSubmitted);
+            self.inner.dispose(value);
+        }
+
+        fn now(&self) -> Instant {
+            self.inner.now()
+        }
+
+        fn sleep_until(&self, deadline: Option<Instant>) -> crate::BoxedSleep {
+            self.inner.sleep_until(deadline)
+        }
+    }
+
+    struct BindOrderingSignal {
+        inner: Arc<dyn crate::MailboxSignal>,
+        events: Arc<Mutex<Vec<BindEffectEvent>>>,
+    }
+
+    impl crate::MailboxSignal for BindOrderingSignal {
+        fn pulse(&self) {
+            self.events
+                .lock()
+                .expect("bind effect recorder mutex")
+                .push(BindEffectEvent::SignalPulsed);
+            self.inner.pulse();
+        }
+
+        fn watcher(&self) -> Box<dyn crate::MailboxSignalWatcher> {
+            self.inner.watcher()
+        }
+    }
+
+    struct BindOrderingWake(Arc<Mutex<Vec<BindEffectEvent>>>);
+
+    impl Wake for BindOrderingWake {
+        fn wake(self: Arc<Self>) {
+            self.0
+                .lock()
+                .expect("bind effect recorder mutex")
+                .push(BindEffectEvent::SenderWoken);
         }
     }
 
@@ -1829,6 +1911,53 @@ pub(super) mod tests {
             third.as_mut().poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Ok(_))
         ));
+    }
+
+    #[test]
+    fn bind_submits_displaced_payloads_for_disposal_before_waking_senders() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Arc::new(BindOrderingRuntime {
+            inner: crate::capability::tests::runtime(),
+            events: Arc::clone(&events),
+        });
+        let mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
+        MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest);
+
+        let first = match mailbox.submit(1) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("an unbound mailbox parks its send")
+            }
+        };
+        let second = match mailbox.submit(2) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("an unbound mailbox parks its send")
+            }
+        };
+        first.install_test_waker(Waker::from(Arc::new(BindOrderingWake(Arc::clone(&events)))));
+        second.install_test_waker(Waker::from(Arc::new(BindOrderingWake(Arc::clone(&events)))));
+
+        let mut identity = ScopeIdentity::new();
+        let (_, mut incarnations) = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available")
+            .into_pair();
+        MailboxControl::bind(
+            &*mailbox,
+            incarnations.mint().expect("incarnation available"),
+        );
+
+        assert_eq!(
+            *events.lock().expect("bind effect recorder mutex"),
+            [
+                BindEffectEvent::SignalPulsed,
+                BindEffectEvent::DisposalSubmitted,
+                BindEffectEvent::SenderWoken,
+                BindEffectEvent::SenderWoken,
+            ],
+            "binding preserves pulse, disposal-submission, then wake ordering"
+        );
     }
 
     #[test]

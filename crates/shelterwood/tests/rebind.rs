@@ -7,8 +7,7 @@ use std::{
 };
 
 use crate::common::{
-    DestructorBlocker, DestructorGate, POLL_TIMEOUT, ReleaseGate, policy::never, poll_once,
-    poll_until,
+    DestructorBlocker, DestructorGate, ReleaseGate, assert_eventually, policy::never, poll_once,
 };
 use shelterwood::{
     Backoff, CallErrorKind, ExitError, ExitResult, Jitter, Mailbox, RawActor, RawContext, RawDef,
@@ -151,17 +150,15 @@ async fn rebind_refreshes_all_overflow_waiter_incarnation_evidence() {
 
     fail_first.release();
     let mut replacement = None;
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            if let std::task::Poll::Ready(result) = poll_once(promoted.as_mut()) {
-                replacement = Some(result.expect("first waiter enters replacement capacity"));
-                true
-            } else {
-                false
-            }
-        })
-        .await
-    );
+    assert_eventually!(|| {
+        if let std::task::Poll::Ready(result) = poll_once(promoted.as_mut()) {
+            replacement = Some(result.expect("first waiter enters replacement capacity"));
+            true
+        } else {
+            false
+        }
+    })
+    .await;
     let replacement = replacement.expect("replacement bind promotes the first waiter");
     assert!(replacement.supersedes(first));
     assert_eq!(factories.load(Ordering::SeqCst), 2);
@@ -225,16 +222,14 @@ async fn send_rides_the_frozen_destructor_and_rebind_window() {
     destructor.release();
     let accepting = parked.await.expect("send rides into replacement");
     assert!(accepting.supersedes(first));
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            deliveries
-                .lock()
-                .expect("deliveries mutex poisoned")
-                .as_slice()
-                == [(2, 42)]
-        })
-        .await
-    );
+    assert_eventually!(|| {
+        deliveries
+            .lock()
+            .expect("deliveries mutex poisoned")
+            .as_slice()
+            == [(2, 42)]
+    })
+    .await;
     assert_eq!(
         factories.load(Ordering::SeqCst),
         2,
@@ -314,18 +309,16 @@ async fn timed_send_withdraws_while_replacement_is_in_backoff() {
     assert!(poll_once(timed.as_mut()).is_pending());
     fail_first.release();
     let mut observed_rebind = None;
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            match actor.try_send(0) {
-                Err(error) if error.kind == SendErrorKind::NotRunning => {
-                    observed_rebind = Some(error.incarnation_observed);
-                    true
-                }
-                _ => false,
+    assert_eventually!(|| {
+        match actor.try_send(0) {
+            Err(error) if error.kind == SendErrorKind::NotRunning => {
+                observed_rebind = Some(error.incarnation_observed);
+                true
             }
-        })
-        .await
-    );
+            _ => false,
+        }
+    })
+    .await;
     assert_eq!(observed_rebind, Some(None));
     tokio::time::advance(timeout).await;
     let error = timed.await.expect_err("backoff outlives timeout");
@@ -375,18 +368,18 @@ async fn dropping_a_parked_send_in_the_rebind_window_withdraws_it() {
     destructor.release();
     parked.await.expect("the retained send rides the window");
     actor.send(44).await.expect("replacement accepts");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+    assert_eventually!(
+        || {
             deliveries
                 .lock()
                 .expect("deliveries mutex poisoned")
                 .as_slice()
                 == [(2, 42), (2, 44)]
-        })
-        .await,
+        },
         "the withdrawn send must never be promoted at bind: {:?}",
         deliveries.lock().expect("deliveries mutex poisoned")
-    );
+    )
+    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await

@@ -7,11 +7,10 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, advance_time, assert_quiet,
-    policy::never,
-    poll_once, poll_until,
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet, policy::never,
+    poll_once,
     waiting::{
-        liveness_probed_waiting_task, signalled_waiting_task, task as waiting_task,
+        liveness_probe, liveness_probed_waiting_task, signalled_waiting_task, task as waiting_task,
         tree as waiting_tree,
     },
 };
@@ -38,13 +37,11 @@ use shelterwood::{
 /// transaction. An absent resident is therefore a sound signal that the id
 /// is free again.
 async fn wait_for_id_release(scope: &DynamicScopeRef, id: &str) {
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            scope.as_scope().child(id).is_none()
-        })
-        .await,
+    assert_eventually!(
+        || scope.as_scope().child(id).is_none(),
         "removal of {id} did not release its id"
-    );
+    )
+    .await;
 }
 
 struct DropProbe(Arc<AtomicBool>);
@@ -132,15 +129,11 @@ impl RawActor for SignalledWaitingRaw {
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
         self.started.store(true, Ordering::SeqCst);
         if let Some((gate, observed)) = &self.liveness {
-            let shutdown = context.shutdown_token();
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => {
-                    self.cancelled.store(true, Ordering::SeqCst);
-                    return Ok(());
-                }
-                () = gate.wait() => observed.store(true, Ordering::SeqCst),
+            if !liveness_probe(context.shutdown_token(), gate.clone()).await {
+                self.cancelled.store(true, Ordering::SeqCst);
+                return Ok(());
             }
+            observed.store(true, Ordering::SeqCst);
         }
         context.shutdown_token().cancelled().await;
         self.cancelled.store(true, Ordering::SeqCst);
@@ -160,15 +153,11 @@ fn signalled_waiting_tree(
             TaskOnceDef::new(move |context| async move {
                 started.store(true, Ordering::SeqCst);
                 if let Some((gate, observed)) = liveness {
-                    let shutdown = context.shutdown_token();
-                    tokio::select! {
-                        biased;
-                        () = shutdown.cancelled() => {
-                            cancelled.store(true, Ordering::SeqCst);
-                            return Ok::<_, ExitError>(());
-                        }
-                        () = gate.wait() => observed.store(true, Ordering::SeqCst),
+                    if !liveness_probe(context.shutdown_token(), gate).await {
+                        cancelled.store(true, Ordering::SeqCst);
+                        return Ok::<_, ExitError>(());
                     }
+                    observed.store(true, Ordering::SeqCst);
                 }
                 context.shutdown_token().cancelled().await;
                 cancelled.store(true, Ordering::SeqCst);
@@ -182,13 +171,11 @@ fn signalled_waiting_tree(
 
 async fn assert_positive_liveness(gate: &ReleaseGate, observed: &Arc<AtomicBool>) {
     gate.release();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            observed.load(Ordering::SeqCst)
-        })
-        .await,
+    assert_eventually!(
+        || observed.load(Ordering::SeqCst),
         "the detached child must execute work released after its admission future was dropped"
-    );
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -370,16 +357,16 @@ async fn task_raw_and_subtree_admissions_resolve_before_manual_startup() {
     .expect("subtree is admitted");
 
     for id in ["gated-task", "gated-raw", "gated-subtree"] {
-        assert!(
-            poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
+        assert_eventually!(
+            || {
                 scope
                     .as_scope()
                     .child(id)
                     .is_some_and(|child| matches!(child.state, ChildState::Starting))
-            })
-            .await,
+            },
             "{id} remains admitted but startup-gated"
-        );
+        )
+        .await;
     }
     assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
     assert_eq!(scope.remove_actor(&raw).await, RemoveOutcome::Removed);
@@ -590,7 +577,7 @@ async fn exact_scope_removal_does_not_touch_a_same_id_successor() {
         .await
         .expect("first subtree admitted");
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), root.remove_scope(&first))
+        tokio::time::timeout(POLL_TIMEOUT, root.remove_scope(&first))
             .await
             .expect("first subtree removal completes"),
         RemoveOutcome::Removed
@@ -606,7 +593,7 @@ async fn exact_scope_removal_does_not_touch_a_same_id_successor() {
         RemoveOutcome::AlreadyAbsent
     );
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), root.remove_scope(&second))
+        tokio::time::timeout(POLL_TIMEOUT, root.remove_scope(&second))
             .await
             .expect("second subtree removal completes"),
         RemoveOutcome::Removed
@@ -686,12 +673,7 @@ async fn removal_is_synchronous_detached_and_shared() {
         Err(ReserveError::RemovalInProgress(ref id)) if id.as_str() == "worker"
     ));
     drop(first);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            cancelled.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| cancelled.load(Ordering::SeqCst)).await;
     gate.release();
     assert_eq!(second.await, RemoveOutcome::Removed);
     let replacement = scope
@@ -862,13 +844,11 @@ async fn select_and_timeout_preserve_fused_and_split_admission_ownership() {
             .await
             .is_err()
     );
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            split_started.load(Ordering::SeqCst)
-        })
-        .await,
+    assert_eventually!(
+        || split_started.load(Ordering::SeqCst),
         "timing out a polled split admission detaches the running child"
-    );
+    )
+    .await;
     assert!(matches!(
         scope.reserve_task("split-timeout"),
         Err(ReserveError::DuplicateId(_))
@@ -907,19 +887,9 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         signalled_waiting_task(Arc::clone(&fused_started), Arc::clone(&fused_cancelled)),
     ));
     assert!(poll_once(fused.as_mut()).is_pending());
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            fused_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| fused_started.load(Ordering::SeqCst)).await;
     drop(fused);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            fused_cancelled.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| fused_cancelled.load(Ordering::SeqCst)).await;
     wait_for_id_release(&scope, "fused-after-admission").await;
     let reused = scope
         .add_task("fused-after-admission", waiting_task())
@@ -941,12 +911,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
     )));
     assert!(poll_once(split.as_mut()).is_pending());
     drop(split);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            split_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| split_started.load(Ordering::SeqCst)).await;
     assert_quiet(Duration::from_millis(20), || {
         split_cancelled.load(Ordering::SeqCst)
     })
@@ -969,12 +934,7 @@ async fn fused_drop_withdraws_or_removes_while_split_drop_detaches() {
         Arc::clone(&split_after_liveness_seen),
     )));
     assert!(poll_once(split_after.as_mut()).is_pending());
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            split_after_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| split_after_started.load(Ordering::SeqCst)).await;
     drop(split_after);
     assert_quiet(Duration::from_millis(20), || {
         split_after_cancelled.load(Ordering::SeqCst)
@@ -1012,19 +972,9 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
         }),
     ));
     assert!(poll_once(fused_actor.as_mut()).is_pending());
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            actor_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| actor_started.load(Ordering::SeqCst)).await;
     drop(fused_actor);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            actor_cancelled.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| actor_cancelled.load(Ordering::SeqCst)).await;
     wait_for_id_release(&scope, "fused-actor").await;
     let actor = scope
         .add_raw("fused-actor", RawDef::factory(|| WaitingRaw))
@@ -1043,19 +993,9 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
         )),
     ));
     assert!(poll_once(fused_subtree.as_mut()).is_pending());
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            subtree_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| subtree_started.load(Ordering::SeqCst)).await;
     drop(fused_subtree);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            subtree_cancelled.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| subtree_cancelled.load(Ordering::SeqCst)).await;
     wait_for_id_release(&scope, "fused-subtree").await;
     let subtree = scope
         .add_subtree_once("fused-subtree", SubtreeOnceDef::new(waiting_tree()))
@@ -1080,12 +1020,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
         )),
     })));
     assert!(poll_once(split_actor.as_mut()).is_pending());
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            actor_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| actor_started.load(Ordering::SeqCst)).await;
     drop(split_actor);
     assert_quiet(Duration::from_millis(20), || {
         actor_cancelled.load(Ordering::SeqCst)
@@ -1113,12 +1048,7 @@ async fn actor_and_subtree_slots_preserve_fused_and_split_drop_ownership() {
             )),
         ))));
     assert!(poll_once(split_subtree.as_mut()).is_pending());
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            subtree_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| subtree_started.load(Ordering::SeqCst)).await;
     drop(split_subtree);
     assert_quiet(Duration::from_millis(20), || {
         subtree_cancelled.load(Ordering::SeqCst)
@@ -1159,12 +1089,7 @@ async fn removing_a_member_releases_its_factory_before_scope_shutdown() {
         )
         .await
         .expect("task admitted");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| started.load(Ordering::SeqCst)).await;
 
     assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
     assert!(factory_dropped.load(Ordering::SeqCst));
@@ -1357,12 +1282,7 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
     let scope = root.add_subtree("dynamic", subtree).expect("valid subtree");
     let system = root.spawn().expect("runtime is available");
 
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            first_started.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| first_started.load(Ordering::SeqCst)).await;
     system
         .scope()
         .wait_for_child(
@@ -1449,12 +1369,7 @@ fn pending_restart_subtree(
 }
 
 async fn await_first_restart_window(root: &ScopeRef, starts: &Arc<AtomicUsize>) {
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            starts.load(Ordering::SeqCst) == 1
-        })
-        .await
-    );
+    assert_eventually!(|| starts.load(Ordering::SeqCst) == 1).await;
     root.wait_for_child(
         "nested",
         |child| matches!(child.state, ChildState::Restarting),
@@ -1554,13 +1469,11 @@ async fn assert_pending_restart_shutdown_is_expedited<R: Clone>(
     // never reaches a *later* incarnation only re-measures the quiet interior
     // of the window it already observed.
     advance_time(width + Duration::from_secs(1)).await;
-    assert!(
-        poll_until(Duration::from_secs(5), Duration::from_millis(1), || {
-            starts.load(Ordering::SeqCst) >= 3
-        })
-        .await,
+    assert_eventually!(
+        || starts.load(Ordering::SeqCst) >= 3,
         "a consumed pending request must not suppress the ordinary backoff restart"
-    );
+    )
+    .await;
     assert_eq!(
         starts.load(Ordering::SeqCst),
         3,
@@ -1609,7 +1522,7 @@ async fn same_batch_removal_suppresses_pending_restart_shutdown() {
     let removal = system.scope().remove_scope(&nested);
     nested.request_shutdown();
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), removal)
+        tokio::time::timeout(POLL_TIMEOUT, removal)
             .await
             .expect("removal does not wait for restart backoff"),
         RemoveOutcome::Removed
@@ -1647,12 +1560,7 @@ async fn draining_scopes_reject_admission_and_treat_removal_as_absent() {
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(2)));
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            cancelled.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| cancelled.load(Ordering::SeqCst)).await;
     assert!(matches!(
         scope.add_task("late", waiting_task()).await,
         Err(ReserveError::NotAdmitting(NotAdmittingCause::Draining))
@@ -1880,13 +1788,11 @@ async fn startup_failed_roots_reject_reservation_and_admission_with_startup_fail
         .wait_started()
         .await
         .expect_err("pre-ready terminal exit aborts startup");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            matches!(scope.as_scope().snapshot().state, ScopeState::StartupFailed)
-        })
-        .await,
+    assert_eventually!(
+        || matches!(scope.as_scope().snapshot().state, ScopeState::StartupFailed),
         "the root publishes StartupFailed while the started prefix remains supervised"
-    );
+    )
+    .await;
 
     assert!(matches!(
         scope.reserve_task("late"),

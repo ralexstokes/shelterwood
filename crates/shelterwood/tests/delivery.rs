@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, poll_once, poll_until};
+use crate::common::{ReleaseGate, assert_eventually, poll_once};
 use shelterwood::{
     CallErrorKind, ExitError, ExitResult, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Reply,
     SendErrorKind, Shutdown, SubtreeOnceDef, Tree,
@@ -70,22 +70,15 @@ async fn accepted_but_undelivered_prefix_never_crosses_an_incarnation() {
     actor.try_send(2).expect("remainder accepts");
     actor.try_send(3).expect("remainder accepts");
     gate.release();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            generation.load(Ordering::SeqCst) == 2
-        })
-        .await
-    );
+    assert_eventually!(|| generation.load(Ordering::SeqCst) == 2).await;
     actor
         .send(4)
         .await
         .expect("fresh message reaches replacement");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            log.lock().expect("prefix log mutex poisoned").as_slice() == [(1, 1), (2, 4)]
-        })
-        .await
-    );
+    assert_eventually!(|| {
+        log.lock().expect("prefix log mutex poisoned").as_slice() == [(1, 1), (2, 4)]
+    })
+    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -243,12 +236,7 @@ async fn queue_preserves_per_sender_fifo_under_interleaved_senders() {
     sender_a.await.expect("sender a joins");
     sender_b.await.expect("sender b joins");
     gate.release();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            log.lock().expect("order log mutex poisoned").len() == 4
-        })
-        .await
-    );
+    assert_eventually!(|| log.lock().expect("order log mutex poisoned").len() == 4).await;
     let log = log.lock().expect("order log mutex poisoned").clone();
     let a: Vec<_> = log
         .iter()
@@ -360,21 +348,17 @@ async fn send_cancellation_withdraws_before_acceptance_but_not_after() {
     assert!(poll_once(before.as_mut()).is_pending());
     drop(before);
     gate.release();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            log.lock().expect("send log mutex poisoned").as_slice() == [(2, 1)]
-        })
-        .await
-    );
+    assert_eventually!(|| {
+        log.lock().expect("send log mutex poisoned").as_slice() == [(2, 1)]
+    })
+    .await;
     let mut after = Box::pin(actor.send(3));
     assert!(matches!(poll_once(after.as_mut()), Poll::Ready(Ok(_))));
     drop(after);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            log.lock().expect("send log mutex poisoned").as_slice() == [(2, 1), (2, 3)]
-        })
-        .await
-    );
+    assert_eventually!(|| {
+        log.lock().expect("send log mutex poisoned").as_slice() == [(2, 1), (2, 3)]
+    })
+    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -421,12 +405,7 @@ async fn call_cancellation_withdraws_before_acceptance_but_processes_after() {
         gate.release();
         let expected = usize::from(accepted_before_drop);
         if accepted_before_drop {
-            assert!(
-                poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-                    calls.load(Ordering::SeqCst) == expected
-                })
-                .await
-            );
+            assert_eventually!(|| calls.load(Ordering::SeqCst) == expected).await;
         }
         system
             .shutdown(Duration::from_secs(1))

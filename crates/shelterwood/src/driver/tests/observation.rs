@@ -971,6 +971,8 @@ fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
     scope.set_observation_config(Default::default(), first);
 
     let start = Arc::new(Barrier::new(2));
+    let (first_update, first_update_seen) = std::sync::mpsc::sync_channel(0);
+    let (first_snapshot, first_snapshot_seen) = std::sync::mpsc::sync_channel(0);
     let writer_scope = Arc::clone(&scope);
     let writer_start = Arc::clone(&start);
     let writer = std::thread::spawn(move || {
@@ -978,16 +980,32 @@ fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
         for update in 0..UPDATES {
             let intensity = if update % 2 == 0 { second } else { first };
             writer_scope.set_observation_config(Default::default(), intensity);
+            if update == 0 {
+                first_update
+                    .send(())
+                    .expect("the snapshot reader remains available");
+                first_snapshot_seen
+                    .recv()
+                    .expect("the snapshot reader acknowledges its observation");
+            }
         }
     });
 
     start.wait();
-    for _ in 0..UPDATES {
+    first_update_seen
+        .recv()
+        .expect("the writer publishes its first update");
+    for snapshot in 0..UPDATES {
         let intensity = scope.snapshot().intensity;
         assert!(
             intensity == first || intensity == second,
             "a snapshot observes one complete configuration update"
         );
+        if snapshot == 0 {
+            first_snapshot
+                .send(())
+                .expect("the config writer remains available");
+        }
     }
     writer.join().expect("config writer completes");
 }

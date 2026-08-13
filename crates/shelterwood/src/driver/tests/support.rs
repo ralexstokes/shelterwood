@@ -14,10 +14,11 @@ pub(super) use std::{
 
 pub(super) use crate::{
     ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
-    GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox,
-    MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ReserveError,
-    RestartCondition, RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind,
-    StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+    GracePhase, Incarnation, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
+    Mailbox, MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome,
+    ReserveError, RestartCondition, RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState,
+    SendErrorKind, StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef,
+    TaskDef, Tree,
     engine::{
         ChildKey, Effect as SupervisorEffect, Epoch, Event as SupervisorEvent, ScopeLifecycle,
         StopLadder, SupervisorState, arbitrate, step as supervisor_step,
@@ -30,16 +31,84 @@ pub(super) use crate::{
     runtime::{CompletionGatedLatch, DedicatedRuntime, Latch},
 };
 
+pub(super) struct ObservedExit {
+    pub(super) child: ChildKey,
+    incarnation: Incarnation,
+    recorded: Option<RecordedOutcome>,
+    join: crate::runtime::JoinOutcome<()>,
+    cancellation: Cancellation,
+    readiness_signal_seen: bool,
+}
+
+impl ObservedExit {
+    pub(super) fn dispatch(self, scope: &mut ScopeRuntime) {
+        scope.handle_exit(
+            self.child,
+            self.incarnation,
+            self.recorded,
+            self.join,
+            self.cancellation,
+            self.readiness_signal_seen,
+        );
+    }
+}
+
+pub(super) async fn recv_child_exit(
+    receiver: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    timeout: Duration,
+    expectation: &str,
+) -> ObservedExit {
+    match crate::runtime::timeout(timeout, receiver.recv()).await {
+        crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
+            child,
+            incarnation,
+            recorded,
+            join,
+            cancellation,
+            readiness_signal_seen,
+        }))) => ObservedExit {
+            child,
+            incarnation,
+            recorded,
+            join,
+            cancellation,
+            readiness_signal_seen,
+        },
+        crate::runtime::Timeout::Completed(_) => panic!("expected {expectation}"),
+        crate::runtime::Timeout::Elapsed => panic!("timed out waiting for {expectation}"),
+    }
+}
+
 pub(super) use super::super::{
-    AncestorCommandLatches, ChildEvent, ChildResources, ChildRuntime, ChildTerminality,
-    DriverEvent, DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage,
-    MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
-    ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard, ScopeFlavor,
-    ScopeRole, ScopeRuntime, StartupDisposition, cancel_dynamic_reservation,
-    discharge_child_terminality, monitor_root_driver, report_slot, reserve_dynamic,
-    resident_projection, restart_shutdown_work, run_nested_factory, run_nested_tree, run_scope,
-    run_scope_incarnation, storage::Obligation,
+    AdmissionRequest, AncestorCommandLatches, ChildEvent, ChildResources, ChildRuntime,
+    ChildTerminality, DriverEvent, DynamicControl, DynamicEntry, DynamicReservation, GateCapture,
+    MemberCell, MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest,
+    RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent,
+    ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
+    cancel_dynamic_reservation, discharge_child_terminality, monitor_root_driver, report_slot,
+    reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
+    run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
 };
+
+pub(super) async fn begin_admission(
+    reservation: &DynamicReservation,
+    receiver: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    fused_cancel: Option<Latch>,
+) -> (
+    crate::runtime::OneShotReceiver<Result<(), ReserveError>>,
+    AdmissionRequest,
+) {
+    let response = super::super::start_admission(
+        Arc::clone(&reservation.control),
+        Arc::clone(&reservation.slot),
+        fused_cancel,
+    )
+    .expect("admission starts inside the runtime");
+    let Some(DriverEvent::Admission(request)) = receiver.recv().await else {
+        panic!("admission enqueueing submits the request")
+    };
+    (response, request)
+}
 
 pub(super) struct ChildArena<T> {
     children: BTreeMap<ChildKey, T>,

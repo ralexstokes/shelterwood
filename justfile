@@ -11,6 +11,9 @@ fmt:
 lint:
     cargo +nightly clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+lint-default:
+    cargo +nightly clippy --locked --workspace --lib -- -D warnings
+
 check:
     cargo check --locked --workspace --all-targets --all-features
 
@@ -48,7 +51,7 @@ nixfmt-check:
 
 # Fast local CI mirror — reuses the local cargo cache and incremental builds.
 # The clean Nix lane retains the explicit all-target build for non-test codegen coverage.
-ci: fmt lint test doc-check runtime-api-check packaged-docs-check nixfmt-check
+ci: fmt lint lint-default test doc-check runtime-api-check packaged-docs-check nixfmt-check
 
 # Full clean Nix CI lane; use before pushing or when touching Nix files.
 ci-nix:

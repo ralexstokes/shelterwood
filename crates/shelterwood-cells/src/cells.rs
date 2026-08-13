@@ -1265,22 +1265,6 @@ impl ScopeCell {
         });
     }
 
-    fn update_child_record(
-        &self,
-        member: &MemberCell,
-        update: impl FnOnce(&mut MemberRecord),
-        event: Option<LifecycleEventKind>,
-    ) {
-        self.with_observation_gate(|wakes| {
-            member.update_locked(wakes, update);
-            if let Some(event) = event {
-                self.emit_locked(wakes, event);
-            } else {
-                self.publish_snapshot_chain_locked(wakes);
-            }
-        });
-    }
-
     pub fn set_child_removing_locked(&self, member: &MemberCell, txn: &mut ObservationTxn<'_>) {
         if member.record().membership_status == MembershipStatus::Removing {
             return;
@@ -1298,7 +1282,14 @@ impl ScopeCell {
         update: impl FnOnce(&mut MemberRecord),
         event: Option<LifecycleEventKind>,
     ) {
-        self.update_child_record(member, update, event);
+        self.with_observation_gate(|wakes| {
+            member.update_locked(wakes, update);
+            if let Some(event) = event {
+                self.emit_locked(wakes, event);
+            } else {
+                self.publish_snapshot_chain_locked(wakes);
+            }
+        });
     }
 
     pub fn transition_child_stage(
@@ -1307,7 +1298,7 @@ impl ScopeCell {
         transition: MemberTransition,
         event: Option<LifecycleEventKind>,
     ) {
-        // Routed through `transition_locked` rather than `update_child_record`
+        // Routed through `transition_locked` rather than a record-only update
         // so a restart schedule's displaced exit leaves the gate on this path
         // too.
         self.with_observation_gate(|wakes| {

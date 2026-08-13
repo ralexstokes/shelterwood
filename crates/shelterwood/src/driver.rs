@@ -111,23 +111,6 @@ impl SystemRun {
     }
 }
 
-#[cfg(test)]
-fn classify_root_driver_join(
-    outcome: runtime::JoinOutcome<StopReason>,
-) -> Result<StopReason, Exit> {
-    let (join, cancellation) = match outcome {
-        runtime::JoinOutcome::Ok { value } => return Ok(value),
-        runtime::JoinOutcome::Panic { message } => (
-            runtime::JoinOutcome::Panic { message },
-            Cancellation::NotObserved,
-        ),
-        runtime::JoinOutcome::Cancelled => {
-            (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
-        }
-    };
-    Err(classify_exit(None, join, None, cancellation))
-}
-
 fn classify_retained_root_driver_join(
     outcome: runtime::JoinOutcome<RetainedStopReason>,
 ) -> Result<RetainedStopReason, Exit> {

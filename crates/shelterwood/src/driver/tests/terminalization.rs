@@ -167,11 +167,12 @@ async fn root_driver_panic_mid_drain_upgrades_to_the_join_monitor_verdict() {
                 .build();
             panic!("root driver panicked mid-drain");
             #[allow(unreachable_code)]
-            StopReason::Finished
+            crate::cells::RetainedStopReason::new(StopReason::Finished)
         }
     });
-    let panic_exit = super::super::classify_root_driver_join(crate::runtime::join(driver).await)
-        .expect_err("the injected root-driver panic reaches its join monitor");
+    let panic_exit =
+        super::super::classify_retained_root_driver_join(crate::runtime::join(driver).await)
+            .expect_err("the injected root-driver panic reaches its join monitor");
 
     let drained = ScopeState::Stopped {
         reason: StopReason::Finished,

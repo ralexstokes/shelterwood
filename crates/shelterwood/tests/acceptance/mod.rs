@@ -1,5 +1,8 @@
 //! Application-scale acceptance scenarios from `SPEC.md` Appendix C.
 
-mod assistant;
-mod shard_store;
-mod sidecar;
+register_test_modules!(
+    "tests/acceptance";
+    mod assistant;
+    mod shard_store;
+    mod sidecar;
+);

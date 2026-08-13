@@ -6,9 +6,8 @@ use std::{
     },
 };
 
-use tokio::task;
-
-use super::{Latch, catch_panic, contain_panic_payload, discard_panic, is_available};
+use super::{Latch, catch_panic, contain_panic_payload, discard_panic};
+use crate::spawn::{BlockingPoolJob, submit_blocking_job};
 
 /// Ownership wrapper for user values retained by framework state.
 ///
@@ -94,13 +93,6 @@ where
         // worker or double-panic while the job is being dropped.
         discard_panic(catch_panic(|| completion(panic)).err());
     }
-
-    fn is_pending(&self) -> bool {
-        self.state
-            .lock()
-            .expect("disposal job mutex poisoned")
-            .is_some()
-    }
 }
 
 impl<T, C> Drop for DisposalJob<T, C>
@@ -113,18 +105,20 @@ where
     }
 }
 
-/// Erased view of a queued disposal job for the shared fallback thread.
-trait QueuedDisposal: Send + Sync {
-    fn run(&self);
-}
-
-impl<T, C> QueuedDisposal for DisposalJob<T, C>
+impl<T, C> BlockingPoolJob for DisposalJob<T, C>
 where
     T: Send + 'static,
     C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
     fn run(&self) {
         self.finish();
+    }
+
+    fn is_pending(&self) -> bool {
+        self.state
+            .lock()
+            .expect("disposal job mutex poisoned")
+            .is_some()
     }
 }
 
@@ -134,7 +128,7 @@ where
 /// under this lock, and submitters push and consult it under the same lock, so
 /// a queued job always has a live worker destined to drain it.
 struct FallbackDisposals {
-    queue: VecDeque<Arc<dyn QueuedDisposal>>,
+    queue: VecDeque<Arc<dyn BlockingPoolJob>>,
     worker_live: bool,
 }
 
@@ -146,7 +140,7 @@ static FALLBACK_DISPOSALS: Mutex<FallbackDisposals> = Mutex::new(FallbackDisposa
 /// Queues a disposal job for the shared fallback thread, lazily starting it.
 /// Returns `false` when no worker exists and none could be started; the
 /// caller must then finish the job itself.
-fn enqueue_fallback_disposal(job: Arc<dyn QueuedDisposal>) -> bool {
+fn enqueue_fallback_disposal(job: Arc<dyn BlockingPoolJob>) -> bool {
     let mut state = FALLBACK_DISPOSALS
         .lock()
         .expect("fallback disposal queue mutex poisoned");
@@ -194,47 +188,15 @@ fn run_fallback_disposals() {
     }
 }
 
-/// Returns whether Tokio synchronously rejected the blocking task.
-///
-/// Sole ownership proves that Tokio no longer holds the submitted closure.
-/// The pending check distinguishes rejection from a task that ran to
-/// completion before the submitter observed its reference count; requeueing
-/// the latter would leave empty jobs behind a blocked fallback disposal.
-///
-/// This pins Tokio's `spawn_task` shutdown path: a rejected closure is
-/// destroyed synchronously, before `spawn_blocking` returns. A future Tokio
-/// that deferred that drop would leave the count at two and degrade
-/// fail-safe to the old inline behavior rather than misroute a live closure.
-/// The end-to-end regression below pins the behavior we rely on.
-fn blocking_spawn_needs_fallback<T, C>(job: &Arc<DisposalJob<T, C>>) -> bool
-where
-    T: Send + 'static,
-    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
-{
-    Arc::strong_count(job) == 1 && job.is_pending()
-}
-
 fn dispatch_disposal<T, C>(job: Arc<DisposalJob<T, C>>)
 where
     T: Send + 'static,
     C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
-    if is_available() {
-        let worker = Arc::clone(&job);
-        match catch_panic(|| task::spawn_blocking(move || worker.finish())) {
-            Ok(handle) => {
-                drop(handle);
-                // Tokio returns a handle even when the blocking pool is
-                // already shutting down. In that case it synchronously
-                // destroys the closure, leaving `job` as the only reference.
-                // Fall through so the fallback thread, rather than this
-                // runtime-teardown thread, owns user destruction.
-                if !blocking_spawn_needs_fallback(&job) {
-                    return;
-                }
-            }
-            Err(payload) => discard_panic(Some(payload)),
-        }
+    // A rejected submission falls through so the fallback thread, rather than
+    // this runtime-teardown thread, owns user destruction.
+    if submit_blocking_job(&job) {
+        return;
     }
 
     // Outside a runtime, one shared lazily started thread drains a queue of
@@ -245,7 +207,7 @@ where
     // user destructors, exactly what isolation must prevent. Serialization is
     // the accepted trade: one blocking destructor delays later fallback
     // disposals instead of consuming another native thread.
-    if enqueue_fallback_disposal(Arc::clone(&job) as Arc<dyn QueuedDisposal>) {
+    if enqueue_fallback_disposal(Arc::clone(&job) as Arc<dyn BlockingPoolJob>) {
         return;
     }
 
@@ -312,9 +274,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{
-        DisposalJob, DisposalPanic, Isolated, blocking_spawn_needs_fallback, dispose_detached,
-    };
+    use super::{DisposalJob, DisposalPanic, Isolated, dispose_detached};
+    use crate::spawn::{BlockingPoolJob, blocking_pool_accepted};
 
     /// Name of the shared non-runtime disposal thread, asserted on to pin
     /// *where* isolated destruction lands rather than merely where it does not.
@@ -371,7 +332,7 @@ mod tests {
         let accepted = DisposalJob::new((), |_| {});
         let accepted_worker = Arc::clone(&accepted);
         assert!(
-            !blocking_spawn_needs_fallback(&accepted),
+            blocking_pool_accepted(&accepted),
             "an accepted closure still owned by Tokio must stay on its blocking pool"
         );
         drop(accepted_worker);
@@ -380,16 +341,16 @@ mod tests {
         let rejected_worker = Arc::clone(&rejected);
         drop(rejected_worker);
         assert!(
-            blocking_spawn_needs_fallback(&rejected),
+            !blocking_pool_accepted(&rejected),
             "a synchronously dropped closure must move to the fallback queue"
         );
 
         let completed = DisposalJob::new((), |_| {});
         let completed_worker = Arc::clone(&completed);
-        completed_worker.finish();
+        completed_worker.run();
         drop(completed_worker);
         assert!(
-            !blocking_spawn_needs_fallback(&completed),
+            blocking_pool_accepted(&completed),
             "an already-completed closure must not enqueue an empty job"
         );
     }

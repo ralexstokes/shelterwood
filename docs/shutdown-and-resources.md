@@ -90,6 +90,17 @@ A late return value or panic is discarded if its future was dropped. Therefore
 blocking operations must be safe to outlive the actor and must not retain
 exclusive process resources indefinitely.
 
+If Tokio has already closed its blocking pool during runtime teardown,
+Shelterwood reroutes a rejected `run_blocking` operation to a detached
+Shelterwood-owned thread. This keeps both the operation and destruction of its
+captured state off the submitting runtime thread. An operation that never runs
+at all — Tokio discarded an already-accepted submission as the runtime went
+away, or the native fallback could not start — transfers its captured state to
+detached disposal, and awaiting the future reports runtime-teardown
+cancellation. If the system cannot create the disposal worker either, disposal
+destroys the state synchronously rather than lose it; native thread exhaustion
+is the sole exception to the isolation guarantee.
+
 Async offloads are different: they are incarnation-owned, are cancelled at the
 stop freeze, and never outlive the incarnation. They are intentionally absent
 from `StopContext`.

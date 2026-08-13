@@ -91,6 +91,10 @@ macro_rules! actor_context_forwarders {
         ///
         /// Cancellation is cooperative; a hard-aborted operation's OS thread
         /// detaches and may outlive this actor incarnation.
+        /// A blocking-pool rejection during runtime teardown uses a detached
+        /// Shelterwood thread; inability to start one makes the returned
+        /// future panic with a runtime-teardown cancellation diagnostic when
+        /// awaited.
         pub fn run_blocking<F, T>(&self, operation: F) -> Blocking<T>
         where
             F: FnOnce(CancellationToken) -> T + Send + 'static,

@@ -11,8 +11,8 @@ use tokio::{sync::mpsc, task};
 use shelterwood_core::exit::JoinVerdict as JoinOutcome;
 
 use super::{
-    DisposingReceiver, OneShotSender, PanicPayload, catch_panic, discard_panic, dispose_detached,
-    oneshot, sleep_until_std,
+    DisposingReceiver, OneShotReceiver, OneShotSender, PanicPayload, catch_panic, discard_panic,
+    dispose_detached, oneshot, sleep_until_std,
 };
 
 const BLOCKING_FALLBACK_THREAD: &str = "shelterwood-blocking";
@@ -134,7 +134,6 @@ pub fn spawn_blocking_work<T: Send + 'static>(
     operation: impl FnOnce() -> T + Send + 'static,
 ) -> impl Future<Output = T> + Send {
     let (completion, receiver) = oneshot();
-    let mut receiver = DisposingReceiver::new(receiver);
     let job = BlockingJob::new(operation, completion);
     let worker = Arc::clone(&job);
 
@@ -151,28 +150,52 @@ pub fn spawn_blocking_work<T: Send + 'static>(
     }
 
     if needs_fallback {
-        let worker = Arc::clone(&job);
         // A blocking operation cannot share disposal's single fallback queue:
         // one legitimately long operation would strand every later job. This
         // path exists only for runtime teardown, so one detached thread per
         // rejected operation is the appropriate degradation.
-        let fallback = std::thread::Builder::new()
-            .name(BLOCKING_FALLBACK_THREAD.to_owned())
-            .spawn(move || worker.run());
-        if let Err(error) = fallback {
-            // `job` still owns the operation. Its Drop implementation routes
-            // the captured closure through isolated disposal, so even native
-            // thread exhaustion cannot destroy user state on this submitter.
-            drop(error);
-        }
+        spawn_blocking_fallback_with(&job, |worker| {
+            std::thread::Builder::new()
+                .name(BLOCKING_FALLBACK_THREAD.to_owned())
+                .spawn(move || worker.run())
+        });
     }
     drop(job);
 
-    async move {
-        match poll_fn(|context| receiver.poll_receive(context)).await {
-            Some(Ok(value)) => value,
-            Some(Err(payload)) => resume_unwind(payload),
-            None => panic!("blocking operation was cancelled during runtime teardown"),
+    receive_blocking(receiver)
+}
+
+async fn receive_blocking<T: Send + 'static>(receiver: OneShotReceiver<BlockingOutcome<T>>) -> T {
+    let mut receiver = DisposingReceiver::new(receiver);
+    match poll_fn(|context| receiver.poll_receive(context)).await {
+        Some(Ok(value)) => value,
+        Some(Err(payload)) => resume_unwind(payload),
+        None => panic!("blocking operation was cancelled during runtime teardown"),
+    }
+}
+
+/// Gives one rejected job to a native fallback thread.
+///
+/// The injected spawner makes the failure ownership edge directly testable:
+/// `std::thread::Builder::spawn` consumes and destroys its closure before it
+/// returns `Err`, so either spawner outcome has consumed `worker`. The
+/// submitter's `job` reference remains authoritative until this function
+/// returns.
+fn spawn_blocking_fallback_with<F, T>(
+    job: &Arc<BlockingJob<F, T>>,
+    spawn: impl FnOnce(Arc<BlockingJob<F, T>>) -> std::io::Result<std::thread::JoinHandle<()>>,
+) where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let worker = Arc::clone(job);
+    match spawn(worker) {
+        Ok(handle) => drop(handle),
+        Err(error) => {
+            // `job` still owns the operation. Its Drop implementation routes
+            // the captured closure through disposal, which retries isolation
+            // independently and closes the completion lane if it cannot run.
+            drop(error);
         }
     }
 }
@@ -212,11 +235,21 @@ where
             return;
         };
         let outcome = catch_panic(operation);
-        if let Err(unclaimed) = completion.send(outcome) {
-            // The returned future was dropped. We are already on a blocking
-            // worker, but still contain a hostile result/panic-payload
-            // destructor so it cannot unwind through the worker entry point.
-            discard_panic(catch_panic(|| drop(unclaimed)).err());
+        match catch_panic(|| completion.send(outcome)) {
+            Ok(Ok(())) => {}
+            Ok(Err(unclaimed)) => {
+                // The returned future was dropped. We are already on a
+                // blocking worker, but still contain a hostile
+                // result/panic-payload destructor so it cannot unwind through
+                // the worker entry point.
+                discard_panic(catch_panic(|| drop(unclaimed)).err());
+            }
+            Err(waker_panic) => {
+                // Tokio publishes the value before waking the receiver. A
+                // hostile executor waker must not unwind this detached worker;
+                // the receiver still owns the authoritative outcome.
+                discard_panic(Some(waker_panic));
+            }
         }
     }
 
@@ -472,7 +505,13 @@ impl Default for JitterRng {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Condvar, Mutex, mpsc},
+        panic,
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        task::{Context, Poll, Wake, Waker},
         thread::{self, ThreadId},
         time::{Duration, Instant},
     };
@@ -506,6 +545,36 @@ mod tests {
                     .expect("release mutex available")
                     .0;
             }
+        }
+    }
+
+    struct RecordingDrop(mpsc::Sender<ThreadDescription>);
+
+    impl Drop for RecordingDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(describe_current_thread());
+        }
+    }
+
+    struct PanickingDrop(mpsc::Sender<()>);
+
+    impl Drop for PanickingDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+            panic!("hostile blocking outcome destructor");
+        }
+    }
+
+    struct PanicWake(Arc<AtomicUsize>);
+
+    impl Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            panic!("hostile blocking-result waker");
         }
     }
 
@@ -570,6 +639,184 @@ mod tests {
                 message: Some(message)
             } if message == "blocking work panic"
         ));
+    }
+
+    #[test]
+    fn fallback_detection_distinguishes_owned_pending_and_completed_jobs() {
+        let (accepted_completion, _accepted_receiver) = super::oneshot();
+        let accepted = super::BlockingJob::new(|| 1_u8, accepted_completion);
+        let accepted_worker = Arc::clone(&accepted);
+        assert!(
+            !super::blocking_spawn_needs_fallback(&accepted),
+            "an accepted closure still owned by Tokio must stay on its blocking pool"
+        );
+        drop(accepted_worker);
+
+        let (rejected_completion, _rejected_receiver) = super::oneshot();
+        let rejected = super::BlockingJob::new(|| 2_u8, rejected_completion);
+        let rejected_worker = Arc::clone(&rejected);
+        drop(rejected_worker);
+        assert!(
+            super::blocking_spawn_needs_fallback(&rejected),
+            "a synchronously dropped closure must move to the fallback thread"
+        );
+
+        let (completed_completion, _completed_receiver) = super::oneshot();
+        let completed = super::BlockingJob::new(|| 3_u8, completed_completion);
+        let completed_worker = Arc::clone(&completed);
+        completed_worker.run();
+        drop(completed_worker);
+        assert!(
+            !super::blocking_spawn_needs_fallback(&completed),
+            "a fast completed closure must not enqueue an empty job"
+        );
+    }
+
+    #[test]
+    fn completion_contains_a_panicking_receiver_waker() {
+        let (completion, mut receiver) = super::oneshot();
+        let job = super::BlockingJob::new(|| 42_u8, completion);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(PanicWake(Arc::clone(&wakes))));
+        assert!(matches!(
+            receiver.poll_receive(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+
+        assert!(
+            super::catch_panic(|| job.run()).is_ok(),
+            "a receiver waker cannot unwind the detached worker"
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            receiver.poll_receive(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Some(Ok(42)))
+        ));
+    }
+
+    #[test]
+    fn unclaimed_result_and_panic_payload_destructors_are_contained() {
+        let (result_dropped, result_dropped_rx) = mpsc::channel();
+        let (result_completion, result_receiver) = super::oneshot();
+        drop(result_receiver);
+        let result_job =
+            super::BlockingJob::new(move || PanickingDrop(result_dropped), result_completion);
+        assert!(
+            super::catch_panic(|| result_job.run()).is_ok(),
+            "an unclaimed result destructor cannot unwind the worker"
+        );
+        result_dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the unclaimed result is destroyed");
+
+        let (payload_dropped, payload_dropped_rx) = mpsc::channel();
+        let (panic_completion, panic_receiver) = super::oneshot();
+        drop(panic_receiver);
+        let panic_job = super::BlockingJob::new(
+            move || -> () { panic::panic_any(PanickingDrop(payload_dropped)) },
+            panic_completion,
+        );
+        assert!(
+            super::catch_panic(|| panic_job.run()).is_ok(),
+            "an unclaimed panic-payload destructor cannot unwind the worker"
+        );
+        payload_dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the unclaimed panic payload is destroyed");
+    }
+
+    #[test]
+    fn accepted_then_cancelled_job_isolates_capture_and_reports_teardown() {
+        let (captured_dropped, captured_dropped_rx) = mpsc::channel();
+        let captured = RecordingDrop(captured_dropped);
+        let (completion, receiver) = super::oneshot();
+        let job = super::BlockingJob::new(
+            move || {
+                drop(captured);
+                42_u8
+            },
+            completion,
+        );
+        let accepted_worker = Arc::clone(&job);
+        drop(job);
+
+        let (cancelled_on, cancelled_on_rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("tokio-canceller".to_owned())
+            .spawn(move || {
+                cancelled_on
+                    .send(thread::current().id())
+                    .expect("test observes cancellation");
+                drop(accepted_worker);
+            })
+            .expect("cancellation thread starts")
+            .join()
+            .expect("cancellation thread completes");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("consumer runtime");
+        let cancellation =
+            super::catch_panic(|| runtime.block_on(super::receive_blocking(receiver)))
+                .expect_err("an unstarted accepted job reports cancellation");
+        assert_eq!(
+            cancellation.downcast_ref::<&'static str>().copied(),
+            Some("blocking operation was cancelled during runtime teardown")
+        );
+
+        let cancellation_thread = cancelled_on_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the cancellation thread is recorded");
+        let (destructor_thread, destructor_name) = captured_dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the cancelled capture reaches disposal");
+        assert_ne!(destructor_thread, cancellation_thread);
+        assert_eq!(
+            destructor_name.as_deref(),
+            Some("shelterwood-disposal"),
+            "accepted cancellation must isolate closure destruction"
+        );
+    }
+
+    #[test]
+    fn failed_native_fallback_isolates_capture_and_reports_teardown() {
+        let submitting_thread = thread::current().id();
+        let (captured_dropped, captured_dropped_rx) = mpsc::channel();
+        let captured = RecordingDrop(captured_dropped);
+        let (completion, receiver) = super::oneshot();
+        let job = super::BlockingJob::new(
+            move || {
+                drop(captured);
+                42_u8
+            },
+            completion,
+        );
+
+        super::spawn_blocking_fallback_with(&job, |_worker| {
+            Err(std::io::Error::other("injected native thread exhaustion"))
+        });
+        drop(job);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("consumer runtime");
+        let cancellation =
+            super::catch_panic(|| runtime.block_on(super::receive_blocking(receiver)))
+                .expect_err("a fallback that cannot start reports cancellation");
+        assert_eq!(
+            cancellation.downcast_ref::<&'static str>().copied(),
+            Some("blocking operation was cancelled during runtime teardown")
+        );
+
+        let (destructor_thread, destructor_name) = captured_dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the unstartable capture reaches disposal");
+        assert_ne!(destructor_thread, submitting_thread);
+        assert_eq!(
+            destructor_name.as_deref(),
+            Some("shelterwood-disposal"),
+            "native fallback failure must retry through disposal isolation"
+        );
     }
 
     #[test]

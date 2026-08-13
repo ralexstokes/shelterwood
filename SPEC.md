@@ -1098,10 +1098,14 @@ handlers non-blocking. Contracts:
   discards a later panic along with the detached thread (documented). A
   submission synchronously rejected by Tokio during blocking-pool shutdown
   moves to a detached Shelterwood-owned thread; the operation and destruction
-  of its captured state never run on the submitting runtime thread. If native
-  thread creation also fails, the captured state still reaches isolated
-  disposal and awaiting the future panics with a runtime-teardown cancellation
-  diagnostic rather than an internal task-invariant claim.
+  of its captured state stay off the submitting runtime thread while an
+  isolation worker can be created. If the dedicated fallback thread cannot
+  start, the captured state transfers to detached disposal and awaiting the
+  future panics with a runtime-teardown cancellation diagnostic rather than an
+  internal task-invariant claim. If the system cannot create the disposal
+  worker either, disposal's final no-loss fallback destroys the state
+  synchronously; thread exhaustion is the sole exception to the isolation
+  guarantee.
 - On orderly return, error, or caught-panic teardown, offloads, lifetime
   tasks, and monitor leases are frozen, cancelled, and joined before actor
   state is dropped. Hard abort necessarily drops the handler future (and

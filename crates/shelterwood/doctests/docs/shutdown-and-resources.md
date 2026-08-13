@@ -93,9 +93,12 @@ exclusive process resources indefinitely.
 If Tokio has already closed its blocking pool during runtime teardown,
 Shelterwood reroutes a rejected `run_blocking` operation to a detached
 Shelterwood-owned thread. This keeps both the operation and destruction of its
-captured state off the submitting runtime thread. If neither Tokio nor a native
-fallback thread can start the operation, its captured state still goes through
-isolated disposal and awaiting the future reports runtime-teardown cancellation.
+captured state off the submitting runtime thread. If that native fallback
+cannot start, its captured state transfers to detached disposal and awaiting
+the future reports runtime-teardown cancellation. If the system cannot create
+the disposal worker either, disposal destroys the state synchronously rather
+than lose it; native thread exhaustion is the sole exception to the isolation
+guarantee.
 
 Async offloads are different: they are incarnation-owned, are cancelled at the
 stop freeze, and never outlive the incarnation. They are intentionally absent

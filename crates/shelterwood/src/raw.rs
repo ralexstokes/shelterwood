@@ -129,7 +129,10 @@ impl Drop for Guard {
 /// Cancellation cannot forcibly stop a blocking thread. Dropping this future
 /// or hard-aborting its actor detaches the thread after requesting cooperative
 /// cancellation; Shelterwood does not join it, and any later value or panic is
-/// discarded. The operation must therefore be safe to outlive its actor.
+/// discarded. A submission rejected during runtime teardown moves to a
+/// detached Shelterwood thread; if no execution thread can start, awaiting the
+/// future panics with a runtime-teardown cancellation diagnostic. The
+/// operation must therefore be safe to outlive its actor.
 #[must_use = "dropping this future requests cooperative cancellation and detaches the thread"]
 pub struct Blocking<T> {
     future: Pin<Box<dyn Future<Output = T> + Send + 'static>>,
@@ -1382,6 +1385,9 @@ impl<M: Send + 'static> RawContext<M> {
     ///
     /// Cancellation is cooperative. If this future is dropped or its actor is
     /// hard-aborted, the OS thread detaches and can outlive the incarnation.
+    /// A blocking-pool rejection during runtime teardown uses a detached
+    /// Shelterwood thread; inability to start one makes the returned future
+    /// panic with a runtime-teardown cancellation diagnostic when awaited.
     pub fn run_blocking<F, T>(&self, operation: F) -> Blocking<T>
     where
         F: FnOnce(CancellationToken) -> T + Send + 'static,

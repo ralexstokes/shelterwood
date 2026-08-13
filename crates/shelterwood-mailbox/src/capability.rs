@@ -148,7 +148,7 @@ impl<T> OneShotReceiver<T> {
     }
 }
 
-fn dispose_value<T: Send + 'static>(runtime: &dyn MailboxRuntime, value: T) {
+pub(crate) fn dispose_value<T: Send + 'static>(runtime: &dyn MailboxRuntime, value: T) {
     runtime.dispose(Box::new(value));
 }
 
@@ -196,207 +196,137 @@ impl<T> Drop for DisposingReceiver<T> {
     }
 }
 
+/// The capability object this crate's own tests run against.
+///
+/// `shelterwood-runtime` depends on this crate, so its `mailbox_runtime()`
+/// implements the trait belonging to the *non-test* build of this crate and
+/// cannot satisfy the `cfg(test)` one. The binding is therefore rebuilt here,
+/// but only as delegation to the same adapter primitives production uses:
+/// restating one-shot, signal, or clock semantics in a hand-written double
+/// would let a divergence from the adapter read as a passing test.
+///
+/// The dev-dependency does not weaken the inversion, which is a claim about
+/// the production graph — `cargo tree -p shelterwood-mailbox -e normal`.
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
         future::Future,
         pin::Pin,
-        sync::{
-            Arc,
-            atomic::{AtomicU8, Ordering},
-        },
+        sync::Arc,
         task::{Context, Poll},
         time::Instant,
     };
 
-    use tokio::sync::{oneshot, watch};
+    use crate::runtime::{
+        OneShotClose, OneShotReceiver, OneShotSender, Signal, SignalWatcher, dispose_detached, now,
+        oneshot, sleep_until,
+    };
 
     use super::{
         BoxedSleep, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
         MailboxRuntime, MailboxSignal, MailboxSignalWatcher,
     };
 
-    const OPEN: u8 = 0;
-    const SENDING: u8 = 1;
-    const SENT: u8 = 2;
-    const SENDER_CLOSED: u8 = 3;
-    const RECEIVER_CLOSED: u8 = 4;
+    struct AdapterRuntime;
 
-    struct TestSender {
-        channel: Option<oneshot::Sender<ErasedValue>>,
-        state: Arc<AtomicU8>,
-    }
-
-    impl ErasedOneShotSender for TestSender {
-        fn send(mut self: Box<Self>, value: ErasedValue) -> Result<(), ErasedValue> {
-            if self
-                .state
-                .compare_exchange(OPEN, SENDING, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Err(value);
-            }
-            match self
-                .channel
-                .take()
-                .expect("a live test sender retains its channel")
-                .send(value)
-            {
-                Ok(()) => {
-                    self.state.store(SENT, Ordering::Release);
-                    Ok(())
-                }
-                Err(value) => {
-                    self.state.store(RECEIVER_CLOSED, Ordering::Release);
-                    Err(value)
-                }
-            }
-        }
-
-        fn is_closed(&self) -> bool {
-            self.channel.as_ref().is_none_or(oneshot::Sender::is_closed)
-        }
-    }
-
-    impl Drop for TestSender {
-        fn drop(&mut self) {
-            if self.channel.is_some() {
-                let _ = self.state.compare_exchange(
-                    OPEN,
-                    SENDER_CLOSED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
-            }
-        }
-    }
-
-    struct TestReceiver {
-        channel: oneshot::Receiver<ErasedValue>,
-        state: Arc<AtomicU8>,
-    }
-
-    impl ErasedOneShotReceiver for TestReceiver {
-        fn poll_receive(
-            mut self: Pin<&mut Self>,
-            context: &mut Context<'_>,
-        ) -> Poll<Option<ErasedValue>> {
-            Pin::new(&mut self.channel).poll(context).map(Result::ok)
-        }
-
-        fn close_and_poll_receive(
-            mut self: Pin<&mut Self>,
-            context: &mut Context<'_>,
-        ) -> ErasedOneShotClose {
-            match self.state.compare_exchange(
-                OPEN,
-                RECEIVER_CLOSED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    self.channel.close();
-                    ErasedOneShotClose::Empty
-                }
-                Err(SENDER_CLOSED) => ErasedOneShotClose::SenderClosed,
-                Err(SENDING) | Err(SENT) => match Pin::new(&mut self.channel).poll(context) {
-                    Poll::Ready(Ok(value)) => ErasedOneShotClose::Value(value),
-                    Poll::Ready(Err(_)) => ErasedOneShotClose::SenderClosed,
-                    Poll::Pending => ErasedOneShotClose::Pending,
-                },
-                Err(RECEIVER_CLOSED) => ErasedOneShotClose::Empty,
-                Err(other) => unreachable!("unknown test one-shot state {other}"),
-            }
-        }
-
-        fn close(mut self: Pin<&mut Self>) {
-            let _ = self.state.compare_exchange(
-                OPEN,
-                RECEIVER_CLOSED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            self.channel.close();
-        }
-
-        fn close_and_take(mut self: Pin<&mut Self>) -> Option<ErasedValue> {
-            self.as_mut().close();
-            self.channel.try_recv().ok()
-        }
-    }
-
-    struct TestSignal(watch::Sender<()>);
-
-    impl MailboxSignal for TestSignal {
-        fn pulse(&self) {
-            self.0.send_modify(|_| {});
-        }
-
-        fn watcher(&self) -> Box<dyn MailboxSignalWatcher> {
-            Box::new(TestWatcher(self.0.subscribe()))
-        }
-    }
-
-    struct TestWatcher(watch::Receiver<()>);
-
-    impl MailboxSignalWatcher for TestWatcher {
-        fn changed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-            Box::pin(async move {
-                let _ = self.0.changed().await;
-            })
-        }
-    }
-
-    #[derive(Debug)]
-    struct TestRuntime;
-
-    impl MailboxRuntime for TestRuntime {
+    impl MailboxRuntime for AdapterRuntime {
         fn oneshot(
             &self,
         ) -> (
             Box<dyn ErasedOneShotSender>,
             Pin<Box<dyn ErasedOneShotReceiver>>,
         ) {
-            let (sender, receiver) = oneshot::channel();
-            let state = Arc::new(AtomicU8::new(OPEN));
+            let (sender, receiver) = oneshot();
             (
-                Box::new(TestSender {
-                    channel: Some(sender),
-                    state: Arc::clone(&state),
-                }),
-                Box::pin(TestReceiver {
-                    channel: receiver,
-                    state,
-                }),
+                Box::new(AdapterOneShotSender(sender)),
+                Box::pin(AdapterOneShotReceiver(receiver)),
             )
         }
 
         fn signal(&self) -> Arc<dyn MailboxSignal> {
-            Arc::new(TestSignal(watch::channel(()).0))
+            Arc::new(AdapterSignal(Signal::default()))
         }
 
         fn dispose(&self, value: Box<dyn Send + 'static>) {
-            let worker = std::thread::spawn(move || {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)));
-            });
-            drop(worker);
+            dispose_detached(value);
         }
 
         fn now(&self) -> Instant {
-            tokio::time::Instant::now().into_std()
+            now()
         }
 
         fn sleep_until(&self, deadline: Option<Instant>) -> BoxedSleep {
-            Box::pin(async move {
-                match deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
-                    None => std::future::pending().await,
-                }
-            })
+            deadline.map_or_else(
+                || Box::pin(std::future::pending()) as BoxedSleep,
+                sleep_until,
+            )
+        }
+    }
+
+    struct AdapterOneShotSender(OneShotSender<ErasedValue>);
+
+    impl ErasedOneShotSender for AdapterOneShotSender {
+        fn send(self: Box<Self>, value: ErasedValue) -> Result<(), ErasedValue> {
+            self.0.send(value)
+        }
+
+        fn is_closed(&self) -> bool {
+            self.0.is_closed()
+        }
+    }
+
+    struct AdapterOneShotReceiver(OneShotReceiver<ErasedValue>);
+
+    impl ErasedOneShotReceiver for AdapterOneShotReceiver {
+        fn poll_receive(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<ErasedValue>> {
+            self.0.poll_receive(context)
+        }
+
+        fn close_and_poll_receive(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> ErasedOneShotClose {
+            match self.0.close_and_poll_receive(context) {
+                OneShotClose::Value(value) => ErasedOneShotClose::Value(value),
+                OneShotClose::SenderClosed => ErasedOneShotClose::SenderClosed,
+                OneShotClose::Empty => ErasedOneShotClose::Empty,
+                OneShotClose::Pending => ErasedOneShotClose::Pending,
+            }
+        }
+
+        fn close(mut self: Pin<&mut Self>) {
+            self.0.close();
+        }
+
+        fn close_and_take(mut self: Pin<&mut Self>) -> Option<ErasedValue> {
+            self.0.close_and_take()
+        }
+    }
+
+    struct AdapterSignal(Signal);
+
+    impl MailboxSignal for AdapterSignal {
+        fn pulse(&self) {
+            self.0.pulse();
+        }
+
+        fn watcher(&self) -> Box<dyn MailboxSignalWatcher> {
+            Box::new(AdapterSignalWatcher(self.0.watcher()))
+        }
+    }
+
+    struct AdapterSignalWatcher(SignalWatcher);
+
+    impl MailboxSignalWatcher for AdapterSignalWatcher {
+        fn changed(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(self.0.changed())
         }
     }
 
     pub(crate) fn runtime() -> Arc<dyn MailboxRuntime> {
-        Arc::new(TestRuntime)
+        Arc::new(AdapterRuntime)
     }
 }

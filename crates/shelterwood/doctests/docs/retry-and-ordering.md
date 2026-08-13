@@ -91,8 +91,9 @@ of these shapes instead:
 - call another actor through an incarnation-owned `offload`, returning the
   result as a continuation message; or
 - split `actor.reply_channel()`, `try_send` the request from the handler
-  (handling `Full`/`NotRunning` — a plain `send` future is lazy, so constructing it
-  without awaiting it sends nothing), and await the receiver from an offload.
+  (handling `Full`/`NotRunning` — a plain `send` future is lazy, so
+  constructing it without awaiting it sends nothing), and await the receiver
+  from an offload.
 
 Offloads use one deadline and their completion returns through the actor loop.
 Cancellation suppresses the continuation, so no offload extends the actor

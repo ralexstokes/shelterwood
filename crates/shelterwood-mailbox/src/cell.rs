@@ -9,7 +9,7 @@ use std::{
 use crate::{
     ChildId, Incarnation, MailboxControl, MailboxDisposal, MailboxRuntime, MailboxSignal,
     MailboxSignalWatcher, MailboxTermination,
-    capability::dispose,
+    capability::{dispose, dispose_value},
     identity::{AtomicPoisonedCounter, PoisonedCounter},
     panic::{PanicAccumulator, PanicPayload, resume_panic},
     policy::ResolvedMailbox,
@@ -516,9 +516,12 @@ impl<M> WaiterQueue<M> {
 /// `MailboxTxn` owns this sink beside the guard and drops the guard first.
 /// Locked transition code can only enqueue effects; pulse callbacks, waker
 /// vtables, payload destructors, and runtime disposal all run during flush.
-struct MailboxEffects<M: Send + 'static> {
-    runtime: Arc<dyn MailboxRuntime>,
-    changed: Arc<dyn MailboxSignal>,
+/// The sink borrows its mailbox rather than cloning the capability handles out
+/// of it: it never outlives the `MailboxTxn` that owns it, and every mailbox
+/// transition — including the per-message receive path — would otherwise pay
+/// two atomic refcount pairs to restate what the transaction already holds.
+struct MailboxEffects<'a, M: Send + 'static> {
+    cell: &'a MailboxCell<M>,
     pulse: bool,
     displaced: Vec<Envelope<M>>,
     isolate_displaced: bool,
@@ -526,11 +529,10 @@ struct MailboxEffects<M: Send + 'static> {
     returned: Option<M>,
 }
 
-impl<M: Send + 'static> MailboxEffects<M> {
-    fn new(cell: &MailboxCell<M>) -> Self {
+impl<'a, M: Send + 'static> MailboxEffects<'a, M> {
+    fn new(cell: &'a MailboxCell<M>) -> Self {
         Self {
-            runtime: Arc::clone(&cell.runtime),
-            changed: Arc::clone(&cell.changed),
+            cell,
             pulse: false,
             displaced: Vec::new(),
             isolate_displaced: false,
@@ -548,11 +550,11 @@ impl<M: Send + 'static> MailboxEffects<M> {
     }
 }
 
-impl<M: Send + 'static> Drop for MailboxEffects<M> {
+impl<M: Send + 'static> Drop for MailboxEffects<'_, M> {
     fn drop(&mut self) {
         let mut panics = PanicAccumulator::default();
         if self.pulse {
-            panics.run(|| self.changed.pulse());
+            panics.run(|| self.cell.changed.pulse());
         }
         // Binding a latest-value mailbox historically handed displaced
         // payloads to isolated disposal before accepted senders were woken.
@@ -561,8 +563,8 @@ impl<M: Send + 'static> Drop for MailboxEffects<M> {
         if self.isolate_displaced && !self.displaced.is_empty() {
             let displaced = std::mem::take(&mut self.displaced);
             panics.run(|| {
-                dispose(
-                    &self.runtime,
+                dispose_value(
+                    self.cell.runtime.as_ref(),
                     MailboxPayload {
                         queue: Some(displaced.into()),
                         latest: None,
@@ -586,7 +588,7 @@ impl<M: Send + 'static> Drop for MailboxEffects<M> {
 /// A mailbox transition guard paired with its mandatory post-unlock effects.
 struct MailboxTxn<'a, M: Send + 'static> {
     state: Option<MutexGuard<'a, MailboxState<M>>>,
-    effects: MailboxEffects<M>,
+    effects: MailboxEffects<'a, M>,
 }
 
 impl<'a, M: Send + 'static> MailboxTxn<'a, M> {
@@ -599,7 +601,7 @@ impl<'a, M: Send + 'static> MailboxTxn<'a, M> {
         }
     }
 
-    fn parts(&mut self) -> (&mut MailboxState<M>, &mut MailboxEffects<M>) {
+    fn parts(&mut self) -> (&mut MailboxState<M>, &mut MailboxEffects<'a, M>) {
         (
             self.state
                 .as_deref_mut()
@@ -1198,7 +1200,7 @@ fn accept_locked<M>(
     incarnation: Incarnation,
     message: M,
     accepted: &AtomicPoisonedCounter,
-    effects: &mut MailboxEffects<M>,
+    effects: &mut MailboxEffects<'_, M>,
 ) -> Result<Incarnation, M>
 where
     M: Send + 'static,
@@ -1253,7 +1255,7 @@ where
 fn promote_waiters<M: Send + 'static>(
     state: &mut MailboxState<M>,
     accepted_sequence: &AtomicPoisonedCounter,
-    effects: &mut MailboxEffects<M>,
+    effects: &mut MailboxEffects<'_, M>,
 ) {
     let Some(kind) = state.kind else {
         return;
@@ -1287,7 +1289,7 @@ fn promote_waiter_queue<M: Send + 'static>(
     queue: &mut VecDeque<Envelope<M>>,
     latest: &mut Option<Envelope<M>>,
     accepted_sequence: &AtomicPoisonedCounter,
-    effects: &mut MailboxEffects<M>,
+    effects: &mut MailboxEffects<'_, M>,
 ) {
     let available = match kind {
         MailboxKind::Queue(capacity) => capacity.get().saturating_sub(queue.len()),

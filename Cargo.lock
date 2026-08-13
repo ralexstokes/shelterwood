@@ -135,6 +135,7 @@ name = "shelterwood-mailbox"
 version = "0.1.0"
 dependencies = [
  "shelterwood-core",
+ "shelterwood-runtime",
  "tokio",
 ]
 

@@ -816,8 +816,13 @@ Delivery is at-most-once (§1 principle 6). Send flavors on `ActorRef`
 only synchronous state transitions. A transition records signal pulses,
 waker wake/drop actions, displaced payloads, and isolated disposal requests in
 an effects sink paired with its guard; the guard is released before that sink
-can flush. No `RawWaker` vtable, message destructor, signal callback, or
-runtime-disposal capability runs under either mutex, including unwind paths.
+can flush. On every path a transition can complete — acceptance, rejection,
+withdrawal, terminal teardown, and an unwind out of any of them — no `RawWaker`
+vtable, message destructor, signal callback, or runtime-disposal capability
+runs under either mutex. The one carve-out is a framework invariant break
+(identity-space exhaustion or an unreachable binding state): those unwind with
+the payload still under the guard, and they poison the mutex regardless, so the
+transition is abandoned rather than completed.
 The registered-waker slot exposes no operation that returns or replaces a
 `Waker` without an effects sink, making the #202 failure shape structurally
 unrepresentable rather than a call-site convention. Cancellation returns one

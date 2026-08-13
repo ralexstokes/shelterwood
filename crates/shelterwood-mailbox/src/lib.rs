@@ -2,9 +2,10 @@
 
 //! Mailbox state machines and public messaging primitives.
 //!
-//! Tokio details remain behind `shelterwood-runtime`; this crate names only
-//! the adapter operations its futures need. Cross-crate lifecycle and identity
-//! capabilities are public implementation seams, not supported façade API.
+//! Tokio details remain behind `shelterwood-runtime`: this crate declares the
+//! runtime capabilities its futures need and never names an executor, in tests
+//! as well as in production. Cross-crate lifecycle and identity capabilities
+//! are public implementation seams, not supported façade API.
 
 use std::{fmt, sync::Arc};
 
@@ -97,7 +98,14 @@ impl<T: ActorIdentity + ?Sized> ActorIdentity for Arc<T> {
     }
 }
 
+/// The Tokio adapter, reachable only as a dev-dependency.
+///
+/// `shelterwood-runtime` depends on this crate, so this is a dev-only cycle
+/// that leaves the production graph inverted (`cargo tree -e normal` shows
+/// `shelterwood-core` alone). Tests take their capability object and their
+/// runtime attribute from the real adapter rather than a stand-in, keeping
+/// tokio unnamed here.
 #[cfg(test)]
 mod runtime {
-    pub(crate) use tokio::{test, time::advance};
+    pub(crate) use shelterwood_runtime::*;
 }

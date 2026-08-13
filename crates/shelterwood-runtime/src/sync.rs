@@ -336,7 +336,7 @@ impl<T> OneShotReceiver<T> {
     /// The shared transition word distinguishes sender-drop from receiver
     /// close, which Tokio's post-close `try_recv` result alone cannot do. A
     /// send that wins but is preempted before publishing returns `Pending`;
-    /// the preceding channel poll registered the wake for its completion.
+    /// the channel poll in that branch registers the wake for its completion.
     pub fn close_and_poll_receive(
         &mut self,
         context: &mut std::task::Context<'_>,
@@ -640,7 +640,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Poll, Waker},
+        task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
 
@@ -648,6 +648,14 @@ mod tests {
         CompletionGatedLatch, JoinOutcome, Latch, OneShotClose, Signal, Timeout, join, oneshot,
         spawn, timeout, yield_now,
     };
+
+    struct CountWake(Arc<AtomicUsize>);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn closing_oneshot_distinguishes_value_sender_drop_and_receiver_win() {
@@ -740,6 +748,56 @@ mod tests {
         assert_eq!(transitions, 1);
         assert!(latch.is_fired());
         assert!(!latch.fire());
+    }
+
+    #[test]
+    fn silent_fire_defers_a_parked_waiters_wake_until_notify() {
+        let latch = Latch::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+        let mut fired = Box::pin(latch.fired());
+
+        assert!(
+            fired
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert!(latch.fire_silently());
+        assert!(latch.is_fired());
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+        latch.notify();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(
+            fired
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+    }
+
+    #[test]
+    fn completion_waiters_cover_parked_and_already_completed_paths() {
+        let parked = CompletionGatedLatch::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+        let mut waiting = Box::pin(parked.completed());
+        let mut context = Context::from_waker(&waker);
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert!(!parked.complete());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(waiting.as_mut().poll(&mut context).is_ready());
+
+        let completed = CompletionGatedLatch::default();
+        assert!(!completed.complete());
+        let mut immediate = Box::pin(completed.completed());
+        assert!(
+            immediate
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

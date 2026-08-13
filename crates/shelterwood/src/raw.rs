@@ -1420,6 +1420,10 @@ impl<M: Send + 'static> RawContext<M> {
                 return None;
             }
             if self.shutdown.is_cancelled() {
+                // Every driver path freezes (or closes) this incarnation's
+                // mailbox before firing its shutdown token. That ordering is
+                // what makes the frozen accepted prefix a complete drain
+                // boundary once cancellation is observable here.
                 self.freeze_and_report();
                 return None;
             }

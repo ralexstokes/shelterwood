@@ -237,24 +237,44 @@ fn explore(
 
 /// The configurations every property is checked against.
 ///
-/// Both flavors at both widths, plus a dynamic roster carrying a runtime
-/// membership so R1's initial-only aggregate has a counterexample available.
-/// There is deliberately no ordered mixed roster: runtime admission is
-/// reachable only through the dynamic surface, so an ordered scope with a
-/// runtime member is not a state the library can produce, and asserting over
-/// it would pin behavior nothing generates.
+/// Both flavors, plus a dynamic roster carrying a runtime membership so R1's
+/// initial-only aggregate has a counterexample available. There is
+/// deliberately no ordered mixed roster: runtime admission is reachable only
+/// through the dynamic surface, so an ordered scope with a runtime member is
+/// not a state the library can produce, and asserting over it would pin
+/// behavior nothing generates.
 const CONFIGURATIONS: &[(ScopeFlavor, Roster)] = &[
     (ScopeFlavor::Ordered, &[true, true]),
     (ScopeFlavor::Dynamic, &[true, true]),
     (ScopeFlavor::Dynamic, &[true, false]),
 ];
 
-fn explore_all(mut check: impl FnMut(&Transition<'_>)) -> Exploration {
+/// The same walk one child wider, which the ordinary lane does not run.
+///
+/// Width three costs 1.4M states and 53M transitions against width two's 49k
+/// and 1.3M — 40x for the same properties, because each additional child
+/// multiplies the space by its own phase count and, for ordered scopes, by the
+/// cursor positions that range over it. Measured against a mutation set
+/// covering R1–R6, E4 and S3–S5, every mutation width three catches is already
+/// caught at width two, and the two that neither catches are progress rules
+/// that no width can see (`ordered_startup_advances_through_every_initial_member_in_order`
+/// and `ordered_stop_releases_one_child_per_join_in_reverse_order` own those).
+/// So it is kept as a widening tool for when the reducer's shape changes,
+/// not as coverage the ordinary loop pays for every run.
+const WIDE_CONFIGURATIONS: &[(ScopeFlavor, Roster)] = &[
+    (ScopeFlavor::Ordered, &[true, true, true]),
+    (ScopeFlavor::Dynamic, &[true, true, true]),
+];
+
+fn explore_all(
+    configurations: &[(ScopeFlavor, Roster)],
+    mut check: impl FnMut(&Transition<'_>),
+) -> Exploration {
     let mut total = Exploration {
         states: 0,
         transitions: 0,
     };
-    for &(flavor, roster) in CONFIGURATIONS {
+    for &(flavor, roster) in configurations {
         let run = explore(flavor, roster, &mut check);
         println!(
             "{flavor:?} {roster:?}: {} states, {} transitions",
@@ -655,18 +675,33 @@ fn check_s5_derived_level_triggered_completion(transition: &Transition<'_>) {
 /// reclaim rules need to be reachable at all.
 #[test]
 fn exhaustive_reachable_states_preserve_the_reducer_invariants() {
-    let run = explore_all(|transition| {
-        check_e4_authoritative_membership_and_incarnation_state(transition);
-        check_r5_effects_are_acknowledgeable(transition);
-        check_r5_settlement_reaches_a_fixed_point(transition);
-        check_r3_removal_is_sampled_at_publication(transition);
-        check_r1_r2_r6_startup_aggregate(transition);
-        check_r4_one_accepted_start_edge(transition);
-        check_s3_s4_stop_sequencing_and_drain_lattice(transition);
-        check_s5_derived_level_triggered_completion(transition);
-    });
+    let run = explore_all(CONFIGURATIONS, check_every_invariant);
     println!(
         "explored {} states over {} transitions",
         run.states, run.transitions
     );
+}
+
+/// The same properties one child wider; see [`WIDE_CONFIGURATIONS`] for why
+/// the ordinary lane does not pay for it. Run with
+/// `cargo test -p shelterwood-core -- --ignored --nocapture`.
+#[test]
+#[ignore = "40x the ordinary lane's cost for no mutation the ordinary lane misses"]
+fn exhaustive_reachable_states_preserve_the_reducer_invariants_one_child_wider() {
+    let run = explore_all(WIDE_CONFIGURATIONS, check_every_invariant);
+    println!(
+        "explored {} states over {} transitions",
+        run.states, run.transitions
+    );
+}
+
+fn check_every_invariant(transition: &Transition<'_>) {
+    check_e4_authoritative_membership_and_incarnation_state(transition);
+    check_r5_effects_are_acknowledgeable(transition);
+    check_r5_settlement_reaches_a_fixed_point(transition);
+    check_r3_removal_is_sampled_at_publication(transition);
+    check_r1_r2_r6_startup_aggregate(transition);
+    check_r4_one_accepted_start_edge(transition);
+    check_s3_s4_stop_sequencing_and_drain_lattice(transition);
+    check_s5_derived_level_triggered_completion(transition);
 }

@@ -155,6 +155,9 @@ impl<H: Unpin> Future for Admission<H> {
                     return Poll::Ready(Err(error));
                 }
                 AdmissionState::Unpolled(pending) => {
+                    // Keep the annul-owning `Unpolled` state installed until
+                    // this fallible operation returns. If it unwinds, Drop
+                    // must still find `pending` and cancel the reservation.
                     let wait = match pending.start() {
                         Ok(wait) => wait,
                         Err(error) => {

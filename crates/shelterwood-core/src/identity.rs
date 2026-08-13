@@ -658,6 +658,28 @@ mod tests {
     }
 
     #[test]
+    fn terminal_eviction_recovers_an_exhausted_id_with_a_fresh_lineage() {
+        const TEST_LINEAGE: u64 = u64::MAX;
+        let id = ChildId::from("worker");
+        // The global allocator cannot reach this fixture lineage in the test,
+        // so recovery must allocate a distinct comparison domain.
+        let mut scope = ScopeIdentity::near_exhaustion(id.clone(), TEST_LINEAGE);
+        let last = scope
+            .mint_membership(&id)
+            .expect("last usable membership is minted")
+            .membership();
+        assert!(scope.mint_membership(&id).is_none());
+
+        scope.evict(&id, last);
+        let recovered = scope
+            .mint_membership(&id)
+            .expect("terminal eviction releases the exhausted id")
+            .membership();
+        assert!(!last.supersedes(recovered));
+        assert!(!recovered.supersedes(last));
+    }
+
+    #[test]
     fn exhausted_stable_domain_rejects_a_rebuilt_declaration() {
         let id = ChildId::from("worker");
         let mut stable = ScopeIdentity::near_exhaustion(id.clone(), 7);

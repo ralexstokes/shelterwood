@@ -1095,7 +1095,13 @@ handlers non-blocking. Contracts:
   closure's return value; a panic in the closure is captured and resumes
   where the future is awaited — on the actor task, the ordinary
   actor-panic path (§7) — while a future dropped before completion
-  discards a later panic along with the detached thread (documented).
+  discards a later panic along with the detached thread (documented). A
+  submission synchronously rejected by Tokio during blocking-pool shutdown
+  moves to a detached Shelterwood-owned thread; the operation and destruction
+  of its captured state never run on the submitting runtime thread. If native
+  thread creation also fails, the captured state still reaches isolated
+  disposal and awaiting the future panics with a runtime-teardown cancellation
+  diagnostic rather than an internal task-invariant claim.
 - On orderly return, error, or caught-panic teardown, offloads, lifetime
   tasks, and monitor leases are frozen, cancelled, and joined before actor
   state is dropped. Hard abort necessarily drops the handler future (and

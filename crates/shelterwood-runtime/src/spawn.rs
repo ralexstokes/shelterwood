@@ -1,10 +1,24 @@
-use std::{any::Any, future::Future, ops::RangeBounds, panic::resume_unwind};
+use std::{
+    any::Any,
+    future::{Future, poll_fn},
+    ops::RangeBounds,
+    panic::resume_unwind,
+    sync::{Arc, Mutex},
+};
 
 use tokio::{sync::mpsc, task};
 
 use shelterwood_core::exit::JoinVerdict as JoinOutcome;
 
-use super::{PanicPayload, catch_panic, discard_panic, sleep_until_std};
+use super::{
+    DisposingReceiver, OneShotSender, PanicPayload, catch_panic, discard_panic, dispose_detached,
+    oneshot, sleep_until_std,
+};
+
+const BLOCKING_FALLBACK_THREAD: &str = "shelterwood-blocking";
+
+type BlockingOutcome<T> = Result<T, PanicPayload>;
+type BlockingCompletion<T> = OneShotSender<BlockingOutcome<T>>;
 
 /// Counts the runtime's currently alive spawned tasks, keeping runtime
 /// metrics access in this module.
@@ -119,8 +133,133 @@ pub fn spawn_actor_work(future: impl Future<Output = ()> + Send + 'static) -> Ac
 pub fn spawn_blocking_work<T: Send + 'static>(
     operation: impl FnOnce() -> T + Send + 'static,
 ) -> impl Future<Output = T> + Send {
-    let handle = spawn_blocking(operation);
-    async move { join_resuming(handle).await }
+    let (completion, receiver) = oneshot();
+    let mut receiver = DisposingReceiver::new(receiver);
+    let job = BlockingJob::new(operation, completion);
+    let worker = Arc::clone(&job);
+
+    let mut needs_fallback = true;
+    match catch_panic(|| task::spawn_blocking(move || worker.run())) {
+        Ok(handle) => {
+            drop(handle);
+            // Tokio returns a handle even when the blocking pool is already
+            // shutting down. In that case it synchronously destroys the
+            // closure, leaving `job` as the only reference with pending work.
+            needs_fallback = blocking_spawn_needs_fallback(&job);
+        }
+        Err(payload) => discard_panic(Some(payload)),
+    }
+
+    if needs_fallback {
+        let worker = Arc::clone(&job);
+        // A blocking operation cannot share disposal's single fallback queue:
+        // one legitimately long operation would strand every later job. This
+        // path exists only for runtime teardown, so one detached thread per
+        // rejected operation is the appropriate degradation.
+        let fallback = std::thread::Builder::new()
+            .name(BLOCKING_FALLBACK_THREAD.to_owned())
+            .spawn(move || worker.run());
+        if let Err(error) = fallback {
+            // `job` still owns the operation. Its Drop implementation routes
+            // the captured closure through isolated disposal, so even native
+            // thread exhaustion cannot destroy user state on this submitter.
+            drop(error);
+        }
+    }
+    drop(job);
+
+    async move {
+        match poll_fn(|context| receiver.poll_receive(context)).await {
+            Some(Ok(value)) => value,
+            Some(Err(payload)) => resume_unwind(payload),
+            None => panic!("blocking operation was cancelled during runtime teardown"),
+        }
+    }
+}
+
+/// A blocking closure plus the completion lane that outlives its Tokio task.
+///
+/// Tokio can synchronously destroy a rejected `spawn_blocking` closure while
+/// still returning a join handle. Keeping the user closure behind an `Arc`
+/// lets the submitter detect that outcome and move the same job to a fallback
+/// thread without ever reclaiming the captured state inline.
+struct BlockingJob<F, T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    pending: Mutex<Option<(F, BlockingCompletion<T>)>>,
+}
+
+impl<F, T> BlockingJob<F, T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    fn new(operation: F, completion: BlockingCompletion<T>) -> Arc<Self> {
+        Arc::new(Self {
+            pending: Mutex::new(Some((operation, completion))),
+        })
+    }
+
+    fn run(&self) {
+        let Some((operation, completion)) = self
+            .pending
+            .lock()
+            .expect("blocking job mutex poisoned")
+            .take()
+        else {
+            return;
+        };
+        let outcome = catch_panic(operation);
+        if let Err(unclaimed) = completion.send(outcome) {
+            // The returned future was dropped. We are already on a blocking
+            // worker, but still contain a hostile result/panic-payload
+            // destructor so it cannot unwind through the worker entry point.
+            discard_panic(catch_panic(|| drop(unclaimed)).err());
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending
+            .lock()
+            .expect("blocking job mutex poisoned")
+            .is_some()
+    }
+}
+
+impl<F, T> Drop for BlockingJob<F, T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    fn drop(&mut self) {
+        let Some((operation, completion)) = self
+            .pending
+            .lock()
+            .expect("blocking job mutex poisoned")
+            .take()
+        else {
+            return;
+        };
+        // A cancelled or unstartable job must wake its waiter, but a hostile
+        // waiter waker must not interrupt isolation of the captured closure.
+        discard_panic(catch_panic(|| drop(completion)).err());
+        dispose_detached(operation);
+    }
+}
+
+/// Returns whether Tokio synchronously rejected a blocking work submission.
+///
+/// Sole ownership proves that Tokio no longer holds the submitted closure;
+/// the pending check distinguishes rejection from a fast task that completed
+/// before the submitter sampled the reference count.
+fn blocking_spawn_needs_fallback<F, T>(job: &Arc<BlockingJob<F, T>>) -> bool
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    Arc::strong_count(job) == 1 && job.is_pending()
 }
 
 /// A spawned operation owned by the library.
@@ -332,6 +471,50 @@ impl Default for JitterRng {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Condvar, Mutex, mpsc},
+        thread::{self, ThreadId},
+        time::{Duration, Instant},
+    };
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    type ThreadDescription = (ThreadId, Option<String>);
+
+    fn describe_current_thread() -> ThreadDescription {
+        let current = thread::current();
+        (current.id(), current.name().map(str::to_owned))
+    }
+
+    struct BlockingDrop {
+        entered: mpsc::Sender<ThreadDescription>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl Drop for BlockingDrop {
+        fn drop(&mut self) {
+            let _ = self.entered.send(describe_current_thread());
+            let (released, wake) = &*self.release;
+            let mut released = released.lock().expect("release mutex available");
+            let deadline = Instant::now() + WAIT;
+            while !*released {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                released = wake
+                    .wait_timeout(released, remaining)
+                    .expect("release mutex available")
+                    .0;
+            }
+        }
+    }
+
+    fn release(gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (released, wake) = &**gate;
+        *released.lock().expect("release mutex available") = true;
+        wake.notify_all();
+    }
+
     #[tokio::test]
     async fn scope_wait_prefers_signal_when_both_control_futures_are_ready() {
         let (_sender, mut receiver) = super::unbounded_mpsc::<()>();
@@ -372,5 +555,100 @@ mod tests {
 
         assert!(matches!(wake, super::ScopeWake::Message(Some(999))));
         assert_eq!(control_receiver.try_recv(), Ok(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_work_preserves_values_and_panics() {
+        assert_eq!(super::spawn_blocking_work(|| 42_u8).await, 42);
+
+        let panicking = super::spawn(async {
+            super::spawn_blocking_work(|| panic!("blocking work panic")).await
+        });
+        assert!(matches!(
+            super::join(panicking).await,
+            super::JoinOutcome::Panic {
+                message: Some(message)
+            } if message == "blocking work panic"
+        ));
+    }
+
+    #[test]
+    fn shut_down_blocking_pool_runs_rejected_work_off_the_submitting_thread() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .expect("test runtime");
+        let (worker_started, worker_started_rx) = mpsc::channel();
+        let (release_worker, release_worker_rx) = mpsc::channel();
+        drop(runtime.spawn_blocking(move || {
+            worker_started
+                .send(())
+                .expect("test observes the occupied blocking worker");
+            release_worker_rx
+                .recv()
+                .expect("test releases the occupied blocking worker");
+        }));
+        worker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the sole blocking worker starts");
+
+        let (future_tx, future_rx) = mpsc::channel();
+        let (submitted, submitted_rx) = mpsc::channel();
+        let (returned, returned_rx) = mpsc::channel();
+        let (entered, entered_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let captured = BlockingDrop {
+            entered,
+            release: Arc::clone(&gate),
+        };
+        // This outer task stays queued behind the occupied worker. Tokio runs
+        // it while draining shutdown, so its nested blocking submission is
+        // synchronously rejected even though `spawn_blocking` returns a handle.
+        drop(runtime.spawn_blocking(move || {
+            let submitting_thread = thread::current().id();
+            let future = super::spawn_blocking_work(move || {
+                drop(captured);
+                42_u8
+            });
+            submitted
+                .send(submitting_thread)
+                .expect("test observes the submitting thread");
+            future_tx
+                .send(future)
+                .expect("test receives the blocking-work future");
+            returned.send(()).expect("test observes submission return");
+        }));
+        runtime.shutdown_background();
+        release_worker
+            .send(())
+            .expect("the blocking-pool teardown may proceed");
+
+        let submitting_thread = submitted_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime teardown submits blocking work");
+        let future = future_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a rejected submission still returns its future");
+        let (operation_thread, operation_name) = entered_rx
+            .recv_timeout(WAIT + Duration::from_secs(1))
+            .expect("the rejected operation starts");
+        // This arrives while the captured destructor is still blocked. On the
+        // regression path Tokio destroys the closure inline and submission
+        // cannot return until the escape hatch fires.
+        let submission_returned = returned_rx.recv_timeout(Duration::from_secs(1));
+
+        release(&gate);
+        submission_returned.expect("captured destruction must not block submission");
+
+        let consumer = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("consumer runtime");
+        assert_eq!(consumer.block_on(future), 42);
+        assert_ne!(operation_thread, submitting_thread);
+        assert_eq!(
+            operation_name.as_deref(),
+            Some(super::BLOCKING_FALLBACK_THREAD),
+            "a rejected operation must land on Shelterwood's fallback thread"
+        );
     }
 }

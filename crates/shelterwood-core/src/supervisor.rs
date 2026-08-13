@@ -931,6 +931,123 @@ mod tests {
         }
     }
 
+    /// R4 — ordered startup hands out one start edge at a time *and reaches
+    /// every member*. The cursor's advance is a progress rule, so no safety
+    /// property over reachable states can see it: a cursor that skipped a
+    /// middle member would leave that member unready forever, which is a
+    /// startup that never completes rather than a state that is wrong.
+    #[test]
+    fn ordered_startup_advances_through_every_initial_member_in_order() {
+        let members = memberships(3);
+        let mut state = SupervisorState::new(ScopeFlavor::Ordered, ScopeLifecycle::starting());
+        let keys: Vec<_> = members
+            .iter()
+            .map(|membership| admit(&mut state, *membership, true))
+            .collect();
+
+        let mut effects = Vec::new();
+        for &expected in &keys {
+            step(&mut state, Event::Settle, &mut effects);
+            assert_eq!(
+                effects,
+                [Effect::StartChild { child: expected }],
+                "ordered startup starts the cursor's own member next"
+            );
+            effects.clear();
+            step(&mut state, Event::Spawned { child: expected }, &mut effects);
+            step(
+                &mut state,
+                Event::Ready {
+                    child: expected,
+                    removal_latched: false,
+                },
+                &mut effects,
+            );
+            assert!(effects.is_empty());
+        }
+
+        step(&mut state, Event::Settle, &mut effects);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StartupCompleted { .. }]
+        ));
+        state.check_invariants();
+    }
+
+    /// The ordered half of R6's aggregate rule, which is narrower than the
+    /// section states: a member latched for removal parks the ordered cursor
+    /// until the removal commits, so ordered startup can have every initial
+    /// member ready and still withhold completion. Dynamic startup completes
+    /// on the readiness predicate alone.
+    #[test]
+    fn ordered_startup_waits_for_a_removing_member_to_commit() {
+        let members = memberships(2);
+        let mut state = SupervisorState::new(ScopeFlavor::Ordered, ScopeLifecycle::starting());
+        let keys: Vec<_> = members
+            .iter()
+            .map(|membership| admit(&mut state, *membership, true))
+            .collect();
+        let mut effects = Vec::new();
+        for &child in &keys {
+            step(&mut state, Event::Settle, &mut effects);
+            effects.clear();
+            step(&mut state, Event::Spawned { child }, &mut effects);
+            step(
+                &mut state,
+                Event::Ready {
+                    child,
+                    removal_latched: false,
+                },
+                &mut effects,
+            );
+        }
+        effects.clear();
+
+        let removing = keys[1];
+        step(
+            &mut state,
+            Event::RemovalLatched { child: removing },
+            &mut effects,
+        );
+        assert_eq!(effects, [Effect::StopChild { child: removing }]);
+        effects.clear();
+        assert!(
+            keys.iter().all(|&child| state.initial_ready(child)),
+            "every initial member is ready before the cursor is asked to advance"
+        );
+
+        step(&mut state, Event::Settle, &mut effects);
+        assert!(
+            effects.is_empty(),
+            "the ordered cursor waits on the removing member, {effects:?}"
+        );
+
+        step(
+            &mut state,
+            Event::IncarnationComplete { child: removing },
+            &mut effects,
+        );
+        step(
+            &mut state,
+            Event::DisposalStarted { child: removing },
+            &mut effects,
+        );
+        step(
+            &mut state,
+            Event::Terminalized { child: removing },
+            &mut effects,
+        );
+        assert_eq!(effects, [Effect::FinalizeRemoval { child: removing }]);
+        effects.clear();
+        step(&mut state, Event::Reclaim { child: removing }, &mut effects);
+        step(&mut state, Event::Settle, &mut effects);
+        assert!(
+            matches!(effects.as_slice(), [Effect::StartupCompleted { .. }]),
+            "committing the removal releases the aggregate, {effects:?}"
+        );
+        state.check_invariants();
+    }
+
     #[test]
     fn ordered_stop_releases_one_child_per_join_in_reverse_order() {
         let members = memberships(3);

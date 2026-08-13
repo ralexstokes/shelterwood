@@ -397,6 +397,31 @@ fn check_r5_settlement_reaches_a_fixed_point(transition: &Transition<'_>) {
     );
 }
 
+/// R3 — removal is sampled at the publication transition. A true sample marks
+/// the membership `Removing` first, and readiness is then rejected, so the
+/// removal path can never manufacture the readiness edge it raced.
+fn check_r3_removal_is_sampled_at_publication(transition: &Transition<'_>) {
+    let Event::Ready {
+        child,
+        removal_latched: true,
+    } = transition.event
+    else {
+        return;
+    };
+    if !transition.after.contains(*child) {
+        return;
+    }
+    assert_eq!(
+        transition.after.membership_status(*child),
+        MembershipStatus::Removing,
+        "a true latch sample marks the membership before readiness is considered"
+    );
+    assert!(
+        !transition.after.initial_ready(*child) || transition.before.initial_ready(*child),
+        "a latched readiness edge cannot join the startup aggregate"
+    );
+}
+
 /// R1/R2/R6 — the startup aggregate is derived from initial memberships only,
 /// readiness is monotone until a restart rearms it while startup is
 /// incomplete, and a completed startup never rewinds.
@@ -476,7 +501,8 @@ fn check_r1_r2_r6_startup_aggregate(transition: &Transition<'_>) {
             .any(|record| record.state.membership_status() == MembershipStatus::Removing);
     if settling_a_starting_scope && !unready && !ordered_cursor_may_wait {
         assert_eq!(
-            completed, 1,
+            completed,
+            1,
             "a settle that finds no unready initial member completes startup: {:?} {:?}",
             transition.before.flavor(),
             transition.before.children,
@@ -633,6 +659,7 @@ fn exhaustive_reachable_states_preserve_the_reducer_invariants() {
         check_e4_authoritative_membership_and_incarnation_state(transition);
         check_r5_effects_are_acknowledgeable(transition);
         check_r5_settlement_reaches_a_fixed_point(transition);
+        check_r3_removal_is_sampled_at_publication(transition);
         check_r1_r2_r6_startup_aggregate(transition);
         check_r4_one_accepted_start_edge(transition);
         check_s3_s4_stop_sequencing_and_drain_lattice(transition);

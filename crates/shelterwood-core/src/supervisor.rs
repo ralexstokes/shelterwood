@@ -972,6 +972,45 @@ mod tests {
         state.check_invariants();
     }
 
+    /// R4 — dynamic startup emits one start per *unspawned* initial member.
+    /// A member awaiting a restart deadline has spawned once already, and its
+    /// re-construction belongs to the restart path rather than to settlement;
+    /// re-attracting it here would ask two owners to construct the same
+    /// incarnation. No state-space property can see this — the record is
+    /// `startable`, so the start is acknowledgeable, and re-settling reproduces
+    /// it, so the fixed point holds — which is why it is pinned directly.
+    #[test]
+    fn dynamic_startup_leaves_a_restart_pending_member_to_the_restart_path() {
+        let membership = memberships(1)[0];
+        let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::starting());
+        let child = admit(&mut state, membership, true);
+        let mut effects = Vec::new();
+        step(&mut state, Event::Settle, &mut effects);
+        assert_eq!(effects, [Effect::StartChild { child }]);
+        effects.clear();
+
+        for event in [
+            Event::Spawned { child },
+            Event::IncarnationComplete { child },
+            Event::RestartPending { child },
+        ] {
+            step(&mut state, event, &mut effects);
+        }
+        assert_eq!(
+            state.child_state(child),
+            Some(ChildState::Resident(IncarnationState::RestartPending))
+        );
+        assert!(state.spawned_once(child));
+        effects.clear();
+
+        step(&mut state, Event::Settle, &mut effects);
+        assert!(
+            effects.is_empty(),
+            "settlement does not re-attract a member the restart path owns, got {effects:?}"
+        );
+        state.check_invariants();
+    }
+
     /// The ordered half of R6's aggregate rule, which is narrower than the
     /// section states: a member latched for removal parks the ordered cursor
     /// until the removal commits, so ordered startup can have every initial

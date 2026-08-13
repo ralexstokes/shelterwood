@@ -37,7 +37,7 @@ const MAX_WIDTH: usize = 4;
 /// That makes any field dropped from it a silent pruning bug — the successors
 /// only the discarded state had are never explored — which is why the
 /// destructure below is exhaustive and a new field cannot compile until it is
-/// classified. Two fields are deliberately not encoded, each with a reason
+/// classified. Four fields are deliberately not encoded, each with a reason
 /// that holds by construction rather than by inspection:
 ///
 /// - `child_keys` is the exact inverse of `children`, and the walk asserts
@@ -45,6 +45,9 @@ const MAX_WIDTH: usize = 4;
 ///   cannot carry a distinction `children` does not already carry.
 /// - `keys` only advances on admission, which is not in the alphabet, so it is
 ///   constant across a walk. [`explore`] asserts that instead of encoding it.
+/// - `ordered_stop_inspections` is diagnostic; see the destructure below.
+/// - `ChildRecord::membership` is immutable for the life of its key, so the
+///   slot index already carries it; see `slot` below.
 ///
 /// A packed word rather than a struct of collections because the walk hashes
 /// tens of millions of them: allocation per state dominated everything else
@@ -107,6 +110,10 @@ fn fingerprint(state: &SupervisorState, keys: &[ChildKey]) -> u64 {
 
     let cursor = |key: &Option<ChildKey>| key.map_or(7, slot);
     let (lifecycle_state, lifecycle_reason) = lifecycle.fingerprint();
+    // The exhaustive match in `ScopeLifecycle::fingerprint` forces a new
+    // variant to choose a projection, but not to choose one that fits: a value
+    // of 8 would alias into the flavor bit and prune the space silently.
+    assert!(lifecycle_state < 8 && lifecycle_reason < 8, "3-bit fields");
     word |= u64::from(lifecycle_state) << (8 * MAX_WIDTH);
     word |= u64::from(lifecycle_reason) << (8 * MAX_WIDTH + 3);
     word |= u64::from(*flavor == ScopeFlavor::Ordered) << (8 * MAX_WIDTH + 6);
@@ -243,27 +250,23 @@ fn explore(
 /// through the dynamic surface, so an ordered scope with a runtime member is
 /// not a state the library can produce, and asserting over it would pin
 /// behavior nothing generates.
+///
+/// **Two children, not three, and that is not a budget compromise.** Every
+/// property here is per-child, a fold over children, or cursor-versus-one-
+/// child; the reducer has no rule that couples three memberships, so a third
+/// adds combinations rather than cases. Measured, a third child costs 40x
+/// (1.4M states and 53M transitions against 49k and 1.3M) and no mutation
+/// covering R1–R6, E4 or S3–S5 survives width two but falls to width three.
+/// The one genuinely three-body distinction — `keys_after(child).next()`
+/// against `.last()`, which needs a middle element to differ at all — is a
+/// progress rule that no width detects; `ordered_startup_advances_through_every_initial_member_in_order`
+/// and `ordered_stop_releases_one_child_per_join_in_reverse_order` own that
+/// class. Widening is a one-line change here if the reducer grows a rule that
+/// needs it, and [`MAX_WIDTH`] leaves the fingerprint room for it.
 const CONFIGURATIONS: &[(ScopeFlavor, Roster)] = &[
     (ScopeFlavor::Ordered, &[true, true]),
     (ScopeFlavor::Dynamic, &[true, true]),
     (ScopeFlavor::Dynamic, &[true, false]),
-];
-
-/// The same walk one child wider, which the ordinary lane does not run.
-///
-/// Width three costs 1.4M states and 53M transitions against width two's 49k
-/// and 1.3M — 40x for the same properties, because each additional child
-/// multiplies the space by its own phase count and, for ordered scopes, by the
-/// cursor positions that range over it. Measured against a mutation set
-/// covering R1–R6, E4 and S3–S5, every mutation width three catches is already
-/// caught at width two, and the two that neither catches are progress rules
-/// that no width can see (`ordered_startup_advances_through_every_initial_member_in_order`
-/// and `ordered_stop_releases_one_child_per_join_in_reverse_order` own those).
-/// So it is kept as a widening tool for when the reducer's shape changes,
-/// not as coverage the ordinary loop pays for every run.
-const WIDE_CONFIGURATIONS: &[(ScopeFlavor, Roster)] = &[
-    (ScopeFlavor::Ordered, &[true, true, true]),
-    (ScopeFlavor::Dynamic, &[true, true, true]),
 ];
 
 fn explore_all(
@@ -421,6 +424,23 @@ fn check_r5_settlement_reaches_a_fixed_point(transition: &Transition<'_>) {
 /// the membership `Removing` first, and readiness is then rejected, so the
 /// removal path can never manufacture the readiness edge it raced.
 fn check_r3_removal_is_sampled_at_publication(transition: &Transition<'_>) {
+    // The rule is stated over the membership, not over the event that latched
+    // it: a record that reached `Removing` through any route rejects readiness
+    // from then on. Checking only the latched `Ready` variant would leave the
+    // `RemovalSampled`-then-`Ready { removal_latched: false }` pair — which the
+    // alphabet offers in every such state — asserted about by nothing.
+    for &child in transition.keys {
+        if transition.before.contains(child)
+            && transition.before.membership_status(child) == MembershipStatus::Removing
+        {
+            assert!(
+                !transition.after.initial_ready(child) || transition.before.initial_ready(child),
+                "a removing membership never gains readiness, got {:?}",
+                transition.event
+            );
+        }
+    }
+
     let Event::Ready {
         child,
         removal_latched: true,
@@ -465,6 +485,19 @@ fn check_r1_r2_r6_startup_aggregate(transition: &Transition<'_>) {
                 matches!(transition.event, Event::Ready { child: key, .. } if *key == child),
                 "only a readiness edge sets the aggregate bit, got {:?}",
                 transition.event
+            );
+            // Naming the event is not enough: readiness is incarnation-local,
+            // so the edge must also come from an executing incarnation. Without
+            // this, a `Ready` accepted in `Complete` or `RestartPending` — R2's
+            // own restart direction — is invisible to the walk, because E4
+            // permits an unchanged phase and the aggregate bit is not a phase.
+            assert!(
+                matches!(
+                    incarnation(transition.before, child),
+                    Some(IncarnationState::Active | IncarnationState::Stopping)
+                ),
+                "readiness publishes only from an executing incarnation, got {:?}",
+                incarnation(transition.before, child)
             );
         }
         if before && !after {
@@ -513,12 +546,19 @@ fn check_r1_r2_r6_startup_aggregate(transition: &Transition<'_>) {
     // ordered-sequencing rule rather than a defect, but it is not what R6 says
     // — see `ordered_startup_waits_for_a_removing_member_to_commit`, which
     // pins the ordered behavior on its own.
+    // Scoped to the cursor rather than to the whole roster: a member latched
+    // for removal *behind* the cursor has already been passed and withholds
+    // nothing, so exempting it would switch off a live property in states that
+    // satisfy it anyway.
     let ordered_cursor_may_wait = transition.before.flavor() == ScopeFlavor::Ordered
         && transition
             .before
-            .children
-            .values()
-            .any(|record| record.state.membership_status() == MembershipStatus::Removing);
+            .next_ordered_start()
+            .is_some_and(|cursor| {
+                transition.before.children.iter().any(|(&key, record)| {
+                    key >= cursor && record.state.membership_status() == MembershipStatus::Removing
+                })
+            });
     if settling_a_starting_scope && !unready && !ordered_cursor_may_wait {
         assert_eq!(
             completed,
@@ -651,17 +691,42 @@ fn check_s5_derived_level_triggered_completion(transition: &Transition<'_>) {
             .all(|child| transition.after.joined(child)),
         "the derived completion query cannot drift from child state"
     );
-    for effect in transition.effects {
-        if let Effect::Finished { .. } = effect {
-            assert!(
-                !transition.before.finish_emitted,
-                "the finish edge is published once"
-            );
-            assert!(
-                transition.after.all_children_joined(),
-                "a scope finishes only once every child has joined"
-            );
-        }
+    let finished = transition
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::Finished { .. }));
+    if finished {
+        assert!(
+            !transition.before.finish_emitted,
+            "the finish edge is published once"
+        );
+        assert!(
+            transition.after.all_children_joined(),
+            "a scope finishes only once every child has joined"
+        );
+        // The other direction of S5's "iff". Stated over the lifecycle rather
+        // than by calling `finish_if_ready`, which would restate the body of
+        // the code under test: a scope that is neither draining nor a non-empty
+        // ordered workload has nothing to finish.
+        assert!(
+            transition.after.lifecycle().is_draining()
+                || (transition.after.flavor() == ScopeFlavor::Ordered
+                    && !transition.after.is_empty()),
+            "only a draining scope, or a non-empty ordered one, finishes"
+        );
+    }
+    // And its liveness half: settlement is level-triggered, so a drained scope
+    // whose children have all joined must publish on the very next settle
+    // rather than wait for an edge that is not coming.
+    if matches!(transition.event, Event::Settle)
+        && !transition.before.finish_emitted
+        && transition.before.lifecycle().is_draining()
+        && transition.after.all_children_joined()
+    {
+        assert!(
+            finished,
+            "a drained scope whose children have all joined finishes"
+        );
     }
 }
 
@@ -676,19 +741,6 @@ fn check_s5_derived_level_triggered_completion(transition: &Transition<'_>) {
 #[test]
 fn exhaustive_reachable_states_preserve_the_reducer_invariants() {
     let run = explore_all(CONFIGURATIONS, check_every_invariant);
-    println!(
-        "explored {} states over {} transitions",
-        run.states, run.transitions
-    );
-}
-
-/// The same properties one child wider; see [`WIDE_CONFIGURATIONS`] for why
-/// the ordinary lane does not pay for it. Run with
-/// `cargo test -p shelterwood-core -- --ignored --nocapture`.
-#[test]
-#[ignore = "40x the ordinary lane's cost for no mutation the ordinary lane misses"]
-fn exhaustive_reachable_states_preserve_the_reducer_invariants_one_child_wider() {
-    let run = explore_all(WIDE_CONFIGURATIONS, check_every_invariant);
     println!(
         "explored {} states over {} transitions",
         run.states, run.transitions

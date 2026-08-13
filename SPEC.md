@@ -1196,6 +1196,7 @@ integration suite and `supervisor::…` names the pure reducer suite.
    initial member in declaration order. Dynamic startup may emit one accepted
    start per unspawned initial member. (`supervisor::start_effects_are_confined_to_the_spawn_transition`,
    `supervisor::ordered_startup_advances_through_every_initial_member_in_order`,
+   `supervisor::dynamic_startup_leaves_a_restart_pending_member_to_the_restart_path`,
    `integration::ordered_startup_advances_past_a_reclaimed_cursor`.)
 5. **R5 — settlement effects must be acknowledgeable.** Every
    `StartChild { child }` names a resident `Unstarted | RestartPending` child,
@@ -1206,11 +1207,13 @@ integration suite and `supervisor::…` names the pure reducer suite.
    (`supervisor::start_effects_are_confined_to_the_spawn_transition`,
    `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`.)
 6. **R6 — aggregate completion is derived.** `Settle` emits
-   `StartupCompleted` at most once, and never while a resident initial record
-   remains unready. The empty initial set satisfies the predicate. For a
-   dynamic scope that predicate is also sufficient; ordered startup adds its
-   cursor, so a member latched for removal withholds completion until the
-   removal commits even when every initial member is ready.
+   `StartupCompleted` at most once, and never while any initial record remains
+   unready — including one already latched for removal, which leaves the
+   initial set only at `Reclaim` (R3). The empty initial set satisfies the
+   predicate. For a dynamic scope that predicate is also sufficient; ordered
+   startup adds its cursor, so a member latched for removal at or ahead of the
+   cursor withholds completion until the removal commits even when every
+   initial member is ready.
    (`supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`,
    `supervisor::ordered_startup_waits_for_a_removing_member_to_commit`,
    `integration::dynamic_startup_completes_after_removing_sole_unready_initial_member`,

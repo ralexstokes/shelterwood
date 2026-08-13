@@ -772,16 +772,24 @@ mod tests {
     #[test]
     fn completion_waiters_cover_parked_and_already_completed_paths() {
         let parked = CompletionGatedLatch::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
         let mut waiting = Box::pin(parked.completed());
-        let mut context = Context::from_waker(Waker::noop());
+        let mut context = Context::from_waker(&waker);
         assert!(waiting.as_mut().poll(&mut context).is_pending());
         assert!(!parked.complete());
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
         assert!(waiting.as_mut().poll(&mut context).is_ready());
 
         let completed = CompletionGatedLatch::default();
         assert!(!completed.complete());
         let mut immediate = Box::pin(completed.completed());
-        assert!(immediate.as_mut().poll(&mut context).is_ready());
+        assert!(
+            immediate
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

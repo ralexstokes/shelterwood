@@ -29,6 +29,16 @@ async fn runtime_teardown_finishes_the_cancelled_root_driver() {
         .expect("dedicated runtime publishes the driver handle");
     let monitor = monitor_root_driver(Arc::clone(&root), driver);
     root.wait_started().await.expect("root starts");
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let stopped_waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+    let mut stopped = Box::pin(root.wait_stopped());
+    assert!(
+        stopped
+            .as_mut()
+            .poll(&mut Context::from_waker(&stopped_waker))
+            .is_pending(),
+        "the live root observer parks before runtime teardown"
+    );
 
     teardown_sender
         .send(())
@@ -36,14 +46,24 @@ async fn runtime_teardown_finishes_the_cancelled_root_driver() {
     runtime_thread.join().expect("runtime teardown completes");
 
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(1), root.wait_stopped()).await,
-        crate::runtime::Timeout::Completed(StopReason::ShutdownRequested)
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(monitor)).await,
+        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok {
+            value: StopReason::ShutdownRequested,
+        })
+    ));
+    assert!(
+        wakes.load(Ordering::SeqCst) > 0,
+        "the join monitor wakes an observer parked before cancellation"
+    );
+    assert!(matches!(
+        stopped
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(StopReason::ShutdownRequested)
     ));
     assert!(matches!(
-        crate::runtime::join(monitor).await,
-        crate::runtime::JoinOutcome::Ok {
-            value: StopReason::ShutdownRequested
-        }
+        root.member.record().stage,
+        MemberStage::Terminal(ref exit) if exit.cancellation() == Cancellation::Observed
     ));
 }
 

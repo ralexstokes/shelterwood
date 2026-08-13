@@ -1650,6 +1650,12 @@ pub(super) mod tests {
         assert_eq!(error.kind, SendErrorKind::TimedOut);
         assert_eq!(error.message, 1);
         drop(teardown);
+
+        let retry = actor
+            .try_send(2)
+            .expect_err("the terminal mailbox rejects a retry");
+        assert_eq!(retry.kind, SendErrorKind::Terminated);
+        assert_eq!(retry.incarnation_observed, None);
     }
 
     #[test]

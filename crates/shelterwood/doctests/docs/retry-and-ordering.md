@@ -17,7 +17,7 @@ Treat these tokens as part of the protocol, not merely diagnostic metadata.
 | `ReplyDropped` | The request was accepted, but its `Reply` was dropped unanswered. | Retry only an idempotent operation, only under one overall deadline, and only after a newer incarnation is running. |
 | `Terminated` | The target membership ended before acceptance. | That handle can never follow a same-id replacement. Obtain the replacement's new handle deliberately. |
 
-An already-expired acceptance timeout can win withdrawal before deferred waiter discharge even when mailbox termination linearized first; it still proves guaranteed-never-accepted, and a retry then reports `Terminated` with the final incarnation.
+An already-expired acceptance timeout can win withdrawal before deferred waiter discharge even when mailbox termination linearized first; it still proves guaranteed-never-accepted, and a retry then reports `Terminated`, including the final incarnation when one existed.
 
 For a safe `ReplyDropped` retry in the core API:
 

@@ -185,9 +185,13 @@ mod tests {
             Err(super::ReplyError::Dropped)
         );
 
+        // Exercises `Reply::send`'s rejection branch for a panic only: the
+        // value it discards is unobservable from here. That the discard runs
+        // through isolated disposal rather than inline is asserted in
+        // `late_reply_send_disposes_unclaimed_value_off_the_sender`
+        // (`crates/shelterwood/tests/disposal.rs`), which owns that claim.
         let (reply, receiver) = actor.reply_channel::<u8>();
         drop(receiver);
-        assert!(reply.sender.is_closed());
         reply.send(9);
     }
 }

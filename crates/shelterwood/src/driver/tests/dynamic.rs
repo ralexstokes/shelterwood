@@ -1033,10 +1033,17 @@ async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
     );
 
     // The first latch re-check rejects the reservation before child
-    // conversion, leaving no resident or dynamic-state entry behind.
+    // conversion. The reconciliation count replaces the old raw-mutex poison
+    // probe, preserving that proof while keeping identity storage private.
+    let reconciliations = root.child_identity_reconciliations();
     assert!(
         catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request))).is_ok(),
         "overtaking fused cancellation rejects before fallible child conversion"
+    );
+    assert_eq!(
+        root.child_identity_reconciliations(),
+        reconciliations,
+        "the pre-conversion latch check rejects before identity reconciliation"
     );
     assert!(matches!(
         response.receive().await,

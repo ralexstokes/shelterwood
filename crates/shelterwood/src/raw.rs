@@ -352,7 +352,6 @@ struct EventQueue<M> {
     // sequence and there is no integer counter whose saturation could blur a
     // boundary.
     queue: Mutex<VecDeque<QueuedEvent<M>>>,
-    signal: Signal,
     disposal: RawDisposal,
 }
 
@@ -367,7 +366,6 @@ impl<M> EventQueue<M> {
     fn new(disposal: RawDisposal) -> Self {
         Self {
             queue: Mutex::new(VecDeque::new()),
-            signal: disposal.signal.clone(),
             disposal,
         }
     }
@@ -377,7 +375,7 @@ impl<M> EventQueue<M> {
             .lock()
             .expect("actor event queue mutex poisoned")
             .push_back(event);
-        self.signal.pulse();
+        self.disposal.signal.pulse();
     }
 
     #[cfg(test)]
@@ -396,7 +394,7 @@ impl<M> EventQueue<M> {
     ) {
         self.insert_with(event, before_insert);
         after_insert();
-        self.signal.pulse();
+        self.disposal.signal.pulse();
     }
 
     fn watermark(&self) -> usize {
@@ -597,8 +595,8 @@ impl<M> TimerStore<M> {
         // cannot unwind through a hostile key or message destructor.
         let key = Contained::new(key, self.disposal.clone());
         let message = Contained::new(message, self.disposal.clone());
-        self.remove(key.get());
         let hash = self.hash_key(key.get());
+        self.remove_hashed(hash, key.get());
         self.keyed.entry(hash).or_default().push(TimerEntry {
             key: Box::new(key.into_inner()),
             deadline,
@@ -618,6 +616,13 @@ impl<M> TimerStore<M> {
         K: Hash + Eq + 'static,
     {
         let hash = self.hash_key(key);
+        self.take_hashed(hash, key)
+    }
+
+    fn take_hashed<K>(&mut self, hash: KeyHash, key: &K) -> Option<TimerEntry<M>>
+    where
+        K: Eq + 'static,
+    {
         let (entry, empty) = {
             let bucket = self.keyed.get_mut(&hash)?;
             #[cfg(test)]
@@ -651,6 +656,17 @@ impl<M> TimerStore<M> {
         K: Hash + Eq + 'static,
     {
         let Some(entry) = self.take(key) else {
+            return false;
+        };
+        self.dispose_entry(entry);
+        true
+    }
+
+    fn remove_hashed<K>(&mut self, hash: KeyHash, key: &K) -> bool
+    where
+        K: Eq + 'static,
+    {
+        let Some(entry) = self.take_hashed(hash, key) else {
             return false;
         };
         self.dispose_entry(entry);
@@ -829,12 +845,6 @@ enum OffloadPoll {
     Finished,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OffloadScope {
-    Unscoped,
-    Scoped,
-}
-
 struct SharedOffloadState {
     // Polling takes the future out of this mutex. Cancellation either takes
     // an idle future or marks an in-progress poll so that the poller disposes
@@ -845,19 +855,14 @@ struct SharedOffloadState {
 }
 
 impl SharedOffloadState {
-    fn new(
-        future: OffloadFuture,
-        panic: Arc<PanicSlot>,
-        signal: Signal,
-        finished: Latch,
-    ) -> SharedWork {
+    fn new(future: OffloadFuture, disposal: RawDisposal, finished: Latch) -> SharedWork {
         Arc::new(Self {
             state: Mutex::new(OffloadFutureState {
                 future: Some(future),
                 polling: false,
                 cancelled: false,
             }),
-            disposal: RawDisposal { panic, signal },
+            disposal,
             finished,
         })
     }
@@ -987,7 +992,6 @@ struct RawResources<M> {
     timer_orders: PoisonedCounter,
     ready_batch: Option<ReadyBatch>,
     events: Arc<EventQueue<M>>,
-    panic: Arc<PanicSlot>,
     disposal: RawDisposal,
     event_watcher: SignalWatcher,
     offloads: Vec<OffloadResource>,
@@ -997,12 +1001,9 @@ impl<M> Default for RawResources<M> {
     fn default() -> Self {
         let signal = Signal::default();
         let panic = Arc::new(PanicSlot::default());
-        let disposal = RawDisposal {
-            panic: Arc::clone(&panic),
-            signal,
-        };
+        let disposal = RawDisposal { panic, signal };
+        let event_watcher = disposal.signal.watcher();
         let events = Arc::new(EventQueue::new(disposal.clone()));
-        let event_watcher = events.signal.watcher();
         Self {
             accepting: true,
             continuations: ContinuationQueue::new(disposal.clone()),
@@ -1011,7 +1012,6 @@ impl<M> Default for RawResources<M> {
             timer_orders: PoisonedCounter::new(),
             ready_batch: None,
             events,
-            panic,
             disposal,
             event_watcher,
             offloads: Vec::new(),
@@ -1057,7 +1057,7 @@ impl<M> RawResources<M> {
         // take is destructive, so containment here would drop the retained
         // offload diagnostic and let the loop keep running.
         resume_preferred_panic_outside_unwind(UnwindPanics {
-            primary: self.panic.take(),
+            primary: self.disposal.panic.take(),
             cleanup: None,
         });
     }
@@ -1073,7 +1073,7 @@ impl<M> RawResources<M> {
                                 .to_owned()
                         });
                         tracing::error!(%message, "library-owned offload task panicked");
-                        self.panic.record(Box::new(message));
+                        self.disposal.panic.record(Box::new(message));
                     }
                 }
             }
@@ -1093,7 +1093,7 @@ impl<M> Drop for RawResources<M> {
         // `freeze` can transfer a destructor panic into the shared slot. Take
         // that retained application diagnostic after cleanup and preserve it
         // ahead of a direct framework-cleanup panic.
-        panics.record(self.panic.take());
+        panics.record(self.disposal.panic.take());
         panics.record(freeze_panic);
     }
 }
@@ -1352,8 +1352,8 @@ impl<M: Send + 'static> RawContext<M> {
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> M + Send + 'static,
     {
-        self.start_offload(work, continuation, deadline.into(), OffloadScope::Unscoped)
-            .map(|_| ())
+        self.start_offload(work, continuation, deadline.into())
+            .map(Guard::detach)
     }
 
     /// Starts guarded incarnation-owned async work with one deadline budget.
@@ -1374,8 +1374,7 @@ impl<M: Send + 'static> RawContext<M> {
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> M + Send + 'static,
     {
-        self.start_offload(work, continuation, deadline.into(), OffloadScope::Scoped)
-            .map(|guard| guard.expect("scoped offload must produce a guard"))
+        self.start_offload(work, continuation, deadline.into())
     }
 
     /// Starts blocking work with cancellation tied to shutdown and future drop.
@@ -1474,8 +1473,7 @@ impl<M: Send + 'static> RawContext<M> {
         work: F,
         continuation: C,
         deadline: DeadlineBudget,
-        scope: OffloadScope,
-    ) -> Result<Option<Guard>, Rejected<(F, C)>>
+    ) -> Result<Guard, Rejected<(F, C)>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
@@ -1491,11 +1489,11 @@ impl<M: Send + 'static> RawContext<M> {
 
         let cancellation = Latch::default();
         let finished = Latch::default();
-        let guard = (scope == OffloadScope::Scoped).then(|| Guard {
+        let guard = Guard {
             cancellation: cancellation.clone(),
             finished: finished.clone(),
             armed: true,
-        });
+        };
         let events = Arc::clone(&self.resources.events);
         let disposal = self.resources.disposal.clone();
         // Zero selects no attempt (SPEC Appendix B): the work future is never
@@ -1548,8 +1546,7 @@ impl<M: Send + 'static> RawContext<M> {
         };
         let state = SharedOffloadState::new(
             Box::pin(operation),
-            Arc::clone(&self.resources.panic),
-            self.resources.events.signal.clone(),
+            self.resources.disposal.clone(),
             finished.clone(),
         );
         let task = runtime::spawn_actor_work(SharedOffloadFuture(Arc::clone(&state)));
@@ -1815,7 +1812,7 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     fn take_resource_panic(&self) -> Option<PanicPayload> {
-        self.resources.panic.take()
+        self.resources.disposal.panic.take()
     }
 }
 
@@ -2137,7 +2134,8 @@ mod tests {
 
     use super::{
         ArmingOrder, EventQueue, OffloadPoll, OffloadResource, PanicSlot, QueuedEvent, RawContext,
-        RawResources, RawRunContext, SharedOffloadFuture, SharedOffloadState, TimerMessage,
+        RawDisposal, RawResources, RawRunContext, SharedOffloadFuture, SharedOffloadState,
+        TimerMessage,
     };
     use crate::{
         ChildId, MailboxShutdown, Readiness,
@@ -2402,7 +2400,7 @@ mod tests {
     #[crate::runtime::test]
     async fn event_visibility_precedes_signal_without_losing_the_wakeup() {
         let queue = Arc::new(EventQueue::default());
-        let mut watcher = queue.signal.watcher();
+        let mut watcher = queue.disposal.signal.watcher();
         let inserted = Arc::new(Barrier::new(2));
         let release_signal = Arc::new(Barrier::new(2));
         let producer = {
@@ -2454,8 +2452,10 @@ mod tests {
                 drops: Arc::clone(&drops),
                 panic_on_drop: true,
             }),
-            Arc::clone(&panic),
-            Signal::default(),
+            RawDisposal {
+                panic: Arc::clone(&panic),
+                signal: Signal::default(),
+            },
             finished.clone(),
         );
         let poller = {
@@ -2491,8 +2491,7 @@ mod tests {
     fn absent_offload_future_does_not_claim_a_poller() {
         let state = SharedOffloadState::new(
             Box::pin(std::future::pending()),
-            Arc::new(PanicSlot::default()),
-            Signal::default(),
+            RawDisposal::default(),
             Latch::default(),
         );
         let future = state.take_for_poll().expect("fixture future is present");
@@ -2546,7 +2545,7 @@ mod tests {
     fn a_skipped_freeze_still_contains_queued_continuation_destructors() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut resources = RawResources::<CountedDrop>::default();
-        let panic = Arc::clone(&resources.panic);
+        let panic = Arc::clone(&resources.disposal.panic);
         resources.accepting = false;
         for panic_on_drop in [true, false] {
             resources.continuations.push_back(CountedDrop {
@@ -2614,7 +2613,7 @@ mod tests {
     #[test]
     fn resident_raw_collections_do_not_clone_disposal_per_element() {
         let mut resources = RawResources::<()>::default();
-        let baseline = Arc::strong_count(&resources.panic);
+        let baseline = Arc::strong_count(&resources.disposal.panic);
 
         resources.continuations.push_back(());
         resources.events.push(QueuedEvent {
@@ -2626,7 +2625,7 @@ mod tests {
             .replace(7_u8, None, ArmingOrder(1), TimerMessage::Once(()), None);
 
         assert_eq!(
-            Arc::strong_count(&resources.panic),
+            Arc::strong_count(&resources.disposal.panic),
             baseline,
             "continuations, events, and timers store raw elements without disposal clones"
         );
@@ -2647,6 +2646,7 @@ mod tests {
         resources.join_offloads().await;
 
         let payload = resources
+            .disposal
             .panic
             .take()
             .expect("the framework panic is retained for incarnation teardown");
@@ -2671,8 +2671,7 @@ mod tests {
                     drops: Arc::clone(&drops),
                     panic_on_drop,
                 }),
-                Arc::clone(&resources.panic),
-                resources.events.signal.clone(),
+                resources.disposal.clone(),
                 completion.clone(),
             );
             resources.offloads.push(OffloadResource {
@@ -2736,6 +2735,7 @@ mod tests {
             "one hostile destructor cannot skip later collection elements or drains"
         );
         let payload = resources
+            .disposal
             .panic
             .take()
             .expect("the first cleanup panic is retained");
@@ -2770,6 +2770,26 @@ mod timer_store_tests {
     impl std::hash::Hash for CollidingKey {
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
             0_u8.hash(state);
+        }
+    }
+
+    struct CountingHashKey {
+        value: u8,
+        hashes: Arc<AtomicUsize>,
+    }
+
+    impl PartialEq for CountingHashKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.value == other.value
+        }
+    }
+
+    impl Eq for CountingHashKey {}
+
+    impl std::hash::Hash for CountingHashKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.hashes.fetch_add(1, Ordering::SeqCst);
+            std::hash::Hash::hash(&self.value, state);
         }
     }
 
@@ -2810,6 +2830,27 @@ mod timer_store_tests {
             panic!("expected a live one-shot timer")
         };
         message
+    }
+
+    #[test]
+    fn timer_replacement_hashes_each_incoming_key_once() {
+        let hashes = Arc::new(AtomicUsize::new(0));
+        let mut timers = TimerStore::default();
+
+        for (order, message) in [(1, "first"), (2, "second")] {
+            timers.replace(
+                CountingHashKey {
+                    value: 7,
+                    hashes: Arc::clone(&hashes),
+                },
+                None,
+                super::ArmingOrder(order),
+                TimerMessage::Once(message),
+                None,
+            );
+        }
+
+        assert_eq!(hashes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

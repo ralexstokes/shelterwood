@@ -420,6 +420,7 @@ impl MemberCell {
 
     pub fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
         self.with_observation_txn(|txn| {
+            let mut rejected = None;
             let terminal_exit = {
                 let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
                 match &mut *state {
@@ -430,7 +431,10 @@ impl MemberCell {
                     MemberMailbox::Attached(_)
                     | MemberMailbox::Terminal {
                         control: Some(_), ..
-                    } => panic!("a member can own only one mailbox"),
+                    } => {
+                        rejected = Some(mailbox);
+                        None
+                    }
                     MemberMailbox::Terminal {
                         control,
                         exit,
@@ -443,6 +447,17 @@ impl MemberCell {
                     }
                 }
             };
+            // Follow the mailbox layer's convention and release the lock before
+            // panicking, so a driver-contract violation stays on this thread
+            // instead of poisoning the mutex under every later mailbox lookup.
+            // The rejected mailbox still owns unread user messages, so the
+            // transaction destroys it after the gate is released -- during this
+            // panic's unwind, which is exactly when an inline destructor would
+            // be a double panic.
+            if let Some(rejected) = rejected {
+                txn.defer(move || drop(rejected));
+                panic!("a member can own only one mailbox");
+            }
             if let Some(terminal_exit) = terminal_exit {
                 self.terminalize_locked(terminal_exit, StartupDisposition::Unchanged, txn);
             }
@@ -469,13 +484,22 @@ impl MemberCell {
         startup: StartupDisposition,
         txn: &mut ObservationTxn<'_>,
     ) -> Exit {
+        // A losing terminalizer's exit is destroyed here, and an
+        // `ExitKind::Failed` payload owns a type-erased user error whose
+        // destructor may block, panic, or re-enter observation. Hand it to the
+        // transaction rather than dropping it under the gate.
+        let mut losing_exit = None;
         let terminal_exit = {
             let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
             match &*state {
                 MemberMailbox::Terminal {
                     exit: terminal_exit,
                     ..
-                } => terminal_exit.clone(),
+                } => {
+                    let terminal_exit = terminal_exit.clone();
+                    losing_exit = Some(exit);
+                    terminal_exit
+                }
                 MemberMailbox::Unattached => {
                     *state = MemberMailbox::Terminal {
                         control: None,
@@ -496,6 +520,9 @@ impl MemberCell {
                 }
             }
         };
+        if let Some(losing_exit) = losing_exit {
+            txn.defer(move || drop(losing_exit));
+        }
         let mut published = false;
         self.record.modify_silently(|record| {
             match startup {
@@ -634,6 +661,19 @@ impl ObservationGate {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether some thread — possibly this one — is inside the gate.
+    ///
+    /// The probe a lock-rule test needs: a value's destructor asks whether it
+    /// is running inside the critical section, which a same-thread `try_lock`
+    /// answers without the reentrant acquisition that would deadlock. A
+    /// poisoned but unheld gate reports `false`, matching [`Self::lock`]'s
+    /// deliberate poison tolerance.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        matches!(self.0.try_lock(), Err(std::sync::TryLockError::WouldBlock))
     }
 }
 

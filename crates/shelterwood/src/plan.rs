@@ -111,15 +111,28 @@ impl SlotCell {
     }
 
     pub(crate) fn define(&self, definition: ChildConstruction) {
-        let mut state = self.definition.lock().expect("definition mutex poisoned");
-        match *state {
-            DefinitionState::Undefined => {
-                *state = DefinitionState::Defined(Isolated::new(definition));
+        // A rejected definition owns user construction closures, and the
+        // panic below is a caller-contract violation rather than a broken
+        // slot. Release the lock before either destroys anything, so a hostile
+        // closure destructor cannot poison the definition mutex for every
+        // later lowering step. `Isolated` keeps the destruction itself off
+        // this thread.
+        let rejected = {
+            let mut state = self.definition.lock().expect("definition mutex poisoned");
+            match *state {
+                DefinitionState::Undefined => {
+                    *state = DefinitionState::Defined(Isolated::new(definition));
+                    None
+                }
+                DefinitionState::Defined(_) | DefinitionState::Lowered => {
+                    Some(Isolated::new(definition))
+                }
             }
-            DefinitionState::Defined(_) | DefinitionState::Lowered => {
-                panic!("a child slot was defined more than once")
-            }
-        }
+        };
+        assert!(
+            rejected.is_none(),
+            "a child slot was defined more than once"
+        );
     }
 
     pub(crate) fn is_undefined(&self) -> bool {

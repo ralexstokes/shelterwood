@@ -24,9 +24,10 @@ name = "shelterwood"
 
 # Enforced in every lane that compiles the workspace -- plain `cargo check`
 # included -- rather than by appending a flag to one CI clippy invocation.
-# `-D warnings` escalates these to errors in `just lint` and the Nix
-# `cargo-clippy` check, so the template's check definition stays unforked.
+# `dead_code` is denied directly so feature-specific gaps fail wherever they
+# surface. `-D warnings` escalates `unreachable_pub` in the Clippy lanes.
 [workspace.lints.rust]
+dead_code = "deny"
 unreachable_pub = "warn"
 
 [workspace.dependencies]

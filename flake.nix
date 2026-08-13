@@ -32,6 +32,16 @@
           ...
         }:
         {
+          cargo-clippy-default = craneLibNightly.cargoClippy (
+            commonArgs
+            // {
+              cargoArtifacts = cargoArtifactsNightly;
+              cargoExtraArgs = "--locked";
+              cargoClippyExtraArgs = "--workspace --lib -- -D warnings";
+              doInstallCargoArtifacts = false;
+            }
+          );
+
           api-enforcement = craneLibNightly.mkCargoDerivation (
             commonArgs
             // {

@@ -597,11 +597,17 @@ impl SnapshotHub {
     /// makes it safe, and the only receiver that could observe the refresh is
     /// the one minted here — which captures the refreshed generation as
     /// already seen. `RetainedScopeSnapshot` makes the displaced projection
-    /// safe to release before that gate is unlocked.
+    /// safe to release before that gate is unlocked, so nothing is deferred
+    /// here.
+    ///
+    /// The transaction is nonetheless taken and unused: it is only obtainable
+    /// under the gate, so requiring it is what makes "hub initialization and
+    /// the receiverless refresh are serialized against publication" a static
+    /// property of every caller rather than a convention.
     pub(crate) fn subscribe(
         &self,
         initial: RetainedScopeSnapshot,
-        _txn: &mut crate::cells::ObservationTxn<'_>,
+        _gate: &mut crate::cells::ObservationTxn<'_>,
     ) -> SnapshotReceiver {
         let sender = self.sender.get_or_init(|| {
             runtime::watch(SnapshotHubState {

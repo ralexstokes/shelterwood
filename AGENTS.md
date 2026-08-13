@@ -52,10 +52,14 @@ rests on:
   audit confirmed was a drop that *looked* like refcount traffic. Resident
   member records, scope records, lifecycle events, snapshot projections and
   driver completions protect failed exits through `RetainedExit`; its drop
-  transfers destruction to a critical-safe disposal queue whose
-  resource-exhaustion fallback retains the job rather than destroying it
-  inline. Scope state and startup results need that protection too: a
-  structured startup failure recursively owns the triggering child's `Exit`.
+  transfers destruction to `runtime::dispose_critical`, whose every path —
+  exhausted thread creation, and a runtime torn down under an accepted
+  submission — keeps the job rather than destroying it inline. Records that
+  hand out clones (`MemberRecord`, `ScopeRecord`) keep their guards behind one
+  shared `Arc` placed after every raw projection, so a read is refcount
+  traffic and only the last clone submits disposal. Scope state and startup
+  results need that protection too: a structured startup failure recursively
+  owns the triggering child's `Exit`.
   `ScopeCell::clear_residents_locked` and `prune_child_locked` may therefore
   release their `Arc<MemberCell>`s under the gate without relying on driver
   field-drop order to keep a user error alive.
@@ -64,7 +68,12 @@ rests on:
   framework-only impls, not user traits; calling them under a lock runs no
   caller code. `MailboxRuntime` is nonetheless kept off every locked path: its
   disposal capability hands work to a blocking worker, so it belongs to the
-  effects flush like the user code it carries.
+  effects flush like the user code it carries. That is a preference, not a
+  prohibition, and `RetainedExit::drop` is where the difference shows: a
+  submission runs no user code, so it is legal under a lock, but it can cost
+  a native thread start, so a caller that already owns an effects sink should
+  still flush it. Retained exits retire from drop glue, which has no sink to
+  reach, so they submit in place.
 - **Nested framework locks in one direction.** The resident-tree observation
   gate is outermost: everything else is taken under it or standalone, never
   around it. Inside, the documented orders are cells' member mailbox →
@@ -84,7 +93,10 @@ goes to `runtime::dispose_detached`, not merely past the unlock. That second
 convention is currently met for mailbox payloads, construction closures and
 offloads. Framework-retained `Exit` copies meet it through `RetainedExit`,
 including driver completions and pending terminal disposal; exits handed to
-users keep ordinary drop timing.
+users keep ordinary drop timing. Its fail-safe under exhausted thread
+creation is an unreclaimed queued job — memory held for the life of the
+process, along with whatever the user error owns — which is the accepted
+trade against destroying it in a critical section.
 
 Reviewing a new `.lock()` is one pass: name every value the critical section
 can destroy, every callback it can invoke, and every panic it can raise. If

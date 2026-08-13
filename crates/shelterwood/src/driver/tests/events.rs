@@ -354,7 +354,7 @@ async fn queued_admissions_yield_to_shutdown_without_forwarder_tasks() {
     // Latch shutdown without yielding to the already-woken driver. Its first
     // batch begins draining and rejects one control prefix; the full-batch
     // yield must then let `exiting` run and publish its primary-lane exit.
-    let mut shutdown = Box::pin(scope.shutdown_and_wait(DRIVER_PROGRESS_WAIT));
+    let mut shutdown = Box::pin(scope.as_scope().shutdown_and_wait(DRIVER_PROGRESS_WAIT));
     assert!(
         shutdown
             .as_mut()

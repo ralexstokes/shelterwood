@@ -95,7 +95,6 @@ pub enum StopPrecedence {
 
 /// Failure of the root startup barrier.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
 pub enum StartupError {
     /// A child or nested lowering failed terminally during startup.
     #[error("tree startup failed")]
@@ -240,7 +239,6 @@ impl Error for MessageError {}
 /// through [`ExitError::intensity_trip`] rather than round-tripping the payload
 /// through a user conversion.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub struct IntensityTrip {
     /// Configured maximum restarts within the rolling window.
     pub max_restarts: u64,
@@ -344,7 +342,6 @@ impl Error for StartupFailure {
 
 /// The cause of a nested-scope startup failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum StartupFailureCause {
     /// A child terminalized before releasing its readiness gate.
     Child {
@@ -481,7 +478,6 @@ fn exit_kind_eq(left: &ExitKind, right: &ExitKind) -> bool {
 
 /// The primary classification of an [`Exit`].
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub enum ExitKind {
     /// The incarnation returned successfully.
     Completed,

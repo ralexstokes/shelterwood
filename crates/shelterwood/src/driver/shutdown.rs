@@ -35,7 +35,7 @@ async fn wait_for_incarnation(scope: &ScopeCell, epoch: Epoch) {
 
 pub(crate) async fn shutdown_scope(
     scope: Arc<ScopeCell>,
-    timeout: Duration,
+    timeout: DeadlineBudget,
 ) -> Result<(), ShutdownTimeout> {
     if scope.settled(None) {
         return Ok(());
@@ -55,7 +55,16 @@ pub(crate) async fn shutdown_scope(
         watcher.changed().await;
     }
 
-    match runtime::timeout(timeout, wait_for_incarnation(&scope, epoch)).await {
+    // Zero selects immediate escalation (SPEC Appendix B): it is an escalation
+    // budget, not an observation opportunity, so the cooperative request above
+    // is still delivered but its wait is skipped even when the incarnation
+    // could settle on an immediate poll.
+    let outcome = if timeout.is_zero() {
+        runtime::Timeout::Elapsed
+    } else {
+        runtime::timeout(timeout.duration(), wait_for_incarnation(&scope, epoch)).await
+    };
+    match outcome {
         runtime::Timeout::Completed(()) => Ok(()),
         runtime::Timeout::Elapsed => {
             let mut stragglers = Vec::new();

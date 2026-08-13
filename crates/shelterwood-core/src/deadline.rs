@@ -2,6 +2,52 @@
 
 use std::time::{Duration, Instant};
 
+/// A relative time budget supplied to a public deadline-bearing operation.
+///
+/// The value deliberately permits zero. Zero is not interpreted by the
+/// caller: each operation fixes one of the three library-defined behaviors in
+/// its own contract—no attempt, one observation pass, or immediate
+/// escalation—and SPEC Appendix B tabulates which operation takes which.
+/// Public surfaces accept `impl Into<DeadlineBudget>`, so a plain `Duration`
+/// still reads naturally at the call site while the semantics have one name.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DeadlineBudget(Duration);
+
+impl DeadlineBudget {
+    /// A zero-width budget.
+    pub const ZERO: Self = Self(Duration::ZERO);
+
+    /// Creates a budget from a duration.
+    #[must_use]
+    pub const fn new(duration: Duration) -> Self {
+        Self(duration)
+    }
+
+    /// Returns the represented duration.
+    #[must_use]
+    pub const fn duration(self) -> Duration {
+        self.0
+    }
+
+    /// Reports whether this budget has zero width.
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.0.is_zero()
+    }
+}
+
+impl From<Duration> for DeadlineBudget {
+    fn from(duration: Duration) -> Self {
+        Self::new(duration)
+    }
+}
+
+impl From<DeadlineBudget> for Duration {
+    fn from(budget: DeadlineBudget) -> Self {
+        budget.duration()
+    }
+}
+
 /// An absolute deadline, or one too distant for the clock to represent.
 ///
 /// Overflow consistently means that the deadline never arrives. In
@@ -45,6 +91,11 @@ impl Deadline {
         }
     }
 
+    /// Captures a nominal public budget relative to `started_at`.
+    pub fn after_budget(started_at: Instant, budget: DeadlineBudget) -> Self {
+        Self::after(started_at, budget.duration())
+    }
+
     /// Returns the representable absolute deadline, if there is one.
     pub fn instant(self) -> Option<Instant> {
         self.0
@@ -79,7 +130,18 @@ impl Deadline {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::Deadline;
+    use super::{Deadline, DeadlineBudget};
+
+    #[test]
+    fn a_zero_budget_deadline_is_already_due_at_its_own_start() {
+        let started_at = Instant::now();
+        let expires = Deadline::after_budget(started_at, DeadlineBudget::ZERO);
+        assert_eq!(expires.instant(), Some(started_at));
+        assert!(
+            expires.is_due(started_at),
+            "the poll-once surfaces read their zero budget through this rule"
+        );
+    }
 
     fn latest_representable(started_at: Instant) -> Instant {
         let mut low = Duration::ZERO;

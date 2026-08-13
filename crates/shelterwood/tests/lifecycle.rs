@@ -120,9 +120,8 @@ async fn framework_task_verdicts_remain_typed() {
     let abort_task = abort_tree
         .add_task(
             "stubborn",
-            TaskDef::new(|_| future::pending()).shutdown(Shutdown::Graceful {
-                grace: Duration::from_millis(5),
-            }),
+            TaskDef::new(|_| future::pending())
+                .shutdown(Shutdown::graceful(Duration::from_millis(5)).expect("grace is non-zero")),
         )
         .expect("valid task");
     let abort_system = abort_tree.spawn().expect("runtime is available");
@@ -431,7 +430,7 @@ async fn grace_expiry_mid_ladder_joins_the_abort_before_advancing() {
                     }
                 }
             })
-            .shutdown(Shutdown::Graceful { grace }),
+            .shutdown(Shutdown::graceful(grace).expect("grace is non-zero")),
         )
         .expect("valid last task");
     *last_handle.lock().expect("last handle mutex poisoned") = Some(last.clone());
@@ -607,7 +606,7 @@ async fn concurrent_initial_failures_publish_one_startup_failed_scope_edge() {
     }
 
     let system = tree.spawn().expect("runtime is available");
-    let mut lifecycle = system.scope().subscribe_lifecycle();
+    let mut lifecycle = system.scope().as_scope().subscribe_lifecycle();
     release.wait().await;
 
     let mut exits = 0;

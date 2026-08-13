@@ -244,6 +244,7 @@ impl RouterActor {
         let ready = self
             .0
             .ranges
+            .as_scope()
             .wait_for_child(
                 id,
                 |child| matches!(child.state, shelterwood::ChildState::Running),
@@ -741,6 +742,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
         async move { ranges.remove_scope(&scope).await }
     });
     ranges
+        .as_scope()
         .wait_for_child(
             "range-live",
             |child| {

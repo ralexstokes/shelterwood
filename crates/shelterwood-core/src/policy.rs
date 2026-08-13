@@ -97,6 +97,40 @@ pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// The default gated-readiness deadline.
 pub const DEFAULT_READINESS_DEADLINE: Duration = Duration::from_secs(30);
 
+/// A duration statically known to be non-zero.
+///
+/// Policy variants use this sealed value when zero would otherwise create a
+/// second semantic branch: [`Shutdown::Graceful`] (whose zero grace would
+/// duplicate `Abort` with different recorded provenance) and
+/// [`BoundedReadinessDeadline`]. Construct it with [`NonZeroDuration::new`];
+/// the private representation prevents zero-valued literals:
+///
+/// ```compile_fail,E0423
+/// use std::time::Duration;
+/// use shelterwood::NonZeroDuration;
+///
+/// let _invalid = NonZeroDuration(Duration::ZERO);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NonZeroDuration(Duration);
+
+impl NonZeroDuration {
+    /// Validates and constructs a non-zero duration.
+    pub fn new(duration: Duration) -> Result<Self, PolicyError> {
+        if duration.is_zero() {
+            Err(PolicyError::ZeroDuration)
+        } else {
+            Ok(Self(duration))
+        }
+    }
+
+    /// Returns the validated duration.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
 /// The condition under which an exited child is restarted.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RestartCondition {
@@ -463,8 +497,8 @@ impl Default for RestartPolicy {
 pub enum Shutdown {
     /// Request cooperative shutdown for up to the supplied grace.
     Graceful {
-        /// Cooperative grace.
-        grace: Duration,
+        /// Validated non-zero cooperative grace.
+        grace: NonZeroDuration,
     },
     /// Escalate immediately after cancellation.
     Abort,
@@ -473,8 +507,17 @@ pub enum Shutdown {
 impl Default for Shutdown {
     fn default() -> Self {
         Self::Graceful {
-            grace: DEFAULT_SHUTDOWN_GRACE,
+            grace: NonZeroDuration(DEFAULT_SHUTDOWN_GRACE),
         }
+    }
+}
+
+impl Shutdown {
+    /// Constructs a graceful policy with a validated non-zero grace.
+    pub fn graceful(grace: Duration) -> Result<Self, PolicyError> {
+        Ok(Self::Graceful {
+            grace: NonZeroDuration::new(grace)?,
+        })
     }
 }
 
@@ -503,8 +546,10 @@ pub enum ReadinessDeadline {
 
 /// Validated non-zero payload of a bounded [`ReadinessDeadline`].
 ///
-/// Values are created by [`ReadinessDeadline::bounded`]. `E0423` records the
-/// privacy failure this proof depends on:
+/// Values are created by [`ReadinessDeadline::bounded`]. The invariant is
+/// carried by [`NonZeroDuration`] rather than re-checked here, so the policy
+/// surface has one non-zero-duration type. `E0423` records the privacy failure
+/// this proof depends on:
 ///
 /// ```compile_fail,E0423
 /// use std::time::Duration;
@@ -513,23 +558,22 @@ pub enum ReadinessDeadline {
 /// let _ = ReadinessDeadline::Bounded(BoundedReadinessDeadline(Duration::ZERO));
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct BoundedReadinessDeadline(Duration);
+pub struct BoundedReadinessDeadline(NonZeroDuration);
 
 impl BoundedReadinessDeadline {
     /// Returns the non-zero deadline duration.
     #[must_use]
     pub const fn duration(self) -> Duration {
-        self.0
+        self.0.get()
     }
 }
 
 impl ReadinessDeadline {
     /// Constructs a validated bounded deadline.
     pub fn bounded(duration: Duration) -> Result<Self, PolicyError> {
-        if duration.is_zero() {
-            return Err(PolicyError::ZeroDuration);
-        }
-        Ok(Self::Bounded(BoundedReadinessDeadline(duration)))
+        Ok(Self::Bounded(BoundedReadinessDeadline(
+            NonZeroDuration::new(duration)?,
+        )))
     }
 }
 
@@ -590,6 +634,8 @@ impl Default for Intensity {
 }
 
 /// Core mailbox declarations carried as L1 policy data.
+///
+/// Non-exhaustive deliberately: Part II adds `latest_by_key`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum Mailbox {
@@ -649,6 +695,8 @@ pub enum Retention {
 }
 
 /// Ordered-scope fate-sharing strategy.
+///
+/// Non-exhaustive deliberately: Part II adds group strategies.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum Strategy {
@@ -668,8 +716,9 @@ pub struct ScopeDefaults {
     pub mailbox: Option<Mailbox>,
     /// Default mailbox shutdown behavior.
     pub mailbox_shutdown: Option<MailboxShutdown>,
-    /// Default readiness deadline.
-    pub readiness_deadline: Option<ReadinessDeadline>,
+    /// Default readiness deadline; [`ReadinessDeadline::Inherit`] is the
+    /// explicit unset state.
+    pub readiness_deadline: ReadinessDeadline,
 }
 
 /// How a subtree edge treats inherited scope defaults.
@@ -683,6 +732,9 @@ pub enum DefaultsInheritance {
 }
 
 /// A policy-construction error.
+///
+/// Non-exhaustive deliberately: future validated policy payloads add
+/// construction failures without changing existing variants.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PolicyError {
@@ -807,10 +859,10 @@ impl ResolvedDefaults {
                 None | Some(Mailbox::Queue(None) | Mailbox::Latest) => self.queue_capacity,
             },
             mailbox_shutdown: resolve(values.mailbox_shutdown, self.mailbox_shutdown),
-            readiness_deadline: values
-                .readiness_deadline
-                .map(|value| ResolvedReadinessDeadline::resolve(value, self.readiness_deadline))
-                .unwrap_or(self.readiness_deadline),
+            readiness_deadline: ResolvedReadinessDeadline::resolve(
+                values.readiness_deadline,
+                self.readiness_deadline,
+            ),
         }
     }
 }
@@ -880,9 +932,10 @@ mod tests {
 
     use super::{
         Backoff, BackoffFactor, ChildMode, CommonOptions, Intensity, Jitter, JitterSample, Mailbox,
-        MailboxShutdown, PolicyError, Readiness, ReadinessDeadline, ResolvedDefaults,
-        ResolvedMailbox, RestartAttempt, RestartCondition, RestartCount, RestartPolicy, Retention,
-        ScopeDefaults, Shutdown, TotalRestarts, resolve_common, tidy_abort_beat,
+        MailboxShutdown, NonZeroDuration, PolicyError, Readiness, ReadinessDeadline,
+        ResolvedDefaults, ResolvedMailbox, RestartAttempt, RestartCondition, RestartCount,
+        RestartPolicy, Retention, ScopeDefaults, Shutdown, TotalRestarts, resolve_common,
+        tidy_abort_beat,
     };
 
     #[test]
@@ -902,7 +955,8 @@ mod tests {
         assert_eq!(
             Shutdown::default(),
             Shutdown::Graceful {
-                grace: Duration::from_secs(5),
+                grace: NonZeroDuration::new(Duration::from_secs(5))
+                    .expect("the default grace is non-zero"),
             }
         );
         assert_eq!(
@@ -926,6 +980,21 @@ mod tests {
         assert_eq!(
             tidy_abort_beat(Duration::from_secs(5)),
             Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn graceful_shutdown_rejects_the_zero_duration_branch() {
+        assert_eq!(
+            Shutdown::graceful(Duration::ZERO),
+            Err(PolicyError::ZeroDuration)
+        );
+        assert_eq!(
+            Shutdown::graceful(Duration::from_nanos(1)),
+            Ok(Shutdown::Graceful {
+                grace: NonZeroDuration::new(Duration::from_nanos(1))
+                    .expect("one nanosecond is non-zero"),
+            })
         );
     }
 
@@ -1298,13 +1367,13 @@ mod tests {
             child_shutdown: Some(Shutdown::Abort),
             mailbox: Some(Mailbox::Latest),
             mailbox_shutdown: Some(MailboxShutdown::Discard),
-            readiness_deadline: Some(ReadinessDeadline::Unbounded),
+            readiness_deadline: ReadinessDeadline::Unbounded,
         });
 
         assert_eq!(inherited.overlay(&ScopeDefaults::default()), inherited);
         assert_eq!(
             inherited.overlay(&ScopeDefaults {
-                readiness_deadline: Some(ReadinessDeadline::Inherit),
+                readiness_deadline: ReadinessDeadline::Inherit,
                 ..ScopeDefaults::default()
             }),
             inherited

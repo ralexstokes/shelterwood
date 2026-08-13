@@ -11,7 +11,7 @@ use std::{
     collections::BTreeMap,
     ops::{Index, IndexMut},
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 mod storage;
@@ -29,8 +29,8 @@ use removal::RemovalRequest;
 pub(crate) use shutdown::shutdown_scope;
 
 use crate::{
-    Cancellation, ChildId, Exit, GracePhase, Incarnation, JitterSample, Readiness, ScopeState,
-    ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
+    Cancellation, ChildId, DeadlineBudget, Exit, GracePhase, Incarnation, JitterSample, Readiness,
+    ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
         MemberStage, MemberTransition, ResidentProjection, ScopeCell, ScopeControlEvent,
@@ -85,7 +85,10 @@ fn resident_projection(slot: &SlotCell) -> ResidentProjection {
 }
 
 impl SystemRun {
-    pub(crate) async fn shutdown(&mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
+    pub(crate) async fn shutdown(
+        &mut self,
+        timeout: DeadlineBudget,
+    ) -> Result<(), ShutdownTimeout> {
         let result = shutdown_scope(Arc::clone(&self.root), timeout).await;
         self.join_driver().await;
         result

@@ -482,9 +482,8 @@ async fn zero_timeout_reports_recursive_straggler_paths_and_joins_them() {
 #[tokio::test(start_paused = true)]
 async fn ordered_graces_sum_while_dynamic_graces_overlap() {
     fn stubborn() -> TaskDef {
-        TaskDef::new(|_| future::pending()).shutdown(Shutdown::Graceful {
-            grace: Duration::from_secs(10),
-        })
+        TaskDef::new(|_| future::pending())
+            .shutdown(Shutdown::graceful(Duration::from_secs(10)).expect("grace is non-zero"))
     }
 
     let mut ordered = Tree::new();
@@ -527,7 +526,7 @@ async fn dynamic_and_always_members_do_not_finish_naturally() {
     let dynamic = dynamic.spawn().expect("runtime is available");
     dynamic.wait_started().await.expect("dynamic starts");
     let dynamic_scope = dynamic.scope();
-    let mut dynamic_stopped = Box::pin(dynamic_scope.wait_stopped());
+    let mut dynamic_stopped = Box::pin(dynamic_scope.as_scope().wait_stopped());
     assert_quiet(Duration::from_millis(20), || {
         poll_once(dynamic_stopped.as_mut()).is_ready()
     })
@@ -591,9 +590,8 @@ async fn hard_aborted_subtree_descendants_still_publish_exits() {
     let leaf = nested
         .add_task(
             "leaf",
-            TaskDef::new(|_| future::pending()).shutdown(Shutdown::Graceful {
-                grace: Duration::from_secs(60),
-            }),
+            TaskDef::new(|_| future::pending())
+                .shutdown(Shutdown::graceful(Duration::from_secs(60)).expect("grace is non-zero")),
         )
         .expect("valid leaf");
     let mut root = Tree::new();
@@ -643,9 +641,7 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
                     Ok(())
                 }
             })
-            .shutdown(Shutdown::Graceful {
-                grace: Duration::from_secs(60),
-            }),
+            .shutdown(Shutdown::graceful(Duration::from_secs(60)).expect("grace is non-zero")),
         )
         .expect("valid leaf");
     drop(held);
@@ -931,7 +927,6 @@ async fn restart_attempt_resets_after_a_ready_incarnation_settles() {
             }
             Err(LifecycleTryRecvError::Empty) => break,
             Err(LifecycleTryRecvError::Closed) => panic!("live root stream closed"),
-            Ok(_) | Err(_) => panic!("unexpected future lifecycle variant"),
         }
     }
     assert_eq!(
@@ -1485,7 +1480,7 @@ async fn subtree_readiness_deadline_defaults_inherit_or_reset_end_to_end() {
     let (reset_tree, reset_task) = manual_tree(reset_started.clone());
     let mut root = DynamicTree::new();
     root.defaults(ScopeDefaults {
-        readiness_deadline: Some(ReadinessDeadline::Unbounded),
+        readiness_deadline: ReadinessDeadline::Unbounded,
         ..ScopeDefaults::default()
     });
     let inherited_scope = root

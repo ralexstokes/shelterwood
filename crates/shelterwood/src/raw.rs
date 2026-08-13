@@ -13,8 +13,8 @@ use std::{
 };
 
 use crate::{
-    ActorRef, ChildId, ExitResult, Incarnation, Mailbox, MailboxShutdown, PolicyError, Readiness,
-    ReadinessDeadline, RestartPolicy, Retention, Shutdown,
+    ActorRef, ChildId, DeadlineBudget, ExitResult, Incarnation, Mailbox, MailboxShutdown,
+    PolicyError, Readiness, ReadinessDeadline, RestartPolicy, Retention, Shutdown,
     cancellation::{CancellationToken, ParentCancellationToken},
     cells::MemberCell,
     definition::DefinitionSource,
@@ -1339,18 +1339,20 @@ impl<M: Send + 'static> RawContext<M> {
     /// in-flight count even under sustained mailbox traffic. Bookkeeping for
     /// finished offloads is reclaimed when a new offload starts, on every
     /// input-selection turn, and when the loop goes idle.
+    /// A zero budget never polls `work`; its continuation is queued with
+    /// [`DeadlineElapsed`] through the ordinary completion path.
     pub fn offload<F, T, C>(
         &mut self,
         work: F,
         continuation: C,
-        deadline: Duration,
+        deadline: impl Into<DeadlineBudget>,
     ) -> Result<(), Rejected<(F, C)>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> M + Send + 'static,
     {
-        self.start_offload(work, continuation, deadline, OffloadScope::Unscoped)
+        self.start_offload(work, continuation, deadline.into(), OffloadScope::Unscoped)
             .map(|_| ())
     }
 
@@ -1359,18 +1361,20 @@ impl<M: Send + 'static> RawContext<M> {
     /// Completion storage follows [`offload`](Self::offload): unbounded, but
     /// one entry per offload the actor itself started and drained in bounded
     /// arbitration turns alongside mailbox input so no backlog accumulates.
+    /// Like `offload`, a zero budget never polls `work` and queues the
+    /// continuation with [`DeadlineElapsed`].
     pub fn offload_scoped<F, T, C>(
         &mut self,
         work: F,
         continuation: C,
-        deadline: Duration,
+        deadline: impl Into<DeadlineBudget>,
     ) -> Result<Guard, Rejected<(F, C)>>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
         C: FnOnce(Result<T, DeadlineElapsed>) -> M + Send + 'static,
     {
-        self.start_offload(work, continuation, deadline, OffloadScope::Scoped)
+        self.start_offload(work, continuation, deadline.into(), OffloadScope::Scoped)
             .map(|guard| guard.expect("scoped offload must produce a guard"))
     }
 
@@ -1469,7 +1473,7 @@ impl<M: Send + 'static> RawContext<M> {
         &mut self,
         work: F,
         continuation: C,
-        deadline: Duration,
+        deadline: DeadlineBudget,
         scope: OffloadScope,
     ) -> Result<Option<Guard>, Rejected<(F, C)>>
     where
@@ -1494,6 +1498,9 @@ impl<M: Send + 'static> RawContext<M> {
         });
         let events = Arc::clone(&self.resources.events);
         let disposal = self.resources.disposal.clone();
+        // Zero selects no attempt (SPEC Appendix B): the work future is never
+        // polled, and the continuation still travels the ordinary completion
+        // path so its venue and ordering are unchanged.
         if deadline.is_zero() {
             drop(work);
             events.push(QueuedEvent {
@@ -1512,7 +1519,7 @@ impl<M: Send + 'static> RawContext<M> {
 
         let token = self.shutdown.child(cancellation.clone());
         let started_at = runtime::now();
-        let expires_at = crate::deadline::Deadline::after(started_at, deadline).instant();
+        let expires_at = crate::deadline::Deadline::after_budget(started_at, deadline).instant();
         let event_cancellation = cancellation.clone();
         let operation = async move {
             let completion = async move {

@@ -5,8 +5,8 @@
 use std::{fmt, future::Future, hash::Hash, marker::PhantomData, time::Duration};
 
 use crate::{
-    ActorRef, Blocking, ChildId, DeadlineElapsed, ExitError, ExitResult, Guard, Incarnation,
-    Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
+    ActorRef, Blocking, ChildId, DeadlineBudget, DeadlineElapsed, ExitError, ExitResult, Guard,
+    Incarnation, Mailbox, MailboxShutdown, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
     ReadinessDeadline, Rejected, RestartPolicy, Retention, ScopeRef, Shutdown,
     cancellation::CancellationToken, policy::CommonOptions,
 };
@@ -214,11 +214,13 @@ impl<'a, A: Actor> Context<'a, A> {
     }
 
     /// Starts incarnation-owned async work with one total deadline budget.
+    /// A zero budget never polls `work` and re-enters with
+    /// [`DeadlineElapsed`].
     pub fn offload<F, T, C>(
         &mut self,
         work: F,
         continuation: C,
-        deadline: Duration,
+        deadline: impl Into<DeadlineBudget>,
     ) -> Result<(), Rejected<(F, C)>>
     where
         F: Future<Output = T> + Send + 'static,
@@ -233,11 +235,13 @@ impl<'a, A: Actor> Context<'a, A> {
     }
 
     /// Starts guarded incarnation-owned async work with one deadline budget.
+    /// A zero budget never polls `work` and re-enters with
+    /// [`DeadlineElapsed`].
     pub fn offload_scoped<F, T, C>(
         &mut self,
         work: F,
         continuation: C,
-        deadline: Duration,
+        deadline: impl Into<DeadlineBudget>,
     ) -> Result<Guard, Rejected<(F, C)>>
     where
         F: Future<Output = T> + Send + 'static,

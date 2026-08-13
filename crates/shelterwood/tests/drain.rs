@@ -360,7 +360,7 @@ async fn run_fault_fixture(
                 blocking_result: Arc::clone(&blocking_result),
             })
             .mailbox_shutdown(mailbox_shutdown)
-            .shutdown(Shutdown::Graceful { grace }),
+            .shutdown(Shutdown::graceful(grace).expect("grace is non-zero")),
         )
         .expect("valid fault actor");
     let system = tree.spawn().expect("runtime is available");

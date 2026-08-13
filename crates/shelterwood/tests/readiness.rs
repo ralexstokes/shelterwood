@@ -701,7 +701,7 @@ async fn dynamic_startup_completes_after_removing_sole_unready_initial_member() 
     let scope = system.scope();
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            scope.child("gate").is_some()
+            scope.as_scope().child("gate").is_some()
         })
         .await
     );
@@ -732,9 +732,10 @@ async fn dynamic_startup_completes_after_removing_last_unready_initial_member() 
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             scope
+                .as_scope()
                 .child("ready")
                 .is_some_and(|child| matches!(child.state, ChildState::Running))
-                && scope.child("gate").is_some()
+                && scope.as_scope().child("gate").is_some()
         })
         .await
     );
@@ -766,7 +767,7 @@ async fn dynamic_startup_completes_after_removing_every_initial_member() {
     let scope = system.scope();
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            scope.child("first").is_some() && scope.child("second").is_some()
+            scope.as_scope().child("first").is_some() && scope.as_scope().child("second").is_some()
         })
         .await
     );
@@ -804,7 +805,7 @@ async fn removal_completed_nested_startup_releases_the_ordered_sibling() {
     let scope = system.scope();
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            nested_scope.child("gate").is_some()
+            nested_scope.as_scope().child("gate").is_some()
         })
         .await
     );
@@ -850,9 +851,10 @@ async fn removing_a_ready_initial_member_leaves_startup_pending() {
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             scope
+                .as_scope()
                 .child("ready")
                 .is_some_and(|child| matches!(child.state, ChildState::Running))
-                && scope.child("gate").is_some()
+                && scope.as_scope().child("gate").is_some()
         })
         .await
     );
@@ -862,7 +864,7 @@ async fn removing_a_ready_initial_member_leaves_startup_pending() {
         shelterwood::RemoveOutcome::Removed
     );
     assert_quiet(Duration::from_secs(30), || {
-        !matches!(scope.snapshot().state, ScopeState::Starting)
+        !matches!(scope.as_scope().snapshot().state, ScopeState::Starting)
     })
     .await;
     system
@@ -1037,7 +1039,7 @@ async fn nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause() {
     ));
     assert!(sibling_cancelled.load(Ordering::SeqCst));
     assert!(matches!(
-        nested_scope.wait_stopped().await,
+        nested_scope.as_scope().wait_stopped().await,
         shelterwood::StopReason::StartupFailed(_)
     ));
     system
@@ -1230,11 +1232,8 @@ async fn start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stra
     let prefix = tree
         .add_task(
             "prefix",
-            TaskDef::new(|_| std::future::pending::<shelterwood::ExitResult>()).shutdown(
-                Shutdown::Graceful {
-                    grace: Duration::from_secs(60),
-                },
-            ),
+            TaskDef::new(|_| std::future::pending::<shelterwood::ExitResult>())
+                .shutdown(Shutdown::graceful(Duration::from_secs(60)).expect("grace is non-zero")),
         )
         .expect("valid prefix");
     tree.add_task(
@@ -1404,7 +1403,7 @@ async fn nested_startup_rollback_includes_runtime_added_members() {
     assert!(matches!(runtime_exit.kind(), ExitKind::Completed));
     assert_eq!(runtime_exit.cancellation(), Cancellation::Observed);
     assert!(matches!(
-        nested.wait_stopped().await,
+        nested.as_scope().wait_stopped().await,
         shelterwood::StopReason::StartupFailed(_)
     ));
 

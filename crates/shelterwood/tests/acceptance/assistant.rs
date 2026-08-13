@@ -466,6 +466,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     stream.send(3).await.expect("third stream update accepted");
     stream_gate.release();
     sessions
+        .as_scope()
         .wait_for_child(
             "session",
             |child| matches!(child.state, ChildState::Running),
@@ -539,6 +540,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .await
         .expect("temporary tool admitted");
     tools
+        .as_scope()
         .wait_for_child(
             "temporary-tool",
             |child| matches!(child.state, ChildState::Running),
@@ -553,6 +555,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
             tools
+                .as_scope()
                 .snapshot()
                 .child("temporary-tool")
                 .is_some_and(|child| {
@@ -693,6 +696,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     assert!(!replacement.membership().supersedes(session_membership));
     assert!(!session_membership.supersedes(replacement.membership()));
     sessions
+        .as_scope()
         .wait_for_child(
             "session",
             |child| matches!(child.state, ChildState::Running),
@@ -701,6 +705,7 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
         .await
         .expect("replacement session becomes ready");
     let replacement_snapshot = sessions
+        .as_scope()
         .snapshot()
         .child("session")
         .expect("replacement is resident")

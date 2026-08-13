@@ -158,7 +158,7 @@ impl StopLadder {
                 } else {
                     match self.policy {
                         Shutdown::Graceful { grace } => {
-                            self.deadline = Deadline::after(now, grace).instant();
+                            self.deadline = Deadline::after(now, grace.get()).instant();
                         }
                         Shutdown::Abort => {
                             self.deadline = Some(now);
@@ -173,7 +173,7 @@ impl StopLadder {
                         if !self.force_requested {
                             self.grace_phase = GracePhase::AfterGrace;
                         }
-                        grace
+                        grace.get()
                     }
                     Shutdown::Abort => Duration::ZERO,
                 };
@@ -1123,7 +1123,8 @@ mod tests {
     fn ladder_uses_cancel_escalate_and_hard_abort_for_every_policy() {
         let start = Instant::now();
         let grace = Duration::from_millis(100);
-        let mut graceful = StopLadder::new(Shutdown::Graceful { grace });
+        let mut graceful =
+            StopLadder::new(Shutdown::graceful(grace).expect("test grace is non-zero"));
         assert_eq!(graceful.advance(start), Some(StopAction::Cancel));
         assert_eq!(graceful.advance(start + grace / 2), None);
         assert_eq!(graceful.advance(start + grace), Some(StopAction::Escalate));
@@ -1149,7 +1150,8 @@ mod tests {
     fn repeated_force_expedites_without_rewinding_the_ladder() {
         let start = Instant::now();
         let grace = Duration::from_secs(30);
-        let mut ladder = StopLadder::new(Shutdown::Graceful { grace });
+        let mut ladder =
+            StopLadder::new(Shutdown::graceful(grace).expect("test grace is non-zero"));
 
         assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
         ladder.force(start);
@@ -1166,7 +1168,8 @@ mod tests {
              to the grace it skipped"
         );
 
-        let mut unforced = StopLadder::new(Shutdown::Graceful { grace });
+        let mut unforced =
+            StopLadder::new(Shutdown::graceful(grace).expect("test grace is non-zero"));
         assert_eq!(unforced.advance(start), Some(StopAction::Cancel));
         assert_eq!(unforced.advance(start + grace), Some(StopAction::Escalate));
         assert_eq!(
@@ -1199,7 +1202,8 @@ mod tests {
     fn force_preserves_an_already_due_deadline() {
         let start = Instant::now();
         let grace = Duration::from_secs(30);
-        let mut ladder = StopLadder::new(Shutdown::Graceful { grace });
+        let mut ladder =
+            StopLadder::new(Shutdown::graceful(grace).expect("test grace is non-zero"));
 
         assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
         let due = ladder.deadline().expect("grace deadline");
@@ -1269,9 +1273,9 @@ mod tests {
     #[test]
     fn overflowing_grace_stays_pending_until_force_rescues_the_ladder() {
         let start = Instant::now();
-        let mut ladder = StopLadder::new(Shutdown::Graceful {
-            grace: Duration::MAX,
-        });
+        let mut ladder = StopLadder::new(
+            Shutdown::graceful(Duration::MAX).expect("maximum duration is non-zero"),
+        );
 
         assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
         assert_eq!(ladder.deadline(), None);

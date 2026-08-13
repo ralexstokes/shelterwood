@@ -1,7 +1,8 @@
-use std::{fmt, marker::PhantomData, sync::Arc, time::Duration};
+use std::{fmt, marker::PhantomData, sync::Arc};
 
 use crate::{
-    DefaultsInheritance, ReadinessDeadline, RestartPolicy, Retention, Shutdown, ShutdownTimeout,
+    DeadlineBudget, DefaultsInheritance, ReadinessDeadline, RestartPolicy, Retention, Shutdown,
+    ShutdownTimeout,
     definition::DefinitionSource,
     exit::{StartupError, StopReason},
     plan::{BuilderCore, ScopeConstruction},
@@ -195,10 +196,13 @@ impl<R> System<R> {
     /// Unlike [`Self::wait_started`], this consumes the owner so a failed
     /// startup cannot leave its successfully started prefix running. The error
     /// preserves both the original startup cause and any rollback timeout.
+    /// A zero rollback budget requests cooperative cancellation and then
+    /// enters the ordinary escalation tail without a cooperative wait.
     pub async fn start_or_shutdown(
         mut self,
-        timeout: Duration,
+        timeout: impl Into<DeadlineBudget>,
     ) -> Result<Self, StartOrShutdownError> {
+        let timeout: DeadlineBudget = timeout.into();
         match self.wait_started().await {
             Ok(()) => Ok(self),
             Err(startup) => {
@@ -220,8 +224,13 @@ impl<R> System<R> {
     /// its synchronous drop epilogue; deeper task destruction may therefore
     /// finish after return. Blocking threads created by `run_blocking` detach
     /// past hard abort independently of that fallback.
-    pub async fn shutdown(mut self, timeout: Duration) -> Result<(), ShutdownTimeout> {
-        self.run.shutdown(timeout).await
+    /// A zero budget still requests cooperative cancellation, then skips its
+    /// wait and enters the ordinary escalation tail immediately.
+    pub async fn shutdown(
+        mut self,
+        timeout: impl Into<DeadlineBudget>,
+    ) -> Result<(), ShutdownTimeout> {
+        self.run.shutdown(timeout.into()).await
     }
 
     /// Waits for natural or externally requested terminal state.

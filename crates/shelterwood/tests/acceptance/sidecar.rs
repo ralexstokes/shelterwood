@@ -163,9 +163,7 @@ fn sidecar(cycle: usize, journal: HostJournal) -> SidecarFixture {
             stubborn_task(
                 cycle,
                 "graceful-worker",
-                Shutdown::Graceful {
-                    grace: Duration::from_millis(5),
-                },
+                Shutdown::graceful(Duration::from_millis(5)).expect("grace is non-zero"),
                 journal.clone(),
             ),
         )

@@ -676,6 +676,7 @@ async fn restart_window_removal_joins_factory_disposal_before_terminality() {
         .await
         .expect("first incarnation starts");
     scope
+        .as_scope()
         .wait_for_child(
             "restarting",
             |child| matches!(child.state, ChildState::Restarting),
@@ -810,7 +811,7 @@ async fn ordered_shutdown_waits_for_later_unstarted_definition_disposal() {
 }
 
 #[tokio::test]
-async fn hard_shutdown_detaches_a_blocking_factory_disposal() {
+async fn zero_shutdown_reports_the_live_child_but_detaches_blocking_factory_disposal() {
     let gate = DestructorGate::default();
     let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
     let mut tree = Tree::new();
@@ -846,7 +847,9 @@ async fn hard_shutdown_detaches_a_blocking_factory_disposal() {
     let result = bounded
         .expect("hard escalation is not held by factory disposal")
         .expect("shutdown task joins");
-    result.expect("post-exit disposal is not an actor straggler");
+    let timeout = result.expect_err("zero skips the cooperative wait for the live child");
+    assert_eq!(timeout.stragglers.len(), 1);
+    assert_eq!(timeout.stragglers[0].path[0].as_str(), "blocked-factory");
     let exit = task.wait().await;
     assert!(matches!(exit.kind(), ExitKind::Completed));
     assert_eq!(exit.cancellation(), Cancellation::Observed);

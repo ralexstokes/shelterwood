@@ -47,7 +47,6 @@ impl LifecycleSeq {
 
 /// One item read from a lifecycle subscription.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum LifecycleItem {
     /// One ordered lifecycle edge.
     Event(LifecycleEvent),
@@ -72,6 +71,8 @@ pub struct LifecycleEvent {
 }
 
 /// Core lifecycle event inventory.
+///
+/// Non-exhaustive deliberately: Part II observation extensions add event kinds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum LifecycleEventKind {
@@ -140,7 +141,6 @@ pub enum LifecycleEventKind {
 
 /// Current state of one child membership.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[non_exhaustive]
 pub enum ChildState {
     /// Membership admitted; its first spawn has not begun.
     Admitted,
@@ -503,7 +503,6 @@ impl fmt::Debug for SnapshotHub {
 
 /// Error from a non-blocking lifecycle receive.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
 pub enum LifecycleTryRecvError {
     /// No item is ready yet.
     #[error("lifecycle subscription is empty")]
@@ -693,7 +692,6 @@ impl fmt::Debug for LifecycleHub {
 
 /// Failure returned while a façade scope handle waits for a child snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
 pub enum WaitError {
     /// The trailing deadline elapsed before a matching child appeared.
     #[error("child wait timed out")]

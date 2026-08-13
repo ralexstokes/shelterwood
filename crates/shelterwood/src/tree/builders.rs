@@ -20,7 +20,6 @@ use super::{
 
 /// A root lowering error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[non_exhaustive]
 pub enum BuildError {
     /// No ambient supported async runtime exists.
     #[error("no ambient Tokio runtime is available")]

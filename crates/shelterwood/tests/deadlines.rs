@@ -511,9 +511,7 @@ async fn overflowing_shutdown_grace_does_not_escalate() {
                 }
             }
         })
-        .shutdown(Shutdown::Graceful {
-            grace: Duration::MAX,
-        }),
+        .shutdown(Shutdown::graceful(Duration::MAX).expect("maximum grace is non-zero")),
     )
     .expect("valid task");
     let system = tree.spawn().expect("runtime is available");

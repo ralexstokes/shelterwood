@@ -356,6 +356,7 @@ async fn restartable_and_dynamic_actor_definition_surfaces_work() {
         .await
         .expect("dynamic actor live");
     let stopped = dynamic
+        .as_scope()
         .wait_for_child("dynamic", |child| child.state.is_terminal(), POLL_TIMEOUT)
         .await
         .expect("the dynamic actor's requested stop reaches terminal publication");

@@ -510,9 +510,8 @@ async fn forced_teardown_terminalizes_nested_mailboxes() {
     let actor = nested
         .add_raw(
             "stubborn",
-            RawDef::factory(|| StubbornActor).shutdown(Shutdown::Graceful {
-                grace: Duration::from_secs(30),
-            }),
+            RawDef::factory(|| StubbornActor)
+                .shutdown(Shutdown::graceful(Duration::from_secs(30)).expect("grace is non-zero")),
         )
         .expect("valid actor");
     let mut root = Tree::new();

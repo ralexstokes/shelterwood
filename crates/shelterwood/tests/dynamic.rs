@@ -40,7 +40,7 @@ use shelterwood::{
 async fn wait_for_id_release(scope: &DynamicScopeRef, id: &str) {
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            scope.child(id).is_none()
+            scope.as_scope().child(id).is_none()
         })
         .await,
         "removal of {id} did not release its id"
@@ -373,6 +373,7 @@ async fn task_raw_and_subtree_admissions_resolve_before_manual_startup() {
         assert!(
             poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
                 scope
+                    .as_scope()
                     .child(id)
                     .is_some_and(|child| matches!(child.state, ChildState::Starting))
             })
@@ -1251,7 +1252,10 @@ async fn pre_spawn_dynamic_handles_reject_reservations_without_a_live_incarnatio
     ));
     drop(slot);
     drop(root);
-    assert_eq!(scope.wait_stopped().await, StopReason::NeverStarted);
+    assert_eq!(
+        scope.as_scope().wait_stopped().await,
+        StopReason::NeverStarted
+    );
 }
 
 #[tokio::test]
@@ -1636,9 +1640,7 @@ async fn draining_scopes_reject_admission_and_treat_removal_as_absent() {
                 }
             }
         })
-        .shutdown(Shutdown::Graceful {
-            grace: Duration::from_secs(1),
-        }),
+        .shutdown(Shutdown::graceful(Duration::from_secs(1)).expect("grace is non-zero")),
     )
     .expect("valid task");
     let system = tree.spawn().expect("runtime is available");
@@ -1729,9 +1731,7 @@ async fn ancestor_hard_abort_disposes_a_queued_admission_and_midflight_removal()
                     }
                 }
             })
-            .shutdown(Shutdown::Graceful {
-                grace: Duration::from_secs(60),
-            }),
+            .shutdown(Shutdown::graceful(Duration::from_secs(60)).expect("grace is non-zero")),
         )
         .expect("valid worker");
     let mut root = Tree::new();
@@ -1882,7 +1882,7 @@ async fn startup_failed_roots_reject_reservation_and_admission_with_startup_fail
         .expect_err("pre-ready terminal exit aborts startup");
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            matches!(scope.snapshot().state, ScopeState::StartupFailed)
+            matches!(scope.as_scope().snapshot().state, ScopeState::StartupFailed)
         })
         .await,
         "the root publishes StartupFailed while the started prefix remains supervised"
@@ -1915,7 +1915,10 @@ async fn terminal_scopes_reject_reservation_and_admission_with_terminal() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("root stops");
-    assert_eq!(scope.wait_stopped().await, StopReason::ShutdownRequested);
+    assert_eq!(
+        scope.as_scope().wait_stopped().await,
+        StopReason::ShutdownRequested
+    );
 
     assert!(matches!(
         scope.reserve_task("late"),

@@ -253,6 +253,7 @@ async fn default_restart_backoff_and_retention_follow_definition_ownership() {
         .await
         .expect("restartable task is admitted");
     let running = scope
+        .as_scope()
         .wait_for_child(
             "restartable",
             |child| {
@@ -278,7 +279,7 @@ async fn default_restart_backoff_and_retention_follow_definition_ownership() {
     one_shot.wait().await;
     assert!(
         poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            scope.child("one-shot").is_none()
+            scope.as_scope().child("one-shot").is_none()
         })
         .await,
         "the default one-shot retention removes the terminal membership"

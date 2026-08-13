@@ -831,16 +831,7 @@ impl Drop for ResidentChild {
         let Some(parent) = completion.parent.upgrade() else {
             return;
         };
-        parent.with_observation_gate(|wakes| {
-            parent.emit_locked(
-                wakes,
-                LifecycleEventKind::Removed {
-                    id: completion.projection.member.id().clone(),
-                    membership: completion.projection.member.membership(),
-                    last_incarnation: completion.projection.member.record().last_incarnation,
-                },
-            );
-        });
+        parent.with_observation_gate(|txn| Self::publish_removal(completion, txn));
     }
 }
 
@@ -909,7 +900,7 @@ struct ScopeObservation {
 pub struct ScopeCell {
     pub member: Arc<MemberCell>,
     pub flavor: ScopeFlavor,
-    pub child_identity: Mutex<ScopeIdentity>,
+    child_identity: Mutex<ScopeIdentity>,
     control: Mutex<ScopeControl>,
     dynamic_route: Mutex<Option<Arc<ErasedDynamicRoute>>>,
     observation: ScopeObservation,
@@ -947,6 +938,24 @@ pub struct RuntimeStorage {
 }
 
 impl ScopeCell {
+    pub fn mint_membership(&self, id: &ChildId) -> Option<MintedMembership> {
+        self.child_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mint_membership(id)
+    }
+
+    pub fn adopt_or_mint_membership(
+        &self,
+        id: &ChildId,
+        provisional: Membership,
+    ) -> Option<Option<MintedMembership>> {
+        self.child_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .adopt_or_mint_membership(id, provisional)
+    }
+
     pub fn evict_child_identity(&self, member: &MemberCell) {
         self.child_identity
             .lock()
@@ -1182,15 +1191,11 @@ impl ScopeCell {
             .map(|resident| resident.projection.clone())
             .collect::<Vec<_>>();
         for descendant in descendants {
+            descendant
+                .member
+                .install_observation_gate_locked(previous, gate);
             if let Some(scope) = descendant.scope {
-                descendant
-                    .member
-                    .install_observation_gate_locked(previous, gate);
                 scope.adopt_descendant_observation_gates_locked(previous, gate, _txn);
-            } else {
-                descendant
-                    .member
-                    .install_observation_gate_locked(previous, gate);
             }
         }
     }
@@ -1468,14 +1473,10 @@ impl ScopeCell {
             .config
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let children = self
-            .current_children()
-            .iter()
-            .map(|resident| resident.projection.clone())
-            .collect::<Vec<_>>();
+        let children = self.current_children();
         let children = children
             .iter()
-            .map(|child| self.child_snapshot_locked(child))
+            .map(|resident| self.child_snapshot_locked(&resident.projection))
             .collect::<Vec<_>>();
         Arc::new(ScopeSnapshot {
             state: record.state,

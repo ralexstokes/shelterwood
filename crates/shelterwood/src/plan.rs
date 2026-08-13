@@ -40,9 +40,6 @@ pub(crate) fn mint_reserved_slot(
     child_scope: Option<ScopeFlavor>,
 ) -> Result<Arc<SlotCell>, ReserveError> {
     let membership = parent
-        .child_identity
-        .lock()
-        .expect("scope identity mutex poisoned")
         .mint_membership(id)
         .ok_or(ReserveError::IdentityExhausted)?;
     let member = MemberCell::new(id.clone(), membership);
@@ -179,13 +176,14 @@ impl SlotCell {
         owner: &ScopeCell,
         txn: &mut ObservationTxn<'_>,
     ) {
-        self.member.terminalize_locked(
-            Exit::never_started(),
-            crate::cells::StartupDisposition::Unchanged,
-            txn,
-        );
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started_locked(txn);
+        } else {
+            self.member.terminalize_locked(
+                Exit::never_started(),
+                crate::cells::StartupDisposition::Unchanged,
+                txn,
+            );
         }
         owner.evict_child_identity(&self.member);
     }
@@ -373,16 +371,11 @@ impl BuilderCore {
             // evict the terminalized slots from the override's identity map,
             // not this builder's throwaway root.
             self.adopting_root = Some(Arc::clone(&root));
-            let mut identity = root
-                .child_identity
-                .lock()
-                .expect("scope identity mutex poisoned");
             for slot in &self.slots {
                 let Some(rebased) =
-                    identity.adopt_or_mint_membership(slot.member.id(), slot.member.membership())
+                    root.adopt_or_mint_membership(slot.member.id(), slot.member.membership())
                 else {
                     let id = slot.member.id().clone();
-                    drop(identity);
                     let disposal = self.begin_failed_disposal();
                     return Err(LowerError::IdentityExhausted { id, disposal });
                 };

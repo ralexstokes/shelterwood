@@ -363,10 +363,7 @@ pub(super) fn restarting_member_fixture() -> (Arc<ScopeCell>, Arc<MemberCell>, I
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
         child_id.clone(),
-        root.child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .mint_membership(&child_id)
+        root.mint_membership(&child_id)
             .expect("child membership available"),
     );
     resolve_fixture_options(&member);

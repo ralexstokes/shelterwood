@@ -357,6 +357,14 @@ struct SnapshotHubState {
 }
 
 impl SnapshotHub {
+    /// Subscribes while the containing scope's observation gate is held.
+    ///
+    /// No wake is owed for the receiverless refresh below: the gate is what
+    /// makes it safe, and the only receiver that could observe the refresh is
+    /// the one minted here — which captures the refreshed generation as
+    /// already seen. The transaction is still needed, for the one thing the
+    /// refresh does owe: retiring the projection it displaces, whose child
+    /// exits carry user payloads (§1's lock rule).
     pub(crate) fn subscribe(
         &self,
         initial: Arc<ScopeSnapshot>,
@@ -374,8 +382,7 @@ impl SnapshotHub {
             // Publication is skipped while receiverless, so the first
             // subscriber after a quiet stretch installs current state itself.
             // A closed hub already holds the authoritative terminal
-            // projection, installed by `close`; leave it, and skip the pulse
-            // that would then wake nobody about nothing.
+            // projection installed by `close`; leave it unchanged.
             let mut retired = None;
             sender.modify_silently(|state| {
                 if state.closed {
@@ -389,7 +396,6 @@ impl SnapshotHub {
             });
             if let Some(retired) = retired {
                 retire_snapshot(txn, retired);
-                txn.pulse(sender);
             }
         }
         let inner = sender.watcher();

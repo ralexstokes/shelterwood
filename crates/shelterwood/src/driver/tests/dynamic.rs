@@ -163,10 +163,7 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
         child_id.clone(),
-        root.child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .mint_membership(&child_id)
+        root.mint_membership(&child_id)
             .expect("child membership available"),
     );
     let slot = SlotCell::new(Arc::clone(&member), None);
@@ -309,10 +306,7 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
         child_id.clone(),
-        root.child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .mint_membership(&child_id)
+        root.mint_membership(&child_id)
             .expect("child membership available"),
     );
     let slot = SlotCell::new(Arc::clone(&member), None);
@@ -581,9 +575,6 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
     let child_id = ChildId::from("worker");
     let membership = root
-        .child_identity
-        .lock()
-        .expect("scope identity mutex poisoned")
         .mint_membership(&child_id)
         .expect("membership available");
     let member = MemberCell::new(child_id.clone(), membership);
@@ -1041,22 +1032,18 @@ async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
         "a reserved membership cannot emit a key-addressed Removal"
     );
 
-    // If handle_admission loses its first latch re-check, conversion now
-    // reaches this poisoned identity mutex and unwinds before the later
-    // under-lock check. The real guard rejects without touching it.
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| {
-            let _identity = root
-                .child_identity
-                .lock()
-                .expect("scope identity mutex starts healthy");
-            panic!("poison conversion after the overtaking fused cancellation");
-        }))
-        .is_err()
-    );
+    // Conversion issues the membership's incarnation counter to the child
+    // runtime and never returns it, so an unclaimed counter afterwards is
+    // evidence that the first latch re-check rejected before conversion ran.
+    // That is what the sibling under-lock test parks on to reach the later
+    // disjunct.
     assert!(
         catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request))).is_ok(),
         "overtaking fused cancellation rejects before fallible child conversion"
+    );
+    assert!(
+        member.lock_incarnation_counter().is_some(),
+        "the pre-conversion latch check rejects before the counter is issued"
     );
     assert!(matches!(
         response.receive().await,
@@ -1099,8 +1086,8 @@ async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_rech
     };
 
     // Fused cancellation fires while the driver is already inside child
-    // conversion: past the pre-conversion latch check, parked on the child
-    // identity mutex held below. Only the re-check under the control-plane
+    // conversion: past the pre-conversion latch check, parked on the
+    // incarnation-counter mutex held below. Only the re-check under the control-plane
     // lock can observe this firing, so this interleaving pins that disjunct
     // specifically. The entry stays Reserved throughout — a fired latch
     // cannot mark a keyless reservation Removing — which keeps the

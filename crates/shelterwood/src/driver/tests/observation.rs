@@ -7,10 +7,7 @@ fn snapshot_rejects_a_resident_whose_options_were_never_resolved() {
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
         child_id.clone(),
-        root.child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .mint_membership(&child_id)
+        root.mint_membership(&child_id)
             .expect("child membership available"),
     );
 
@@ -542,9 +539,6 @@ async fn wait_for_child_reloads_after_its_predicate_closes_the_snapshot_stream()
     scope.set_state(ScopeState::Running);
     let child_id = ChildId::from("child");
     let membership = scope
-        .child_identity
-        .lock()
-        .expect("scope identity mutex is healthy")
         .mint_membership(&child_id)
         .expect("child membership is available");
     let child = MemberCell::new(child_id, membership);
@@ -938,9 +932,6 @@ fn admitted_subtree_rehomes_existing_descendants_to_one_gate() {
     let raw_leaf = MemberCell::new(
         raw_leaf_id.clone(),
         nested
-            .child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
             .mint_membership(&raw_leaf_id)
             .expect("raw leaf membership is available"),
     );
@@ -1257,10 +1248,7 @@ fn a_retired_snapshot_payload_is_destroyed_outside_the_gate() {
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
         child_id.clone(),
-        root.child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .mint_membership(&child_id)
+        root.mint_membership(&child_id)
             .expect("child membership available"),
     );
     resolve_fixture_options(&member);
@@ -1362,10 +1350,7 @@ fn a_snapshot_retired_by_observation_closure_is_destroyed_outside_the_gate() {
     let child_id = ChildId::from("worker");
     let member = MemberCell::new(
         child_id.clone(),
-        root.child_identity
-            .lock()
-            .expect("scope identity mutex poisoned")
-            .mint_membership(&child_id)
+        root.mint_membership(&child_id)
             .expect("child membership available"),
     );
     resolve_fixture_options(&member);

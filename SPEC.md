@@ -3048,12 +3048,18 @@ integration toolkit for the driver shell and the end-to-end invariants.
     (re-entering `snapshot()` from the waker succeeds; the mutex is
     unpoisoned afterwards). A message, actor-state, or exit payload whose
     destructor blocks or panics: displace it by conflation, recover it by
-    withdrawal, retire it by terminalization, and supersede it by
-    publication — every one must be destroyed after the guard, and the
-    blocking kind must reach isolated disposal rather than any framework
-    thread. The gate-held probe is the direct oracle: a payload
-    destructor that asks whether the observation gate is held must answer
-    no, on every path that retires one.
+    withdrawal, retire it by terminalization, supersede it by a restart
+    schedule, and retire the projection that carried it — every one must
+    be destroyed after the guard. The gate-held probe is the direct
+    oracle: a payload destructor that asks whether the observation gate is
+    held must answer no, on every path that retires one. What this item
+    does *not* assert is where the destructor then runs: a mailbox
+    payload reaches isolated disposal, an `Exit`'s application error is
+    destroyed on the framework thread that released the guard. Moving the
+    second to isolated disposal is a separate rule about blocking
+    destructors on framework threads, tracked outside this item, because
+    the same thread already destroys exits on paths that hold no lock at
+    all.
 
 ## 14. Core-spike decisions
 

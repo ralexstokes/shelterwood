@@ -41,8 +41,13 @@ rests on:
   `SnapshotHub`'s deferred retirement all encode that.
 - **`Arc` traffic that cannot reach zero.** Cloning an `Arc` under a lock is
   refcount work; dropping one is only refcount work while another owner is
-  provable. Prefer restructuring over the proof — three confirmed violations
-  (see #235) were each a drop that *looked* like refcount traffic.
+  provable. Prefer restructuring over the proof — every violation the #235
+  audit confirmed was a drop that *looked* like refcount traffic. One
+  exemption still rests on such a proof: `ScopeCell::clear_residents_locked`
+  and `prune_child_locked` drop `Arc<MemberCell>`s under the gate, and a
+  member record owns an `Exit`. They are safe only because the driver's own
+  child map outlives residency (`ScopeRuntime`'s `Drop` clears residents
+  before `self.children`), which is an ordering nothing enforces.
 - **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination` and
   `DynamicRoute` are cross-crate implementation seams with framework-only
   impls, not user traits; calling them under a lock runs no caller code.
@@ -50,13 +55,25 @@ rests on:
   gate is outermost: everything else is taken under it or standalone, never
   around it. Inside, the documented orders are cells' member mailbox →
   `MailboxCell::state`, and `MailboxCell::state` → `SendOperation::state`.
+  Gate-to-gate is the one exception to "outermost": `adopt_observation_gate`
+  takes the adoptee's *current* gate while the adopting parent's is held, in
+  the parent-to-child direction only, and re-reads the installed pointer
+  under the acquired guard so a concurrent handoff retries rather than
+  deadlocks.
 
 Two conventions that are not the rule itself but travel with it: panicking
 while holding a mutex the codebase `.expect()`s poisons it for every later
 caller, so compute the verdict, release, *then* panic (`MailboxCell::bind` is
 the pattern; where releasing is impossible, `debug_assert!` instead, as
 `MailboxState::take_waiters` does). And a value that may block on destruction
-goes to `runtime::dispose_detached`, not merely past the unlock.
+goes to `runtime::dispose_detached`, not merely past the unlock. That second
+convention is currently met for mailbox payloads, construction closures and
+offloads, and *not* met for an `Exit`'s application error: no site in the
+workspace routes an `Exit` through isolated disposal, while the driver
+destroys exits inline on its own thread on several paths that hold no lock at
+all. Treat that as a known gap to close as a class, not by detaching whichever
+site a review happens to land on — a half-detached class reads as if the
+whole class were handled.
 
 Reviewing a new `.lock()` is one pass: name every value the critical section
 can destroy, every callback it can invoke, and every panic it can raise. If

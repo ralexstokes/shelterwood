@@ -356,6 +356,27 @@ pub(super) fn gate_probe_exit(scope: &Arc<ScopeCell>) -> (Exit, Arc<Mutex<Option
     (exit, held_at_drop)
 }
 
+/// A dynamic root with one admitted, started child, plus the child's
+/// incarnation counter — the shape a restart schedule needs.
+pub(super) fn restarting_member_fixture() -> (Arc<ScopeCell>, Arc<MemberCell>, IncarnationCounter) {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let child_id = ChildId::from("worker");
+    let member = MemberCell::new(
+        child_id.clone(),
+        root.child_identity
+            .lock()
+            .expect("scope identity mutex poisoned")
+            .mint_membership(&child_id)
+            .expect("child membership available"),
+    );
+    resolve_fixture_options(&member);
+    let mut incarnations = member.take_incarnation_counter();
+    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    let first = incarnations.mint().expect("incarnation available");
+    member.transition(MemberTransition::Starting { incarnation: first });
+    (root, member, incarnations)
+}
+
 pub(super) fn gate_probe_verdict(held_at_drop: &Arc<Mutex<Option<bool>>>) -> Option<bool> {
     *held_at_drop.lock().expect("gate probe mutex poisoned")
 }

@@ -90,7 +90,14 @@ impl MemberRecord {
     /// Every watch-channel writer routes stage changes through here (see
     /// [`MemberCell::transition`] for the wake-bus contract), so each arm
     /// asserts the source stages its driver call sites can actually present.
-    fn apply_transition(&mut self, transition: MemberTransition) {
+    ///
+    /// Returns the exit this transition displaced from `last_exit`, if any.
+    /// The record is mutated under the observation gate and the watch
+    /// channel's own lock, and an `ExitKind::Failed` payload owns a
+    /// type-erased user error, so the displaced value is surrendered to the
+    /// caller rather than destroyed here (§1's lock rule).
+    #[must_use]
+    fn apply_transition(&mut self, transition: MemberTransition) -> Option<Exit> {
         match transition {
             MemberTransition::Admitted => {
                 debug_assert!(
@@ -99,6 +106,7 @@ impl MemberRecord {
                     self.stage
                 );
                 self.stage = MemberStage::Admitted;
+                None
             }
             MemberTransition::Starting { incarnation } => {
                 debug_assert!(
@@ -110,6 +118,7 @@ impl MemberRecord {
                 self.incarnation = Some(incarnation);
                 self.last_incarnation = Some(incarnation);
                 self.restart_at = None;
+                None
             }
             MemberTransition::Running => {
                 debug_assert!(
@@ -119,6 +128,7 @@ impl MemberRecord {
                     self.stage
                 );
                 self.stage = MemberStage::Running;
+                None
             }
             MemberTransition::Stopping => {
                 debug_assert!(
@@ -127,6 +137,7 @@ impl MemberRecord {
                     self.stage
                 );
                 self.stage = MemberStage::Stopping;
+                None
             }
             MemberTransition::RestartScheduled {
                 exit,
@@ -143,9 +154,10 @@ impl MemberRecord {
                 );
                 self.stage = MemberStage::Restarting;
                 self.incarnation = None;
-                self.last_exit = Some(exit);
+                let displaced = self.last_exit.replace(exit);
                 self.restart_count = restart_count;
                 self.restart_at = restart_at;
+                displaced
             }
         }
     }
@@ -402,7 +414,18 @@ impl MemberCell {
     }
 
     pub fn transition_locked(&self, txn: &mut ObservationTxn<'_>, transition: MemberTransition) {
-        self.update_locked(txn, |record| record.apply_transition(transition));
+        // A restart schedule overwrites `last_exit`. The record is mutated
+        // under the gate and the watch channel's own lock, so the exit it
+        // displaces -- whose `ExitKind::Failed` payload owns a type-erased
+        // user error -- leaves the critical section and is destroyed by the
+        // transaction instead.
+        let mut displaced_exit = None;
+        self.update_locked(txn, |record| {
+            displaced_exit = record.apply_transition(transition);
+        });
+        if let Some(displaced_exit) = displaced_exit {
+            txn.defer(move || drop(displaced_exit));
+        }
     }
 
     pub fn set_options(&self, options: ResolvedCommonOptions) {
@@ -524,6 +547,9 @@ impl MemberCell {
             txn.defer(move || drop(losing_exit));
         }
         let mut published = false;
+        // Terminalization also overwrites `last_exit`, which a prior restart
+        // schedule may already have filled with a different user payload.
+        let mut displaced_exit = None;
         self.record.modify_silently(|record| {
             match startup {
                 StartupDisposition::Unchanged => {}
@@ -533,11 +559,14 @@ impl MemberCell {
             if !matches!(record.stage, MemberStage::Terminal(_)) {
                 record.incarnation = None;
                 record.restart_at = None;
-                record.last_exit = Some(terminal_exit.clone());
+                displaced_exit = record.last_exit.replace(terminal_exit.clone());
                 record.stage = MemberStage::Terminal(terminal_exit.clone());
                 published = true;
             }
         });
+        if let Some(displaced_exit) = displaced_exit {
+            txn.defer(move || drop(displaced_exit));
+        }
         let record_changed = published || startup != StartupDisposition::Unchanged;
         // Store before discharge so reentrant mailbox wakers observe the
         // winning exit. Notification-driven readers still see
@@ -1273,7 +1302,17 @@ impl ScopeCell {
         transition: MemberTransition,
         event: Option<LifecycleEventKind>,
     ) {
-        self.update_child_record(member, |record| record.apply_transition(transition), event);
+        // Routed through `transition_locked` rather than `update_child_record`
+        // so a restart schedule's displaced exit leaves the gate on this path
+        // too.
+        self.with_observation_gate(|wakes| {
+            member.transition_locked(wakes, transition);
+            if let Some(event) = event {
+                self.emit_locked(wakes, event);
+            } else {
+                self.publish_snapshot_chain_locked(wakes);
+            }
+        });
     }
 
     #[cfg(any(test, feature = "test-util"))]

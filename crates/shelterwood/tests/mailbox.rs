@@ -331,15 +331,24 @@ async fn call_distinguishes_success_drop_and_response_timeout() {
 
 #[tokio::test(start_paused = true)]
 async fn reply_receiver_is_consuming_and_late_replies_are_discarded() {
+    let values = Arc::new(Mutex::new(Vec::new()));
+    let asks = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "reply-runtime",
+            shelterwood::RawOnceDef::new(recorder(None, &values, &asks, ReplyMode::Answer)),
+        )
+        .expect("valid actor");
     let width = Duration::from_secs(10);
-    let (reply, receiver) = Reply::channel();
+    let (reply, receiver) = actor.reply_channel();
     let mut waiter = Box::pin(receiver.recv(width));
     assert!(poll_once(waiter.as_mut()).is_pending());
     advance_time(width).await;
     assert_eq!(waiter.await, Err(ReplyError::Timeout));
     reply.send(1);
 
-    let (reply, receiver) = Reply::<usize>::channel();
+    let (reply, receiver) = actor.reply_channel::<usize>();
     drop(receiver);
     reply.send(2);
 }

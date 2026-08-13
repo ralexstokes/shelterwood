@@ -6,11 +6,13 @@
 //! types remain unreachable from the supported `shelterwood` public API.
 
 mod disposal;
+mod mailbox;
 mod spawn;
 mod sync;
 mod timer;
 
 pub use disposal::*;
+pub use mailbox::*;
 // Unwind handling is plain `std::panic`, so it lives in the runtime-neutral
 // core. Re-exported here because the adapter's own modules and the façade
 // reach it as a runtime facility.

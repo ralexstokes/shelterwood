@@ -2165,7 +2165,7 @@ mod tests {
             id.clone(),
             identity.mint_membership(&id).expect("membership available"),
         );
-        let mailbox = MailboxCell::new(id.clone());
+        let mailbox = MailboxCell::new(id.clone(), crate::runtime::mailbox_runtime());
         member.attach_mailbox(mailbox.clone());
         MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox);
         let incarnation = member

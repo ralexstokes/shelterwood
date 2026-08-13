@@ -1,10 +1,13 @@
 use std::{
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use shelterwood_core::DeadlineBudget;
+
+use crate::{BoxedSleep, MailboxRuntime};
 
 pub(crate) use shelterwood_core::deadline::Deadline;
 
@@ -52,9 +55,10 @@ pub(super) trait DeadlineOperation {
 /// First-poll deadline capture shared by every public mailbox deadline future.
 pub(super) struct Deadlined<F> {
     pub(super) operation: F,
+    runtime: Arc<dyn MailboxRuntime>,
     budget_width: DeadlineBudget,
     budget: Option<crate::deadline::Deadline>,
-    timer: Option<crate::runtime::BoxedSleep>,
+    timer: Option<BoxedSleep>,
     pub(super) started: bool,
     phase: DeadlinePhase,
 }
@@ -62,9 +66,14 @@ pub(super) struct Deadlined<F> {
 impl<F> Deadlined<F> {
     /// Constructs the shared no-attempt deadline policy used by public
     /// mailbox operations.
-    pub(super) fn no_attempt(operation: F, budget_width: impl Into<DeadlineBudget>) -> Self {
+    pub(super) fn no_attempt(
+        operation: F,
+        budget_width: impl Into<DeadlineBudget>,
+        runtime: Arc<dyn MailboxRuntime>,
+    ) -> Self {
         Self {
             operation,
+            runtime,
             budget_width: budget_width.into(),
             budget: None,
             timer: None,
@@ -81,10 +90,11 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
         let this = self.as_mut().get_mut();
         if !this.started {
             this.started = true;
-            let budget = crate::runtime::deadline(this.budget_width.duration());
+            let budget =
+                crate::deadline::Deadline::after(this.runtime.now(), this.budget_width.duration());
             this.budget = Some(budget);
             if !this.budget_width.is_zero() {
-                this.timer = Some(crate::runtime::sleep_deadline(budget));
+                this.timer = Some(this.runtime.sleep_until(budget.instant()));
             }
         }
         // A zero budget short-circuits: the operation is never attempted, so
@@ -170,6 +180,7 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             width,
+            crate::capability::tests::runtime(),
         ));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -188,6 +199,7 @@ mod tests {
         let mut future = Box::pin(super::Deadlined::no_attempt(
             PendingOnFirstExpiry::default(),
             shelterwood_core::DeadlineBudget::ZERO,
+            crate::capability::tests::runtime(),
         ));
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);

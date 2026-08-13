@@ -396,10 +396,10 @@ fn raw_types_obey_error_and_future_trait_contracts() {
         },
         DeadlineBudget::new(Duration::from_secs(1)),
     ));
-    let (reply, receiver) = Reply::<Cell<()>>::channel();
+    let (reply, receiver) = actor.reply_channel::<Cell<()>>();
     assert_send(reply);
     assert_send(receiver);
-    let (_reply, receiver) = Reply::<Cell<()>>::channel();
+    let (_reply, receiver) = actor.reply_channel::<Cell<()>>();
     assert_send(receiver.recv(DeadlineBudget::new(Duration::from_secs(1))));
 }
 

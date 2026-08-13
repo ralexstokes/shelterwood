@@ -1,11 +1,15 @@
 use std::{
     fmt,
+    sync::Arc,
     task::{Context, Poll},
 };
 
 use shelterwood_core::DeadlineBudget;
 
-use crate::runtime::{DisposingReceiver, OneShotClose, OneShotSender, dispose_detached};
+use crate::{
+    MailboxRuntime,
+    capability::{DisposingReceiver, OneShotClose, OneShotSender, dispose, oneshot},
+};
 
 use super::{
     ReplyError, ReplyReceive,
@@ -20,6 +24,7 @@ use super::{
 /// isolated disposal.
 pub struct Reply<T> {
     sender: OneShotSender<T>,
+    runtime: Arc<dyn MailboxRuntime>,
 }
 
 impl<T> fmt::Debug for Reply<T> {
@@ -35,14 +40,15 @@ impl<T> fmt::Debug for Reply<T> {
 }
 
 impl<T: Send + 'static> Reply<T> {
-    /// Creates a reply capability and its single owned receiver.
-    #[must_use]
-    pub fn channel() -> (Self, ReplyReceiver<T>) {
-        let (sender, receiver) = crate::runtime::oneshot();
+    pub(crate) fn channel(runtime: Arc<dyn MailboxRuntime>) -> (Self, ReplyReceiver<T>) {
+        let (sender, receiver) = oneshot(&runtime);
         (
-            Self { sender },
+            Self {
+                sender,
+                runtime: Arc::clone(&runtime),
+            },
             ReplyReceiver {
-                receiver: DisposingReceiver::new(receiver),
+                receiver: DisposingReceiver::new(receiver, runtime),
             },
         )
     }
@@ -53,12 +59,13 @@ impl<T: Send + 'static> Reply<T> {
         // run a possibly blocking or panicking user destructor on the replying
         // actor; route the discard through isolated disposal instead.
         if let Err(unclaimed) = self.sender.send(value) {
-            dispose_detached(unclaimed);
+            dispose(&self.runtime, unclaimed);
         }
     }
 }
 
-/// The owned, non-cloneable receive half of [`Reply::channel`].
+/// The owned, non-cloneable receive half of
+/// [`ActorRef::reply_channel`](crate::ActorRef::reply_channel).
 pub struct ReplyReceiver<T> {
     pub(super) receiver: DisposingReceiver<T>,
 }
@@ -77,12 +84,14 @@ impl<T: Send + 'static> ReplyReceiver<T> {
     /// A zero budget does not observe an already-published response; it closes
     /// this receive capability and reports [`ReplyError::Timeout`].
     pub fn recv(self, deadline: impl Into<DeadlineBudget>) -> ReplyReceive<T> {
+        let runtime = self.receiver.runtime();
         ReplyReceive {
             deadlined: Deadlined::no_attempt(
                 ReplyOperation {
                     receiver: self.receiver,
                 },
                 deadline,
+                runtime,
             ),
         }
     }
@@ -98,7 +107,7 @@ pub(super) enum ReplyPoll<T> {
     TimedOut,
 }
 
-pub(super) fn poll_reply<T>(
+pub(super) fn poll_reply<T: Send + 'static>(
     receiver: &mut DisposingReceiver<T>,
     context: &mut Context<'_>,
     phase: DeadlinePhase,
@@ -118,7 +127,7 @@ pub(super) fn poll_reply<T>(
     }
 }
 
-impl<T> DeadlineOperation for ReplyOperation<T> {
+impl<T: Send + 'static> DeadlineOperation for ReplyOperation<T> {
     type Output = Result<T, ReplyError>;
 
     fn poll_deadlined(
@@ -143,9 +152,12 @@ impl<T> DeadlineOperation for ReplyOperation<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cell::tests::actor;
+
     #[test]
     fn reply_debug_still_reports_the_derived_unanswered_state() {
-        let (reply, receiver) = super::Reply::<u8>::channel();
+        let (_, actor) = actor();
+        let (reply, receiver) = actor.reply_channel::<u8>();
 
         let rendered = format!("{reply:?}");
         assert!(rendered.contains("Reply"));
@@ -160,19 +172,20 @@ mod tests {
     #[crate::runtime::test]
     async fn reply_halves_preserve_success_drop_and_cancellation_lifecycles() {
         let deadline = std::time::Duration::from_secs(1);
+        let (_, actor) = actor();
 
-        let (reply, receiver) = super::Reply::channel();
+        let (reply, receiver) = actor.reply_channel();
         reply.send(7_u8);
         assert_eq!(receiver.recv(deadline).await, Ok(7));
 
-        let (reply, receiver) = super::Reply::<u8>::channel();
+        let (reply, receiver) = actor.reply_channel::<u8>();
         drop(reply);
         assert_eq!(
             receiver.recv(deadline).await,
             Err(super::ReplyError::Dropped)
         );
 
-        let (reply, receiver) = super::Reply::<u8>::channel();
+        let (reply, receiver) = actor.reply_channel::<u8>();
         drop(receiver);
         assert!(reply.sender.is_closed());
         reply.send(9);

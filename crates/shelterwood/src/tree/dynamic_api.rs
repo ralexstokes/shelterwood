@@ -66,7 +66,10 @@ impl DynamicScopeRef {
         ownership: AdmissionOwnership,
     ) -> Result<DynamicActorSlot<M>, ReserveError> {
         crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
-            let mailbox = MailboxCell::new(reservation.slot.member.id().clone());
+            let mailbox = MailboxCell::new(
+                reservation.slot.member.id().clone(),
+                crate::runtime::mailbox_runtime(),
+            );
             reservation.slot.member.attach_mailbox(mailbox.clone());
             DynamicActorSlot {
                 core: ActorSlotCore::new(DynamicSlotEndpoint::new(reservation, ownership), mailbox),

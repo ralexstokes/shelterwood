@@ -46,7 +46,7 @@ pub(super) fn dispose_rejected<D: Send + 'static>(
 }
 
 fn attach_actor_slot<M: Send + 'static>(slot: Arc<SlotCell>) -> ActorSlot<M> {
-    let mailbox = MailboxCell::new(slot.member.id().clone());
+    let mailbox = MailboxCell::new(slot.member.id().clone(), crate::runtime::mailbox_runtime());
     slot.member.attach_mailbox(mailbox.clone());
     ActorSlot {
         core: ActorSlotCore::new(StaticSlotEndpoint(slot), mailbox),

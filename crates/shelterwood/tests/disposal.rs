@@ -1322,7 +1322,11 @@ async fn cancelled_call_disposes_stored_reply_off_the_caller() {
 #[tokio::test]
 async fn dropped_reply_receiver_disposes_stored_value_through_isolated_disposal() {
     let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
-    let (reply, receiver) = Reply::<DropProbe>::channel();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once("reply-runtime", RawOnceDef::new(Unread::<()>::default()))
+        .expect("valid actor");
+    let (reply, receiver) = actor.reply_channel::<DropProbe>();
     reply.send(DropProbe::panicking(dropped, "unclaimed reply destructor"));
     drop(receiver);
     assert_ne!(
@@ -1551,7 +1555,11 @@ async fn dropped_unstarted_call_disposes_constructor_off_the_caller() {
 async fn late_reply_send_disposes_unclaimed_value_off_the_sender() {
     let gate = DestructorGate::default();
     let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
-    let (reply, receiver) = Reply::<BlockingDropProbe>::channel();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once("reply-runtime", RawOnceDef::new(Unread::<()>::default()))
+        .expect("valid actor");
+    let (reply, receiver) = actor.reply_channel::<BlockingDropProbe>();
     drop(receiver);
     reply.send(BlockingDropProbe::new(&gate, dropped));
     wait_for_destructor(&gate).await;

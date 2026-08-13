@@ -13,9 +13,7 @@ workspace = true
 
 [dependencies]
 shelterwood-core.workspace = true
-shelterwood-runtime.workspace = true
 
 [dev-dependencies]
 shelterwood-core = { workspace = true, features = ["test-util"] }
-shelterwood-runtime = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }

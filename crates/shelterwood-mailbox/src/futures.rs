@@ -4,19 +4,22 @@ use std::{
     hash::{Hash, Hasher},
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
 use shelterwood_core::DeadlineBudget;
 
 use crate::{
-    ActorIdentity, ChildId, Incarnation, Membership,
-    runtime::{DisposingReceiver, dispose_detached},
+    ActorIdentity, ChildId, Incarnation, MailboxRuntime, Membership,
+    capability::{DisposingReceiver, dispose},
 };
 
 use super::{
     CallError, CallErrorKind, Replied, Reply, ReplyError, SendError, SendErrorKind,
-    cell::{MailboxCell, OperationOutcome, SendOperation, Submission, Withdrawal},
+    cell::{
+        MailboxCell, OperationPoll, SendOperation, Submission, Withdrawal, WithdrawalDisposition,
+        WithdrawalOutcome,
+    },
     deadline::{DeadlineOperation, DeadlinePhase, Deadlined},
     reply::{ReplyOperation, ReplyPoll, poll_reply},
 };
@@ -61,6 +64,10 @@ impl<M> ActorRef<M> {
     pub fn membership(&self) -> Membership {
         self.member.membership()
     }
+
+    pub(super) fn runtime(&self) -> Arc<dyn MailboxRuntime> {
+        self.mailbox.runtime()
+    }
 }
 
 /// Builds the façade's actor handle from its cross-crate identity and mailbox
@@ -101,14 +108,22 @@ impl<M: Send + 'static> ActorRef<M> {
     /// A zero budget makes no acceptance attempt and returns the unaccepted
     /// message with [`SendErrorKind::TimedOut`].
     pub fn send_timeout(&self, message: M, deadline: impl Into<DeadlineBudget>) -> SendTimeout<M> {
+        let runtime = self.mailbox.runtime();
         SendTimeout {
             deadlined: Deadlined::no_attempt(
                 TimedSend {
                     send: self.send(message),
                 },
                 deadline,
+                runtime,
             ),
         }
+    }
+
+    /// Creates a reply capability using this actor handle's installed runtime.
+    #[must_use]
+    pub fn reply_channel<T: Send + 'static>(&self) -> (Reply<T>, crate::ReplyReceiver<T>) {
+        Reply::channel(self.runtime())
     }
 
     /// Sends a request built around one reply capability and awaits its reply.
@@ -133,17 +148,20 @@ impl<M: Send + 'static> ActorRef<M> {
         make_msg: impl FnOnce(Reply<T>) -> M + Send + 'static,
         deadline: impl Into<DeadlineBudget>,
     ) -> CallFuture<M, T> {
+        let runtime = self.mailbox.runtime();
         CallFuture {
             deadlined: Deadlined::no_attempt(
                 CallOperation {
                     actor: self.clone(),
+                    runtime: Arc::clone(&runtime),
                     make_msg: Some(Box::new(make_msg)),
                     send: None,
                     reply: None,
                     accepted: None,
-                    dispose_constructor: dispose_detached::<MessageConstructor<M, T>>,
+                    dispose_constructor: dispose::<MessageConstructor<M, T>>,
                 },
                 deadline,
+                runtime,
             ),
         }
     }
@@ -188,11 +206,16 @@ impl<M> Hash for ActorRef<M> {
 #[must_use]
 pub struct SendFuture<M> {
     mailbox: Arc<MailboxCell<M>>,
+    runtime: Arc<dyn MailboxRuntime>,
     state: SendFutureState<M>,
     // Captured where `M: Send + 'static` holds so the unbounded `Drop` impl
     // can route a withdrawn message through isolated disposal.
-    dispose: fn(M),
+    dispose: fn(&Arc<dyn MailboxRuntime>, M),
+    withdraw_operation: WithdrawOperation<M>,
 }
+
+type WithdrawOperation<M> =
+    fn(&MailboxCell<M>, &Arc<SendOperation<M>>, WithdrawalDisposition) -> Withdrawal<M>;
 
 enum SendFutureState<M> {
     Immediate(Option<M>),
@@ -210,30 +233,31 @@ impl<M> Unpin for SendFuture<M> {}
 
 impl<M: Send + 'static> SendFuture<M> {
     fn new(mailbox: Arc<MailboxCell<M>>, message: M) -> Self {
+        let runtime = mailbox.runtime();
         Self {
             mailbox,
+            runtime,
             state: SendFutureState::Immediate(Some(message)),
-            dispose: dispose_detached::<M>,
+            dispose: dispose::<M>,
+            withdraw_operation: MailboxCell::withdraw,
         }
     }
 
-    /// Withdraws this send, also releasing any waker it had registered.
-    ///
-    /// The waker travels back to the caller unchanged: only the caller knows
-    /// whether a `RawWaker` destructor may run on its thread.
-    fn withdraw(&mut self) -> (Withdrawal<M>, Option<Waker>) {
+    /// Withdraws this send into a post-unlock effect set.
+    fn withdraw(&mut self, disposition: WithdrawalDisposition) -> Withdrawal<M> {
         match std::mem::replace(&mut self.state, SendFutureState::Done) {
-            SendFutureState::Immediate(mut message) => (
-                Withdrawal::Withdrawn {
+            SendFutureState::Immediate(mut message) => {
+                Withdrawal::without_effects(WithdrawalOutcome::Withdrawn {
                     message: message
                         .take()
                         .expect("an unsubmitted send retains its message"),
                     observed: self.mailbox.current_observation(),
-                },
-                None,
-            ),
-            SendFutureState::Parked(operation) => self.mailbox.withdraw(&operation),
-            SendFutureState::Sent(incarnation) => (Withdrawal::Accepted(incarnation), None),
+                })
+            }
+            SendFutureState::Parked(operation) => self.mailbox.withdraw(&operation, disposition),
+            SendFutureState::Sent(incarnation) => {
+                Withdrawal::without_effects(WithdrawalOutcome::Accepted(incarnation))
+            }
             SendFutureState::Done => panic!("a completed send was withdrawn"),
         }
     }
@@ -307,53 +331,30 @@ impl<M: Send + 'static> Future for SendFuture<M> {
         // lock in `SendOperation::accept`/`terminate`, so installing after that
         // re-read cannot lose a wakeup: any completion ordered after it takes
         // the waker this poll registered.
-        let mut cloned_waker: Option<Waker> = None;
+        let mut cloned_waker = None;
         loop {
-            let mut operation_state = operation
-                .state
-                .lock()
-                .expect("send operation mutex poisoned");
-            match &mut operation_state.outcome {
-                OperationOutcome::Accepted(incarnation) => {
-                    let incarnation = *incarnation;
-                    drop(operation_state);
+            match operation.poll(cloned_waker.take(), context.waker()) {
+                OperationPoll::Accepted(incarnation) => {
                     this.state = SendFutureState::Sent(incarnation);
                     return Poll::Ready(Ok(incarnation));
                 }
-                OperationOutcome::Terminated {
+                OperationPoll::Terminated {
                     message,
                     final_incarnation,
                 } => {
                     let error = SendError {
                         actor_id: this.mailbox.actor_id.clone(),
-                        incarnation_observed: *final_incarnation,
-                        message: message
-                            .take()
-                            .expect("a terminal operation retains its message until observed"),
+                        incarnation_observed: final_incarnation,
+                        message,
                         kind: SendErrorKind::Terminated,
                     };
-                    drop(operation_state);
                     this.state = SendFutureState::Done;
                     return Poll::Ready(Err(error));
                 }
-                OperationOutcome::Waiting { .. } => {
-                    if let Some(next_waker) = cloned_waker.take() {
-                        let stale_waker = operation_state.waker.replace(next_waker);
-                        drop(operation_state);
-                        drop(stale_waker);
-                        return Poll::Pending;
-                    }
-                    if operation_state
-                        .waker
-                        .as_ref()
-                        .is_some_and(|registered| registered.will_wake(context.waker()))
-                    {
-                        return Poll::Pending;
-                    }
-                    drop(operation_state);
+                OperationPoll::Pending => return Poll::Pending,
+                OperationPoll::NeedsWakerClone => {
                     cloned_waker = Some(context.waker().clone());
                 }
-                OperationOutcome::Withdrawn => panic!("a withdrawn send future was polled"),
             }
         }
     }
@@ -368,17 +369,21 @@ impl<M> Drop for SendFuture<M> {
         match std::mem::replace(&mut self.state, SendFutureState::Done) {
             SendFutureState::Immediate(mut message) => {
                 if let Some(message) = message.take() {
-                    (self.dispose)(message);
+                    (self.dispose)(&self.runtime, message);
                 }
             }
             SendFutureState::Parked(operation) => {
-                let (withdrawal, waker) = self.mailbox.withdraw(&operation);
-                match withdrawal {
-                    Withdrawal::Withdrawn { message, .. }
-                    | Withdrawal::Terminated { message, .. } => {
-                        (self.dispose)(message);
+                let mut withdrawal = (self.withdraw_operation)(
+                    &self.mailbox,
+                    &operation,
+                    WithdrawalDisposition::Isolated,
+                );
+                match withdrawal.take_outcome() {
+                    WithdrawalOutcome::Withdrawn { message, .. }
+                    | WithdrawalOutcome::Terminated { message, .. } => {
+                        (self.dispose)(&self.runtime, message);
                     }
-                    Withdrawal::Accepted(_) => {}
+                    WithdrawalOutcome::Accepted(_) => {}
                 }
                 // A RawWaker vtable is caller code and there is no caller left
                 // to surface a panic to. Destroying it inline would run a
@@ -387,9 +392,7 @@ impl<M> Drop for SendFuture<M> {
                 // -- so route it through isolated disposal like the message.
                 // Sequencing it after the message also keeps a hostile waker
                 // destructor from diverting the message from that route.
-                if let Some(waker) = waker {
-                    dispose_detached(waker);
-                }
+                withdrawal.finish();
             }
             SendFutureState::Sent(_) | SendFutureState::Done => {}
         }
@@ -417,16 +420,16 @@ impl<M> fmt::Debug for SendTimeout<M> {
 
 fn withdraw_send<M: Send + 'static>(send: &mut SendFuture<M>) -> Result<Incarnation, SendError<M>> {
     let actor_id = send.mailbox.actor_id.clone();
-    let (withdrawal, waker) = send.withdraw();
-    let result = match withdrawal {
-        Withdrawal::Withdrawn { message, observed } => Err(SendError {
+    let mut withdrawal = send.withdraw(WithdrawalDisposition::Inline);
+    let result = match withdrawal.take_outcome() {
+        WithdrawalOutcome::Withdrawn { message, observed } => Err(SendError {
             actor_id,
             incarnation_observed: observed,
             message,
             kind: SendErrorKind::TimedOut,
         }),
-        Withdrawal::Accepted(incarnation) => Ok(incarnation),
-        Withdrawal::Terminated { message, observed } => Err(SendError {
+        WithdrawalOutcome::Accepted(incarnation) => Ok(incarnation),
+        WithdrawalOutcome::Terminated { message, observed } => Err(SendError {
             actor_id,
             incarnation_observed: observed,
             message,
@@ -437,7 +440,7 @@ fn withdraw_send<M: Send + 'static>(send: &mut SendFuture<M>) -> Result<Incarnat
     // task, so the caller's waker destructor stays inline and its panic stays
     // visible; no core lock is held and the recovered message already belongs
     // to `result`.
-    drop(waker);
+    withdrawal.finish();
     result
 }
 
@@ -486,6 +489,7 @@ type MessageConstructor<M, T> = Box<dyn FnOnce(Reply<T>) -> M + Send + 'static>;
 
 struct CallOperation<M, T> {
     actor: ActorRef<M>,
+    runtime: Arc<dyn MailboxRuntime>,
     make_msg: Option<MessageConstructor<M, T>>,
     send: Option<SendFuture<M>>,
     reply: Option<DisposingReceiver<T>>,
@@ -493,7 +497,7 @@ struct CallOperation<M, T> {
     // Captured where `M: Send + 'static` holds so the unbounded `Drop` impl
     // can route an unused constructor and its captures through isolated
     // disposal.
-    dispose_constructor: fn(MessageConstructor<M, T>),
+    dispose_constructor: fn(&Arc<dyn MailboxRuntime>, MessageConstructor<M, T>),
 }
 
 impl<M, T> Drop for CallOperation<M, T> {
@@ -503,7 +507,7 @@ impl<M, T> Drop for CallOperation<M, T> {
             // without ever building a message. Destroying the captures inline
             // would run possibly blocking or panicking user destructors in
             // this drop glue, so route them through isolated disposal.
-            (self.dispose_constructor)(make_msg);
+            (self.dispose_constructor)(&self.runtime, make_msg);
         }
     }
 }
@@ -518,7 +522,7 @@ impl<M, T> fmt::Debug for CallFuture<M, T> {
     }
 }
 
-impl<M, T> CallOperation<M, T> {
+impl<M, T: Send + 'static> CallOperation<M, T> {
     fn poll_reply(
         &mut self,
         context: &mut Context<'_>,
@@ -568,7 +572,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             // Capture the one overall budget before invoking user code. A
             // slow message constructor consumes acceptance/response time. The
             // shared scaffold captured `budget` before this callback runs.
-            let (reply, receiver) = Reply::channel();
+            let (reply, receiver) = self.actor.reply_channel();
             let message =
                 self.make_msg
                     .take()
@@ -577,11 +581,11 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             // at the exact deadline win. Construction is different: no send
             // existed before it completed, so do not start one after the
             // captured budget is strictly in the past.
-            if budget.is_overdue(crate::runtime::now()) {
+            if budget.is_overdue(self.runtime.now()) {
                 // Construction completed, but timeout cleanup owns the
                 // unsubmitted message. Keep its potentially blocking or
                 // panicking destructor off the caller task.
-                dispose_detached(message);
+                dispose(&self.runtime, message);
                 return Poll::Ready(self.short_circuit());
             }
             self.reply = Some(receiver.receiver);
@@ -603,7 +607,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
                     // The call surface has no way to hand the recovered
                     // message back; route the discard through isolated
                     // disposal.
-                    dispose_detached(error.message);
+                    dispose(&self.runtime, error.message);
                     return Poll::Ready(Err(CallError {
                         actor_id: error.actor_id,
                         incarnation_observed: error.incarnation_observed,
@@ -642,7 +646,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
                 self.close_reply();
                 // The call surface has no way to hand the recovered message
                 // back; route the discard through isolated disposal.
-                dispose_detached(error.message);
+                dispose(&self.runtime, error.message);
                 Poll::Ready(Err(CallError {
                     actor_id: error.actor_id,
                     incarnation_observed: error.incarnation_observed,

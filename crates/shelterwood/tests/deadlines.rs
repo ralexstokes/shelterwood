@@ -146,7 +146,7 @@ async fn maximum_mailbox_deadlines_are_unbounded_waits() {
 
     let mut send = Box::pin(actor.send_timeout(Message::Value(1), Duration::MAX));
     let mut call = Box::pin(actor.call(Message::Ask, Duration::MAX));
-    let (reply, receiver) = Reply::channel();
+    let (reply, receiver) = actor.reply_channel();
     let mut receive = Box::pin(receiver.recv(Duration::MAX));
     assert!(poll_once(send.as_mut()).is_pending());
     assert!(poll_once(call.as_mut()).is_pending());
@@ -616,18 +616,28 @@ async fn zero_duration_wait_observes_an_already_satisfied_child() {
 
 #[tokio::test]
 async fn reply_receiver_reports_drop_and_is_safe_to_abandon() {
-    let (reply, receiver) = Reply::<usize>::channel();
+    let values = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "reply-runtime",
+            RawOnceDef::new(boundary_actor(None, &values, &calls, false)),
+        )
+        .expect("valid actor");
+
+    let (reply, receiver) = actor.reply_channel::<usize>();
     drop(reply);
     assert_eq!(
         receiver.recv(Duration::from_secs(1)).await,
         Err(ReplyError::Dropped)
     );
 
-    let (reply, receiver) = Reply::<usize>::channel();
+    let (reply, receiver) = actor.reply_channel::<usize>();
     drop(receiver);
     reply.send(1);
 
-    let (reply, receiver) = Reply::channel();
+    let (reply, receiver) = actor.reply_channel();
     reply.send(2);
     assert_eq!(
         receiver.recv(Duration::ZERO).await,
@@ -638,8 +648,17 @@ async fn reply_receiver_reports_drop_and_is_safe_to_abandon() {
 
 #[tokio::test(start_paused = true)]
 async fn reply_completion_wins_at_the_exact_deadline() {
+    let values = Arc::new(Mutex::new(Vec::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "reply-deadline-runtime",
+            RawOnceDef::new(boundary_actor(None, &values, &calls, false)),
+        )
+        .expect("valid actor");
     let width = Duration::from_secs(10);
-    let (reply, receiver) = Reply::channel();
+    let (reply, receiver) = actor.reply_channel();
     let mut receive = Box::pin(receiver.recv(width));
     assert!(poll_once(receive.as_mut()).is_pending());
 

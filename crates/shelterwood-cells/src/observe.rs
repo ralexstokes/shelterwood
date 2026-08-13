@@ -346,6 +346,12 @@ struct SnapshotHubState {
 }
 
 impl SnapshotHub {
+    /// Subscribes while the containing scope's observation gate is held.
+    ///
+    /// The transaction is taken but unused: the gate is what makes the
+    /// receiverless refresh below safe, and no wake can be owed, because the
+    /// only receiver that could observe the refresh is the one minted here —
+    /// and it captures the refreshed generation as already seen.
     pub(crate) fn subscribe(
         &self,
         initial: Arc<ScopeSnapshot>,

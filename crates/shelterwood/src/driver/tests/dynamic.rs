@@ -1032,18 +1032,18 @@ async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
         "a reserved membership cannot emit a key-addressed Removal"
     );
 
-    // The first latch re-check rejects the reservation before child
-    // conversion. The reconciliation count replaces the old raw-mutex poison
-    // probe, preserving that proof while keeping identity storage private.
-    let reconciliations = root.child_identity_reconciliations();
+    // Conversion issues the membership's incarnation counter to the child
+    // runtime and never returns it, so an unclaimed counter afterwards is
+    // evidence that the first latch re-check rejected before conversion ran.
+    // That is what the sibling under-lock test parks on to reach the later
+    // disjunct.
     assert!(
         catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request))).is_ok(),
         "overtaking fused cancellation rejects before fallible child conversion"
     );
-    assert_eq!(
-        root.child_identity_reconciliations(),
-        reconciliations,
-        "the pre-conversion latch check rejects before identity reconciliation"
+    assert!(
+        member.lock_incarnation_counter().is_some(),
+        "the pre-conversion latch check rejects before the counter is issued"
     );
     assert!(matches!(
         response.receive().await,
@@ -1086,8 +1086,8 @@ async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_rech
     };
 
     // Fused cancellation fires while the driver is already inside child
-    // conversion: past the pre-conversion latch check, parked on the child
-    // identity mutex held below. Only the re-check under the control-plane
+    // conversion: past the pre-conversion latch check, parked on the
+    // incarnation-counter mutex held below. Only the re-check under the control-plane
     // lock can observe this firing, so this interleaving pins that disjunct
     // specifically. The entry stays Reserved throughout — a fired latch
     // cannot mark a keyless reservation Removing — which keeps the

@@ -836,8 +836,6 @@ pub struct ScopeCell {
     dynamic_route: Mutex<Option<Arc<ErasedDynamicRoute>>>,
     observation: ScopeObservation,
     #[cfg(any(test, feature = "test-util"))]
-    child_identity_reconciliations: AtomicUsize,
-    #[cfg(any(test, feature = "test-util"))]
     ancestor_parent_reads: AtomicUsize,
     #[cfg(any(test, feature = "test-util"))]
     runtime_storage: Mutex<RuntimeStorage>,
@@ -883,18 +881,10 @@ impl ScopeCell {
         id: &ChildId,
         provisional: Membership,
     ) -> Option<Option<MintedMembership>> {
-        #[cfg(any(test, feature = "test-util"))]
-        self.child_identity_reconciliations
-            .fetch_add(1, Ordering::Relaxed);
         self.child_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .adopt_or_mint_membership(id, provisional)
-    }
-
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn child_identity_reconciliations(&self) -> usize {
-        self.child_identity_reconciliations.load(Ordering::Relaxed)
     }
 
     pub fn evict_child_identity(&self, member: &MemberCell) {
@@ -930,8 +920,6 @@ impl ScopeCell {
                 snapshots: SnapshotHub::default(),
                 closed: AtomicBool::new(false),
             },
-            #[cfg(any(test, feature = "test-util"))]
-            child_identity_reconciliations: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-util"))]
             ancestor_parent_reads: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-util"))]

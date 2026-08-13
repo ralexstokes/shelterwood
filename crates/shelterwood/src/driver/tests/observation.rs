@@ -591,7 +591,7 @@ async fn terminality_fallback_preserves_restart_window_scope_reason() {
         record.stage = MemberStage::Restarting;
         record.incarnation = None;
         record.last_incarnation = Some(last_incarnation);
-        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
+        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved).into());
     });
     nested.set_state(ScopeState::Stopped {
         reason: StopReason::Finished,
@@ -1238,8 +1238,7 @@ fn gate_handoff_rejects_a_scope_with_an_unadmitted_dynamic_reservation() {
 /// retire one under the resident-tree observation gate: a losing
 /// terminalization, a superseded snapshot (on subscription and on closure),
 /// and the member record's `last_exit` slot (on a restart schedule and on
-/// terminalization). The one remaining retirement is the lifecycle ring's
-/// eviction, which the hub cannot intercept — see #244.
+/// terminalization), lifecycle-ring eviction and residency retirement.
 #[test]
 fn a_losing_terminal_exit_payload_is_destroyed_outside_the_gate() {
     let scope = isolated_scope("scope", ScopeFlavor::Ordered);
@@ -1253,9 +1252,8 @@ fn a_losing_terminal_exit_payload_is_destroyed_outside_the_gate() {
         .member
         .terminalize(losing, StartupDisposition::Unchanged);
 
-    assert_eq!(
-        gate_probe_verdict(&held_at_drop),
-        Some(false),
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
         "a competing terminalizer's exit payload must outlive the gate"
     );
 }
@@ -1289,9 +1287,8 @@ fn a_retired_snapshot_payload_is_destroyed_outside_the_gate() {
     );
 
     let _resubscribed = root.subscribe_snapshots();
-    assert_eq!(
-        gate_probe_verdict(&held_at_drop),
-        Some(false),
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
         "a superseded snapshot's payload must outlive the gate"
     );
 }
@@ -1324,9 +1321,8 @@ fn a_superseded_restart_exit_payload_is_destroyed_outside_the_gate() {
         restart_count: RestartCount::ZERO.bump().bump(),
         restart_at: None,
     });
-    assert_eq!(
-        gate_probe_verdict(&held_at_drop),
-        Some(false),
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
         "a superseded restart exit payload must outlive the gate"
     );
 }
@@ -1353,9 +1349,8 @@ fn a_restart_exit_payload_superseded_by_terminalization_outlives_the_gate() {
         Exit::new(ExitKind::Completed, Cancellation::NotObserved),
         StartupDisposition::Unchanged,
     );
-    assert_eq!(
-        gate_probe_verdict(&held_at_drop),
-        Some(false),
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
         "a terminalized member's superseded exit payload must outlive the gate"
     );
 }
@@ -1387,9 +1382,64 @@ fn a_snapshot_retired_by_observation_closure_is_destroyed_outside_the_gate() {
     );
 
     root.terminalize_never_started();
-    assert_eq!(
-        gate_probe_verdict(&held_at_drop),
-        Some(false),
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
         "the projection a closing hub supersedes must outlive the gate"
+    );
+}
+
+#[test]
+fn lifecycle_ring_eviction_isolates_a_failed_exit_payload() {
+    let (root, member, _incarnations) = restarting_member_fixture();
+    let incarnation = member
+        .record()
+        .incarnation
+        .expect("the fixture starts one incarnation");
+    let _events = root.subscribe_lifecycle();
+    let (exit, held_at_drop) = gate_probe_exit(&root);
+
+    root.emit(LifecycleEventKind::Exited {
+        id: member.id().clone(),
+        membership: member.membership(),
+        incarnation,
+        exit,
+    });
+    for _ in 0..LIFECYCLE_EVENT_CAPACITY {
+        root.emit(LifecycleEventKind::ScopeState {
+            state: ScopeState::Running,
+        });
+    }
+
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
+        "an evicted lifecycle exit must not run its payload under the observation gate"
+    );
+}
+
+#[test]
+fn residency_can_release_the_last_member_arc_with_a_failed_exit() {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let child_id = ChildId::from("worker");
+    let member = MemberCell::new(
+        child_id.clone(),
+        root.mint_membership(&child_id)
+            .expect("child membership available"),
+    );
+    resolve_fixture_options(&member);
+    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    let weak = Arc::downgrade(&member);
+    let (exit, held_at_drop) = gate_probe_exit(&root);
+    member.terminalize(exit, StartupDisposition::Unchanged);
+    drop(member);
+
+    root.clear_residents();
+
+    assert!(
+        weak.upgrade().is_none(),
+        "residency held the final member Arc"
+    );
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
+        "retiring the member record must not run its payload under the observation gate"
     );
 }

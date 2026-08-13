@@ -44,17 +44,17 @@ rests on:
   a drop. What must be outside the critical section is the *destination*:
   `MailboxTxn::finish`/`finish_returned` handing the value back only after
   releasing the guard, `withdraw`'s `Withdrawal` carrying its outcome and
-  post-unlock effects together, and `SnapshotHub`'s deferred retirement all
+  post-unlock effects together, and `Acceptance`'s `#[must_use]` result all
   encode that.
 - **`Arc` traffic that cannot reach zero.** Cloning an `Arc` under a lock is
   refcount work; dropping one is only refcount work while another owner is
   provable. Prefer restructuring over the proof — every violation the #235
-  audit confirmed was a drop that *looked* like refcount traffic. One
-  exemption still rests on such a proof: `ScopeCell::clear_residents_locked`
-  and `prune_child_locked` drop `Arc<MemberCell>`s under the gate, and a
-  member record owns an `Exit`. They are safe only because the driver's own
-  child map outlives residency (`ScopeRuntime`'s `Drop` clears residents
-  before `self.children`), which is an ordering nothing enforces.
+  audit confirmed was a drop that *looked* like refcount traffic. Resident
+  member records, lifecycle events and snapshot projections hold failed exits
+  through `RetainedExit`; its drop transfers destruction to isolated disposal.
+  `ScopeCell::clear_residents_locked` and `prune_child_locked` may therefore
+  release their `Arc<MemberCell>`s under the gate without relying on driver
+  field-drop order to keep a user error alive.
 - **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination`,
   `MailboxRuntime` and `DynamicRoute` are cross-crate implementation seams with
   framework-only impls, not user traits; calling them under a lock runs no
@@ -78,12 +78,9 @@ the pattern; where releasing is impossible, `debug_assert!` instead, as
 `MailboxState::take_waiters` does). And a value that may block on destruction
 goes to `runtime::dispose_detached`, not merely past the unlock. That second
 convention is currently met for mailbox payloads, construction closures and
-offloads, and *not* met for an `Exit`'s application error: no site in the
-workspace routes an `Exit` through isolated disposal, while the driver
-destroys exits inline on its own thread on several paths that hold no lock at
-all. Treat that as a known gap to close as a class, not by detaching whichever
-site a review happens to land on — a half-detached class reads as if the
-whole class were handled.
+offloads. Framework-retained `Exit` copies meet it through `RetainedExit`,
+including driver completions and pending terminal disposal; exits handed to
+users keep ordinary drop timing.
 
 Reviewing a new `.lock()` is one pass: name every value the critical section
 can destroy, every callback it can invoke, and every panic it can raise. If

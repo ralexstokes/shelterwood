@@ -14,11 +14,11 @@ pub(super) use std::{
 
 pub(super) use crate::{
     ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
-    GracePhase, Incarnation, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
-    Mailbox, MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome,
-    ReserveError, RestartCondition, RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState,
-    SendErrorKind, StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef,
-    TaskDef, Tree,
+    GracePhase, Incarnation, Intensity, LIFECYCLE_EVENT_CAPACITY, LifecycleEventKind,
+    LifecycleItem, LifecycleTryRecvError, Mailbox, MembershipStatus, RawOnceDef, Readiness,
+    ReadinessDeadline, RemoveOutcome, ReserveError, RestartCondition, RestartCount, RestartPolicy,
+    Retention, ScopeRef, ScopeState, SendErrorKind, StartupError, StartupFailureCause, StopReason,
+    SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
     engine::{
         ChildKey, Effect as SupervisorEffect, Epoch, Event as SupervisorEvent, ScopeLifecycle,
         StopLadder, SupervisorState, arbitrate, step as supervisor_step,
@@ -83,8 +83,8 @@ pub(super) use super::super::{
     AdmissionRequest, AncestorCommandLatches, ChildEvent, ChildResources, ChildRuntime,
     ChildTerminality, DriverEvent, DynamicControl, DynamicEntry, DynamicReservation, GateCapture,
     MemberCell, MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest,
-    RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent,
-    ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
+    RemovalResponses, ResidentProjection, RetainedExit, RuntimeStorage, ScopeCell,
+    ScopeControlEvent, ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
     cancel_dynamic_reservation, discharge_child_terminality, monitor_root_driver, report_slot,
     reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
     run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
@@ -400,15 +400,17 @@ pub(super) fn finished_tree() -> Tree {
     tree
 }
 
-/// A user error payload that records whether the observation gate was held
-/// when its destructor ran.
+/// A user error payload that records whether its destructor ran on the
+/// retiring thread while the observation gate was held.
 ///
 /// The lock rule's probe for `Exit`: an `ExitKind::Failed` carries a
 /// type-erased application error, so wherever the cell layer destroys an exit
-/// it is running caller code. `ObservationGate::is_held` answers from inside
-/// that destructor without the reentrant acquisition that would deadlock.
+/// it is running caller code. The retiring thread identity plus
+/// `ObservationGate::is_held` answers from inside that destructor without the
+/// reentrant acquisition that would deadlock.
 pub(super) struct GateProbeError {
     gate: crate::cells::ObservationGate,
+    retiring_thread: std::thread::ThreadId,
     held_at_drop: Arc<Mutex<Option<bool>>>,
 }
 
@@ -418,6 +420,7 @@ pub(super) fn gate_probe_exit(scope: &Arc<ScopeCell>) -> (Exit, Arc<Mutex<Option
     let exit = Exit::new(
         ExitKind::Failed(ExitError::from(GateProbeError {
             gate: scope.observation_gate(),
+            retiring_thread: std::thread::current().id(),
             held_at_drop: Arc::clone(&held_at_drop),
         })),
         Cancellation::NotObserved,
@@ -447,6 +450,20 @@ pub(super) fn gate_probe_verdict(held_at_drop: &Arc<Mutex<Option<bool>>>) -> Opt
     *held_at_drop.lock().expect("gate probe mutex poisoned")
 }
 
+pub(super) fn wait_for_gate_probe(held_at_drop: &Arc<Mutex<Option<bool>>>) -> bool {
+    let deadline = std::time::Instant::now() + CAPTURE_PROBE_WAIT;
+    loop {
+        if let Some(verdict) = gate_probe_verdict(held_at_drop) {
+            return verdict;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for retained exit disposal"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 impl std::fmt::Debug for GateProbeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("GateProbeError")
@@ -463,7 +480,9 @@ impl std::error::Error for GateProbeError {}
 
 impl Drop for GateProbeError {
     fn drop(&mut self) {
-        *self.held_at_drop.lock().expect("gate probe mutex poisoned") = Some(self.gate.is_held());
+        let ran_inline_under_gate =
+            std::thread::current().id() == self.retiring_thread && self.gate.is_held();
+        *self.held_at_drop.lock().expect("gate probe mutex poisoned") = Some(ran_inline_under_gate);
     }
 }
 

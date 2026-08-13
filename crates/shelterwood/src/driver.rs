@@ -33,8 +33,8 @@ use crate::{
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
-        MemberStage, MemberTransition, ResidentProjection, ScopeCell, ScopeControlEvent,
-        StartupDisposition,
+        MemberStage, MemberTransition, ResidentProjection, RetainedExit, ScopeCell,
+        ScopeControlEvent, StartupDisposition,
     },
     deadline::Deadline,
     engine::{
@@ -334,7 +334,7 @@ impl<T> IndexMut<&ChildKey> for ChildResources<T> {
 
 struct ScopeCompletion {
     reason: StopReason,
-    root_exit: Option<Exit>,
+    root_exit: Option<RetainedExit>,
 }
 
 impl Drop for ScopeRuntime {
@@ -384,7 +384,8 @@ impl Drop for ScopeRuntime {
             .or_else(|| self.supervisor.lifecycle().draining_reason().cloned())
             .unwrap_or(StopReason::ShutdownRequested);
         if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
-            self.root.finish_root_incarnation(self.epoch, reason, exit);
+            self.root
+                .finish_root_incarnation(self.epoch, reason, exit.into_exit());
         } else {
             self.root.finish_incarnation(self.epoch, reason);
         }
@@ -1089,7 +1090,10 @@ async fn run_scope_incarnation(
         // until the recomputation above establishes that order.
         scope.publish_startup_removals();
         if let Some(reason) = scope.finished.take() {
-            let root_exit = scope.role.is_root().then(|| stop_reason_root_exit(&reason));
+            let root_exit = scope
+                .role
+                .is_root()
+                .then(|| RetainedExit::new(stop_reason_root_exit(&reason)));
             // ScopeRuntime's synchronous epilogue clears dynamic state,
             // discharges child obligations and residency, and only then
             // publishes the scope's terminal state.

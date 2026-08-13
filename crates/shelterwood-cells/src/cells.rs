@@ -24,16 +24,85 @@ use crate::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartCount, Strategy, TotalRestarts,
     admission::{RemoveOutcome, ReserveError},
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
-    exit::{StartupError, StopReason, stop_reason_precedence},
+    exit::{ExitKind, StartupError, StopReason, stop_reason_precedence},
     identity::{AtomicPoisonedCounter, IncarnationCounter, MintedMembership, ScopeIdentity},
     mailbox::{ActorIdentity, MailboxControl, MailboxTermination},
     observe::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-        LifecycleHub, LifecycleSeq, ScopeKind, ScopeSnapshot, SnapshotHub, SnapshotReceiver,
+        LifecycleHub, LifecycleSeq, RetainedScopeSnapshot, ScopeKind, ScopeSnapshot, SnapshotHub,
+        SnapshotReceiver,
     },
     policy::{ResolvedCommonOptions, ScopeFlavor},
     runtime::{self, Latch},
 };
+
+/// An exit copy retained by framework state.
+///
+/// Failed exits own a type-erased user error. Retiring such a copy always
+/// transfers it to isolated disposal, regardless of its current strong count:
+/// a count probe would race every other owner and could still leave one
+/// framework thread running the last user destructor inline.
+#[derive(Clone)]
+pub struct RetainedExit(Option<Exit>);
+
+impl RetainedExit {
+    pub fn new(exit: Exit) -> Self {
+        Self(Some(exit))
+    }
+
+    pub fn as_exit(&self) -> &Exit {
+        self.0.as_ref().expect("retained exit was already taken")
+    }
+
+    pub fn into_exit(mut self) -> Exit {
+        self.0.take().expect("retained exit was already taken")
+    }
+
+    pub fn kind(&self) -> &ExitKind {
+        self.as_exit().kind()
+    }
+
+    pub fn cancellation(&self) -> crate::exit::Cancellation {
+        self.as_exit().cancellation()
+    }
+}
+
+impl From<Exit> for RetainedExit {
+    fn from(exit: Exit) -> Self {
+        Self::new(exit)
+    }
+}
+
+impl fmt::Debug for RetainedExit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_exit().fmt(formatter)
+    }
+}
+
+impl PartialEq for RetainedExit {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_exit() == other.as_exit()
+    }
+}
+
+impl PartialEq<Exit> for RetainedExit {
+    fn eq(&self, other: &Exit) -> bool {
+        self.as_exit() == other
+    }
+}
+
+impl Eq for RetainedExit {}
+
+impl Drop for RetainedExit {
+    fn drop(&mut self) {
+        let Some(exit) = self.0.take() else {
+            return;
+        };
+        if matches!(exit.kind(), ExitKind::Failed(_)) {
+            runtime::dispose_detached(exit);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MemberStage {
@@ -43,7 +112,7 @@ pub enum MemberStage {
     Running,
     Restarting,
     Stopping,
-    Terminal(Exit),
+    Terminal(RetainedExit),
 }
 
 /// One non-terminal member-record transition owned by the cell layer.
@@ -77,7 +146,7 @@ pub struct MemberRecord {
     pub stage: MemberStage,
     pub incarnation: Option<Incarnation>,
     pub last_incarnation: Option<Incarnation>,
-    pub last_exit: Option<Exit>,
+    pub last_exit: Option<RetainedExit>,
     pub restart_count: RestartCount,
     pub restart_at: Option<Instant>,
     pub membership_status: MembershipStatus,
@@ -91,13 +160,10 @@ impl MemberRecord {
     /// [`MemberCell::transition`] for the wake-bus contract), so each arm
     /// asserts the source stages its driver call sites can actually present.
     ///
-    /// Returns the exit this transition displaced from `last_exit`, if any.
-    /// The record is mutated under the observation gate and the watch
-    /// channel's own lock, and an `ExitKind::Failed` payload owns a
-    /// type-erased user error, so the displaced value is surrendered to the
-    /// caller rather than destroyed here (§1's lock rule).
-    #[must_use]
-    fn apply_transition(&mut self, transition: MemberTransition) -> Option<Exit> {
+    /// Retained exits are safe to retire inside the watch mutation: a failed
+    /// payload's destructor is transferred to isolated disposal by
+    /// [`RetainedExit::drop`].
+    fn apply_transition(&mut self, transition: MemberTransition) {
         match transition {
             MemberTransition::Admitted => {
                 debug_assert!(
@@ -106,7 +172,6 @@ impl MemberRecord {
                     self.stage
                 );
                 self.stage = MemberStage::Admitted;
-                None
             }
             MemberTransition::Starting { incarnation } => {
                 debug_assert!(
@@ -118,7 +183,6 @@ impl MemberRecord {
                 self.incarnation = Some(incarnation);
                 self.last_incarnation = Some(incarnation);
                 self.restart_at = None;
-                None
             }
             MemberTransition::Running => {
                 debug_assert!(
@@ -128,7 +192,6 @@ impl MemberRecord {
                     self.stage
                 );
                 self.stage = MemberStage::Running;
-                None
             }
             MemberTransition::Stopping => {
                 debug_assert!(
@@ -137,7 +200,6 @@ impl MemberRecord {
                     self.stage
                 );
                 self.stage = MemberStage::Stopping;
-                None
             }
             MemberTransition::RestartScheduled {
                 exit,
@@ -154,10 +216,9 @@ impl MemberRecord {
                 );
                 self.stage = MemberStage::Restarting;
                 self.incarnation = None;
-                let displaced = self.last_exit.replace(exit);
+                self.last_exit = Some(RetainedExit::new(exit));
                 self.restart_count = restart_count;
                 self.restart_at = restart_at;
-                displaced
             }
         }
     }
@@ -204,7 +265,7 @@ enum MemberMailbox {
     Attached(Arc<dyn MailboxControl>),
     Terminal {
         control: Option<Arc<dyn MailboxControl>>,
-        exit: Exit,
+        exit: RetainedExit,
         teardown: Option<Box<dyn MailboxTermination>>,
     },
 }
@@ -315,7 +376,7 @@ impl MemberCell {
         assert!(matches!(*mailbox, MemberMailbox::Unattached));
         *mailbox = MemberMailbox::Terminal {
             control: None,
-            exit,
+            exit: RetainedExit::new(exit),
             teardown: None,
         };
     }
@@ -414,18 +475,7 @@ impl MemberCell {
     }
 
     pub fn transition_locked(&self, txn: &mut ObservationTxn<'_>, transition: MemberTransition) {
-        // A restart schedule overwrites `last_exit`. The record is mutated
-        // under the gate and the watch channel's own lock, so the exit it
-        // displaces -- whose `ExitKind::Failed` payload owns a type-erased
-        // user error -- leaves the critical section and is destroyed by the
-        // transaction instead.
-        let mut displaced_exit = None;
-        self.update_locked(txn, |record| {
-            displaced_exit = record.apply_transition(transition);
-        });
-        if let Some(displaced_exit) = displaced_exit {
-            txn.defer(move || drop(displaced_exit));
-        }
+        self.update_locked(txn, |record| record.apply_transition(transition));
     }
 
     pub fn set_options(&self, options: ResolvedCommonOptions) {
@@ -466,7 +516,7 @@ impl MemberCell {
                         debug_assert!(teardown.is_none());
                         *teardown = mailbox.prepare_termination();
                         *control = Some(mailbox);
-                        Some(exit.clone())
+                        Some(exit.as_exit().clone())
                     }
                 }
             };
@@ -519,14 +569,14 @@ impl MemberCell {
                     exit: terminal_exit,
                     ..
                 } => {
-                    let terminal_exit = terminal_exit.clone();
+                    let terminal_exit = terminal_exit.as_exit().clone();
                     losing_exit = Some(exit);
                     terminal_exit
                 }
                 MemberMailbox::Unattached => {
                     *state = MemberMailbox::Terminal {
                         control: None,
-                        exit: exit.clone(),
+                        exit: RetainedExit::new(exit.clone()),
                         teardown: None,
                     };
                     exit
@@ -536,7 +586,7 @@ impl MemberCell {
                     let teardown = control.prepare_termination();
                     *state = MemberMailbox::Terminal {
                         control: Some(control),
-                        exit: exit.clone(),
+                        exit: RetainedExit::new(exit.clone()),
                         teardown,
                     };
                     exit
@@ -547,9 +597,6 @@ impl MemberCell {
             txn.defer(move || drop(losing_exit));
         }
         let mut published = false;
-        // Terminalization also overwrites `last_exit`, which a prior restart
-        // schedule may already have filled with a different user payload.
-        let mut displaced_exit = None;
         self.record.modify_silently(|record| {
             match startup {
                 StartupDisposition::Unchanged => {}
@@ -559,14 +606,11 @@ impl MemberCell {
             if !matches!(record.stage, MemberStage::Terminal(_)) {
                 record.incarnation = None;
                 record.restart_at = None;
-                displaced_exit = record.last_exit.replace(terminal_exit.clone());
-                record.stage = MemberStage::Terminal(terminal_exit.clone());
+                record.last_exit = Some(RetainedExit::new(terminal_exit.clone()));
+                record.stage = MemberStage::Terminal(RetainedExit::new(terminal_exit.clone()));
                 published = true;
             }
         });
-        if let Some(displaced_exit) = displaced_exit {
-            txn.defer(move || drop(displaced_exit));
-        }
         let record_changed = published || startup != StartupDisposition::Unchanged;
         // Store before discharge so reentrant mailbox wakers observe the
         // winning exit. Notification-driven readers still see
@@ -598,7 +642,7 @@ impl MemberCell {
         let mut watcher = self.record.watcher();
         loop {
             if let MemberStage::Terminal(exit) = watcher.borrow_cloned().stage {
-                return exit;
+                return exit.into_exit();
             }
             watcher.changed().await;
         }
@@ -1436,7 +1480,7 @@ impl ScopeCell {
     }
 
     pub fn snapshot(&self) -> Arc<ScopeSnapshot> {
-        self.with_observation_gate(|_| self.snapshot_locked())
+        self.with_observation_gate(|_| self.snapshot_locked().into_public())
     }
 
     pub fn subscribe_snapshots(&self) -> SnapshotReceiver {
@@ -1466,7 +1510,7 @@ impl ScopeCell {
         })
     }
 
-    fn snapshot_locked(&self) -> Arc<ScopeSnapshot> {
+    fn snapshot_locked(&self) -> RetainedScopeSnapshot {
         let record = self.record();
         let config = *self
             .observation
@@ -1474,11 +1518,14 @@ impl ScopeCell {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let children = self.current_children();
-        let children = children
-            .iter()
-            .map(|resident| self.child_snapshot_locked(&resident.projection))
-            .collect::<Vec<_>>();
-        Arc::new(ScopeSnapshot {
+        let mut projected = Vec::with_capacity(children.len());
+        let mut retained_exits = Vec::new();
+        for resident in children.iter() {
+            let (child, exits) = self.child_snapshot_locked(&resident.projection);
+            projected.push(child);
+            retained_exits.extend(exits);
+        }
+        let snapshot = Arc::new(ScopeSnapshot {
             state: record.state,
             kind: match self.flavor {
                 ScopeFlavor::Ordered => ScopeKind::Ordered,
@@ -1490,43 +1537,76 @@ impl ScopeCell {
             lifecycle_seq: LifecycleSeq::new(
                 self.observation.lifecycle_seq.load(Ordering::Acquire),
             ),
-            children: children.into(),
-        })
+            children: projected.into(),
+        });
+        RetainedScopeSnapshot::new(snapshot, retained_exits)
     }
 
-    fn child_snapshot_locked(&self, child: &ResidentProjection) -> ChildSnapshot {
-        let record = child.member.record();
+    fn child_snapshot_locked(
+        &self,
+        child: &ResidentProjection,
+    ) -> (ChildSnapshot, Vec<RetainedExit>) {
+        let MemberRecord {
+            stage,
+            incarnation,
+            last_incarnation: _,
+            last_exit,
+            restart_count,
+            restart_at,
+            membership_status,
+            startup_aborted,
+        } = child.member.record();
         let options = child.member.options();
-        let terminal = matches!(record.stage, MemberStage::Terminal(_));
-        let nested = child.scope.as_ref().and_then(|scope| {
-            (record.incarnation.is_some() || terminal).then(|| scope.snapshot_locked())
+        let terminal = matches!(&stage, MemberStage::Terminal(_));
+        let mut retained_exits = Vec::new();
+        let nested = child
+            .scope
+            .as_ref()
+            .and_then(|scope| (incarnation.is_some() || terminal).then(|| scope.snapshot_locked()))
+            .map(|nested| {
+                let (snapshot, exits) = nested.into_parts();
+                retained_exits.extend(exits);
+                snapshot
+            });
+        let state = match stage {
+            MemberStage::Reserved | MemberStage::Admitted => ChildState::Admitted,
+            MemberStage::Starting => ChildState::Starting,
+            MemberStage::Running => ChildState::Running,
+            MemberStage::Restarting => ChildState::Restarting,
+            MemberStage::Stopping => ChildState::Stopping,
+            MemberStage::Terminal(exit) if startup_aborted => {
+                let public = exit.as_exit().clone();
+                retained_exits.push(exit);
+                ChildState::StartupAborted { exit: public }
+            }
+            MemberStage::Terminal(exit) => {
+                let public = exit.as_exit().clone();
+                retained_exits.push(exit);
+                ChildState::Stopped { exit: public }
+            }
+        };
+        let last_exit = last_exit.map(|exit| {
+            let public = exit.as_exit().clone();
+            retained_exits.push(exit);
+            public
         });
-        ChildSnapshot {
+        let snapshot = ChildSnapshot {
             id: child.member.id().clone(),
             membership: child.member.membership(),
-            incarnation: record.incarnation,
-            state: match record.stage {
-                MemberStage::Reserved | MemberStage::Admitted => ChildState::Admitted,
-                MemberStage::Starting => ChildState::Starting,
-                MemberStage::Running => ChildState::Running,
-                MemberStage::Restarting => ChildState::Restarting,
-                MemberStage::Stopping => ChildState::Stopping,
-                MemberStage::Terminal(exit) if record.startup_aborted => {
-                    ChildState::StartupAborted { exit }
-                }
-                MemberStage::Terminal(exit) => ChildState::Stopped { exit },
-            },
-            last_exit: record.last_exit,
-            membership_status: record.membership_status,
-            restart_count: record.restart_count,
+            incarnation,
+            state,
+            last_exit,
+            membership_status,
+            restart_count,
             restart_policy: options.restart,
             retention: options.retention,
-            restart_at: record.restart_at,
+            restart_at,
             nested,
             scope_seq: child.scope.as_ref().map(|scope| {
                 LifecycleSeq::new(scope.observation.lifecycle_seq.load(Ordering::Acquire))
             }),
-        }
+        };
+        (snapshot, retained_exits)
     }
 
     fn ancestors_locked(&self) -> Vec<Arc<ScopeCell>> {
@@ -2161,11 +2241,59 @@ impl ScopeCell {
 #[cfg(test)]
 mod tests {
     use std::{
+        fmt,
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::Arc,
+        sync::{Arc, mpsc},
+        time::Duration,
     };
 
-    use crate::{ChildId, MemberCell, ScopeCell, identity::ScopeIdentity, policy::ScopeFlavor};
+    use shelterwood_core::{Cancellation, Exit, ExitError, ExitKind};
+
+    use crate::{
+        ChildId, MemberCell, RetainedExit, ScopeCell, identity::ScopeIdentity, policy::ScopeFlavor,
+    };
+
+    struct ThreadProbe(mpsc::SyncSender<std::thread::ThreadId>);
+
+    impl fmt::Debug for ThreadProbe {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("ThreadProbe")
+        }
+    }
+
+    impl fmt::Display for ThreadProbe {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("thread probe")
+        }
+    }
+
+    impl std::error::Error for ThreadProbe {}
+
+    impl Drop for ThreadProbe {
+        fn drop(&mut self) {
+            let _ = self.0.send(std::thread::current().id());
+        }
+    }
+
+    #[test]
+    fn retained_failed_exit_disposes_off_the_retiring_thread() {
+        let retiring_thread = std::thread::current().id();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retained = RetainedExit::new(Exit::new(
+            ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+            Cancellation::NotObserved,
+        ));
+
+        drop(retained);
+
+        let disposal_thread = observed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("isolated exit disposal completes");
+        assert_ne!(
+            disposal_thread, retiring_thread,
+            "a retained failed exit must not run its user destructor inline"
+        );
+    }
 
     #[test]
     fn destructor_shutdown_tolerates_a_poisoned_control_mutex() {

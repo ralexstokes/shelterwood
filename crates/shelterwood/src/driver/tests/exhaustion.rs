@@ -36,10 +36,7 @@ fn member_transitions_own_their_complete_record_projection() {
     assert_eq!(record.stage, MemberStage::Restarting);
     assert_eq!(record.incarnation, None);
     assert_eq!(record.last_incarnation, Some(incarnation));
-    assert_eq!(
-        record.last_exit.as_ref().map(RetainedExit::as_exit),
-        Some(&exit)
-    );
+    assert_eq!(record.last_exit, Some(exit));
     assert_eq!(record.restart_count, restart_count);
     assert_eq!(record.restart_at, Some(restart_at));
 
@@ -53,8 +50,8 @@ fn member_transitions_own_their_complete_record_projection() {
     assert_eq!(record.last_incarnation, Some(second));
     assert_eq!(record.restart_at, None);
     assert_eq!(
-        record.last_exit.as_ref().map(RetainedExit::as_exit),
-        Some(&Exit::new(ExitKind::Completed, Cancellation::NotObserved))
+        record.last_exit,
+        Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved))
     );
     assert_eq!(record.restart_count, restart_count);
 }
@@ -87,14 +84,7 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
     assert!(counter.mint().is_some());
     assert!(counter.mint().is_none());
     assert!(matches!(member.record().stage, MemberStage::Restarting));
-    assert_eq!(
-        member
-            .record()
-            .last_exit
-            .as_ref()
-            .map(RetainedExit::as_exit),
-        Some(&previous)
-    );
+    assert_eq!(member.record().last_exit, Some(previous));
     assert!(counter.mint().is_none());
 }
 
@@ -148,7 +138,7 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
         |record| {
             record.incarnation = None;
             record.last_incarnation = Some(first);
-            record.last_exit = Some(previous.clone().into());
+            record.last_exit = Some(previous.clone());
             record.stage = MemberStage::Restarting;
         },
         None,
@@ -579,7 +569,7 @@ async fn scope_incarnation_exhaustion_closes_nested_observation() {
     member.update(|record| {
         record.stage = MemberStage::Restarting;
         record.last_incarnation = Some(first);
-        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved).into());
+        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
     });
     scope.set_state(ScopeState::Stopped {
         reason: StopReason::Finished,

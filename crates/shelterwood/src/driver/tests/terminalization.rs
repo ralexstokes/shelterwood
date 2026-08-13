@@ -859,8 +859,8 @@ fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent
     assert_eq!(
         *probe.observed.lock().expect("observation mutex poisoned"),
         Some((
-            MemberStage::Terminal(first_exit.clone().into()),
-            MemberStage::Terminal(first_exit.clone().into())
+            MemberStage::Terminal(first_exit.clone()),
+            MemberStage::Terminal(first_exit.clone())
         ))
     );
     assert!(matches!(
@@ -900,8 +900,8 @@ fn attach_during_terminal_publication_finishes_record_before_mailbox_wake() {
     assert_eq!(
         *probe.observed.lock().expect("observation mutex poisoned"),
         Some((
-            MemberStage::Terminal(first_exit.clone().into()),
-            MemberStage::Terminal(first_exit.clone().into())
+            MemberStage::Terminal(first_exit.clone()),
+            MemberStage::Terminal(first_exit.clone())
         ))
     );
     assert!(matches!(

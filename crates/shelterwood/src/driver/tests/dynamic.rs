@@ -870,7 +870,7 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
     }
     assert_eq!(
         emitted_exit.as_ref(),
-        Some(record_exit.as_exit()),
+        Some(&record_exit),
         "the lifecycle stream and the terminal record agree on the exit"
     );
 }

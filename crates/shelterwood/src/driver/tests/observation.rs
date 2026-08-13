@@ -591,7 +591,7 @@ async fn terminality_fallback_preserves_restart_window_scope_reason() {
         record.stage = MemberStage::Restarting;
         record.incarnation = None;
         record.last_incarnation = Some(last_incarnation);
-        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved).into());
+        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
     });
     nested.set_state(ScopeState::Stopped {
         reason: StopReason::Finished,

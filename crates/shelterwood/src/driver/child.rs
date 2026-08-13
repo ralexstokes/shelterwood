@@ -604,7 +604,6 @@ impl ScopeRuntime {
                 .member
                 .record()
                 .last_exit
-                .map(RetainedExit::into_exit)
                 .unwrap_or_else(Exit::never_started);
             let startup = if self.supervisor.is_initial(key)
                 && !self.supervisor.lifecycle().startup_complete()
@@ -767,10 +766,7 @@ impl ScopeRuntime {
                 self.deadlines.cancel(deadline);
             }
             let record = child.slot.member.record();
-            let exit = record
-                .last_exit
-                .map(RetainedExit::into_exit)
-                .unwrap_or_else(Exit::never_started);
+            let exit = record.last_exit.unwrap_or_else(Exit::never_started);
             // A never-ran child and a child stopped between restart
             // incarnations share the same post-disposal terminal route. Hard
             // shutdown still detaches disposal through `hard_forced` below.

@@ -142,7 +142,7 @@ impl Drop for RetainedExit {
             return;
         };
         if matches!(exit.kind(), ExitKind::Failed(_)) {
-            runtime::dispose_detached(exit);
+            runtime::dispose_critical(exit);
         }
     }
 }

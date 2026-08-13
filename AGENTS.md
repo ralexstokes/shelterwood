@@ -52,9 +52,10 @@ rests on:
   audit confirmed was a drop that *looked* like refcount traffic. Resident
   member records, scope records, lifecycle events, snapshot projections and
   driver completions protect failed exits through `RetainedExit`; its drop
-  transfers destruction to isolated disposal. Scope state and startup results
-  need that protection too: a structured startup failure recursively owns the
-  triggering child's `Exit`.
+  transfers destruction to a critical-safe disposal queue whose
+  resource-exhaustion fallback retains the job rather than destroying it
+  inline. Scope state and startup results need that protection too: a
+  structured startup failure recursively owns the triggering child's `Exit`.
   `ScopeCell::clear_residents_locked` and `prune_child_locked` may therefore
   release their `Arc<MemberCell>`s under the gate without relying on driver
   field-drop order to keep a user error alive.

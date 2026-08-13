@@ -126,7 +126,10 @@ where
 ///
 /// `worker_live` is only cleared by the worker after observing an empty queue
 /// under this lock, and submitters push and consult it under the same lock, so
-/// a queued job always has a live worker destined to drain it.
+/// a successful worker start cannot miss queued work. Critical-section
+/// disposal is allowed to remain queued without a worker after native thread
+/// creation fails; every later submission retries the worker start.
+#[derive(Default)]
 struct FallbackDisposals {
     queue: VecDeque<Arc<dyn BlockingPoolJob>>,
     worker_live: bool,
@@ -141,30 +144,58 @@ static FALLBACK_DISPOSALS: Mutex<FallbackDisposals> = Mutex::new(FallbackDisposa
 /// Returns `false` when no worker exists and none could be started; the
 /// caller must then finish the job itself.
 fn enqueue_fallback_disposal(job: Arc<dyn BlockingPoolJob>) -> bool {
-    let mut state = FALLBACK_DISPOSALS
+    enqueue_fallback_disposal_with(&FALLBACK_DISPOSALS, job, false, || {
+        std::thread::Builder::new()
+            .name("shelterwood-disposal".to_owned())
+            .spawn(run_fallback_disposals)
+    })
+}
+
+/// Queues a disposal that must never fall back to the submitting thread.
+///
+/// If native thread creation is temporarily exhausted, the static queue keeps
+/// ownership and a later disposal submission retries the worker start. The
+/// fail-safe degradation is delayed reclamation, never user destruction in a
+/// framework critical section.
+fn enqueue_critical_disposal(job: Arc<dyn BlockingPoolJob>) {
+    let queued = enqueue_fallback_disposal_with(&FALLBACK_DISPOSALS, job, true, || {
+        std::thread::Builder::new()
+            .name("shelterwood-disposal".to_owned())
+            .spawn(run_fallback_disposals)
+    });
+    debug_assert!(queued, "critical disposal always transfers ownership");
+}
+
+fn enqueue_fallback_disposal_with(
+    disposals: &Mutex<FallbackDisposals>,
+    job: Arc<dyn BlockingPoolJob>,
+    retain_on_spawn_failure: bool,
+    spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> bool {
+    let mut state = disposals
         .lock()
-        .expect("fallback disposal queue mutex poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.queue.push_back(job);
     if state.worker_live {
         return true;
     }
     // Spawning under the lock makes queueing and worker liveness one atomic
-    // decision: no submitter can observe a queued job without a worker.
-    match std::thread::Builder::new()
-        .name("shelterwood-disposal".to_owned())
-        .spawn(run_fallback_disposals)
-    {
+    // decision. Critical disposals deliberately stay queued when the spawn
+    // fails; non-critical callers reclaim only the entry they just appended.
+    match spawn() {
         Ok(worker) => {
             drop(worker);
             state.worker_live = true;
             true
         }
         Err(_) => {
-            // The queue was empty before this push (no live worker implies an
-            // empty queue), so the popped entry is exactly the failed job.
-            let rejected = state.queue.pop_back();
-            debug_assert!(rejected.is_some());
-            false
+            if retain_on_spawn_failure {
+                true
+            } else {
+                let rejected = state.queue.pop_back();
+                debug_assert!(rejected.is_some());
+                false
+            }
         }
     }
 }
@@ -174,7 +205,7 @@ fn run_fallback_disposals() {
         let job = {
             let mut state = FALLBACK_DISPOSALS
                 .lock()
-                .expect("fallback disposal queue mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(job) = state.queue.pop_front() else {
                 state.worker_live = false;
                 return;
@@ -238,6 +269,20 @@ pub fn dispose_detached<T: Send + 'static>(value: T) {
     dispose_then(value, |_| {});
 }
 
+/// Detaches user destruction from a framework critical section.
+///
+/// Unlike [`dispose_detached`], exhausted task and native-thread creation
+/// never falls back to synchronous destruction. The pending job remains in a
+/// static queue until a later submission can start the shared disposal
+/// worker, preserving the lock rule even under resource exhaustion.
+pub fn dispose_critical<T: Send + 'static>(value: T) {
+    let job = DisposalJob::new(value, |_| {});
+    if submit_blocking_job(&job) {
+        return;
+    }
+    enqueue_critical_disposal(Arc::clone(&job) as Arc<dyn BlockingPoolJob>);
+}
+
 /// Starts isolated disposal for every value and fires once all jobs finish.
 ///
 /// Each value gets its own unwind boundary, so one destructor panic cannot
@@ -274,7 +319,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{DisposalJob, DisposalPanic, Isolated, dispose_detached};
+    use super::{
+        DisposalJob, DisposalPanic, FallbackDisposals, Isolated, dispose_detached,
+        enqueue_fallback_disposal_with,
+    };
     use crate::spawn::{BlockingPoolJob, blocking_pool_accepted};
 
     /// Name of the shared non-runtime disposal thread, asserted on to pin
@@ -325,6 +373,35 @@ mod tests {
                 message: Some(message)
             })) if message == "cancelled disposal job payload"
         ));
+    }
+
+    #[test]
+    fn critical_disposal_stays_queued_when_the_fallback_thread_cannot_start() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let job = DisposalJob::new(PanickingDrop(Arc::clone(&drops)), |_| {});
+        let disposals = Mutex::new(FallbackDisposals::default());
+
+        assert!(enqueue_fallback_disposal_with(
+            &disposals,
+            Arc::clone(&job) as Arc<dyn BlockingPoolJob>,
+            true,
+            || Err(std::io::Error::other("injected thread exhaustion")),
+        ));
+        drop(job);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "thread-creation failure must not reclaim critical payloads inline"
+        );
+
+        let queued = disposals
+            .lock()
+            .expect("local disposal queue remains healthy")
+            .queue
+            .pop_front()
+            .expect("failed spawn keeps critical disposal queued");
+        queued.run();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

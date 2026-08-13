@@ -14,10 +14,11 @@ pub(super) use std::{
 
 pub(super) use crate::{
     ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
-    GracePhase, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox,
-    MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ReserveError,
-    RestartCondition, RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind,
-    StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+    GracePhase, Incarnation, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
+    Mailbox, MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome,
+    ReserveError, RestartCondition, RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState,
+    SendErrorKind, StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef,
+    TaskDef, Tree,
     engine::{
         ChildKey, Effect as SupervisorEffect, Epoch, Event as SupervisorEvent, ScopeLifecycle,
         StopLadder, SupervisorState, arbitrate, step as supervisor_step,
@@ -30,16 +31,84 @@ pub(super) use crate::{
     runtime::{CompletionGatedLatch, DedicatedRuntime, Latch},
 };
 
+pub(super) struct ObservedExit {
+    pub(super) child: ChildKey,
+    incarnation: Incarnation,
+    recorded: Option<RecordedOutcome>,
+    join: crate::runtime::JoinOutcome<()>,
+    cancellation: Cancellation,
+    readiness_signal_seen: bool,
+}
+
+impl ObservedExit {
+    pub(super) fn dispatch(self, scope: &mut ScopeRuntime) {
+        scope.handle_exit(
+            self.child,
+            self.incarnation,
+            self.recorded,
+            self.join,
+            self.cancellation,
+            self.readiness_signal_seen,
+        );
+    }
+}
+
+pub(super) async fn recv_child_exit(
+    receiver: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    timeout: Duration,
+    expectation: &str,
+) -> ObservedExit {
+    match crate::runtime::timeout(timeout, receiver.recv()).await {
+        crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
+            child,
+            incarnation,
+            recorded,
+            join,
+            cancellation,
+            readiness_signal_seen,
+        }))) => ObservedExit {
+            child,
+            incarnation,
+            recorded,
+            join,
+            cancellation,
+            readiness_signal_seen,
+        },
+        crate::runtime::Timeout::Completed(_) => panic!("expected {expectation}"),
+        crate::runtime::Timeout::Elapsed => panic!("timed out waiting for {expectation}"),
+    }
+}
+
 pub(super) use super::super::{
-    AncestorCommandLatches, ChildEvent, ChildResources, ChildRuntime, ChildTerminality,
-    DriverEvent, DynamicControl, DynamicEntry, GateCapture, MemberCell, MemberStage,
-    MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
-    ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard, ScopeFlavor,
-    ScopeRole, ScopeRuntime, StartupDisposition, cancel_dynamic_reservation,
-    discharge_child_terminality, monitor_root_driver, report_slot, reserve_dynamic,
-    resident_projection, restart_shutdown_work, run_nested_factory, run_nested_tree, run_scope,
-    run_scope_incarnation, storage::Obligation,
+    AdmissionRequest, AncestorCommandLatches, ChildEvent, ChildResources, ChildRuntime,
+    ChildTerminality, DriverEvent, DynamicControl, DynamicEntry, DynamicReservation, GateCapture,
+    MemberCell, MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest,
+    RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent,
+    ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
+    cancel_dynamic_reservation, discharge_child_terminality, monitor_root_driver, report_slot,
+    reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
+    run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
 };
+
+pub(super) async fn begin_admission(
+    reservation: &DynamicReservation,
+    receiver: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    fused_cancel: Option<Latch>,
+) -> (
+    crate::runtime::OneShotReceiver<Result<(), ReserveError>>,
+    AdmissionRequest,
+) {
+    let response = super::super::start_admission(
+        Arc::clone(&reservation.control),
+        Arc::clone(&reservation.slot),
+        fused_cancel,
+    )
+    .expect("admission starts inside the runtime");
+    let Some(DriverEvent::Admission(request)) = receiver.recv().await else {
+        panic!("admission enqueueing submits the request")
+    };
+    (response, request)
+}
 
 pub(super) struct ChildArena<T> {
     children: BTreeMap<ChildKey, T>,
@@ -329,6 +398,73 @@ pub(super) fn finished_tree() -> Tree {
     )
     .expect("finished child is valid");
     tree
+}
+
+/// A user error payload that records whether the observation gate was held
+/// when its destructor ran.
+///
+/// The lock rule's probe for `Exit`: an `ExitKind::Failed` carries a
+/// type-erased application error, so wherever the cell layer destroys an exit
+/// it is running caller code. `ObservationGate::is_held` answers from inside
+/// that destructor without the reentrant acquisition that would deadlock.
+pub(super) struct GateProbeError {
+    gate: crate::cells::ObservationGate,
+    held_at_drop: Arc<Mutex<Option<bool>>>,
+}
+
+/// Builds a failed exit whose payload reports where it was destroyed.
+pub(super) fn gate_probe_exit(scope: &Arc<ScopeCell>) -> (Exit, Arc<Mutex<Option<bool>>>) {
+    let held_at_drop = Arc::new(Mutex::new(None));
+    let exit = Exit::new(
+        ExitKind::Failed(ExitError::from(GateProbeError {
+            gate: scope.observation_gate(),
+            held_at_drop: Arc::clone(&held_at_drop),
+        })),
+        Cancellation::NotObserved,
+    );
+    (exit, held_at_drop)
+}
+
+/// A dynamic root with one admitted, started child, plus the child's
+/// incarnation counter — the shape a restart schedule needs.
+pub(super) fn restarting_member_fixture() -> (Arc<ScopeCell>, Arc<MemberCell>, IncarnationCounter) {
+    let root = isolated_scope("root", ScopeFlavor::Dynamic);
+    let child_id = ChildId::from("worker");
+    let member = MemberCell::new(
+        child_id.clone(),
+        root.mint_membership(&child_id)
+            .expect("child membership available"),
+    );
+    resolve_fixture_options(&member);
+    let mut incarnations = member.take_incarnation_counter();
+    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    let first = incarnations.mint().expect("incarnation available");
+    member.transition(MemberTransition::Starting { incarnation: first });
+    (root, member, incarnations)
+}
+
+pub(super) fn gate_probe_verdict(held_at_drop: &Arc<Mutex<Option<bool>>>) -> Option<bool> {
+    *held_at_drop.lock().expect("gate probe mutex poisoned")
+}
+
+impl std::fmt::Debug for GateProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GateProbeError")
+    }
+}
+
+impl std::fmt::Display for GateProbeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("gate probe")
+    }
+}
+
+impl std::error::Error for GateProbeError {}
+
+impl Drop for GateProbeError {
+    fn drop(&mut self) {
+        *self.held_at_drop.lock().expect("gate probe mutex poisoned") = Some(self.gate.is_held());
+    }
 }
 
 pub(super) struct SnapshotReentryWake {

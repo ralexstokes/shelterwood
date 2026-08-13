@@ -261,10 +261,6 @@ impl FenceCounter {
         }
     }
 
-    fn sequence() -> Self {
-        Self::new(Lineage(0))
-    }
-
     #[cfg(any(test, feature = "test-util"))]
     fn near_exhaustion(lineage: u64) -> Self {
         Self {
@@ -299,7 +295,7 @@ impl FenceCounter {
 #[derive(Debug)]
 pub struct IncarnationCounter {
     membership: Membership,
-    counter: FenceCounter,
+    generations: PoisonedCounter,
 }
 
 /// An inseparable identity grant: the counter for an incarnation lineage is
@@ -311,6 +307,16 @@ pub struct MintedMembership {
 }
 
 impl MintedMembership {
+    fn new(membership: Membership) -> Self {
+        Self {
+            membership,
+            incarnation_counter: IncarnationCounter {
+                membership,
+                generations: PoisonedCounter::new(),
+            },
+        }
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub fn membership(&self) -> Membership {
         self.membership
@@ -323,9 +329,10 @@ impl MintedMembership {
 
 impl IncarnationCounter {
     pub fn mint(&mut self) -> Option<Incarnation> {
-        self.counter.mint().map(|fence| Incarnation {
+        let generation = Generation::new(self.generations.mint()?)?;
+        Some(Incarnation {
             membership: self.membership,
-            generation: fence.generation,
+            generation,
         })
     }
 
@@ -333,7 +340,7 @@ impl IncarnationCounter {
     pub fn fixture(membership: Membership) -> Self {
         Self {
             membership,
-            counter: FenceCounter::sequence(),
+            generations: PoisonedCounter::new(),
         }
     }
 
@@ -341,7 +348,7 @@ impl IncarnationCounter {
     pub fn near_exhaustion(membership: Membership) -> Self {
         Self {
             membership,
-            counter: FenceCounter::near_exhaustion(0),
+            generations: PoisonedCounter::near_exhaustion(),
         }
     }
 }
@@ -390,13 +397,7 @@ impl ScopeIdentity {
                 Some(membership)
             }
         }?;
-        Some(MintedMembership {
-            membership,
-            incarnation_counter: IncarnationCounter {
-                membership,
-                counter: FenceCounter::sequence(),
-            },
-        })
+        Some(MintedMembership::new(membership))
     }
 
     /// Reconciles a declaration-time membership with this stable scope.
@@ -415,13 +416,7 @@ impl ScopeIdentity {
         match self.memberships.entry(id.clone()) {
             Entry::Occupied(mut entry) => {
                 let membership = entry.get_mut().mint().map(Membership)?;
-                Some(Some(MintedMembership {
-                    membership,
-                    incarnation_counter: IncarnationCounter {
-                        membership,
-                        counter: FenceCounter::sequence(),
-                    },
-                }))
+                Some(Some(MintedMembership::new(membership)))
             }
             Entry::Vacant(entry) => {
                 debug_assert_ne!(provisional.0.generation, Generation::POISON);
@@ -454,8 +449,7 @@ mod tests {
     use crate::ChildId;
 
     use super::{
-        AtomicPoisonedCounter, FenceCounter, Generation, IncarnationCounter, PoisonedCounter,
-        ScopeIdentity,
+        AtomicPoisonedCounter, Generation, IncarnationCounter, PoisonedCounter, ScopeIdentity,
     };
 
     #[test]
@@ -732,8 +726,9 @@ mod tests {
         assert!(!Generation::POISON.supersedes(second));
         assert!(!second.supersedes(Generation::POISON));
 
-        let mut sequence = FenceCounter::sequence();
-        assert_eq!(sequence.mint().map(|fence| fence.generation.get()), Some(1));
+        let membership = MembershipFixture::at(1, 1);
+        let mut sequence = IncarnationCounter::fixture(membership);
+        assert_eq!(sequence.mint().map(|value| value.generation.get()), Some(1));
     }
 
     struct MembershipFixture;

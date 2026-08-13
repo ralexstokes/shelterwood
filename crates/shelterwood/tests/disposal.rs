@@ -11,8 +11,8 @@ use std::{
 };
 
 use crate::common::{
-    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, policy::never,
-    poll_until,
+    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually,
+    policy::never,
 };
 use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult,
@@ -158,6 +158,31 @@ async fn poll_pending<F: Future>(future: &mut std::pin::Pin<Box<F>>) {
     .await;
 }
 
+async fn assert_disposed_off(
+    drops: &mut tokio::sync::mpsc::UnboundedReceiver<ThreadId>,
+    forbidden: ThreadId,
+    description: &str,
+) {
+    let actual = drops
+        .recv()
+        .await
+        .unwrap_or_else(|| panic!("{description}"));
+    assert_ne!(actual, forbidden, "{description}");
+}
+
+async fn assert_disposed_off_current(
+    drops: &mut tokio::sync::mpsc::UnboundedReceiver<ThreadId>,
+    description: &str,
+) {
+    let actual = drops
+        .recv()
+        .await
+        .unwrap_or_else(|| panic!("{description}"));
+    // The test task may migrate while `recv` is pending, so sample its worker
+    // only after the disposal report wakes it.
+    assert_ne!(actual, thread::current().id(), "{description}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocking_unread_message_does_not_hold_bounded_shutdown() {
     let gate = DestructorGate::default();
@@ -177,7 +202,7 @@ async fn blocking_unread_message_does_not_hold_bounded_shutdown() {
 
     let mut shutdown = tokio::spawn(system.shutdown(Duration::from_secs(1)));
     wait_for_destructor(&gate).await;
-    let bounded = tokio::time::timeout(Duration::from_secs(1), &mut shutdown).await;
+    let bounded = tokio::time::timeout(POLL_TIMEOUT, &mut shutdown).await;
     gate.release();
     let result = match bounded {
         Ok(joined) => joined.expect("shutdown task joins"),
@@ -234,13 +259,11 @@ async fn panicking_unread_messages_are_all_disposed_without_reclassifying_the_ac
         .shutdown(Duration::from_secs(1))
         .await
         .expect("payload panics do not unwind the scope driver");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            drops.load(Ordering::SeqCst) == 2
-        })
-        .await,
+    assert_eventually!(
+        || drops.load(Ordering::SeqCst) == 2,
         "one payload panic must not strand the remaining unread messages"
-    );
+    )
+    .await;
     let exit = loop {
         let Some(item) = lifecycle.recv().await else {
             panic!("actor exit was not published")
@@ -490,8 +513,7 @@ async fn non_runtime_reservation_cancellation_contains_destructor_panic() {
     let cancellation_thread = cancellation
         .join()
         .expect("cancellation outside a Tokio runtime must not panic");
-    let disposal_thread = drops.recv().await.expect("definition was disposed");
-    assert_ne!(disposal_thread, cancellation_thread);
+    assert_disposed_off(&mut drops, cancellation_thread, "definition was disposed").await;
     assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     system
         .shutdown(Duration::from_secs(1))
@@ -599,11 +621,12 @@ async fn non_runtime_disposals_run_off_callers_and_contain_panics() {
         dropper_thread
     });
     let late_dropper_thread = late_dropper.join().expect("late cancellation never panics");
-    let late_disposal_thread = drops
-        .recv()
-        .await
-        .expect("disposal keeps running after a contained destructor panic");
-    assert_ne!(late_disposal_thread, late_dropper_thread);
+    assert_disposed_off(
+        &mut drops,
+        late_dropper_thread,
+        "disposal keeps running after a contained destructor panic",
+    )
+    .await;
 
     system
         .shutdown(Duration::from_secs(1))
@@ -630,13 +653,7 @@ async fn unadmitted_removal_completes_after_blocking_definition_disposal() {
     }));
     let mut removal = Box::pin(scope.remove_task(&task));
     wait_for_destructor(&gate).await;
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("definition disposal reports its thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "definition disposal reports its thread").await;
     assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     poll_pending(&mut removal).await;
     gate.release();
@@ -688,13 +705,7 @@ async fn restart_window_removal_joins_factory_disposal_before_terminality() {
     let mut removal = Box::pin(scope.remove_task(&task));
     poll_pending(&mut removal).await;
     wait_for_destructor(&gate).await;
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("factory disposal reports its thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "factory disposal reports its thread").await;
     poll_pending(&mut removal).await;
     let mut terminal = Box::pin(task.wait());
     poll_pending(&mut terminal).await;
@@ -728,7 +739,7 @@ async fn unadmitted_removal_completes_when_the_panic_payload_destructor_panics()
     }));
 
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), scope.remove_task(&task))
+        tokio::time::timeout(POLL_TIMEOUT, scope.remove_task(&task))
             .await
             .expect("panic payload disposal publishes removal completion"),
         RemoveOutcome::Removed
@@ -835,14 +846,8 @@ async fn zero_shutdown_reports_the_live_child_but_detaches_blocking_factory_disp
 
     let mut shutdown = tokio::spawn(system.shutdown(Duration::ZERO));
     wait_for_destructor(&gate).await;
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("factory disposal reports its thread"),
-        thread::current().id()
-    );
-    let bounded = tokio::time::timeout(Duration::from_secs(1), &mut shutdown).await;
+    assert_disposed_off_current(&mut drops, "factory disposal reports its thread").await;
+    let bounded = tokio::time::timeout(POLL_TIMEOUT, &mut shutdown).await;
     gate.release();
     let result = bounded
         .expect("hard escalation is not held by factory disposal")
@@ -884,14 +889,8 @@ async fn startup_rollback_detaches_never_started_one_shot_state_after_escalation
     let system = tree.spawn().expect("runtime is available");
     let mut rollback = tokio::spawn(system.start_or_shutdown(Duration::ZERO));
     wait_for_destructor(&gate).await;
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("one-shot state reports its thread"),
-        thread::current().id()
-    );
-    let bounded = tokio::time::timeout(Duration::from_secs(1), &mut rollback).await;
+    assert_disposed_off_current(&mut drops, "one-shot state reports its thread").await;
+    let bounded = tokio::time::timeout(POLL_TIMEOUT, &mut rollback).await;
     gate.release();
     let result = bounded
         .expect("rollback escalation is not held by one-shot state")
@@ -937,13 +936,7 @@ async fn startup_rollback_joins_never_started_disposal_before_terminality() {
     let mut rollback = Box::pin(system.start_or_shutdown(Duration::from_secs(5)));
     poll_pending(&mut rollback).await;
     wait_for_destructor(&gate).await;
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("one-shot state reports its thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "one-shot state reports its thread").await;
     poll_pending(&mut rollback).await;
     let mut terminal = Box::pin(completion.wait());
     poll_pending(&mut terminal).await;
@@ -983,15 +976,9 @@ async fn hard_shutdown_detaches_failed_nested_lowering_disposal() {
 
     let system = tree.spawn().expect("runtime is available");
     wait_for_destructor(&gate).await;
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("failed definition disposal reports its thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "failed definition disposal reports its thread").await;
     let mut shutdown = tokio::spawn(system.shutdown(Duration::ZERO));
-    let bounded = tokio::time::timeout(Duration::from_secs(1), &mut shutdown).await;
+    let bounded = tokio::time::timeout(POLL_TIMEOUT, &mut shutdown).await;
     gate.release();
     let result = bounded
         .expect("hard shutdown is not held by failed lowering disposal")
@@ -1037,13 +1024,7 @@ async fn restart_window_cleanup_is_isolated_without_reclassifying_the_recorded_e
         .shutdown(Duration::ZERO)
         .await
         .expect("restart-window cleanup does not become a shutdown straggler");
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("restart-window factory was disposed"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "restart-window factory was disposed").await;
     assert!(matches!(
         task.wait().await.kind(),
         ExitKind::Failed(error) if error.to_string() == "restart me"
@@ -1066,17 +1047,11 @@ async fn abandoned_one_shot_completion_disposes_blocking_value_off_the_task() {
 
     let system = tree.spawn().expect("runtime is available");
     wait_for_destructor(&gate).await;
-    let bounded = tokio::time::timeout(Duration::from_secs(1), task.wait()).await;
+    let bounded = tokio::time::timeout(POLL_TIMEOUT, task.wait()).await;
     gate.release();
     let exit = bounded.expect("a blocked abandoned-claim disposal must not hang the task");
     assert!(matches!(exit.kind(), ExitKind::Completed));
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("abandoned result reports its disposal thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "abandoned result reports its disposal thread").await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 }
 
@@ -1099,13 +1074,7 @@ async fn abandoned_one_shot_completion_keeps_completed_verdict_through_destructo
         matches!(exit.kind(), ExitKind::Completed),
         "an abandoned claim's destructor panic must not reclassify the task: {exit:?}"
     );
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("abandoned result reports its disposal thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "abandoned result reports its disposal thread").await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 }
 
@@ -1131,12 +1100,12 @@ async fn duplicate_id_rejection_disposes_blocking_definition_off_the_caller() {
     assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
 
     wait_for_destructor(&gate).await;
-    let disposal_thread = drops
-        .recv()
-        .await
-        .expect("rejected definition reports its disposal thread");
+    assert_disposed_off_current(
+        &mut drops,
+        "rejected definition reports its disposal thread",
+    )
+    .await;
     gate.release();
-    assert_ne!(disposal_thread, thread::current().id());
 }
 
 struct HostileCapture {
@@ -1166,13 +1135,7 @@ async fn duplicate_id_rejection_contains_definition_destructor_panic() {
         )
         .expect_err("duplicate id is rejected without unwinding the caller");
     assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("rejected definition reports its disposal thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "rejected definition reports its disposal thread").await;
 }
 
 #[tokio::test]
@@ -1193,13 +1156,7 @@ async fn dynamic_duplicate_rejection_disposes_definition_before_admission() {
             }
         }),
     );
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("rejected definition reports its disposal thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "rejected definition reports its disposal thread").await;
     let error = admission.await.expect_err("duplicate id is rejected");
     assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
     system
@@ -1227,12 +1184,8 @@ async fn cancelled_send_disposes_blocking_message_off_the_caller() {
     };
 
     wait_for_destructor(&gate).await;
-    let disposal_thread = drops
-        .recv()
-        .await
-        .expect("withdrawn message reports its disposal thread");
+    assert_disposed_off_current(&mut drops, "withdrawn message reports its disposal thread").await;
     gate.release();
-    assert_ne!(disposal_thread, thread::current().id());
     drop(tree);
 }
 
@@ -1247,13 +1200,7 @@ async fn cancelled_send_contains_message_destructor_panic() {
         Box::pin(actor.send(DropProbe::panicking(dropped, "cancelled send destructor")));
     poll_pending(&mut pending).await;
     drop(pending);
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("withdrawn message reports its disposal thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "withdrawn message reports its disposal thread").await;
 }
 
 struct ReplyThenPark {
@@ -1307,12 +1254,8 @@ async fn cancelled_call_disposes_stored_reply_off_the_caller() {
     replied.wait().await;
     drop(call);
     wait_for_destructor(&gate).await;
-    let disposal_thread = drops
-        .recv()
-        .await
-        .expect("stored reply reports its disposal thread");
+    assert_disposed_off_current(&mut drops, "stored reply reports its disposal thread").await;
     gate.release();
-    assert_ne!(disposal_thread, thread::current().id());
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -1325,13 +1268,7 @@ async fn dropped_reply_receiver_disposes_stored_value_through_isolated_disposal(
     let (reply, receiver) = Reply::<DropProbe>::channel();
     reply.send(DropProbe::panicking(dropped, "unclaimed reply destructor"));
     drop(receiver);
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("stored reply reports its disposal thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "stored reply reports its disposal thread").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1352,12 +1289,12 @@ async fn unclaimed_completion_value_disposes_blocking_destructor_off_the_claim_h
     assert!(matches!(exit.kind(), ExitKind::Completed));
     drop(completion);
     wait_for_destructor(&gate).await;
-    let disposal_thread = drops
-        .recv()
-        .await
-        .expect("unclaimed completion reports its disposal thread");
+    assert_disposed_off_current(
+        &mut drops,
+        "unclaimed completion reports its disposal thread",
+    )
+    .await;
     gate.release();
-    assert_ne!(disposal_thread, thread::current().id());
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 }
 
@@ -1377,13 +1314,7 @@ async fn unclaimed_completion_value_contains_destructor_panic() {
     let exit = task.wait().await;
     assert!(matches!(exit.kind(), ExitKind::Completed));
     drop(completion);
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("unclaimed completion reports its disposal thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "unclaimed completion reports its disposal thread").await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 }
 
@@ -1433,13 +1364,7 @@ async fn terminated_call_disposes_recovered_message_off_the_caller() {
         .await
         .expect_err("terminated actor rejects the call");
     assert!(matches!(error.kind, CallErrorKind::Terminated));
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("recovered message reports its disposal thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "recovered message reports its disposal thread").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1467,12 +1392,8 @@ async fn acceptance_timed_out_call_disposes_recovered_message_off_the_caller() {
         .expect_err("unbound mailbox never accepts within the deadline");
     assert!(matches!(error.kind, CallErrorKind::AcceptanceTimedOut));
     wait_for_destructor(&gate).await;
-    let disposal_thread = drops
-        .recv()
-        .await
-        .expect("recovered message reports its disposal thread");
+    assert_disposed_off_current(&mut drops, "recovered message reports its disposal thread").await;
     gate.release();
-    assert_ne!(disposal_thread, thread::current().id());
     drop(tree);
 }
 
@@ -1514,11 +1435,12 @@ async fn overdue_call_construction_disposes_message_off_constructor_task_and_con
         .recv()
         .await
         .expect("constructor reports its thread");
-    let disposal_thread = drops
-        .recv()
-        .await
-        .expect("overdue message destructor runs despite its contained panic");
-    assert_ne!(disposal_thread, construction_thread);
+    assert_disposed_off(
+        &mut drops,
+        construction_thread,
+        "overdue message destructor runs despite its contained panic",
+    )
+    .await;
     drop(tree);
 }
 
@@ -1538,13 +1460,7 @@ async fn dropped_unstarted_call_disposes_constructor_off_the_caller() {
         Duration::from_secs(1),
     );
     drop(call);
-    assert_ne!(
-        drops
-            .recv()
-            .await
-            .expect("unstarted constructor reports its disposal thread"),
-        thread::current().id()
-    );
+    assert_disposed_off_current(&mut drops, "unstarted constructor reports its disposal thread").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1555,12 +1471,8 @@ async fn late_reply_send_disposes_unclaimed_value_off_the_sender() {
     drop(receiver);
     reply.send(BlockingDropProbe::new(&gate, dropped));
     wait_for_destructor(&gate).await;
-    let disposal_thread = drops
-        .recv()
-        .await
-        .expect("late reply reports its disposal thread");
+    assert_disposed_off_current(&mut drops, "late reply reports its disposal thread").await;
     gate.release();
-    assert_ne!(disposal_thread, thread::current().id());
 }
 
 struct OffloadPanic {

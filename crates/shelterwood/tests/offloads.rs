@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_quiet, poll_until};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
     Guard, LifecycleEventKind, LifecycleItem, Mailbox, Readiness, Shutdown, StartupError,
@@ -224,12 +224,7 @@ async fn timers_and_offload_completions_never_cross_an_incarnation_boundary() {
         .send(RestartMessage::Poison)
         .await
         .expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            generations.load(Ordering::SeqCst) >= 2
-        })
-        .await
-    );
+    assert_eventually!(|| generations.load(Ordering::SeqCst) >= 2).await;
     actor
         .send(RestartMessage::Fresh)
         .await
@@ -409,13 +404,11 @@ async fn detached_run_blocking_completion_stays_with_its_old_incarnation() {
         .send(DetachedBlockingMessage::Poison)
         .await
         .expect("actor accepts poison");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            generations.load(Ordering::SeqCst) >= 2
-        })
-        .await,
+    assert_eventually!(
+        || generations.load(Ordering::SeqCst) >= 2,
         "replacement starts while the old blocking thread remains detached"
-    );
+    )
+    .await;
 
     thread_release.release();
     // The gate only witnesses that the result's destructor ran somewhere; the
@@ -527,13 +520,11 @@ async fn offload_completion_wins_at_the_exact_deadline() {
         .send(DeadlineMessage::Start)
         .await
         .expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            armed.load(Ordering::SeqCst) && offload_started.load(Ordering::SeqCst)
-        })
-        .await,
+    assert_eventually!(
+        || armed.load(Ordering::SeqCst) && offload_started.load(Ordering::SeqCst),
         "the offload is polled and its deadline is registered before time moves"
-    );
+    )
+    .await;
     tokio::time::advance(Duration::from_secs(10)).await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(*result.lock().expect("result mutex poisoned"), Some(Ok(42)));
@@ -600,13 +591,11 @@ async fn dropping_scoped_guard_suppresses_the_continuation() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     actor.send(GuardMessage::Start).await.expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            guard_dropped.load(Ordering::SeqCst)
-        })
-        .await,
+    assert_eventually!(
+        || guard_dropped.load(Ordering::SeqCst),
         "the actor drops the guard before the negative window begins"
-    );
+    )
+    .await;
     assert_quiet(Duration::from_secs(1), || {
         deliveries.load(Ordering::SeqCst) != 0
     })
@@ -749,16 +738,33 @@ enum BlockingMessage {
     Run,
 }
 
+/// What the handler observed around its `run_blocking` call. A handler
+/// cannot judge this itself: supervision contains a handler panic, so an
+/// in-handler assertion never reaches the test. The evidence is published
+/// instead, and the test body is the only place that judges it.
+struct BlockingObservation {
+    entered_on: tokio::task::Id,
+    resumed_on: tokio::task::Id,
+    cancelled_while_blocking: bool,
+}
+
 struct BlockingActor {
     observed: Arc<AtomicUsize>,
+    observation: Arc<Mutex<Option<BlockingObservation>>>,
 }
 
 impl Actor for BlockingActor {
     type Msg = BlockingMessage;
-    type Args = Arc<AtomicUsize>;
+    type Args = (Arc<AtomicUsize>, Arc<Mutex<Option<BlockingObservation>>>);
 
-    async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
-        Ok(Self { observed: args })
+    async fn init(
+        (observed, observation): Self::Args,
+        _: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        Ok(Self {
+            observed,
+            observation,
+        })
     }
 
     async fn handle(
@@ -766,11 +772,18 @@ impl Actor for BlockingActor {
         BlockingMessage::Run: Self::Msg,
         context: &mut Context<'_, Self>,
     ) -> ExitResult {
-        let value = context.run_blocking(|token| {
-            assert!(!token.is_cancelled());
-            73usize
+        let entered_on = tokio::task::id();
+        let value = context.run_blocking(|token| (73usize, token.is_cancelled()));
+        let (value, cancelled_while_blocking) = value.await;
+        self.observed.store(value, Ordering::SeqCst);
+        *self
+            .observation
+            .lock()
+            .expect("blocking observation mutex poisoned") = Some(BlockingObservation {
+            entered_on,
+            resumed_on: tokio::task::id(),
+            cancelled_while_blocking,
         });
-        self.observed.store(value.await, Ordering::SeqCst);
         context.stop();
         Ok(())
     }
@@ -779,11 +792,12 @@ impl Actor for BlockingActor {
 #[tokio::test]
 async fn run_blocking_returns_on_the_actor_task() {
     let observed = Arc::new(AtomicUsize::new(0));
+    let observation = Arc::new(Mutex::new(None));
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "blocking",
-            ActorOnceDef::<BlockingActor>::new(Arc::clone(&observed)),
+            ActorOnceDef::<BlockingActor>::new((Arc::clone(&observed), Arc::clone(&observation))),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -791,6 +805,16 @@ async fn run_blocking_returns_on_the_actor_task() {
     actor.send(BlockingMessage::Run).await.expect("actor live");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(observed.load(Ordering::SeqCst), 73);
+    let observation = observation
+        .lock()
+        .expect("blocking observation mutex poisoned")
+        .take()
+        .expect("the handler ran to completion");
+    assert!(!observation.cancelled_while_blocking);
+    assert_eq!(
+        observation.resumed_on, observation.entered_on,
+        "run_blocking resumes its handler on the actor task, not the blocking thread"
+    );
 }
 
 enum CancelBlockingMessage {
@@ -844,12 +868,7 @@ async fn dropping_run_blocking_future_cancels_and_detaches_its_thread() {
         .await
         .expect("actor live");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            cancelled.load(Ordering::SeqCst)
-        })
-        .await
-    );
+    assert_eventually!(|| cancelled.load(Ordering::SeqCst)).await;
 }
 
 #[derive(Clone, Copy)]
@@ -965,7 +984,7 @@ async fn cancellation_destructor_panic_wakes_an_otherwise_idle_actor() {
 
     guard.cancel();
 
-    let exit = tokio::time::timeout(Duration::from_secs(1), async {
+    let exit = tokio::time::timeout(POLL_TIMEOUT, async {
         loop {
             let item = events.recv().await.expect("lifecycle remains open");
             let LifecycleItem::Event(event) = item else {
@@ -1326,13 +1345,11 @@ async fn queued_offload_panic_survives_hard_abort() {
         .send(PanicMessage::Trigger)
         .await
         .expect("mailbox accepts before readiness");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            queued.load(Ordering::SeqCst)
-        })
-        .await,
+    assert_eventually!(
+        || queued.load(Ordering::SeqCst),
         "offload panic is queued before hard abort"
-    );
+    )
+    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -1402,13 +1419,11 @@ async fn hard_abort_preserves_owned_offload_panic_over_handler_destructor() {
     let mut events = system.scope().subscribe_lifecycle();
     system.wait_started().await.expect("actor starts");
     actor.send(()).await.expect("actor accepts trigger");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            queued.load(Ordering::SeqCst)
-        })
-        .await,
+    assert_eventually!(
+        || queued.load(Ordering::SeqCst),
         "offload panic is owned before hard abort"
-    );
+    )
+    .await;
     system
         .shutdown(Duration::from_secs(1))
         .await
@@ -1506,12 +1521,7 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_panic() {
         .send(CrashTeardownMessage::Start)
         .await
         .expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            log.lock().expect("drop log mutex poisoned").len() == 2
-        })
-        .await
-    );
+    assert_eventually!(|| log.lock().expect("drop log mutex poisoned").len() == 2).await;
     assert_eq!(
         *log.lock().expect("drop log mutex poisoned"),
         ["offload", "actor"]
@@ -1654,12 +1664,7 @@ async fn offload_completion_flood_is_absorbed_and_fully_delivered() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     actor.send(FloodMessage::Start).await.expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            completed_work.load(Ordering::SeqCst) == FLOOD
-        })
-        .await
-    );
+    assert_eventually!(|| completed_work.load(Ordering::SeqCst) == FLOOD).await;
     release.release();
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 }
@@ -1838,12 +1843,7 @@ async fn incarnation_offloads_are_destroyed_before_actor_state_on_error() {
         .send(FailTeardownMessage::Start)
         .await
         .expect("actor live");
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            log.lock().expect("drop log mutex poisoned").len() == 2
-        })
-        .await
-    );
+    assert_eventually!(|| log.lock().expect("drop log mutex poisoned").len() == 2).await;
     assert_eq!(
         *log.lock().expect("drop log mutex poisoned"),
         ["offload", "actor"]

@@ -1,6 +1,6 @@
 use std::{future, time::Duration};
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, policy::never, poll_until};
+use crate::common::{ReleaseGate, assert_eventually, policy::never};
 use shelterwood::{
     Actor, ActorOnceDef, ChildState, Context, ExitError, ExitKind, ExitResult, GracePhase,
     Readiness, ReadinessDeadline, Shutdown, StartOrShutdownError, StopContext, SubtreeOnceDef,
@@ -190,12 +190,7 @@ async fn sidecar_runs_two_host_owned_cycles_with_readiness_and_policy_exact_shut
         let fixture = sidecar(cycle, journal.clone());
         let system = fixture.tree.spawn().expect("runtime is available");
         let scope = system.scope();
-        assert!(
-            poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-                log.events(cycle, "config") == ["started"]
-            })
-            .await
-        );
+        assert_eventually!(|| log.events(cycle, "config") == ["started"]).await;
         let parked = scope.snapshot();
         assert!(matches!(
             parked.child("config").expect("config child").state,
@@ -305,12 +300,7 @@ async fn sidecar_startup_failure_leaves_prefix_supervised_until_host_rolls_it_ba
     let mut fixture = failing_sidecar();
     let system = fixture.tree.spawn().expect("runtime is available");
     let scope = system.scope();
-    assert!(
-        poll_until(POLL_TIMEOUT, Duration::from_millis(1), || {
-            fixture.log.events(99, "config") == ["started"]
-        })
-        .await
-    );
+    assert_eventually!(|| fixture.log.events(99, "config") == ["started"]).await;
     fixture.gate.release();
     let startup = system
         .wait_started()

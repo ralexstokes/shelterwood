@@ -9,7 +9,9 @@ homepage = "https://github.com/ralexstokes/shelterwood"
 repository = "https://github.com/ralexstokes/shelterwood"
 
 [features]
-test-util = ["tokio/test-util"]
+# `rt-multi-thread` is the dedicated-runtime fixture's, not the library's: the
+# adapter itself never builds a runtime.
+test-util = ["tokio/test-util", "tokio/rt-multi-thread"]
 
 [lints]
 workspace = true
@@ -20,4 +22,4 @@ shelterwood-core.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

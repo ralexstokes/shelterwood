@@ -143,9 +143,19 @@ impl Drop for SystemRun {
 
 pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
     let root = Arc::clone(&plan.root);
-    let monitor_root = Arc::clone(&root);
     let driver = runtime::spawn(async move { run_scope(plan, ScopeRole::Root).await });
-    let lifecycle = runtime::spawn(async move {
+    let lifecycle = monitor_root_driver(Arc::clone(&root), driver);
+    SystemRun {
+        root,
+        driver: Some(lifecycle),
+    }
+}
+
+fn monitor_root_driver(
+    monitor_root: Arc<ScopeCell>,
+    driver: runtime::JoinHandle<StopReason>,
+) -> runtime::JoinHandle<StopReason> {
+    runtime::spawn(async move {
         match classify_root_driver_join(runtime::join(driver).await) {
             Ok(reason) => reason,
             Err(exit) => {
@@ -153,11 +163,7 @@ pub(crate) fn spawn_system(plan: ScopePlan) -> SystemRun {
                 StopReason::ShutdownRequested
             }
         }
-    });
-    SystemRun {
-        root,
-        driver: Some(lifecycle),
-    }
+    })
 }
 
 struct AncestorCommandLatches {

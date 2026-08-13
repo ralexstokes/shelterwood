@@ -1,8 +1,11 @@
-mod gates;
-mod ownership;
-pub(crate) mod policy;
-mod timing;
-pub(crate) mod waiting;
+register_test_modules!(
+    "tests/common";
+    mod gates;
+    mod ownership;
+    pub(crate) mod policy;
+    mod timing;
+    pub(crate) mod waiting;
+);
 
 pub(crate) use gates::{DestructorBlocker, DestructorGate, ReleaseGate};
 pub(crate) use ownership::{ConsumeCount, ConsumeGuard, LiveFlag, PanicOnDrop};

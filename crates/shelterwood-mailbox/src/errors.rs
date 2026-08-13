@@ -11,7 +11,10 @@ pub enum SendErrorKind {
     Full,
     /// The membership is terminal.
     Terminated,
-    /// A timed send was withdrawn before acceptance.
+    /// A timed send was withdrawn before acceptance. An already-expired
+    /// withdrawal can win before deferred waiter discharge even when mailbox
+    /// termination linearized first; a retry then reports `Terminated` and
+    /// includes the final incarnation when one existed.
     TimedOut,
 }
 
@@ -63,7 +66,10 @@ impl fmt::Display for SendErrorKind {
 pub enum CallErrorKind {
     /// The membership terminalized before acceptance.
     Terminated,
-    /// The request was withdrawn before acceptance.
+    /// The request was withdrawn before acceptance. An already-expired
+    /// withdrawal can win before deferred waiter discharge even when mailbox
+    /// termination linearized first; a retry then reports `Terminated` and
+    /// includes the final incarnation when one existed.
     AcceptanceTimedOut,
     /// The request was accepted but its response missed the deadline.
     ResponseTimedOut,

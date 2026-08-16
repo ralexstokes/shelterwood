@@ -3,8 +3,14 @@ use super::*;
 fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<ShutdownStraggler>) {
     let children = scope.resident_projections();
     for child in children {
-        if matches!(child.member.record().stage, MemberStage::Terminal(_))
-            || child.member.terminal_disposal_pending()
+        // Read the release/acquire marker before the terminal projection. If
+        // terminal publication has already cleared it, that acquire orders
+        // the following record read after publication; if cleanup is still
+        // pending, the marker itself excludes the child. Reading the record
+        // first could pair a stale nonterminal projection with the later
+        // cleared marker and recreate a narrow trailing gap.
+        if child.member.terminal_disposal_pending()
+            || matches!(child.member.record().stage, MemberStage::Terminal(_))
         {
             continue;
         }
@@ -82,7 +88,7 @@ pub(crate) async fn shutdown_scope(
 
 impl ScopeRuntime {
     fn drain_entry_terminal_disposals(&self, effects: &[SupervisorEffect]) -> Vec<Arc<MemberCell>> {
-        let mut keys = Vec::new();
+        let mut keys = BTreeSet::new();
         for effect in effects {
             let key = match effect {
                 SupervisorEffect::StopChild { child } | SupervisorEffect::ForceChild { child } => {
@@ -90,8 +96,7 @@ impl ScopeRuntime {
                 }
                 _ => continue,
             };
-            if keys.contains(&key)
-                || self.supervisor.membership_terminal(key)
+            if self.supervisor.membership_terminal(key)
                 || self.supervisor.is_disposing(key)
                 || self
                     .children
@@ -100,7 +105,7 @@ impl ScopeRuntime {
             {
                 continue;
             }
-            keys.push(key);
+            keys.insert(key);
         }
         keys.into_iter()
             .filter_map(|key| {

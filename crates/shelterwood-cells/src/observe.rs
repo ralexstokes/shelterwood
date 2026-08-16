@@ -9,6 +9,7 @@ use std::{
 use crate::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartAttempt, RestartCount, RestartPolicy,
     Retention, Strategy, TotalRestarts,
+    cells::RetainedExit,
     engine::{MembershipStatus, ScopeState},
     runtime,
 };
@@ -68,6 +69,205 @@ pub struct LifecycleEvent {
     pub seq: LifecycleSeq,
     /// State transition carried by this event.
     pub kind: LifecycleEventKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetainedLifecycleEvent {
+    scope_path: Vec<ChildId>,
+    scope: Membership,
+    seq: LifecycleSeq,
+    kind: RetainedLifecycleEventKind,
+}
+
+impl RetainedLifecycleEvent {
+    fn new(event: LifecycleEvent) -> Self {
+        Self {
+            scope_path: event.scope_path,
+            scope: event.scope,
+            seq: event.seq,
+            kind: RetainedLifecycleEventKind::new(event.kind),
+        }
+    }
+
+    fn into_public(self) -> LifecycleEvent {
+        LifecycleEvent {
+            scope_path: self.scope_path,
+            scope: self.scope,
+            seq: self.seq,
+            kind: self.kind.into_public(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RetainedLifecycleEventKind {
+    Added {
+        id: ChildId,
+        membership: Membership,
+    },
+    Started {
+        id: ChildId,
+        membership: Membership,
+        incarnation: Incarnation,
+    },
+    Ready {
+        id: ChildId,
+        membership: Membership,
+        incarnation: Incarnation,
+    },
+    Exited {
+        id: ChildId,
+        membership: Membership,
+        incarnation: Incarnation,
+        exit: RetainedExit,
+    },
+    RestartScheduled {
+        id: ChildId,
+        membership: Membership,
+        attempt: RestartAttempt,
+        delay: Duration,
+    },
+    Removed {
+        id: ChildId,
+        membership: Membership,
+        last_incarnation: Option<Incarnation>,
+    },
+    ScopeState {
+        state: ScopeState,
+        retained_exits: Vec<RetainedExit>,
+    },
+}
+
+impl RetainedLifecycleEventKind {
+    fn new(kind: LifecycleEventKind) -> Self {
+        match kind {
+            LifecycleEventKind::Added { id, membership } => Self::Added { id, membership },
+            LifecycleEventKind::Started {
+                id,
+                membership,
+                incarnation,
+            } => Self::Started {
+                id,
+                membership,
+                incarnation,
+            },
+            LifecycleEventKind::Ready {
+                id,
+                membership,
+                incarnation,
+            } => Self::Ready {
+                id,
+                membership,
+                incarnation,
+            },
+            LifecycleEventKind::Exited {
+                id,
+                membership,
+                incarnation,
+                exit,
+            } => Self::Exited {
+                id,
+                membership,
+                incarnation,
+                exit: RetainedExit::new(exit),
+            },
+            LifecycleEventKind::RestartScheduled {
+                id,
+                membership,
+                attempt,
+                delay,
+            } => Self::RestartScheduled {
+                id,
+                membership,
+                attempt,
+                delay,
+            },
+            LifecycleEventKind::Removed {
+                id,
+                membership,
+                last_incarnation,
+            } => Self::Removed {
+                id,
+                membership,
+                last_incarnation,
+            },
+            LifecycleEventKind::ScopeState { state } => {
+                let mut retained_exits = Vec::new();
+                RetainedExit::retain_scope_state(&mut retained_exits, &state);
+                Self::ScopeState {
+                    state,
+                    retained_exits,
+                }
+            }
+        }
+    }
+
+    fn into_public(self) -> LifecycleEventKind {
+        match self {
+            Self::Added { id, membership } => LifecycleEventKind::Added { id, membership },
+            Self::Started {
+                id,
+                membership,
+                incarnation,
+            } => LifecycleEventKind::Started {
+                id,
+                membership,
+                incarnation,
+            },
+            Self::Ready {
+                id,
+                membership,
+                incarnation,
+            } => LifecycleEventKind::Ready {
+                id,
+                membership,
+                incarnation,
+            },
+            Self::Exited {
+                id,
+                membership,
+                incarnation,
+                exit,
+            } => LifecycleEventKind::Exited {
+                id,
+                membership,
+                incarnation,
+                exit: exit.into_exit(),
+            },
+            Self::RestartScheduled {
+                id,
+                membership,
+                attempt,
+                delay,
+            } => LifecycleEventKind::RestartScheduled {
+                id,
+                membership,
+                attempt,
+                delay,
+            },
+            Self::Removed {
+                id,
+                membership,
+                last_incarnation,
+            } => LifecycleEventKind::Removed {
+                id,
+                membership,
+                last_incarnation,
+            },
+            Self::ScopeState {
+                state,
+                retained_exits,
+            } => {
+                // The public state now owns the raw copies. Converting the
+                // guards back to ordinary exits preserves caller-controlled
+                // last-drop timing at this read boundary.
+                for exit in retained_exits {
+                    drop(exit.into_exit());
+                }
+                LifecycleEventKind::ScopeState { state }
+            }
+        }
+    }
 }
 
 /// Core lifecycle event inventory.
@@ -278,6 +478,51 @@ impl ScopeSnapshot {
     }
 }
 
+/// A public projection plus retained copies of every exit it contains.
+///
+/// Field order is intentional: the public projection's `Arc` is released
+/// while the retained exits still prove that no user error can be destroyed
+/// inline. Each retained exit then transfers its failed payload to isolated
+/// disposal. A public `Arc` handed to a caller may outlive these guards, in
+/// which case that caller keeps ordinary last-drop semantics.
+#[derive(Clone, Debug)]
+pub(crate) struct RetainedScopeSnapshot {
+    snapshot: Arc<ScopeSnapshot>,
+    exits: Arc<Vec<RetainedExit>>,
+}
+
+impl RetainedScopeSnapshot {
+    pub(crate) fn new(snapshot: Arc<ScopeSnapshot>, exits: Vec<RetainedExit>) -> Self {
+        Self {
+            snapshot,
+            exits: Arc::new(exits),
+        }
+    }
+
+    fn public(&self) -> Arc<ScopeSnapshot> {
+        Arc::clone(&self.snapshot)
+    }
+
+    pub(crate) fn into_public(self) -> Arc<ScopeSnapshot> {
+        let (snapshot, exits) = self.into_parts();
+        // The public projection owns a raw clone corresponding to every
+        // guard, so releasing these copies inline is provably refcount-only.
+        // The caller's eventual last drop keeps ordinary user semantics.
+        for exit in exits {
+            drop(exit.into_exit());
+        }
+        snapshot
+    }
+
+    pub(crate) fn into_parts(self) -> (Arc<ScopeSnapshot>, Vec<RetainedExit>) {
+        let exits = match Arc::try_unwrap(self.exits) {
+            Ok(exits) => exits,
+            Err(exits) => exits.as_ref().clone(),
+        };
+        (self.snapshot, exits)
+    }
+}
+
 /// Error returned after a snapshot watch has closed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("scope snapshot watch is closed")]
@@ -294,7 +539,7 @@ impl SnapshotReceiver {
     /// Borrows the newest snapshot without marking it observed.
     #[must_use]
     pub fn borrow_latest(&self) -> Arc<ScopeSnapshot> {
-        self.inner.borrow_cloned().snapshot
+        self.inner.borrow_cloned().snapshot.public()
     }
 
     /// Borrows the newest snapshot and terminal flag from one retained state.
@@ -302,7 +547,7 @@ impl SnapshotReceiver {
     #[doc(hidden)]
     pub fn borrow_latest_and_closed(&self) -> (Arc<ScopeSnapshot>, bool) {
         let state = self.inner.borrow_cloned();
-        (state.snapshot, state.closed)
+        (state.snapshot.public(), state.closed)
     }
 
     /// Waits for and returns a newer snapshot.
@@ -312,7 +557,7 @@ impl SnapshotReceiver {
             if state.generation.current() != self.seen_generation {
                 let state = self.inner.borrow_and_update_cloned();
                 self.seen_generation = state.generation.current();
-                return Ok(state.snapshot);
+                return Ok(state.snapshot.public());
             }
             if state.closed {
                 return Err(SnapshotClosed);
@@ -338,20 +583,9 @@ pub(crate) struct SnapshotHub {
     sender: OnceLock<runtime::WatchSender<SnapshotHubState>>,
 }
 
-/// Destroys a superseded snapshot after the observation gate is released.
-///
-/// A published projection carries every resident child's `Exit`, and an
-/// `ExitKind::Failed` payload owns a type-erased user error. The retained
-/// state is the payload's last owner whenever the member cell it was cloned
-/// from has already been reclaimed, so replacing it in place would run a user
-/// destructor under the gate *and* under the watch channel's own lock.
-fn retire_snapshot(txn: &mut crate::cells::ObservationTxn<'_>, retired: Arc<ScopeSnapshot>) {
-    txn.defer(move || drop(retired));
-}
-
 #[derive(Clone, Debug)]
 struct SnapshotHubState {
-    snapshot: Arc<ScopeSnapshot>,
+    snapshot: RetainedScopeSnapshot,
     generation: crate::identity::PoisonedCounter,
     closed: bool,
 }
@@ -362,17 +596,22 @@ impl SnapshotHub {
     /// No wake is owed for the receiverless refresh below: the gate is what
     /// makes it safe, and the only receiver that could observe the refresh is
     /// the one minted here — which captures the refreshed generation as
-    /// already seen. The transaction is still needed, for the one thing the
-    /// refresh does owe: retiring the projection it displaces, whose child
-    /// exits carry user payloads (§1's lock rule).
+    /// already seen. `RetainedScopeSnapshot` makes the displaced projection
+    /// safe to release before that gate is unlocked, so nothing is deferred
+    /// here.
+    ///
+    /// The transaction is nonetheless taken and unused: it is only obtainable
+    /// under the gate, so requiring it is what makes "hub initialization and
+    /// the receiverless refresh are serialized against publication" a static
+    /// property of every caller rather than a convention.
     pub(crate) fn subscribe(
         &self,
-        initial: Arc<ScopeSnapshot>,
-        txn: &mut crate::cells::ObservationTxn<'_>,
+        initial: RetainedScopeSnapshot,
+        _gate: &mut crate::cells::ObservationTxn<'_>,
     ) -> SnapshotReceiver {
         let sender = self.sender.get_or_init(|| {
             runtime::watch(SnapshotHubState {
-                snapshot: Arc::clone(&initial),
+                snapshot: initial.clone(),
                 generation: crate::identity::PoisonedCounter::new(),
                 closed: false,
             })
@@ -395,7 +634,7 @@ impl SnapshotHub {
                     .expect("snapshot generation space exhausted");
             });
             if let Some(retired) = retired {
-                retire_snapshot(txn, retired);
+                drop(retired);
             }
         }
         let inner = sender.watcher();
@@ -413,7 +652,7 @@ impl SnapshotHub {
     pub(crate) fn publish(
         &self,
         txn: &mut crate::cells::ObservationTxn<'_>,
-        snapshot: impl FnOnce() -> Arc<ScopeSnapshot>,
+        snapshot: impl FnOnce() -> RetainedScopeSnapshot,
     ) {
         let Some(sender) = self.sender.get() else {
             return;
@@ -433,7 +672,7 @@ impl SnapshotHub {
                 .expect("snapshot generation space exhausted");
         });
         if let Some(retired) = retired {
-            retire_snapshot(txn, retired);
+            drop(retired);
             txn.pulse(sender);
         }
     }
@@ -447,7 +686,7 @@ impl SnapshotHub {
     pub(crate) fn close(
         &self,
         txn: &mut crate::cells::ObservationTxn<'_>,
-        final_snapshot: impl FnOnce() -> Arc<ScopeSnapshot>,
+        final_snapshot: impl FnOnce() -> RetainedScopeSnapshot,
     ) {
         let mut final_snapshot = Some(final_snapshot);
         let mut initialized = false;
@@ -492,7 +731,7 @@ impl SnapshotHub {
             }
         });
         if let Some(retired) = retired {
-            retire_snapshot(txn, retired);
+            drop(retired);
             txn.pulse(sender);
         }
     }
@@ -533,7 +772,7 @@ pub enum LifecycleTryRecvError {
 
 /// One membership-owned lifecycle subscription.
 pub struct LifecycleEvents {
-    events: runtime::BroadcastReceiver<LifecycleEvent>,
+    events: runtime::BroadcastReceiver<RetainedLifecycleEvent>,
     signal: runtime::WatchReceiver<LifecycleSignal>,
     seen_explicit_lag: u64,
 }
@@ -579,7 +818,7 @@ impl LifecycleEvents {
             return Ok(LifecycleItem::Lagged { dropped });
         }
         match self.events.try_receive() {
-            runtime::BroadcastReceive::Item(event) => Ok(LifecycleItem::Event(event)),
+            runtime::BroadcastReceive::Item(event) => Ok(LifecycleItem::Event(event.into_public())),
             runtime::BroadcastReceive::Lagged(dropped) => Ok(LifecycleItem::Lagged { dropped }),
             runtime::BroadcastReceive::Empty if signal.closed => Err(LifecycleTryRecvError::Closed),
             runtime::BroadcastReceive::Empty => Err(LifecycleTryRecvError::Empty),
@@ -602,7 +841,7 @@ pub(crate) struct LifecycleHub {
 }
 
 struct LifecycleChannels {
-    events: runtime::BroadcastSender<LifecycleEvent>,
+    events: runtime::BroadcastSender<RetainedLifecycleEvent>,
     signal: runtime::WatchSender<LifecycleSignal>,
 }
 
@@ -646,16 +885,8 @@ impl LifecycleHub {
         txn: &mut crate::cells::ObservationTxn<'_>,
         event: LifecycleEvent,
     ) {
+        let event = RetainedLifecycleEvent::new(event);
         let mut published = false;
-        // An event carrying an `Exit` owns a type-erased user error, so the
-        // two paths that decline to retain one -- a closed hub, and a
-        // broadcast with no live receiver -- hand the undelivered value out of
-        // the critical section rather than destroying it under the observation
-        // gate. Neither is the payload's last owner today (the emitting
-        // member's record retains the same exit), so this holds the rule by
-        // construction rather than by that refcount argument. The bounded
-        // ring's *eviction* is the one retirement this hub cannot intercept,
-        // and it is reachable: see #244.
         let mut undelivered = None;
         self.channels.signal.modify_silently(|signal| {
             if signal.closed {
@@ -666,7 +897,7 @@ impl LifecycleHub {
             published = true;
         });
         if let Some(undelivered) = undelivered {
-            txn.defer(move || drop(undelivered));
+            drop(undelivered);
         }
         if published {
             txn.pulse(&self.channels.signal);
@@ -744,18 +975,23 @@ mod tests {
     };
     use shelterwood_core::{ScopeState, StopReason};
 
-    use super::{LIFECYCLE_EVENT_CAPACITY, LifecycleHub, LifecycleSeq, SnapshotHub};
+    use super::{
+        LIFECYCLE_EVENT_CAPACITY, LifecycleHub, LifecycleSeq, RetainedScopeSnapshot, SnapshotHub,
+    };
 
-    fn snapshot(state: ScopeState) -> Arc<ScopeSnapshot> {
-        Arc::new(ScopeSnapshot {
-            state,
-            kind: ScopeKind::Dynamic,
-            strategy: None,
-            intensity: Intensity::default(),
-            total_restarts: crate::TotalRestarts::ZERO,
-            lifecycle_seq: LifecycleSeq::new(0),
-            children: Arc::from([]),
-        })
+    fn snapshot(state: ScopeState) -> RetainedScopeSnapshot {
+        RetainedScopeSnapshot::new(
+            Arc::new(ScopeSnapshot {
+                state,
+                kind: ScopeKind::Dynamic,
+                strategy: None,
+                intensity: Intensity::default(),
+                total_restarts: crate::TotalRestarts::ZERO,
+                lifecycle_seq: LifecycleSeq::new(0),
+                children: Arc::from([]),
+            }),
+            Vec::new(),
+        )
     }
 
     #[test]

@@ -168,7 +168,7 @@ pub(super) struct ChildRuntime {
 }
 
 pub(super) struct PendingTerminal {
-    exit: Exit,
+    exit: RetainedExit,
     exited_incarnation: Option<Incarnation>,
     startup: StartupDisposition,
 }
@@ -1065,7 +1065,7 @@ impl ScopeRuntime {
                 return;
             }
             child.pending_terminal = Some(PendingTerminal {
-                exit,
+                exit: RetainedExit::new(exit),
                 exited_incarnation,
                 startup,
             });
@@ -1108,10 +1108,11 @@ impl ScopeRuntime {
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
-        let Some(mut terminal) = child.pending_terminal.take() else {
+        let Some(terminal) = child.pending_terminal.take() else {
             return;
         };
         child.slot.member.set_terminal_disposal_pending(false);
+        let mut exit = terminal.exit.into_exit();
         if terminal.exited_incarnation.is_some()
             && let Some(runtime::DisposalPanic { message }) = panic
         {
@@ -1119,10 +1120,8 @@ impl ScopeRuntime {
             // never-started child or a child between restart incarnations
             // keeps its already-authoritative verdict while disposal remains
             // ordered ahead of terminal routing.
-            terminal.exit = classify_disposal_panic(terminal.exit, message);
+            exit = classify_disposal_panic(exit, message);
         }
-
-        let exit = terminal.exit;
         // §6's `StartupAborted` is a startup-sequence property of a
         // membership that *ran* and failed before its initial readiness
         // edge. A terminal without an exited incarnation never ran, so it

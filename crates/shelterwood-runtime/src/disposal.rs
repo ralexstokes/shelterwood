@@ -60,6 +60,8 @@ where
     C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
     state: Mutex<Option<(T, C)>>,
+    /// Whether the submitter may never destroy this payload itself.
+    critical: bool,
 }
 
 impl<T, C> DisposalJob<T, C>
@@ -68,18 +70,35 @@ where
     C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
     fn new(value: T, completion: C) -> Arc<Self> {
+        Self::with_criticality(value, completion, false)
+    }
+
+    /// Builds a job whose last owner re-routes instead of finishing inline.
+    fn critical(value: T, completion: C) -> Arc<Self> {
+        Self::with_criticality(value, completion, true)
+    }
+
+    fn with_criticality(value: T, completion: C, critical: bool) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Some((value, completion))),
+            critical,
         })
     }
 
-    fn finish(&self) {
-        let Some((value, completion)) = self
-            .state
+    /// Claims the pending work, if this job still holds any.
+    ///
+    /// Poison is tolerated rather than raised: the only work under this mutex
+    /// is taking the payload out, and the critical drop path below must stay
+    /// panic-free because it can run inside an unwind.
+    fn take_pending(&self) -> Option<(T, C)> {
+        self.state
             .lock()
-            .expect("disposal job mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
-        else {
+    }
+
+    fn finish(&self) {
+        let Some((value, completion)) = self.take_pending() else {
             return;
         };
         let panic = match catch_panic(|| drop(value)) {
@@ -101,7 +120,22 @@ where
     C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
     fn drop(&mut self) {
-        self.finish();
+        if !self.critical {
+            self.finish();
+            return;
+        }
+        // This runs only when the last reference dies, and for a critical job
+        // that owner is not allowed to destroy the payload: Tokio can drop an
+        // accepted closure after `submit_blocking_job` sampled acceptance,
+        // which leaves the submitting thread -- possibly inside a framework
+        // critical section -- holding the last still-pending reference. Hand
+        // the work to a fresh job on the fallback queue instead. The queued
+        // copy is only ever dropped after the worker has run it, so this
+        // cannot re-enter.
+        let Some((value, completion)) = self.take_pending() else {
+            return;
+        };
+        retain_fallback_disposal(Self::critical(value, completion) as Arc<dyn BlockingPoolJob>);
     }
 }
 
@@ -126,7 +160,10 @@ where
 ///
 /// `worker_live` is only cleared by the worker after observing an empty queue
 /// under this lock, and submitters push and consult it under the same lock, so
-/// a queued job always has a live worker destined to drain it.
+/// a successful worker start cannot miss queued work. Critical-section
+/// disposal is allowed to remain queued without a worker after native thread
+/// creation fails; every later submission retries the worker start.
+#[derive(Default)]
 struct FallbackDisposals {
     queue: VecDeque<Arc<dyn BlockingPoolJob>>,
     worker_live: bool,
@@ -141,31 +178,78 @@ static FALLBACK_DISPOSALS: Mutex<FallbackDisposals> = Mutex::new(FallbackDisposa
 /// Returns `false` when no worker exists and none could be started; the
 /// caller must then finish the job itself.
 fn enqueue_fallback_disposal(job: Arc<dyn BlockingPoolJob>) -> bool {
-    let mut state = FALLBACK_DISPOSALS
+    enqueue_fallback_disposal_with(&FALLBACK_DISPOSALS, job, spawn_fallback_worker)
+}
+
+/// Queues a disposal that must never fall back to the submitting thread.
+///
+/// The `()` return is the contract: every path transfers ownership. If native
+/// thread creation is temporarily exhausted, the static queue keeps the job
+/// and a later disposal submission retries the worker start. The fail-safe
+/// degradation is unreclaimed memory, never user destruction in a framework
+/// critical section.
+fn retain_fallback_disposal(job: Arc<dyn BlockingPoolJob>) {
+    retain_fallback_disposal_with(&FALLBACK_DISPOSALS, job, spawn_fallback_worker);
+}
+
+fn spawn_fallback_worker() -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("shelterwood-disposal".to_owned())
+        .spawn(run_fallback_disposals)
+}
+
+fn enqueue_fallback_disposal_with(
+    disposals: &Mutex<FallbackDisposals>,
+    job: Arc<dyn BlockingPoolJob>,
+    spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> bool {
+    let mut state = disposals
         .lock()
-        .expect("fallback disposal queue mutex poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.queue.push_back(job);
+    if start_worker_locked(&mut state, spawn) {
+        return true;
+    }
+    // The push and this pop share one guard, so the reclaimed entry is exactly
+    // the job just appended even when older critical jobs are still queued.
+    let rejected = state.queue.pop_back();
+    debug_assert!(rejected.is_some());
+    false
+}
+
+fn retain_fallback_disposal_with(
+    disposals: &Mutex<FallbackDisposals>,
+    job: Arc<dyn BlockingPoolJob>,
+    spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<()>>,
+) {
+    let mut state = disposals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.queue.push_back(job);
+    // A failed worker start leaves the job queued deliberately; the next
+    // submission of any kind retries the start and drains it.
+    start_worker_locked(&mut state, spawn);
+}
+
+/// Reports whether a worker is live, starting one under the caller's guard.
+///
+/// Spawning under the lock makes queueing and worker liveness one atomic
+/// decision, so no submitter can observe a queued job without a worker that a
+/// later submission will start.
+fn start_worker_locked(
+    state: &mut FallbackDisposals,
+    spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<()>>,
+) -> bool {
     if state.worker_live {
         return true;
     }
-    // Spawning under the lock makes queueing and worker liveness one atomic
-    // decision: no submitter can observe a queued job without a worker.
-    match std::thread::Builder::new()
-        .name("shelterwood-disposal".to_owned())
-        .spawn(run_fallback_disposals)
-    {
+    match spawn() {
         Ok(worker) => {
             drop(worker);
             state.worker_live = true;
             true
         }
-        Err(_) => {
-            // The queue was empty before this push (no live worker implies an
-            // empty queue), so the popped entry is exactly the failed job.
-            let rejected = state.queue.pop_back();
-            debug_assert!(rejected.is_some());
-            false
-        }
+        Err(_) => false,
     }
 }
 
@@ -174,7 +258,7 @@ fn run_fallback_disposals() {
         let job = {
             let mut state = FALLBACK_DISPOSALS
                 .lock()
-                .expect("fallback disposal queue mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(job) = state.queue.pop_front() else {
                 state.worker_live = false;
                 return;
@@ -238,6 +322,24 @@ pub fn dispose_detached<T: Send + 'static>(value: T) {
     dispose_then(value, |_| {});
 }
 
+/// Detaches user destruction from a framework critical section.
+///
+/// Unlike [`dispose_detached`], no path destroys the value on the submitting
+/// thread. Exhausted task and native-thread creation leaves the job in a
+/// static queue until a later submission can start the shared disposal
+/// worker, and the accepted path is covered too: acceptance is sampled from a
+/// reference count, so a runtime shut down right after that sample can leave
+/// this thread holding the last still-pending reference. `DisposalJob`'s drop
+/// re-routes that payload instead of finishing it, which keeps the lock rule
+/// under both resource exhaustion and teardown races.
+pub fn dispose_critical<T: Send + 'static>(value: T) {
+    let job = DisposalJob::critical(value, |_| {});
+    if submit_blocking_job(&job) {
+        return;
+    }
+    retain_fallback_disposal(Arc::clone(&job) as Arc<dyn BlockingPoolJob>);
+}
+
 /// Starts isolated disposal for every value and fires once all jobs finish.
 ///
 /// Each value gets its own unwind boundary, so one destructor panic cannot
@@ -274,7 +376,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{DisposalJob, DisposalPanic, Isolated, dispose_detached};
+    use super::{
+        DisposalJob, DisposalPanic, FallbackDisposals, Isolated, dispose_detached,
+        retain_fallback_disposal_with,
+    };
     use crate::spawn::{BlockingPoolJob, blocking_pool_accepted};
 
     /// Name of the shared non-runtime disposal thread, asserted on to pin
@@ -325,6 +430,69 @@ mod tests {
                 message: Some(message)
             })) if message == "cancelled disposal job payload"
         ));
+    }
+
+    #[test]
+    fn critical_disposal_stays_queued_when_the_fallback_thread_cannot_start() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let job = DisposalJob::critical(PanickingDrop(Arc::clone(&drops)), |_| {});
+        let disposals = Mutex::new(FallbackDisposals::default());
+
+        retain_fallback_disposal_with(
+            &disposals,
+            Arc::clone(&job) as Arc<dyn BlockingPoolJob>,
+            || Err(std::io::Error::other("injected thread exhaustion")),
+        );
+        drop(job);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "thread-creation failure must not reclaim critical payloads inline"
+        );
+
+        let queued = disposals
+            .lock()
+            .expect("local disposal queue remains healthy")
+            .queue
+            .pop_front()
+            .expect("failed spawn keeps critical disposal queued");
+        queued.run();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    struct ReportingDrop(mpsc::Sender<DestructorThread>);
+
+    impl Drop for ReportingDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(describe_current_thread());
+        }
+    }
+
+    /// The teardown race `dispose_critical` cannot sample its way out of:
+    /// Tokio may drop an accepted closure after acceptance was observed,
+    /// leaving the submitter with the last still-pending reference. Dropping
+    /// the sole reference here stands in for that owner, and must re-route
+    /// rather than destroy the payload on this thread.
+    #[test]
+    fn dropping_the_last_critical_job_reroutes_off_the_owning_thread() {
+        let owning_thread = thread::current().id();
+        let (destroyed, destroyed_rx) = mpsc::channel();
+        let job = DisposalJob::critical(ReportingDrop(destroyed), |_| {});
+
+        drop(job);
+
+        let (destructor_thread, destructor_name) = destroyed_rx
+            .recv_timeout(DESTRUCTOR_ESCAPE)
+            .expect("the re-routed payload is destroyed");
+        assert_ne!(
+            destructor_thread, owning_thread,
+            "a critical payload must never be destroyed by its last owner"
+        );
+        assert_eq!(
+            destructor_name.as_deref(),
+            Some(FALLBACK_THREAD),
+            "the re-routed payload lands on the shared fallback thread"
+        );
     }
 
     #[test]

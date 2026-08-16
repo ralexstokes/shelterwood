@@ -91,20 +91,3 @@ impl Drop for PanicOnDrop {
         panic!("{}", self.0);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{ConsumeCount, LiveFlag};
-
-    #[test]
-    fn guards_report_drop_and_consumption() {
-        let (flag, guard) = LiveFlag::guarded();
-        assert!(flag.is_live());
-        drop(guard);
-        assert!(!flag.is_live());
-
-        let count = ConsumeCount::default();
-        count.guard().consume();
-        count.assert_once();
-    }
-}

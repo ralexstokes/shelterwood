@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     sync::{
         Arc,
@@ -7,7 +9,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet, policy::never,
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet,
+    policy::never,
     poll_once,
     waiting::{
         liveness_probe, liveness_probed_waiting_task, signalled_waiting_task, task as waiting_task,

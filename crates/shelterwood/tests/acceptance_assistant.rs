@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
@@ -835,7 +837,10 @@ async fn assistant_sessions_idle_evict_on_timers_and_streams_cancel_mid_flight()
         .await
         .expect("idle timer fires after the re-armed window")
         .expect("eviction signal arrives");
-    assert!(evicted.try_recv().is_err(), "exactly one eviction is emitted");
+    assert!(
+        evicted.try_recv().is_err(),
+        "exactly one eviction is emitted"
+    );
     assert_quiet(Duration::from_secs(1), || evicted.try_recv().is_ok()).await;
 
     // Eviction is removal of the session scope; the stream is cut off

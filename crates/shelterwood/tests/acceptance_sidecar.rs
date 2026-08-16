@@ -1,3 +1,5 @@
+mod common;
+
 use std::{future, time::Duration};
 
 use crate::common::{ReleaseGate, assert_eventually, policy::never};

@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     sync::{
         Arc, Mutex,
@@ -567,11 +569,7 @@ async fn overflowing_restart_delay_has_no_substitute_and_never_restarts() {
 #[tokio::test(start_paused = true)]
 async fn zero_duration_wait_observes_an_already_satisfied_child() {
     let mut tree = Tree::new();
-    tree.add_task(
-        "ready",
-        waiting_task(),
-    )
-    .expect("valid task");
+    tree.add_task("ready", waiting_task()).expect("valid task");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("task starts");
 

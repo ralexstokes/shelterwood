@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{

@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     sync::{
         Arc, Condvar, Mutex,

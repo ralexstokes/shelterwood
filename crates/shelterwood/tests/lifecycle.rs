@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     future::{self, Future},
     pin::Pin,
@@ -72,12 +74,7 @@ async fn non_owners_are_quiet_and_an_empty_root_needs_its_owner() {
 #[tokio::test]
 async fn fire_and_forget_owner_drop_still_tears_down() {
     let mut tree = Tree::new();
-    let task = tree
-        .add_task(
-            "worker",
-            waiting_task(),
-        )
-        .expect("valid task");
+    let task = tree.add_task("worker", waiting_task()).expect("valid task");
     drop(tree.spawn().expect("runtime is available"));
     let exit = tokio::time::timeout(POLL_TIMEOUT, task.wait())
         .await
@@ -334,10 +331,8 @@ async fn ordered_teardown_is_reverse_and_joins_before_advancing() {
     gates[2].release();
     assert_eventually!(|| order.lock().expect("order mutex poisoned").as_slice() == [2, 1]).await;
     gates[1].release();
-    assert_eventually!(|| {
-        order.lock().expect("order mutex poisoned").as_slice() == [2, 1, 0]
-    })
-    .await;
+    assert_eventually!(|| { order.lock().expect("order mutex poisoned").as_slice() == [2, 1, 0] })
+        .await;
     gates[0].release();
     shutdown
         .await

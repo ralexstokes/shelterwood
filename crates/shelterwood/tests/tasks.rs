@@ -1,3 +1,5 @@
+mod common;
+
 use std::time::Duration;
 
 use crate::common::LiveFlag;

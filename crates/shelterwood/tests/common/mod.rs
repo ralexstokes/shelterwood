@@ -1,11 +1,12 @@
-register_test_modules!(
-    "tests/common";
-    mod gates;
-    mod ownership;
-    pub(crate) mod policy;
-    mod timing;
-    pub(crate) mod waiting;
-);
+// Every integration-test crate imports this module independently and uses a
+// different subset of its fixtures.
+#![allow(dead_code, unused_imports, unused_macros)]
+
+mod gates;
+mod ownership;
+pub(crate) mod policy;
+mod timing;
+pub(crate) mod waiting;
 
 pub(crate) use gates::{DestructorBlocker, DestructorGate, ReleaseGate};
 pub(crate) use ownership::{ConsumeCount, ConsumeGuard, LiveFlag, PanicOnDrop};

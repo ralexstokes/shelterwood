@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     sync::{
         Arc, Mutex,
@@ -662,11 +664,8 @@ async fn handler_context_scope_shutdown_request_stops_the_tree() {
     let actor = tree
         .add_actor_once("quitter", ActorOnceDef::<HandlerScopeQuitter>::new(()))
         .expect("valid actor");
-    tree.add_task(
-        "parked",
-        waiting_task(),
-    )
-    .expect("valid parked task");
+    tree.add_task("parked", waiting_task())
+        .expect("valid parked task");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     actor.send(()).await.expect("quitter is live");
@@ -705,11 +704,8 @@ async fn stop_context_scope_shutdown_request_escalates_a_local_stop() {
     let actor = tree
         .add_actor_once("escalating", ActorOnceDef::<StopEscalatingActor>::new(()))
         .expect("valid actor");
-    tree.add_task(
-        "parked",
-        waiting_task(),
-    )
-    .expect("valid parked task");
+    tree.add_task("parked", waiting_task())
+        .expect("valid parked task");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("tree starts");
     actor.send(()).await.expect("escalating actor is live");

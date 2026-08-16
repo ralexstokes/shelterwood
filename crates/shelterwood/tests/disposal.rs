@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     future::{Future, poll_fn},
     marker::PhantomData,
@@ -1135,7 +1137,11 @@ async fn duplicate_id_rejection_contains_definition_destructor_panic() {
         )
         .expect_err("duplicate id is rejected without unwinding the caller");
     assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
-    assert_disposed_off_current(&mut drops, "rejected definition reports its disposal thread").await;
+    assert_disposed_off_current(
+        &mut drops,
+        "rejected definition reports its disposal thread",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1156,7 +1162,11 @@ async fn dynamic_duplicate_rejection_disposes_definition_before_admission() {
             }
         }),
     );
-    assert_disposed_off_current(&mut drops, "rejected definition reports its disposal thread").await;
+    assert_disposed_off_current(
+        &mut drops,
+        "rejected definition reports its disposal thread",
+    )
+    .await;
     let error = admission.await.expect_err("duplicate id is rejected");
     assert!(matches!(error, ReserveError::DuplicateId(id) if id.as_str() == "dup"));
     system
@@ -1318,7 +1328,11 @@ async fn unclaimed_completion_value_contains_destructor_panic() {
     let exit = task.wait().await;
     assert!(matches!(exit.kind(), ExitKind::Completed));
     drop(completion);
-    assert_disposed_off_current(&mut drops, "unclaimed completion reports its disposal thread").await;
+    assert_disposed_off_current(
+        &mut drops,
+        "unclaimed completion reports its disposal thread",
+    )
+    .await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 }
 
@@ -1464,7 +1478,11 @@ async fn dropped_unstarted_call_disposes_constructor_off_the_caller() {
         Duration::from_secs(1),
     );
     drop(call);
-    assert_disposed_off_current(&mut drops, "unstarted constructor reports its disposal thread").await;
+    assert_disposed_off_current(
+        &mut drops,
+        "unstarted constructor reports its disposal thread",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

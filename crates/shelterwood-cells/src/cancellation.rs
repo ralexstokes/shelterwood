@@ -10,8 +10,7 @@ pub struct CancellationToken {
 }
 
 impl CancellationToken {
-    #[doc(hidden)]
-    pub fn from_latch(latch: Latch) -> Self {
+    pub(crate) fn from_latch(latch: Latch) -> Self {
         Self {
             primary: latch,
             secondary: None,

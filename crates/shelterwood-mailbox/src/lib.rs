@@ -6,6 +6,12 @@
 //! runtime capabilities its futures need and never names an executor, in tests
 //! as well as in production. Cross-crate lifecycle and identity capabilities
 //! are public implementation seams, not supported façade API.
+//!
+//! Direct dependencies on this crate are unsupported. Its public capability
+//! traits and their installation helpers exist only so sibling Shelterwood
+//! crates can complete the dependency inversion. They are not user extension
+//! points: foreign implementations may be called from framework critical
+//! sections and therefore invalidate the framework's lock-rule guarantees.
 
 use std::{fmt, sync::Arc};
 
@@ -47,6 +53,12 @@ pub type MailboxDisposal = Box<dyn Send>;
 
 /// Prepared terminal mailbox transition. Finishing it wakes terminal waiters
 /// before returning unread payload ownership for detached disposal.
+///
+/// # Implementation boundary
+///
+/// This trait is implemented and installed only by Shelterwood's mailbox
+/// state machine. It is public solely because sibling implementation crates
+/// retain it through type erasure; it is not a user extension point.
 pub trait MailboxTermination: Send {
     fn finish(self: Box<Self>) -> Option<MailboxDisposal>;
 }
@@ -58,6 +70,12 @@ pub trait MailboxTermination: Send {
 /// close is skipped, messages accepted for the prior incarnation can leak
 /// into the replacement. Once termination is prepared, later binds are
 /// intentionally ignored.
+///
+/// # Implementation boundary
+///
+/// This trait is implemented and installed only by Shelterwood's mailbox
+/// state machine. Framework code can invoke it while holding the member
+/// mailbox mutex, so a foreign implementation invalidates the lock rule.
 pub trait MailboxControl: fmt::Debug + Send + Sync {
     /// Installs the declaration-time mailbox policy before the first bind.
     /// Reconfiguration may only repeat the same resolved policy; a mismatch
@@ -83,6 +101,12 @@ pub trait MailboxControl: fmt::Debug + Send + Sync {
 }
 
 /// Restart-stable identity capability retained by an actor handle.
+///
+/// # Implementation boundary
+///
+/// This trait is implemented only by Shelterwood's restart-stable member
+/// cell. It is public solely to bridge the mailbox and cell crates and is not
+/// a user extension point.
 pub trait ActorIdentity: Send + Sync {
     fn id(&self) -> &ChildId;
     fn membership(&self) -> Membership;

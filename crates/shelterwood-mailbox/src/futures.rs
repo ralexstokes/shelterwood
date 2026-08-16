@@ -72,6 +72,11 @@ impl<M> ActorRef<M> {
 
 /// Builds the façade's actor handle from its cross-crate identity and mailbox
 /// capabilities without exposing a new inherent constructor on `ActorRef`.
+///
+/// This sibling-crate seam is not a supported constructor. The identity and
+/// mailbox must belong to the same member; violating that invariant produces
+/// a handle whose equality and error identity disagree with its route.
+#[doc(hidden)]
 pub fn actor_ref_from_parts<I, M>(member: Arc<I>, mailbox: Arc<MailboxCell<M>>) -> ActorRef<M>
 where
     I: ActorIdentity + 'static,

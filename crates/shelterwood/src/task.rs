@@ -11,7 +11,7 @@ use std::{
 use crate::{
     ChildId, Exit, ExitError, ExitResult, Incarnation, Membership, PolicyError, Readiness,
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
-    cancellation::CancellationToken,
+    cancellation::{CancellationToken, ParentCancellationToken},
     cells::MemberCell,
     policy::CommonOptions,
     runtime::{self, CompletionGatedLatch, Latch},
@@ -41,8 +41,8 @@ impl TaskContext {
         Self {
             id,
             incarnation,
-            shutdown: CancellationToken::from_latch(latches.shutdown),
-            abort: CancellationToken::from_latch(latches.abort),
+            shutdown: ParentCancellationToken::from_latch(latches.shutdown).token(),
+            abort: ParentCancellationToken::from_latch(latches.abort).token(),
             ready: latches.ready,
         }
     }

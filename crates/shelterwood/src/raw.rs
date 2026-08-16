@@ -1174,7 +1174,7 @@ impl<M: Send + 'static> RawContext<M> {
             myself,
             scope: run.scope,
             shutdown: ParentCancellationToken::from_latch(run.shutdown),
-            abort: CancellationToken::from_latch(run.abort),
+            abort: ParentCancellationToken::from_latch(run.abort).token(),
             ready: run.ready,
             local_stop: run.local_stop,
             readiness,

@@ -3046,6 +3046,18 @@ integration toolkit for the driver shell and the end-to-end invariants.
     behind typed verdicts, and the property that matters at the remaining
     façade boundary — blanket user error conversion cannot mint an
     authenticated structured payload — is pinned by its conformance probe.
+    The cross-crate `DynamicRoute`, `MailboxControl`, `MailboxTermination`,
+    `ActorIdentity`, and `MailboxRuntime` traits and their installers remain an
+    explicitly unsupported direct-dependency seam, not user extension points.
+    A private-supertrait seal in the defining lower crate would also exclude
+    the legitimate implementations in downstream sibling crates, while a
+    publicly obtainable installation capability would not exclude direct
+    dependents. The supported `shelterwood` façade therefore remains the
+    enforced boundary: it exports neither those traits nor their installation
+    paths. Foreign implementations or construction through the lower crates
+    void the lock-rule and identity-pairing contracts. Public constructors on
+    façade types are different: `CancellationToken::from_latch` is crate-gated
+    even though its hidden rustdoc signature previously escaped the JSON walk.
 14. **Event-woken observers see consistent-or-newer snapshots.** Subscribe
    to lifecycle events; *synchronously inside the event arm*, read the
    snapshot and assert it already reflects the event — at both ends of the

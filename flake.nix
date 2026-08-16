@@ -63,6 +63,7 @@
                   cargo rustdoc --locked -p shelterwood-mailbox --all-features --lib
                 cargo run --locked -p shelterwood-api-reachability -- \
                   target/doc/shelterwood_mailbox.json
+                ${pkgs.bash}/bin/bash ./tools/check-external-consumer.sh
                 ${pkgs.bash}/bin/bash ./tools/sync-packaged-docs.sh --check
               '';
               doInstallCargoArtifacts = false;

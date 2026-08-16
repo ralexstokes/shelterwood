@@ -1187,22 +1187,36 @@ integration suite and `supervisor::…` names the pure reducer suite.
    the membership `Removing`; readiness is then rejected. A committed removal
    shrinks the initial set only at `Reclaim`, after `Removed` publication and
    before the removal response resolves. (`supervisor::sampled_removal_suppresses_start_effects_until_commit`,
+   `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`,
    `integration::queued_removal_suppresses_replayed_self_stop_readiness`,
    `integration::startup_removal_response_follows_aggregate_recomputation`.)
 4. **R4 — ordered start is one accepted edge at a time.** `Settle` emits
    `StartChild` only for the current initial cursor, and advances the cursor
-   only past a spawned-and-ready member or a reclaimed key. Dynamic startup
-   may emit one accepted start per unspawned initial member. (`supervisor::start_effects_are_confined_to_the_spawn_transition`,
+   only past a spawned-and-ready member or a reclaimed key, reaching every
+   initial member in declaration order. Dynamic startup may emit one accepted
+   start per unspawned initial member. (`supervisor::start_effects_are_confined_to_the_spawn_transition`,
+   `supervisor::ordered_startup_advances_through_every_initial_member_in_order`,
+   `supervisor::dynamic_startup_leaves_a_restart_pending_member_to_the_restart_path`,
    `integration::ordered_startup_advances_past_a_reclaimed_cursor`.)
 5. **R5 — settlement effects must be acknowledgeable.** Every
    `StartChild { child }` names a resident `Unstarted | RestartPending` child,
    exactly the acceptance set of `Event::Spawned`; a settlement pass that
-   emits no acknowledgeable work is already at a fixed point. This prevents
-   the driver’s level-triggered settle loop from spinning. (`supervisor::start_effects_are_confined_to_the_spawn_transition`,
-   `supervisor::exhaustive_small_scope_interleavings_preserve_reducer_invariants`.)
+   emits no acknowledgeable work is already at a fixed point, and re-entering
+   `Settle` on an unchanged state reproduces its start effects and nothing
+   else. This prevents the driver’s level-triggered settle loop from spinning.
+   (`supervisor::start_effects_are_confined_to_the_spawn_transition`,
+   `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`.)
 6. **R6 — aggregate completion is derived.** `Settle` emits
-   `StartupCompleted` at most once, iff no resident initial record remains
-   unready. The empty initial set satisfies the predicate. (`integration::dynamic_startup_completes_after_removing_sole_unready_initial_member`,
+   `StartupCompleted` at most once, and never while any initial record remains
+   unready — including one already latched for removal, which leaves the
+   initial set only at `Reclaim` (R3). The empty initial set satisfies the
+   predicate. For a dynamic scope that predicate is also sufficient; ordered
+   startup adds its cursor, so a member latched for removal at or ahead of the
+   cursor withholds completion until the removal commits even when every
+   initial member is ready.
+   (`supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`,
+   `supervisor::ordered_startup_waits_for_a_removing_member_to_commit`,
+   `integration::dynamic_startup_completes_after_removing_sole_unready_initial_member`,
    `integration::dynamic_startup_completes_after_removing_every_initial_member`.)
 7. **R7 — terminal pre-ready failure is flavor-independent, rollback is
    position-dependent.** The exit funnel applies restart policy first. A
@@ -1425,7 +1439,7 @@ One classification, produced at one point, used by every consumer.
    total no-ops. Removal changes the enclosing membership state monotonically
    to `Removing`, never a parallel flag. (`supervisor::transition_table_keeps_removal_in_the_authoritative_state`,
    `supervisor::stale_events_cannot_skip_or_regress_incarnation_phases`,
-   `supervisor::exhaustive_small_scope_interleavings_preserve_reducer_invariants`.)
+   `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`.)
 5. **E5 — restart suppression is state-derived.** Exits schedule restart only
    while the scope is running and the membership is resident. Draining or
    `Removing` records schedule nothing and charge no intensity.
@@ -2183,18 +2197,20 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
    reverse cursor for ordered scopes and emits `StopChild` for every incomplete
    child of a dynamic scope. Ordered `Settle` exposes at most one incomplete
    child and does not advance until it joins. (`supervisor::ordered_stop_releases_one_child_per_join_in_reverse_order`,
+   `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`,
    `integration::ordered_graces_sum_while_dynamic_graces_overlap`.)
 4. **S4 — drain reason is a monotone lattice.** A later transition may upgrade
    `Finished < IntensityTripped < StartupFailed < ShutdownRequested`, never
    downgrade it. Forced shutdown also sets the hard-force fact and emits one
    `ForceChild` per incomplete child. (`engine::scope_lifecycle_upgrades_drain_reasons_monotonically`,
+   `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`,
    `integration::latched_shutdown_upgrades_an_intensity_drain`,
    `integration::force_uses_the_stop_funnel_for_every_ordered_child`.)
 5. **S5 — completion is derived and level-triggered.** `all_children_joined`
    is derived from child states. `Settle` emits `Finished` once iff the
    lifecycle’s flavor-specific finish predicate accepts that derived value.
    (`supervisor::derived_completion_property_matches_the_child_states`,
-   `supervisor::exhaustive_small_scope_interleavings_preserve_reducer_invariants`.)
+   `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`.)
 6. **S6 — shutdown requests are sampled latches.** Scope shutdown and removal
    are synchronous, idempotent latches sampled into reducer events at step
    entry. A request consumed by incarnation N does not reach N+1; a request

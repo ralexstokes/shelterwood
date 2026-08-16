@@ -772,11 +772,11 @@ pub fn step(state: &mut SupervisorState, event: Event, effects: &mut impl Effect
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use crate::{ChildId, ScopeIdentity};
 
     use super::*;
+
+    mod exploration;
 
     fn memberships(count: usize) -> Vec<Membership> {
         let mut identity = ScopeIdentity::new();
@@ -927,6 +927,162 @@ mod tests {
             assert_eq!(effects, [Effect::StopChild { child }]);
             state.check_invariants();
         }
+    }
+
+    /// R4 — ordered startup hands out one start edge at a time *and reaches
+    /// every member*. The cursor's advance is a progress rule, so no safety
+    /// property over reachable states can see it: a cursor that skipped a
+    /// middle member would leave that member unready forever, which is a
+    /// startup that never completes rather than a state that is wrong.
+    #[test]
+    fn ordered_startup_advances_through_every_initial_member_in_order() {
+        let members = memberships(3);
+        let mut state = SupervisorState::new(ScopeFlavor::Ordered, ScopeLifecycle::starting());
+        let keys: Vec<_> = members
+            .iter()
+            .map(|membership| admit(&mut state, *membership, true))
+            .collect();
+
+        let mut effects = Vec::new();
+        for &expected in &keys {
+            step(&mut state, Event::Settle, &mut effects);
+            assert_eq!(
+                effects,
+                [Effect::StartChild { child: expected }],
+                "ordered startup starts the cursor's own member next"
+            );
+            effects.clear();
+            step(&mut state, Event::Spawned { child: expected }, &mut effects);
+            step(
+                &mut state,
+                Event::Ready {
+                    child: expected,
+                    removal_latched: false,
+                },
+                &mut effects,
+            );
+            assert!(effects.is_empty());
+        }
+
+        step(&mut state, Event::Settle, &mut effects);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StartupCompleted { .. }]
+        ));
+        state.check_invariants();
+    }
+
+    /// R4 — dynamic startup emits one start per *unspawned* initial member.
+    /// A member awaiting a restart deadline has spawned once already, and its
+    /// re-construction belongs to the restart path rather than to settlement;
+    /// re-attracting it here would ask two owners to construct the same
+    /// incarnation. No state-space property can see this — the record is
+    /// `startable`, so the start is acknowledgeable, and re-settling reproduces
+    /// it, so the fixed point holds — which is why it is pinned directly.
+    #[test]
+    fn dynamic_startup_leaves_a_restart_pending_member_to_the_restart_path() {
+        let membership = memberships(1)[0];
+        let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::starting());
+        let child = admit(&mut state, membership, true);
+        let mut effects = Vec::new();
+        step(&mut state, Event::Settle, &mut effects);
+        assert_eq!(effects, [Effect::StartChild { child }]);
+        effects.clear();
+
+        for event in [
+            Event::Spawned { child },
+            Event::IncarnationComplete { child },
+            Event::RestartPending { child },
+        ] {
+            step(&mut state, event, &mut effects);
+        }
+        assert_eq!(
+            state.child_state(child),
+            Some(ChildState::Resident(IncarnationState::RestartPending))
+        );
+        assert!(state.spawned_once(child));
+        effects.clear();
+
+        step(&mut state, Event::Settle, &mut effects);
+        assert!(
+            effects.is_empty(),
+            "settlement does not re-attract a member the restart path owns, got {effects:?}"
+        );
+        state.check_invariants();
+    }
+
+    /// The ordered half of R6's aggregate rule, which is narrower than the
+    /// section states: a member latched for removal parks the ordered cursor
+    /// until the removal commits, so ordered startup can have every initial
+    /// member ready and still withhold completion. Dynamic startup completes
+    /// on the readiness predicate alone.
+    #[test]
+    fn ordered_startup_waits_for_a_removing_member_to_commit() {
+        let members = memberships(2);
+        let mut state = SupervisorState::new(ScopeFlavor::Ordered, ScopeLifecycle::starting());
+        let keys: Vec<_> = members
+            .iter()
+            .map(|membership| admit(&mut state, *membership, true))
+            .collect();
+        let mut effects = Vec::new();
+        for &child in &keys {
+            step(&mut state, Event::Settle, &mut effects);
+            effects.clear();
+            step(&mut state, Event::Spawned { child }, &mut effects);
+            step(
+                &mut state,
+                Event::Ready {
+                    child,
+                    removal_latched: false,
+                },
+                &mut effects,
+            );
+        }
+        effects.clear();
+
+        let removing = keys[1];
+        step(
+            &mut state,
+            Event::RemovalLatched { child: removing },
+            &mut effects,
+        );
+        assert_eq!(effects, [Effect::StopChild { child: removing }]);
+        effects.clear();
+        assert!(
+            keys.iter().all(|&child| state.initial_ready(child)),
+            "every initial member is ready before the cursor is asked to advance"
+        );
+
+        step(&mut state, Event::Settle, &mut effects);
+        assert!(
+            effects.is_empty(),
+            "the ordered cursor waits on the removing member, {effects:?}"
+        );
+
+        step(
+            &mut state,
+            Event::IncarnationComplete { child: removing },
+            &mut effects,
+        );
+        step(
+            &mut state,
+            Event::DisposalStarted { child: removing },
+            &mut effects,
+        );
+        step(
+            &mut state,
+            Event::Terminalized { child: removing },
+            &mut effects,
+        );
+        assert_eq!(effects, [Effect::FinalizeRemoval { child: removing }]);
+        effects.clear();
+        step(&mut state, Event::Reclaim { child: removing }, &mut effects);
+        step(&mut state, Event::Settle, &mut effects);
+        assert!(
+            matches!(effects.as_slice(), [Effect::StartupCompleted { .. }]),
+            "committing the removal releases the aggregate, {effects:?}"
+        );
+        state.check_invariants();
     }
 
     #[test]
@@ -1215,161 +1371,6 @@ mod tests {
                     }
                     state.check_invariants();
                 }
-            }
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-    enum SmallEvent {
-        Spawn(usize),
-        Ready(usize),
-        Remove(usize),
-        Terminal(usize),
-    }
-
-    fn permutations<T: Copy>(values: &mut [T], at: usize, visit: &mut impl FnMut(&[T])) {
-        if at == values.len() {
-            visit(values);
-            return;
-        }
-        for index in at..values.len() {
-            values.swap(at, index);
-            permutations(values, at + 1, visit);
-            values.swap(at, index);
-        }
-    }
-
-    /// Exhausts every ordering of spawn/readiness/removal/terminal inputs for
-    /// two children (8! schedules), then every three-child ordering of the
-    /// adjudication-sensitive readiness/removal/terminal inputs (9!
-    /// schedules). Invalid/stale events are intentionally part of the state
-    /// space: totality requires them to be harmless.
-    #[test]
-    fn exhaustive_small_scope_interleavings_preserve_reducer_invariants() {
-        for width in [2, 3] {
-            let members = memberships(width);
-            let mut schedule = Vec::new();
-            for index in 0..width {
-                if width == 2 {
-                    schedule.push(SmallEvent::Spawn(index));
-                }
-                schedule.extend([
-                    SmallEvent::Ready(index),
-                    SmallEvent::Remove(index),
-                    SmallEvent::Terminal(index),
-                ]);
-            }
-            for flavor in [ScopeFlavor::Ordered, ScopeFlavor::Dynamic] {
-                let mut unique_final = HashSet::new();
-                permutations(&mut schedule, 0, &mut |ordering| {
-                    let mut state = SupervisorState::new(flavor, ScopeLifecycle::starting());
-                    let keys: Vec<_> = members
-                        .iter()
-                        .map(|membership| admit(&mut state, *membership, true))
-                        .collect();
-                    let mut published_ready = HashSet::new();
-                    let mut removal_seen = HashSet::new();
-                    let mut joined_seen = HashSet::new();
-                    for event in ordering {
-                        let mut effects = Vec::new();
-                        match *event {
-                            SmallEvent::Spawn(index) => step(
-                                &mut state,
-                                Event::Spawned { child: keys[index] },
-                                &mut effects,
-                            ),
-                            SmallEvent::Ready(index) => {
-                                let removing = state.membership_status(keys[index])
-                                    == MembershipStatus::Removing;
-                                step(
-                                    &mut state,
-                                    Event::Ready {
-                                        child: keys[index],
-                                        removal_latched: removing,
-                                    },
-                                    &mut effects,
-                                );
-                                if !removing && state.initial_ready(keys[index]) {
-                                    published_ready.insert(keys[index]);
-                                }
-                            }
-                            SmallEvent::Remove(index) => step(
-                                &mut state,
-                                Event::RemovalLatched { child: keys[index] },
-                                &mut effects,
-                            ),
-                            SmallEvent::Terminal(index) => {
-                                // Runtime terminal completion joins retained
-                                // definition disposal before publishing the
-                                // membership edge. Keep that ordered pair atomic
-                                // while permuting it against the other children'
-                                // inputs.
-                                step(
-                                    &mut state,
-                                    Event::DisposalStarted { child: keys[index] },
-                                    &mut effects,
-                                );
-                                step(
-                                    &mut state,
-                                    Event::Terminalized { child: keys[index] },
-                                    &mut effects,
-                                );
-                            }
-                        }
-                        step(&mut state, Event::Settle, &mut effects);
-                        state.check_invariants();
-                        for child in &keys {
-                            if removal_seen.contains(child) {
-                                assert_eq!(
-                                    state.membership_status(*child),
-                                    MembershipStatus::Removing,
-                                    "removal is a monotone state transition"
-                                );
-                            }
-                            if joined_seen.contains(child) {
-                                assert!(state.joined(*child), "joined state cannot regress");
-                            }
-                            if state.membership_status(*child) == MembershipStatus::Removing {
-                                removal_seen.insert(*child);
-                                assert!(
-                                    !state.initial_ready(*child) || published_ready.contains(child),
-                                    "removal never manufactures a readiness edge"
-                                );
-                            }
-                            if state.joined(*child) {
-                                joined_seen.insert(*child);
-                            }
-                        }
-                        assert_eq!(
-                            state.all_children_joined(),
-                            keys.iter().all(|child| state.joined(*child))
-                        );
-                        for effect in &effects {
-                            match effect {
-                                Effect::StartChild { child }
-                                | Effect::StopChild { child }
-                                | Effect::ForceChild { child }
-                                | Effect::FinalizeRemoval { child } => {
-                                    assert!(state.contains(*child), "effects name a live key");
-                                }
-                                _ => {}
-                            }
-                            if let Effect::StartChild { child } = effect {
-                                assert!(
-                                    state.children[child].startable(),
-                                    "a start effect the shell would decline re-derives from \
-                                     unchanged state and never lets settlement terminate"
-                                );
-                            }
-                        }
-                    }
-                    unique_final.insert(
-                        keys.iter()
-                            .map(|child| state.child_state(*child).expect("resident"))
-                            .collect::<Vec<_>>(),
-                    );
-                });
-                assert!(!unique_final.is_empty());
             }
         }
     }

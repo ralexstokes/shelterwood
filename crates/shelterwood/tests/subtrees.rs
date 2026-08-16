@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     future,
     sync::{
@@ -8,8 +10,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet, poll_once, poll_until,
-    waiting::task as waiting_task,
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet, poll_once,
+    poll_until, waiting::task as waiting_task,
 };
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DefaultsInheritance,
@@ -34,11 +36,8 @@ async fn a_restartable_subtree_can_heal_an_unfilled_lowering_failure() {
                 let slot = tree.reserve_task("undefined").expect("reservation");
                 *rejected.lock().expect("rejected mutex poisoned") = Some(slot.task_ref());
             } else {
-                tree.add_task(
-                    "healthy",
-                    waiting_task(),
-                )
-                .expect("valid task");
+                tree.add_task("healthy", waiting_task())
+                    .expect("valid task");
             }
             tree
         }

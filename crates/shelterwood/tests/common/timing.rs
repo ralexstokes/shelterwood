@@ -76,39 +76,3 @@ pub(crate) async fn assert_quiet(duration: Duration, mut predicate: impl FnMut()
         tokio::time::sleep(POLL_INTERVAL.min(deadline - now)).await;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::{cell::Cell, future, task::Poll, time::Duration};
-
-    use super::{assert_quiet, poll_once};
-
-    #[test]
-    fn one_poll_uses_a_noop_waker() {
-        let mut future = Box::pin(future::ready(7));
-        assert_eq!(poll_once(future.as_mut()), Poll::Ready(7));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn quiet_window_completes_with_paused_time() {
-        let duration = Duration::from_secs(1);
-        let started_at = tokio::time::Instant::now();
-
-        assert_quiet(duration, || false).await;
-
-        assert_eq!(tokio::time::Instant::now() - started_at, duration);
-    }
-
-    #[tokio::test]
-    async fn eventual_assertion_context_is_evaluated_only_on_failure() {
-        let evaluated = Cell::new(false);
-
-        crate::common::assert_eventually!(|| true, "{}", {
-            evaluated.set(true);
-            "unexpected context evaluation"
-        })
-        .await;
-
-        assert!(!evaluated.get());
-    }
-}

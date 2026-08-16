@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     sync::{
         Arc, Mutex,
@@ -7,7 +9,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet, policy::never,
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet,
+    policy::never,
     waiting::{gate_released_manual_ready_task, task as waiting_task},
 };
 use shelterwood::{
@@ -260,10 +263,8 @@ async fn ordered_startup_waits_for_manual_readiness() {
     .expect("valid task");
 
     let system = tree.spawn().expect("runtime is available");
-    assert_eventually!(|| {
-        order.lock().expect("order mutex poisoned").as_slice() == ["gated"]
-    })
-    .await;
+    assert_eventually!(|| { order.lock().expect("order mutex poisoned").as_slice() == ["gated"] })
+        .await;
     assert_quiet(Duration::from_millis(20), || {
         order.lock().expect("order mutex poisoned").len() > 1
     })
@@ -420,9 +421,9 @@ async fn ready_at_deadline_wins_and_shutdown_disarms_the_gate() {
         .add_task(
             "edge",
             waiting_task()
-            .readiness(Readiness::Manual)
-            .expect("manual readiness")
-            .readiness_deadline(ReadinessDeadline::bounded(width).expect("non-zero deadline")),
+                .readiness(Readiness::Manual)
+                .expect("manual readiness")
+                .readiness_deadline(ReadinessDeadline::bounded(width).expect("non-zero deadline")),
         )
         .expect("valid task");
     let shutdown_system = shutdown_tree.spawn().expect("runtime is available");

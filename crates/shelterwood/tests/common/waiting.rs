@@ -5,10 +5,7 @@ use std::sync::{
 
 use shelterwood::{CancellationToken, Readiness, TaskDef, Tree};
 
-pub(crate) async fn liveness_probe(
-    shutdown: CancellationToken,
-    gate: super::ReleaseGate,
-) -> bool {
+pub(crate) async fn liveness_probe(shutdown: CancellationToken, gate: super::ReleaseGate) -> bool {
     tokio::select! {
         biased;
         () = shutdown.cancelled() => false,

@@ -8,7 +8,6 @@ description = "A structured-supervision and actor runtime for asynchronous Rust"
 documentation = "https://docs.rs/shelterwood"
 homepage = "https://github.com/ralexstokes/shelterwood"
 repository = "https://github.com/ralexstokes/shelterwood"
-autotests = false
 
 [lints]
 workspace = true
@@ -26,7 +25,3 @@ shelterwood-cells = { workspace = true, features = ["test-util"] }
 shelterwood-core = { workspace = true, features = ["test-util"] }
 shelterwood-runtime = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
-
-[[test]]
-name = "integration"
-path = "tests/mod.rs"

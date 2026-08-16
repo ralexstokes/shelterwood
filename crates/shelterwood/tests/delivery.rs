@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     sync::{
         Arc, Mutex,
@@ -348,10 +350,8 @@ async fn send_cancellation_withdraws_before_acceptance_but_not_after() {
     assert!(poll_once(before.as_mut()).is_pending());
     drop(before);
     gate.release();
-    assert_eventually!(|| {
-        log.lock().expect("send log mutex poisoned").as_slice() == [(2, 1)]
-    })
-    .await;
+    assert_eventually!(|| { log.lock().expect("send log mutex poisoned").as_slice() == [(2, 1)] })
+        .await;
     let mut after = Box::pin(actor.send(3));
     assert!(matches!(poll_once(after.as_mut()), Poll::Ready(Ok(_))));
     drop(after);

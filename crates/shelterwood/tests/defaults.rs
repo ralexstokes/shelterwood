@@ -2,6 +2,8 @@
 //! sets policy explicitly, so without these a default regression passes the
 //! whole suite.
 
+mod common;
+
 use std::{
     sync::{
         Arc, Mutex,

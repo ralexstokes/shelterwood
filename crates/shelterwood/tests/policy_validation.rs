@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use shelterwood::{
     Backoff, BackoffFactor, BoundedReadinessDeadline, ExponentialBackoff, FixedBackoff, Intensity,
-    Jitter, Mailbox, PolicyError, ReadinessDeadline,
+    Jitter, Mailbox, NonZeroDuration, PolicyError, ReadinessDeadline,
 };
 
 #[test]
@@ -64,6 +64,11 @@ fn other_policy_constructors_reject_zero_values() {
 /// is the private-field one they claim.
 #[test]
 fn sealed_payloads_expose_only_constructor_validated_values() {
+    let duration = Duration::from_nanos(1);
+    let duration: NonZeroDuration =
+        NonZeroDuration::new(duration).expect("the duration is non-zero");
+    assert_eq!(duration.get(), Duration::from_nanos(1));
+
     let fixed_delay = Duration::from_millis(10);
     let Backoff::Fixed(fixed) =
         Backoff::fixed(fixed_delay, Jitter::Equal).expect("the delay is non-zero")

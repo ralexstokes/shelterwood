@@ -11,8 +11,8 @@ use std::{
 use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
-    Guard, LifecycleEventKind, LifecycleItem, Mailbox, Readiness, Shutdown, StartupError,
-    StartupFailureCause, Tree,
+    Guard, Handler, LifecycleEventKind, LifecycleItem, Mailbox, RawActor, RawContext, RawOnceDef,
+    Readiness, Shutdown, StartupError, StartupFailureCause, StopContext, Tree,
 };
 
 enum ZeroMessage {
@@ -1324,6 +1324,188 @@ async fn assert_queued_panic_beats_orderly_exit(mode: QueuedPanicMode) {
 async fn queued_offload_panic_survives_stop_and_handler_error() {
     assert_queued_panic_beats_orderly_exit(QueuedPanicMode::Stop).await;
     assert_queued_panic_beats_orderly_exit(QueuedPanicMode::HandlerError).await;
+}
+
+struct StopPathPanicObservations {
+    on_stop_ran: AtomicBool,
+    further_delivery_ran: AtomicBool,
+    decorator_result: Mutex<Option<&'static str>>,
+}
+
+struct StopPathPanicActor {
+    observations: Arc<StopPathPanicObservations>,
+}
+
+impl Actor for StopPathPanicActor {
+    type Msg = PanicMessage;
+    type Args = (Arc<StopPathPanicObservations>, ReleaseGate);
+
+    async fn init(
+        (observations, release): Self::Args,
+        _: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        release.wait().await;
+        Ok(Self { observations })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            PanicMessage::Trigger => {
+                let guard = context
+                    .offload_scoped(
+                        async {
+                            panic!("stop-path offload panic");
+                        },
+                        |_| PanicMessage::Delivery,
+                        Duration::MAX,
+                    )
+                    .expect("offload accepted");
+                guard.finished().await;
+                context.stop();
+            }
+            PanicMessage::Delivery => {
+                self.observations
+                    .further_delivery_ran
+                    .store(true, Ordering::SeqCst);
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_stop(&mut self, _: &mut StopContext<'_, Self>) {
+        self.observations.on_stop_ran.store(true, Ordering::SeqCst);
+    }
+}
+
+struct StopPathPanicDecorator {
+    inner: Handler<StopPathPanicActor>,
+    observations: Arc<StopPathPanicObservations>,
+}
+
+impl RawActor for StopPathPanicDecorator {
+    type Msg = PanicMessage;
+
+    fn readiness() -> Readiness {
+        Readiness::Manual
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        let result = self.inner.run(context).await;
+        *self
+            .observations
+            .decorator_result
+            .lock()
+            .expect("decorator result mutex poisoned") =
+            Some(if result.is_ok() { "ok" } else { "err" });
+        result
+    }
+}
+
+#[tokio::test]
+async fn pending_offload_panic_stops_before_drain_on_stop_and_decorator_resume() {
+    let release_init = ReleaseGate::default();
+    let observations = Arc::new(StopPathPanicObservations {
+        on_stop_ran: AtomicBool::new(false),
+        further_delivery_ran: AtomicBool::new(false),
+        decorator_result: Mutex::new(None),
+    });
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "stop-path-panic",
+            RawOnceDef::new(StopPathPanicDecorator {
+                inner: Handler::new((Arc::clone(&observations), release_init.clone())),
+                observations: Arc::clone(&observations),
+            }),
+        )
+        .expect("valid decorated actor");
+    let system = tree.spawn().expect("runtime is available");
+    actor
+        .send(PanicMessage::Trigger)
+        .await
+        .expect("mailbox accepts before readiness");
+    actor
+        .send(PanicMessage::Delivery)
+        .await
+        .expect("frozen prefix message is accepted before readiness");
+    release_init.release();
+
+    let message = startup_panic_message(
+        system
+            .wait_started()
+            .await
+            .expect_err("the queued offload panic fails startup"),
+    );
+    assert_eq!(message.as_deref(), Some("stop-path offload panic"));
+    assert!(
+        !observations.on_stop_ran.load(Ordering::SeqCst),
+        "on_stop must not run after an incarnation-owned panic"
+    );
+    assert!(
+        !observations.further_delivery_ran.load(Ordering::SeqCst),
+        "the frozen prefix must not drain after an incarnation-owned panic"
+    );
+    assert_eq!(
+        *observations
+            .decorator_result
+            .lock()
+            .expect("decorator result mutex poisoned"),
+        None,
+        "the offload panic must unwind through the Handler composition point"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root shuts down");
+}
+
+struct StoppingTryRecvPanicActor;
+
+impl RawActor for StoppingTryRecvPanicActor {
+    type Msg = ();
+
+    fn readiness() -> Readiness {
+        Readiness::Manual
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        let guard = context
+            .offload_scoped(
+                async {
+                    panic!("stopping try_recv offload panic");
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("offload accepted");
+        guard.finished().await;
+        context.stop();
+        let _ = context.try_recv();
+        unreachable!("stopping try_recv must resume the retained offload panic")
+    }
+}
+
+#[tokio::test]
+async fn stopping_try_recv_resumes_a_pending_offload_panic_before_drain() {
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "stopping-try-recv-panic",
+        RawOnceDef::new(StoppingTryRecvPanicActor),
+    )
+    .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+
+    let message = startup_panic_message(
+        system
+            .wait_started()
+            .await
+            .expect_err("the queued offload panic fails startup"),
+    );
+    assert_eq!(message.as_deref(), Some("stopping try_recv offload panic"));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root shuts down");
 }
 
 #[tokio::test]

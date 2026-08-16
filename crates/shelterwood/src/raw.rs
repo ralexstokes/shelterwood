@@ -1407,8 +1407,8 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Receives the next accepted message, biased toward shutdown.
     ///
-    /// While the incarnation is running, a retained offload-work panic resumes
-    /// from this receive path before another event is delivered. A panic in an
+    /// A retained offload-work panic resumes from this receive path before
+    /// another event is delivered or a stop is reported. A panic in an
     /// offload's continuation closure — the `FnOnce` that builds the message
     /// from the offload result, not a [`continue_with`](Self::continue_with)
     /// continuation, which is a plain stored message and cannot panic here —
@@ -1425,6 +1425,7 @@ impl<M: Send + 'static> RawContext<M> {
                 // ending the raw loop; removing this await would let a local
                 // stop bypass that cross-task handshake.
                 self.shutdown.cancelled().await;
+                self.resources.resume_pending_panic();
                 return None;
             }
             if self.shutdown.is_cancelled() {
@@ -1433,6 +1434,7 @@ impl<M: Send + 'static> RawContext<M> {
                 // what makes the frozen accepted prefix a complete drain
                 // boundary once cancellation is observable here.
                 self.freeze_and_report();
+                self.resources.resume_pending_panic();
                 return None;
             }
             if let Some(message) = self.next_ready() {
@@ -1448,11 +1450,13 @@ impl<M: Send + 'static> RawContext<M> {
     /// before returning another event; a panic in an offload's continuation
     /// closure (the message-building `FnOnce`, not a
     /// [`continue_with`](Self::continue_with) continuation, which is a plain
-    /// stored message) surfaces directly from this call. During drain it reads
-    /// the frozen accepted mailbox prefix directly.
+    /// stored message) surfaces directly from this call. During drain it first
+    /// resumes any retained offload-work panic, then reads the frozen accepted
+    /// mailbox prefix directly.
     pub fn try_recv(&mut self) -> Option<M> {
         if self.is_stopping() {
             self.freeze_and_report();
+            self.resources.resume_pending_panic();
             self.receiver.try_recv()
         } else {
             self.next_ready()

@@ -994,8 +994,11 @@ the drain, leaving the handled log a proper prefix of the accepted one.
 non-failed actor: on every cooperative stop path above, whether or not a
 drain preceded it. It does not run when `init` failed (no actor value
 exists), when a handler — live or draining — returned `Err` or panicked
-(the incarnation is failed; cleanup is the crash-only path, `Drop`), or
-on hard abort (the future is destroyed). Grace bounds drain plus
+(the incarnation is failed; cleanup is the crash-only path, `Drop`), when an
+incarnation-owned offload panic resumes at a receive boundary (including one
+entering stop or drain), or on hard abort (the future is destroyed). An
+offload panic therefore fails the incarnation before any further delivery or
+`on_stop`. Grace bounds drain plus
 `on_stop` together (§10) — including after a local `ctx.stop()`, which
 arms the child's own configured ladder (§10).
 

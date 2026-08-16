@@ -1,3 +1,4 @@
+#[path = "mod.rs"]
 mod common;
 
 use std::{cell::Cell, future, task::Poll, time::Duration};

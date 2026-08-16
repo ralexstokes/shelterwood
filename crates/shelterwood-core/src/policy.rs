@@ -107,7 +107,7 @@ pub const DEFAULT_READINESS_DEADLINE: Duration = Duration::from_secs(30);
 ///
 /// ```compile_fail,E0423
 /// use std::time::Duration;
-/// use shelterwood::NonZeroDuration;
+/// use shelterwood_core::policy::NonZeroDuration;
 ///
 /// let _invalid = NonZeroDuration(Duration::ZERO);
 /// ```
@@ -230,7 +230,7 @@ impl std::hash::Hash for BackoffFactor {
 ///
 /// ```compile_fail,E0451
 /// use std::time::Duration;
-/// use shelterwood::{Backoff, FixedBackoff, Jitter};
+/// use shelterwood_core::policy::{Backoff, FixedBackoff, Jitter};
 ///
 /// let _ = Backoff::Fixed(FixedBackoff {
 ///     delay: Duration::ZERO,
@@ -242,7 +242,7 @@ impl std::hash::Hash for BackoffFactor {
 ///
 /// ```compile_fail,E0451
 /// use std::time::Duration;
-/// use shelterwood::{Backoff, BackoffFactor, ExponentialBackoff, Jitter};
+/// use shelterwood_core::policy::{Backoff, BackoffFactor, ExponentialBackoff, Jitter};
 ///
 /// let _ = Backoff::Exponential(ExponentialBackoff {
 ///     base: Duration::ZERO,
@@ -553,9 +553,12 @@ pub enum ReadinessDeadline {
 ///
 /// ```compile_fail,E0423
 /// use std::time::Duration;
-/// use shelterwood::{BoundedReadinessDeadline, ReadinessDeadline};
+/// use shelterwood_core::policy::{
+///     BoundedReadinessDeadline, NonZeroDuration, ReadinessDeadline,
+/// };
 ///
-/// let _ = ReadinessDeadline::Bounded(BoundedReadinessDeadline(Duration::ZERO));
+/// let duration = NonZeroDuration::new(Duration::from_secs(1)).unwrap();
+/// let _ = ReadinessDeadline::Bounded(BoundedReadinessDeadline(duration));
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BoundedReadinessDeadline(NonZeroDuration);
@@ -585,7 +588,7 @@ impl ReadinessDeadline {
 ///
 /// ```compile_fail,E0451
 /// use std::time::Duration;
-/// use shelterwood::Intensity;
+/// use shelterwood_core::policy::Intensity;
 ///
 /// let _ = Intensity {
 ///     max_restarts: 1,

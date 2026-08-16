@@ -4,8 +4,47 @@ fn accepts_supported_token(_: &CancellationToken) {}
 
 #[cfg(feature = "installable-seams")]
 use shelterwood::{
-    ActorIdentity, DynamicRoute, MailboxControl, MailboxRuntime, MailboxTermination,
+    ActorIdentity, DynamicRoute, MailboxCell, MailboxControl, MailboxRuntime, MailboxTermination,
+    MemberCell, ParentCancellationToken, ScopeCell, actor_ref_from_parts,
 };
+
+#[cfg(feature = "sealed-mailbox-seams")]
+mod sealed_mailbox_seams {
+    use shelterwood_core::{Incarnation, ResolvedMailbox};
+    use shelterwood_mailbox::{MailboxControl, MailboxDisposal, MailboxTermination};
+
+    struct ForeignTermination;
+
+    impl MailboxTermination for ForeignTermination {
+        fn finish(self: Box<Self>) -> Option<MailboxDisposal> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct ForeignControl;
+
+    impl MailboxControl for ForeignControl {
+        fn configure(&self, _: ResolvedMailbox) {}
+
+        fn bind(&self, _: Incarnation) {}
+
+        fn freeze(&self, _: Incarnation) {}
+
+        fn close(&self, _: Incarnation) -> Option<MailboxDisposal> {
+            None
+        }
+
+        fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>> {
+            None
+        }
+
+        #[cfg(debug_assertions)]
+        fn bind_order_valid(&self) -> bool {
+            true
+        }
+    }
+}
 
 fn main() {
     let _ = accepts_supported_token;

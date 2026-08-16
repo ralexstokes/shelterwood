@@ -64,21 +64,23 @@ rests on:
   release their `Arc<MemberCell>`s under the gate without relying on driver
   field-drop order to keep a user error alive.
 - **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination`,
-  `MailboxRuntime`, `ActorIdentity` and `DynamicRoute` are cross-crate
-  implementation seams with framework-only impls, not user traits; where the
-  framework invokes one under a lock, no caller code runs. This is the one
-  convention-held public boundary: Rust cannot private-seal a trait in the
+  `MailboxRuntime`, `ActorIdentity` and `DynamicRoute` are implementation seams
+  with framework-only impls, not user traits; where the framework invokes one
+  under a lock, no caller code runs. `MailboxControl` and
+  `MailboxTermination` are private-supertrait sealed because their legitimate
+  implementations live in the defining mailbox crate. The other three are the
+  one convention-held public boundary: Rust cannot private-seal a trait in the
   lower crate while permitting its legitimate implementation in a downstream
   sibling, and a public capability token would be obtainable by the same
   unsupported direct dependent. The supported `shelterwood` façade exports
-  neither the traits nor their installers; implementing or installing them
-  through a direct dependency invalidates the lock rule. `MailboxRuntime` is
-  nonetheless kept off every locked path: its disposal capability hands work
-  to a blocking worker, so it belongs to the effects flush like the user code
-  it carries. That is a preference, not a prohibition, and
-  `RetainedExit::drop` is where the difference shows: a submission runs no
-  user code, so it is legal under a lock, but it can cost a native thread
-  start, so a caller that already owns an effects sink should still flush it.
+  neither the traits nor their installers; implementing or installing those
+  three through a direct dependency invalidates the lock rule. `MailboxRuntime`
+  is nonetheless kept off every locked path: its disposal capability hands
+  work to a blocking worker, so it belongs to the effects flush like the user
+  code it carries. That is a preference, not a prohibition, and
+  `RetainedExit::drop` is where the difference shows: a submission runs no user
+  code, so it is legal under a lock, but it can cost a native thread start, so
+  a caller that already owns an effects sink should still flush it.
   Retained exits retire from drop glue, which has no sink to reach, so they
   submit in place.
 - **Nested framework locks in one direction.** The resident-tree observation

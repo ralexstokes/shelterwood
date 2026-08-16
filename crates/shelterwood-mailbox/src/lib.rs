@@ -9,9 +9,11 @@
 //!
 //! Direct dependencies on this crate are unsupported. Its public capability
 //! traits and their installation helpers exist only so sibling Shelterwood
-//! crates can complete the dependency inversion. They are not user extension
-//! points: foreign implementations may be called from framework critical
-//! sections and therefore invalidate the framework's lock-rule guarantees.
+//! crates can complete the dependency inversion. [`MailboxControl`] and
+//! [`MailboxTermination`] are structurally sealed because their implementations
+//! live here. The remaining cross-crate traits are not user extension points:
+//! foreign implementations may be called from framework critical sections and
+//! therefore invalidate the framework's lock-rule guarantees.
 
 use std::{fmt, sync::Arc};
 
@@ -39,6 +41,11 @@ mod identity {
     pub(crate) use shelterwood_core::identity::*;
 }
 
+mod private {
+    pub trait SealedMailboxControl {}
+    pub trait SealedMailboxTermination {}
+}
+
 mod panic {
     pub(crate) use shelterwood_core::panic::*;
 }
@@ -56,10 +63,10 @@ pub type MailboxDisposal = Box<dyn Send>;
 ///
 /// # Implementation boundary
 ///
-/// This trait is implemented and installed only by Shelterwood's mailbox
-/// state machine. It is public solely because sibling implementation crates
-/// retain it through type erasure; it is not a user extension point.
-pub trait MailboxTermination: Send {
+/// This trait is structurally sealed to Shelterwood's mailbox state machine.
+/// It is public solely because sibling implementation crates retain it through
+/// type erasure; it is not a user extension point.
+pub trait MailboxTermination: private::SealedMailboxTermination + Send {
     fn finish(self: Box<Self>) -> Option<MailboxDisposal>;
 }
 
@@ -73,10 +80,10 @@ pub trait MailboxTermination: Send {
 ///
 /// # Implementation boundary
 ///
-/// This trait is implemented and installed only by Shelterwood's mailbox
-/// state machine. Framework code can invoke it while holding the member
-/// mailbox mutex, so a foreign implementation invalidates the lock rule.
-pub trait MailboxControl: fmt::Debug + Send + Sync {
+/// This trait is structurally sealed to Shelterwood's mailbox state machine.
+/// Framework code can invoke it while holding the member mailbox mutex, so
+/// preventing foreign implementations is part of the lock-rule boundary.
+pub trait MailboxControl: private::SealedMailboxControl + fmt::Debug + Send + Sync {
     /// Installs the declaration-time mailbox policy before the first bind.
     /// Reconfiguration may only repeat the same resolved policy; a mismatch
     /// panics after the mailbox lock has been released.

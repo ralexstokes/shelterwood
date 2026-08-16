@@ -72,6 +72,8 @@ name = "shelterwood-external-consumer"
 version = "0.0.0"
 dependencies = [
  "shelterwood",
+ "shelterwood-core",
+ "shelterwood-mailbox",
 ]
 
 [[package]]

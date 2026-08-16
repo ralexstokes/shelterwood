@@ -22,10 +22,33 @@ if cargo check --locked --manifest-path "$manifest" --features installable-seams
     echo "the supported façade exports lower-crate installation seams" >&2
     exit 1
 fi
-for seam in ActorIdentity DynamicRoute MailboxControl MailboxRuntime MailboxTermination; do
+for seam in \
+    ActorIdentity \
+    DynamicRoute \
+    MailboxCell \
+    MailboxControl \
+    MailboxRuntime \
+    MailboxTermination \
+    MemberCell \
+    ParentCancellationToken \
+    ScopeCell \
+    actor_ref_from_parts
+do
     if ! grep -Fq "no \`$seam\` in the root" "$diagnostics"; then
         cat "$diagnostics" >&2
         echo "installable-seam probe failed for an unexpected reason" >&2
+        exit 1
+    fi
+done
+
+if cargo check --locked --manifest-path "$manifest" --features sealed-mailbox-seams >"$diagnostics" 2>&1; then
+    echo "external consumers can implement sealed mailbox seams" >&2
+    exit 1
+fi
+for seam in SealedMailboxControl SealedMailboxTermination; do
+    if ! grep -Fq "$seam" "$diagnostics"; then
+        cat "$diagnostics" >&2
+        echo "sealed-mailbox-seam probe failed for an unexpected reason" >&2
         exit 1
     fi
 done

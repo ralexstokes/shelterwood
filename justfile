@@ -7,6 +7,7 @@ default:
 
 fmt:
     cargo +nightly fmt --all --check
+    cargo +nightly fmt --manifest-path tools/external-consumer/Cargo.toml -- --check
 
 lint:
     cargo +nightly clippy --locked --workspace --all-targets --all-features -- -D warnings

@@ -9,6 +9,9 @@ publish = false
 [features]
 from-latch = []
 installable-seams = []
+sealed-mailbox-seams = ["dep:shelterwood-core", "dep:shelterwood-mailbox"]
 
 [dependencies]
 shelterwood = { path = "../../crates/shelterwood" }
+shelterwood-core = { path = "../../crates/shelterwood-core", optional = true }
+shelterwood-mailbox = { path = "../../crates/shelterwood-mailbox", optional = true }

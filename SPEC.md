@@ -2771,6 +2771,14 @@ dynamic removal: the removed id becomes reusable (and a repeated `remove`
 reports `AlreadyAbsent`) only at the commit that withdraws the member
 from residency and publishes its `Removed` edge — §2's
 resident-membership uniqueness holds at every observable cut.
+Drain entry follows the same rule: publishing `Draining` includes the
+terminal-disposal intent for every inactive child selected to stop in that
+same driver step. A zero-budget shutdown's straggler sample cannot split that
+entry step, so restart-window cleanup already committed by it is not a
+straggler; an active child, or an ordered sibling whose stop has not yet been
+selected, remains reportable. This ruling is pinned on a multi-thread runtime
+by
+`integration::restart_window_cleanup_is_isolated_without_reclassifying_the_recorded_exit`.
 
 `tracing` spans emit from one choke point (the optional `metrics` surface
 is Part II §20). Everything else observational — peer monitoring, actor

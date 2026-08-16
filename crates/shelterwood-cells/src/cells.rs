@@ -1435,6 +1435,36 @@ impl ScopeCell {
         });
     }
 
+    /// Publishes drain entry together with terminal-cleanup intent selected by
+    /// the same driver step.
+    ///
+    /// A zero-budget shutdown waiter wakes from the state publication and
+    /// immediately samples descendants. Installing these markers under the
+    /// shared observation gate keeps that sample from splitting drain entry
+    /// between the scope transition and an inactive child's cleanup.
+    pub fn publish_drain(
+        &self,
+        state: ScopeState,
+        startup: Option<Result<(), StartupError>>,
+        terminal_disposals: &[Arc<MemberCell>],
+    ) {
+        debug_assert!(matches!(state, ScopeState::Draining));
+        self.with_observation_gate(|txn| {
+            for member in terminal_disposals {
+                debug_assert!(
+                    self.current_observation_gate()
+                        .same_gate(&member.current_observation_gate()),
+                    "a drain entry may mark only a resident member on its observation gate"
+                );
+                member.set_terminal_disposal_pending(true);
+            }
+            if let Some(startup) = startup {
+                self.set_startup_locked(startup, txn);
+            }
+            self.set_state_locked(state, txn);
+        });
+    }
+
     fn set_state_locked(&self, state: ScopeState, txn: &mut ObservationTxn<'_>) {
         let mut transient_retained = Vec::new();
         RetainedExit::retain_scope_state(&mut transient_retained, &state);

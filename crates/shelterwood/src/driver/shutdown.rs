@@ -81,6 +81,36 @@ pub(crate) async fn shutdown_scope(
 }
 
 impl ScopeRuntime {
+    fn drain_entry_terminal_disposals(&self, effects: &[SupervisorEffect]) -> Vec<Arc<MemberCell>> {
+        let mut keys = Vec::new();
+        for effect in effects {
+            let key = match effect {
+                SupervisorEffect::StopChild { child } | SupervisorEffect::ForceChild { child } => {
+                    *child
+                }
+                _ => continue,
+            };
+            if keys.contains(&key)
+                || self.supervisor.membership_terminal(key)
+                || self.supervisor.is_disposing(key)
+                || self
+                    .children
+                    .get(key)
+                    .is_none_or(|child| child.active.is_some())
+            {
+                continue;
+            }
+            keys.push(key);
+        }
+        keys.into_iter()
+            .filter_map(|key| {
+                self.children
+                    .get(key)
+                    .map(|child| Arc::clone(&child.slot.member))
+            })
+            .collect()
+    }
+
     pub(super) fn begin_drain(&mut self, reason: StopReason) {
         let startup = self
             .supervisor
@@ -125,12 +155,16 @@ impl ScopeRuntime {
         else {
             unreachable!()
         };
-        if let Some(startup) = startup {
-            self.root.set_state_and_startup(state, startup);
-        } else {
-            debug_assert!(!startup_pending);
-            self.root.set_state(state);
-        }
+        debug_assert!(startup.is_some() || !startup_pending);
+        // Ordered drain exposes its first stop only through `Settle`; derive
+        // that command before publication so both scope flavors can commit an
+        // inactive child's terminal-cleanup intent with the `Draining` edge.
+        // Later ordered siblings are deliberately absent: their cooperative
+        // stop has not begun and a zero-budget sample must still report them.
+        self.reduce(SupervisorEvent::Settle);
+        let terminal_disposals =
+            self.drain_entry_terminal_disposals(&self.supervisor_effects[before..]);
+        self.root.publish_drain(state, startup, &terminal_disposals);
         self.flush_supervisor_effects();
         self.settle_supervisor();
     }
@@ -150,12 +184,14 @@ impl ScopeRuntime {
             else {
                 unreachable!()
             };
-            if startup_pending {
-                self.root
-                    .set_state_and_startup(state, Err(StartupError::ShutdownRequested));
-            } else {
-                self.root.set_state(state);
-            }
+            self.reduce(SupervisorEvent::Settle);
+            let terminal_disposals =
+                self.drain_entry_terminal_disposals(&self.supervisor_effects[before..]);
+            self.root.publish_drain(
+                state,
+                startup_pending.then_some(Err(StartupError::ShutdownRequested)),
+                &terminal_disposals,
+            );
         }
         self.flush_supervisor_effects();
         self.settle_supervisor();

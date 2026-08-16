@@ -1111,7 +1111,7 @@ impl ScopeRuntime {
         let Some(terminal) = child.pending_terminal.take() else {
             return;
         };
-        child.slot.member.set_terminal_disposal_pending(false);
+        let member = Arc::clone(&child.slot.member);
         let mut exit = terminal.exit.into_exit();
         if terminal.exited_incarnation.is_some()
             && let Some(runtime::DisposalPanic { message }) = panic
@@ -1135,6 +1135,10 @@ impl ScopeRuntime {
             StartupDisposition::NotAborted
         };
         self.terminalize_child(key, exit.clone(), terminal.exited_incarnation, startup);
+        // Keep the marker installed until terminal publication has committed.
+        // A concurrent shutdown sampler then sees either pending cleanup or a
+        // terminal member, never the gap between those two representations.
+        member.set_terminal_disposal_pending(false);
         if self.supervisor.membership_status(key) == MembershipStatus::Removing {
             self.flush_supervisor_effects();
         } else if terminal.startup == StartupDisposition::Aborted

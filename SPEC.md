@@ -1169,8 +1169,9 @@ polled** — never inferred from poll order.
 ### 6.1 Reducer invariants and transitions
 
 These rules are normative over `SupervisorState`, `Event`, and `Effect`.
-Bracketed names are the checked evidence; `integration::…` names the public
-integration suite and `supervisor::…` names the pure reducer suite.
+Bracketed names are the checked evidence; `integration::…` labels a test
+function under `crates/shelterwood/tests` — not a Cargo `--test` target —
+and `supervisor::…` names the pure reducer suite.
 
 1. **R1 — initial-only aggregate.** Only an `Initial { ready }` membership
    gates scope startup. A runtime admission never enters the aggregate.

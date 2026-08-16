@@ -11,8 +11,9 @@ use std::{
 use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
-    Guard, Handler, LifecycleEventKind, LifecycleItem, Mailbox, RawActor, RawContext, RawOnceDef,
-    Readiness, Shutdown, StartupError, StartupFailureCause, StopContext, Tree,
+    Guard, Handler, LifecycleEventKind, LifecycleItem, Mailbox, MailboxShutdown, RawActor,
+    RawContext, RawOnceDef, Readiness, Shutdown, StartupError, StartupFailureCause, StopContext,
+    Tree,
 };
 
 enum ZeroMessage {
@@ -1401,8 +1402,9 @@ impl RawActor for StopPathPanicDecorator {
     }
 }
 
-#[tokio::test]
-async fn pending_offload_panic_stops_before_drain_on_stop_and_decorator_resume() {
+async fn assert_pending_offload_panic_stops_before_handler_teardown(
+    mailbox_shutdown: MailboxShutdown,
+) {
     let release_init = ReleaseGate::default();
     let observations = Arc::new(StopPathPanicObservations {
         on_stop_ran: AtomicBool::new(false),
@@ -1416,7 +1418,8 @@ async fn pending_offload_panic_stops_before_drain_on_stop_and_decorator_resume()
             RawOnceDef::new(StopPathPanicDecorator {
                 inner: Handler::new((Arc::clone(&observations), release_init.clone())),
                 observations: Arc::clone(&observations),
-            }),
+            })
+            .mailbox_shutdown(mailbox_shutdown),
         )
         .expect("valid decorated actor");
     let system = tree.spawn().expect("runtime is available");
@@ -1459,7 +1462,89 @@ async fn pending_offload_panic_stops_before_drain_on_stop_and_decorator_resume()
         .expect("failed root shuts down");
 }
 
-struct StoppingTryRecvPanicActor;
+#[tokio::test]
+async fn pending_offload_panic_stops_before_drain_on_stop_and_decorator_resume() {
+    assert_pending_offload_panic_stops_before_handler_teardown(MailboxShutdown::Drain).await;
+}
+
+#[tokio::test]
+async fn pending_offload_panic_resumes_from_local_recv_before_discard_teardown() {
+    // Discard bypasses Handler's `try_recv` drain. This pins the local-stop
+    // branch of `recv` independently of the separate draining check.
+    assert_pending_offload_panic_stops_before_handler_teardown(MailboxShutdown::Discard).await;
+}
+
+struct ExternalStoppingRecvPanicActor {
+    panic_queued: Arc<AtomicBool>,
+}
+
+impl RawActor for ExternalStoppingRecvPanicActor {
+    type Msg = ();
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        let guard = context
+            .offload_scoped(
+                async {
+                    panic!("external-stop recv offload panic");
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("offload accepted");
+        guard.finished().await;
+        self.panic_queued.store(true, Ordering::SeqCst);
+        context.shutdown_token().cancelled().await;
+        let _ = context.recv().await;
+        unreachable!("externally stopped recv must resume the retained offload panic")
+    }
+}
+
+#[tokio::test]
+async fn externally_stopped_recv_resumes_a_pending_offload_panic() {
+    let panic_queued = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "external-stop-recv-panic",
+        RawOnceDef::new(ExternalStoppingRecvPanicActor {
+            panic_queued: Arc::clone(&panic_queued),
+        }),
+    )
+    .expect("valid raw actor");
+    let system = tree.spawn().expect("runtime is available");
+    let mut events = system.scope().subscribe_lifecycle();
+    system.wait_started().await.expect("raw actor starts");
+    assert_eventually!(
+        || panic_queued.load(Ordering::SeqCst),
+        "offload panic is queued before external shutdown"
+    )
+    .await;
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed actor shuts down");
+
+    let mut panic_message = None;
+    while let Some(item) = events.recv().await {
+        let LifecycleItem::Event(event) = item else {
+            panic!("small fixture must not lag");
+        };
+        if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+            && id.as_str() == "external-stop-recv-panic"
+            && let ExitKind::Panicked { message } = exit.kind()
+        {
+            panic_message = message.clone();
+        }
+    }
+    assert_eq!(
+        panic_message.as_deref(),
+        Some("external-stop recv offload panic")
+    );
+}
+
+struct StoppingTryRecvPanicActor {
+    enter: ReleaseGate,
+}
 
 impl RawActor for StoppingTryRecvPanicActor {
     type Msg = ();
@@ -1469,6 +1554,7 @@ impl RawActor for StoppingTryRecvPanicActor {
     }
 
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        self.enter.wait().await;
         let guard = context
             .offload_scoped(
                 async {
@@ -1487,13 +1573,22 @@ impl RawActor for StoppingTryRecvPanicActor {
 
 #[tokio::test]
 async fn stopping_try_recv_resumes_a_pending_offload_panic_before_drain() {
+    let enter = ReleaseGate::default();
     let mut tree = Tree::new();
-    tree.add_raw_once(
-        "stopping-try-recv-panic",
-        RawOnceDef::new(StoppingTryRecvPanicActor),
-    )
-    .expect("valid raw actor");
+    let actor = tree
+        .add_raw_once(
+            "stopping-try-recv-panic",
+            RawOnceDef::new(StoppingTryRecvPanicActor {
+                enter: enter.clone(),
+            }),
+        )
+        .expect("valid raw actor");
     let system = tree.spawn().expect("runtime is available");
+    actor
+        .send(())
+        .await
+        .expect("frozen prefix message is accepted before readiness");
+    enter.release();
 
     let message = startup_panic_message(
         system

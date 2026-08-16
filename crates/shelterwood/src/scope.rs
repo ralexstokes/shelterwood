@@ -77,9 +77,9 @@ impl ScopeRef {
 impl ScopeRef {
     /// Waits for a named child snapshot satisfying an at-or-past predicate.
     ///
-    /// Snapshot watches conflate intermediate states, so `pred` should accept
-    /// every state at or beyond the desired edge and must remain cheap and
-    /// non-blocking.
+    /// Snapshot watches expose complete observation transactions but conflate
+    /// intermediate committed states, so `pred` should accept every state at
+    /// or beyond the desired edge and must remain cheap and non-blocking.
     /// A zero budget evaluates the current snapshot exactly once, with
     /// predicate match taking precedence over terminal scope and timeout.
     ///

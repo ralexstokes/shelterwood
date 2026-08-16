@@ -529,6 +529,11 @@ impl RetainedScopeSnapshot {
 pub struct SnapshotClosed;
 
 /// Conflating receiver for recursive scope snapshots.
+///
+/// Every retained value is a complete observation-gate transaction cut.
+/// Repeated publications for one scope within a transaction are coalesced, so
+/// an ungated borrow sees either the preceding committed cut or the final one,
+/// never an intermediate value from a compound transition.
 #[derive(Clone)]
 pub struct SnapshotReceiver {
     inner: runtime::WatchReceiver<SnapshotHubState>,
@@ -536,7 +541,8 @@ pub struct SnapshotReceiver {
 }
 
 impl SnapshotReceiver {
-    /// Borrows the newest snapshot without marking it observed.
+    /// Borrows the newest committed transaction cut without marking it
+    /// observed.
     #[must_use]
     pub fn borrow_latest(&self) -> Arc<ScopeSnapshot> {
         self.inner.borrow_cloned().snapshot.public()
@@ -588,6 +594,100 @@ struct SnapshotHubState {
     snapshot: RetainedScopeSnapshot,
     generation: crate::identity::PoisonedCounter,
     closed: bool,
+}
+
+pub(crate) struct SnapshotPublication {
+    sender: runtime::WatchSender<SnapshotHubState>,
+    snapshot: Option<RetainedScopeSnapshot>,
+    published: bool,
+    closed: bool,
+}
+
+impl SnapshotPublication {
+    fn published(
+        sender: runtime::WatchSender<SnapshotHubState>,
+        snapshot: RetainedScopeSnapshot,
+    ) -> Self {
+        Self {
+            sender,
+            snapshot: Some(snapshot),
+            published: true,
+            closed: false,
+        }
+    }
+
+    fn closed(
+        sender: runtime::WatchSender<SnapshotHubState>,
+        snapshot: RetainedScopeSnapshot,
+    ) -> Self {
+        Self {
+            sender,
+            snapshot: Some(snapshot),
+            published: false,
+            closed: true,
+        }
+    }
+
+    pub(crate) fn same_hub(&self, other: &Self) -> bool {
+        self.sender.same_channel(&other.sender)
+    }
+
+    pub(crate) fn closes(&self, hub: &SnapshotHub) -> bool {
+        self.closed
+            && hub
+                .sender
+                .get()
+                .is_some_and(|sender| self.sender.same_channel(sender))
+    }
+
+    pub(crate) fn coalesce(&mut self, mut newer: Self) -> RetainedScopeSnapshot {
+        debug_assert!(self.same_hub(&newer));
+        debug_assert!(!self.closed, "a closed snapshot hub cannot publish again");
+        self.published |= newer.published;
+        self.closed = newer.closed;
+        self.snapshot
+            .replace(
+                newer
+                    .snapshot
+                    .take()
+                    .expect("a staged snapshot is installed exactly once"),
+            )
+            .expect("a staged snapshot is present until installation")
+    }
+
+    pub(crate) fn install(mut self, effects: &mut Vec<Box<dyn FnOnce()>>) {
+        let mut snapshot = self.snapshot.take();
+        let mut retired = None;
+        let mut modified = false;
+        let mut generation_exhausted = false;
+        self.sender.modify_silently(|state| {
+            if state.closed {
+                retired = snapshot.take();
+                return;
+            }
+            retired = Some(std::mem::replace(
+                &mut state.snapshot,
+                snapshot
+                    .take()
+                    .expect("a staged snapshot is installed exactly once"),
+            ));
+            if self.published && state.generation.mint().is_none() {
+                generation_exhausted = true;
+            }
+            state.closed = self.closed;
+            modified = true;
+        });
+        if let Some(retired) = retired {
+            effects.push(Box::new(move || drop(retired)));
+        }
+        if generation_exhausted {
+            effects.push(Box::new(|| panic!("snapshot generation space exhausted")));
+        }
+        if modified {
+            let sender = self.sender.clone();
+            effects.push(Box::new(move || sender.pulse()));
+        }
+    }
 }
 
 impl SnapshotHub {
@@ -660,21 +760,10 @@ impl SnapshotHub {
         if sender.receiver_count() == 0 {
             return;
         }
-        let mut retired = None;
-        sender.modify_silently(|state| {
-            if state.closed {
-                return;
-            }
-            retired = Some(std::mem::replace(&mut state.snapshot, snapshot()));
-            state
-                .generation
-                .mint()
-                .expect("snapshot generation space exhausted");
-        });
-        if let Some(retired) = retired {
-            drop(retired);
-            txn.pulse(sender);
+        if txn.snapshot_hub_will_close(self) || sender.read_with(|state| state.closed) {
+            return;
         }
+        txn.stage_snapshot(SnapshotPublication::published(sender.clone(), snapshot()));
     }
 
     /// Closes while the containing scope's observation gate is held.
@@ -704,36 +793,24 @@ impl SnapshotHub {
         if initialized {
             return;
         }
-        let mut retired = None;
-        sender.modify_silently(|state| {
-            if !state.closed {
-                // Install the caller's authoritative terminal projection
-                // unconditionally, whether or not receivers are attached.
-                // Publication is skipped entirely while receiverless, and one
-                // close site (`finish_incarnation_with_terminal`'s stale-epoch
-                // branch) deliberately closes without publishing a `Stopped`
-                // projection first, so the retained value is not otherwise
-                // reliably terminal -- and it is what every later subscriber
-                // reads, since a closed hub declines to install their
-                // recomputed snapshot.
-                //
-                // The install is silent: no generation mint, so live receivers
-                // see exactly the closure they saw before rather than an extra
-                // conflated event. A closed hub delivers no further changes,
-                // so this only corrects what `borrow_latest` reports.
-                retired = Some(std::mem::replace(
-                    &mut state.snapshot,
-                    final_snapshot
-                        .take()
-                        .expect("final snapshot is built exactly once")(),
-                ));
-                state.closed = true;
-            }
-        });
-        if let Some(retired) = retired {
-            drop(retired);
-            txn.pulse(sender);
+        if txn.snapshot_hub_will_close(self) || sender.read_with(|state| state.closed) {
+            return;
         }
+        // Install the caller's authoritative terminal projection
+        // unconditionally, whether or not receivers are attached.
+        // Publication is skipped entirely while receiverless, and one close
+        // site (`finish_incarnation_with_terminal`'s stale-epoch branch)
+        // deliberately closes without publishing a `Stopped` projection
+        // first, so the retained value is not otherwise reliably terminal.
+        // If this transaction already staged a publication, coalescing keeps
+        // that publication's generation edge but replaces its projection with
+        // this final one.
+        txn.stage_snapshot(SnapshotPublication::closed(
+            sender.clone(),
+            final_snapshot
+                .take()
+                .expect("final snapshot is built exactly once")(),
+        ));
     }
 
     pub(crate) fn is_closed(&self) -> bool {

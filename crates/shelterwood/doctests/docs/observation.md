@@ -62,13 +62,16 @@ expected generation number. Several restarts may occur between observations.
 
 ## Waits must accept at-or-past state
 
-Snapshot watches conflate intermediate states. A `wait_for_child` predicate
-must accept every state at or beyond the desired edge, not only the single
-transition it hopes to catch. For example, a readiness wait should accept a
-running or terminal state according to the application's protocol, and a
-restart wait should accept any incarnation that `supersedes` the saved one.
-Pin the returned `membership` when a same-id replacement would not satisfy the
-logical wait.
+Each snapshot-watch value is a complete observation transaction: compound
+changes such as initial batch admission appear all at once, and an ungated
+`borrow_latest` sees either the preceding committed cut or the final one.
+Watches can still conflate intermediate *committed* states. A
+`wait_for_child` predicate must therefore accept every state at or beyond the
+desired edge, not only the single transition it hopes to catch. For example, a
+readiness wait should accept a running or terminal state according to the
+application's protocol, and a restart wait should accept any incarnation that
+`supersedes` the saved one. Pin the returned `membership` when a same-id
+replacement would not satisfy the logical wait.
 
 Use a finite deadline budget for operational waits. The wait accepts any
 `impl Into<DeadlineBudget>`, so a plain `Duration` reads naturally.

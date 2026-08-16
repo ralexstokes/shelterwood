@@ -33,7 +33,7 @@ use crate::{
     observe::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
         LifecycleHub, LifecycleSeq, RetainedScopeSnapshot, ScopeKind, ScopeSnapshot, SnapshotHub,
-        SnapshotReceiver,
+        SnapshotPublication, SnapshotReceiver,
     },
     policy::{ResolvedCommonOptions, ScopeFlavor},
     runtime::{self, Latch},
@@ -907,20 +907,23 @@ impl ObservationGate {
 ///
 /// Every retained control-plane writer takes this token, making an
 /// out-of-transaction mutation unavailable by construction. Tokio invokes
-/// registered wakers synchronously, so pulses and disposal work accumulate on
-/// the token and flush only after its gate guard has been released. The same
-/// drop path runs during unwind, preventing a poisoned transaction from
-/// stranding already-committed wakes.
+/// registered wakers synchronously, so snapshot publications coalesce on the
+/// token and are installed once at commit while the gate is still held. Pulses
+/// and disposal work then flush only after its gate guard has been released.
+/// The same drop path runs during unwind, preventing a poisoned transaction
+/// from stranding already-committed wakes.
 pub struct ObservationTxn<'a> {
     guard: Option<MutexGuard<'a, ()>>,
-    pulses: Vec<Box<dyn FnOnce()>>,
+    effects: Vec<Box<dyn FnOnce()>>,
+    snapshots: Vec<SnapshotPublication>,
 }
 
 impl<'a> ObservationTxn<'a> {
     fn new(guard: MutexGuard<'a, ()>) -> Self {
         Self {
             guard: Some(guard),
-            pulses: Vec::new(),
+            effects: Vec::new(),
+            snapshots: Vec::new(),
         }
     }
 
@@ -928,12 +931,13 @@ impl<'a> ObservationTxn<'a> {
     pub(crate) fn detached() -> Self {
         Self {
             guard: None,
-            pulses: Vec::new(),
+            effects: Vec::new(),
+            snapshots: Vec::new(),
         }
     }
 
     pub fn defer(&mut self, operation: impl FnOnce() + 'static) {
-        self.pulses.push(Box::new(operation));
+        self.effects.push(Box::new(operation));
     }
 
     /// Defers a watch-channel wake. The driver reaches its own senders
@@ -943,13 +947,38 @@ impl<'a> ObservationTxn<'a> {
         self.defer(move || sender.pulse());
     }
 
+    pub(crate) fn snapshot_hub_will_close(&self, hub: &SnapshotHub) -> bool {
+        self.snapshots
+            .iter()
+            .any(|publication| publication.closes(hub))
+    }
+
+    pub(crate) fn stage_snapshot(&mut self, publication: SnapshotPublication) {
+        let retired = if let Some(staged) = self
+            .snapshots
+            .iter_mut()
+            .find(|staged| staged.same_hub(&publication))
+        {
+            Some(staged.coalesce(publication))
+        } else {
+            self.snapshots.push(publication);
+            None
+        };
+        if let Some(retired) = retired {
+            self.defer(move || drop(retired));
+        }
+    }
+
     fn commit(&mut self) {
+        for publication in self.snapshots.drain(..) {
+            publication.install(&mut self.effects);
+        }
         drop(self.guard.take());
         let mut panics = runtime::PanicAccumulator::default();
-        for pulse in self.pulses.drain(..) {
+        for effect in self.effects.drain(..) {
             // One hostile waker must not prevent the remaining committed
             // observation edges from notifying their waiters.
-            panics.run(pulse);
+            panics.run(effect);
         }
     }
 }

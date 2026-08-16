@@ -2772,6 +2772,15 @@ reports `AlreadyAbsent`) only at the commit that withdraws the member
 from residency and publishes its `Removed` edge — §2's
 resident-membership uniqueness holds at every observable cut.
 
+A transaction may contain several of those transitions — initial batch
+admission is the canonical example. Snapshot-watch publication is coalesced
+per scope hub inside the transaction and the single final projection is
+installed at commit, before the observation gate is released. Consequently
+the ungated `borrow_latest` surface and `wait_for_child` see either the prior
+committed cut or the transaction's final cut, never a partial batch. Watch
+conflation remains permitted only *between committed transaction cuts*; it is
+not permission to expose the transaction's internal publications.
+
 `tracing` spans emit from one choke point (the optional `metrics` surface
 is Part II §20). Everything else observational — peer monitoring, actor
 statistics, the self-recovering child-observation reducer, the packaged
@@ -4199,8 +4208,11 @@ implied on all; error/outcome types are B.3 and B.8):
   `run_blocking`'s child token): library-owned; `is_cancelled()`,
   awaitable `cancelled()`; derivation and detach-past-abort per §5.5.
 - **Snapshot receiver**: conflating watch — borrow-latest and
-  changed-await operations; closes at terminality, including a declaring
-  tree dropped unspawned (§3.2 — the terminal
+  changed-await operations. Every retained value is a complete §12
+  observation-transaction cut: publications within one transaction are
+  coalesced and installed once at commit, so an ungated borrow sees the prior
+  or final cut, never an intermediate one. The receiver closes at terminality,
+  including a declaring tree dropped unspawned (§3.2 — the terminal
   `Stopped { reason: NeverStarted }` snapshot is published first).
 
 **Pinned result shapes for the wait/stop surface.** Names carry
@@ -4255,10 +4267,11 @@ fn wait_for_child(
 Semantics: the predicate is evaluated against the named child's
 snapshot within the scope's current snapshot, then against each
 subsequently published one; the future resolves with the first
-**matching** `ChildSnapshot`. The watch conflates, so intermediate
-states can be skipped — the predicate MUST be written to accept any
-state at-or-past the awaited edge (§3.3's ordering discipline: state
-predicates and `supersedes`, never equality with an expected next
+**matching** `ChildSnapshot`. Each value is a complete §12 transaction
+cut, including compound batch admission. The watch can conflate cuts, so
+intermediate committed states can be skipped — the predicate MUST be written
+to accept any state at-or-past the awaited edge (§3.3's ordering discipline:
+state predicates and `supersedes`, never equality with an expected next
 state), and the documentation teaches this. An id with no resident
 membership simply does not match yet; a later `Added` under that id can
 satisfy the wait — ids are labels (§2), so callers needing exactness

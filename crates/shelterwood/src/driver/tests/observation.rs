@@ -1011,6 +1011,37 @@ fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
 }
 
 #[test]
+fn snapshot_watch_batch_admission_is_one_committed_cut() {
+    let root = isolated_scope("root", ScopeFlavor::Ordered);
+    let first = isolated_scope("first", ScopeFlavor::Dynamic);
+    let second = isolated_scope("second", ScopeFlavor::Dynamic);
+    resolve_fixture_options(&first.member);
+    resolve_fixture_options(&second.member);
+    let first_slot = SlotCell::new(Arc::clone(&first.member), Some(first));
+    let second_slot = SlotCell::new(Arc::clone(&second.member), Some(second));
+    let snapshots = root.subscribe_snapshots();
+
+    root.with_observation_gate(|txn| {
+        root.clear_residents_locked(txn);
+        root.admit_child_locked(resident_projection(&first_slot), txn);
+        assert!(
+            snapshots.borrow_latest().children.is_empty(),
+            "the first admission must remain staged until the batch commits"
+        );
+        root.admit_child_locked(resident_projection(&second_slot), txn);
+        assert!(
+            snapshots.borrow_latest().children.is_empty(),
+            "the complete batch must remain staged until its transaction commits"
+        );
+    });
+
+    let committed = snapshots.borrow_latest();
+    assert_eq!(committed.children.len(), 2);
+    assert!(committed.child("first").is_some());
+    assert!(committed.child("second").is_some());
+}
+
+#[test]
 fn plain_resident_state_is_released_before_recursive_removed_publication() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let first = isolated_scope("first", ScopeFlavor::Dynamic);

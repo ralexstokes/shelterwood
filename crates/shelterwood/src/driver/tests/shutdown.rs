@@ -1,5 +1,13 @@
 use super::support::*;
 
+struct BlockingFactoryDrop(Arc<FactoryGate>);
+
+impl Drop for BlockingFactoryDrop {
+    fn drop(&mut self) {
+        self.0.block();
+    }
+}
+
 #[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_teardown_finishes_the_cancelled_root_driver() {
     let plan = DynamicTree::new().lower_for_test();
@@ -41,6 +49,98 @@ async fn runtime_teardown_finishes_the_cancelled_root_driver() {
         root.member.record().stage,
         MemberStage::Terminal(ref exit) if exit.cancellation() == Cancellation::Observed
     ));
+}
+
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_teardown_publishes_the_exit_awaiting_factory_disposal() {
+    const FAILURE: &str = "distinctive application failure";
+
+    let gate = Arc::new(FactoryGate::default());
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "worker",
+            TaskDef::new({
+                let capture = BlockingFactoryDrop(Arc::clone(&gate));
+                move |_| {
+                    let _ = &capture;
+                    async { Err(ExitError::message(FAILURE)) }
+                }
+            })
+            .restart(RestartPolicy::new(
+                RestartCondition::Never,
+                Backoff::Immediate,
+            ))
+            .retention(Retention::Retain),
+        )
+        .expect("valid task");
+    let plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let mut events = root.subscribe_lifecycle();
+    let (hosted, driver) = DedicatedRuntime::spawn(run_scope(plan, ScopeRole::Root));
+
+    root.wait_started().await.expect("root starts");
+    assert!(matches!(
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, gate.wait_entered()).await,
+        crate::runtime::Timeout::Completed(())
+    ));
+    let pending = task.cell.record();
+
+    // Dropping this dedicated runtime destroys the scope-driver future while
+    // the blocking pool remains held in the retained factory's destructor.
+    // Run teardown concurrently so the test can observe the synchronous
+    // driver epilogue before allowing that destructor to finish.
+    let teardown = crate::runtime::spawn(hosted.shutdown());
+    let publication = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
+        let terminal = task.wait().await;
+        let lifecycle = loop {
+            let Some(item) = events.recv().await else {
+                panic!("driver teardown closed lifecycle without an Exited event")
+            };
+            if let LifecycleItem::Event(event) = item
+                && let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+                && id.as_str() == "worker"
+            {
+                break exit;
+            }
+        };
+        (terminal, lifecycle, task.cell.record())
+    })
+    .await;
+
+    // Always unblock the runtime thread before asserting the publication, so
+    // a regression fails promptly rather than waiting for the gate backstop.
+    gate.release();
+    let teardown =
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(teardown)).await;
+    let driver = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(driver)).await;
+
+    assert!(matches!(
+        teardown,
+        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { value: () })
+    ));
+    assert!(matches!(
+        driver,
+        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Cancelled)
+    ));
+    assert!(matches!(pending.stage, MemberStage::Running));
+    assert_eq!(pending.last_exit, None);
+    let crate::runtime::Timeout::Completed((terminal, lifecycle, record)) = publication else {
+        panic!("driver teardown did not publish the pending terminal exit")
+    };
+    let MemberStage::Terminal(recorded) = record.stage else {
+        panic!("driver teardown did not terminalize the child membership")
+    };
+    for exit in [&terminal, &lifecycle, &recorded] {
+        assert!(matches!(
+            exit.kind(),
+            ExitKind::Failed(error) if error.to_string() == FAILURE
+        ));
+        assert_eq!(exit.cancellation(), Cancellation::NotObserved);
+    }
+    assert_eq!(lifecycle, terminal);
+    assert_eq!(recorded, terminal);
+    assert_eq!(record.last_exit, Some(terminal));
 }
 
 #[crate::runtime::test]

@@ -740,6 +740,8 @@ impl<M: Send + 'static> MailboxTermination for MailboxTeardown<M> {
     }
 }
 
+impl<M: Send + 'static> crate::private::SealedMailboxTermination for MailboxTeardown<M> {}
+
 impl<M: Send + 'static> Drop for MailboxTeardown<M> {
     fn drop(&mut self) {
         let mut panics = PanicAccumulator::default();
@@ -1186,6 +1188,8 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             )
     }
 }
+
+impl<M: Send + 'static> crate::private::SealedMailboxControl for MailboxCell<M> {}
 
 fn mint_accepted_sequence(accepted: &AtomicPoisonedCounter) -> AcceptedSequence {
     AcceptedSequence(

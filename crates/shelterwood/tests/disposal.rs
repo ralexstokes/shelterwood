@@ -4,23 +4,23 @@ use std::{
     future::{Future, poll_fn},
     marker::PhantomData,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    task::Poll,
+    task::{Context, Poll, Wake, Waker},
     thread::{self, ThreadId},
     time::Duration,
 };
 
 use crate::common::{
     DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually,
-    policy::never,
+    policy::never, poll_once,
 };
 use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult,
     Jitter, LifecycleEventKind, LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef,
     Readiness, ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition,
-    RestartPolicy, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    RestartPolicy, ScopeState, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe {
@@ -73,6 +73,33 @@ impl BlockingDropProbe {
 impl Drop for BlockingDropProbe {
     fn drop(&mut self) {
         let _ = self.dropped.send(thread::current().id());
+    }
+}
+
+struct BlockingWake {
+    blocker: Mutex<Option<DestructorBlocker>>,
+}
+
+impl BlockingWake {
+    fn new(blocker: DestructorBlocker) -> Self {
+        Self {
+            blocker: Mutex::new(Some(blocker)),
+        }
+    }
+}
+
+impl Wake for BlockingWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let blocker = self
+            .blocker
+            .lock()
+            .expect("blocking waker mutex is available")
+            .take();
+        drop(blocker);
     }
 }
 
@@ -988,7 +1015,7 @@ async fn hard_shutdown_detaches_failed_nested_lowering_disposal() {
     assert!(result.is_err(), "the still-live subtree is a straggler");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restart_window_cleanup_is_isolated_without_reclassifying_the_recorded_exit() {
     let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
     let mut tree = Tree::new();
@@ -1022,8 +1049,42 @@ async fn restart_window_cleanup_is_isolated_without_reclassifying_the_recorded_e
         )
         .await
         .expect("task enters restart backoff");
-    system
-        .shutdown(Duration::ZERO)
+
+    // Park the driver inside the wake flush for its `Draining` snapshot. The
+    // shutdown future can then sample the published cut on the other worker
+    // before the driver proceeds to its queued `StopChild` effect. This makes
+    // the multi-thread race deterministic: drain publication must already
+    // include the restart-window child's terminal-disposal intent.
+    let snapshot_wake_gate = DestructorGate::default();
+    let snapshot_waker = Waker::from(Arc::new(BlockingWake::new(snapshot_wake_gate.blocker())));
+    let mut snapshots = scope.subscribe_snapshots();
+    let mut snapshot_change = Box::pin(snapshots.changed());
+    let mut snapshot_context = Context::from_waker(&snapshot_waker);
+    assert!(
+        snapshot_change
+            .as_mut()
+            .poll(&mut snapshot_context)
+            .is_pending()
+    );
+
+    let mut shutdown = Box::pin(system.shutdown(Duration::ZERO));
+    assert!(poll_once(shutdown.as_mut()).is_pending());
+    wait_for_destructor(&snapshot_wake_gate).await;
+    // `BlockingWake` is one-shot, so it parks the driver at whichever
+    // snapshot pulse arrives first. Pin the parked cut: without this the
+    // second `poll_once` below could report `Pending` merely because the
+    // shutdown future is still waiting to observe `Draining`, and the test
+    // would pass having exercised nothing.
+    assert!(
+        matches!(scope.snapshot().state, ScopeState::Draining),
+        "the driver must be parked on the drain publication, not an earlier pulse"
+    );
+    assert!(
+        poll_once(shutdown.as_mut()).is_pending(),
+        "the zero-budget sample escalates before the blocked driver continues"
+    );
+    snapshot_wake_gate.release();
+    shutdown
         .await
         .expect("restart-window cleanup does not become a shutdown straggler");
     assert_disposed_off_current(&mut drops, "restart-window factory was disposed").await;

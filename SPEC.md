@@ -994,10 +994,21 @@ the drain, leaving the handled log a proper prefix of the accepted one.
 non-failed actor: on every cooperative stop path above, whether or not a
 drain preceded it. It does not run when `init` failed (no actor value
 exists), when a handler — live or draining — returned `Err` or panicked
-(the incarnation is failed; cleanup is the crash-only path, `Drop`), or
-on hard abort (the future is destroyed). Grace bounds drain plus
-`on_stop` together (§10) — including after a local `ctx.stop()`, which
-arms the child's own configured ladder (§10).
+(the incarnation is failed; cleanup is the crash-only path, `Drop`), when
+any incarnation-owned disposal panic is observed at a receive boundary
+(including one entering stop or drain), or on hard abort (the future is
+destroyed). Incarnation-owned disposal is §5.5's resource funnel — the
+offloaded future and its continuation closure, plus the queued
+continuations, armed timers and queued offload completions released at
+the intake freeze; the frozen mailbox prefix's own detached disposal
+above is not part of it and stays a disposal fault. A disposal panic
+**already retained when a receive boundary is reached** therefore fails
+the incarnation before any further delivery or `on_stop`. As with
+`Guard::finished()` (§5.5) this is not a join: a panic that lands after
+the last receive boundary is still the incarnation's exit, but cannot
+suppress `on_stop`. Grace bounds drain plus `on_stop` together (§10) —
+including after a local `ctx.stop()`, which arms the child's own
+configured ladder (§10).
 
 ### 5.3 One timer facility
 
@@ -1120,7 +1131,12 @@ handlers non-blocking. Contracts:
   `Guard::is_finished` / `finished()` report either ordinary work
   completion or an incarnation-teardown cancellation request. They are not
   a join guarantee: a hard-aborted task can still be unwinding after the
-  notification.
+  notification. Ordinary completion does retain a panicking future's
+  payload *before* the notification fires, so a `finished()` await that
+  observed completion guarantees the panic is retained for §5.2's next
+  receive boundary; a teardown cancellation fires the same notification
+  without that ordering, which is why §5.2 conditions its guarantee on
+  retention rather than on the panic having happened.
 - Any higher-level helper that composes `call` inside `offload` MUST
   preserve: incarnation ownership; completion through the actor loop; a
   total timeout continuation; and no await inside the handler.
@@ -2289,11 +2305,17 @@ framework contract**. No other normative shutdown paragraph is unmapped.
   terminalize (sends fail `Terminated`, exit-awaiting surfaces resolve),
   in-flight admissions and removals resolve their enumerated rejections,
   and every `Added` is paired with its `Removed` before the scope's own
-  final event. First publication wins: an orderly post-join report that
-  already landed is never overwritten. §7's post-join precision is an
+  final event. An inactive child in the classified-but-unpublished terminal-
+  disposal state is not coarsened: teardown publishes its stored exit before
+  discharging terminality, without waiting for the retained user-state
+  disposal, so that classified verdict wins. A retained-construction
+  destructor panic is not folded in on this path, whether still in flight or
+  already reported but undispatched: teardown consumes the stored verdict as
+  classified at join. First publication wins: an orderly post-join report
+  that already landed is never overwritten. §7's post-join precision is an
   orderly-path property, deliberately traded for promptness on the kill
-  path — the future was destroyed, so "what would it have reported"
-  is unknowable in bounded time; this is the same trade `brutal_kill` →
+  path — the future was destroyed, so "what would it have reported" is
+  unknowable in bounded time; this is the same trade `brutal_kill` →
   `killed` makes, decided here once rather than per call site.
 - "Drained" has exactly one definition, derived from child state (no
   hand-maintained live counter).
@@ -2771,6 +2793,17 @@ dynamic removal: the removed id becomes reusable (and a repeated `remove`
 reports `AlreadyAbsent`) only at the commit that withdraws the member
 from residency and publishes its `Removed` edge — §2's
 resident-membership uniqueness holds at every observable cut.
+Drain entry follows the same rule: publishing `Draining` includes the
+terminal-disposal intent for every inactive child selected to stop in that
+same driver step. A zero-budget shutdown's straggler sample cannot split that
+entry step, so restart-window cleanup already committed by it is not a
+straggler; an active child, or an ordered sibling whose stop has not yet
+been selected, remains reportable. The guarantee covers that entry step
+only: an ordered scope stops its children one step at a time, and every
+step after entry races the sample by design, so whether a later sibling
+has already terminalized when the sample runs is schedule-dependent and
+both outcomes conform. This ruling is pinned on a multi-thread runtime by
+`integration::restart_window_cleanup_is_isolated_without_reclassifying_the_recorded_exit`.
 
 A transaction may contain several of those transitions — initial batch
 admission is the canonical example. Snapshot-watch publication is coalesced
@@ -3057,6 +3090,27 @@ integration toolkit for the driver shell and the end-to-end invariants.
     behind typed verdicts, and the property that matters at the remaining
     façade boundary — blanket user error conversion cannot mint an
     authenticated structured payload — is pinned by its conformance probe.
+    `MailboxControl` and `MailboxTermination` are private-supertrait sealed in
+    their defining mailbox crate. The cross-crate `DynamicRoute`,
+    `ActorIdentity`, and `MailboxRuntime` traits and their installers remain an
+    explicitly unsupported direct-dependency seam, not user extension points.
+    A private-supertrait seal in either defining lower crate would also exclude
+    these three traits' legitimate implementations in downstream sibling
+    crates, while a publicly obtainable installation capability would not
+    exclude direct dependents. The supported `shelterwood` façade therefore
+    remains the enforced boundary: it exports neither the traits nor their
+    installation paths. Foreign implementations or construction through the
+    lower crates void the lock-rule and identity-pairing contracts. Public
+    constructors on façade types are different: `CancellationToken::from_latch`
+    is crate-gated even though its hidden rustdoc signature previously escaped
+    the JSON walk. The same capability nonetheless survives one type over:
+    `ParentCancellationToken::from_latch` stays `pub` on a `#[doc(hidden)]`
+    struct, reachable only through the same unsupported direct dependency on
+    `shelterwood-cells`, which is why crate-gating it is a tidiness gain and
+    not the enforcement. The rustdoc-JSON walk is deliberately left blind to
+    hidden items rather than taught to descend into hidden methods on
+    exported types; the façade-absence probe in
+    `tools/check-external-consumer.sh` is what enforces this boundary.
 14. **Event-woken observers see consistent-or-newer snapshots.** Subscribe
    to lifecycle events; *synchronously inside the event arm*, read the
    snapshot and assert it already reflects the event — at both ends of the

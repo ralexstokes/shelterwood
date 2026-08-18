@@ -9,6 +9,10 @@ fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<Shutd
         // pending, the marker itself excludes the child. Reading the record
         // first could pair a stale nonterminal projection with the later
         // cleared marker and recreate a narrow trailing gap.
+        //
+        // Argued, not pinned: the window is too narrow to provoke
+        // deterministically, and reverting to record-first leaves the suite
+        // green.
         if child.member.terminal_disposal_pending()
             || matches!(child.member.record().stage, MemberStage::Terminal(_))
         {
@@ -189,7 +193,11 @@ impl ScopeRuntime {
             else {
                 unreachable!()
             };
-            self.reduce(SupervisorEvent::Settle);
+            // No pre-`Settle` here, unlike `begin_drain_transition`.
+            // `SupervisorEvent::Force` already pushes `ForceChild` for every
+            // non-joined child, a strict superset of the single `StopChild` an
+            // ordered scope's `Settle` could add, so settling early cannot
+            // contribute a member this selection would otherwise miss.
             let terminal_disposals =
                 self.drain_entry_terminal_disposals(&self.supervisor_effects[before..]);
             self.root.publish_drain(

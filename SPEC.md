@@ -2775,9 +2775,12 @@ Drain entry follows the same rule: publishing `Draining` includes the
 terminal-disposal intent for every inactive child selected to stop in that
 same driver step. A zero-budget shutdown's straggler sample cannot split that
 entry step, so restart-window cleanup already committed by it is not a
-straggler; an active child, or an ordered sibling whose stop has not yet been
-selected, remains reportable. This ruling is pinned on a multi-thread runtime
-by
+straggler; an active child, or an ordered sibling whose stop has not yet
+been selected, remains reportable. The guarantee covers that entry step
+only: an ordered scope stops its children one step at a time, and every
+step after entry races the sample by design, so whether a later sibling
+has already terminalized when the sample runs is schedule-dependent and
+both outcomes conform. This ruling is pinned on a multi-thread runtime by
 `integration::restart_window_cleanup_is_isolated_without_reclassifying_the_recorded_exit`.
 
 `tracing` spans emit from one choke point (the optional `metrics` surface

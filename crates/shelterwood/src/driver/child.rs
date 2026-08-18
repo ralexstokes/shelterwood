@@ -1138,6 +1138,10 @@ impl ScopeRuntime {
         // Keep the marker installed until terminal publication has committed.
         // A concurrent shutdown sampler then sees either pending cleanup or a
         // terminal member, never the gap between those two representations.
+        //
+        // Argued, not pinned: clearing the marker before `terminalize_child`
+        // reopens that gap for a few instructions, which no test in the suite
+        // can provoke deterministically.
         member.set_terminal_disposal_pending(false);
         if self.supervisor.membership_status(key) == MembershipStatus::Removing {
             self.flush_supervisor_effects();

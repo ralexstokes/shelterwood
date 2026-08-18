@@ -20,7 +20,7 @@ use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult,
     Jitter, LifecycleEventKind, LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef,
     Readiness, ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition,
-    RestartPolicy, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    RestartPolicy, ScopeState, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe {
@@ -1070,6 +1070,15 @@ async fn restart_window_cleanup_is_isolated_without_reclassifying_the_recorded_e
     let mut shutdown = Box::pin(system.shutdown(Duration::ZERO));
     assert!(poll_once(shutdown.as_mut()).is_pending());
     wait_for_destructor(&snapshot_wake_gate).await;
+    // `BlockingWake` is one-shot, so it parks the driver at whichever
+    // snapshot pulse arrives first. Pin the parked cut: without this the
+    // second `poll_once` below could report `Pending` merely because the
+    // shutdown future is still waiting to observe `Draining`, and the test
+    // would pass having exercised nothing.
+    assert!(
+        matches!(scope.snapshot().state, ScopeState::Draining),
+        "the driver must be parked on the drain publication, not an earlier pulse"
+    );
     assert!(
         poll_once(shutdown.as_mut()).is_pending(),
         "the zero-budget sample escalates before the blocked driver continues"

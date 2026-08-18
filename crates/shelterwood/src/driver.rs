@@ -419,11 +419,30 @@ impl Drop for ScopeRuntime {
 }
 
 impl ScopeRuntime {
+    /// Folds every construction-disposal completion the lane already holds.
+    ///
+    /// Non-blocking by construction, so a disposal still running on the
+    /// blocking pool stays detached. A completion the driver already lifted
+    /// out of this lane into the current arbitrated batch is out of reach
+    /// here; SPEC records that limit and #293 tracks closing it.
     fn drain_arrived_disposal_events(&mut self) {
-        while let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-            runtime::unbounded_mpsc_try_recv(&mut self.disposal_event_receiver)
+        while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut self.disposal_event_receiver)
         {
-            self.handle_construction_disposed(child, panic);
+            // The lane has one producer, which sends exactly one variant.
+            // Assert rather than let a pattern-matching loop condition drop
+            // an unexpected event and silently abandon the rest of the
+            // drain; teardown runs this during an unwind, where a panic
+            // would abort.
+            debug_assert!(
+                matches!(
+                    event,
+                    DriverEvent::Child(ChildEvent::ConstructionDisposed { .. })
+                ),
+                "the disposal lane carries only construction-disposal completions"
+            );
+            if let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = event {
+                self.handle_construction_disposed(child, panic);
+            }
         }
     }
 

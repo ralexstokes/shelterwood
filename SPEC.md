@@ -2309,11 +2309,14 @@ framework contract**. No other normative shutdown paragraph is unmapped.
   disposal state is not coarsened: teardown publishes its stored exit before
   discharging terminality, without waiting for the retained user-state
   disposal, so that classified verdict wins. A retained-construction
-  destructor panic already reported on the disposal lane is folded into that
+  destructor panic still queued on the disposal lane is folded into that
   exit before publication, just as on orderly dispatch. Teardown drains only
-  the arrived prefix and never waits: a disposal still in flight remains
-  detached, and its unknowable result cannot delay the kill path. First
-  publication wins, so a later completion cannot overwrite the bounded
+  what the lane already holds and never waits: a disposal still in flight
+  remains detached, and its unknowable result cannot delay the kill path. A
+  completion the driver already lifted out of the lane into its current
+  arbitrated batch is likewise not folded — the teardown transition sorts
+  ahead of it — so the fold is a promptness improvement, not a guarantee.
+  First publication wins, so a later completion cannot overwrite the bounded
   fallback. This is the same precision boundary `brutal_kill` → `killed`
   makes, decided here once rather than per call site.
 - "Drained" has exactly one definition, derived from child state (no

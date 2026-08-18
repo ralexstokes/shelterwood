@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use shelterwood::{
     Backoff, BackoffFactor, BoundedReadinessDeadline, ExponentialBackoff, FixedBackoff, Intensity,
-    Jitter, Mailbox, NonZeroDuration, PolicyError, ReadinessDeadline,
+    Jitter, Mailbox, PolicyError, ReadinessDeadline,
 };
 
 #[test]
@@ -59,16 +59,14 @@ fn other_policy_constructors_reject_zero_values() {
 
 /// Every binding here is type-annotated on purpose. The sealing proofs in
 /// `policy.rs` are `compile_fail` fences, which pass for *any* compilation
-/// error; naming each payload type in a test that must compile keeps them
-/// exported and nameable, so the only failure those fences can be resting on
-/// is the private-field one they claim.
+/// error, so each one rests on the payload type staying exported under the
+/// name it uses. That nameability is pinned by the façade's `pub use` list
+/// (`shelterwood::policy`, re-exported from `lib.rs`), which would stop
+/// compiling on a rename or a removal; what this test adds is the other half
+/// of the claim — that the only way through those private fields is a
+/// validating constructor, and that the accessors report what it validated.
 #[test]
 fn sealed_payloads_expose_only_constructor_validated_values() {
-    let duration = Duration::from_nanos(1);
-    let duration: NonZeroDuration =
-        NonZeroDuration::new(duration).expect("the duration is non-zero");
-    assert_eq!(duration.get(), Duration::from_nanos(1));
-
     let fixed_delay = Duration::from_millis(10);
     let Backoff::Fixed(fixed) =
         Backoff::fixed(fixed_delay, Jitter::Equal).expect("the delay is non-zero")

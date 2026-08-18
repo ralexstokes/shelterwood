@@ -854,6 +854,15 @@ pub type ErasedDynamicSlot = dyn Any + Send + Sync;
 /// Object-safe dynamic route retained by a restart-stable scope cell.
 pub type ErasedDynamicRoute = dyn DynamicRoute<Slot = ErasedDynamicSlot>;
 
+/// Cross-crate implementation seam for the façade's dynamic declaration
+/// route.
+///
+/// # Implementation boundary
+///
+/// This is not a user extension point. Only Shelterwood's façade implements
+/// and installs this trait. Its methods may run while the restart-stable tree
+/// owns its observation gate, so a foreign implementation invalidates the
+/// framework's lock-rule guarantees.
 pub trait DynamicRoute: Send + Sync {
     type Slot: ?Sized + Send + Sync;
 

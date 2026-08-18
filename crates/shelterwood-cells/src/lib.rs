@@ -5,6 +5,13 @@
 //! This implementation crate is structurally below Shelterwood's mutable
 //! driver. Its broader public surface consists of cross-crate implementation
 //! seams; the supported API remains the `shelterwood` façade.
+//!
+//! Direct dependencies on this crate are unsupported. In particular,
+//! [`DynamicRoute`] and the public methods that install it exist so the
+//! downstream façade crate can complete the dependency inversion; they are
+//! not user extension points. A foreign implementation may be called while a
+//! framework observation mutex is held and therefore invalidates the
+//! framework's lock-rule guarantees.
 
 mod admission;
 mod cancellation;

@@ -55,6 +55,12 @@ pub trait MailboxSignalWatcher: Send {
 /// The public façade installs one object per mailbox. Type erasure keeps the
 /// adapter out of `ActorRef`'s type parameters while this crate remains free of
 /// Tokio and every other concrete executor.
+///
+/// # Implementation boundary
+///
+/// This is an implementation seam for Shelterwood's runtime-adapter crate,
+/// not a user-supplied executor interface. Foreign implementations and direct
+/// construction of mailbox cells are outside the supported façade contract.
 #[doc(hidden)]
 pub trait MailboxRuntime: Send + Sync {
     fn oneshot(

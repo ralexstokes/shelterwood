@@ -1,0 +1,18 @@
+[package]
+name = "shelterwood-external-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+from-latch = []
+installable-seams = []
+sealed-mailbox-seams = ["dep:shelterwood-core", "dep:shelterwood-mailbox"]
+private-seal-module = ["dep:shelterwood-mailbox"]
+
+[dependencies]
+shelterwood = { path = "../../crates/shelterwood" }
+shelterwood-core = { path = "../../crates/shelterwood-core", optional = true }
+shelterwood-mailbox = { path = "../../crates/shelterwood-mailbox", optional = true }

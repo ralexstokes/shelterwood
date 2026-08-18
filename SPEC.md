@@ -3059,7 +3059,14 @@ integration toolkit for the driver shell and the end-to-end invariants.
     lower crates void the lock-rule and identity-pairing contracts. Public
     constructors on façade types are different: `CancellationToken::from_latch`
     is crate-gated even though its hidden rustdoc signature previously escaped
-    the JSON walk.
+    the JSON walk. The same capability nonetheless survives one type over:
+    `ParentCancellationToken::from_latch` stays `pub` on a `#[doc(hidden)]`
+    struct, reachable only through the same unsupported direct dependency on
+    `shelterwood-cells`, which is why crate-gating it is a tidiness gain and
+    not the enforcement. The rustdoc-JSON walk is deliberately left blind to
+    hidden items rather than taught to descend into hidden methods on
+    exported types; the façade-absence probe in
+    `tools/check-external-consumer.sh` is what enforces this boundary.
 14. **Event-woken observers see consistent-or-newer snapshots.** Subscribe
    to lifecycle events; *synchronously inside the event arm*, read the
    snapshot and assert it already reflects the event — at both ends of the

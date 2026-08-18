@@ -46,6 +46,16 @@ mod sealed_mailbox_seams {
     }
 }
 
+// The sealed-trait bound above is reported the same way whether or not the
+// seal module is reachable. This states the underlying property directly: the
+// module holding the private supertraits must not be nameable from outside
+// its defining crate.
+#[cfg(feature = "private-seal-module")]
+use shelterwood_mailbox::private::SealedMailboxControl;
+
+#[cfg(feature = "private-seal-module")]
+use shelterwood_mailbox::private::SealedMailboxTermination;
+
 fn main() {
     let _ = accepts_supported_token;
 

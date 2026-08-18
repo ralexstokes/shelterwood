@@ -76,6 +76,11 @@ impl<M> ActorRef<M> {
 /// This sibling-crate seam is not a supported constructor. The identity and
 /// mailbox must belong to the same member; violating that invariant produces
 /// a handle whose equality and error identity disagree with its route.
+// `doc(hidden)` trades enforcement for rustdoc tidiness: the rustdoc-JSON
+// reachability walk (`shelterwood-api-reachability`) skips hidden items, so it
+// no longer sees this signature. It names only local types today, so nothing
+// leaks; the sole remaining enforcement that the façade cannot re-export it is
+// `tools/check-external-consumer.sh`'s `installable-seams` probe.
 #[doc(hidden)]
 pub fn actor_ref_from_parts<I, M>(member: Arc<I>, mailbox: Arc<MailboxCell<M>>) -> ActorRef<M>
 where

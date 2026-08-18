@@ -45,10 +45,26 @@ if cargo check --locked --manifest-path "$manifest" --features sealed-mailbox-se
     echo "external consumers can implement sealed mailbox seams" >&2
     exit 1
 fi
+# The unsatisfied-bound error names the sealed supertrait whether or not `mod
+# private` is reachable, so a bare name grep would still pass against a
+# `pub mod private`. Only rustc's "which is not accessible" note distinguishes
+# a genuine seal from a consumer that merely forgot a supertrait impl.
 for seam in SealedMailboxControl SealedMailboxTermination; do
-    if ! grep -Fq "$seam" "$diagnostics"; then
+    if ! grep -Fq "\`shelterwood_mailbox::private::$seam\`, which is not accessible" "$diagnostics"; then
         cat "$diagnostics" >&2
         echo "sealed-mailbox-seam probe failed for an unexpected reason" >&2
         exit 1
     fi
 done
+
+# Belt and braces for the same property, stated directly: the seal module
+# itself must be unnameable from outside its defining crate.
+if cargo check --locked --manifest-path "$manifest" --features private-seal-module >"$diagnostics" 2>&1; then
+    echo "external consumers can name the mailbox seal module" >&2
+    exit 1
+fi
+if ! grep -Fq 'module `private` is private' "$diagnostics"; then
+    cat "$diagnostics" >&2
+    echo "private-seal-module probe failed for an unexpected reason" >&2
+    exit 1
+fi

@@ -3,8 +3,18 @@ use super::*;
 fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<ShutdownStraggler>) {
     let children = scope.resident_projections();
     for child in children {
-        if matches!(child.member.record().stage, MemberStage::Terminal(_))
-            || child.member.terminal_disposal_pending()
+        // Read the release/acquire marker before the terminal projection. If
+        // terminal publication has already cleared it, that acquire orders
+        // the following record read after publication; if cleanup is still
+        // pending, the marker itself excludes the child. Reading the record
+        // first could pair a stale nonterminal projection with the later
+        // cleared marker and recreate a narrow trailing gap.
+        //
+        // Argued, not pinned: the window is too narrow to provoke
+        // deterministically, and reverting to record-first leaves the suite
+        // green.
+        if child.member.terminal_disposal_pending()
+            || matches!(child.member.record().stage, MemberStage::Terminal(_))
         {
             continue;
         }
@@ -81,6 +91,35 @@ pub(crate) async fn shutdown_scope(
 }
 
 impl ScopeRuntime {
+    fn drain_entry_terminal_disposals(&self, effects: &[SupervisorEffect]) -> Vec<Arc<MemberCell>> {
+        let mut keys = BTreeSet::new();
+        for effect in effects {
+            let key = match effect {
+                SupervisorEffect::StopChild { child } | SupervisorEffect::ForceChild { child } => {
+                    *child
+                }
+                _ => continue,
+            };
+            if self.supervisor.membership_terminal(key)
+                || self.supervisor.is_disposing(key)
+                || self
+                    .children
+                    .get(key)
+                    .is_none_or(|child| child.active.is_some())
+            {
+                continue;
+            }
+            keys.insert(key);
+        }
+        keys.into_iter()
+            .filter_map(|key| {
+                self.children
+                    .get(key)
+                    .map(|child| Arc::clone(&child.slot.member))
+            })
+            .collect()
+    }
+
     pub(super) fn begin_drain(&mut self, reason: StopReason) {
         let startup = self
             .supervisor
@@ -125,12 +164,16 @@ impl ScopeRuntime {
         else {
             unreachable!()
         };
-        if let Some(startup) = startup {
-            self.root.set_state_and_startup(state, startup);
-        } else {
-            debug_assert!(!startup_pending);
-            self.root.set_state(state);
-        }
+        debug_assert!(startup.is_some() || !startup_pending);
+        // Ordered drain exposes its first stop only through `Settle`; derive
+        // that command before publication so both scope flavors can commit an
+        // inactive child's terminal-cleanup intent with the `Draining` edge.
+        // Later ordered siblings are deliberately absent: their cooperative
+        // stop has not begun and a zero-budget sample must still report them.
+        self.reduce(SupervisorEvent::Settle);
+        let terminal_disposals =
+            self.drain_entry_terminal_disposals(&self.supervisor_effects[before..]);
+        self.root.publish_drain(state, startup, &terminal_disposals);
         self.flush_supervisor_effects();
         self.settle_supervisor();
     }
@@ -150,12 +193,18 @@ impl ScopeRuntime {
             else {
                 unreachable!()
             };
-            if startup_pending {
-                self.root
-                    .set_state_and_startup(state, Err(StartupError::ShutdownRequested));
-            } else {
-                self.root.set_state(state);
-            }
+            // No pre-`Settle` here, unlike `begin_drain_transition`.
+            // `SupervisorEvent::Force` already pushes `ForceChild` for every
+            // non-joined child, a strict superset of the single `StopChild` an
+            // ordered scope's `Settle` could add, so settling early cannot
+            // contribute a member this selection would otherwise miss.
+            let terminal_disposals =
+                self.drain_entry_terminal_disposals(&self.supervisor_effects[before..]);
+            self.root.publish_drain(
+                state,
+                startup_pending.then_some(Err(StartupError::ShutdownRequested)),
+                &terminal_disposals,
+            );
         }
         self.flush_supervisor_effects();
         self.settle_supervisor();

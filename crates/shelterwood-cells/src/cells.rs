@@ -509,10 +509,41 @@ impl MemberCell {
         };
     }
 
+    /// Reads the drain-entry terminal-disposal marker.
+    ///
+    /// `Acquire` pairs with the `Release` store in
+    /// [`Self::set_terminal_disposal_pending`]. Two separate edges make a
+    /// zero-budget straggler sample (the driver's `collect_stragglers`)
+    /// correct, and both rest on these atomics alone: the sample is *not*
+    /// incidentally serialized by the observation gate, because
+    /// [`ScopeCell::resident_projections`] takes `observation.current_children`
+    /// — a different mutex from the gate `publish_drain` holds.
+    ///
+    /// * A load that observes the *clear* synchronizes with the store the
+    ///   driver issues after `terminalize_child` published
+    ///   `MemberStage::Terminal`, so the sampler's following record read is
+    ///   ordered after that publication. It cannot pair a stale nonterminal
+    ///   projection with an already-cleared marker.
+    /// * A load cannot return a stale `false` from *before* the marker was
+    ///   set. A sampler reaches this call only after reading
+    ///   `ScopeState::Draining` out of the scope record, and
+    ///   [`Self::set_terminal_disposal_pending`] stores every drain-entry
+    ///   marker *before* `publish_drain` writes that record. The record
+    ///   write/read pair supplies happens-before, and coherence then forbids
+    ///   this load from returning a value preceding `true` in the marker's
+    ///   modification order.
     pub fn terminal_disposal_pending(&self) -> bool {
         self.terminal_disposal_pending.load(Ordering::Acquire)
     }
 
+    /// Installs or clears the drain-entry terminal-disposal marker.
+    ///
+    /// `Release` publishes everything the caller sequenced before it. The
+    /// clearing store at terminal publication therefore carries
+    /// `MemberStage::Terminal` to any sampler whose `Acquire` load reads it;
+    /// the setting store is made visible by the `Draining` record write that
+    /// `publish_drain` performs afterwards. See
+    /// [`Self::terminal_disposal_pending`] for the full argument.
     pub fn set_terminal_disposal_pending(&self, pending: bool) {
         self.terminal_disposal_pending
             .store(pending, Ordering::Release);
@@ -1440,6 +1471,48 @@ impl ScopeCell {
     pub fn set_state_and_startup(&self, state: ScopeState, startup: Result<(), StartupError>) {
         self.with_observation_gate(|txn| {
             self.set_startup_locked(startup, txn);
+            self.set_state_locked(state, txn);
+        });
+    }
+
+    /// Publishes drain entry together with terminal-cleanup intent selected by
+    /// the same driver step.
+    ///
+    /// A zero-budget shutdown waiter wakes from the state publication and
+    /// immediately samples descendants. Installing these markers under the
+    /// shared observation gate keeps that sample from splitting drain entry
+    /// between the scope transition and an inactive child's cleanup.
+    pub fn publish_drain(
+        &self,
+        state: ScopeState,
+        startup: Option<Result<(), StartupError>>,
+        terminal_disposals: &[Arc<MemberCell>],
+    ) {
+        debug_assert!(matches!(state, ScopeState::Draining));
+        self.with_observation_gate(|txn| {
+            // Statement order is load-bearing: every marker must be stored
+            // *before* `set_state_locked` writes `Draining` into the scope
+            // record. A zero-budget sampler reads that record first, so the
+            // `Draining` read is the release edge that makes the markers
+            // visible to it. Publishing the state first reopens #270: the
+            // driver writes `Draining` with no marker yet stored, a sampler on
+            // another worker reads `Draining`, then reads `false` for a child
+            // this very step is disposing, then reads that child's still
+            // nonterminal record, and reports a spurious
+            // `Err(ShutdownTimeout)`. No test holds this order — moving the
+            // loop below `set_state_locked` leaves the suite green — so this
+            // comment is the only guard.
+            for member in terminal_disposals {
+                debug_assert!(
+                    self.current_observation_gate()
+                        .same_gate(&member.current_observation_gate()),
+                    "a drain entry may mark only a resident member on its observation gate"
+                );
+                member.set_terminal_disposal_pending(true);
+            }
+            if let Some(startup) = startup {
+                self.set_startup_locked(startup, txn);
+            }
             self.set_state_locked(state, txn);
         });
     }

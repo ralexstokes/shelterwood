@@ -556,6 +556,18 @@ impl SnapshotReceiver {
         (state.snapshot.public(), state.closed)
     }
 
+    /// The hub's current generation.
+    ///
+    /// Delivery conflates generation edges, so [`Self::changed`] resolves once
+    /// whether a transaction minted one edge or ten. A test that pins the
+    /// publication economy — one edge per hub per transaction — has to read
+    /// the counter directly.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn current_generation(&self) -> u64 {
+        self.inner.borrow_cloned().generation.current()
+    }
+
     /// Waits for and returns a newer snapshot.
     pub async fn changed(&mut self) -> Result<Arc<ScopeSnapshot>, SnapshotClosed> {
         loop {
@@ -596,9 +608,37 @@ struct SnapshotHubState {
     closed: bool,
 }
 
+/// Deferred construction of one hub's transaction-final projection.
+///
+/// A publication stages a producer rather than a value. A compound transition
+/// touching M children publishes M times per hub, and every intermediate cut
+/// is superseded by the next one, so materializing them would build M full
+/// recursive projections and retain all but one of them until commit — M²/2
+/// `ChildSnapshot`s per hub for a batch admission whose width the user
+/// declares. Coalescing replaces the producer instead, so a superseded cut is
+/// never built at all and the survivor runs exactly once, inside `commit`,
+/// while the observation gate still holds the resident tree still.
+///
+/// The producer is `FnMut` rather than `FnOnce` so that running it does not
+/// also destroy it: it captures an `Arc<ScopeCell>` whose release belongs
+/// after the gate is unlocked, like every other user-bearing drop. `install`
+/// hands the spent producer to the effect list rather than dropping it.
+pub(crate) struct SnapshotProjection(Box<dyn FnMut() -> Option<RetainedScopeSnapshot>>);
+
+impl SnapshotProjection {
+    fn new(build: impl FnOnce() -> RetainedScopeSnapshot + 'static) -> Self {
+        let mut build = Some(build);
+        Self(Box::new(move || build.take().map(|build| build())))
+    }
+
+    fn build(&mut self) -> RetainedScopeSnapshot {
+        (self.0)().expect("a staged projection is built exactly once")
+    }
+}
+
 pub(crate) struct SnapshotPublication {
     sender: runtime::WatchSender<SnapshotHubState>,
-    snapshot: Option<RetainedScopeSnapshot>,
+    projection: SnapshotProjection,
     published: bool,
     closed: bool,
 }
@@ -606,11 +646,11 @@ pub(crate) struct SnapshotPublication {
 impl SnapshotPublication {
     fn published(
         sender: runtime::WatchSender<SnapshotHubState>,
-        snapshot: RetainedScopeSnapshot,
+        projection: SnapshotProjection,
     ) -> Self {
         Self {
             sender,
-            snapshot: Some(snapshot),
+            projection,
             published: true,
             closed: false,
         }
@@ -618,11 +658,11 @@ impl SnapshotPublication {
 
     fn closed(
         sender: runtime::WatchSender<SnapshotHubState>,
-        snapshot: RetainedScopeSnapshot,
+        projection: SnapshotProjection,
     ) -> Self {
         Self {
             sender,
-            snapshot: Some(snapshot),
+            projection,
             published: false,
             closed: true,
         }
@@ -640,43 +680,57 @@ impl SnapshotPublication {
                 .is_some_and(|sender| self.sender.same_channel(sender))
     }
 
-    pub(crate) fn coalesce(&mut self, mut newer: Self) -> RetainedScopeSnapshot {
+    pub(crate) fn coalesce(&mut self, newer: Self) -> SnapshotProjection {
         debug_assert!(self.same_hub(&newer));
         debug_assert!(!self.closed, "a closed snapshot hub cannot publish again");
         self.published |= newer.published;
         self.closed = newer.closed;
-        self.snapshot
-            .replace(
-                newer
-                    .snapshot
-                    .take()
-                    .expect("a staged snapshot is installed exactly once"),
-            )
-            .expect("a staged snapshot is present until installation")
+        std::mem::replace(&mut self.projection, newer.projection)
     }
 
-    pub(crate) fn install(mut self, effects: &mut Vec<Box<dyn FnOnce()>>) {
-        let mut snapshot = self.snapshot.take();
+    /// Builds and installs this hub's final cut while the gate is still held.
+    ///
+    /// Every user-bearing value leaves through `effects`: the spent producer
+    /// with its capture of the publishing scope, the projection this one
+    /// displaces, and the generation-exhaustion panic. The producer runs
+    /// before the watch's own lock is taken, so building a cut — which walks
+    /// the resident tree — never nests that tree's locks inside the watch.
+    pub(crate) fn install(self, effects: &mut Vec<Box<dyn FnOnce()>>) {
+        let Self {
+            sender,
+            mut projection,
+            published,
+            closed,
+        } = self;
+        // A hub closed by an earlier transaction keeps the authoritative
+        // terminal projection `close` installed; this cut is never built.
+        let mut snapshot = (!sender.read_with(|state| state.closed)).then(|| projection.build());
+        // Retire the producer first: until the effect list owns it, the
+        // publishing scope has no provable owner here, and every drop below
+        // reaches it through that scope.
+        effects.push(Box::new(move || drop(projection)));
         let mut retired = None;
         let mut modified = false;
         let mut generation_exhausted = false;
-        self.sender.modify_silently(|state| {
-            if state.closed {
-                retired = snapshot.take();
-                return;
-            }
-            retired = Some(std::mem::replace(
-                &mut state.snapshot,
-                snapshot
-                    .take()
-                    .expect("a staged snapshot is installed exactly once"),
-            ));
-            if self.published && state.generation.mint().is_none() {
-                generation_exhausted = true;
-            }
-            state.closed = self.closed;
-            modified = true;
-        });
+        if snapshot.is_some() {
+            sender.modify_silently(|state| {
+                debug_assert!(
+                    !state.closed,
+                    "the gate serializes closure against installation"
+                );
+                retired = Some(std::mem::replace(
+                    &mut state.snapshot,
+                    snapshot
+                        .take()
+                        .expect("a staged snapshot is installed exactly once"),
+                ));
+                if published && state.generation.mint().is_none() {
+                    generation_exhausted = true;
+                }
+                state.closed = closed;
+                modified = true;
+            });
+        }
         if let Some(retired) = retired {
             effects.push(Box::new(move || drop(retired)));
         }
@@ -684,7 +738,6 @@ impl SnapshotPublication {
             effects.push(Box::new(|| panic!("snapshot generation space exhausted")));
         }
         if modified {
-            let sender = self.sender.clone();
             effects.push(Box::new(move || sender.pulse()));
         }
     }
@@ -696,9 +749,10 @@ impl SnapshotHub {
     /// No wake is owed for the receiverless refresh below: the gate is what
     /// makes it safe, and the only receiver that could observe the refresh is
     /// the one minted here — which captures the refreshed generation as
-    /// already seen. The displaced projection and a generation-exhaustion
-    /// panic are still deferred through the transaction so retirement and
-    /// panic resumption happen after that gate is unlocked.
+    /// already seen. The displaced projection, the caller's own projection
+    /// wherever it goes uninstalled, and a generation-exhaustion panic are
+    /// still deferred through the transaction so retirement and panic
+    /// resumption happen after that gate is unlocked.
     ///
     /// Requiring the transaction also makes "hub initialization and the
     /// receiverless refresh are serialized against publication" a static
@@ -718,6 +772,12 @@ impl SnapshotHub {
             })
             .0
         });
+        // Initialization consumed a clone, and a closed hub declines the
+        // install below. Whatever the caller's projection is not moved into is
+        // still a full retained cut, so it retires through the transaction
+        // rather than under the gate — and, on the closed branch, under the
+        // watch's own lock as well.
+        let mut uninstalled = Some(initial);
         if !initialized && sender.receiver_count() == 0 {
             // Publication is skipped while receiverless, so the first
             // subscriber after a quiet stretch installs current state itself.
@@ -729,7 +789,12 @@ impl SnapshotHub {
                 if state.closed {
                     return;
                 }
-                retired = Some(std::mem::replace(&mut state.snapshot, initial));
+                retired = Some(std::mem::replace(
+                    &mut state.snapshot,
+                    uninstalled
+                        .take()
+                        .expect("the caller's projection is installed at most once"),
+                ));
                 generation_exhausted = state.generation.mint().is_none();
             });
             if let Some(retired) = retired {
@@ -738,6 +803,9 @@ impl SnapshotHub {
             if generation_exhausted {
                 txn.defer(|| panic!("snapshot generation space exhausted"));
             }
+        }
+        if let Some(uninstalled) = uninstalled {
+            txn.defer(move || drop(uninstalled));
         }
         let inner = sender.watcher();
         let seen_generation = inner.borrow_cloned().generation.current();
@@ -754,7 +822,7 @@ impl SnapshotHub {
     pub(crate) fn publish(
         &self,
         txn: &mut crate::cells::ObservationTxn<'_>,
-        snapshot: impl FnOnce() -> RetainedScopeSnapshot,
+        snapshot: impl FnOnce() -> RetainedScopeSnapshot + 'static,
     ) {
         let Some(sender) = self.sender.get() else {
             return;
@@ -765,7 +833,10 @@ impl SnapshotHub {
         if txn.snapshot_hub_will_close(self) || sender.read_with(|state| state.closed) {
             return;
         }
-        txn.stage_snapshot(SnapshotPublication::published(sender.clone(), snapshot()));
+        txn.stage_snapshot(SnapshotPublication::published(
+            sender.clone(),
+            SnapshotProjection::new(snapshot),
+        ));
     }
 
     /// Closes while the containing scope's observation gate is held.
@@ -777,7 +848,7 @@ impl SnapshotHub {
     pub(crate) fn close(
         &self,
         txn: &mut crate::cells::ObservationTxn<'_>,
-        final_snapshot: impl FnOnce() -> RetainedScopeSnapshot,
+        final_snapshot: impl FnOnce() -> RetainedScopeSnapshot + 'static,
     ) {
         let mut final_snapshot = Some(final_snapshot);
         let mut initialized = false;
@@ -809,9 +880,11 @@ impl SnapshotHub {
         // this final one.
         txn.stage_snapshot(SnapshotPublication::closed(
             sender.clone(),
-            final_snapshot
-                .take()
-                .expect("final snapshot is built exactly once")(),
+            SnapshotProjection::new(move || {
+                final_snapshot
+                    .take()
+                    .expect("final snapshot is built exactly once")()
+            }),
         ));
     }
 
@@ -1044,7 +1117,10 @@ pub enum WaitError {
 mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use crate::{
@@ -1136,15 +1212,62 @@ mod tests {
         let receiver = hub.subscribe(snapshot(ScopeState::Unstarted), &mut txn);
         drop(txn);
 
+        // The mid-transaction reading is published outward rather than
+        // asserted in place: an assert inside the closure would panic into
+        // the unwind that `catch_unwind` swallows, leaving the staging half
+        // of this test inert.
+        let mut mid_txn = None;
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
                 let mut txn = crate::cells::ObservationTxn::detached();
                 hub.publish(&mut txn, || snapshot(ScopeState::Running));
+                mid_txn = Some(receiver.borrow_latest().state.clone());
                 panic!("inject transaction unwind");
             }))
             .is_err()
         );
+        assert_eq!(
+            mid_txn,
+            Some(ScopeState::Unstarted),
+            "an ungated borrow taken mid-transaction reads the preceding cut"
+        );
         assert_eq!(receiver.borrow_latest().state, ScopeState::Running);
+    }
+
+    #[test]
+    fn repeated_publication_builds_and_mints_once_per_transaction() {
+        let hub = SnapshotHub::default();
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let receiver = hub.subscribe(snapshot(ScopeState::Unstarted), &mut txn);
+        drop(txn);
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let mut txn = crate::cells::ObservationTxn::detached();
+        for state in [
+            ScopeState::Starting,
+            ScopeState::Running,
+            ScopeState::Draining,
+        ] {
+            let builds = Arc::clone(&builds);
+            hub.publish(&mut txn, move || {
+                builds.fetch_add(1, Ordering::Relaxed);
+                snapshot(state)
+            });
+        }
+        drop(txn);
+
+        assert_eq!(
+            builds.load(Ordering::Relaxed),
+            1,
+            "coalescing leaves one producer per hub, and only it is built"
+        );
+        assert_eq!(receiver.borrow_latest().state, ScopeState::Draining);
+        let generation = hub
+            .sender
+            .get()
+            .expect("subscription initializes the hub")
+            .read_with(|state| state.generation.current());
+        assert_eq!(generation, 1, "one transaction mints one generation edge");
     }
 
     #[test]
@@ -1160,6 +1283,11 @@ mod tests {
                 reason: StopReason::Finished,
             })
         });
+        assert!(
+            !receiver.borrow_latest_and_closed().1,
+            "the close is still staged, so the publication below is declined \
+             by the transaction rather than by an installed terminal state"
+        );
         hub.publish(&mut txn, || {
             panic!("publication after a staged close must remain lazy")
         });

@@ -2775,7 +2775,9 @@ resident-membership uniqueness holds at every observable cut.
 A transaction may contain several of those transitions — initial batch
 admission is the canonical example. Snapshot-watch publication is coalesced
 per scope hub inside the transaction and the single final projection is
-installed at commit, before the observation gate is released. Consequently
+installed at commit, before the observation gate is released; the only
+install that may precede commit is a new subscription seeding its own
+starting value, which no receiver is yet attached to observe. Consequently
 the ungated `borrow_latest` surface and `wait_for_child` see either the prior
 committed cut or the transaction's final cut, never a partial batch. Watch
 conflation remains permitted only *between committed transaction cuts*; it is

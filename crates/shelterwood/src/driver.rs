@@ -290,10 +290,6 @@ impl<T> ChildResources<T> {
         self.0.values()
     }
 
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.0.values_mut()
-    }
-
     #[cfg(test)]
     fn len(&self) -> usize {
         self.0.len()
@@ -354,7 +350,31 @@ impl Drop for ScopeRuntime {
         } else {
             None
         };
-        for child in self.children.values_mut() {
+        // An exited child can be waiting only for retained user construction
+        // to finish disposal. Its exit is already classified, so driver death
+        // must publish that verdict before the terminality fallback gets a
+        // chance to synthesize a coarse cancellation. The disposal job stays
+        // detached; as on hard escalation, teardown does not wait for it and
+        // does not incorporate a destructor panic that has not been
+        // dispatched at publication — including a completion already queued
+        // on the disposal lane but not yet dispatched. Consuming that arrived
+        // half is issue #291, which covers this site and the matching discard
+        // in `force_child`.
+        let child_keys: Vec<_> = self.children.iter().map(|(key, _)| key).collect();
+        for key in child_keys {
+            if self
+                .children
+                .get(key)
+                .is_some_and(|child| child.pending_terminal.is_some())
+            {
+                self.handle_construction_disposed(key, None);
+            }
+            let Some(child) = self.children.get_mut(key) else {
+                // Terminal publication can reclaim a remove-retained dynamic
+                // child; its terminality obligation was completed in that
+                // path, so there is no fallback left to discharge here.
+                continue;
+            };
             if let Some(active) = child.active.take() {
                 if let Some(mailbox) = &child.mailbox {
                     mailbox.freeze(active.incarnation);

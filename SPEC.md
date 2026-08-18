@@ -2305,11 +2305,17 @@ framework contract**. No other normative shutdown paragraph is unmapped.
   terminalize (sends fail `Terminated`, exit-awaiting surfaces resolve),
   in-flight admissions and removals resolve their enumerated rejections,
   and every `Added` is paired with its `Removed` before the scope's own
-  final event. First publication wins: an orderly post-join report that
-  already landed is never overwritten. §7's post-join precision is an
+  final event. An inactive child in the classified-but-unpublished terminal-
+  disposal state is not coarsened: teardown publishes its stored exit before
+  discharging terminality, without waiting for the retained user-state
+  disposal, so that classified verdict wins. A retained-construction
+  destructor panic is not folded in on this path, whether still in flight or
+  already reported but undispatched: teardown consumes the stored verdict as
+  classified at join. First publication wins: an orderly post-join report
+  that already landed is never overwritten. §7's post-join precision is an
   orderly-path property, deliberately traded for promptness on the kill
-  path — the future was destroyed, so "what would it have reported"
-  is unknowable in bounded time; this is the same trade `brutal_kill` →
+  path — the future was destroyed, so "what would it have reported" is
+  unknowable in bounded time; this is the same trade `brutal_kill` →
   `killed` makes, decided here once rather than per call site.
 - "Drained" has exactly one definition, derived from child state (no
   hand-maintained live counter).
@@ -2787,6 +2793,17 @@ dynamic removal: the removed id becomes reusable (and a repeated `remove`
 reports `AlreadyAbsent`) only at the commit that withdraws the member
 from residency and publishes its `Removed` edge — §2's
 resident-membership uniqueness holds at every observable cut.
+Drain entry follows the same rule: publishing `Draining` includes the
+terminal-disposal intent for every inactive child selected to stop in that
+same driver step. A zero-budget shutdown's straggler sample cannot split that
+entry step, so restart-window cleanup already committed by it is not a
+straggler; an active child, or an ordered sibling whose stop has not yet
+been selected, remains reportable. The guarantee covers that entry step
+only: an ordered scope stops its children one step at a time, and every
+step after entry races the sample by design, so whether a later sibling
+has already terminalized when the sample runs is schedule-dependent and
+both outcomes conform. This ruling is pinned on a multi-thread runtime by
+`integration::restart_window_cleanup_is_isolated_without_reclassifying_the_recorded_exit`.
 
 `tracing` spans emit from one choke point (the optional `metrics` surface
 is Part II §20). Everything else observational — peer monitoring, actor

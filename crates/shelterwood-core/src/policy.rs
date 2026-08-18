@@ -107,7 +107,7 @@ pub const DEFAULT_READINESS_DEADLINE: Duration = Duration::from_secs(30);
 ///
 /// ```compile_fail,E0423
 /// use std::time::Duration;
-/// use shelterwood::NonZeroDuration;
+/// use shelterwood_core::policy::NonZeroDuration;
 ///
 /// let _invalid = NonZeroDuration(Duration::ZERO);
 /// ```
@@ -230,7 +230,7 @@ impl std::hash::Hash for BackoffFactor {
 ///
 /// ```compile_fail,E0451
 /// use std::time::Duration;
-/// use shelterwood::{Backoff, FixedBackoff, Jitter};
+/// use shelterwood_core::policy::{Backoff, FixedBackoff, Jitter};
 ///
 /// let _ = Backoff::Fixed(FixedBackoff {
 ///     delay: Duration::ZERO,
@@ -242,7 +242,7 @@ impl std::hash::Hash for BackoffFactor {
 ///
 /// ```compile_fail,E0451
 /// use std::time::Duration;
-/// use shelterwood::{Backoff, BackoffFactor, ExponentialBackoff, Jitter};
+/// use shelterwood_core::policy::{Backoff, BackoffFactor, ExponentialBackoff, Jitter};
 ///
 /// let _ = Backoff::Exponential(ExponentialBackoff {
 ///     base: Duration::ZERO,
@@ -265,6 +265,20 @@ pub enum Backoff {
 ///
 /// Values are created by [`Backoff::fixed`], which guarantees a non-zero
 /// delay. The private representation prevents invalid fixed-backoff literals.
+///
+/// The literal fence on [`Backoff`] is satisfied by any one surviving private
+/// field, so the invariant-bearing field is fenced on its own: reading
+/// `delay` off a constructor-validated payload must not compile. `E0616`
+/// records the privacy failure this proof depends on:
+///
+/// ```compile_fail,E0616
+/// use std::time::Duration;
+/// use shelterwood_core::policy::{Backoff, Jitter};
+///
+/// let Backoff::Fixed(fixed) = Backoff::fixed(Duration::from_secs(1), Jitter::None).unwrap()
+/// else { unreachable!() };
+/// let _ = fixed.delay;
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FixedBackoff {
     delay: Duration,
@@ -289,6 +303,53 @@ impl FixedBackoff {
 ///
 /// Values are created by [`Backoff::exponential`], which guarantees non-zero
 /// delays, a valid factor, and a maximum no shorter than the base.
+///
+/// The literal fence on [`Backoff`] is satisfied by any one surviving private
+/// field, so each invariant-bearing field is fenced on its own: reading
+/// `base`, `factor`, or `max` off a constructor-validated payload must not
+/// compile. `E0616` records the privacy failure these proofs depend on:
+///
+/// ```compile_fail,E0616
+/// use std::time::Duration;
+/// use shelterwood_core::policy::{Backoff, BackoffFactor, Jitter};
+///
+/// let Backoff::Exponential(exponential) = Backoff::exponential(
+///     Duration::from_secs(1),
+///     BackoffFactor::new(2.0).unwrap(),
+///     Duration::from_secs(2),
+///     Jitter::None,
+/// )
+/// .unwrap() else { unreachable!() };
+/// let _ = exponential.base;
+/// ```
+///
+/// ```compile_fail,E0616
+/// use std::time::Duration;
+/// use shelterwood_core::policy::{Backoff, BackoffFactor, Jitter};
+///
+/// let Backoff::Exponential(exponential) = Backoff::exponential(
+///     Duration::from_secs(1),
+///     BackoffFactor::new(2.0).unwrap(),
+///     Duration::from_secs(2),
+///     Jitter::None,
+/// )
+/// .unwrap() else { unreachable!() };
+/// let _ = exponential.factor;
+/// ```
+///
+/// ```compile_fail,E0616
+/// use std::time::Duration;
+/// use shelterwood_core::policy::{Backoff, BackoffFactor, Jitter};
+///
+/// let Backoff::Exponential(exponential) = Backoff::exponential(
+///     Duration::from_secs(1),
+///     BackoffFactor::new(2.0).unwrap(),
+///     Duration::from_secs(2),
+///     Jitter::None,
+/// )
+/// .unwrap() else { unreachable!() };
+/// let _ = exponential.max;
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ExponentialBackoff {
     base: Duration,
@@ -553,9 +614,12 @@ pub enum ReadinessDeadline {
 ///
 /// ```compile_fail,E0423
 /// use std::time::Duration;
-/// use shelterwood::{BoundedReadinessDeadline, ReadinessDeadline};
+/// use shelterwood_core::policy::{
+///     BoundedReadinessDeadline, NonZeroDuration, ReadinessDeadline,
+/// };
 ///
-/// let _ = ReadinessDeadline::Bounded(BoundedReadinessDeadline(Duration::ZERO));
+/// let duration = NonZeroDuration::new(Duration::from_secs(1)).unwrap();
+/// let _ = ReadinessDeadline::Bounded(BoundedReadinessDeadline(duration));
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BoundedReadinessDeadline(NonZeroDuration);
@@ -585,12 +649,25 @@ impl ReadinessDeadline {
 ///
 /// ```compile_fail,E0451
 /// use std::time::Duration;
-/// use shelterwood::Intensity;
+/// use shelterwood_core::policy::Intensity;
 ///
 /// let _ = Intensity {
 ///     max_restarts: 1,
 ///     within: Duration::ZERO,
 /// };
+/// ```
+///
+/// That literal fence is satisfied by either private field, so the
+/// invariant-bearing field is fenced on its own: reading `within` off a
+/// constructor-validated budget must not compile. `E0616` records the privacy
+/// failure this proof depends on:
+///
+/// ```compile_fail,E0616
+/// use std::time::Duration;
+/// use shelterwood_core::policy::Intensity;
+///
+/// let intensity = Intensity::new(1, Duration::from_secs(1)).unwrap();
+/// let _ = intensity.within;
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Intensity {

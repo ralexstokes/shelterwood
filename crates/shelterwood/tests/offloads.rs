@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet};
+use crate::common::{POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually, assert_quiet};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
     Guard, Handler, LifecycleEventKind, LifecycleItem, Mailbox, MailboxShutdown, RawActor,
@@ -1330,7 +1330,19 @@ async fn queued_offload_panic_survives_stop_and_handler_error() {
 struct StopPathPanicObservations {
     on_stop_ran: AtomicBool,
     further_delivery_ran: AtomicBool,
+    continuation_queued: AtomicBool,
     decorator_result: Mutex<Option<&'static str>>,
+}
+
+impl StopPathPanicObservations {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            on_stop_ran: AtomicBool::new(false),
+            further_delivery_ran: AtomicBool::new(false),
+            continuation_queued: AtomicBool::new(false),
+            decorator_result: Mutex::new(None),
+        })
+    }
 }
 
 struct StopPathPanicActor {
@@ -1378,13 +1390,13 @@ impl Actor for StopPathPanicActor {
     }
 }
 
-struct StopPathPanicDecorator {
-    inner: Handler<StopPathPanicActor>,
+struct StopPathPanicDecorator<A: Actor> {
+    inner: Handler<A>,
     observations: Arc<StopPathPanicObservations>,
 }
 
-impl RawActor for StopPathPanicDecorator {
-    type Msg = PanicMessage;
+impl<A: Actor> RawActor for StopPathPanicDecorator<A> {
+    type Msg = A::Msg;
 
     fn readiness() -> Readiness {
         Readiness::Manual
@@ -1406,17 +1418,16 @@ async fn assert_pending_offload_panic_stops_before_handler_teardown(
     mailbox_shutdown: MailboxShutdown,
 ) {
     let release_init = ReleaseGate::default();
-    let observations = Arc::new(StopPathPanicObservations {
-        on_stop_ran: AtomicBool::new(false),
-        further_delivery_ran: AtomicBool::new(false),
-        decorator_result: Mutex::new(None),
-    });
+    let observations = StopPathPanicObservations::new();
     let mut tree = Tree::new();
     let actor = tree
         .add_raw_once(
             "stop-path-panic",
             RawOnceDef::new(StopPathPanicDecorator {
-                inner: Handler::new((Arc::clone(&observations), release_init.clone())),
+                inner: Handler::<StopPathPanicActor>::new((
+                    Arc::clone(&observations),
+                    release_init.clone(),
+                )),
                 observations: Arc::clone(&observations),
             })
             .mailbox_shutdown(mailbox_shutdown),
@@ -1597,6 +1608,116 @@ async fn stopping_try_recv_resumes_a_pending_offload_panic_before_drain() {
             .expect_err("the queued offload panic fails startup"),
     );
     assert_eq!(message.as_deref(), Some("stopping try_recv offload panic"));
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed root shuts down");
+}
+
+const DISCARDED_CONTINUATION_PANIC: &str = "discarded continuation destructor panic";
+
+enum DiscardedContinuationMessage {
+    Trigger,
+    Continuation(PanicOnDrop),
+}
+
+/// Queues a continuation whose destructor panics, then stops. The stop's
+/// freeze discards the continuation into the incarnation's shared disposal
+/// slot, which the following receive boundary resumes: SPEC §5.2's exclusion
+/// covers any incarnation-owned disposal panic, not offload work alone.
+struct DiscardedContinuationPanicActor {
+    observations: Arc<StopPathPanicObservations>,
+}
+
+impl Actor for DiscardedContinuationPanicActor {
+    type Msg = DiscardedContinuationMessage;
+    type Args = Arc<StopPathPanicObservations>;
+
+    async fn init(observations: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self { observations })
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            DiscardedContinuationMessage::Trigger => {
+                let queued = context.continue_with(DiscardedContinuationMessage::Continuation(
+                    PanicOnDrop::new(DISCARDED_CONTINUATION_PANIC),
+                ));
+                self.observations
+                    .continuation_queued
+                    .store(queued.is_ok(), Ordering::SeqCst);
+                // A rejection would hand the panicking payload back here; leak
+                // it rather than unwinding inside the handler, and let the test
+                // body judge the published flag.
+                if let Err(rejected) = queued {
+                    std::mem::forget(rejected);
+                }
+                context.stop();
+            }
+            DiscardedContinuationMessage::Continuation(payload) => {
+                self.observations
+                    .further_delivery_ran
+                    .store(true, Ordering::SeqCst);
+                // Unreachable: the freeze inside `stop` discards queued
+                // continuations. Leak the payload so a regression reports
+                // through the flag instead of a second panic from in here.
+                std::mem::forget(payload);
+            }
+        }
+        Ok(())
+    }
+
+    async fn on_stop(&mut self, _: &mut StopContext<'_, Self>) {
+        self.observations.on_stop_ran.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn discarded_continuation_destructor_panic_resumes_before_stop_teardown() {
+    let observations = StopPathPanicObservations::new();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw_once(
+            "discarded-continuation-panic",
+            RawOnceDef::new(StopPathPanicDecorator {
+                inner: Handler::<DiscardedContinuationPanicActor>::new(Arc::clone(&observations)),
+                observations: Arc::clone(&observations),
+            }),
+        )
+        .expect("valid decorated actor");
+    let system = tree.spawn().expect("runtime is available");
+    actor
+        .send(DiscardedContinuationMessage::Trigger)
+        .await
+        .expect("mailbox accepts before readiness");
+
+    let message = startup_panic_message(
+        system
+            .wait_started()
+            .await
+            .expect_err("the discarded continuation destructor panic fails startup"),
+    );
+    assert_eq!(message.as_deref(), Some(DISCARDED_CONTINUATION_PANIC));
+    assert!(
+        observations.continuation_queued.load(Ordering::SeqCst),
+        "the continuation must be queued before the stop freezes it"
+    );
+    assert!(
+        !observations.on_stop_ran.load(Ordering::SeqCst),
+        "on_stop must not run after an incarnation-owned disposal panic"
+    );
+    assert!(
+        !observations.further_delivery_ran.load(Ordering::SeqCst),
+        "a discarded continuation must never be delivered"
+    );
+    assert_eq!(
+        *observations
+            .decorator_result
+            .lock()
+            .expect("decorator result mutex poisoned"),
+        None,
+        "the disposal panic must unwind through the Handler composition point"
+    );
     system
         .shutdown(Duration::from_secs(1))
         .await

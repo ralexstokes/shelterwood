@@ -1407,12 +1407,20 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Receives the next accepted message, biased toward shutdown.
     ///
-    /// A retained offload-work panic resumes from this receive path before
-    /// another event is delivered or a stop is reported. A panic in an
-    /// offload's continuation closure — the `FnOnce` that builds the message
-    /// from the offload result, not a [`continue_with`](Self::continue_with)
-    /// continuation, which is a plain stored message and cannot panic here —
-    /// surfaces directly from this receive call.
+    /// Any incarnation-owned disposal panic retained by the time this path
+    /// runs resumes here before another event is delivered or a stop is
+    /// reported: an offload-work panic, and — because the stop branches
+    /// freeze first — a destructor panic from the queued continuations,
+    /// armed timers, queued offload completions and offload futures that the
+    /// freeze releases. Retention is the guarantee, not a join: a payload
+    /// recorded after this check is still the incarnation's exit, but is
+    /// classified by the epilogue and cannot suppress `on_stop`.
+    ///
+    /// A panic in an offload's continuation closure — the `FnOnce` that
+    /// builds the message from the offload result, not a
+    /// [`continue_with`](Self::continue_with) continuation, which is a plain
+    /// stored message whose construction cannot panic here — surfaces
+    /// directly from this receive call.
     pub async fn recv(&mut self) -> Option<M> {
         loop {
             if self.local_stop.is_fired() {
@@ -1446,13 +1454,18 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Receives one ready event without awaiting or consulting shutdown.
     ///
-    /// Outside shutdown drain, this resumes a retained offload-work panic
-    /// before returning another event; a panic in an offload's continuation
-    /// closure (the message-building `FnOnce`, not a
+    /// Outside shutdown drain, this resumes a retained disposal panic before
+    /// returning another event; a panic in an offload's continuation closure
+    /// (the message-building `FnOnce`, not a
     /// [`continue_with`](Self::continue_with) continuation, which is a plain
-    /// stored message) surfaces directly from this call. During drain it first
-    /// resumes any retained offload-work panic, then reads the frozen accepted
-    /// mailbox prefix directly.
+    /// stored message) surfaces directly from this call. During drain it
+    /// freezes first, then resumes any incarnation-owned disposal panic
+    /// retained by that point — an offload-work panic, or a destructor panic
+    /// from the continuations, timers, queued completions and offload futures
+    /// the freeze releases — before reading the frozen accepted mailbox
+    /// prefix. Retention is the guarantee, not a join: a payload recorded
+    /// after the check is still the incarnation's exit, but is classified by
+    /// the epilogue and cannot suppress `on_stop`.
     pub fn try_recv(&mut self) -> Option<M> {
         if self.is_stopping() {
             self.freeze_and_report();

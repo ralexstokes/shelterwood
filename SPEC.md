@@ -2289,11 +2289,17 @@ framework contract**. No other normative shutdown paragraph is unmapped.
   terminalize (sends fail `Terminated`, exit-awaiting surfaces resolve),
   in-flight admissions and removals resolve their enumerated rejections,
   and every `Added` is paired with its `Removed` before the scope's own
-  final event. First publication wins: an orderly post-join report that
-  already landed is never overwritten. §7's post-join precision is an
+  final event. An inactive child in the classified-but-unpublished terminal-
+  disposal state is not coarsened: teardown publishes its stored exit before
+  discharging terminality, without waiting for the retained user-state
+  disposal, so that classified verdict wins. A retained-construction
+  destructor panic is not folded in on this path, whether still in flight or
+  already reported but undispatched: teardown consumes the stored verdict as
+  classified at join. First publication wins: an orderly post-join report
+  that already landed is never overwritten. §7's post-join precision is an
   orderly-path property, deliberately traded for promptness on the kill
-  path — the future was destroyed, so "what would it have reported"
-  is unknowable in bounded time; this is the same trade `brutal_kill` →
+  path — the future was destroyed, so "what would it have reported" is
+  unknowable in bounded time; this is the same trade `brutal_kill` →
   `killed` makes, decided here once rather than per call site.
 - "Drained" has exactly one definition, derived from child state (no
   hand-maintained live counter).

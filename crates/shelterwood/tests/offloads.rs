@@ -1672,8 +1672,9 @@ impl Actor for DiscardedContinuationPanicActor {
     }
 }
 
-#[tokio::test]
-async fn discarded_continuation_destructor_panic_resumes_before_stop_teardown() {
+async fn assert_discarded_continuation_panic_stops_before_handler_teardown(
+    mailbox_shutdown: MailboxShutdown,
+) {
     let observations = StopPathPanicObservations::new();
     let mut tree = Tree::new();
     let actor = tree
@@ -1682,7 +1683,8 @@ async fn discarded_continuation_destructor_panic_resumes_before_stop_teardown() 
             RawOnceDef::new(StopPathPanicDecorator {
                 inner: Handler::<DiscardedContinuationPanicActor>::new(Arc::clone(&observations)),
                 observations: Arc::clone(&observations),
-            }),
+            })
+            .mailbox_shutdown(mailbox_shutdown),
         )
         .expect("valid decorated actor");
     let system = tree.spawn().expect("runtime is available");
@@ -1722,6 +1724,19 @@ async fn discarded_continuation_destructor_panic_resumes_before_stop_teardown() 
         .shutdown(Duration::from_secs(1))
         .await
         .expect("failed root shuts down");
+}
+
+#[tokio::test]
+async fn discarded_continuation_destructor_panic_resumes_before_drain_teardown() {
+    assert_discarded_continuation_panic_stops_before_handler_teardown(MailboxShutdown::Drain).await;
+}
+
+#[tokio::test]
+async fn discarded_continuation_destructor_panic_resumes_before_discard_teardown() {
+    // Discard skips Handler's `try_recv` drain, so only `recv`'s local-stop
+    // branch can carry the freeze-time destructor panic out of the loop.
+    assert_discarded_continuation_panic_stops_before_handler_teardown(MailboxShutdown::Discard)
+        .await;
 }
 
 #[tokio::test]

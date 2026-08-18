@@ -994,10 +994,21 @@ the drain, leaving the handled log a proper prefix of the accepted one.
 non-failed actor: on every cooperative stop path above, whether or not a
 drain preceded it. It does not run when `init` failed (no actor value
 exists), when a handler — live or draining — returned `Err` or panicked
-(the incarnation is failed; cleanup is the crash-only path, `Drop`), or
-on hard abort (the future is destroyed). Grace bounds drain plus
-`on_stop` together (§10) — including after a local `ctx.stop()`, which
-arms the child's own configured ladder (§10).
+(the incarnation is failed; cleanup is the crash-only path, `Drop`), when
+any incarnation-owned disposal panic is observed at a receive boundary
+(including one entering stop or drain), or on hard abort (the future is
+destroyed). Incarnation-owned disposal is §5.5's resource funnel — the
+offloaded future and its continuation closure, plus the queued
+continuations, armed timers and queued offload completions released at
+the intake freeze; the frozen mailbox prefix's own detached disposal
+above is not part of it and stays a disposal fault. A disposal panic
+**already retained when a receive boundary is reached** therefore fails
+the incarnation before any further delivery or `on_stop`. As with
+`Guard::finished()` (§5.5) this is not a join: a panic that lands after
+the last receive boundary is still the incarnation's exit, but cannot
+suppress `on_stop`. Grace bounds drain plus `on_stop` together (§10) —
+including after a local `ctx.stop()`, which arms the child's own
+configured ladder (§10).
 
 ### 5.3 One timer facility
 
@@ -1120,7 +1131,12 @@ handlers non-blocking. Contracts:
   `Guard::is_finished` / `finished()` report either ordinary work
   completion or an incarnation-teardown cancellation request. They are not
   a join guarantee: a hard-aborted task can still be unwinding after the
-  notification.
+  notification. Ordinary completion does retain a panicking future's
+  payload *before* the notification fires, so a `finished()` await that
+  observed completion guarantees the panic is retained for §5.2's next
+  receive boundary; a teardown cancellation fires the same notification
+  without that ordering, which is why §5.2 conditions its guarantee on
+  retention rather than on the panic having happened.
 - Any higher-level helper that composes `call` inside `offload` MUST
   preserve: incarnation ownership; completion through the actor loop; a
   total timeout continuation; and no await inside the handler.

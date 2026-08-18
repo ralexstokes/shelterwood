@@ -354,8 +354,12 @@ impl Drop for ScopeRuntime {
         // to finish disposal. Its exit is already classified, so driver death
         // must publish that verdict before the terminality fallback gets a
         // chance to synthesize a coarse cancellation. The disposal job stays
-        // detached; as on hard escalation, teardown does not wait for it or
-        // incorporate a destructor panic that arrives after publication.
+        // detached; as on hard escalation, teardown does not wait for it and
+        // does not incorporate a destructor panic that has not been
+        // dispatched at publication — including a completion already queued
+        // on the disposal lane but not yet dispatched. Consuming that arrived
+        // half is issue #291, which covers this site and the matching discard
+        // in `force_child`.
         let child_keys: Vec<_> = self.children.iter().map(|(key, _)| key).collect();
         for key in child_keys {
             if self

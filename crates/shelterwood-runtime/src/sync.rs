@@ -469,6 +469,12 @@ pub fn watch<T>(initial: T) -> (WatchSender<T>, WatchReceiver<T>) {
 }
 
 impl<T> WatchSender<T> {
+    /// Whether both senders address the same watch channel.
+    #[must_use]
+    pub fn same_channel(&self, other: &Self) -> bool {
+        self.0.same_channel(&other.0)
+    }
+
     pub fn watcher(&self) -> WatchReceiver<T> {
         WatchReceiver(self.0.subscribe())
     }

@@ -1011,6 +1011,104 @@ fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
 }
 
 #[test]
+fn snapshot_watch_batch_admission_is_one_committed_cut() {
+    let root = isolated_scope("root", ScopeFlavor::Ordered);
+    let first = isolated_scope("first", ScopeFlavor::Dynamic);
+    let second = isolated_scope("second", ScopeFlavor::Dynamic);
+    resolve_fixture_options(&first.member);
+    resolve_fixture_options(&second.member);
+    let first_slot = SlotCell::new(Arc::clone(&first.member), Some(first));
+    let second_slot = SlotCell::new(Arc::clone(&second.member), Some(second));
+    let snapshots = root.subscribe_snapshots();
+
+    root.with_observation_gate(|txn| {
+        root.clear_residents_locked(txn);
+        root.admit_child_locked(resident_projection(&first_slot), txn);
+        assert!(
+            snapshots.borrow_latest().children.is_empty(),
+            "the first admission must remain staged until the batch commits"
+        );
+        root.admit_child_locked(resident_projection(&second_slot), txn);
+        assert!(
+            snapshots.borrow_latest().children.is_empty(),
+            "the complete batch must remain staged until its transaction commits"
+        );
+    });
+
+    let committed = snapshots.borrow_latest();
+    assert_eq!(committed.children.len(), 2);
+    assert!(committed.child("first").is_some());
+    assert!(committed.child("second").is_some());
+}
+
+#[test]
+fn snapshot_watch_batch_admission_mints_one_generation_per_hub() {
+    let root = isolated_scope("root", ScopeFlavor::Ordered);
+    let branch = isolated_scope("branch", ScopeFlavor::Dynamic);
+    resolve_fixture_options(&branch.member);
+    let branch_slot = SlotCell::new(Arc::clone(&branch.member), Some(Arc::clone(&branch)));
+    root.with_observation_gate(|txn| {
+        root.admit_child_locked(resident_projection(&branch_slot), txn);
+    });
+
+    let first = isolated_scope("first", ScopeFlavor::Dynamic);
+    let second = isolated_scope("second", ScopeFlavor::Dynamic);
+    resolve_fixture_options(&first.member);
+    resolve_fixture_options(&second.member);
+    let first_slot = SlotCell::new(Arc::clone(&first.member), Some(first));
+    let second_slot = SlotCell::new(Arc::clone(&second.member), Some(second));
+
+    // Two hubs, because a batch publishes each admission to the admitting
+    // scope and to every ancestor: coalescing must group publications by hub,
+    // neither leaving one hub with several edges nor folding a descendant's
+    // cut into its ancestor's.
+    let root_snapshots = root.subscribe_snapshots();
+    let mut branch_snapshots = branch.subscribe_snapshots();
+    let root_generation = root_snapshots.current_generation();
+    let branch_generation = branch_snapshots.current_generation();
+
+    branch.with_observation_gate(|txn| {
+        branch.admit_child_locked(resident_projection(&first_slot), txn);
+        branch.admit_child_locked(resident_projection(&second_slot), txn);
+    });
+
+    assert_eq!(
+        branch_snapshots.current_generation(),
+        branch_generation + 1,
+        "a batch admission mints exactly one generation edge on its own hub"
+    );
+    assert_eq!(
+        root_snapshots.current_generation(),
+        root_generation + 1,
+        "and exactly one on the ancestor it propagates to"
+    );
+
+    let mut changed = Box::pin(branch_snapshots.changed());
+    let Poll::Ready(Ok(committed)) = changed
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("the committed batch resolves the pending change");
+    };
+    drop(changed);
+    assert_eq!(
+        committed.children.len(),
+        2,
+        "the one delivered value carries the whole batch"
+    );
+    let mut changed = Box::pin(branch_snapshots.changed());
+    assert!(
+        matches!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ),
+        "the batch owes no second delivery"
+    );
+}
+
+#[test]
 fn plain_resident_state_is_released_before_recursive_removed_publication() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let first = isolated_scope("first", ScopeFlavor::Dynamic);

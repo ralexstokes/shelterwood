@@ -33,7 +33,7 @@ use crate::{
     observe::{
         ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
         LifecycleHub, LifecycleSeq, RetainedScopeSnapshot, ScopeKind, ScopeSnapshot, SnapshotHub,
-        SnapshotReceiver,
+        SnapshotPublication, SnapshotReceiver,
     },
     policy::{ResolvedCommonOptions, ScopeFlavor},
     runtime::{self, Latch},
@@ -947,20 +947,23 @@ impl ObservationGate {
 ///
 /// Every retained control-plane writer takes this token, making an
 /// out-of-transaction mutation unavailable by construction. Tokio invokes
-/// registered wakers synchronously, so pulses and disposal work accumulate on
-/// the token and flush only after its gate guard has been released. The same
-/// drop path runs during unwind, preventing a poisoned transaction from
-/// stranding already-committed wakes.
+/// registered wakers synchronously, so snapshot publications coalesce on the
+/// token and are installed once at commit while the gate is still held. Pulses
+/// and disposal work then flush only after its gate guard has been released.
+/// The same drop path runs during unwind, preventing a poisoned transaction
+/// from stranding already-committed wakes.
 pub struct ObservationTxn<'a> {
     guard: Option<MutexGuard<'a, ()>>,
-    pulses: Vec<Box<dyn FnOnce()>>,
+    effects: Vec<Box<dyn FnOnce()>>,
+    snapshots: Vec<SnapshotPublication>,
 }
 
 impl<'a> ObservationTxn<'a> {
     fn new(guard: MutexGuard<'a, ()>) -> Self {
         Self {
             guard: Some(guard),
-            pulses: Vec::new(),
+            effects: Vec::new(),
+            snapshots: Vec::new(),
         }
     }
 
@@ -968,12 +971,13 @@ impl<'a> ObservationTxn<'a> {
     pub(crate) fn detached() -> Self {
         Self {
             guard: None,
-            pulses: Vec::new(),
+            effects: Vec::new(),
+            snapshots: Vec::new(),
         }
     }
 
     pub fn defer(&mut self, operation: impl FnOnce() + 'static) {
-        self.pulses.push(Box::new(operation));
+        self.effects.push(Box::new(operation));
     }
 
     /// Defers a watch-channel wake. The driver reaches its own senders
@@ -983,13 +987,46 @@ impl<'a> ObservationTxn<'a> {
         self.defer(move || sender.pulse());
     }
 
+    pub(crate) fn snapshot_hub_will_close(&self, hub: &SnapshotHub) -> bool {
+        self.snapshots
+            .iter()
+            .any(|publication| publication.closes(hub))
+    }
+
+    pub(crate) fn stage_snapshot(&mut self, publication: SnapshotPublication) {
+        let retired = if let Some(staged) = self
+            .snapshots
+            .iter_mut()
+            .find(|staged| staged.same_hub(&publication))
+        {
+            Some(staged.coalesce(publication))
+        } else {
+            self.snapshots.push(publication);
+            None
+        };
+        if let Some(retired) = retired {
+            // A superseded producer was never run, so nothing is retired but
+            // its capture of the publishing scope — which still leaves with
+            // the effect list rather than under the gate.
+            self.defer(move || drop(retired));
+        }
+    }
+
     fn commit(&mut self) {
+        // Installation precedes the unlock, and the order is load-bearing:
+        // released first, two transactions on one gate could interleave as
+        // "T1 unlocks, T2 stages and installs a newer cut, T1 installs its
+        // stale one", leaving every ungated borrow behind the tree until some
+        // later publication corrected it. SPEC §12 promises this ordering.
+        for publication in self.snapshots.drain(..) {
+            publication.install(&mut self.effects);
+        }
         drop(self.guard.take());
         let mut panics = runtime::PanicAccumulator::default();
-        for pulse in self.pulses.drain(..) {
+        for effect in self.effects.drain(..) {
             // One hostile waker must not prevent the remaining committed
             // observation edges from notifying their waiters.
-            panics.run(pulse);
+            panics.run(effect);
         }
     }
 }
@@ -1137,6 +1174,12 @@ struct ScopeObservation {
 pub struct ScopeCell {
     pub member: Arc<MemberCell>,
     pub flavor: ScopeFlavor,
+    /// This cell's own handle, for work it defers past the current borrow.
+    ///
+    /// Snapshot construction is staged during a transaction and runs at its
+    /// commit, by which time the `&self` that staged it has returned, so the
+    /// producer must own the cell rather than borrow it.
+    me: Weak<ScopeCell>,
     child_identity: Mutex<ScopeIdentity>,
     control: Mutex<ScopeControl>,
     dynamic_route: Mutex<Option<Arc<ErasedDynamicRoute>>>,
@@ -1211,9 +1254,10 @@ impl ScopeCell {
             total_restarts: TotalRestarts::ZERO,
             retained_exits: Arc::new(Vec::new()),
         });
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             member,
             flavor,
+            me: me.clone(),
             child_identity: Mutex::new(child_identity),
             control: Mutex::new(ScopeControl::default()),
             dynamic_route: Mutex::new(None),
@@ -1234,6 +1278,17 @@ impl ScopeCell {
             #[cfg(any(test, feature = "test-util"))]
             gate_capture_probe: Mutex::new(None),
         })
+    }
+
+    /// An owning handle to this cell.
+    ///
+    /// `ScopeCell::new` is the only constructor and it publishes the cell
+    /// inside an `Arc`, so the upgrade can only fail from within this cell's
+    /// own destructor — which observes nothing.
+    fn owned(&self) -> Arc<ScopeCell> {
+        self.me
+            .upgrade()
+            .expect("a live scope cell owns a handle to itself")
     }
 
     pub fn record(&self) -> ScopeRecord {
@@ -1869,14 +1924,19 @@ impl ScopeCell {
         wakes: &mut ObservationTxn<'_>,
         ancestors: &[Arc<ScopeCell>],
     ) {
+        // Each producer owns the scope it projects: the cut is built at
+        // commit, once per hub, after every publication in this transaction
+        // has been coalesced onto it.
+        let scope = self.owned();
         self.observation
             .snapshots
-            .publish(wakes, || self.snapshot_locked());
+            .publish(wakes, move || scope.snapshot_locked());
         for ancestor in ancestors {
+            let scope = Arc::clone(ancestor);
             ancestor
                 .observation
                 .snapshots
-                .publish(wakes, || ancestor.snapshot_locked());
+                .publish(wakes, move || scope.snapshot_locked());
         }
     }
 
@@ -1931,9 +1991,10 @@ impl ScopeCell {
         }
         // Closure follows the final state/snapshot/event publication performed
         // by the caller while this same observation gate remains held.
+        let scope = self.owned();
         self.observation
             .snapshots
-            .close(wakes, || self.snapshot_locked());
+            .close(wakes, move || scope.snapshot_locked());
         self.observation.lifecycle.close(wakes);
     }
 
@@ -2520,12 +2581,17 @@ mod tests {
     use std::{
         fmt,
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::{Arc, mpsc},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         time::Duration,
     };
 
     use shelterwood_core::{
-        Cancellation, Exit, ExitError, ExitKind, StartupFailure, StartupFailureCause, StopReason,
+        Cancellation, Exit, ExitError, ExitKind, ScopeState, StartupFailure, StartupFailureCause,
+        StopReason,
     };
 
     use crate::{
@@ -2679,6 +2745,44 @@ mod tests {
             reading_thread,
             "the member record's final guard must isolate its failed payload"
         );
+    }
+
+    #[test]
+    fn a_staged_cut_is_installed_before_its_gate_is_released() {
+        let id = ChildId::from("root");
+        let mut identity = ScopeIdentity::new();
+        let member = MemberCell::new(
+            id.clone(),
+            identity
+                .mint_membership(&id)
+                .expect("root membership is available"),
+        );
+        let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
+        let gate = scope.observation_gate();
+        let receiver = scope.subscribe_snapshots();
+
+        // Installation must not slide past the unlock: two transactions on
+        // one gate would otherwise be free to interleave as "T1 stages, T1
+        // unlocks, T2 stages and installs a newer cut, T1 installs its stale
+        // one", leaving every ungated borrow behind the tree until the next
+        // publication. The staged producer runs inside the install, so asking
+        // it whether the gate is still held asks exactly that.
+        let under_gate = Arc::new(AtomicBool::new(false));
+        scope.with_observation_gate(|txn| {
+            let probe = Arc::clone(&under_gate);
+            let gate = gate.clone();
+            let cell = Arc::clone(&scope);
+            scope.observation.snapshots.publish(txn, move || {
+                probe.store(gate.is_held(), Ordering::Relaxed);
+                cell.snapshot_locked()
+            });
+        });
+
+        assert!(
+            under_gate.load(Ordering::Relaxed),
+            "a staged cut is built and installed while the transaction still holds its gate"
+        );
+        assert_eq!(receiver.borrow_latest().state, ScopeState::Unstarted);
     }
 
     #[test]

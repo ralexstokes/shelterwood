@@ -8,7 +8,7 @@ mod shutdown;
 mod startup;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ops::{Index, IndexMut},
     sync::{Arc, OnceLock},
     time::Instant,
@@ -33,8 +33,8 @@ use crate::{
     ScopeState, ShutdownStraggler, ShutdownTimeout, StartupFailure, StartupFailureCause,
     admission::{NotAdmittingCause, ReserveError},
     cells::{
-        MemberStage, MemberTransition, ResidentProjection, RetainedExit, RetainedStopReason,
-        ScopeCell, ScopeControlEvent, StartupDisposition,
+        MemberCell, MemberStage, MemberTransition, ResidentProjection, RetainedExit,
+        RetainedStopReason, ScopeCell, ScopeControlEvent, StartupDisposition,
     },
     deadline::Deadline,
     engine::{
@@ -71,7 +71,7 @@ pub(crate) use admission_control::{
 };
 
 #[cfg(test)]
-use crate::cells::{GateCapture, MemberCell, RuntimeStorage};
+use crate::cells::{GateCapture, RuntimeStorage};
 #[cfg(test)]
 use admission_control::RemovalResponses;
 

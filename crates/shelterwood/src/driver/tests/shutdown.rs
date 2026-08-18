@@ -234,6 +234,10 @@ async fn runtime_teardown_folds_an_arrived_factory_disposal_panic() {
 
     drop(scope);
 
+    assert_arrived_disposal_panic_published(&member);
+}
+
+fn assert_arrived_disposal_panic_published(member: &Arc<MemberCell>) {
     assert!(matches!(
         member.record().stage,
         MemberStage::Terminal(ref exit)
@@ -245,6 +249,38 @@ async fn runtime_teardown_folds_an_arrived_factory_disposal_panic() {
     ));
 }
 
+/// The lane is empty by the time a forced batch dispatches: collection
+/// already moved the completion into the batch, where `Pending::Force`
+/// (`ScopeShutdown`) outranks it (`ChildExit`). Staging is what keeps it
+/// reachable from the hard-force fallback.
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_force_folds_a_batch_collected_factory_disposal_panic() {
+    let (mut scope, key, member) = scope_with_arrived_factory_disposal_panic().await;
+
+    let mut pending = vec![Pending::Force.classified()];
+    collect_driver_events(&mut scope.disposal_event_receiver, 8, &mut pending);
+    scope.stage_batch_disposal_panics(&mut pending);
+    arbitrate(&mut pending);
+    let mut batch = pending.into_iter().map(|(_, event)| event);
+    assert!(matches!(batch.next(), Some(Pending::Force)));
+
+    scope.force_all();
+
+    assert!(!scope.supervisor.is_disposing(key));
+    assert_arrived_disposal_panic_published(&member);
+
+    // The batch's own entry still dispatches, against an already-taken
+    // `pending_terminal`, and must not disturb the published verdict.
+    let Some(Pending::Child(ChildEvent::ConstructionDisposed { child, panic })) = batch.next()
+    else {
+        panic!("the batch collected the construction-disposal completion")
+    };
+    assert_eq!(child, key);
+    let panic = panic.or_else(|| scope.take_arrived_disposal_panic(child));
+    scope.handle_construction_disposed(child, panic);
+    assert_arrived_disposal_panic_published(&member);
+}
+
 #[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hard_force_folds_an_arrived_factory_disposal_panic() {
     let (mut scope, key, member) = scope_with_arrived_factory_disposal_panic().await;
@@ -252,15 +288,7 @@ async fn hard_force_folds_an_arrived_factory_disposal_panic() {
     scope.force_all();
 
     assert!(!scope.supervisor.is_disposing(key));
-    assert!(matches!(
-        member.record().stage,
-        MemberStage::Terminal(ref exit)
-            if matches!(
-                exit.kind(),
-                ExitKind::Panicked { message }
-                    if message.as_deref() == Some(ARRIVED_FACTORY_DISPOSAL_PANIC)
-            )
-    ));
+    assert_arrived_disposal_panic_published(&member);
 }
 
 #[crate::runtime::test]

@@ -85,7 +85,8 @@ pub(super) use super::super::{
     MemberCell, MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest,
     RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent,
     ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
-    cancel_dynamic_reservation, discharge_child_terminality, monitor_root_driver, report_slot,
+    cancel_dynamic_reservation, discharge_child_terminality,
+    events::collect_driver_events, monitor_root_driver, report_slot,
     reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
     run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
 };
@@ -273,6 +274,7 @@ impl ScopeRuntimeBuilder {
             events: self.events,
             disposal_events: self.disposal_events,
             disposal_event_receiver: self.disposal_event_receiver,
+            arrived_disposal_panics: BTreeMap::new(),
             deadlines: super::super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::new(),
             role: ScopeRole::Root,

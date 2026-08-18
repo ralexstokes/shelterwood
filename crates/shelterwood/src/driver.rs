@@ -220,6 +220,7 @@ struct ScopeRuntime {
     restart_shutdown_retries: Vec<(ChildKey, Epoch)>,
     events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
+    disposal_event_receiver: runtime::UnboundedMpscReceiver<DriverEvent>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
     role: ScopeRole,
@@ -355,11 +356,11 @@ impl Drop for ScopeRuntime {
         // must publish that verdict before the terminality fallback gets a
         // chance to synthesize a coarse cancellation. The disposal job stays
         // detached; as on hard escalation, teardown does not wait for it and
-        // does not incorporate a destructor panic that has not been
-        // dispatched at publication — including a completion already queued
-        // on the disposal lane but not yet dispatched. Consuming that arrived
-        // half is issue #291, which covers this site and the matching discard
-        // in `force_child`.
+        // cannot incorporate a destructor panic that has not completed at
+        // publication. A completion already queued on the disposal lane is
+        // available without waiting, however, so consume that arrived prefix
+        // before falling back to the stored verdict.
+        self.drain_arrived_disposal_events();
         let child_keys: Vec<_> = self.children.iter().map(|(key, _)| key).collect();
         for key in child_keys {
             if self
@@ -418,6 +419,14 @@ impl Drop for ScopeRuntime {
 }
 
 impl ScopeRuntime {
+    fn drain_arrived_disposal_events(&mut self) {
+        while let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
+            runtime::unbounded_mpsc_try_recv(&mut self.disposal_event_receiver)
+        {
+            self.handle_construction_disposed(child, panic);
+        }
+    }
+
     fn reduce(&mut self, event: SupervisorEvent) {
         supervisor_step(&mut self.supervisor, event, &mut self.supervisor_effects);
     }
@@ -852,7 +861,7 @@ async fn run_scope_incarnation(
         .saturating_mul(3)
         .max(MIN_EVENT_BATCH_LIMIT);
     let (events, mut event_receiver) = runtime::unbounded_mpsc();
-    let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
+    let (disposal_events, disposal_event_receiver) = runtime::unbounded_mpsc();
     let (dynamic, mut dynamic_event_receiver) = if plan.root.flavor == ScopeFlavor::Dynamic {
         let (dynamic_events, receiver) = runtime::unbounded_mpsc();
         (Some(DynamicControl::new(dynamic_events)), Some(receiver))
@@ -901,6 +910,7 @@ async fn run_scope_incarnation(
         restart_shutdown_retries: Vec::new(),
         events,
         disposal_events,
+        disposal_event_receiver,
         deadlines: DeadlineQueue::default(),
         jitter: runtime::JitterRng::new(),
         role,
@@ -982,7 +992,7 @@ async fn run_scope_incarnation(
             EventLanes {
                 primary: &mut event_receiver,
                 control: dynamic_event_receiver.as_mut(),
-                disposal: &mut disposal_event_receiver,
+                disposal: &mut scope.disposal_event_receiver,
             },
             event_batch_limit,
             &mut pending,

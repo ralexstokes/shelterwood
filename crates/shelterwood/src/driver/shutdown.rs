@@ -224,10 +224,15 @@ impl ScopeRuntime {
             ladder.force(now);
         }
         self.advance_ladder(key, now);
+        // A retained-factory destructor may already have completed even
+        // though its disposal event has not reached ordinary dispatch. Fold
+        // every arrived completion before the hard-force fallback; the drain
+        // is non-blocking, so still-running disposal remains detached.
+        self.drain_arrived_disposal_events();
         if self.supervisor.is_disposing(key) {
             // The incarnation has already exited; only its retained factory
-            // remains. Hard escalation detaches that cleanup, but must not
-            // rewrite the actor's recorded verdict.
+            // remains and its disposal completion has not arrived. Hard
+            // escalation detaches that cleanup and keeps the recorded verdict.
             self.handle_construction_disposed(key, None);
         }
     }

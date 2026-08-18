@@ -87,13 +87,12 @@ async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnat
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
     let key = children
         .insert(child)
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_lifecycle(ScopeLifecycle::running())
         .with_children(children)
@@ -179,7 +178,6 @@ async fn expedited_restart_progresses_synchronous_readiness() {
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     // Scope definitions currently resolve to Manual and expose no public
     // readiness setter. Model that API invariant changing: the expedited
@@ -190,7 +188,7 @@ async fn expedited_restart_progresses_synchronous_readiness() {
     let key = children
         .insert(child)
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_children(children)
         .with_next_ordered_start(Some(key))
@@ -262,7 +260,6 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
@@ -275,7 +272,7 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
         .keys()
         .find(|key| children[*key].slot.member.id().as_str() == "nested")
         .expect("nested child key");
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_children(children)
         .with_next_ordered_start(Some(first))
@@ -347,13 +344,12 @@ async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_become
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
     let key = children
         .insert(child)
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_lifecycle(ScopeLifecycle::running())
         .with_children(children)
@@ -445,7 +441,6 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
@@ -462,7 +457,7 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
         .find(|key| children[*key].slot.member.id().as_str() == "trip")
         .expect("tripping child key");
     let next_ordered_start = children.keys().next();
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
@@ -606,7 +601,6 @@ async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
@@ -623,7 +617,7 @@ async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
         .find(|key| children[*key].slot.member.id().as_str() == "trip")
         .expect("tripping child key");
     let next_ordered_start = children.keys().next();
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
@@ -769,13 +763,12 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
     let key = children
         .insert(child)
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
@@ -839,11 +832,11 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
         }
     }
 
-    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
-        disposal_event_receiver
-            .recv()
-            .await
-            .expect("disposal reports completion")
+    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = scope
+        .disposal_event_receiver
+        .recv()
+        .await
+        .expect("disposal reports completion")
     else {
         panic!("only construction disposal was armed")
     };
@@ -907,7 +900,6 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
@@ -917,7 +909,7 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
     }
     let gone = children.keys().next().expect("first ordered child");
     let next = children.keys().nth(1).expect("second ordered child");
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_children(children)
         .with_next_ordered_start(Some(gone))
@@ -981,7 +973,6 @@ async fn startup_removal_response_follows_aggregate_recomputation() {
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (control_events, _control_event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(control_events);
     let mut children = ChildArena::default();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
@@ -993,7 +984,7 @@ async fn startup_removal_response_follows_aggregate_recomputation() {
     });
     root.set_dynamic_route(Some(control.clone()));
     let member = Arc::clone(&children[key].slot.member);
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_children(children)
         .with_dynamic(Some(control))
@@ -1057,7 +1048,6 @@ async fn queued_removal_suppresses_replayed_self_stop_readiness() {
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (control_events, mut control_event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(control_events);
     let mut children = ChildArena::default();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
@@ -1069,7 +1059,7 @@ async fn queued_removal_suppresses_replayed_self_stop_readiness() {
     });
     root.set_dynamic_route(Some(control.clone()));
     let member = Arc::clone(&children[key].slot.member);
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_children(children)
         .with_dynamic(Some(control))

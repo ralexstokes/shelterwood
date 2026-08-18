@@ -168,6 +168,7 @@ pub(super) struct ScopeRuntimeBuilder {
     epoch: Epoch,
     events: crate::runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: crate::runtime::UnboundedMpscSender<DriverEvent>,
+    disposal_event_receiver: crate::runtime::UnboundedMpscReceiver<DriverEvent>,
     defaults: ResolvedDefaults,
     intensity_policy: Intensity,
     children: ChildArena<ChildRuntime>,
@@ -182,13 +183,14 @@ impl ScopeRuntimeBuilder {
         root: Arc<ScopeCell>,
         epoch: Epoch,
         events: crate::runtime::UnboundedMpscSender<DriverEvent>,
-        disposal_events: crate::runtime::UnboundedMpscSender<DriverEvent>,
     ) -> Self {
+        let (disposal_events, disposal_event_receiver) = crate::runtime::unbounded_mpsc();
         Self {
             root,
             epoch,
             events,
             disposal_events,
+            disposal_event_receiver,
             defaults: ResolvedDefaults::default(),
             intensity_policy: Intensity::default(),
             children: ChildArena::default(),
@@ -270,6 +272,7 @@ impl ScopeRuntimeBuilder {
             supervisor_effects,
             events: self.events,
             disposal_events: self.disposal_events,
+            disposal_event_receiver: self.disposal_event_receiver,
             deadlines: super::super::DeadlineQueue::default(),
             jitter: crate::runtime::JitterRng::new(),
             role: ScopeRole::Root,
@@ -314,7 +317,6 @@ pub(super) fn running_dynamic_fixture() -> (
     ScopeRuntime,
     crate::runtime::UnboundedMpscReceiver<DriverEvent>,
     crate::runtime::UnboundedMpscReceiver<DriverEvent>,
-    crate::runtime::UnboundedMpscReceiver<DriverEvent>,
     Arc<DynamicControl>,
 ) {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
@@ -328,21 +330,14 @@ pub(super) fn running_dynamic_fixture() -> (
 
     let (events, event_receiver) = crate::runtime::unbounded_mpsc();
     let (dynamic_events, dynamic_event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(dynamic_events);
     root.set_dynamic_route(Some(control.clone()));
     root.set_admitted_children(Vec::new());
-    let scope = ScopeRuntimeBuilder::new(root, epoch, events, disposal_events)
+    let scope = ScopeRuntimeBuilder::new(root, epoch, events)
         .with_lifecycle(ScopeLifecycle::running())
         .with_dynamic(Some(control.clone()))
         .build();
-    (
-        scope,
-        event_receiver,
-        dynamic_event_receiver,
-        disposal_event_receiver,
-        control,
-    )
+    (scope, event_receiver, dynamic_event_receiver, control)
 }
 
 #[derive(Debug, Default)]

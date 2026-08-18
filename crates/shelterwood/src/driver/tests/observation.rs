@@ -348,7 +348,6 @@ struct AbortedNestedDriverFixture {
     incarnation: crate::identity::Incarnation,
     driver: ScopeRuntime,
     _events: crate::runtime::UnboundedMpscReceiver<DriverEvent>,
-    _disposal_events: crate::runtime::UnboundedMpscReceiver<DriverEvent>,
 }
 
 impl AbortedNestedDriverFixture {
@@ -372,8 +371,7 @@ impl AbortedNestedDriverFixture {
         nested.set_admitted_children(Vec::new());
 
         let (events, events_receiver) = crate::runtime::unbounded_mpsc();
-        let (disposal_events, disposal_receiver) = crate::runtime::unbounded_mpsc();
-        let driver = ScopeRuntimeBuilder::new(Arc::clone(&nested), epoch, events, disposal_events)
+        let driver = ScopeRuntimeBuilder::new(Arc::clone(&nested), epoch, events)
             .with_lifecycle(ScopeLifecycle::running())
             .build();
         Self {
@@ -382,7 +380,6 @@ impl AbortedNestedDriverFixture {
             incarnation,
             driver,
             _events: events_receiver,
-            _disposal_events: disposal_receiver,
         }
     }
 

@@ -164,11 +164,10 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     root.set_startup(Ok(()));
 
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
     root.set_dynamic_route(Some(control.clone()));
     root.set_admitted_children(Vec::new());
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_lifecycle(ScopeLifecycle::running())
         .with_dynamic(Some(control.clone()))
         .build();
@@ -265,7 +264,7 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        disposal_event_receiver.recv().await
+        scope.disposal_event_receiver.recv().await
     else {
         panic!("removal joins retained construction disposal")
     };

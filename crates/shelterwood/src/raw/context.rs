@@ -707,18 +707,26 @@ impl<M> RawResources<M> {
         // independently, while this outer accumulator keeps one failure from
         // skipping later offloads or any of the collection drains.
         let mut panics = PanicAccumulator::default();
+        // An already-retained offload failure happened before this freeze and
+        // therefore precedes every synchronous cleanup failure below.
+        panics.record(self.disposal.panic.take());
         for offload in &mut self.offloads {
-            panics.record(offload.cancel());
+            panics.record(offload.cancel(&self.disposal.panic));
+            panics.record(self.disposal.panic.take());
         }
         panics.run(|| self.continuations.clear());
+        panics.record(self.disposal.panic.take());
         panics.run(|| self.timers.clear());
+        panics.record(self.disposal.panic.take());
         panics.run(|| self.ready_batch = None);
+        panics.record(self.disposal.panic.take());
         panics.run(|| self.events.clear());
+        panics.record(self.disposal.panic.take());
         if let Some(payload) = panics.take() {
             // The owned raw-incarnation epilogue drains this slot after the
             // freeze and before joining, so publication is delayed until all
             // synchronous cleanup has completed without losing the diagnostic.
-            self.disposal.panic.record(payload);
+            self.disposal.panic.restore_first(payload);
         }
         dropped_continuations
     }
@@ -1550,7 +1558,7 @@ mod tests {
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Poll, Waker},
+        task::{Context, Poll, Wake, Waker},
         thread,
         time::Duration,
     };
@@ -1699,6 +1707,18 @@ mod tests {
     }
 
     struct PanickingDrop(Arc<AtomicUsize>);
+
+    struct PanickingWake(&'static str);
+
+    impl Wake for PanickingWake {
+        fn wake(self: Arc<Self>) {
+            panic!("{}", self.0);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            panic!("{}", self.0);
+        }
+    }
 
     impl Drop for PanickingDrop {
         fn drop(&mut self) {
@@ -2346,6 +2366,108 @@ mod tests {
             drops.load(Ordering::SeqCst),
             2,
             "repeat cancellation is inert"
+        );
+    }
+
+    #[test]
+    fn freeze_preserves_an_offload_wake_panic_ahead_of_later_collection_disposal() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut resources = RawResources::<PanickingDrop>::default();
+        resources
+            .continuations
+            .push_back(PanickingDrop(Arc::clone(&drops)));
+
+        let finished = Latch::default();
+        let mut waiter = Box::pin(finished.fired());
+        let hostile = Waker::from(Arc::new(PanickingWake("first finished wake panic")));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished: finished.clone(),
+            state: None,
+            task: None,
+        });
+
+        assert_eq!(resources.freeze(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let payload = resources
+            .disposal
+            .panic
+            .take()
+            .expect("the first cleanup failure is retained");
+        assert_eq!(panic_message(&payload), Some("first finished wake panic"));
+    }
+
+    #[test]
+    fn freeze_preserves_future_disposal_ahead_of_its_later_finished_wake() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut resources = RawResources::<()>::default();
+        let finished = Latch::default();
+        let mut waiter = Box::pin(finished.fired());
+        let hostile = Waker::from(Arc::new(PanickingWake("later finished wake panic")));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        let state = SharedOffloadState::new(
+            Box::pin(BlockingPollDrop {
+                entered: Arc::new(Barrier::new(1)),
+                release: Arc::new(Barrier::new(1)),
+                drops: Arc::clone(&drops),
+                panic_on_drop: true,
+            }),
+            resources.disposal.clone(),
+            finished.clone(),
+        );
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished: finished.clone(),
+            state: Some(state),
+            task: None,
+        });
+
+        assert_eq!(resources.freeze(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let payload = resources
+            .disposal
+            .panic
+            .take()
+            .expect("the first cleanup failure is retained");
+        assert_eq!(
+            panic_message(&payload),
+            Some("unit offload destructor panic")
+        );
+    }
+
+    #[test]
+    fn repeated_freeze_preserves_the_first_failure_without_repeating_disposal() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut resources = RawResources::<PanickingDrop>::default();
+        resources
+            .continuations
+            .push_back(PanickingDrop(Arc::clone(&drops)));
+
+        assert_eq!(resources.freeze(), 1);
+        assert_eq!(resources.freeze(), 0, "the freeze transition is one-shot");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let payload = catch_unwind(AssertUnwindSafe(|| drop(resources)))
+            .expect_err("drop resumes the failure retained by the first freeze");
+        assert_eq!(
+            panic_message(&payload),
+            Some("contained raw payload destructor panic")
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "drop does not re-run already completed disposal"
         );
     }
 

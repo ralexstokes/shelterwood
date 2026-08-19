@@ -1450,6 +1450,14 @@ impl<M: Send + 'static> RawContext<M> {
     /// [`continue_with`](Self::continue_with) continuation, which is a plain
     /// stored message whose construction cannot panic here — surfaces
     /// directly from this receive call.
+    ///
+    /// A panic escaping this call leaves the fired selection cut installed,
+    /// so the next receive retries the same timer arming rather than
+    /// discarding the remaining batch. A raw loop that catches such a panic
+    /// and receives again therefore repeats an interval whose user `Clone`
+    /// panics deterministically; clear that key with
+    /// [`clear_timer`](Self::clear_timer) — or [`stop`](Self::stop) — before
+    /// resuming the loop.
     pub async fn recv(&mut self) -> Option<M> {
         loop {
             if self.local_stop.is_fired() {
@@ -1495,6 +1503,14 @@ impl<M: Send + 'static> RawContext<M> {
     /// prefix. Retention is the guarantee, not a join: a payload recorded
     /// after the check is still the incarnation's exit, but is classified by
     /// the epilogue and cannot suppress `on_stop`.
+    ///
+    /// A panic escaping this call leaves the fired selection cut installed,
+    /// so the next receive retries the same timer arming rather than
+    /// discarding the remaining batch. A raw loop that catches such a panic
+    /// and receives again therefore repeats an interval whose user `Clone`
+    /// panics deterministically; clear that key with
+    /// [`clear_timer`](Self::clear_timer) — or [`stop`](Self::stop) — before
+    /// resuming the loop.
     pub fn try_recv(&mut self) -> Option<M> {
         if self.is_stopping() {
             self.freeze_and_report();

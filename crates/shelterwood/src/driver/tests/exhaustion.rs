@@ -418,8 +418,9 @@ async fn nested_membership_exhaustion_is_structured_and_fail_closed() {
         crate::policy::ResolvedDefaults::default(),
         NestedScopeLatches {
             parent_ready: ready.clone(),
+            child_shutdown: Latch::default(),
             ancestor: AncestorCommandLatches {
-                shutdown: Latch::default(),
+                framework_shutdown: Latch::default(),
                 abort: Latch::default(),
                 abort_ack: Latch::default(),
             },
@@ -481,6 +482,7 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
         .expect("provisional declaration succeeds");
     let epoch = ScopeEpochGuard::begin(&scope).expect("the first nested epoch is available");
     let ancestor_shutdown = Latch::default();
+    let child_shutdown = Latch::default();
     match source {
         PreLoopStopSource::ScopeShutdown => {
             let target = scope
@@ -491,6 +493,9 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
         PreLoopStopSource::ScopeForce => scope.force_shutdown(epoch.epoch()),
         PreLoopStopSource::AncestorShutdown => {
             ancestor_shutdown.fire();
+            // Parent cancellation publishes the user-facing edge separately
+            // from the nested driver's framework-only observation edge.
+            child_shutdown.fire();
         }
     }
     let ready = CompletionGatedLatch::default();
@@ -500,8 +505,9 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
         crate::policy::ResolvedDefaults::default(),
         NestedScopeLatches {
             parent_ready: ready.clone(),
+            child_shutdown: child_shutdown.clone(),
             ancestor: AncestorCommandLatches {
-                shutdown: ancestor_shutdown.clone(),
+                framework_shutdown: ancestor_shutdown.clone(),
                 abort: Latch::default(),
                 abort_ack: Latch::default(),
             },
@@ -512,8 +518,8 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
 
     assert!(result.is_ok());
     assert!(
-        ancestor_shutdown.is_fired(),
-        "the upgraded verdict fires the latch that reports the exit as cancelled"
+        child_shutdown.is_fired(),
+        "the upgraded verdict fires the user-facing latch that classifies the exit as cancelled"
     );
     assert!(matches!(
         scope.record().startup,

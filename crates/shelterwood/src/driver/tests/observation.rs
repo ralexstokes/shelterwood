@@ -848,8 +848,9 @@ async fn panicking_nested_factory_releases_its_pre_driver_epoch() {
             crate::policy::ResolvedDefaults::default(),
             NestedScopeLatches {
                 parent_ready: CompletionGatedLatch::default(),
+                child_shutdown: Latch::default(),
                 ancestor: AncestorCommandLatches {
-                    shutdown: Latch::default(),
+                    framework_shutdown: Latch::default(),
                     abort: Latch::default(),
                     abort_ack: Latch::default(),
                 },

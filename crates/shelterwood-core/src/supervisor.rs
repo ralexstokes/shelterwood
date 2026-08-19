@@ -673,6 +673,16 @@ impl SupervisorState {
         self.hard_forced = forced;
     }
 
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn exhaust_child_keys_for_test(&mut self) {
+        self.keys = PoisonedCounter::near_exhaustion();
+        assert!(self.keys.mint().is_some(), "the final child key is usable");
+        assert!(
+            self.keys.mint().is_none(),
+            "the child-key domain reaches its permanent poison state"
+        );
+    }
+
     #[cfg(test)]
     fn check_invariants(&self) {
         assert_eq!(self.children.len(), self.child_keys.len());

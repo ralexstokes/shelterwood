@@ -59,6 +59,7 @@ fn declaration_errors_are_eager_and_root_lowering_is_the_only_other_build_error(
         Err(shelterwood::ReserveError::DuplicateId(ref id)) if id.as_str() == "duplicate"
     ));
     let task = slot.task_ref();
+    drop(slot);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()

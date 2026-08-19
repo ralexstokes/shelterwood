@@ -347,10 +347,14 @@ impl<M> MailboxState<M> {
 
     /// Replaces one binding only after its waiter identity domain is empty.
     ///
-    /// This check remains a debug assertion because every caller holds the
-    /// mailbox mutex. A violated framework invariant must not poison the lock
-    /// in release builds, and the old binding stays installed if debug
-    /// diagnosis fires.
+    /// The check is not an `assert!` because every caller holds the mailbox
+    /// mutex and a violated framework invariant must not poison it. Both
+    /// builds therefore keep the old binding: debug diagnoses first, and
+    /// release declines the replacement rather than dropping a live
+    /// `WaiterQueue` here. That drop would release the queue's
+    /// `Arc<SendOperation<M>>`s under the mutex, so wherever one is the last
+    /// owner a user message destructor would run in the critical section.
+    /// Declining costs a stalled transition, which is the lesser of the two.
     fn replace_binding(&mut self, replacement: MailboxBinding<M>) {
         let replaceable = match &self.binding {
             MailboxBinding::Unbound(waiters)
@@ -363,6 +367,9 @@ impl<M> MailboxState<M> {
             replaceable,
             "mailbox binding replacement requires an empty waiter queue"
         );
+        if !replaceable {
+            return;
+        }
         self.binding = replacement;
     }
 

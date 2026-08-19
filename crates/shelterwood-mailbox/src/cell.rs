@@ -624,6 +624,33 @@ struct MailboxEffectBatch<M> {
     accepted_sequence_exhausted: bool,
 }
 
+/// A received message remains isolated until every post-unlock effect has
+/// flushed successfully. If a pulse, waker, displaced payload, or exhaustion
+/// verdict panics, unwinding submits the message for detached disposal instead
+/// of destroying it on the mailbox caller's stack.
+struct ReturnedMessage<M: Send + 'static> {
+    value: Option<M>,
+    runtime: Arc<dyn MailboxRuntime>,
+}
+
+impl<M: Send + 'static> ReturnedMessage<M> {
+    fn new(value: Option<M>, runtime: Arc<dyn MailboxRuntime>) -> Self {
+        Self { value, runtime }
+    }
+
+    fn take(&mut self) -> Option<M> {
+        self.value.take()
+    }
+}
+
+impl<M: Send + 'static> Drop for ReturnedMessage<M> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            dispose(&self.runtime, value);
+        }
+    }
+}
+
 impl<M: Send + 'static> MailboxEffectBatch<M> {
     fn flush(mut self) {
         let mut panics = PanicAccumulator::default();
@@ -706,9 +733,12 @@ impl<'a, 's, M: Send + 'static> MailboxTxn<'a, 's, M> {
 
     fn finish_returned(mut self) -> Option<M> {
         drop(self.state.take());
-        let output = self.effects.returned.take();
+        let mut output = ReturnedMessage::new(
+            self.effects.returned.take(),
+            Arc::clone(&self.effects.cell.runtime),
+        );
         drop(self);
-        output
+        output.take()
     }
 }
 
@@ -2377,9 +2407,13 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn promotion_sequence_exhaustion_panics_after_unlock_without_poisoning() {
-        let mut mailbox =
-            MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    fn promotion_sequence_exhaustion_isolates_the_received_message_before_panicking() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Arc::new(BindOrderingRuntime {
+            inner: crate::capability::tests::runtime(),
+            events: Arc::clone(&events),
+        });
+        let mut mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
         Arc::get_mut(&mut mailbox)
             .expect("mailbox is uniquely owned")
             .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
@@ -2394,11 +2428,19 @@ pub(super) mod tests {
             .into_pair();
         let incarnation = incarnations.mint().expect("incarnation available");
         bind(&mailbox, token, incarnation);
+        let weak = Arc::downgrade(&mailbox);
+        let (dropped, observed) = mpsc::channel();
         assert!(matches!(
-            mailbox.submit(1_u8),
+            mailbox.submit(LockCheckingMessage {
+                mailbox: Weak::clone(&weak),
+                dropped: Some(dropped),
+            }),
             super::Submission::Accepted(_)
         ));
-        let operation = match mailbox.submit(2_u8) {
+        let operation = match mailbox.submit(LockCheckingMessage {
+            mailbox: weak,
+            dropped: None,
+        }) {
             super::Submission::Parked(operation) => operation,
             super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
                 panic!("the full queue parks the second message")
@@ -2413,10 +2455,23 @@ pub(super) mod tests {
                 .lock()
                 .expect("the exhaustion panic occurs after mailbox unlock"),
         );
+        assert!(
+            events
+                .lock()
+                .expect("effect recorder mutex")
+                .contains(&BindEffectEvent::DisposalSubmitted),
+            "the live return value is submitted for isolated disposal before unwind"
+        );
+        assert!(
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("isolated returned-message destructor reports"),
+            "the returned message is destroyed outside the mailbox mutex"
+        );
         let mut withdrawal = mailbox.withdraw(&operation, super::WithdrawalDisposition::Inline);
         assert!(matches!(
             withdrawal.take_outcome(),
-            super::WithdrawalOutcome::Withdrawn { message: 2, .. }
+            super::WithdrawalOutcome::Withdrawn { .. }
         ));
         withdrawal.finish();
     }

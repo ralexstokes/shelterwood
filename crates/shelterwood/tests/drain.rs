@@ -26,6 +26,7 @@ enum Message {
 
 struct Args {
     stop_entered: Arc<AtomicBool>,
+    stop_was_draining: Arc<AtomicBool>,
     allow_stop: ReleaseGate,
     drain_entered: Arc<AtomicBool>,
     allow_drain: ReleaseGate,
@@ -46,7 +47,9 @@ impl Actor for DrainActor {
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         match message {
             Message::Stop => {
-                assert!(!context.is_draining());
+                self.0
+                    .stop_was_draining
+                    .store(context.is_draining(), Ordering::SeqCst);
                 self.0.log.lock().expect("log mutex poisoned").push(0);
                 self.0.stop_entered.store(true, Ordering::SeqCst);
                 self.0.allow_stop.wait().await;
@@ -119,6 +122,7 @@ impl Actor for DrainActor {
 
 async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
     let stop_entered = Arc::new(AtomicBool::new(false));
+    let stop_was_draining = Arc::new(AtomicBool::new(false));
     let allow_stop = ReleaseGate::default();
     let drain_entered = Arc::new(AtomicBool::new(false));
     let allow_drain = ReleaseGate::default();
@@ -131,6 +135,7 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
             "drain",
             ActorOnceDef::<DrainActor>::new(Args {
                 stop_entered: Arc::clone(&stop_entered),
+                stop_was_draining: Arc::clone(&stop_was_draining),
                 allow_stop: allow_stop.clone(),
                 drain_entered: Arc::clone(&drain_entered),
                 allow_drain: allow_drain.clone(),
@@ -154,6 +159,10 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
         .await
         .expect("prefix accepted");
     allow_stop.release();
+    assert!(
+        !stop_was_draining.load(Ordering::SeqCst),
+        "the initiating handler runs before mailbox drain begins"
+    );
 
     assert_eventually!(|| drain_entered.load(Ordering::SeqCst)).await;
     let rejection = actor
@@ -230,6 +239,7 @@ struct FaultArgs {
     mode: FaultMode,
     hold_entered: ReleaseGate,
     hold_release: ReleaseGate,
+    hold_was_draining: Arc<AtomicBool>,
     shutdown_seen: ReleaseGate,
     drain_entered: ReleaseGate,
     stop_entered: Arc<AtomicBool>,
@@ -256,7 +266,9 @@ impl Actor for FaultActor {
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         match message {
             FaultMessage::Hold => {
-                assert!(!context.is_draining());
+                self.0
+                    .hold_was_draining
+                    .store(context.is_draining(), Ordering::SeqCst);
                 self.0.hold_entered.release();
                 self.0.hold_release.wait().await;
                 Ok(())
@@ -332,6 +344,7 @@ async fn run_fault_fixture(
 ) -> FaultOutcome {
     let hold_entered = ReleaseGate::default();
     let hold_release = ReleaseGate::default();
+    let hold_was_draining = Arc::new(AtomicBool::new(false));
     let shutdown_seen = ReleaseGate::default();
     let drain_entered = ReleaseGate::default();
     let stop_entered = Arc::new(AtomicBool::new(false));
@@ -345,6 +358,7 @@ async fn run_fault_fixture(
                 mode,
                 hold_entered: hold_entered.clone(),
                 hold_release: hold_release.clone(),
+                hold_was_draining: Arc::clone(&hold_was_draining),
                 shutdown_seen: shutdown_seen.clone(),
                 drain_entered: drain_entered.clone(),
                 stop_entered: Arc::clone(&stop_entered),
@@ -374,6 +388,10 @@ async fn run_fault_fixture(
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(30)));
     shutdown_seen.wait().await;
     hold_release.release();
+    assert!(
+        !hold_was_draining.load(Ordering::SeqCst),
+        "the held handler observes live delivery before its gate is released"
+    );
     if matches!(mode, FaultMode::SharedGrace) {
         drain_entered.wait().await;
         assert!(

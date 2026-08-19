@@ -610,26 +610,24 @@ async fn mailbox_waker_panic_is_contained_without_wedging_system_completion() {
     waiter_started.fired().await;
     exit.fire();
 
-    let member_exit = match crate::runtime::timeout(
-        Duration::from_secs(2),
-        crate::runtime::join(terminal_waiter),
-    )
-    .await
-    {
-        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { value }) => value,
-        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Panic { message }) => {
-            panic!("the terminal waiter panicked: {message:?}")
-        }
-        crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Cancelled) => {
-            panic!("the terminal waiter was cancelled")
-        }
-        crate::runtime::Timeout::Elapsed => {
-            panic!("the terminal waiter was not pulsed after the mailbox panic")
-        }
-    };
+    let member_exit =
+        match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(terminal_waiter))
+            .await
+        {
+            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { value }) => value,
+            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Panic { message }) => {
+                panic!("the terminal waiter panicked: {message:?}")
+            }
+            crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Cancelled) => {
+                panic!("the terminal waiter was cancelled")
+            }
+            crate::runtime::Timeout::Elapsed => {
+                panic!("the terminal waiter was not pulsed after the mailbox panic")
+            }
+        };
     assert!(matches!(member_exit.kind(), ExitKind::Completed));
 
-    let reason = match crate::runtime::timeout(Duration::from_secs(2), system.wait()).await {
+    let reason = match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, system.wait()).await {
         crate::runtime::Timeout::Completed(reason) => reason,
         crate::runtime::Timeout::Elapsed => {
             panic!("the system monitor did not contain the driver unwind")

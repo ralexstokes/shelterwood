@@ -32,6 +32,14 @@ enum ReplyMode {
     Hold,
 }
 
+struct CountedReplyDrop(Arc<AtomicUsize>);
+
+impl Drop for CountedReplyDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 struct Recorder {
     gate: Option<ReleaseGate>,
     values: Arc<Mutex<Vec<usize>>>,
@@ -318,14 +326,23 @@ async fn reply_receiver_is_consuming_and_late_replies_are_discarded() {
         )
         .expect("valid actor");
     let width = Duration::from_secs(10);
+    let timed_out_reply_drops = Arc::new(AtomicUsize::new(0));
     let (reply, receiver) = actor.reply_channel();
     let mut waiter = Box::pin(receiver.recv(width));
     assert!(poll_once(waiter.as_mut()).is_pending());
     advance_time(width).await;
-    assert_eq!(waiter.await, Err(ReplyError::Timeout));
-    reply.send(1);
+    assert!(matches!(waiter.await, Err(ReplyError::Timeout)));
+    reply.send(CountedReplyDrop(Arc::clone(&timed_out_reply_drops)));
+    assert_eventually!(|| timed_out_reply_drops.load(Ordering::SeqCst) == 1).await;
 
-    let (reply, receiver) = actor.reply_channel::<usize>();
+    let dropped_receiver_reply_drops = Arc::new(AtomicUsize::new(0));
+    let (reply, receiver) = actor.reply_channel::<CountedReplyDrop>();
     drop(receiver);
-    reply.send(2);
+    reply.send(CountedReplyDrop(Arc::clone(&dropped_receiver_reply_drops)));
+    assert_eventually!(|| dropped_receiver_reply_drops.load(Ordering::SeqCst) == 1).await;
+    assert_quiet(Duration::from_millis(20), || {
+        timed_out_reply_drops.load(Ordering::SeqCst) != 1
+            || dropped_receiver_reply_drops.load(Ordering::SeqCst) != 1
+    })
+    .await;
 }

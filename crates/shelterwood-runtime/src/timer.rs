@@ -174,6 +174,10 @@ mod tests {
         let Some(requested) = current.checked_add(beyond_tokio_ticks) else {
             // Some platforms have a narrower Instant domain than Tokio's
             // u64 millisecond tick range, so this boundary cannot be tested.
+            eprintln!(
+                "skipping deadline_beyond_tokios_tick_range_is_armed_in_a_bounded_slice: \
+                 this platform's Instant cannot represent Tokio's u64-millisecond boundary"
+            );
             return;
         };
 
@@ -188,6 +192,10 @@ mod tests {
         let current = super::now();
         let Some(requested) = current.checked_add(Duration::from_millis(u64::MAX - 2)) else {
             // See `deadline_beyond_tokios_tick_range_is_armed_in_a_bounded_slice`.
+            eprintln!(
+                "skipping deadline_beyond_tokios_tick_range_does_not_fire_at_the_first_slice: \
+                 this platform's Instant cannot represent Tokio's u64-millisecond boundary"
+            );
             return;
         };
         let mut sleep = std::pin::pin!(super::sleep_until_std(requested));

@@ -25,7 +25,13 @@ struct ZeroDeadlineActor;
 #[derive(Debug, Eq, PartialEq)]
 struct ZeroDeadlineObservation {
     result: Result<usize, DeadlineElapsed>,
-    continuation_task_matches: bool,
+    /// The tasks `init` and the continuation ran on. `tokio::task::Id` is
+    /// `Copy + Eq`, so both ids travel whole rather than as a pre-collapsed
+    /// comparison: a failure then names the two tasks instead of printing
+    /// `false`, and the judgement does not rest on `Debug` output this
+    /// repository treats as non-contractual.
+    actor_task: tokio::task::Id,
+    continuation_task: tokio::task::Id,
 }
 
 struct ZeroDeadlinePanickingDrop {
@@ -65,7 +71,7 @@ impl Actor for ZeroDeadlineActor {
         (polled, observed): Self::Args,
         context: &mut Context<'_, Self>,
     ) -> Result<Self, ExitError> {
-        let actor_task = format!("{:?}", tokio::task::id());
+        let actor_task = tokio::task::id();
         context
             .offload(
                 async move {
@@ -76,8 +82,8 @@ impl Actor for ZeroDeadlineActor {
                     observed
                         .send(ZeroDeadlineObservation {
                             result,
-                            continuation_task_matches: format!("{:?}", tokio::task::id())
-                                == actor_task,
+                            actor_task,
+                            continuation_task: tokio::task::id(),
                         })
                         .expect("the test retains the observation receiver");
                     ZeroMessage::Done
@@ -136,17 +142,27 @@ async fn zero_budget_offload_never_polls_work_and_times_out_on_actor_task() {
     )
     .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
-    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    assert!(!polled.load(Ordering::SeqCst));
+    // The actor stops only on receipt of the continuation's message, so a
+    // dropped completion would park here forever and report as a harness
+    // timeout instead of a failed assertion.
     assert_eq!(
-        observations
-            .recv_timeout(POLL_TIMEOUT)
-            .expect("the continuation publishes its result"),
-        ZeroDeadlineObservation {
-            result: Err(DeadlineElapsed),
-            continuation_task_matches: true,
-        },
-        "a zero-budget offload times out without polling and its continuation runs on the actor task"
+        tokio::time::timeout(POLL_TIMEOUT, system.wait())
+            .await
+            .expect("the zero-budget continuation is delivered"),
+        shelterwood::StopReason::Finished
+    );
+    assert!(!polled.load(Ordering::SeqCst));
+    let observation = observations
+        .recv_timeout(POLL_TIMEOUT)
+        .expect("the continuation publishes its result");
+    assert_eq!(
+        observation.result,
+        Err(DeadlineElapsed),
+        "a zero-budget offload times out without polling its work"
+    );
+    assert_eq!(
+        observation.continuation_task, observation.actor_task,
+        "the continuation runs on the actor task"
     );
     assert!(
         observations.try_recv().is_err(),

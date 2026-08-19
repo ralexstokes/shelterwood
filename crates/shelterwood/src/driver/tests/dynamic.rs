@@ -24,16 +24,21 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
             )
             .await
             .expect("task admission");
-        let storage = cell.runtime_storage();
+        // `deadline_slots` is exact, not a band: every removal cancels through
+        // `DeadlineQueue::cancel`, which always compacts because one stale
+        // heap entry exceeds twice the zero remaining registrations. A stale
+        // cancelled entry surviving a cycle is exactly the leak this asserts
+        // against, so widening this to `deadlines..=deadlines * 2` would
+        // admit it.
         assert_eq!(
-            (storage.children, storage.child_slots, storage.deadlines),
-            (1, 1, 1),
+            cell.runtime_storage(),
+            RuntimeStorage {
+                children: 1,
+                child_slots: 1,
+                deadlines: 1,
+                deadline_slots: 1,
+            },
             "cycle {cycle} stores exactly the live child and readiness deadline"
-        );
-        assert!(
-            storage.deadline_slots >= storage.deadlines
-                && storage.deadline_slots <= storage.deadlines * 2,
-            "cycle {cycle} bounds raw deadline storage by the live heap policy: {storage:?}"
         );
 
         assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);

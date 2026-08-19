@@ -790,31 +790,33 @@ impl<M> Drop for TimerStore<M> {
 }
 
 struct ReadyBatch {
-    armings: VecDeque<ArmingOrder>,
-    // Only fired batches constrain continuations to a captured prefix.
-    // Steady-state continuations stay live so one queued by an external
-    // handler retains `continue_with`'s next-message priority.
-    continuations_remaining: usize,
+    phase: ReadyBatchPhase,
     mailbox_through: AcceptedSequence,
-    // Steady state takes one mailbox delivery before its captured offload
-    // prefix. A timer promotion removes that budget and drains the entire
-    // pre-fire mailbox prefix before delivering the timer armings.
-    mailbox_remaining: Option<usize>,
-    mailbox_complete: bool,
     offloads_remaining: usize,
-    offloads_complete: bool,
+}
+
+enum ReadyBatchPhase {
+    // Steady state takes one mailbox delivery before its captured offload
+    // prefix. Steady-state continuations stay live so one queued by an
+    // external handler retains `continue_with`'s next-message priority.
+    Steady {
+        mailbox_budget: usize,
+    },
+    // Fired batches drain the entire pre-fire mailbox prefix, constrain
+    // continuations to their captured prefix, and retain every due arming
+    // until its delivery commits.
+    Fired {
+        armings: VecDeque<ArmingOrder>,
+        continuations_remaining: usize,
+    },
 }
 
 impl ReadyBatch {
     fn steady(mailbox_through: AcceptedSequence, offloads_remaining: usize) -> Self {
         Self {
-            armings: VecDeque::new(),
-            continuations_remaining: 0,
+            phase: ReadyBatchPhase::Steady { mailbox_budget: 1 },
             mailbox_through,
-            mailbox_remaining: Some(1),
-            mailbox_complete: false,
             offloads_remaining,
-            offloads_complete: false,
         }
     }
 
@@ -826,43 +828,72 @@ impl ReadyBatch {
         offloads_remaining: usize,
     ) {
         debug_assert!(!armings.is_empty());
-        debug_assert!(self.mailbox_remaining.is_some());
-        self.armings = armings;
-        self.continuations_remaining = continuations_remaining;
+        debug_assert!(matches!(self.phase, ReadyBatchPhase::Steady { .. }));
+        self.phase = ReadyBatchPhase::Fired {
+            armings,
+            continuations_remaining,
+        };
         self.mailbox_through = mailbox_through;
-        self.mailbox_remaining = None;
-        self.mailbox_complete = false;
         self.offloads_remaining = offloads_remaining;
-        self.offloads_complete = false;
     }
 
     fn mailbox_budget_exhausted(&self) -> bool {
-        self.mailbox_remaining == Some(0)
+        matches!(self.phase, ReadyBatchPhase::Steady { mailbox_budget: 0 })
+    }
+
+    fn mailbox_is_eligible(&self) -> bool {
+        match self.phase {
+            ReadyBatchPhase::Steady { mailbox_budget } => mailbox_budget > 0,
+            ReadyBatchPhase::Fired { .. } => true,
+        }
     }
 
     fn is_fired(&self) -> bool {
-        self.mailbox_remaining.is_none()
+        matches!(self.phase, ReadyBatchPhase::Fired { .. })
     }
 
     fn continuation_is_eligible(&self) -> bool {
-        !self.is_fired() || self.continuations_remaining > 0
+        match self.phase {
+            ReadyBatchPhase::Steady { .. } => true,
+            ReadyBatchPhase::Fired {
+                continuations_remaining,
+                ..
+            } => continuations_remaining > 0,
+        }
     }
 
     fn record_continuation_delivery(&mut self) {
-        if self.is_fired() {
-            debug_assert!(self.continuations_remaining > 0);
-            self.continuations_remaining -= 1;
+        if let ReadyBatchPhase::Fired {
+            continuations_remaining,
+            ..
+        } = &mut self.phase
+        {
+            debug_assert!(*continuations_remaining > 0);
+            *continuations_remaining -= 1;
         }
     }
 
     fn record_mailbox_delivery(&mut self) {
-        if let Some(remaining) = &mut self.mailbox_remaining {
-            debug_assert!(*remaining > 0);
-            *remaining -= 1;
-            if *remaining == 0 {
-                self.mailbox_complete = true;
-            }
+        if let ReadyBatchPhase::Steady { mailbox_budget } = &mut self.phase {
+            debug_assert!(*mailbox_budget > 0);
+            *mailbox_budget -= 1;
         }
+    }
+
+    fn next_arming(&self) -> Option<ArmingOrder> {
+        let ReadyBatchPhase::Fired { armings, .. } = &self.phase else {
+            return None;
+        };
+        armings.front().copied()
+    }
+
+    fn commit_arming(&mut self, arming: ArmingOrder) {
+        let ReadyBatchPhase::Fired { armings, .. } = &mut self.phase else {
+            debug_assert!(false, "only a fired batch delivers timer armings");
+            return;
+        };
+        let removed = armings.pop_front();
+        debug_assert_eq!(removed, Some(arming));
     }
 }
 
@@ -1686,7 +1717,7 @@ impl<M: Send + 'static> RawContext<M> {
                 return Some(message);
             }
 
-            if !batch.mailbox_complete {
+            if batch.mailbox_is_eligible() {
                 let message = self.receiver.try_recv_live_through(batch.mailbox_through);
                 if let Some(message) = message {
                     batch.record_mailbox_delivery();
@@ -1694,10 +1725,9 @@ impl<M: Send + 'static> RawContext<M> {
                     self.resources.ready_batch = Some(batch);
                     return Some(message);
                 }
-                batch.mailbox_complete = true;
             }
 
-            if !batch.offloads_complete {
+            if batch.offloads_remaining > 0 {
                 while let Some(event) = self
                     .resources
                     .events
@@ -1712,7 +1742,6 @@ impl<M: Send + 'static> RawContext<M> {
                         return Some(message);
                     }
                 }
-                batch.offloads_complete = true;
             }
 
             // A steady batch may have exhausted its captured external turn
@@ -1739,14 +1768,12 @@ impl<M: Send + 'static> RawContext<M> {
                 self.resources.ready_batch = Some(batch);
                 return Some(message);
             }
-            batch.continuations_remaining = 0;
 
-            while let Some(arming) = batch.armings.front().copied() {
+            while let Some(arming) = batch.next_arming() {
                 let (restored, message) =
                     self.with_ready_batch_installed(batch, |this| this.deliver_timer(arming));
                 batch = restored;
-                let removed = batch.armings.pop_front();
-                debug_assert_eq!(removed, Some(arming));
+                batch.commit_arming(arming);
                 if let Some(message) = message {
                     self.resources.continuation_needs_external = false;
                     self.resources.ready_batch = Some(batch);
@@ -2756,7 +2783,7 @@ mod tests {
                 .resources
                 .ready_batch
                 .as_ref()
-                .is_some_and(|batch| batch.armings.front() == Some(&arming)),
+                .is_some_and(|batch| batch.next_arming() == Some(arming)),
             "the caught panic leaves the due arming in its installed batch"
         );
 
@@ -2793,7 +2820,7 @@ mod tests {
                 .resources
                 .ready_batch
                 .as_ref()
-                .is_some_and(|batch| batch.armings.front() == Some(&arming)),
+                .is_some_and(|batch| batch.next_arming() == Some(arming)),
             "the caught continuation panic leaves later timer work in the batch"
         );
         assert_eq!(

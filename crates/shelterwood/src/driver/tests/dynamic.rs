@@ -24,12 +24,11 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
             )
             .await
             .expect("task admission");
-        // `deadline_slots` is exact, not a band: every removal cancels through
-        // `DeadlineQueue::cancel`, which always compacts because one stale
-        // heap entry exceeds twice the zero remaining registrations. A stale
-        // cancelled entry surviving a cycle is exactly the leak this asserts
-        // against, so widening this to `deadlines..=deadlines * 2` would
-        // admit it.
+        // `deadline_slots` is exact, not a band. The removal below pins the
+        // queue empty, and arming one readiness deadline pushes exactly one
+        // heap entry, so two slots here means the arm leaked a second,
+        // never-registered entry — the leak this cycle exists to catch, and
+        // one that `deadlines..=deadlines * 2` would admit unnoticed.
         assert_eq!(
             cell.runtime_storage(),
             RuntimeStorage {

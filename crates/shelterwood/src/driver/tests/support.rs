@@ -388,6 +388,12 @@ impl OrderedScopeFixture {
         }
     }
 
+    /// The raw epoch the built scope transfers, for tests that assert epoch
+    /// retirement after the scope itself is gone.
+    pub(super) fn epoch(&self) -> Epoch {
+        self.epoch.epoch()
+    }
+
     pub(super) fn with_lifecycle(mut self, lifecycle: ScopeLifecycle) -> Self {
         self.lifecycle = lifecycle;
         self

@@ -149,20 +149,10 @@ impl ScopeRuntime {
         // retired.
         RetainedExit::retain_stop_reason(&mut self.retained_exits, &reason);
         let before = self.supervisor_effects.len();
-        self.reduce(SupervisorEvent::BeginDrain { reason });
-        let Some(position) = self.supervisor_effects[before..]
-            .iter()
-            .position(|effect| matches!(effect, SupervisorEffect::DrainStarted { .. }))
-            .map(|position| before + position)
+        let Some((startup_pending, state)) =
+            supervisor_begin_drain(&mut self.supervisor, reason, &mut self.supervisor_effects)
         else {
             return;
-        };
-        let SupervisorEffect::DrainStarted {
-            state,
-            startup_pending,
-        } = self.supervisor_effects.remove(position)
-        else {
-            unreachable!()
         };
         debug_assert!(startup.is_some() || !startup_pending);
         // Ordered drain exposes its first stop only through `Settle`; derive
@@ -180,24 +170,14 @@ impl ScopeRuntime {
 
     pub(super) fn force_all(&mut self) {
         let before = self.supervisor_effects.len();
-        self.reduce(SupervisorEvent::Force);
-        if let Some(position) = self.supervisor_effects[before..]
-            .iter()
-            .position(|effect| matches!(effect, SupervisorEffect::DrainStarted { .. }))
-            .map(|position| before + position)
+        if let Some((startup_pending, state)) =
+            supervisor_force(&mut self.supervisor, &mut self.supervisor_effects)
         {
-            let SupervisorEffect::DrainStarted {
-                state,
-                startup_pending,
-            } = self.supervisor_effects.remove(position)
-            else {
-                unreachable!()
-            };
             // No pre-`Settle` here, unlike `begin_drain_transition`.
-            // `SupervisorEvent::Force` already pushes `ForceChild` for every
-            // non-joined child, a strict superset of the single `StopChild` an
-            // ordered scope's `Settle` could add, so settling early cannot
-            // contribute a member this selection would otherwise miss.
+            // `supervisor_force` already pushes `ForceChild` for every non-joined
+            // child, a strict superset of the single `StopChild` an ordered
+            // scope's `Settle` could add, so settling early cannot contribute a
+            // member this selection would otherwise miss.
             let terminal_disposals =
                 self.drain_entry_terminal_disposals(&self.supervisor_effects[before..]);
             self.root.publish_drain(
@@ -228,13 +208,14 @@ impl ScopeRuntime {
         // though its disposal event has not reached ordinary dispatch. Fold
         // every arrived completion before the hard-force fallback; the drain
         // is non-blocking, so still-running disposal remains detached.
-        self.drain_arrived_disposal_events();
+        let mut panics = runtime::PanicAccumulator::default();
+        self.drain_arrived_disposal_events(&mut panics);
         if self.supervisor.is_disposing(key) {
             // The incarnation has already exited; only its retained factory
             // remains, and the fold above found no completion reported for
             // it. Hard escalation detaches that cleanup and keeps the
             // recorded verdict.
-            self.handle_construction_disposed(key, None);
+            panics.run(|| self.handle_construction_disposed(key, None));
         }
     }
 

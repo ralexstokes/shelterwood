@@ -1643,8 +1643,8 @@ pub(super) mod tests {
     use crate::{
         ActorIdentity, ActorRef, ChildId, Incarnation, MailboxControl, MailboxReceiver,
         SendErrorKind,
-        identity::ScopeIdentity,
         policy::{ResolvedDefaults, ResolvedMailbox},
+        test_support::{mint_actor_incarnation, mint_actor_membership},
     };
 
     use super::MailboxCell;
@@ -1888,15 +1888,11 @@ pub(super) mod tests {
     }
 
     pub(crate) fn actor_for<M: Send + 'static>() -> (Arc<MailboxCell<M>>, ActorRef<M>) {
-        let mut identity = ScopeIdentity::new();
         let id = ChildId::from("actor");
+        let (membership, _) = mint_actor_membership();
         let member = Arc::new(TestIdentity {
             id: id.clone(),
-            membership: identity
-                .mint_membership(&id)
-                .expect("membership available")
-                .into_pair()
-                .0,
+            membership,
         });
         let mailbox = MailboxCell::new(id, crate::capability::tests::runtime());
         (
@@ -1978,12 +1974,7 @@ pub(super) mod tests {
                 std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
             ),
         );
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = mint_actor_incarnation();
         bind(&mailbox, token, incarnation);
 
         assert!(matches!(
@@ -2024,12 +2015,7 @@ pub(super) mod tests {
                 std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
             ),
         );
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = mint_actor_incarnation();
         bind(&mailbox, token, incarnation);
         let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
 
@@ -2182,15 +2168,7 @@ pub(super) mod tests {
         park_with(&mut second, &second_panicking);
         park_with(&mut third, &counting);
         let token = configure(&mailbox, ResolvedDefaults::default().mailbox);
-        let mut generations = {
-            let mut identity = ScopeIdentity::new();
-            let (_, generations) = identity
-                .mint_membership(&ChildId::from("actor"))
-                .expect("membership available")
-                .into_pair();
-            generations
-        };
-        let incarnation = generations.mint().expect("incarnation available");
+        let incarnation = mint_actor_incarnation();
 
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
@@ -2240,16 +2218,7 @@ pub(super) mod tests {
         first.install_test_waker(Waker::from(Arc::new(BindOrderingWake(Arc::clone(&events)))));
         second.install_test_waker(Waker::from(Arc::new(BindOrderingWake(Arc::clone(&events)))));
 
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        bind(
-            &mailbox,
-            token,
-            incarnations.mint().expect("incarnation available"),
-        );
+        bind(&mailbox, token, mint_actor_incarnation());
 
         assert_eq!(
             *events.lock().expect("bind effect recorder mutex"),
@@ -2468,16 +2437,7 @@ pub(super) mod tests {
             .expect("mailbox is uniquely owned")
             .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
         let token = configure(&mailbox, ResolvedMailbox::Latest);
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        bind(
-            &mailbox,
-            token,
-            incarnations.mint().expect("incarnation available"),
-        );
+        bind(&mailbox, token, mint_actor_incarnation());
         let weak = Arc::downgrade(&mailbox);
         assert!(matches!(
             mailbox.submit(LockCheckingMessage {
@@ -2518,12 +2478,7 @@ pub(super) mod tests {
             &mailbox,
             ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero capacity")),
         );
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = mint_actor_incarnation();
         bind(&mailbox, token, incarnation);
         let weak = Arc::downgrade(&mailbox);
         let (dropped, observed) = mpsc::channel();
@@ -2582,12 +2537,7 @@ pub(super) mod tests {
         });
         let mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
         let token = configure(&mailbox, ResolvedMailbox::Latest);
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = mint_actor_incarnation();
         bind(&mailbox, token, incarnation);
         let (dropped, observed) = mpsc::channel();
         assert!(matches!(
@@ -2648,12 +2598,7 @@ pub(super) mod tests {
                 panic!("an unbound mailbox parks its send")
             }
         };
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = mint_actor_incarnation();
 
         // Promotion mints one accepted sequence and then runs out, leaving a
         // latest mailbox with a waiter still parked.

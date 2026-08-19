@@ -32,6 +32,8 @@ mod deadline;
 mod errors;
 mod futures;
 mod reply;
+#[cfg(test)]
+mod test_support;
 
 #[doc(hidden)]
 pub use capability::{

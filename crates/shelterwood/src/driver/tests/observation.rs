@@ -393,9 +393,7 @@ impl AbortedNestedDriverFixture {
         let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
         parent.set_admitted_children(vec![resident_projection(&slot)]);
 
-        let epoch = nested
-            .begin_incarnation(ScopeState::Starting)
-            .expect("nested scope epoch is available");
+        let epoch = ScopeEpochGuard::begin(&nested).expect("nested scope epoch is available");
         let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
         let incarnation = incarnations.mint().expect("child incarnation is available");
         nested.member.update(|record| {
@@ -404,8 +402,6 @@ impl AbortedNestedDriverFixture {
             record.last_incarnation = Some(incarnation);
         });
         nested.set_state(ScopeState::Running);
-        nested.set_admitted_children(Vec::new());
-
         let (events, events_receiver) = crate::runtime::unbounded_mpsc();
         let driver = ScopeRuntimeBuilder::new(Arc::clone(&nested), epoch, events)
             .with_lifecycle(ScopeLifecycle::running())

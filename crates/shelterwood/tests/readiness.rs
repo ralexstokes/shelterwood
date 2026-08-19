@@ -11,7 +11,11 @@ use std::{
 use crate::common::{
     POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet,
     policy::never,
-    waiting::{gate_released_manual_ready_task, task as waiting_task},
+    waiting::{
+        cancellation_signalled_waiting_task, construction_signalled_waiting_task,
+        gate_released_manual_ready_task, signalled_waiting_task, start_signalled_waiting_task,
+        task as waiting_task,
+    },
 };
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DynamicTree, ExitError,
@@ -511,17 +515,7 @@ async fn ordered_terminal_pre_ready_exit_parks_the_root_and_marks_suffix_never_s
     let mut tree = Tree::new();
     tree.add_task(
         "prefix",
-        TaskDef::new({
-            let prefix_cancelled = Arc::clone(&prefix_cancelled);
-            move |context| {
-                let prefix_cancelled = Arc::clone(&prefix_cancelled);
-                async move {
-                    context.shutdown_token().cancelled().await;
-                    prefix_cancelled.store(true, Ordering::SeqCst);
-                    Ok(())
-                }
-            }
-        }),
+        cancellation_signalled_waiting_task(Arc::clone(&prefix_cancelled)),
     )
     .expect("valid prefix");
     tree.add_task(
@@ -578,23 +572,10 @@ async fn dynamic_startup_failure_keeps_other_initial_members_supervised() {
     .expect("valid failing task");
     tree.add_task(
         "sibling",
-        TaskDef::new({
-            let sibling_cancelled = Arc::clone(&sibling_cancelled);
-            let sibling_started = Arc::clone(&sibling_started);
-            move |context| {
-                let sibling_cancelled = Arc::clone(&sibling_cancelled);
-                let sibling_started = Arc::clone(&sibling_started);
-                async move {
-                    sibling_started.store(true, Ordering::SeqCst);
-                    context.shutdown_token().cancelled().await;
-                    sibling_cancelled.store(true, Ordering::SeqCst);
-                    Ok(())
-                }
-            }
-        })
-        .readiness(Readiness::Manual)
-        .expect("manual readiness")
-        .readiness_deadline(ReadinessDeadline::Unbounded),
+        signalled_waiting_task(Arc::clone(&sibling_started), Arc::clone(&sibling_cancelled))
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .readiness_deadline(ReadinessDeadline::Unbounded),
     )
     .expect("valid sibling");
     let system = tree.spawn().expect("runtime is available");
@@ -822,20 +803,10 @@ async fn runtime_dynamic_additions_never_join_aggregate_readiness() {
     let runtime_task = scope
         .add_task(
             "runtime",
-            TaskDef::new({
-                let runtime_started = Arc::clone(&runtime_started);
-                move |context| {
-                    let runtime_started = Arc::clone(&runtime_started);
-                    async move {
-                        runtime_started.store(true, Ordering::SeqCst);
-                        context.shutdown_token().cancelled().await;
-                        Ok(())
-                    }
-                }
-            })
-            .readiness(Readiness::Manual)
-            .expect("manual readiness")
-            .readiness_deadline(ReadinessDeadline::Unbounded),
+            start_signalled_waiting_task(Arc::clone(&runtime_started))
+                .readiness(Readiness::Manual)
+                .expect("manual readiness")
+                .readiness_deadline(ReadinessDeadline::Unbounded),
         )
         .await
         .expect("runtime member is admitted");
@@ -875,20 +846,10 @@ async fn nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause() {
     nested
         .add_task(
             "inner-sibling",
-            TaskDef::new({
-                let sibling_cancelled = Arc::clone(&sibling_cancelled);
-                move |context| {
-                    let sibling_cancelled = Arc::clone(&sibling_cancelled);
-                    async move {
-                        context.shutdown_token().cancelled().await;
-                        sibling_cancelled.store(true, Ordering::SeqCst);
-                        Ok(())
-                    }
-                }
-            })
-            .readiness(Readiness::Manual)
-            .expect("manual readiness")
-            .readiness_deadline(ReadinessDeadline::Unbounded),
+            cancellation_signalled_waiting_task(Arc::clone(&sibling_cancelled))
+                .readiness(Readiness::Manual)
+                .expect("manual readiness")
+                .readiness_deadline(ReadinessDeadline::Unbounded),
         )
         .expect("valid sibling");
 
@@ -961,17 +922,7 @@ async fn nested_ordered_startup_failure_rolls_back_only_the_started_prefix() {
     nested
         .add_task(
             "prefix",
-            TaskDef::new({
-                let prefix_cancelled = Arc::clone(&prefix_cancelled);
-                move |context| {
-                    let prefix_cancelled = Arc::clone(&prefix_cancelled);
-                    async move {
-                        context.shutdown_token().cancelled().await;
-                        prefix_cancelled.store(true, Ordering::SeqCst);
-                        Ok(())
-                    }
-                }
-            }),
+            cancellation_signalled_waiting_task(Arc::clone(&prefix_cancelled)),
         )
         .expect("valid prefix");
     nested
@@ -1100,17 +1051,7 @@ async fn start_or_shutdown_preserves_startup_error_and_rolls_back_the_prefix() {
     let mut tree = Tree::new();
     tree.add_task(
         "prefix",
-        TaskDef::new({
-            let prefix_cancelled = Arc::clone(&prefix_cancelled);
-            move |context| {
-                let prefix_cancelled = Arc::clone(&prefix_cancelled);
-                async move {
-                    context.shutdown_token().cancelled().await;
-                    prefix_cancelled.store(true, Ordering::SeqCst);
-                    Ok(())
-                }
-            }
-        }),
+        cancellation_signalled_waiting_task(Arc::clone(&prefix_cancelled)),
     )
     .expect("valid prefix");
     tree.add_task(
@@ -1344,16 +1285,7 @@ async fn immediate_raw_construction_panic_classifies_post_ready() {
     .expect("valid raw actor");
     tree.add_task(
         "sibling",
-        TaskDef::new({
-            let sibling_started = Arc::clone(&sibling_started);
-            move |context| {
-                sibling_started.store(true, Ordering::SeqCst);
-                async move {
-                    context.shutdown_token().cancelled().await;
-                    Ok(())
-                }
-            }
-        }),
+        construction_signalled_waiting_task(Arc::clone(&sibling_started)),
     )
     .expect("valid sibling");
 

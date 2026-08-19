@@ -65,10 +65,11 @@ async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnat
         )),
     )
     .expect("valid subtree");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let key = fixture.children.keys().next().expect("one child plan");
     let nested = Arc::clone(
-        plan.children[0]
+        fixture.children[key]
             .slot
             .scope
             .as_ref()
@@ -77,27 +78,7 @@ async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnat
     let target = nested
         .request_shutdown()
         .expect("the pre-admission shutdown targets the first epoch");
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_lifecycle(ScopeLifecycle::running())
-        .with_children(children)
-        .build();
-    plan.finish_transfer();
+    let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     scope.spawn_child(key);
     let first = scope.children[key]
@@ -159,42 +140,23 @@ async fn expedited_restart_progresses_synchronous_readiness() {
     let mut tree = Tree::new();
     tree.add_subtree("nested", SubtreeDef::factory(pending_tree))
         .expect("valid subtree");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
+    let mut fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let key = fixture.children.keys().next().expect("one child plan");
     let nested_cell = Arc::clone(
-        plan.children[0]
+        fixture.children[key]
             .slot
             .scope
             .as_ref()
             .expect("nested scope cell"),
     );
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let mut child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     // Scope definitions currently resolve to Manual and expose no public
     // readiness setter. Model that API invariant changing: the expedited
     // restart must still release ordered startup when configuration produces
     // an immediate readiness effect.
-    child.options.readiness = Readiness::Immediate;
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_children(children)
-        .with_next_ordered_start(Some(key))
-        .build();
+    fixture.children[key].options.readiness = Readiness::Immediate;
+    let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
     scope.reduce(SupervisorEvent::Spawned { child: key });
-    plan.finish_transfer();
     let target = nested_cell
         .request_shutdown()
         .expect("the shutdown targets the pending nested incarnation");
@@ -238,10 +200,16 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
     )
     .expect("valid subtree");
 
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let first = fixture.children.keys().next().expect("first ordered child");
+    let nested = fixture
+        .children
+        .keys()
+        .find(|key| fixture.children[*key].slot.member.id().as_str() == "nested")
+        .expect("nested child key");
     let nested_cell = Arc::clone(
-        plan.children[1]
+        fixture.children[nested]
             .slot
             .scope
             .as_ref()
@@ -250,34 +218,7 @@ async fn early_restart_shutdown_does_not_expedite_a_never_started_ordered_child(
     let target = nested_cell
         .request_shutdown()
         .expect("the pre-admission shutdown targets the first epoch");
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let mut children = ChildArena::default();
-    plan.children.reverse();
-    while let Some(child) = plan.children.pop() {
-        children
-            .insert(ChildRuntime::from_plan(child, &root))
-            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    }
-    let first = children.keys().next().expect("first ordered child");
-    let nested = children
-        .keys()
-        .find(|key| children[*key].slot.member.id().as_str() == "nested")
-        .expect("nested child key");
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_children(children)
-        .with_next_ordered_start(Some(first))
-        .build();
-    plan.finish_transfer();
+    let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(first)).build();
 
     // Ordered startup spawns "a" and parks on its (never-fired) readiness.
     scope.progress_startup();
@@ -332,29 +273,9 @@ async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_become
         )),
     )
     .expect("valid subtree");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_lifecycle(ScopeLifecycle::running())
-        .with_children(children)
-        .build();
-    plan.finish_transfer();
+    let fixture = OrderedScopeFixture::new(tree);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     let target = scope.children[key]
         .slot
@@ -429,42 +350,23 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
     tree.add_task("trip", TaskDef::new(|_| future::pending()))
         .expect("valid task");
 
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let mut children = ChildArena::default();
-    plan.children.reverse();
-    while let Some(child) = plan.children.pop() {
-        children
-            .insert(ChildRuntime::from_plan(child, &root))
-            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    }
-    let nested = children
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let nested = fixture
+        .children
         .keys()
-        .find(|key| children[*key].slot.member.id().as_str() == "nested")
+        .find(|key| fixture.children[*key].slot.member.id().as_str() == "nested")
         .expect("nested child key");
-    let trip = children
+    let trip = fixture
+        .children
         .keys()
-        .find(|key| children[*key].slot.member.id().as_str() == "trip")
+        .find(|key| fixture.children[*key].slot.member.id().as_str() == "trip")
         .expect("tripping child key");
-    let next_ordered_start = children.keys().next();
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
+    let next_ordered_start = fixture.children.keys().next();
+    let (mut scope, _event_receiver) = fixture
         .with_lifecycle(ScopeLifecycle::running())
         .with_next_ordered_start(next_ordered_start)
         .build();
-    plan.finish_transfer();
 
     root.transition_child(
         &scope.children[nested].slot.member,
@@ -589,42 +491,22 @@ async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
     tree.add_task("trip", TaskDef::new(|_| future::pending()))
         .expect("valid task");
 
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let mut children = ChildArena::default();
-    plan.children.reverse();
-    while let Some(child) = plan.children.pop() {
-        children
-            .insert(ChildRuntime::from_plan(child, &root))
-            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    }
-    let nested = children
+    let fixture = OrderedScopeFixture::new(tree);
+    let nested = fixture
+        .children
         .keys()
-        .find(|key| children[*key].slot.member.id().as_str() == "nested")
+        .find(|key| fixture.children[*key].slot.member.id().as_str() == "nested")
         .expect("nested child key");
-    let trip = children
+    let trip = fixture
+        .children
         .keys()
-        .find(|key| children[*key].slot.member.id().as_str() == "trip")
+        .find(|key| fixture.children[*key].slot.member.id().as_str() == "trip")
         .expect("tripping child key");
-    let next_ordered_start = children.keys().next();
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
+    let next_ordered_start = fixture.children.keys().next();
+    let (mut scope, _event_receiver) = fixture
         .with_lifecycle(ScopeLifecycle::running())
         .with_next_ordered_start(next_ordered_start)
         .build();
-    plan.finish_transfer();
 
     let target = scope.children[nested]
         .slot
@@ -751,30 +633,10 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
             .readiness_deadline(ReadinessDeadline::Unbounded),
     )
     .expect("valid task");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
-        .with_next_ordered_start(Some(key))
-        .build();
-    plan.finish_transfer();
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
 
     scope.spawn_child(key);
     let active = scope.children[key]
@@ -832,14 +694,12 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
         }
     }
 
-    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = scope
-        .disposal_event_receiver
-        .recv()
-        .await
-        .expect("disposal reports completion")
-    else {
-        panic!("only construction disposal was armed")
-    };
+    let (child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the construction disposal completion",
+    )
+    .await;
     scope.handle_construction_disposed(child, panic);
 
     assert!(
@@ -888,33 +748,14 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
     )
     .expect("valid task");
 
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let mut children = ChildArena::default();
-    plan.children.reverse();
-    while let Some(child) = plan.children.pop() {
-        children
-            .insert(ChildRuntime::from_plan(child, &root))
-            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    }
-    let gone = children.keys().next().expect("first ordered child");
-    let next = children.keys().nth(1).expect("second ordered child");
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_children(children)
-        .with_next_ordered_start(Some(gone))
-        .build();
-    plan.finish_transfer();
+    let fixture = OrderedScopeFixture::new(tree);
+    let gone = fixture.children.keys().next().expect("first ordered child");
+    let next = fixture
+        .children
+        .keys()
+        .nth(1)
+        .expect("second ordered child");
+    let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(gone)).build();
 
     // Retire the authoritative record and runtime resource together, exactly
     // as production reclaim does, without disturbing the child that follows.
@@ -960,36 +801,22 @@ async fn startup_removal_response_follows_aggregate_recomputation() {
 
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (control_events, _control_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(control_events);
     let mut children = ChildArena::default();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
-    root.with_observation_gate(|txn| {
-        control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
-    });
-    root.set_dynamic_route(Some(control.clone()));
+    let key = children.insert(child);
     let member = Arc::clone(&children[key].slot.member);
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_children(children)
         .with_dynamic(Some(control))
+        .with_transferred_plan(plan)
         .build();
-    plan.finish_transfer();
 
     assert!(scope.terminalize_child(
         key,
@@ -1035,36 +862,22 @@ async fn queued_removal_suppresses_replayed_self_stop_readiness() {
 
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let (control_events, mut control_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(control_events);
     let mut children = ChildArena::default();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
-    root.with_observation_gate(|txn| {
-        control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
-    });
-    root.set_dynamic_route(Some(control.clone()));
+    let key = children.insert(child);
     let member = Arc::clone(&children[key].slot.member);
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_children(children)
         .with_dynamic(Some(control))
+        .with_transferred_plan(plan)
         .build();
-    plan.finish_transfer();
 
     scope.spawn_child(key);
     let active = scope.children[key]

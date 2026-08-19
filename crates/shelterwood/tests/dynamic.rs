@@ -13,8 +13,8 @@ use crate::common::{
     policy::never,
     poll_once,
     waiting::{
-        liveness_probe, liveness_probed_waiting_task, signalled_waiting_task, task as waiting_task,
-        tree as waiting_tree,
+        liveness_probe, liveness_probed_waiting_task, signalled_waiting_once_task,
+        signalled_waiting_task, task as waiting_task, tree as waiting_tree,
     },
 };
 use shelterwood::{
@@ -153,19 +153,7 @@ fn signalled_waiting_tree(
     let (_, completion) = tree
         .add_task_once(
             "worker",
-            TaskOnceDef::new(move |context| async move {
-                started.store(true, Ordering::SeqCst);
-                if let Some((gate, observed)) = liveness {
-                    if !liveness_probe(context.shutdown_token(), gate).await {
-                        cancelled.store(true, Ordering::SeqCst);
-                        return Ok::<_, ExitError>(());
-                    }
-                    observed.store(true, Ordering::SeqCst);
-                }
-                context.shutdown_token().cancelled().await;
-                cancelled.store(true, Ordering::SeqCst);
-                Ok::<_, ExitError>(())
-            }),
+            signalled_waiting_once_task(started, cancelled, liveness),
         )
         .expect("valid signalled task");
     drop(completion);

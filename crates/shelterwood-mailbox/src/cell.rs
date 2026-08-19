@@ -59,11 +59,20 @@ impl<M> BoundState<M> {
     }
 }
 
-/// Which mailbox binding states may yield accepted messages.
+/// The structurally valid receive domains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReceiveMode {
-    LiveOnly,
-    IncludeFrozen,
+    Drain,
+    LiveThrough(AcceptedSequence),
+}
+
+impl ReceiveMode {
+    fn accepts(self, sequence: AcceptedSequence) -> bool {
+        match self {
+            Self::Drain => true,
+            Self::LiveThrough(limit) => sequence <= limit,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -341,6 +350,34 @@ impl<M> MailboxState<M> {
         }
     }
 
+    /// Replaces one binding only after its waiter identity domain is empty.
+    ///
+    /// The check is not an `assert!` because every caller holds the mailbox
+    /// mutex and a violated framework invariant must not poison it. Both
+    /// builds therefore keep the old binding: debug diagnoses first, and
+    /// release declines the replacement rather than dropping a live
+    /// `WaiterQueue` here. That drop would release the queue's
+    /// `Arc<SendOperation<M>>`s under the mutex, so wherever one is the last
+    /// owner a user message destructor would run in the critical section.
+    /// Declining costs a stalled transition, which is the lesser of the two.
+    fn replace_binding(&mut self, replacement: MailboxBinding<M>) {
+        let replaceable = match &self.binding {
+            MailboxBinding::Unbound(waiters)
+            | MailboxBinding::Frozen { waiters, .. }
+            | MailboxBinding::Bound(BoundState::Full { waiters, .. }) => waiters.is_empty(),
+            MailboxBinding::Bound(BoundState::Available(_)) => true,
+            MailboxBinding::Terminal(_) => false,
+        };
+        debug_assert!(
+            replaceable,
+            "mailbox binding replacement requires an empty waiter queue"
+        );
+        if !replaceable {
+            return;
+        }
+        self.binding = replacement;
+    }
+
     fn park(&mut self, operation: &Arc<SendOperation<M>>) -> bool {
         match &mut self.binding {
             MailboxBinding::Unbound(waiters)
@@ -358,10 +395,10 @@ impl<M> MailboxState<M> {
                 if !waiters.park(operation) {
                     return false;
                 }
-                self.binding = MailboxBinding::Bound(BoundState::Full {
+                self.replace_binding(MailboxBinding::Bound(BoundState::Full {
                     incarnation,
                     waiters,
-                });
+                }));
             }
             MailboxBinding::Terminal(_) => {
                 unreachable!("terminal submissions return their payload directly")
@@ -410,7 +447,7 @@ impl<M> MailboxState<M> {
             MailboxBinding::Bound(BoundState::Available(_)) | MailboxBinding::Terminal(_) => None,
         };
         if let Some(incarnation) = available {
-            self.binding = MailboxBinding::Bound(BoundState::Available(incarnation));
+            self.replace_binding(MailboxBinding::Bound(BoundState::Available(incarnation)));
         }
         removed
     }
@@ -463,9 +500,11 @@ impl WaiterId {
 /// FIFO registrations with direct removal by a send operation.
 ///
 /// Monotonic keys are insertion order, so the first map entry is the oldest
-/// waiter. Keys are never reused within one queue instance; a queue is only
-/// replaced when it is empty or by the absorbing Terminal state, so no
-/// registration outlives its queue and stale cancellation ids remain harmless.
+/// waiter. Keys are never reused within one queue instance;
+/// `MailboxState::replace_binding` permits replacing a queue only after it is
+/// empty, so no registration outlives its queue and stale cancellation ids
+/// remain harmless. Terminalization detaches the live queue before replacing
+/// the binding and discharges those registrations after unlocking.
 /// `u64::MAX` is a poison key and is never minted; exhaustion remains poisoned
 /// instead of wrapping back into the live id domain.
 pub(super) struct WaiterQueue<M> {
@@ -1034,18 +1073,11 @@ impl<M: Send + 'static> MailboxCell<M> {
         }
     }
 
-    fn receive(
-        &self,
-        incarnation: Incarnation,
-        mode: ReceiveMode,
-        accepted_through: Option<AcceptedSequence>,
-    ) -> Option<M> {
+    fn receive(&self, incarnation: Incarnation, mode: ReceiveMode) -> Option<M> {
         let mut transaction = MailboxTxn::new(self);
         let eligible = match transaction.status() {
             BindingStatus::Bound(current) => current == incarnation,
-            BindingStatus::Frozen(current) => {
-                mode == ReceiveMode::IncludeFrozen && current == incarnation
-            }
+            BindingStatus::Frozen(current) => mode == ReceiveMode::Drain && current == incarnation,
             BindingStatus::Unbound | BindingStatus::Terminal(_) => false,
         };
         if !eligible {
@@ -1053,15 +1085,17 @@ impl<M: Send + 'static> MailboxCell<M> {
         }
         let envelope = match transaction.kind {
             Some(MailboxKind::Queue(_)) => {
-                let eligible = transaction.queue.front().is_some_and(|item| {
-                    accepted_through.is_none_or(|limit| item.accepted_sequence <= limit)
-                });
+                let eligible = transaction
+                    .queue
+                    .front()
+                    .is_some_and(|item| mode.accepts(item.accepted_sequence));
                 eligible.then(|| transaction.queue.pop_front()).flatten()
             }
             Some(MailboxKind::Latest) => {
-                let eligible = transaction.latest.as_ref().is_some_and(|item| {
-                    accepted_through.is_none_or(|limit| item.accepted_sequence <= limit)
-                });
+                let eligible = transaction
+                    .latest
+                    .as_ref()
+                    .is_some_and(|item| mode.accepts(item.accepted_sequence));
                 eligible.then(|| transaction.latest.take()).flatten()
             }
             None => None,
@@ -1297,21 +1331,27 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             // message destructors under the mailbox mutex during the
             // exhaustion panic's own unwind; the post-unlock effect raises
             // that panic instead.
+            //
+            // Assigned directly rather than through `replace_binding`: this
+            // is the one transition whose replacement carries the waiter
+            // queue forward instead of discarding it, so a declined
+            // replacement would destroy exactly what the branch exists to
+            // preserve.
             transaction.binding = MailboxBinding::Frozen {
                 incarnation,
                 waiters,
             };
         } else if waiters.is_empty() {
-            transaction.binding = MailboxBinding::Bound(BoundState::Available(incarnation));
+            transaction.replace_binding(MailboxBinding::Bound(BoundState::Available(incarnation)));
         } else {
             let MailboxKind::Queue(capacity) = kind else {
                 unreachable!("a latest mailbox finishes all waiting submissions")
             };
             debug_assert_eq!(transaction.queue.len(), capacity.get());
-            transaction.binding = MailboxBinding::Bound(BoundState::Full {
+            transaction.replace_binding(MailboxBinding::Bound(BoundState::Full {
                 incarnation,
                 waiters,
-            });
+            }));
         }
         transaction.effects.pulse();
         transaction.effects.isolate_displaced();
@@ -1324,10 +1364,10 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             return transaction.finish(());
         }
         let waiters = transaction.take_waiters();
-        transaction.binding = MailboxBinding::Frozen {
+        transaction.replace_binding(MailboxBinding::Frozen {
             incarnation,
             waiters,
-        };
+        });
         transaction.effects.pulse();
         transaction.finish(())
     }
@@ -1346,7 +1386,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             return transaction.finish(None);
         }
         let waiters = transaction.take_waiters();
-        transaction.binding = MailboxBinding::Unbound(waiters);
+        transaction.replace_binding(MailboxBinding::Unbound(waiters));
         transaction.bind_permit = Arc::new(AtomicBool::new(false));
         let queue = std::mem::take(&mut transaction.queue);
         let latest = transaction.latest.take();
@@ -1378,7 +1418,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         // detached waiter is decided separately by its `Waiting ->` outcome
         // transition, so an already-expired withdrawal may beat the deferred
         // discharge even after this mailbox-wide transition.
-        transaction.binding = MailboxBinding::Terminal(final_incarnation);
+        transaction.replace_binding(MailboxBinding::Terminal(final_incarnation));
         let queue = std::mem::take(&mut transaction.queue);
         let latest = transaction.latest.take();
         let termination = Termination {
@@ -1492,7 +1532,7 @@ fn promote_waiters<M: Send + 'static>(
         effects,
     );
     if waiters.is_empty() {
-        state.binding = MailboxBinding::Bound(BoundState::Available(incarnation));
+        state.replace_binding(MailboxBinding::Bound(BoundState::Available(incarnation)));
     }
 }
 
@@ -1600,15 +1640,13 @@ impl<M: Send + 'static> MailboxReceiver<M> {
     }
 
     pub fn try_recv(&self) -> Option<M> {
-        self.mailbox
-            .receive(self.incarnation, ReceiveMode::IncludeFrozen, None)
+        self.mailbox.receive(self.incarnation, ReceiveMode::Drain)
     }
 
     pub fn try_recv_live_through(&self, accepted_sequence: AcceptedSequence) -> Option<M> {
         self.mailbox.receive(
             self.incarnation,
-            ReceiveMode::LiveOnly,
-            Some(accepted_sequence),
+            ReceiveMode::LiveThrough(accepted_sequence),
         )
     }
 
@@ -1937,6 +1975,65 @@ pub(super) mod tests {
     fn park_with(future: &mut std::pin::Pin<Box<crate::SendFuture<u8>>>, waker: &Waker) {
         let mut context = Context::from_waker(waker);
         assert!(future.as_mut().poll(&mut context).is_pending());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn binding_replacement_rejects_a_live_waiter_identity_domain() {
+        let operation = super::SendOperation::new(1_u8);
+        let mut waiters = super::WaiterQueue::default();
+        waiters.park(&operation);
+        let mut state = super::MailboxState {
+            kind: None,
+            bind_permit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            binding: super::MailboxBinding::Unbound(waiters),
+            last_bound: None,
+            queue: std::collections::VecDeque::new(),
+            latest: None,
+        };
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                state
+                    .replace_binding(super::MailboxBinding::Unbound(super::WaiterQueue::default()));
+            }))
+            .is_err(),
+            "a live waiter queue cannot be replaced"
+        );
+        assert!(matches!(
+            &state.binding,
+            super::MailboxBinding::Unbound(waiters) if waiters.len() == 1
+        ));
+    }
+
+    #[test]
+    fn receive_modes_pin_live_cutoffs_and_frozen_drain() {
+        let (mailbox, actor) = actor();
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(2).expect("non-zero queue capacity"),
+            ),
+        );
+        let incarnation = mint_actor_incarnation();
+        bind(&mailbox, token, incarnation);
+        let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+
+        actor.try_send(1).expect("first message accepts");
+        let through_first = receiver.accepted_sequence();
+        actor.try_send(2).expect("second message accepts");
+        assert_eq!(receiver.try_recv_live_through(through_first), Some(1));
+        assert_eq!(receiver.try_recv_live_through(through_first), None);
+
+        let through_all = receiver.accepted_sequence();
+        receiver.freeze();
+        assert_eq!(
+            receiver.try_recv_live_through(through_all),
+            None,
+            "live reception never enters a frozen mailbox"
+        );
+        assert_eq!(receiver.try_recv(), Some(2));
+        assert_eq!(receiver.try_recv(), None);
     }
 
     #[test]

@@ -33,12 +33,10 @@ use shelterwood_core::{
 use shelterwood_mailbox::{ActorIdentity, MailboxControl, MailboxTermination};
 use shelterwood_runtime as runtime;
 
-use crate::{
-    observe::{
-        ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-        LifecycleHub, LifecycleSeq, RetainedScopeSnapshot, ScopeSnapshot, SnapshotHub,
-        SnapshotPublication, SnapshotReceiver,
-    },
+use crate::observe::{
+    ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleHub,
+    LifecycleSeq, RetainedScopeSnapshot, ScopeSnapshot, SnapshotHub, SnapshotPublication,
+    SnapshotReceiver,
 };
 
 /// An exit copy retained by framework state.

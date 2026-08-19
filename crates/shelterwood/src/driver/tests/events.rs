@@ -155,9 +155,7 @@ fn every_event_lane_is_capped_and_a_saturated_lane_forces_a_yield() {
 #[crate::runtime::test]
 async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_scheduling() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
     root.set_state(ScopeState::Running);
@@ -165,8 +163,6 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
 
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
-    root.set_dynamic_route(Some(control.clone()));
-    root.set_admitted_children(Vec::new());
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_lifecycle(ScopeLifecycle::running())
         .with_dynamic(Some(control.clone()))
@@ -252,22 +248,20 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
         "the restart deadline arm rechecks level-triggered stop sources"
     );
 
-    let forwarded = match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, event_receiver.recv()).await
-    {
-        crate::runtime::Timeout::Completed(Some(event)) => event,
-        crate::runtime::Timeout::Completed(None) => panic!("the driver lane remains open"),
-        crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
-    };
-    let DriverEvent::Removal(removal) = forwarded else {
-        panic!("the queued event is the fused removal");
-    };
+    let removal = recv_removal(
+        &mut event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the fused removal edge",
+    )
+    .await;
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
-    let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        scope.disposal_event_receiver.recv().await
-    else {
-        panic!("removal joins retained construction disposal")
-    };
+    let (child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "removal joins retained construction disposal",
+    )
+    .await;
     scope.handle_construction_disposed(child, panic);
     assert!(scope.children.get(key).is_none());
 }

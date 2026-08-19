@@ -55,7 +55,7 @@ use crate::{
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
     },
-    policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
+    policy::{DefaultsInheritance, Intensity, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
     runtime::{self, CompletionGatedLatch, Latch},
     task::{TaskContext, TaskContextLatches, TaskFactory},
@@ -248,6 +248,33 @@ struct ScopeRuntime {
     retained_exits: Vec<RetainedExit>,
 }
 
+struct ScopeRuntimeWiring {
+    root: Arc<ScopeCell>,
+    defaults: ResolvedDefaults,
+    intensity_policy: Intensity,
+    children: ChildResources<ChildRuntime>,
+    supervisor: SupervisorState,
+    supervisor_effects: Vec<SupervisorEffect>,
+    events: runtime::UnboundedMpscSender<DriverEvent>,
+    disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
+    disposal_event_receiver: runtime::UnboundedMpscReceiver<DriverEvent>,
+    role: ScopeRole,
+    dynamic: Option<Arc<DynamicControl>>,
+}
+
+#[cfg(test)]
+struct ScopeRuntimeTestWiring {
+    root: Arc<ScopeCell>,
+    defaults: ResolvedDefaults,
+    intensity_policy: Intensity,
+    children: Vec<(ChildKey, ChildRuntime)>,
+    lifecycle: ScopeLifecycle,
+    next_ordered_start: Option<Option<ChildKey>>,
+    events: runtime::UnboundedMpscSender<DriverEvent>,
+    dynamic: Option<Arc<DynamicControl>>,
+    hard_forced: bool,
+}
+
 struct ChildResources<T>(BTreeMap<ChildKey, T>);
 
 impl<T> Default for ChildResources<T> {
@@ -425,6 +452,110 @@ impl Drop for ScopeRuntime {
 }
 
 impl ScopeRuntime {
+    fn new(wiring: ScopeRuntimeWiring, epoch: ScopeEpochGuard) -> Self {
+        Self {
+            root: wiring.root,
+            defaults: wiring.defaults,
+            intensity_policy: wiring.intensity_policy,
+            intensity: IntensityState::default(),
+            children: wiring.children,
+            supervisor: wiring.supervisor,
+            supervisor_effects: wiring.supervisor_effects,
+            restart_shutdown_retries: Vec::new(),
+            events: wiring.events,
+            disposal_events: wiring.disposal_events,
+            disposal_event_receiver: wiring.disposal_event_receiver,
+            arrived_disposal_panics: BTreeMap::new(),
+            deadlines: DeadlineQueue::default(),
+            jitter: runtime::JitterRng::new(),
+            role: wiring.role,
+            dynamic: wiring.dynamic,
+            pending_startup_removals: Vec::new(),
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            completion: None,
+            finished: None,
+            retained_exits: Vec::new(),
+            // Transfer last: every fallible setup expression above remains
+            // covered by the pre-driver guard, and completed construction
+            // moves the raw epoch directly into ScopeRuntime's synchronous
+            // epilogue.
+            epoch: epoch.transfer(),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(wiring: ScopeRuntimeTestWiring, epoch: ScopeEpochGuard) -> Self {
+        let mut supervisor = SupervisorState::new(wiring.root.flavor, wiring.lifecycle);
+        let mut supervisor_effects = Vec::new();
+        let mut children = ChildResources::default();
+        for (expected, child) in wiring.children {
+            supervisor_step(
+                &mut supervisor,
+                SupervisorEvent::Admit {
+                    membership: child.slot.member.membership(),
+                    initial: true,
+                    start_immediately: false,
+                },
+                &mut supervisor_effects,
+            );
+            let Some(SupervisorEffect::Admitted { child: actual }) = supervisor_effects.pop()
+            else {
+                panic!("fixture admission produces one key")
+            };
+            assert_eq!(actual, expected);
+            let replaced = children.insert(actual, child);
+            assert!(replaced.is_none(), "fixture child keys are unique");
+        }
+        if let Some(next) = wiring.next_ordered_start {
+            supervisor.set_next_ordered_start_for_test(next);
+        }
+        supervisor.set_hard_forced_for_test(wiring.hard_forced);
+        if let Some(control) = &wiring.dynamic {
+            wiring.root.with_observation_gate(|txn| {
+                control
+                    .register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
+            });
+        }
+        let (disposal_events, disposal_event_receiver) = runtime::unbounded_mpsc();
+        Self::new(
+            ScopeRuntimeWiring {
+                root: wiring.root,
+                defaults: wiring.defaults,
+                intensity_policy: wiring.intensity_policy,
+                children,
+                supervisor,
+                supervisor_effects,
+                events: wiring.events,
+                disposal_events,
+                disposal_event_receiver,
+                role: ScopeRole::Root,
+                dynamic: wiring.dynamic,
+            },
+            epoch,
+        )
+    }
+
+    fn publish_initial_children(&self) {
+        // ScopeRuntime owns teardown before the route becomes public. If
+        // either route notification or initial-child publication unwinds, its
+        // epilogue closes dynamic state, terminalizes every child, and clears
+        // any resident prefix. Install the fully keyed route before publishing
+        // Added so a synchronous observer never sees membership without its
+        // control plane.
+        if let Some(control) = &self.dynamic {
+            self.root.set_dynamic_route(Some(control.clone()));
+        }
+        self.root.set_admitted_children(
+            self.children
+                .values()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        #[cfg(test)]
+        self.record_storage();
+    }
+
     /// Moves the payload of every construction-disposal completion in a
     /// collected batch onto the scope.
     ///
@@ -962,53 +1093,24 @@ async fn run_scope_incarnation(
             control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
         });
     }
-    let mut scope = ScopeRuntime {
-        root: Arc::clone(&root),
-        defaults: plan.defaults.clone(),
-        intensity_policy: plan.intensity_policy(),
-        intensity: IntensityState::default(),
-        children,
-        supervisor,
-        supervisor_effects,
-        restart_shutdown_retries: Vec::new(),
-        events,
-        disposal_events,
-        disposal_event_receiver,
-        arrived_disposal_panics: BTreeMap::new(),
-        deadlines: DeadlineQueue::default(),
-        jitter: runtime::JitterRng::new(),
-        role,
-        dynamic,
-        pending_startup_removals: Vec::new(),
-        ancestor_shutdown_seen: false,
-        ancestor_abort_seen: false,
-        completion: None,
-        finished: None,
-        retained_exits: Vec::new(),
-        // Transfer last: every fallible setup expression above remains
-        // covered by the pre-driver guard, and completed construction moves
-        // the raw epoch directly into ScopeRuntime's synchronous epilogue.
-        epoch: epoch.transfer(),
-    };
-    plan.finish_transfer();
-
-    // ScopeRuntime owns teardown before the route becomes public. If either
-    // route notification or initial-child publication unwinds, its epilogue
-    // closes dynamic state, terminalizes every child, and clears any resident
-    // prefix. Install the fully keyed route before publishing Added so a
-    // synchronous observer never sees membership without its control plane.
-    if let Some(control) = &scope.dynamic {
-        scope.root.set_dynamic_route(Some(control.clone()));
-    }
-    scope.root.set_admitted_children(
-        scope
-            .children
-            .values()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
+    let mut scope = ScopeRuntime::new(
+        ScopeRuntimeWiring {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.intensity_policy(),
+            children,
+            supervisor,
+            supervisor_effects,
+            events,
+            disposal_events,
+            disposal_event_receiver,
+            role,
+            dynamic,
+        },
+        epoch,
     );
-    #[cfg(test)]
-    scope.record_storage();
+    plan.finish_transfer();
+    scope.publish_initial_children();
 
     scope.settle_supervisor();
 

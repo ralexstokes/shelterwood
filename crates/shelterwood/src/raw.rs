@@ -749,6 +749,25 @@ impl<M> TimerStore<M> {
         }
     }
 
+    fn rearm_interval(&mut self, arming_order: ArmingOrder, now: Instant) -> Option<M> {
+        let (message, deadline) = {
+            let entry = self.entry_mut(arming_order)?;
+            let period = entry.period?;
+            let deadline = crate::deadline::Deadline::after(now, period).instant();
+            let TimerMessage::Interval(message, clone_message) = &entry.message else {
+                unreachable!("an interval timer must own a message factory")
+            };
+            // Cloning is user code. Keep the entry's prior deadline intact
+            // until it succeeds so the fired batch can retry this arming if
+            // the panic escapes `recv` and the raw actor catches it.
+            let message = clone_message(message);
+            entry.deadline = deadline;
+            (message, deadline)
+        };
+        self.arm_deadline(arming_order, deadline);
+        Some(message)
+    }
+
     fn next_deadline(&self) -> Option<Instant> {
         self.deadlines.first().map(|(deadline, _)| *deadline)
     }
@@ -1658,7 +1677,10 @@ impl<M: Send + 'static> RawContext<M> {
                     .events
                     .pop_through(&mut batch.offloads_remaining)
                 {
-                    if let Some(message) = self.materialize_event(event) {
+                    let (restored, message) = self
+                        .with_ready_batch_installed(batch, |this| this.materialize_event(event));
+                    batch = restored;
+                    if let Some(message) = message {
                         self.resources.continuation_needs_external = false;
                         self.resources.ready_batch = Some(batch);
                         return Some(message);
@@ -1693,8 +1715,13 @@ impl<M: Send + 'static> RawContext<M> {
             }
             batch.continuations_remaining = 0;
 
-            while let Some(arming) = batch.armings.pop_front() {
-                if let Some(message) = self.deliver_timer(arming) {
+            while let Some(arming) = batch.armings.front().copied() {
+                let (restored, message) =
+                    self.with_ready_batch_installed(batch, |this| this.deliver_timer(arming));
+                batch = restored;
+                let removed = batch.armings.pop_front();
+                debug_assert_eq!(removed, Some(arming));
+                if let Some(message) = message {
                     self.resources.continuation_needs_external = false;
                     self.resources.ready_batch = Some(batch);
                     return Some(message);
@@ -1717,6 +1744,25 @@ impl<M: Send + 'static> RawContext<M> {
             }
             return None;
         }
+    }
+
+    /// Runs a callback-capable selection step while the authoritative batch
+    /// remains installed. If user code unwinds, the next caught receive sees
+    /// the same cutoffs and any not-yet-committed timer armings.
+    fn with_ready_batch_installed<R>(
+        &mut self,
+        batch: ReadyBatch,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> (ReadyBatch, R) {
+        debug_assert!(self.resources.ready_batch.is_none());
+        self.resources.ready_batch = Some(batch);
+        let result = operation(self);
+        let batch = self
+            .resources
+            .ready_batch
+            .take()
+            .expect("callback-capable selection keeps its ready batch installed");
+        (batch, result)
     }
 
     fn materialize_event(&self, event: QueuedEvent<M>) -> Option<M> {
@@ -1762,15 +1808,7 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     fn deliver_timer(&mut self, arming: ArmingOrder) -> Option<M> {
-        let entry = self.resources.timers.entry_mut(arming)?;
-        if let Some(period) = entry.period {
-            let deadline = crate::deadline::Deadline::after(runtime::now(), period).instant();
-            entry.deadline = deadline;
-            let TimerMessage::Interval(message, clone_message) = &entry.message else {
-                unreachable!("an interval timer must own a message factory")
-            };
-            let message = clone_message(message);
-            self.resources.timers.arm_deadline(arming, deadline);
+        if let Some(message) = self.resources.timers.rearm_interval(arming, runtime::now()) {
             return Some(message);
         }
 
@@ -2182,7 +2220,7 @@ mod tests {
 
     /// Builds a live raw incarnation context whose mailbox is configured and
     /// bound, so `next_ready` can take the busy path without a driver.
-    fn bound_raw_context() -> (RawContext<u8>, ActorRef<u8>) {
+    fn bound_raw_context_for<M: Send + 'static>() -> (RawContext<M>, ActorRef<M>) {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("raw-actor");
         let member = MemberCell::new(
@@ -2226,6 +2264,10 @@ mod tests {
             Readiness::Immediate,
         );
         (context, myself)
+    }
+
+    fn bound_raw_context() -> (RawContext<u8>, ActorRef<u8>) {
+        bound_raw_context_for()
     }
 
     fn marker(value: usize) -> QueuedEvent<usize> {
@@ -2303,6 +2345,24 @@ mod tests {
     struct CountedDrop {
         drops: Arc<AtomicUsize>,
         panic_on_drop: bool,
+    }
+
+    #[derive(Debug)]
+    struct PanicOnceClone {
+        clones: Arc<AtomicUsize>,
+        value: u8,
+    }
+
+    impl Clone for PanicOnceClone {
+        fn clone(&self) -> Self {
+            if self.clones.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("interval message clone panic");
+            }
+            Self {
+                clones: Arc::clone(&self.clones),
+                value: self.value,
+            }
+        }
     }
 
     impl Drop for CountedDrop {
@@ -2641,6 +2701,81 @@ mod tests {
     }
 
     #[test]
+    fn a_caught_interval_clone_panic_preserves_the_fired_batch_for_retry() {
+        let clones = Arc::new(AtomicUsize::new(0));
+        let mut context = bound_raw_context_for::<PanicOnceClone>().0;
+        let arming = ArmingOrder(1);
+        let now = crate::runtime::now();
+        context.resources.timers.replace(
+            "interval",
+            Some(now),
+            arming,
+            TimerMessage::Interval(
+                PanicOnceClone {
+                    clones: Arc::clone(&clones),
+                    value: 7,
+                },
+                Clone::clone,
+            ),
+            Some(Duration::from_secs(1)),
+        );
+
+        let panic = catch_unwind(AssertUnwindSafe(|| context.try_recv()))
+            .expect_err("the first interval clone panic escapes the receive call");
+        assert_eq!(panic_message(&panic), Some("interval message clone panic"));
+        assert!(
+            context
+                .resources
+                .ready_batch
+                .as_ref()
+                .is_some_and(|batch| batch.armings.front() == Some(&arming)),
+            "the caught panic leaves the due arming in its installed batch"
+        );
+
+        let message = context
+            .try_recv()
+            .expect("the next receive retries the same interval firing");
+        assert_eq!(message.value, 7);
+        assert_eq!(clones.load(Ordering::SeqCst), 2);
+        assert!(
+            context.resources.timers.next_deadline().is_some(),
+            "a successful retry rearms the interval"
+        );
+    }
+
+    #[test]
+    fn a_caught_offload_continuation_panic_preserves_later_fired_work() {
+        let mut context = bound_raw_context_for::<u8>().0;
+        let arming = ArmingOrder(1);
+        let now = crate::runtime::now();
+        context
+            .resources
+            .timers
+            .replace("timer", Some(now), arming, TimerMessage::Once(7), None);
+        context.resources.events.push(QueuedEvent {
+            cancellation: Latch::default(),
+            make_message: Box::new(|| panic!("offload continuation panic")),
+        });
+
+        let panic = catch_unwind(AssertUnwindSafe(|| context.try_recv()))
+            .expect_err("the offload continuation panic escapes the receive call");
+        assert_eq!(panic_message(&panic), Some("offload continuation panic"));
+        assert!(
+            context
+                .resources
+                .ready_batch
+                .as_ref()
+                .is_some_and(|batch| batch.armings.front() == Some(&arming)),
+            "the caught continuation panic leaves later timer work in the batch"
+        );
+        assert_eq!(
+            context.try_recv(),
+            Some(7),
+            "the next receive completes the fired batch instead of losing it"
+        );
+    }
+
+    #[test]
     fn resident_raw_collections_do_not_clone_disposal_per_element() {
         let mut resources = RawResources::<()>::default();
         let baseline = Arc::strong_count(&resources.disposal.panic);
@@ -2924,6 +3059,42 @@ mod timer_store_tests {
             "new-u8"
         );
         assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn interval_rearm_overflow_makes_the_live_entry_dormant() {
+        let now = Instant::now();
+        let arming = order(1);
+        let mut timers = TimerStore::default();
+        // Construct the delivery-time edge directly: the interval already
+        // fired at a representable deadline, but its next period does not fit
+        // in the clock domain.
+        timers.replace(
+            "interval",
+            Some(now),
+            arming,
+            TimerMessage::Interval("tick", Clone::clone),
+            Some(Duration::MAX),
+        );
+        assert_eq!(timers.take_due(now), [arming]);
+
+        assert_eq!(timers.rearm_interval(arming, now), Some("tick"));
+        assert_eq!(
+            timers
+                .entry_mut(arming)
+                .expect("the dormant interval remains clearable")
+                .deadline,
+            None
+        );
+        assert_eq!(
+            timers.next_deadline(),
+            None,
+            "overflow never substitutes an immediate delivery"
+        );
+        assert!(
+            timers.take(&"interval").is_some(),
+            "overflow dormancy does not erase the keyed interval"
+        );
     }
 
     #[test]

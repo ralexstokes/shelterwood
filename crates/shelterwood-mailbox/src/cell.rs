@@ -1274,7 +1274,21 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
                 effects,
             );
         }
-        if waiters.is_empty() {
+        if transaction.effects.accepted_sequence_exhausted {
+            // Exhaustion is the one way promotion stops early, so neither
+            // derived verdict below holds: a latest mailbox can still owe
+            // waiters and a queue mailbox can still have free capacity.
+            // Freezing is the honest state — no further acceptance is
+            // possible on this counter — and it keeps the parked senders in
+            // mailbox-owned state. Destroying them here would run user
+            // message destructors under the mailbox mutex during the
+            // exhaustion panic's own unwind; the post-unlock effect raises
+            // that panic instead.
+            transaction.binding = MailboxBinding::Frozen {
+                incarnation,
+                waiters,
+            };
+        } else if waiters.is_empty() {
             transaction.binding = MailboxBinding::Bound(BoundState::Available(incarnation));
         } else {
             let MailboxKind::Queue(capacity) = kind else {
@@ -1330,7 +1344,11 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             retired: Vec::new(),
         }) as MailboxDisposal;
         let token = MailboxBindToken::new(Arc::clone(&transaction.bind_permit));
-        transaction.finish(Some(MailboxClose::new(token, disposal)))
+        // The close result outlives this transaction's effect flush at every
+        // caller, so it carries the disposal capability that isolates the
+        // unread payload if that flush unwinds.
+        let runtime = Arc::clone(&transaction.effects.cell.runtime);
+        transaction.finish(Some(MailboxClose::new(token, disposal, runtime)))
     }
 
     fn prepare_termination(
@@ -1696,6 +1714,73 @@ pub(super) mod tests {
 
         fn sleep_until(&self, deadline: Option<Instant>) -> crate::BoxedSleep {
             self.inner.sleep_until(deadline)
+        }
+    }
+
+    /// Runtime whose change signal panics once armed, so a mailbox effect
+    /// flush can be made to unwind on demand.
+    struct PanickingPulseRuntime {
+        inner: Arc<dyn crate::MailboxRuntime>,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::MailboxRuntime for PanickingPulseRuntime {
+        fn oneshot(
+            &self,
+        ) -> (
+            Box<dyn crate::ErasedOneShotSender>,
+            Pin<Box<dyn crate::ErasedOneShotReceiver>>,
+        ) {
+            self.inner.oneshot()
+        }
+
+        fn signal(&self) -> Arc<dyn crate::MailboxSignal> {
+            Arc::new(PanickingPulseSignal {
+                inner: self.inner.signal(),
+                armed: Arc::clone(&self.armed),
+            })
+        }
+
+        fn dispose(&self, value: Box<dyn Send + 'static>) {
+            self.inner.dispose(value);
+        }
+
+        fn now(&self) -> Instant {
+            self.inner.now()
+        }
+
+        fn sleep_until(&self, deadline: Option<Instant>) -> crate::BoxedSleep {
+            self.inner.sleep_until(deadline)
+        }
+    }
+
+    struct PanickingPulseSignal {
+        inner: Arc<dyn crate::MailboxSignal>,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::MailboxSignal for PanickingPulseSignal {
+        fn pulse(&self) {
+            assert!(
+                !self.armed.load(Ordering::SeqCst),
+                "injected mailbox pulse panic"
+            );
+            self.inner.pulse();
+        }
+
+        fn watcher(&self) -> Box<dyn crate::MailboxSignalWatcher> {
+            self.inner.watcher()
+        }
+    }
+
+    /// User message recording the thread its destructor ran on.
+    struct ThreadRecordingMessage(Option<mpsc::Sender<std::thread::ThreadId>>);
+
+    impl Drop for ThreadRecordingMessage {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(std::thread::current().id());
+            }
         }
     }
 
@@ -2474,5 +2559,123 @@ pub(super) mod tests {
             super::WithdrawalOutcome::Withdrawn { .. }
         ));
         withdrawal.finish();
+    }
+
+    #[test]
+    fn a_panicking_close_flush_isolates_the_unread_payload() {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = Arc::new(PanickingPulseRuntime {
+            inner: crate::capability::tests::runtime(),
+            armed: Arc::clone(&armed),
+        });
+        let mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
+        let token = configure(&mailbox, ResolvedMailbox::Latest);
+        let mut identity = ScopeIdentity::new();
+        let (_, mut incarnations) = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available")
+            .into_pair();
+        let incarnation = incarnations.mint().expect("incarnation available");
+        bind(&mailbox, token, incarnation);
+        let (dropped, observed) = mpsc::channel();
+        assert!(matches!(
+            mailbox.submit(ThreadRecordingMessage(Some(dropped))),
+            super::Submission::Accepted(_)
+        ));
+        armed.store(true, Ordering::SeqCst);
+
+        // The driver shape: the close result is a live local across the
+        // effects flush, which wakes registered wakers synchronously and can
+        // therefore unwind on user code.
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let mut effects = crate::MailboxEffectQueue::default();
+            let closed = MailboxControl::close(&*mailbox, incarnation, &mut effects);
+            drop(effects);
+            if let Some(closed) = closed {
+                let (_token, disposal) = closed.into_parts();
+                drop(disposal);
+            }
+        }));
+        assert!(panic.is_err(), "the flush panic reaches the caller");
+
+        let destructor = observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the unread message destructor reports");
+        assert_ne!(
+            destructor,
+            std::thread::current().id(),
+            "an unwinding close flush must not destroy unread user messages on the caller's thread"
+        );
+    }
+
+    #[test]
+    fn bind_sequence_exhaustion_retains_parked_senders_after_unlock() {
+        let mut mailbox =
+            MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+        Arc::get_mut(&mut mailbox)
+            .expect("mailbox is uniquely owned")
+            .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
+        let token = configure(&mailbox, ResolvedMailbox::Latest);
+        let weak = Arc::downgrade(&mailbox);
+        let first = match mailbox.submit(LockCheckingMessage {
+            mailbox: Weak::clone(&weak),
+            dropped: None,
+        }) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("an unbound mailbox parks its send")
+            }
+        };
+        let (dropped, observed) = mpsc::channel();
+        let second = match mailbox.submit(LockCheckingMessage {
+            mailbox: weak,
+            dropped: Some(dropped),
+        }) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("an unbound mailbox parks its send")
+            }
+        };
+        let mut identity = ScopeIdentity::new();
+        let (_, mut incarnations) = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available")
+            .into_pair();
+        let incarnation = incarnations.mint().expect("incarnation available");
+
+        // Promotion mints one accepted sequence and then runs out, leaving a
+        // latest mailbox with a waiter still parked.
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            bind(&mailbox, token, incarnation);
+        }));
+        assert!(panic.is_err(), "exhaustion is reported to the caller");
+        drop(
+            mailbox
+                .state
+                .lock()
+                .expect("the exhaustion panic occurs after mailbox unlock"),
+        );
+
+        let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+        assert!(
+            receiver.try_recv().is_some(),
+            "the promoted message survives the exhaustion verdict"
+        );
+        let mut withdrawal = mailbox.withdraw(&second, super::WithdrawalDisposition::Inline);
+        assert!(
+            matches!(
+                withdrawal.take_outcome(),
+                super::WithdrawalOutcome::Withdrawn { .. }
+            ),
+            "the unpromotable sender still owns its message"
+        );
+        withdrawal.finish();
+        assert!(
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the parked message destructor reports"),
+            "the parked message is destroyed outside the mailbox mutex"
+        );
+        drop(first);
     }
 }

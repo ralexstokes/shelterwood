@@ -89,19 +89,51 @@ impl MailboxBindToken {
 }
 
 /// Result of successfully closing one incarnation.
+///
+/// The unread payload stays isolated until the caller has taken it apart.
+/// Closing rides a non-empty effect batch — at minimum the change pulse that
+/// wakes registered wakers synchronously — and callers hold this value across
+/// that flush. If any effect panics, unwinding submits the payload for
+/// detached disposal instead of destroying every unread user message on the
+/// caller's stack, which for the driver is the driver task itself.
 #[must_use = "closing returns both the next bind permission and unread payload disposal"]
 pub struct MailboxClose {
-    bind: MailboxBindToken,
-    disposal: MailboxDisposal,
+    bind: Option<MailboxBindToken>,
+    disposal: Option<MailboxDisposal>,
+    runtime: Arc<dyn MailboxRuntime>,
 }
 
 impl MailboxClose {
-    pub(crate) fn new(bind: MailboxBindToken, disposal: MailboxDisposal) -> Self {
-        Self { bind, disposal }
+    pub(crate) fn new(
+        bind: MailboxBindToken,
+        disposal: MailboxDisposal,
+        runtime: Arc<dyn MailboxRuntime>,
+    ) -> Self {
+        Self {
+            bind: Some(bind),
+            disposal: Some(disposal),
+            runtime,
+        }
     }
 
-    pub fn into_parts(self) -> (MailboxBindToken, MailboxDisposal) {
-        (self.bind, self.disposal)
+    pub fn into_parts(mut self) -> (MailboxBindToken, MailboxDisposal) {
+        let bind = self
+            .bind
+            .take()
+            .expect("a mailbox close is taken apart exactly once");
+        let disposal = self
+            .disposal
+            .take()
+            .expect("a mailbox close is taken apart exactly once");
+        (bind, disposal)
+    }
+}
+
+impl Drop for MailboxClose {
+    fn drop(&mut self) {
+        if let Some(disposal) = self.disposal.take() {
+            self.runtime.dispose(disposal);
+        }
     }
 }
 

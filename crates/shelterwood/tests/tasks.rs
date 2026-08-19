@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use crate::common::LiveFlag;
+use crate::common::{LiveFlag, assert_eventually};
 use shelterwood::{
     BuildError, Cancellation, DynamicTree, Exit, ExitError, ExitKind, GracePhase, PolicyError,
     Readiness, ReadinessDeadline, RemoveOutcome, ReserveError, Shutdown, StopReason, TaskDef,
@@ -23,26 +23,19 @@ fn task_families_reject_after_init_readiness_eagerly() {
 }
 
 #[test]
-fn public_exit_constructor_preserves_evidence_and_classifies_failures() {
-    let completed = Exit::new(ExitKind::Completed, Cancellation::Observed);
+fn public_exit_constructors_preserve_evidence_and_classify_failures() {
+    let completed = Exit::completed(Cancellation::Observed);
     assert_eq!(completed.cancellation(), Cancellation::Observed);
     assert!(matches!(completed.kind(), ExitKind::Completed));
     assert!(!completed.is_failure());
 
-    for kind in [
-        ExitKind::Failed(ExitError::message("failed")),
-        ExitKind::Panicked {
-            message: Some("panicked".to_owned()),
-        },
-        ExitKind::ReadinessTimedOut {
-            deadline: std::time::Instant::now(),
-        },
-        ExitKind::Aborted {
-            phase: GracePhase::AfterGrace,
-        },
-        ExitKind::NeverStarted,
+    for exit in [
+        Exit::failed(ExitError::message("failed"), Cancellation::NotObserved),
+        Exit::panicked(Some("panicked".to_owned()), Cancellation::NotObserved),
+        Exit::readiness_timed_out(std::time::Instant::now(), Cancellation::NotObserved),
+        Exit::aborted(GracePhase::AfterGrace, Cancellation::NotObserved),
+        Exit::never_started(),
     ] {
-        let exit = Exit::new(kind, Cancellation::NotObserved);
         assert_eq!(exit.cancellation(), Cancellation::NotObserved);
         assert!(exit.is_failure(), "non-completed exit: {:?}", exit.kind());
     }
@@ -66,6 +59,7 @@ fn declaration_errors_are_eager_and_root_lowering_is_the_only_other_build_error(
         Err(shelterwood::ReserveError::DuplicateId(ref id)) if id.as_str() == "duplicate"
     ));
     let task = slot.task_ref();
+    drop(slot);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -325,13 +319,7 @@ async fn dropping_the_owner_requests_cooperative_shutdown() {
     assert_eq!(exit.cancellation(), Cancellation::Observed);
     assert!(matches!(exit.kind(), ExitKind::Completed));
     assert_eq!(completion.wait().await, Ok(()));
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while live.is_live() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("task future dropped");
+    assert_eventually!(|| !live.is_live(), "task future dropped").await;
 }
 
 #[tokio::test]

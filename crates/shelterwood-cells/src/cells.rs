@@ -3,8 +3,8 @@
 //! These cells are the neutral synchronization and observation projection
 //! layer shared by public handles, mailboxes, actor/task contexts, and the
 //! mutable supervision driver. In particular, this module does not depend on
-//! mutable driver state. Its dynamic-route interface names declaration slots
-//! only as opaque capability payloads; their state remains owned elsewhere.
+//! mutable driver state. Its dynamic-route interface retains only the one
+//! close-admission hook needed by restart-stable scope transitions.
 
 use std::{
     any::Any,
@@ -27,19 +27,19 @@ use shelterwood_core::{
         ExitKind, StartupError, StartupFailure, StartupFailureCause, StopReason,
         stop_reason_precedence,
     },
-    identity::{AtomicPoisonedCounter, IncarnationCounter, MintedMembership, ScopeIdentity},
+    identity::{
+        AtomicPoisonedCounter, IncarnationCounter, MembershipReconciliation, MintedMembership,
+        ScopeIdentity,
+    },
     policy::{ResolvedCommonOptions, ScopeFlavor},
 };
-use shelterwood_mailbox::{ActorIdentity, MailboxControl, MailboxTermination};
-use shelterwood_runtime::{self as runtime, Latch};
+use shelterwood_mailbox::{ActorIdentity, MailboxControl, MailboxEffectSink, MailboxTermination};
+use shelterwood_runtime as runtime;
 
-use crate::{
-    admission::{RemoveOutcome, ReserveError},
-    observe::{
-        ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-        LifecycleHub, LifecycleSeq, RetainedScopeSnapshot, ScopeSnapshot, SnapshotHub,
-        SnapshotPublication, SnapshotReceiver,
-    },
+use crate::observe::{
+    ChildSnapshot, ChildState, LifecycleEventKind, LifecycleEvents, LifecycleHub, LifecycleSeq,
+    RetainedLifecycleEvent, RetainedScopeSnapshot, ScopeSnapshot, SnapshotHub, SnapshotPublication,
+    SnapshotReceiver,
 };
 
 /// An exit copy retained by framework state.
@@ -564,9 +564,18 @@ impl MemberCell {
     }
 
     fn with_observation_txn<R>(&self, operation: impl FnOnce(&mut ObservationTxn<'_>) -> R) -> R {
+        self.with_observation_txn_probed(|| {}, operation)
+    }
+
+    fn with_observation_txn_probed<R>(
+        &self,
+        mut report_capture: impl FnMut(),
+        operation: impl FnOnce(&mut ObservationTxn<'_>) -> R,
+    ) -> R {
         let mut operation = Some(operation);
         loop {
             let gate = self.current_observation_gate();
+            report_capture();
             let guard = gate.lock();
             if gate.shares_gate(&self.current_observation_gate()) {
                 let mut txn = ObservationTxn::new(guard);
@@ -608,14 +617,38 @@ impl MemberCell {
     }
 
     fn adopt_observation_gate(&self, gate: &ObservationGate, _txn: &mut ObservationTxn<'_>) {
+        self.adopt_observation_gate_with(
+            gate,
+            || {},
+            |previous| {
+                self.install_observation_gate_locked(previous, gate);
+            },
+        );
+    }
+
+    fn adopt_observation_gate_with(
+        &self,
+        gate: &ObservationGate,
+        mut report_capture: impl FnMut(),
+        install: impl FnOnce(&ObservationGate),
+    ) {
+        let mut install = Some(install);
         loop {
             let current = self.current_observation_gate();
             if current.shares_gate(gate) {
                 return;
             }
+            report_capture();
+            // An operation that passed the pointer check may finish its
+            // complete edge before handoff. One that merely captured this
+            // obsolete gate retries after acquiring it and observing the
+            // replacement.
             let current_guard = current.lock();
             if current.shares_gate(&self.current_observation_gate()) {
-                self.install_observation_gate_locked(&current, gate);
+                let install = install
+                    .take()
+                    .expect("observation gate adoption installs exactly once");
+                install(&current);
                 drop(current_guard);
                 return;
             }
@@ -674,7 +707,7 @@ impl MemberCell {
                         teardown,
                     } => {
                         debug_assert!(teardown.is_none());
-                        *teardown = mailbox.prepare_termination();
+                        *teardown = mailbox.prepare_termination(txn);
                         *control = Some(mailbox);
                         Some(exit.as_exit().clone())
                     }
@@ -743,7 +776,7 @@ impl MemberCell {
                 }
                 MemberMailbox::Attached(control) => {
                     let control = Arc::clone(control);
-                    let teardown = control.prepare_termination();
+                    let teardown = control.prepare_termination(txn);
                     *state = MemberMailbox::Terminal {
                         control: Some(control),
                         exit: RetainedExit::new(exit.clone()),
@@ -783,12 +816,23 @@ impl MemberCell {
         // winning exit. Notification-driven readers still see
         // discharge-before-pulse; tree-scoped publication defers both until
         // the complete observation transaction has released its gate.
+        let mut nonterminal_mailbox = false;
         let teardown = match &mut *self.mailbox.lock().expect("member mailbox mutex poisoned") {
             MemberMailbox::Terminal { teardown, .. } => teardown.take(),
             MemberMailbox::Unattached | MemberMailbox::Attached(_) => {
-                unreachable!("terminal publication requires terminal mailbox state")
+                // Panicking here would poison the member mailbox and can
+                // retire a retained user exit during unwind. Compute the
+                // verdict under the lock and raise it below, once the guard
+                // has been released; release builds keep the already-published
+                // terminal state.
+                nonterminal_mailbox = true;
+                None
             }
         };
+        debug_assert!(
+            !nonterminal_mailbox,
+            "terminal publication requires terminal mailbox state"
+        );
         if let Some(teardown) = teardown {
             txn.defer(move || {
                 if let Some(payload) = teardown.finish() {
@@ -842,66 +886,17 @@ impl ScopeRecord {
     }
 }
 
-/// Type-erased declaration slot carried by the restart-stable cell layer.
-///
-/// The route implementation chooses the concrete slot allocation. Erasing it
-/// here lets [`ScopeCell`] retain the route without depending on the plan
-/// layer that owns declaration state.
-pub type ErasedDynamicSlot = dyn Any + Send + Sync;
-
-/// Object-safe dynamic route retained by a restart-stable scope cell.
-pub type ErasedDynamicRoute = dyn DynamicRoute<Slot = ErasedDynamicSlot>;
-
-/// Cross-crate implementation seam for the façade's dynamic declaration
-/// route.
+/// Cross-crate close-admission hook retained by a restart-stable scope cell.
 ///
 /// # Implementation boundary
 ///
 /// This is not a user extension point. Only Shelterwood's façade implements
-/// and installs this trait. Its methods may run while the restart-stable tree
+/// and installs this trait. The callback runs while the restart-stable tree
 /// owns its observation gate, so a foreign implementation invalidates the
-/// framework's lock-rule guarantees.
-pub trait DynamicRoute: Send + Sync {
-    type Slot: ?Sized + Send + Sync;
-
-    fn reserve(
-        &self,
-        scope: &Arc<ScopeCell>,
-        id: ChildId,
-        child_scope: Option<ScopeFlavor>,
-        txn: &mut ObservationTxn<'_>,
-    ) -> Result<Arc<Self::Slot>, ReserveError>;
-
+/// framework's lock-rule guarantees. Requiring the transaction capability in
+/// the signature keeps that critical-section boundary explicit.
+pub trait DynamicRoute: Any + Send + Sync {
     fn close_admission(&self, txn: &mut ObservationTxn<'_>);
-
-    fn start_admission(
-        self: Arc<Self>,
-        slot: Arc<Self::Slot>,
-        fused_cancel: Option<Latch>,
-    ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError>;
-
-    fn cancel_reservation(
-        &self,
-        scope: &Arc<ScopeCell>,
-        slot: &Self::Slot,
-        txn: &mut ObservationTxn<'_>,
-    );
-
-    fn signal_fused_cancel(
-        &self,
-        scope: &Arc<ScopeCell>,
-        slot: &Self::Slot,
-        latch: &Latch,
-        txn: &mut ObservationTxn<'_>,
-    );
-
-    fn remove(
-        &self,
-        scope: &Arc<ScopeCell>,
-        id: &ChildId,
-        exact: Option<Membership>,
-        txn: &mut ObservationTxn<'_>,
-    ) -> runtime::OneShotReceiver<RemoveOutcome>;
 }
 
 /// Shared critical section for one resident tree's observation projection.
@@ -1040,6 +1035,12 @@ impl Drop for ObservationTxn<'_> {
     }
 }
 
+impl MailboxEffectSink for ObservationTxn<'_> {
+    fn defer_mailbox_effect(&mut self, effect: Box<dyn FnOnce()>) {
+        self.effects.push(effect);
+    }
+}
+
 /// Driver-independent view of one declaration slot while its membership is
 /// resident in a running scope.
 #[derive(Clone)]
@@ -1092,11 +1093,15 @@ impl ResidentChild {
                 },
             );
         }
+        // The projection can carry the last member/mailbox owner. Retire it
+        // only after the resident-tree observation gate is released.
+        txn.defer(move || drop(completion));
     }
 
     fn complete_removal(mut self, txn: &mut ObservationTxn<'_>) {
         let completion = self.disarm_removal();
         Self::publish_removal(completion, txn);
+        txn.defer(move || drop(self));
     }
 }
 
@@ -1184,7 +1189,7 @@ pub struct ScopeCell {
     me: Weak<ScopeCell>,
     child_identity: Mutex<ScopeIdentity>,
     control: Mutex<ScopeControl>,
-    dynamic_route: Mutex<Option<Arc<ErasedDynamicRoute>>>,
+    dynamic_route: Mutex<Option<Arc<dyn DynamicRoute>>>,
     observation: ScopeObservation,
     #[cfg(any(test, feature = "test-util"))]
     ancestor_parent_reads: AtomicUsize,
@@ -1231,7 +1236,7 @@ impl ScopeCell {
         &self,
         id: &ChildId,
         provisional: Membership,
-    ) -> Option<Option<MintedMembership>> {
+    ) -> MembershipReconciliation {
         self.child_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1426,32 +1431,21 @@ impl ScopeCell {
             gate.shares_gate(&parent.current_observation_gate()),
             "observation gates are adopted only in the parent-to-child direction"
         );
-        loop {
-            let current = self.current_observation_gate();
-            if current.shares_gate(gate) {
-                return;
-            }
-            debug_assert!(
-                self.dynamic_route_in(txn).is_none(),
-                "a scope with a live dynamic route is never re-homed"
-            );
-
-            #[cfg(any(test, feature = "test-util"))]
-            self.report_gate_capture(GateCapture::Adoption);
-
-            // An operation that passed `with_observation_gate`'s pointer
-            // check may finish its complete edge before handoff. An operation
-            // that merely captured this obsolete gate retries after acquiring
-            // it and observing the replacement.
-            let current_guard = current.lock();
-            if current.shares_gate(&self.current_observation_gate()) {
-                self.member.install_observation_gate_locked(&current, gate);
-                self.adopt_descendant_observation_gates_locked(&current, gate, txn);
-                drop(current_guard);
-                return;
-            }
-            drop(current_guard);
-        }
+        self.member.adopt_observation_gate_with(
+            gate,
+            || {
+                #[cfg(any(test, feature = "test-util"))]
+                self.report_gate_capture(GateCapture::Adoption);
+            },
+            |current| {
+                debug_assert!(
+                    self.dynamic_route_in(txn).is_none(),
+                    "a scope with a live dynamic route is never re-homed"
+                );
+                self.member.install_observation_gate_locked(current, gate);
+                self.adopt_descendant_observation_gates_locked(current, gate, txn);
+            },
+        );
     }
 
     pub fn adopt_child_observation_gate(
@@ -1502,23 +1496,13 @@ impl ScopeCell {
         &self,
         operation: impl FnOnce(&mut ObservationTxn<'_>) -> R,
     ) -> R {
-        let mut operation = Some(operation);
-        loop {
-            let gate = self.current_observation_gate();
-            #[cfg(any(test, feature = "test-util"))]
-            self.report_gate_capture(GateCapture::Observation);
-            let guard = gate.lock();
-            if gate.shares_gate(&self.current_observation_gate()) {
-                let operation = operation
-                    .take()
-                    .expect("observation operation runs exactly once");
-                let mut txn = ObservationTxn::new(guard);
-                let result = operation(&mut txn);
-                drop(txn);
-                return result;
-            }
-            drop(guard);
-        }
+        self.member.with_observation_txn_probed(
+            || {
+                #[cfg(any(test, feature = "test-util"))]
+                self.report_gate_capture(GateCapture::Observation);
+            },
+            operation,
+        )
     }
 
     pub fn set_state(&self, state: ScopeState) {
@@ -1950,6 +1934,10 @@ impl ScopeCell {
     }
 
     fn emit_locked(&self, wakes: &mut ObservationTxn<'_>, kind: LifecycleEventKind) {
+        // Mint the retention guards before any fallible framework bookkeeping.
+        // A sequence-exhaustion path can then defer a *guarded* edge instead
+        // of destroying a raw `Exit` under the observation gate.
+        let guards = RetainedLifecycleEvent::retain_guards(&kind);
         // Parent links cannot change under the resident-tree observation gate.
         // Resolve them once for snapshot and lifecycle propagation so one leaf
         // edge does not repeatedly lock every ancestor's parent mutex.
@@ -1964,6 +1952,13 @@ impl ScopeCell {
             .lifecycle_seq
             .mint(Ordering::Release, Ordering::Relaxed);
         let Some(seq) = seq.map(LifecycleSeq::new) else {
+            // Raw projection first, guards last, so the guards are the final
+            // owner and destruction is submitted to isolated disposal — the
+            // same field-order argument `RetainedLifecycleEvent` makes.
+            wakes.defer(move || {
+                drop(kind);
+                drop(guards);
+            });
             self.publish_snapshot_chain_through_locked(wakes, &ancestors);
             self.observation.lifecycle.publish_lagged(wakes, 1);
             for ancestor in &ancestors {
@@ -1974,23 +1969,23 @@ impl ScopeCell {
         self.publish_snapshot_chain_through_locked(wakes, &ancestors);
 
         let scope = self.member.membership();
-        let mut event = LifecycleEvent {
-            scope_path: Vec::new(),
-            scope,
-            seq,
-            kind,
-        };
+        let mut event = RetainedLifecycleEvent::from_parts(scope, seq, kind, guards);
         self.observation.lifecycle.publish(wakes, event.clone());
         let mut child_id = self.member.id().clone();
         for ancestor in ancestors {
-            event.scope_path.insert(0, child_id);
+            event.prepend_scope(child_id);
             child_id = ancestor.member.id().clone();
             ancestor.observation.lifecycle.publish(wakes, event.clone());
         }
+        // The producer's own copy still owns a retained exit. Retiring it here
+        // would submit a disposal job — and can start a native thread — with
+        // the observation gate held. This caller owns an effects sink, so it
+        // takes the preferred path and retires after unlock.
+        wakes.defer(move || drop(event));
     }
 
     fn close_observation_locked(&self, wakes: &mut ObservationTxn<'_>) {
-        if self.observation.closed.swap(true, Ordering::AcqRel) {
+        if self.observation.closed.load(Ordering::Acquire) {
             return;
         }
         // Closure follows the final state/snapshot/event publication performed
@@ -2000,6 +1995,9 @@ impl ScopeCell {
             .snapshots
             .close(wakes, move || scope.snapshot_locked());
         self.observation.lifecycle.close(wakes);
+        // Both hub closures are idempotent. Set the aggregate marker last so
+        // an unexpected panic leaves the operation retryable.
+        self.observation.closed.store(true, Ordering::Release);
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -2421,13 +2419,13 @@ impl ScopeCell {
             .iter_mut()
             .map(ResidentChild::disarm_removal)
             .collect::<Vec<_>>();
-        drop(residents);
+        wakes.defer(move || drop(residents));
         for completion in completions {
             ResidentChild::publish_removal(completion, wakes);
         }
     }
 
-    pub fn set_dynamic_route(&self, route: Option<Arc<ErasedDynamicRoute>>) {
+    pub fn set_dynamic_route(&self, route: Option<Arc<dyn DynamicRoute>>) {
         self.with_observation_gate(|txn| {
             self.set_dynamic_route_locked(route, txn);
         });
@@ -2435,7 +2433,7 @@ impl ScopeCell {
 
     pub fn set_dynamic_route_locked(
         &self,
-        route: Option<Arc<ErasedDynamicRoute>>,
+        route: Option<Arc<dyn DynamicRoute>>,
         txn: &mut ObservationTxn<'_>,
     ) {
         let previous = std::mem::replace(
@@ -2449,7 +2447,7 @@ impl ScopeCell {
         txn.pulse(&self.member.record);
     }
 
-    pub fn dynamic_route_in(&self, _txn: &ObservationTxn<'_>) -> Option<Arc<ErasedDynamicRoute>> {
+    pub fn dynamic_route_in(&self, _txn: &ObservationTxn<'_>) -> Option<Arc<dyn DynamicRoute>> {
         self.dynamic_route
             .lock()
             .expect("scope dynamic-route mutex poisoned")
@@ -2457,7 +2455,7 @@ impl ScopeCell {
     }
 
     #[cfg(any(test, feature = "test-util"))]
-    pub fn dynamic_route(&self) -> Option<Arc<ErasedDynamicRoute>> {
+    pub fn dynamic_route(&self) -> Option<Arc<dyn DynamicRoute>> {
         self.with_observation_gate(|txn| self.dynamic_route_in(txn))
     }
 
@@ -2592,23 +2590,126 @@ impl ScopeCell {
 mod tests {
     use std::{
         fmt,
+        future::Future,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
+        task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
 
     use shelterwood_core::{
-        Cancellation, ChildId, Exit, ExitError, ExitKind, ScopeState, StartupFailure,
-        StartupFailureCause, StopReason, identity::ScopeIdentity, policy::ScopeFlavor,
+        Cancellation, ChildId, Exit, ExitError, IntensityTrip, ScopeState, StartupFailure,
+        StartupFailureCause, StopReason,
+        identity::ScopeIdentity,
+        policy::{
+            ChildMode, CommonOptions, Readiness, ResolvedDefaults, ResolvedMailbox, ScopeFlavor,
+            resolve_common,
+        },
+    };
+    use shelterwood_mailbox::{
+        MailboxCell, MailboxControl, MailboxEffectQueue, MailboxReceiver, actor_ref_from_parts,
+    };
+    use shelterwood_runtime as runtime;
+
+    use crate::{
+        GateCapture, LifecycleEventKind, MemberCell, MemberStage, ObservationGate, ObservationTxn,
+        ResidentProjection, RetainedExit, RetainedStopReason, ScopeCell, StartupDisposition,
+        observe::LifecycleItem,
     };
 
-    use crate::{MemberCell, RetainedExit, RetainedStopReason, ScopeCell, StartupDisposition};
+    const TEST_WAIT: Duration = Duration::from_secs(10);
+
+    fn resolve_options(member: &MemberCell) {
+        member.set_options(resolve_common(
+            &CommonOptions::default(),
+            &ResolvedDefaults::default(),
+            ChildMode::Restartable,
+            Readiness::Immediate,
+        ));
+    }
+
+    fn isolated_scope(id: &str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
+        let id = ChildId::from(id);
+        let mut identity = ScopeIdentity::new();
+        let member = MemberCell::new(
+            id.clone(),
+            identity
+                .mint_membership(&id)
+                .expect("scope membership is available"),
+        );
+        resolve_options(&member);
+        ScopeCell::new(member, flavor, ScopeIdentity::new())
+    }
+
+    fn child_member(parent: &ScopeCell, id: &str) -> Arc<MemberCell> {
+        let id = ChildId::from(id);
+        let member = MemberCell::new(
+            id.clone(),
+            parent
+                .mint_membership(&id)
+                .expect("child membership is available"),
+        );
+        resolve_options(&member);
+        member
+    }
+
+    fn child_scope(parent: &ScopeCell, id: &str, flavor: ScopeFlavor) -> Arc<ScopeCell> {
+        ScopeCell::new(child_member(parent, id), flavor, ScopeIdentity::new())
+    }
 
     struct ThreadProbe(mpsc::SyncSender<std::thread::ThreadId>);
+
+    struct GateCheckingWake {
+        gate: super::ObservationGate,
+        woke_after_unlock: Arc<AtomicBool>,
+    }
+
+    impl Wake for GateCheckingWake {
+        fn wake(self: Arc<Self>) {
+            self.woke_after_unlock
+                .store(!self.gate.is_held(), Ordering::SeqCst);
+        }
+    }
+
+    struct GateDropError {
+        gate: super::ObservationGate,
+        dropped: mpsc::SyncSender<bool>,
+    }
+
+    impl fmt::Debug for GateDropError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("GateDropError")
+        }
+    }
+
+    impl fmt::Display for GateDropError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("gate drop probe")
+        }
+    }
+
+    impl std::error::Error for GateDropError {}
+
+    impl Drop for GateDropError {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(!self.gate.is_held());
+        }
+    }
+
+    struct GateDropMessage {
+        gate: super::ObservationGate,
+        dropped: mpsc::SyncSender<bool>,
+    }
+
+    impl Drop for GateDropMessage {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(!self.gate.is_held());
+        }
+    }
 
     impl fmt::Debug for ThreadProbe {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2630,12 +2731,485 @@ mod tests {
         }
     }
 
+    struct PanicWake {
+        gate: ObservationGate,
+        observed_unlocked: Arc<AtomicBool>,
+    }
+
+    impl Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.observed_unlocked
+                .store(!self.gate.is_held(), Ordering::SeqCst);
+            std::panic::panic_any("hostile observation pulse");
+        }
+    }
+
+    struct CountWake(Arc<AtomicUsize>);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn observation_txn_commit_unlocks_before_effects_and_drains_once() {
+        let gate = ObservationGate::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut txn = ObservationTxn::new(gate.lock());
+        for value in [1, 2] {
+            let gate = gate.clone();
+            let order = Arc::clone(&order);
+            txn.defer(move || {
+                assert!(!gate.is_held(), "deferred work runs after the unlock");
+                order
+                    .lock()
+                    .expect("probe mutex remains healthy")
+                    .push(value);
+            });
+        }
+
+        txn.commit();
+        assert_eq!(*order.lock().expect("probe mutex remains healthy"), [1, 2]);
+        drop(txn);
+        assert_eq!(
+            *order.lock().expect("probe mutex remains healthy"),
+            [1, 2],
+            "a second commit from Drop is a no-op"
+        );
+    }
+
+    #[test]
+    fn observation_txn_drop_runs_later_pulses_after_a_hostile_waker() {
+        let gate = ObservationGate::new();
+        let (hostile_sender, mut hostile_receiver) = runtime::watch(());
+        let (later_sender, mut later_receiver) = runtime::watch(());
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+        let hostile_waker = Waker::from(Arc::new(PanicWake {
+            gate: gate.clone(),
+            observed_unlocked: Arc::clone(&observed_unlocked),
+        }));
+        let later_wakes = Arc::new(AtomicUsize::new(0));
+        let later_waker = Waker::from(Arc::new(CountWake(Arc::clone(&later_wakes))));
+        let mut hostile_changed = Box::pin(hostile_receiver.changed());
+        let mut later_changed = Box::pin(later_receiver.changed());
+        assert!(
+            hostile_changed
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile_waker))
+                .is_pending()
+        );
+        assert!(
+            later_changed
+                .as_mut()
+                .poll(&mut Context::from_waker(&later_waker))
+                .is_pending()
+        );
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let mut txn = ObservationTxn::new(gate.lock());
+            txn.pulse(&hostile_sender);
+            txn.pulse(&later_sender);
+        }))
+        .expect_err("the first hostile pulse is resumed after every effect runs");
+
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"hostile observation pulse")
+        );
+        assert!(
+            observed_unlocked.load(Ordering::SeqCst),
+            "the hostile waker runs only after the gate is released"
+        );
+        assert_eq!(
+            later_wakes.load(Ordering::SeqCst),
+            1,
+            "a hostile pulse cannot suppress a later committed pulse"
+        );
+    }
+
+    #[test]
+    fn observation_txn_flushes_during_unwind_without_replacing_the_primary_panic() {
+        let gate = ObservationGate::new();
+        let effects = Arc::new(Mutex::new(Vec::new()));
+        let payload = catch_unwind(AssertUnwindSafe({
+            let effects = Arc::clone(&effects);
+            let gate = gate.clone();
+            move || {
+                let mut txn = ObservationTxn::new(gate.lock());
+                let first = Arc::clone(&effects);
+                let first_gate = gate.clone();
+                // An assertion here would be inert: `PanicAccumulator`
+                // captures it and `resume_preferred_panic` discards captures
+                // raised while a primary unwind is already in flight. The
+                // observation is published instead and judged in the body.
+                txn.defer(move || {
+                    first
+                        .lock()
+                        .expect("probe mutex remains healthy")
+                        .push((1, first_gate.is_held()));
+                    std::panic::panic_any("cleanup panic");
+                });
+                let second = Arc::clone(&effects);
+                let second_gate = gate.clone();
+                txn.defer(move || {
+                    second
+                        .lock()
+                        .expect("probe mutex remains healthy")
+                        .push((2, second_gate.is_held()));
+                });
+                std::panic::panic_any("primary panic");
+            }
+        }))
+        .expect_err("the original unwind reaches its boundary");
+
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"primary panic"));
+        assert_eq!(
+            *effects.lock().expect("probe mutex remains healthy"),
+            [(1, false), (2, false)],
+            "Drop flushes every committed effect with the gate released, even \
+             during an existing unwind"
+        );
+    }
+
+    #[test]
+    fn adoption_retries_when_the_captured_child_gate_has_already_been_replaced() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        let replacement = isolated_scope("replacement", ScopeFlavor::Ordered);
+        let captures = nested.probe_gate_captures();
+        let prior_gate = nested.observation_gate();
+        let held = prior_gate.lock();
+        let adopting_root = Arc::clone(&root);
+        let adopting_nested = Arc::clone(&nested);
+        let adoption = std::thread::spawn(move || {
+            adopting_root.admit_child(ResidentProjection::new(
+                Arc::clone(&adopting_nested.member),
+                Some(adopting_nested),
+            ));
+        });
+
+        assert_eq!(
+            captures
+                .recv_timeout(TEST_WAIT)
+                .expect("adoption captures the child's prior gate"),
+            GateCapture::Adoption
+        );
+        nested.replace_observation_gate(replacement.observation_gate());
+        drop(held);
+        assert_eq!(
+            captures
+                .recv_timeout(TEST_WAIT)
+                .expect("adoption retries after observing the replacement"),
+            GateCapture::Adoption
+        );
+        adoption.join().expect("the retried adoption completes");
+
+        assert!(
+            root.observation_gate()
+                .same_gate(&nested.observation_gate())
+        );
+        assert!(root.has_resident_child(&nested.member));
+        assert_eq!(captures.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn adopting_a_resident_subtree_rehomes_every_descendant_gate() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
+        let leaf_scope = child_scope(&nested, "leaf-scope", ScopeFlavor::Ordered);
+        let leaf_member = child_member(&nested, "leaf-member");
+        // Depth 2. The one-level loop in
+        // `adopt_descendant_observation_gates_locked` re-homes `leaf_scope`'s
+        // own member, and `ScopeCell::observation_gate` reads that member, so
+        // a subtree of depth 1 cannot tell the loop from the recursion. Only
+        // this grandchild is reachable exclusively through the recursive call.
+        let grandchild = child_member(&leaf_scope, "grandchild");
+        leaf_scope
+            .set_admitted_children(vec![ResidentProjection::new(Arc::clone(&grandchild), None)]);
+        nested.set_admitted_children(vec![
+            ResidentProjection::new(
+                Arc::clone(&leaf_scope.member),
+                Some(Arc::clone(&leaf_scope)),
+            ),
+            ResidentProjection::new(Arc::clone(&leaf_member), None),
+        ]);
+
+        root.admit_child(ResidentProjection::new(
+            Arc::clone(&nested.member),
+            Some(Arc::clone(&nested)),
+        ));
+
+        let root_gate = root.observation_gate();
+        for gate in [
+            nested.observation_gate(),
+            leaf_scope.observation_gate(),
+            leaf_member.observation_gate(),
+            grandchild.observation_gate(),
+        ] {
+            assert!(
+                root_gate.same_gate(&gate),
+                "every descendant joins the adopting parent's observation gate"
+            );
+        }
+        assert!(Arc::ptr_eq(
+            &nested.parent().expect("nested parent is installed"),
+            &root
+        ));
+        assert!(Arc::ptr_eq(
+            &leaf_scope.parent().expect("leaf parent is installed"),
+            &nested
+        ));
+    }
+
+    #[test]
+    fn residency_admits_prunes_and_clears_exact_memberships() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
+        let leaf = child_member(&root, "leaf");
+        let nested_membership = nested.member.membership();
+        let leaf_membership = leaf.membership();
+        let mut lifecycle = root.subscribe_lifecycle();
+
+        root.set_admitted_children(vec![
+            ResidentProjection::new(Arc::clone(&nested.member), Some(Arc::clone(&nested))),
+            ResidentProjection::new(Arc::clone(&leaf), None),
+        ]);
+        assert_eq!(root.resident_projections().len(), 2);
+        assert!(root.has_resident_child(&nested.member));
+        assert!(root.has_resident_child(&leaf));
+        assert!(matches!(
+            nested.member.record().stage,
+            MemberStage::Admitted
+        ));
+        assert!(matches!(leaf.record().stage, MemberStage::Admitted));
+
+        assert!(root.prune_child(&nested.member));
+        assert!(!root.prune_child(&nested.member));
+        assert!(!root.has_resident_child(&nested.member));
+        assert!(root.has_resident_child(&leaf));
+        root.clear_residents();
+        assert!(root.resident_projections().is_empty());
+
+        let mut edges = Vec::new();
+        while let Ok(LifecycleItem::Event(event)) = lifecycle.try_recv() {
+            match event.kind {
+                LifecycleEventKind::Added { membership, .. } => {
+                    edges.push(("added", membership));
+                }
+                LifecycleEventKind::Removed { membership, .. } => {
+                    edges.push(("removed", membership));
+                }
+                _ => panic!("residency mutation emitted an unrelated lifecycle edge"),
+            }
+        }
+        assert_eq!(
+            edges,
+            [
+                ("added", nested_membership),
+                ("added", leaf_membership),
+                ("removed", nested_membership),
+                ("removed", leaf_membership),
+            ]
+        );
+    }
+
+    #[test]
+    fn attaching_a_second_mailbox_panics_without_replacing_or_poisoning_the_first() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let first = MailboxCell::<u8>::new(scope.member.id().clone(), runtime::mailbox_runtime());
+        let second = MailboxCell::<u8>::new(scope.member.id().clone(), runtime::mailbox_runtime());
+        let first_control: Arc<dyn MailboxControl> = first;
+        let second_control: Arc<dyn MailboxControl> = second;
+        scope.member.attach_mailbox(Arc::clone(&first_control));
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            scope.member.attach_mailbox(second_control);
+        }))
+        .expect_err("a member rejects a second mailbox");
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"a member can own only one mailbox")
+        );
+        assert!(Arc::ptr_eq(
+            &scope
+                .member
+                .mailbox()
+                .expect("the first mailbox remains attached"),
+            &first_control
+        ));
+        scope.member.terminalize(
+            Exit::completed(Cancellation::NotObserved),
+            StartupDisposition::Unchanged,
+        );
+        assert!(
+            scope.member.mailbox().is_some(),
+            "the rejected attach did not poison the mailbox mutex"
+        );
+    }
+
+    #[test]
+    fn losing_terminalizer_returns_the_winner_without_republishing_or_reclassifying() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let member = &scope.member;
+        let winner = Exit::completed(Cancellation::NotObserved);
+        member.terminalize(winner.clone(), StartupDisposition::NotAborted);
+        let mut watcher = member.record_watcher();
+        let winning_record = watcher.borrow_and_update_cloned();
+        let losing = Exit::failed(ExitError::message("late failure"), Cancellation::Observed);
+
+        let returned = member.with_observation_txn(|txn| {
+            member.terminalize_locked(losing, StartupDisposition::Aborted, txn)
+        });
+
+        assert_eq!(returned, winner);
+        assert_eq!(member.record(), winning_record);
+        assert!(!member.record().startup_aborted);
+        let mut changed = Box::pin(watcher.changed());
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "a losing terminalizer publishes no second record edge"
+        );
+    }
+
+    #[test]
+    fn stopped_publication_uses_the_full_precedence_lattice_and_strict_upgrades() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let mut lifecycle = scope.subscribe_lifecycle();
+        let ascending = vec![
+            StopReason::Finished,
+            StopReason::IntensityTripped(IntensityTrip {
+                max_restarts: 1,
+                observed_restarts: 2,
+                within: Duration::from_secs(1),
+            }),
+            StopReason::StartupFailed(StartupFailure {
+                cause: StartupFailureCause::Lowering {
+                    undefined: vec![ChildId::from("missing")],
+                },
+            }),
+            StopReason::ShutdownRequested,
+            StopReason::NeverStarted,
+        ];
+
+        for reason in &ascending {
+            scope.with_observation_gate(|txn| {
+                scope.publish_stopped_locked(txn, reason.clone(), None, None);
+            });
+            assert_eq!(
+                scope.record().state,
+                ScopeState::Stopped {
+                    reason: reason.clone()
+                }
+            );
+        }
+        for reason in ascending.iter().rev() {
+            scope.with_observation_gate(|txn| {
+                scope.publish_stopped_locked(txn, reason.clone(), None, None);
+            });
+        }
+
+        let mut published = Vec::new();
+        while let Ok(LifecycleItem::Event(event)) = lifecycle.try_recv() {
+            if let LifecycleEventKind::ScopeState {
+                state: ScopeState::Stopped { reason },
+            } = event.kind
+            {
+                published.push(reason);
+            }
+        }
+        assert_eq!(
+            published, ascending,
+            "only strict precedence upgrades publish a stopped-state edge"
+        );
+        assert_eq!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::NeverStarted
+            }
+        );
+    }
+
+    #[test]
+    fn shutdown_and_force_requests_are_exactly_once_and_epoch_scoped() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let first = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("the first epoch is available");
+        assert_eq!(scope.request_shutdown(), Some(first));
+        assert!(scope.take_shutdown_request(first));
+        assert!(!scope.take_shutdown_request(first));
+        scope.force_shutdown(first);
+        assert!(scope.take_force_request(first));
+        assert!(!scope.take_force_request(first));
+        scope.finish_incarnation(first, StopReason::Finished);
+
+        let second = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("the next epoch is available");
+        assert_ne!(first, second);
+        scope.force_shutdown(first);
+        assert!(!scope.take_force_request(first));
+        assert!(!scope.take_force_request(second));
+        assert_eq!(scope.request_shutdown(), Some(second));
+        assert!(!scope.take_shutdown_request(first));
+        assert!(scope.take_shutdown_request(second));
+        scope.force_shutdown(second);
+        assert!(scope.take_force_request(second));
+        assert!(!scope.take_force_request(second));
+        scope.finish_incarnation(second, StopReason::ShutdownRequested);
+    }
+
+    #[test]
+    fn retained_exit_install_keeps_an_equal_shared_guard_set_in_place() {
+        let retiring_thread = std::thread::current().id();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let exit = Exit::failed(
+            ExitError::from(ThreadProbe(dropped)),
+            Cancellation::NotObserved,
+        );
+        let mut guards = Arc::new(vec![RetainedExit::new(exit.clone())]);
+        let original = Arc::clone(&guards);
+
+        RetainedExit::install(&mut guards, vec![RetainedExit::new(exit.clone())]);
+
+        assert!(
+            Arc::ptr_eq(&guards, &original),
+            "an unchanged guard set keeps its shared allocation"
+        );
+        assert_eq!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "the failure payload still has owners here, so no retirement can reach it"
+        );
+        drop(exit);
+        drop(original);
+        drop(guards);
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("the final guard isolates its failed payload"),
+            retiring_thread
+        );
+    }
+
     #[test]
     fn retained_failed_exit_disposes_off_the_retiring_thread() {
         let retiring_thread = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let retained = RetainedExit::new(Exit::new(
-            ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+        let retained = RetainedExit::new(Exit::failed(
+            ExitError::from(ThreadProbe(dropped)),
             Cancellation::NotObserved,
         ));
 
@@ -2662,14 +3236,14 @@ mod tests {
                 .expect("membership is available"),
         );
         member.terminalize(
-            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+            Exit::completed(Cancellation::NotObserved),
             StartupDisposition::Unchanged,
         );
         let (dropped, observed) = mpsc::sync_channel(1);
 
         member.terminalize(
-            Exit::new(
-                ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+            Exit::failed(
+                ExitError::from(ThreadProbe(dropped)),
                 Cancellation::NotObserved,
             ),
             StartupDisposition::Unchanged,
@@ -2722,8 +3296,8 @@ mod tests {
                 cause: StartupFailureCause::Child {
                     id: child_id,
                     membership: child.membership(),
-                    exit: Exit::new(
-                        ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+                    exit: Exit::failed(
+                        ExitError::from(ThreadProbe(dropped)),
                         Cancellation::NotObserved,
                     ),
                 },
@@ -2750,8 +3324,8 @@ mod tests {
     fn retained_exit_conversion_preserves_the_callers_drop_thread() {
         let caller = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let retained = RetainedExit::new(Exit::new(
-            ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+        let retained = RetainedExit::new(Exit::failed(
+            ExitError::from(ThreadProbe(dropped)),
             Cancellation::NotObserved,
         ));
 
@@ -2782,8 +3356,8 @@ mod tests {
             cause: StartupFailureCause::Child {
                 id,
                 membership: member.membership(),
-                exit: Exit::new(
-                    ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+                exit: Exit::failed(
+                    ExitError::from(ThreadProbe(dropped)),
                     Cancellation::NotObserved,
                 ),
             },
@@ -2813,8 +3387,8 @@ mod tests {
                 .expect("membership is available"),
         );
         member.terminalize(
-            Exit::new(
-                ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+            Exit::failed(
+                ExitError::from(ThreadProbe(dropped)),
                 Cancellation::NotObserved,
             ),
             StartupDisposition::Unchanged,
@@ -2912,5 +3486,145 @@ mod tests {
         );
 
         assert!(scope.request_shutdown_ignoring_poison().is_some());
+    }
+
+    #[test]
+    fn mailbox_control_wakes_are_deferred_past_the_observation_gate() {
+        let id = ChildId::from("root");
+        let mut identity = ScopeIdentity::new();
+        let member = MemberCell::new(
+            id.clone(),
+            identity
+                .mint_membership(&id)
+                .expect("root membership is available"),
+        );
+        let mut incarnations = member.take_incarnation_counter();
+        let incarnation = incarnations.mint().expect("incarnation available");
+        let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
+        let gate = scope.observation_gate();
+        let mailbox = MailboxCell::<u8>::new(id, shelterwood_runtime::mailbox_runtime());
+        let mut effects = MailboxEffectQueue::default();
+        let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
+        MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
+        drop(effects);
+        let mut receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+        let woke_after_unlock = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(GateCheckingWake {
+            gate: gate.clone(),
+            woke_after_unlock: Arc::clone(&woke_after_unlock),
+        }));
+        let mut changed = Box::pin(receiver.changed());
+        assert!(matches!(
+            changed.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+
+        scope.with_observation_gate(|txn| {
+            MailboxControl::freeze(&*mailbox, incarnation, txn);
+        });
+
+        assert!(woke_after_unlock.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lifecycle_sequence_exhaustion_retires_the_exit_after_unlock() {
+        let id = ChildId::from("root");
+        let mut identity = ScopeIdentity::new();
+        let member = MemberCell::new(
+            id.clone(),
+            identity
+                .mint_membership(&id)
+                .expect("root membership is available"),
+        );
+        let membership = member.membership();
+        let mut incarnations = member.take_incarnation_counter();
+        let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
+        let gate = scope.observation_gate();
+        scope.set_lifecycle_sequence(u64::MAX - 2);
+        scope.emit(LifecycleEventKind::ScopeState {
+            state: ScopeState::Running,
+        });
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let exhausted = LifecycleEventKind::Exited {
+            id,
+            membership,
+            incarnation: incarnations.mint().expect("incarnation available"),
+            exit: Exit::failed(
+                ExitError::from(GateDropError { gate, dropped }),
+                Cancellation::NotObserved,
+            ),
+        };
+
+        // Retiring a `RetainedExit` never destroys the user error inline: it
+        // always submits the value to isolated disposal, so the destructor
+        // runs on a worker thread in either arrangement and its own view of
+        // the gate is a race. What the deferral changes is *when the
+        // submission happens*. Hold the gate open across the emit: nothing
+        // can arrive on this channel unless the submission already happened
+        // under the gate.
+        let retired_under_gate = scope.with_observation_gate(|wakes| {
+            scope.emit_locked(wakes, exhausted);
+            observed.recv_timeout(Duration::from_millis(500)).is_ok()
+        });
+        assert!(
+            !retired_under_gate,
+            "an unsequenced exit must not be submitted for disposal under the observation gate"
+        );
+
+        assert!(
+            observed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("retained exit destructor reports"),
+            "an unsequenced exit is retired after the observation gate unlocks"
+        );
+    }
+
+    #[test]
+    fn clearing_residents_releases_the_last_mailbox_owner_after_unlock() {
+        let root_id = ChildId::from("root");
+        let mut root_identity = ScopeIdentity::new();
+        let root_member = MemberCell::new(
+            root_id.clone(),
+            root_identity
+                .mint_membership(&root_id)
+                .expect("root membership is available"),
+        );
+        let scope = ScopeCell::new(root_member, ScopeFlavor::Dynamic, ScopeIdentity::new());
+        let gate = scope.observation_gate();
+
+        let child_id = ChildId::from("child");
+        let mut child_identity = ScopeIdentity::new();
+        let child = MemberCell::new(
+            child_id.clone(),
+            child_identity
+                .mint_membership(&child_id)
+                .expect("child membership is available"),
+        );
+        let mut incarnations = child.take_incarnation_counter();
+        let incarnation = incarnations.mint().expect("incarnation available");
+        let mailbox = MailboxCell::new(child_id, shelterwood_runtime::mailbox_runtime());
+        child.attach_mailbox(mailbox.clone());
+        let actor = actor_ref_from_parts(Arc::clone(&child), Arc::clone(&mailbox));
+        let mut effects = MailboxEffectQueue::default();
+        let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
+        MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
+        drop(effects);
+        let (dropped, observed) = mpsc::sync_channel(1);
+        actor
+            .try_send(GateDropMessage { gate, dropped })
+            .expect("bound mailbox accepts the probe");
+        scope.admit_child(ResidentProjection::new(Arc::clone(&child), None));
+        drop(actor);
+        drop(mailbox);
+        drop(child);
+
+        scope.clear_residents();
+
+        assert!(
+            observed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("resident mailbox payload destructor reports"),
+            "the displaced resident owner is released after the gate unlocks"
+        );
     }
 }

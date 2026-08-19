@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     admission::{RemoveOutcome, ReserveError},
-    driver::DynamicReservation,
+    driver::{DynamicReservation, LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR},
     runtime::Latch,
 };
 
@@ -52,9 +52,7 @@ impl<H> PendingAdmission<H> {
                 // never stranded, but fail loudly in debug builds: silence
                 // here would mask an obligation regression.
                 debug_assert!(false, "admission response obligation must complete");
-                Err(ReserveError::NotAdmitting(
-                    crate::NotAdmittingCause::Terminal,
-                ))
+                Err(LOST_ADMISSION_RESPONSE_ERROR)
             })
         }))
     }
@@ -223,13 +221,6 @@ impl fmt::Debug for Removal {
     }
 }
 
-/// Fail-closed outcome when the removal response obligation never completes.
-///
-/// Named so the policy is assertable in every profile: the release fallback is
-/// only reachable once `debug_assert!` is compiled out, so a test that observes
-/// the returned value runs in exactly the builds CI does not exercise.
-const LOST_REMOVAL_RESPONSE_OUTCOME: RemoveOutcome = RemoveOutcome::Removed;
-
 impl Removal {
     pub(super) fn new(response: crate::driver::RemovalResponse) -> Self {
         Self {
@@ -241,7 +232,7 @@ impl Removal {
                     // preserve the removal goal, but flag the invariant break
                     // in debug builds just as admission does above.
                     debug_assert!(false, "removal response obligation must complete");
-                    LOST_REMOVAL_RESPONSE_OUTCOME
+                    LATCHED_REMOVAL_OUTCOME
                 })
             }),
         }
@@ -300,13 +291,22 @@ mod tests {
             panic!("hostile observation waker");
         }
     }
+
+    #[test]
+    fn lost_admission_response_policy_fails_closed() {
+        assert!(matches!(
+            super::LOST_ADMISSION_RESPONSE_ERROR,
+            crate::ReserveError::NotAdmitting(crate::NotAdmittingCause::Terminal)
+        ));
+    }
+
     #[test]
     fn lost_removal_response_policy_fails_closed() {
         // Profile-independent: the release fallback below is unreachable in
         // the debug builds CI runs, so the policy itself is pinned here rather
         // than only through the value a release build happens to observe.
         assert_eq!(
-            super::LOST_REMOVAL_RESPONSE_OUTCOME,
+            super::LATCHED_REMOVAL_OUTCOME,
             crate::RemoveOutcome::Removed,
             "a lost removal response must preserve the removal goal"
         );
@@ -330,7 +330,7 @@ mod tests {
         #[cfg(not(debug_assertions))]
         assert_eq!(
             observed.expect("release fallback does not panic"),
-            std::task::Poll::Ready(super::LOST_REMOVAL_RESPONSE_OUTCOME)
+            std::task::Poll::Ready(super::LATCHED_REMOVAL_OUTCOME)
         );
     }
 

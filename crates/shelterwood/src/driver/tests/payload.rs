@@ -1,4 +1,5 @@
 use super::support::*;
+use crate::mailbox::MailboxEffectQueue;
 
 struct ThreadRecordingRaw {
     dropped: crate::runtime::UnboundedMpscSender<std::thread::ThreadId>,
@@ -6,7 +7,7 @@ struct ThreadRecordingRaw {
 
 impl Drop for ThreadRecordingRaw {
     fn drop(&mut self) {
-        let _ = crate::runtime::unbounded_mpsc_send(&self.dropped, std::thread::current().id());
+        let _ = self.dropped.send(std::thread::current().id());
     }
 }
 
@@ -32,27 +33,17 @@ fn one_shot_raw_scope(
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let member = Arc::clone(&plan.children[0].slot.member);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("the test scope has a live epoch");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
+    let epoch = ScopeEpochGuard::begin(&root).expect("the test scope has a live epoch");
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
+    let key = children.insert(child);
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let scope = ScopeRuntimeBuilder::new(root, epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_lifecycle(ScopeLifecycle::running())
         .with_children(children)
+        .with_transferred_plan(plan)
         .build();
-    plan.finish_transfer();
     (scope, key, member, actor)
 }
 
@@ -118,12 +109,23 @@ async fn rebind_waker_panic_keeps_one_shot_body_isolated() {
         .incarnations
         .mint()
         .expect("a prior incarnation is available");
+    let token = child
+        .mailbox_bind
+        .take()
+        .expect("configuration supplies the first bind token");
+    let mut effects = MailboxEffectQueue::default();
     let mailbox = child.mailbox.as_ref().expect("raw actors own a mailbox");
-    mailbox.bind(prior);
-    mailbox.freeze(prior);
-    if let Some(teardown) = mailbox.close(prior) {
-        crate::runtime::dispose_detached(teardown);
-    }
+    mailbox.bind(token, prior, &mut effects);
+    mailbox.freeze(prior, &mut effects);
+    let close = mailbox
+        .close(prior, &mut effects)
+        .expect("closing the live prior incarnation returns the next bind token");
+    // Hand the rebind token back to the driver before dropping the effect
+    // queue, so `spawn_child` below still takes the restart path.
+    let (rebind, teardown) = close.into_parts();
+    child.mailbox_bind = Some(rebind);
+    drop(effects);
+    crate::runtime::dispose_detached(teardown);
 
     let hostile = Waker::from(Arc::new(PanicWake(PANIC)));
     let mut parked = Box::pin(actor.send(1));

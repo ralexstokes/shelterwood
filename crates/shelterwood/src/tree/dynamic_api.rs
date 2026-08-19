@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId,
     admission::ReserveError,
-    mailbox::MailboxCell,
     raw::{RawDef, RawOnceDef},
     scope::{DynamicScopeRef, ScopeRef},
     task::{OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
@@ -15,6 +14,7 @@ use super::{
     builders::dispose_rejected,
     slots::{
         ActorSlotCore, AdmissionOwnership, DynamicSlotEndpoint, SubtreeSlotCore, TaskSlotCore,
+        attach_actor_mailbox,
     },
     system::sealed,
 };
@@ -66,11 +66,7 @@ impl DynamicScopeRef {
         ownership: AdmissionOwnership,
     ) -> Result<DynamicActorSlot<M>, ReserveError> {
         crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
-            let mailbox = MailboxCell::new(
-                reservation.slot.member.id().clone(),
-                crate::runtime::mailbox_runtime(),
-            );
-            reservation.slot.member.attach_mailbox(mailbox.clone());
+            let mailbox = attach_actor_mailbox(&reservation.slot);
             DynamicActorSlot {
                 core: ActorSlotCore::new(DynamicSlotEndpoint::new(reservation, ownership), mailbox),
             }

@@ -38,15 +38,21 @@ async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
     );
     let publisher = crate::runtime::spawn(async move {
         crate::runtime::yield_now().await;
-        control
-            .send(DriverEvent::Removal(RemovalRequest { key }))
-            .expect("the control lane remains open");
-        primary
-            .send(DriverEvent::Child(ChildEvent::Ready {
-                child: key,
-                incarnation,
-            }))
-            .expect("the primary lane remains open");
+        assert!(
+            control
+                .send(DriverEvent::Removal(RemovalRequest { key }))
+                .is_ok(),
+            "the control lane remains open"
+        );
+        assert!(
+            primary
+                .send(DriverEvent::Child(ChildEvent::Ready {
+                    child: key,
+                    incarnation,
+                }))
+                .is_ok(),
+            "the primary lane remains open"
+        );
     });
     let wake = wait.await;
     assert!(matches!(
@@ -93,16 +99,19 @@ fn every_event_lane_is_capped_and_a_saturated_lane_forces_a_yield() {
     let (primary, mut primary_receiver) = crate::runtime::unbounded_mpsc();
     let (control, mut control_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal, mut disposal_receiver) = crate::runtime::unbounded_mpsc();
-    primary
-        .send(disposed(primary_key))
-        .expect("the primary lane remains open");
-    control
-        .send(disposed(control_key))
-        .expect("the control lane remains open");
+    assert!(
+        primary.send(disposed(primary_key)).is_ok(),
+        "the primary lane remains open"
+    );
+    assert!(
+        control.send(disposed(control_key)).is_ok(),
+        "the control lane remains open"
+    );
     for _ in 0..limit * 2 {
-        disposal
-            .send(disposed(disposal_key))
-            .expect("the disposal lane remains open");
+        assert!(
+            disposal.send(disposed(disposal_key)).is_ok(),
+            "the disposal lane remains open"
+        );
     }
 
     let mut pending = Vec::new();
@@ -142,7 +151,7 @@ fn every_event_lane_is_capped_and_a_saturated_lane_forces_a_yield() {
         "disposal completions trail both lifecycle lanes so they stay batch-tail events"
     );
     assert!(
-        crate::runtime::unbounded_mpsc_try_recv(&mut disposal_receiver).is_some(),
+        disposal_receiver.try_recv().is_some(),
         "the disposal suffix remains for a later scheduler turn"
     );
 }
@@ -155,9 +164,7 @@ fn every_event_lane_is_capped_and_a_saturated_lane_forces_a_yield() {
 #[crate::runtime::test]
 async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_scheduling() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
     root.set_state(ScopeState::Running);
@@ -165,8 +172,6 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
 
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
-    root.set_dynamic_route(Some(control.clone()));
-    root.set_admitted_children(Vec::new());
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_lifecycle(ScopeLifecycle::running())
         .with_dynamic(Some(control.clone()))
@@ -175,9 +180,8 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     let starts = Arc::new(AtomicUsize::new(0));
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new({
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new({
             let starts = Arc::clone(&starts);
             move |_| {
                 let invocation = starts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -189,7 +193,9 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
                     }
                 }
             }
-        })));
+        })
+        .erase(),
+    ));
     let fused_cancel = Latch::default();
     let (mut response, request) = begin_admission(
         &reservation,
@@ -252,22 +258,20 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
         "the restart deadline arm rechecks level-triggered stop sources"
     );
 
-    let forwarded = match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, event_receiver.recv()).await
-    {
-        crate::runtime::Timeout::Completed(Some(event)) => event,
-        crate::runtime::Timeout::Completed(None) => panic!("the driver lane remains open"),
-        crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
-    };
-    let DriverEvent::Removal(removal) = forwarded else {
-        panic!("the queued event is the fused removal");
-    };
+    let removal = recv_removal(
+        &mut event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the fused removal edge",
+    )
+    .await;
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
-    let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        scope.disposal_event_receiver.recv().await
-    else {
-        panic!("removal joins retained construction disposal")
-    };
+    let (child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "removal joins retained construction disposal",
+    )
+    .await;
     scope.handle_construction_disposed(child, panic);
     assert!(scope.children.get(key).is_none());
 }

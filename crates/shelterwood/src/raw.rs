@@ -20,7 +20,8 @@ use crate::{
     definition::DefinitionSource,
     identity::PoisonedCounter,
     mailbox::{
-        AcceptedSequence, MailboxCell, MailboxControl, MailboxReceiver, actor_ref_from_parts,
+        AcceptedSequence, MailboxCell, MailboxControl, MailboxEffectQueue, MailboxReceiver,
+        actor_ref_from_parts,
     },
     policy::{ChildMode, CommonOptions},
     runtime::{
@@ -538,6 +539,12 @@ enum IntervalRearm<M> {
     Interval(M),
 }
 
+#[derive(Clone, Copy)]
+struct TimerLocation {
+    hash: KeyHash,
+    index: usize,
+}
+
 /// Type-aware keyed timer lookup paired with an independently ordered
 /// deadline index.
 ///
@@ -633,32 +640,20 @@ impl<M> TimerStore<M> {
     where
         K: Eq + 'static,
     {
-        let (entry, empty) = {
-            let bucket = self.keyed.get_mut(&hash)?;
-            #[cfg(test)]
-            let mut probes = 0;
-            let index = bucket.iter().position(|entry| {
-                #[cfg(test)]
-                {
-                    probes += 1;
-                }
-                entry.key.downcast_ref::<K>() == Some(key)
-            })?;
+        #[cfg(test)]
+        let mut probes = 0;
+        let location = self.locate(hash, |entry| {
             #[cfg(test)]
             {
-                self.lookup_probes = self.lookup_probes.saturating_add(probes);
+                probes += 1;
             }
-            let entry = bucket.swap_remove(index);
-            (entry, bucket.is_empty())
-        };
-        if empty {
-            self.keyed.remove(&hash);
+            entry.key.downcast_ref::<K>() == Some(key)
+        })?;
+        #[cfg(test)]
+        {
+            self.lookup_probes = self.lookup_probes.saturating_add(probes);
         }
-        self.armings.remove(&entry.arming_order);
-        if let Some(deadline) = entry.deadline {
-            self.deadlines.remove(&(deadline, entry.arming_order));
-        }
-        Some(entry)
+        Some(self.unlink(location))
     }
 
     fn remove<K>(&mut self, key: &K) -> bool
@@ -702,39 +697,77 @@ impl<M> TimerStore<M> {
         self.disposal.dispose(message);
     }
 
-    fn remove_arming(&mut self, arming_order: ArmingOrder) -> Option<TimerEntry<M>> {
-        let hash = self.armings.remove(&arming_order)?;
+    fn locate(
+        &self,
+        hash: KeyHash,
+        mut predicate: impl FnMut(&TimerEntry<M>) -> bool,
+    ) -> Option<TimerLocation> {
+        let index = self.keyed.get(&hash)?.iter().position(&mut predicate)?;
+        Some(TimerLocation { hash, index })
+    }
+
+    fn unlink(&mut self, location: TimerLocation) -> TimerEntry<M> {
         let (entry, empty) = {
             let bucket = self
                 .keyed
-                .get_mut(&hash)
-                .expect("an arming index must reference a key bucket");
-            let index = bucket
-                .iter()
-                .position(|entry| entry.arming_order == arming_order)
-                .expect("an arming index must reference a timer");
-            let entry = bucket.swap_remove(index);
+                .get_mut(&location.hash)
+                .expect("a timer location must reference a key bucket");
+            let entry = bucket.swap_remove(location.index);
             (entry, bucket.is_empty())
         };
+        // `replace` writes the key bucket and the arming index in one window
+        // that cannot panic between them — the user `Hash`/`Eq` callbacks run
+        // strictly before it — and an entry never migrates buckets except
+        // through this method. Their agreement is therefore structural, so
+        // check it where a broken invariant is cheap to see rather than
+        // paying two extra map lookups on every removal.
+        debug_assert_eq!(
+            self.armings.get(&entry.arming_order),
+            Some(&location.hash),
+            "a timer's key and arming indexes must agree"
+        );
         if empty {
-            self.keyed.remove(&hash);
+            self.keyed.remove(&location.hash);
         }
+        self.armings.remove(&entry.arming_order);
         if let Some(deadline) = entry.deadline {
-            self.deadlines.remove(&(deadline, arming_order));
+            self.deadlines.remove(&(deadline, entry.arming_order));
         }
-        Some(entry)
+        entry
+    }
+
+    /// Resolves an arming index to its key-bucket location.
+    ///
+    /// `None` means the arming order is unknown, which is an ordinary miss.
+    /// A known arming order whose bucket or entry is absent is index
+    /// corruption; the two shapes panic distinctly so a failure names which
+    /// half of the pair went missing.
+    fn locate_arming(&self, arming_order: ArmingOrder) -> Option<TimerLocation> {
+        let hash = *self.armings.get(&arming_order)?;
+        let index = self
+            .keyed
+            .get(&hash)
+            .expect("an arming index must reference a key bucket")
+            .iter()
+            .position(|entry| entry.arming_order == arming_order)
+            .expect("an arming index must reference a timer");
+        Some(TimerLocation { hash, index })
+    }
+
+    fn remove_arming(&mut self, arming_order: ArmingOrder) -> Option<TimerEntry<M>> {
+        let location = self.locate_arming(arming_order)?;
+        Some(self.unlink(location))
     }
 
     fn entry_mut(&mut self, arming_order: ArmingOrder) -> Option<&mut TimerEntry<M>> {
-        let hash = *self.armings.get(&arming_order)?;
-        let entry = self
-            .keyed
-            .get_mut(&hash)
-            .expect("an arming index must reference a key bucket")
-            .iter_mut()
-            .find(|entry| entry.arming_order == arming_order)
-            .expect("an arming index must reference a timer");
-        Some(entry)
+        let location = self.locate_arming(arming_order)?;
+        Some(
+            self.keyed
+                .get_mut(&location.hash)
+                .expect("a timer location must reference a key bucket")
+                .get_mut(location.index)
+                .expect("a timer location must reference a timer"),
+        )
     }
 
     fn take_due(&mut self, now: Instant) -> VecDeque<ArmingOrder> {
@@ -1492,6 +1525,7 @@ impl<M: Send + 'static> RawContext<M> {
     pub async fn recv(&mut self) -> Option<M> {
         loop {
             if self.local_stop.is_fired() {
+                self.receiver.freeze();
                 self.freeze_and_report();
                 // `stop()` originates on this task, but the configured
                 // shutdown ladder is owned by the driver. The driver's helper
@@ -1505,10 +1539,10 @@ impl<M: Send + 'static> RawContext<M> {
                 return None;
             }
             if self.shutdown.is_cancelled() {
-                // Every driver path freezes (or closes) this incarnation's
-                // mailbox before firing its shutdown token. That ordering is
-                // what makes the frozen accepted prefix a complete drain
-                // boundary once cancellation is observable here.
+                // Freeze locally as part of observing shutdown. The driver
+                // also freezes before cancellation, but correctness of this
+                // receive boundary does not depend on that remote ordering.
+                self.receiver.freeze();
                 self.freeze_and_report();
                 self.resources.resume_pending_panic();
                 return None;
@@ -1665,6 +1699,18 @@ impl<M: Send + 'static> RawContext<M> {
         Ok(guard)
     }
 
+    fn pop_continuation(&mut self, batch: &mut ReadyBatch, is_lead_slot: bool) -> Option<M> {
+        if (!is_lead_slot || !self.resources.continuation_needs_external)
+            && batch.continuation_is_eligible()
+            && let Some(message) = self.resources.continuations.pop_front()
+        {
+            batch.record_continuation_delivery();
+            self.resources.continuation_needs_external = true;
+            return Some(message);
+        }
+        None
+    }
+
     /// Selects one live-incarnation input without awaiting.
     ///
     /// Every selection runs through one bounded arbitration batch. Steady
@@ -1707,12 +1753,7 @@ impl<M: Send + 'static> RawContext<M> {
                 .ready_batch
                 .take()
                 .expect("ready selection always owns an arbitration batch");
-            if !self.resources.continuation_needs_external
-                && batch.continuation_is_eligible()
-                && let Some(message) = self.resources.continuations.pop_front()
-            {
-                batch.record_continuation_delivery();
-                self.resources.continuation_needs_external = true;
+            if let Some(message) = self.pop_continuation(&mut batch, true) {
                 self.resources.ready_batch = Some(batch);
                 return Some(message);
             }
@@ -1760,11 +1801,7 @@ impl<M: Send + 'static> RawContext<M> {
                 continue;
             }
 
-            if batch.continuation_is_eligible()
-                && let Some(message) = self.resources.continuations.pop_front()
-            {
-                batch.record_continuation_delivery();
-                self.resources.continuation_needs_external = true;
+            if let Some(message) = self.pop_continuation(&mut batch, false) {
                 self.resources.ready_batch = Some(batch);
                 return Some(message);
             }
@@ -2132,7 +2169,11 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
                     None
                 }
             };
-            let mailbox_freeze_panic = catch_panic(|| mailbox.freeze(incarnation)).err();
+            let mailbox_freeze_panic = catch_panic(|| {
+                let mut effects = MailboxEffectQueue::default();
+                mailbox.freeze(incarnation, &mut effects);
+            })
+            .err();
             let resource_freeze_panic = catch_panic(|| owner.raw().freeze_resources()).err();
             let mut cleanup_panic = owner.raw().take_resource_panic();
             keep_first_panic(&mut cleanup_panic, mailbox_freeze_panic);
@@ -2264,7 +2305,9 @@ mod tests {
         ChildId, MailboxShutdown, Readiness,
         cells::{MemberCell, ScopeCell},
         identity::ScopeIdentity,
-        mailbox::{ActorRef, MailboxCell, MailboxControl, actor_ref_from_parts},
+        mailbox::{
+            ActorRef, MailboxCell, MailboxControl, MailboxEffectQueue, actor_ref_from_parts,
+        },
         policy::{ResolvedDefaults, ScopeFlavor},
         runtime::{
             CompletionGatedLatch, Latch, PanicPayload, Signal, UnwindPanics,
@@ -2274,8 +2317,9 @@ mod tests {
     };
 
     /// Builds a live raw incarnation context whose mailbox is configured and
-    /// bound, so `next_ready` can take the busy path without a driver.
-    fn bound_raw_context_for<M: Send + 'static>() -> (RawContext<M>, ActorRef<M>) {
+    /// bound, so `next_ready` can take the busy path without a driver. The
+    /// returned latch is the context's own shutdown token.
+    fn bound_raw_context_for<M: Send + 'static>() -> (RawContext<M>, ActorRef<M>, Latch) {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("raw-actor");
         let member = MemberCell::new(
@@ -2284,12 +2328,17 @@ mod tests {
         );
         let mailbox = MailboxCell::new(id.clone(), crate::runtime::mailbox_runtime());
         member.attach_mailbox(mailbox.clone());
-        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox);
+        let mut effects = MailboxEffectQueue::default();
+        let token = MailboxControl::configure(
+            &*mailbox,
+            ResolvedDefaults::default().mailbox(),
+            &mut effects,
+        );
         let incarnation = member
             .take_incarnation_counter()
             .mint()
             .expect("incarnation available");
-        MailboxControl::bind(&*mailbox, incarnation);
+        MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
 
         let mut scope_identity = ScopeIdentity::new();
         let scope_id = ChildId::from("scope");
@@ -2302,13 +2351,14 @@ mod tests {
         let scope = ScopeCell::new(scope_member, ScopeFlavor::Ordered, ScopeIdentity::new());
 
         let myself = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
+        let shutdown = Latch::default();
         let context = RawContext::new(
             RawRunContext {
                 id,
                 incarnation,
                 member,
                 scope: ScopeRef { cell: scope },
-                shutdown: Latch::default(),
+                shutdown: shutdown.clone(),
                 abort: Latch::default(),
                 ready: CompletionGatedLatch::default(),
                 local_stop: Latch::default(),
@@ -2318,11 +2368,12 @@ mod tests {
             mailbox,
             Readiness::Immediate,
         );
-        (context, myself)
+        (context, myself, shutdown)
     }
 
     fn bound_raw_context() -> (RawContext<u8>, ActorRef<u8>) {
-        bound_raw_context_for()
+        let (context, actor, _shutdown) = bound_raw_context_for();
+        (context, actor)
     }
 
     fn marker(value: usize) -> QueuedEvent<usize> {
@@ -2755,6 +2806,24 @@ mod tests {
         assert!(!context.resources.offloads[0].finished.is_fired());
     }
 
+    #[crate::runtime::test]
+    async fn recv_freezes_its_mailbox_when_it_observes_shutdown() {
+        let (mut context, actor, shutdown) = bound_raw_context_for::<u8>();
+        actor
+            .try_send(1)
+            .expect("the live mailbox accepts before shutdown");
+        shutdown.fire();
+
+        assert_eq!(context.recv().await, None);
+        assert_eq!(
+            actor
+                .try_send(2)
+                .expect_err("recv's local freeze closes the acceptance boundary")
+                .kind,
+            crate::SendErrorKind::NotRunning
+        );
+    }
+
     #[test]
     fn a_caught_interval_clone_panic_preserves_the_fired_batch_for_retry() {
         let clones = Arc::new(AtomicUsize::new(0));
@@ -2995,6 +3064,45 @@ mod tests {
             Some("contained raw payload destructor panic")
         );
     }
+
+    /// A callback actor whose initialization always fails, so `Handler::run`
+    /// takes the error path that returns without installing an actor.
+    struct RefusingInit;
+
+    impl crate::Actor for RefusingInit {
+        type Msg = u8;
+        type Args = ();
+
+        async fn init(
+            _args: Self::Args,
+            _context: &mut crate::Context<'_, Self>,
+        ) -> Result<Self, crate::ExitError> {
+            Err(crate::ExitError::message("initialization refused"))
+        }
+
+        async fn handle(
+            &mut self,
+            _message: Self::Msg,
+            _context: &mut crate::Context<'_, Self>,
+        ) -> crate::ExitResult {
+            Ok(())
+        }
+    }
+
+    // The handler lives in `crate::actor`, but its one-run contract is only
+    // observable against a live raw incarnation, which this module's fixture
+    // owns. A failed initialization spends the handler exactly as a
+    // successful one does.
+    #[crate::runtime::test]
+    #[should_panic(expected = "handler actor initialization invoked more than once")]
+    async fn handler_initialization_runs_at_most_once() {
+        let (mut context, _myself) = bound_raw_context();
+        let mut handler = crate::actor::Handler::<RefusingInit>::new(());
+        crate::RawActor::run(&mut handler, &mut context)
+            .await
+            .expect_err("initialization failure exits the incarnation");
+        let _ = crate::RawActor::run(&mut handler, &mut context).await;
+    }
 }
 
 #[cfg(test)]
@@ -3004,7 +3112,7 @@ mod timer_store_tests {
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -3041,6 +3149,29 @@ mod timer_store_tests {
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
             self.hashes.fetch_add(1, Ordering::SeqCst);
             std::hash::Hash::hash(&self.value, state);
+        }
+    }
+
+    struct PanickingEqKey {
+        value: u8,
+        panic_on_eq: Arc<AtomicBool>,
+    }
+
+    impl PartialEq for PanickingEqKey {
+        fn eq(&self, other: &Self) -> bool {
+            assert!(
+                !self.panic_on_eq.load(Ordering::SeqCst),
+                "timer key equality panic"
+            );
+            self.value == other.value
+        }
+    }
+
+    impl Eq for PanickingEqKey {}
+
+    impl std::hash::Hash for PanickingEqKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.value.hash(state);
         }
     }
 
@@ -3228,6 +3359,52 @@ mod timer_store_tests {
             "replacement"
         );
         assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn equality_panic_leaves_timer_indexes_and_probe_count_coherent() {
+        let panic_on_eq = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let mut timers = TimerStore::default();
+        timers.replace(
+            PanickingEqKey {
+                value: 7,
+                panic_on_eq: Arc::clone(&panic_on_eq),
+            },
+            Some(deadline),
+            order(1),
+            TimerMessage::Once("message"),
+            None,
+        );
+        let query = PanickingEqKey {
+            value: 7,
+            panic_on_eq: Arc::clone(&panic_on_eq),
+        };
+
+        panic_on_eq.store(true, Ordering::SeqCst);
+        let panic = catch_unwind(AssertUnwindSafe(|| timers.take(&query)))
+            .err()
+            .expect("user equality panic escapes the timer lookup");
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("timer key equality panic")
+        );
+        assert_eq!(timers.lookup_probes, 0, "a panicked scan is not committed");
+        assert_eq!(
+            timers.armings.get(&order(1)),
+            Some(&timers.hash_key(&query))
+        );
+        assert_eq!(timers.next_deadline(), Some(deadline));
+
+        panic_on_eq.store(false, Ordering::SeqCst);
+        assert_eq!(
+            once(timers.take(&query).expect("the timer remains linked")),
+            "message"
+        );
+        assert_eq!(timers.lookup_probes, 1);
+        assert!(timers.is_empty());
+        assert!(timers.deadlines.is_empty());
     }
 
     #[test]

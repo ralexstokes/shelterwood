@@ -254,6 +254,7 @@ impl SupervisorState {
         self.children.get(&child).map(|record| record.state)
     }
 
+    /// Missing keys have already been reclaimed and fail closed as removing.
     pub fn membership_status(&self, child: ChildKey) -> MembershipStatus {
         self.child_state(child)
             .map_or(MembershipStatus::Removing, ChildState::membership_status)
@@ -671,6 +672,16 @@ impl SupervisorState {
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_hard_forced_for_test(&mut self, forced: bool) {
         self.hard_forced = forced;
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn exhaust_child_keys_for_test(&mut self) {
+        self.keys = PoisonedCounter::near_exhaustion();
+        assert!(self.keys.mint().is_some(), "the final child key is usable");
+        assert!(
+            self.keys.mint().is_none(),
+            "the child-key domain reaches its permanent poison state"
+        );
     }
 
     #[cfg(test)]

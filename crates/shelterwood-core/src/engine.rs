@@ -278,6 +278,7 @@ impl Default for IntensityState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IntensityCharge {
+    policy: Intensity,
     in_window: u64,
     total_restarts: TotalRestarts,
     tripped: bool,
@@ -306,6 +307,7 @@ impl IntensityState {
         self.total_restarts = self.total_restarts.bump();
         let in_window = u64::try_from(self.charges.len()).unwrap_or(u64::MAX);
         IntensityCharge {
+            policy,
             in_window,
             total_restarts: self.total_restarts,
             tripped: in_window > policy.max_restarts(),
@@ -398,10 +400,10 @@ impl RestartDecision {
         self.charge.total_restarts
     }
 
-    pub fn intensity_trip(&self, policy: Intensity) -> Option<IntensityTrip> {
+    pub fn intensity_trip(&self) -> Option<IntensityTrip> {
         self.charge
             .tripped
-            .then(|| IntensityTrip::new(policy, self.charge))
+            .then(|| IntensityTrip::new(self.charge.policy, self.charge))
     }
 }
 
@@ -1309,50 +1311,91 @@ mod tests {
     }
 
     #[test]
-    fn funnel_dispatch_depends_on_mode_and_membership_state() {
-        let failure = Exit::new(
-            ExitKind::Failed(crate::ExitError::message("boom")),
-            Cancellation::NotObserved,
-        );
-        let restart = RestartPolicy::new(RestartCondition::OnFailure, Backoff::Immediate);
-        assert_eq!(
-            dispatch_exit(
-                &failure,
-                restart,
-                ScopeMode::Running,
-                MembershipStatus::Active
+    fn funnel_dispatch_covers_every_policy_exit_and_suppression_combination() {
+        let cases = [
+            (ExitKind::Completed, false),
+            (ExitKind::Failed(crate::ExitError::message("boom")), true),
+            (
+                ExitKind::Panicked {
+                    message: Some("boom".to_owned()),
+                },
+                true,
             ),
-            ExitDispatch::ScheduleRestart
-        );
-        assert_eq!(
-            dispatch_exit(
-                &failure,
-                restart,
-                ScopeMode::Draining,
-                MembershipStatus::Active
+            (
+                ExitKind::ReadinessTimedOut {
+                    deadline: Instant::now(),
+                },
+                true,
             ),
-            ExitDispatch::Terminal
-        );
-        let success = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
-        assert_eq!(
-            dispatch_exit(
-                &success,
-                restart,
-                ScopeMode::Running,
-                MembershipStatus::Active
+            (
+                ExitKind::Aborted {
+                    phase: GracePhase::AfterGrace,
+                },
+                true,
             ),
-            ExitDispatch::Terminal,
-            "a running scope still honors a restart policy that declines this exit"
-        );
-        assert_eq!(
-            dispatch_exit(
-                &failure,
-                restart,
-                ScopeMode::Running,
-                MembershipStatus::Removing
-            ),
-            ExitDispatch::Terminal
-        );
+            (ExitKind::NeverStarted, true),
+        ];
+        let policies = [
+            (RestartCondition::Never, false, false),
+            (RestartCondition::OnFailure, false, true),
+            (RestartCondition::Always, true, true),
+        ];
+
+        for cancellation in [Cancellation::NotObserved, Cancellation::Observed] {
+            for (kind, failure) in &cases {
+                // Built through the per-kind constructors rather than a generic
+                // `Exit::new`, which no longer exists. `NeverStarted` pairs only
+                // with `NotObserved`: SPEC declares that pair the sole
+                // unconstructible combination, so the matrix covers the eleven
+                // reachable ones.
+                let exit = match kind {
+                    ExitKind::Completed => Exit::completed(cancellation),
+                    ExitKind::Failed(error) => Exit::failed(error.clone(), cancellation),
+                    ExitKind::Panicked { message } => Exit::panicked(message.clone(), cancellation),
+                    ExitKind::ReadinessTimedOut { deadline } => {
+                        Exit::readiness_timed_out(*deadline, cancellation)
+                    }
+                    ExitKind::Aborted { phase } => Exit::aborted(*phase, cancellation),
+                    ExitKind::NeverStarted => match cancellation {
+                        Cancellation::NotObserved => Exit::never_started(),
+                        Cancellation::Observed => continue,
+                    },
+                };
+                assert_eq!(exit.is_failure(), *failure);
+                for (condition, restart_completed, restart_failure) in policies {
+                    let policy = RestartPolicy::new(condition, Backoff::Immediate);
+                    let expected = if *failure {
+                        restart_failure
+                    } else {
+                        restart_completed
+                    };
+                    assert_eq!(
+                        dispatch_exit(&exit, policy, ScopeMode::Running, MembershipStatus::Active),
+                        if expected {
+                            ExitDispatch::ScheduleRestart
+                        } else {
+                            ExitDispatch::Terminal
+                        },
+                        "condition={condition:?}, kind={kind:?}, cancellation={cancellation:?}"
+                    );
+                    assert_eq!(
+                        dispatch_exit(&exit, policy, ScopeMode::Draining, MembershipStatus::Active),
+                        ExitDispatch::Terminal,
+                        "draining suppresses every restart"
+                    );
+                    assert_eq!(
+                        dispatch_exit(
+                            &exit,
+                            policy,
+                            ScopeMode::Running,
+                            MembershipStatus::Removing
+                        ),
+                        ExitDispatch::Terminal,
+                        "planned removal suppresses every restart"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1429,6 +1472,10 @@ mod tests {
         assert_eq!(decision.restart_at, Some(now));
         assert_eq!(decision.charge.total_restarts, TotalRestarts::ZERO.bump());
         assert!(decision.charge.tripped);
+        assert_eq!(
+            decision.intensity_trip(),
+            Some(crate::IntensityTrip::new(intensity_policy, decision.charge))
+        );
     }
 
     #[test]

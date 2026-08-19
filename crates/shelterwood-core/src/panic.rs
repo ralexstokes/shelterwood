@@ -126,7 +126,17 @@ impl Drop for PanicAccumulator {
 
 #[cfg(test)]
 mod tests {
-    use super::discard_panic;
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use super::{
+        PanicAccumulator, PanicPayload, UnwindPanics, discard_panic, resume_preferred_panic,
+    };
 
     struct RecursivelyPanickingPayload;
 
@@ -139,5 +149,110 @@ mod tests {
     #[test]
     fn discarding_a_recursively_hostile_panic_payload_is_contained() {
         discard_panic(Some(Box::new(RecursivelyPanickingPayload)));
+    }
+
+    struct DropCount(Arc<AtomicUsize>);
+
+    impl Drop for DropCount {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ResumeDuringUnwind {
+        primary_drops: Arc<AtomicUsize>,
+        cleanup_drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for ResumeDuringUnwind {
+        fn drop(&mut self) {
+            resume_preferred_panic(UnwindPanics {
+                primary: Some(Box::new(DropCount(Arc::clone(&self.primary_drops)))),
+                cleanup: Some(Box::new(DropCount(Arc::clone(&self.cleanup_drops)))),
+            });
+        }
+    }
+
+    #[test]
+    fn preferred_panics_are_discarded_during_an_existing_unwind() {
+        let primary_drops = Arc::new(AtomicUsize::new(0));
+        let cleanup_drops = Arc::new(AtomicUsize::new(0));
+        let payload = catch_unwind(AssertUnwindSafe({
+            let primary_drops = Arc::clone(&primary_drops);
+            let cleanup_drops = Arc::clone(&cleanup_drops);
+            move || {
+                let _resume = ResumeDuringUnwind {
+                    primary_drops,
+                    cleanup_drops,
+                };
+                std::panic::panic_any("outer panic");
+            }
+        }))
+        .expect_err("the original unwind reaches its boundary");
+
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"outer panic"));
+        assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanup_drops.load(Ordering::SeqCst), 1);
+    }
+
+    struct TaggedPanic {
+        tag: u8,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TaggedPanic {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn tagged_panic(tag: u8, drops: &Arc<AtomicUsize>) -> PanicPayload {
+        Box::new(TaggedPanic {
+            tag,
+            drops: Arc::clone(drops),
+        })
+    }
+
+    #[test]
+    fn accumulator_drop_resumes_the_first_panic_after_discarding_later_ones() {
+        let first_drops = Arc::new(AtomicUsize::new(0));
+        let second_drops = Arc::new(AtomicUsize::new(0));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let mut panics = PanicAccumulator::default();
+            panics.record(Some(tagged_panic(1, &first_drops)));
+            panics.record(Some(tagged_panic(2, &second_drops)));
+        }))
+        .expect_err("dropping the accumulator resumes its first panic");
+
+        assert_eq!(
+            payload.downcast_ref::<TaggedPanic>().map(|panic| panic.tag),
+            Some(1)
+        );
+        assert_eq!(first_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(second_drops.load(Ordering::SeqCst), 1);
+        drop(payload);
+        assert_eq!(first_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn taking_an_accumulated_panic_disarms_drop_resumption() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let mut panics = PanicAccumulator::default();
+            panics.record(Some(tagged_panic(7, &drops)));
+            let payload = panics.take().expect("the first panic is retained");
+            assert!(panics.take().is_none(), "take empties the accumulator");
+            drop(panics);
+            payload
+        }))
+        .expect("a taken panic is not resumed when the accumulator drops");
+
+        assert_eq!(
+            payload.downcast_ref::<TaggedPanic>().map(|panic| panic.tag),
+            Some(7)
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(payload);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

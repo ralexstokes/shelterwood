@@ -3,7 +3,6 @@ use std::{fmt, sync::Arc};
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId, Intensity, ScopeDefaults,
     admission::ReserveError,
-    mailbox::MailboxCell,
     plan::{BuilderCore, LowerError, SlotCell},
     policy::{ResolvedDefaults, ScopeFlavor},
     raw::{RawDef, RawOnceDef},
@@ -14,7 +13,9 @@ use crate::{
 
 use super::{
     ActorSlot, Subtree, SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskSlot,
-    slots::{ActorSlotCore, StaticSlotEndpoint, SubtreeSlotCore, TaskSlotCore},
+    slots::{
+        ActorSlotCore, StaticSlotEndpoint, SubtreeSlotCore, TaskSlotCore, attach_actor_mailbox,
+    },
     system::sealed,
 };
 
@@ -46,8 +47,7 @@ pub(super) fn dispose_rejected<D: Send + 'static>(
 }
 
 fn attach_actor_slot<M: Send + 'static>(slot: Arc<SlotCell>) -> ActorSlot<M> {
-    let mailbox = MailboxCell::new(slot.member.id().clone(), crate::runtime::mailbox_runtime());
-    slot.member.attach_mailbox(mailbox.clone());
+    let mailbox = attach_actor_mailbox(&slot);
     ActorSlot {
         core: ActorSlotCore::new(StaticSlotEndpoint(slot), mailbox),
     }

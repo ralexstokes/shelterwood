@@ -706,7 +706,7 @@ mod tests {
         time::Duration,
     };
 
-    use crate::{ChildId, MailboxControl, identity::ScopeIdentity};
+    use crate::{MailboxControl, MailboxEffectQueue, test_support::mint_actor_incarnation};
 
     use super::{
         super::cell::tests::{actor, actor_for},
@@ -790,17 +790,14 @@ mod tests {
     #[test]
     fn an_accepted_send_reports_acceptance_on_every_poll() {
         let (mailbox, actor) = actor();
-        MailboxControl::configure(
+        let mut effects = MailboxEffectQueue::default();
+        let token = MailboxControl::configure(
             &*mailbox,
-            crate::policy::ResolvedDefaults::default().mailbox,
+            crate::policy::ResolvedDefaults::default().mailbox(),
+            &mut effects,
         );
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        let incarnation = incarnations.mint().expect("incarnation available");
-        MailboxControl::bind(&*mailbox, incarnation);
+        let incarnation = mint_actor_incarnation();
+        MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
 
         let mut send = Box::pin(actor.send(1));
         let mut context = Context::from_waker(Waker::noop());
@@ -1152,8 +1149,9 @@ mod tests {
                 panic!("an unbound mailbox parks its send")
             }
         };
-        let teardown =
-            MailboxControl::prepare_termination(&*mailbox).expect("the mailbox terminates once");
+        let mut effects = MailboxEffectQueue::default();
+        let teardown = MailboxControl::prepare_termination(&*mailbox, &mut effects)
+            .expect("the mailbox terminates once");
         let _ = teardown.finish();
 
         let calls = Arc::new(WakerVtableCalls::default());

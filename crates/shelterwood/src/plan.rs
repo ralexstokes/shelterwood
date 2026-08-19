@@ -8,16 +8,16 @@ use std::{
 use crate::{
     ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults,
     admission::ReserveError,
-    cells::{ErasedDynamicSlot, MemberCell, ObservationTxn, ScopeCell},
+    cells::{MemberCell, ObservationTxn, ScopeCell},
     definition::DefinitionSource,
-    identity::ScopeIdentity,
+    identity::{MembershipReconciliation, ScopeIdentity},
     policy::{
         ChildMode, CommonOptions, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor,
         resolve_common,
     },
     raw::RawConstruction,
     runtime::{self, Isolated, Latch},
-    task::{OnceTask, TaskDef},
+    task::TaskConstruction,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -28,8 +28,7 @@ struct ScopeConfig {
 
 pub(crate) enum ChildConstruction {
     Raw(RawConstruction),
-    Task(TaskDef),
-    TaskOnce(OnceTask),
+    Task(TaskConstruction),
     Scope(Box<ScopeConstruction>),
 }
 
@@ -76,25 +75,6 @@ pub(crate) struct SlotCell {
     pub(crate) member: Arc<MemberCell>,
     pub(crate) scope: Option<Arc<ScopeCell>>,
     definition: Mutex<DefinitionState>,
-}
-
-/// Erases a plan-owned slot without replacing its canonical `Arc` allocation.
-///
-/// Dynamic-route calls cross the lower cell layer through this representation;
-/// only the paired recovery helpers below consume values from that boundary.
-pub(crate) fn erase_dynamic_slot(slot: Arc<SlotCell>) -> Arc<ErasedDynamicSlot> {
-    slot
-}
-
-/// Recovers the plan-owned slot returned by the crate's dynamic route.
-pub(crate) fn concrete_dynamic_slot(slot: Arc<ErasedDynamicSlot>) -> Arc<SlotCell> {
-    Arc::downcast(slot).expect("the dynamic route must return its plan-owned slot type")
-}
-
-/// Borrows the plan-owned slot passed back to the crate's dynamic route.
-pub(crate) fn concrete_dynamic_slot_ref(slot: &ErasedDynamicSlot) -> &SlotCell {
-    slot.downcast_ref()
-        .expect("the dynamic route must receive its plan-owned slot type")
 }
 
 impl SlotCell {
@@ -277,13 +257,8 @@ impl SlotCell {
                 definition.readiness(),
             ),
             ChildConstruction::Task(definition) => (
-                &definition.options,
-                ChildMode::Restartable,
-                Readiness::Immediate,
-            ),
-            ChildConstruction::TaskOnce(definition) => (
-                &definition.options,
-                ChildMode::OneShot,
+                definition.options(),
+                definition.mode(),
                 Readiness::Immediate,
             ),
             ChildConstruction::Scope(definition) => {
@@ -395,15 +370,16 @@ impl BuilderCore {
             // not this builder's throwaway root.
             self.adopting_root = Some(Arc::clone(&root));
             for slot in &self.slots {
-                let Some(rebased) =
-                    root.adopt_or_mint_membership(slot.member.id(), slot.member.membership())
-                else {
-                    let id = slot.member.id().clone();
-                    let disposal = self.begin_failed_disposal();
-                    return Err(LowerError::IdentityExhausted { id, disposal });
-                };
-                if let Some(identity) = rebased {
-                    slot.member.rebase_membership(identity);
+                match root.adopt_or_mint_membership(slot.member.id(), slot.member.membership()) {
+                    MembershipReconciliation::Adopted => {}
+                    MembershipReconciliation::Minted(identity) => {
+                        slot.member.rebase_membership(identity);
+                    }
+                    MembershipReconciliation::Exhausted => {
+                        let id = slot.member.id().clone();
+                        let disposal = self.begin_failed_disposal();
+                        return Err(LowerError::IdentityExhausted { id, disposal });
+                    }
                 }
             }
         }
@@ -625,15 +601,14 @@ mod tests {
         policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
         raw::RawConstruction,
         runtime::{self, Timeout},
-        task::TaskDef,
+        task::{TaskConstruction, TaskDef},
     };
 
     use super::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeConstruction, SlotCell,
-        concrete_dynamic_slot, concrete_dynamic_slot_ref, erase_dynamic_slot,
     };
 
-    fn configured_task() -> TaskDef {
+    fn configured_task() -> TaskConstruction {
         TaskDef::new(|_| async { Ok(()) })
             .restart(RestartPolicy::new(
                 RestartCondition::Always,
@@ -643,6 +618,7 @@ mod tests {
             .readiness(Readiness::Manual)
             .expect("manual task readiness is valid")
             .retention(Retention::Remove)
+            .erase()
     }
 
     struct PanicWake(&'static str);
@@ -744,21 +720,6 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_slot_erasure_preserves_the_canonical_allocation() {
-        let declaration = BuilderCore::new(ScopeFlavor::Dynamic);
-        let slot = SlotCell::new(Arc::clone(&declaration.root.member), None);
-
-        let erased = erase_dynamic_slot(Arc::clone(&slot));
-        assert!(std::ptr::eq(
-            concrete_dynamic_slot_ref(erased.as_ref()),
-            slot.as_ref(),
-        ));
-
-        let restored = concrete_dynamic_slot(erased);
-        assert!(Arc::ptr_eq(&restored, &slot));
-    }
-
-    #[test]
     fn static_and_dynamic_constructions_share_option_resolution() {
         let defaults = ResolvedDefaults::default();
         let mut declaration = BuilderCore::new(ScopeFlavor::Ordered);
@@ -824,12 +785,14 @@ mod tests {
         // definition carries the mode already resolved from its actor type's
         // metadata at erasure.
         assert_eq!(
-            resolved_readiness(ChildConstruction::Task(TaskDef::new(|_| async { Ok(()) }))),
+            resolved_readiness(ChildConstruction::Task(
+                TaskDef::new(|_| async { Ok(()) }).erase()
+            )),
             Readiness::Immediate
         );
         let (completion, _claim) = runtime::oneshot();
         assert_eq!(
-            resolved_readiness(ChildConstruction::TaskOnce(
+            resolved_readiness(ChildConstruction::Task(
                 TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }).erase(completion)
             )),
             Readiness::Immediate
@@ -851,12 +814,13 @@ mod tests {
                 TaskDef::new(|_| async { Ok(()) })
                     .readiness(Readiness::Manual)
                     .expect("manual task readiness is valid")
+                    .erase()
             )),
             Readiness::Manual
         );
         let (completion, _claim) = runtime::oneshot();
         assert_eq!(
-            resolved_readiness(ChildConstruction::TaskOnce(
+            resolved_readiness(ChildConstruction::Task(
                 TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) })
                     .readiness(Readiness::Manual)
                     .expect("manual task readiness is valid")
@@ -1000,7 +964,7 @@ mod tests {
         let slot = declaration
             .reserve("one-shot", None)
             .expect("reservation succeeds");
-        slot.define(ChildConstruction::TaskOnce(construction));
+        slot.define(ChildConstruction::Task(construction));
         let defaults = ResolvedDefaults::default();
         let options = slot
             .resolve_policy(&defaults)

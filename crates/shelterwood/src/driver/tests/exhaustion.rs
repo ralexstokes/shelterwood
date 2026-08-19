@@ -1,5 +1,60 @@
 use super::support::*;
 
+#[crate::runtime::test]
+async fn reserve_error_identity_exhausted_maps_the_membership_domain() {
+    let mut root_identity = ScopeIdentity::new();
+    let root_id = ChildId::from("root");
+    let root_member = MemberCell::new(
+        root_id.clone(),
+        root_identity
+            .mint_membership(&root_id)
+            .expect("root membership available"),
+    );
+    let worker_id = ChildId::from("worker");
+    let child_identity = ScopeIdentity::near_exhaustion(worker_id.clone(), 7);
+    let root = ScopeCell::new(root_member, ScopeFlavor::Dynamic, child_identity);
+    let _epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("scope epoch available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state(ScopeState::Running);
+    root.set_startup(Ok(()));
+    let (events, _receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(events);
+    root.set_dynamic_route(Some(control));
+    root.set_admitted_children(Vec::new());
+
+    root.mint_membership(&worker_id)
+        .expect("the final membership is usable");
+    let Err(error) = reserve_dynamic(&root, worker_id, None) else {
+        panic!("the exhausted membership domain rejects the reservation")
+    };
+    assert!(matches!(error, ReserveError::IdentityExhausted));
+}
+
+#[crate::runtime::test]
+async fn reserve_error_identity_exhausted_maps_the_child_key_domain() {
+    let (mut scope, _events, mut dynamic_events, _control) = running_dynamic_fixture();
+    let reservation = reserve_dynamic(&scope.root, ChildId::from("worker"), None)
+        .expect("the membership domain still has capacity");
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
+    let (response, request) = begin_admission(&reservation, &mut dynamic_events, None).await;
+    scope.supervisor.exhaust_child_keys_for_test();
+    scope.handle_admission(request);
+
+    assert!(matches!(
+        response.receive().await,
+        Some(Err(ReserveError::IdentityExhausted))
+    ));
+    assert!(matches!(
+        reservation.slot.member.record().stage,
+        MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+    ));
+}
+
 #[test]
 fn member_transitions_own_their_complete_record_projection() {
     let mut identity = ScopeIdentity::new();
@@ -24,7 +79,7 @@ fn member_transitions_own_their_complete_record_projection() {
     member.transition(MemberTransition::Stopping);
     assert_eq!(member.record().stage, MemberStage::Stopping);
 
-    let exit = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+    let exit = Exit::completed(Cancellation::NotObserved);
     let restart_count = RestartCount::ZERO.bump();
     let restart_at = crate::runtime::now();
     member.transition(MemberTransition::RestartScheduled {
@@ -51,7 +106,7 @@ fn member_transitions_own_their_complete_record_projection() {
     assert_eq!(record.restart_at, None);
     assert_eq!(
         record.last_exit,
-        Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved))
+        Some(Exit::completed(Cancellation::NotObserved))
     );
     assert_eq!(record.restart_count, restart_count);
 }
@@ -62,8 +117,8 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
     let id = ChildId::from("worker");
     let membership = identity.mint_membership(&id).expect("membership available");
     let member = MemberCell::new(id, membership);
-    let previous = Exit::new(
-        ExitKind::Failed(ExitError::message("last completed incarnation")),
+    let previous = Exit::failed(
+        ExitError::message("last completed incarnation"),
         Cancellation::NotObserved,
     );
     // Walk the record along the production path so the transition-source
@@ -96,31 +151,13 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
         TaskDef::new(|_| future::pending::<crate::ExitResult>()).retention(Retention::Remove),
     )
     .expect("valid task");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
-    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, mut event_receiver) = fixture
         .with_lifecycle(ScopeLifecycle::running())
         .with_next_ordered_start(Some(key))
         .build();
-    plan.finish_transfer();
 
     scope.children[key].incarnations =
         IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
@@ -128,8 +165,8 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
         .incarnations
         .mint()
         .expect("the last usable incarnation mints");
-    let previous = Exit::new(
-        ExitKind::Failed(ExitError::message("last completed incarnation")),
+    let previous = Exit::failed(
+        ExitError::message("last completed incarnation"),
         Cancellation::NotObserved,
     );
     root.transition_child(
@@ -144,14 +181,13 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
     );
 
     assert!(
-        crate::runtime::unbounded_mpsc_send(
-            &scope.events,
-            DriverEvent::Child(ChildEvent::Ready {
+        scope
+            .events
+            .send(DriverEvent::Child(ChildEvent::Ready {
                 child: key,
                 incarnation: first,
-            }),
-        )
-        .is_ok(),
+            }))
+            .is_ok(),
         "the driver lane remains open"
     );
 
@@ -163,17 +199,15 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
     ));
     assert_eq!(root.snapshot().children.len(), 1);
 
-    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = scope
-        .disposal_event_receiver
-        .recv()
-        .await
-        .expect("disposal reports completion")
-    else {
-        panic!("only construction disposal was armed")
-    };
+    let (child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the construction disposal completion",
+    )
+    .await;
     assert!(matches!(
         event_receiver.try_recv(),
-        Ok(DriverEvent::Child(ChildEvent::Ready { .. }))
+        Some(DriverEvent::Child(ChildEvent::Ready { .. }))
     ));
     scope.handle_construction_disposed(child, panic);
 
@@ -201,30 +235,10 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
         TaskDef::new(|_| future::pending::<crate::ExitResult>()),
     )
     .expect("valid task");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
-        .with_next_ordered_start(Some(key))
-        .build();
-    plan.finish_transfer();
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
 
     // Burn the counter's last usable generation without touching the
     // member record: the child is still an unspawned initial member, so
@@ -242,14 +256,12 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
     scope.spawn_child(key);
     assert!(scope.children[key].is_disposing());
 
-    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = scope
-        .disposal_event_receiver
-        .recv()
-        .await
-        .expect("disposal reports completion")
-    else {
-        panic!("only construction disposal was armed")
-    };
+    let (child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the construction disposal completion",
+    )
+    .await;
     scope.handle_construction_disposed(child, panic);
 
     assert!(matches!(
@@ -298,30 +310,10 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
             .expect("manual readiness is valid"),
     )
     .expect("valid task");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
-    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
-        .with_next_ordered_start(Some(key))
-        .build();
-    plan.finish_transfer();
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, mut event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
 
     assert!(scope.supervisor.is_initial(key));
     scope.spawn_child(key);
@@ -368,11 +360,12 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
     );
     assert!(scope.children[key].restart_deadline.is_none());
 
-    let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        scope.disposal_event_receiver.recv().await
-    else {
-        panic!("only construction disposal was armed")
-    };
+    let (child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the construction disposal completion",
+    )
+    .await;
     scope.handle_construction_disposed(child, panic);
     assert!(matches!(
         scope.children[key].slot.member.record().stage,
@@ -418,8 +411,9 @@ async fn nested_membership_exhaustion_is_structured_and_fail_closed() {
         crate::policy::ResolvedDefaults::default(),
         NestedScopeLatches {
             parent_ready: ready.clone(),
+            child_shutdown: Latch::default(),
             ancestor: AncestorCommandLatches {
-                shutdown: Latch::default(),
+                framework_shutdown: Latch::default(),
                 abort: Latch::default(),
                 abort_ack: Latch::default(),
             },
@@ -481,6 +475,7 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
         .expect("provisional declaration succeeds");
     let epoch = ScopeEpochGuard::begin(&scope).expect("the first nested epoch is available");
     let ancestor_shutdown = Latch::default();
+    let child_shutdown = Latch::default();
     match source {
         PreLoopStopSource::ScopeShutdown => {
             let target = scope
@@ -490,6 +485,12 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
         }
         PreLoopStopSource::ScopeForce => scope.force_shutdown(epoch.epoch()),
         PreLoopStopSource::AncestorShutdown => {
+            // Parent cancellation publishes the user-facing edge separately
+            // from the nested driver's framework-only observation edge. The
+            // fixture deliberately withholds that separate parent-published
+            // edge so the post-call assertion observes only what this path
+            // fires: the ancestor arm must not couple its framework observer
+            // back to user-installable cancellation waiters.
             ancestor_shutdown.fire();
         }
     }
@@ -500,8 +501,9 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
         crate::policy::ResolvedDefaults::default(),
         NestedScopeLatches {
             parent_ready: ready.clone(),
+            child_shutdown: child_shutdown.clone(),
             ancestor: AncestorCommandLatches {
-                shutdown: ancestor_shutdown.clone(),
+                framework_shutdown: ancestor_shutdown.clone(),
                 abort: Latch::default(),
                 abort_ack: Latch::default(),
             },
@@ -511,10 +513,16 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
     .await;
 
     assert!(result.is_ok());
-    assert!(
-        ancestor_shutdown.is_fired(),
-        "the upgraded verdict fires the latch that reports the exit as cancelled"
-    );
+    match source {
+        PreLoopStopSource::ScopeShutdown | PreLoopStopSource::ScopeForce => assert!(
+            child_shutdown.is_fired(),
+            "a self-requested stop fires the user-facing latch that classifies the exit as cancelled"
+        ),
+        PreLoopStopSource::AncestorShutdown => assert!(
+            !child_shutdown.is_fired(),
+            "an ancestor-driven stop leaves the user-facing latch to the parent that published it"
+        ),
+    }
     assert!(matches!(
         scope.record().startup,
         Some(Err(StartupError::ShutdownRequested))
@@ -566,7 +574,7 @@ async fn scope_incarnation_exhaustion_closes_nested_observation() {
     member.update(|record| {
         record.stage = MemberStage::Restarting;
         record.last_incarnation = Some(first);
-        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
+        record.last_exit = Some(Exit::completed(Cancellation::NotObserved));
     });
     scope.set_state(ScopeState::Stopped {
         reason: StopReason::Finished,
@@ -588,7 +596,7 @@ async fn scope_incarnation_exhaustion_closes_nested_observation() {
     assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
     assert!(parent.terminalize_child(
         &member,
-        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        Exit::completed(Cancellation::NotObserved),
         None,
         StartupDisposition::NotAborted,
     ));
@@ -690,30 +698,9 @@ async fn settlement_terminates_when_the_first_spawn_exhausts_incarnations() {
         TaskDef::new(|_| future::pending::<crate::ExitResult>()),
     )
     .expect("valid task");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
-        .with_next_ordered_start(Some(key))
-        .build();
-    plan.finish_transfer();
+    let fixture = OrderedScopeFixture::new(tree);
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, _event_receiver) = fixture.with_next_ordered_start(Some(key)).build();
 
     scope.children[key].incarnations =
         IncarnationCounter::near_exhaustion(scope.children[key].slot.member.membership());
@@ -732,14 +719,12 @@ async fn settlement_terminates_when_the_first_spawn_exhausts_incarnations() {
     // membership gates ordered startup, but can no longer be constructed.
     scope.settle_supervisor();
 
-    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = scope
-        .disposal_event_receiver
-        .recv()
-        .await
-        .expect("disposal reports completion")
-    else {
-        panic!("only construction disposal was armed")
-    };
+    let (child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the construction disposal completion",
+    )
+    .await;
     scope.handle_construction_disposed(child, panic);
     scope.settle_supervisor();
     assert!(

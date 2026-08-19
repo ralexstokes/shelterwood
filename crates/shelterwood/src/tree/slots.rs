@@ -96,6 +96,12 @@ pub(super) struct ActorSlotCore<E, M> {
     mailbox: Arc<MailboxCell<M>>,
 }
 
+pub(super) fn attach_actor_mailbox<M: Send + 'static>(slot: &SlotCell) -> Arc<MailboxCell<M>> {
+    let mailbox = MailboxCell::new(slot.member.id().clone(), crate::runtime::mailbox_runtime());
+    slot.member.attach_mailbox(mailbox.clone());
+    mailbox
+}
+
 macro_rules! impl_actor_core_definition {
     ($method:ident, $definition:ident) => {
         pub(super) fn $method<R>(self, definition: $definition<R>) -> E::Output<ActorRef<M>>
@@ -141,7 +147,7 @@ impl<E: SlotEndpoint> TaskSlotCore<E> {
     pub(super) fn define(self, definition: TaskDef) -> E::Output<TaskRef> {
         let task = self.task_ref();
         self.endpoint
-            .define(task, ChildConstruction::Task(definition))
+            .define(task, ChildConstruction::Task(definition.erase()))
     }
 
     pub(super) fn define_once<T: Send + 'static>(
@@ -153,7 +159,7 @@ impl<E: SlotEndpoint> TaskSlotCore<E> {
         let claim = OneShotTaskRef::new(receiver, task.clone());
         self.endpoint.define(
             (task, claim),
-            ChildConstruction::TaskOnce(definition.erase(completion)),
+            ChildConstruction::Task(definition.erase(completion)),
         )
     }
 }

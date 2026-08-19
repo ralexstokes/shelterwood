@@ -41,8 +41,10 @@ use crate::{
         ArbitrationClass, ChildKey, DeadlineHandle, DeadlineQueue, Effect as SupervisorEffect,
         Epoch, Event as SupervisorEvent, ExitDispatch, IncarnationRun, IntensityState,
         MembershipStatus, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState,
-        ScopeLifecycle, ScopeMode, StopAction, StopLadder, SupervisorState, arbitrate,
-        dispatch_exit, schedule_restart, step as supervisor_step,
+        ScopeLifecycle, ScopeMode, StopAction, StopLadder, SupervisorState,
+        admit as supervisor_admit, arbitrate, begin_drain as supervisor_begin_drain, dispatch_exit,
+        fail_startup as supervisor_fail_startup, force as supervisor_force, schedule_restart,
+        step as supervisor_step,
     },
     exit::{
         RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
@@ -480,9 +482,6 @@ impl ScopeRuntime {
             let effects = std::mem::take(&mut self.supervisor_effects);
             for effect in effects {
                 match effect {
-                    SupervisorEffect::Admitted { .. } => {
-                        unreachable!("admission consumes its key synchronously")
-                    }
                     SupervisorEffect::StartChild { child } => self.spawn_child(child),
                     SupervisorEffect::StopChild { child } => self.begin_stop_child(child, None),
                     SupervisorEffect::ForceChild { child } => self.force_child(child),
@@ -492,10 +491,6 @@ impl ScopeRuntime {
                     }
                     SupervisorEffect::Finished { reason } => {
                         self.finished.get_or_insert(reason);
-                    }
-                    SupervisorEffect::StartupFailed { .. }
-                    | SupervisorEffect::DrainStarted { .. } => {
-                        unreachable!("the transition owner publishes its contextual result")
                     }
                 }
             }
@@ -521,18 +516,9 @@ impl ScopeRuntime {
         initial: bool,
     ) -> Result<ChildKey, Box<ChildRuntime>> {
         let membership = child.slot.member.membership();
-        let before = self.supervisor_effects.len();
-        self.reduce(SupervisorEvent::Admit {
-            membership,
-            initial,
-            start_immediately: false,
-        });
-        let key = match self.supervisor_effects.get(before) {
-            Some(SupervisorEffect::Admitted { child }) => *child,
-            None => return Err(Box::new(child)),
-            Some(effect) => unreachable!("admission emitted {effect:?} before its key"),
+        let Some(key) = supervisor_admit(&mut self.supervisor, membership, initial) else {
+            return Err(Box::new(child));
         };
-        self.supervisor_effects.remove(before);
         let replaced = self.children.insert(key, child);
         debug_assert!(
             replaced.is_none(),
@@ -917,22 +903,12 @@ async fn run_scope_incarnation(
     // child's obligation before fallible setup. Thus a panic at any point has
     // exactly one terminality owner for every child.
     let mut supervisor = SupervisorState::new(root.flavor, epoch.lifecycle());
-    let mut supervisor_effects = Vec::new();
     let mut children = ChildResources::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
         let child = ChildRuntime::from_plan(child, &root);
         let membership = child.slot.member.membership();
-        supervisor_step(
-            &mut supervisor,
-            SupervisorEvent::Admit {
-                membership,
-                initial: true,
-                start_immediately: false,
-            },
-            &mut supervisor_effects,
-        );
-        let Some(SupervisorEffect::Admitted { child: key }) = supervisor_effects.pop() else {
+        let Some(key) = supervisor_admit(&mut supervisor, membership, true) else {
             unreachable!("a fresh child-key domain accommodates an in-memory child collection")
         };
         let replaced = children.insert(key, child);
@@ -950,7 +926,7 @@ async fn run_scope_incarnation(
         intensity: IntensityState::default(),
         children,
         supervisor,
-        supervisor_effects,
+        supervisor_effects: Vec::new(),
         restart_shutdown_retries: Vec::new(),
         events,
         disposal_events,

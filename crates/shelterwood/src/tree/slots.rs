@@ -283,6 +283,7 @@ impl TaskSlot {
     }
 
     /// Defines a one-shot task and consumes the slot.
+    #[must_use = "the returned task and completion handles must be retained"]
     pub fn define_once<T: Send + 'static>(
         self,
         definition: TaskOnceDef<T>,

@@ -28,7 +28,7 @@ impl ChildKey {
 
 /// The incarnation-level portion of one authoritative child state.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum IncarnationState {
+enum IncarnationState {
     /// No incarnation has been started yet.
     Unstarted,
     /// The current incarnation is executing.
@@ -51,7 +51,7 @@ pub enum IncarnationState {
 /// synchronous control-plane latch is sampled into [`Event::RemovalLatched`];
 /// after that transition, this enum is the reducer's sole authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ChildState {
+enum ChildState {
     /// Ordinary resident membership.
     Resident(IncarnationState),
     /// Planned removal won while the child was in the enclosed state.
@@ -76,21 +76,6 @@ impl ChildState {
         match self {
             Self::Resident(state) | Self::Removing(state) => Self::Removing(state),
         }
-    }
-
-    /// Whether the membership-terminal edge has been published.
-    ///
-    /// Identical to [`Self::joined`] *by construction*, not by accident: this
-    /// model routes every terminal through `Disposing`, and the shell
-    /// publishes the terminal stage only once retained-definition disposal has
-    /// joined. The state that separated them before the consolidation — a
-    /// published terminal with disposal still outstanding — is unrepresentable
-    /// here, so the old `!is_terminal() || is_disposing()` incompleteness test
-    /// collapses to `!joined()`. Both names are kept because the completion
-    /// trichotomy is the vocabulary the shutdown surface is stated in; see
-    /// `ScopeCell::settled` for the scope-level counterparts.
-    pub fn membership_terminal(self) -> bool {
-        self.incarnation() == IncarnationState::Joined
     }
 
     /// Whether the current incarnation has stopped executing.
@@ -303,7 +288,7 @@ impl SupervisorState {
         self.children.get(&child).map(|record| record.membership)
     }
 
-    pub fn child_state(&self, child: ChildKey) -> Option<ChildState> {
+    fn child_state(&self, child: ChildKey) -> Option<ChildState> {
         self.children.get(&child).map(|record| record.state)
     }
 
@@ -333,11 +318,6 @@ impl SupervisorState {
     pub fn is_disposing(&self, child: ChildKey) -> bool {
         self.child_state(child)
             .is_some_and(|state| state.incarnation() == IncarnationState::Disposing)
-    }
-
-    pub fn membership_terminal(&self, child: ChildKey) -> bool {
-        self.child_state(child)
-            .is_some_and(ChildState::membership_terminal)
     }
 
     pub fn incarnation_complete(&self, child: ChildKey) -> bool {
@@ -390,8 +370,7 @@ impl SupervisorState {
         next: IncarnationState,
     ) -> bool {
         if let Some(record) = self.children.get_mut(&child) {
-            if record.state.membership_terminal() || !expected.contains(&record.state.incarnation())
-            {
+            if record.state.joined() || !expected.contains(&record.state.incarnation()) {
                 return false;
             }
             record.state = record.state.with_incarnation(next);
@@ -509,12 +488,12 @@ impl SupervisorState {
     }
 
     fn begin_drain(&mut self, reason: StopReason, effects: &mut impl EffectSink) {
-        let Some(effect) = self.lifecycle.begin_drain(reason) else {
+        let Some((startup_pending, state)) = self.lifecycle.begin_drain(reason) else {
             return;
         };
         effects.push(Effect::DrainStarted {
-            state: effect.state(),
-            startup_pending: effect.startup_pending(),
+            state,
+            startup_pending,
         });
         match self.flavor {
             ScopeFlavor::Ordered => {
@@ -602,7 +581,7 @@ impl SupervisorState {
                     return;
                 };
                 if record.state.membership_status() == MembershipStatus::Removing
-                    || record.state.membership_terminal()
+                    || record.state.joined()
                     || !matches!(
                         record.state.incarnation(),
                         IncarnationState::Active | IncarnationState::Stopping
@@ -749,7 +728,7 @@ impl SupervisorState {
             // spawnable record must be one `Event::Spawned` away from
             // executing. This is the emission/acceptance agreement that keeps
             // level-triggered settlement terminating.
-            assert!(!child.startable() || !child.state.membership_terminal());
+            assert!(!child.startable() || !child.state.joined());
         }
         // The ordered cursors are flavor-owned state; a dynamic scope that
         // grew one would silently acquire a second stop sequencer.

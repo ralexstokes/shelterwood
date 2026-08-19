@@ -5,9 +5,11 @@ use std::{fmt, num::NonZeroUsize, time::Duration};
 use crate::Exit;
 
 /// Whether a scope has fixed ordered membership or runtime-dynamic membership.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ScopeFlavor {
+    /// Fixed, readiness-ordered membership.
     Ordered,
+    /// Runtime-dynamic membership.
     Dynamic,
 }
 
@@ -91,18 +93,18 @@ pub enum ChildMode {
 }
 
 /// The default bounded FIFO mailbox capacity.
-pub const DEFAULT_MAILBOX_CAPACITY: usize = 64;
+const DEFAULT_MAILBOX_CAPACITY: usize = 64;
 /// The default child shutdown grace.
-pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// The default gated-readiness deadline.
-pub const DEFAULT_READINESS_DEADLINE: Duration = Duration::from_secs(30);
+const DEFAULT_READINESS_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A duration statically known to be non-zero.
 ///
 /// Policy variants use this sealed value when zero would otherwise create a
 /// second semantic branch: [`Shutdown::Graceful`] (whose zero grace would
 /// duplicate `Abort` with different recorded provenance) and
-/// [`BoundedReadinessDeadline`]. Construct it with [`NonZeroDuration::new`];
+/// [`ReadinessDeadline::Bounded`]. Construct it with [`NonZeroDuration::new`];
 /// the private representation prevents zero-valued literals:
 ///
 /// ```compile_fail,E0423
@@ -600,44 +602,15 @@ pub enum ReadinessDeadline {
     #[default]
     Inherit,
     /// Apply a non-zero bound.
-    Bounded(BoundedReadinessDeadline),
+    Bounded(NonZeroDuration),
     /// Wait without a deadline.
     Unbounded,
-}
-
-/// Validated non-zero payload of a bounded [`ReadinessDeadline`].
-///
-/// Values are created by [`ReadinessDeadline::bounded`]. The invariant is
-/// carried by [`NonZeroDuration`] rather than re-checked here, so the policy
-/// surface has one non-zero-duration type. `E0423` records the privacy failure
-/// this proof depends on:
-///
-/// ```compile_fail,E0423
-/// use std::time::Duration;
-/// use shelterwood_core::policy::{
-///     BoundedReadinessDeadline, NonZeroDuration, ReadinessDeadline,
-/// };
-///
-/// let duration = NonZeroDuration::new(Duration::from_secs(1)).unwrap();
-/// let _ = ReadinessDeadline::Bounded(BoundedReadinessDeadline(duration));
-/// ```
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct BoundedReadinessDeadline(NonZeroDuration);
-
-impl BoundedReadinessDeadline {
-    /// Returns the non-zero deadline duration.
-    #[must_use]
-    pub const fn duration(self) -> Duration {
-        self.0.get()
-    }
 }
 
 impl ReadinessDeadline {
     /// Constructs a validated bounded deadline.
     pub fn bounded(duration: Duration) -> Result<Self, PolicyError> {
-        Ok(Self::Bounded(BoundedReadinessDeadline(
-            NonZeroDuration::new(duration)?,
-        )))
+        Ok(Self::Bounded(NonZeroDuration::new(duration)?))
     }
 }
 
@@ -881,7 +854,7 @@ impl ResolvedMailbox {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResolvedReadinessDeadline {
-    Bounded(BoundedReadinessDeadline),
+    Bounded(NonZeroDuration),
     Unbounded,
 }
 
@@ -896,7 +869,7 @@ impl ResolvedReadinessDeadline {
 
     fn duration(self) -> Option<Duration> {
         match self {
-            Self::Bounded(duration) => Some(duration.duration()),
+            Self::Bounded(duration) => Some(duration.get()),
             Self::Unbounded => None,
         }
     }

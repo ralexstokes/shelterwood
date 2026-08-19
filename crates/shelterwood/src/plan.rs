@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults, Strategy,
+    ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults,
     admission::ReserveError,
     cells::{ErasedDynamicSlot, MemberCell, ObservationTxn, ScopeCell},
     definition::DefinitionSource,
@@ -22,7 +22,6 @@ use crate::{
 
 #[derive(Clone, Debug, Default)]
 struct ScopeConfig {
-    strategy: Strategy,
     intensity: Intensity,
     defaults: ScopeDefaults,
 }
@@ -220,6 +219,15 @@ impl SlotCell {
         self.resolve_and_take_defined_with(defaults, || {})
     }
 
+    /// The body of [`Self::resolve_and_take_defined`], with a seam between
+    /// resolution and claim.
+    ///
+    /// Production always passes an empty closure; the sole consumer of a
+    /// non-empty one is
+    /// `dynamic_policy_resolution_and_definition_claim_are_atomic`, which
+    /// releases a competing remover through it. Delegating rather than
+    /// duplicating is what keeps that test pinned to the shipped path: an
+    /// unlock injected here fails it.
     fn resolve_and_take_defined_with(
         &self,
         defaults: &ResolvedDefaults,
@@ -264,7 +272,11 @@ impl SlotCell {
                 Readiness::Immediate,
             ),
             ChildConstruction::Scope(definition) => {
-                (&definition.options, definition.mode(), Readiness::Manual)
+                let options = CommonOptions {
+                    readiness: None,
+                    ..definition.options.clone()
+                };
+                return resolve_common(&options, defaults, definition.mode(), Readiness::Manual);
             }
         };
         resolve_common(options, defaults, mode, default_readiness)
@@ -286,10 +298,6 @@ pub(crate) struct BuilderCore {
 }
 
 impl BuilderCore {
-    pub(crate) fn set_strategy(&mut self, strategy: Strategy) {
-        self.config.strategy = strategy;
-    }
-
     pub(crate) fn set_intensity(&mut self, intensity: Intensity) {
         self.config.intensity = intensity;
     }
@@ -356,7 +364,7 @@ impl BuilderCore {
             .slots
             .iter()
             .filter(|slot| slot.is_undefined())
-            .map(|slot| vec![slot.member.id().clone()])
+            .map(|slot| slot.member.id().clone())
             .collect();
         if !undefined.is_empty() {
             let disposal = self.begin_failed_disposal();
@@ -384,7 +392,7 @@ impl BuilderCore {
                 }
             }
         }
-        root.set_observation_config(self.config.strategy, self.config.intensity);
+        root.set_observation_config(self.config.intensity);
         let mut children = Vec::with_capacity(self.slots.len());
         debug_assert_eq!(
             self.slots.len(),
@@ -530,7 +538,7 @@ impl ChildPlan {
 #[derive(Debug)]
 pub(crate) enum LowerError {
     Undefined {
-        paths: Vec<Vec<ChildId>>,
+        paths: Vec<ChildId>,
         disposal: Latch,
     },
     IdentityExhausted {
@@ -713,7 +721,9 @@ mod tests {
             Readiness::Manual
         );
 
-        // A declared override wins over every per-kind default.
+        // Task and raw declarations expose readiness overrides. Scope
+        // readiness is structural even if an internal fixture forges the
+        // otherwise-unreachable common-options field.
         assert_eq!(
             resolved_readiness(ChildConstruction::Task(
                 TaskDef::new(|_| async { Ok(()) })
@@ -737,7 +747,7 @@ mod tests {
                 readiness: Some(Readiness::Immediate),
                 ..CommonOptions::default()
             })),
-            Readiness::Immediate
+            Readiness::Manual
         );
         assert_eq!(
             resolved_readiness(raw_construction(CommonOptions {

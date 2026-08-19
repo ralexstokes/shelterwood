@@ -586,7 +586,7 @@ impl ScopeRuntime {
         // already-joined boundary directly, so normalize them through the
         // same reducer predecessor instead of allowing `Terminalized` to
         // skip arbitrary incarnation states.
-        if !self.supervisor.is_disposing(key) && !self.supervisor.membership_terminal(key) {
+        if !self.supervisor.is_disposing(key) && !self.supervisor.joined(key) {
             self.reduce(SupervisorEvent::DisposalStarted { child: key });
         }
         let changed = self
@@ -623,7 +623,7 @@ impl ScopeRuntime {
         };
         if self.supervisor.lifecycle().is_draining()
             || child.active.is_some()
-            || self.supervisor.membership_terminal(key)
+            || self.supervisor.joined(key)
             || self.supervisor.is_disposing(key)
         {
             return;
@@ -753,7 +753,7 @@ impl ScopeRuntime {
         let Some(child) = self.children.get(key) else {
             return;
         };
-        if self.supervisor.membership_terminal(key) || self.supervisor.is_disposing(key) {
+        if self.supervisor.joined(key) || self.supervisor.is_disposing(key) {
             return;
         }
         if child
@@ -1087,7 +1087,7 @@ impl ScopeRuntime {
     ) {
         if !self.supervisor.contains(key)
             || self.supervisor.is_disposing(key)
-            || self.supervisor.membership_terminal(key)
+            || self.supervisor.joined(key)
         {
             return;
         }
@@ -1191,11 +1191,11 @@ impl ScopeRuntime {
             && !self.supervisor.lifecycle().is_draining()
         {
             self.fail_startup(key, exit);
-            if self.children[&key].options.retention == crate::Retention::Remove {
+            if self.children[key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
             }
         } else {
-            if self.children[&key].options.retention == crate::Retention::Remove {
+            if self.children[key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
             }
         }

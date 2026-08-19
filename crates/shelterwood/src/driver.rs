@@ -256,37 +256,21 @@ impl<T> Default for ChildResources<T> {
     }
 }
 
-trait ChildKeyArg {
-    fn child_key(self) -> ChildKey;
-}
-
-impl ChildKeyArg for ChildKey {
-    fn child_key(self) -> ChildKey {
-        self
-    }
-}
-
-impl ChildKeyArg for &ChildKey {
-    fn child_key(self) -> ChildKey {
-        *self
-    }
-}
-
 impl<T> ChildResources<T> {
     fn insert(&mut self, key: ChildKey, child: T) -> Option<T> {
         self.0.insert(key, child)
     }
 
-    fn get(&self, key: impl ChildKeyArg) -> Option<&T> {
-        self.0.get(&key.child_key())
+    fn get(&self, key: ChildKey) -> Option<&T> {
+        self.0.get(&key)
     }
 
-    fn get_mut(&mut self, key: impl ChildKeyArg) -> Option<&mut T> {
-        self.0.get_mut(&key.child_key())
+    fn get_mut(&mut self, key: ChildKey) -> Option<&mut T> {
+        self.0.get_mut(&key)
     }
 
-    fn remove(&mut self, key: impl ChildKeyArg) -> Option<T> {
-        self.0.remove(&key.child_key())
+    fn remove(&mut self, key: ChildKey) -> Option<T> {
+        self.0.remove(&key)
     }
 
     fn iter(&self) -> impl Iterator<Item = (ChildKey, &T)> {
@@ -320,22 +304,8 @@ impl<T> Index<ChildKey> for ChildResources<T> {
     }
 }
 
-impl<T> Index<&ChildKey> for ChildResources<T> {
-    type Output = T;
-
-    fn index(&self, key: &ChildKey) -> &Self::Output {
-        self.get(key).expect("live child resource key")
-    }
-}
-
 impl<T> IndexMut<ChildKey> for ChildResources<T> {
     fn index_mut(&mut self, key: ChildKey) -> &mut Self::Output {
-        self.get_mut(key).expect("live child resource key")
-    }
-}
-
-impl<T> IndexMut<&ChildKey> for ChildResources<T> {
-    fn index_mut(&mut self, key: &ChildKey) -> &mut Self::Output {
         self.get_mut(key).expect("live child resource key")
     }
 }

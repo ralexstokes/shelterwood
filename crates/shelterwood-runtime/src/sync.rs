@@ -306,6 +306,15 @@ impl<T> OneShotSender<T> {
     }
 
     pub fn is_closed(&self) -> bool {
+        // Observed under the observation gate and the dynamic-state mutex
+        // (`RemovalResponses::subscribe`), so the missing-channel verdict
+        // cannot be raised as a panic without poisoning both for every later
+        // caller. The total form reports the taken channel as closed, which
+        // is what a sender past `send` is.
+        debug_assert!(
+            self.channel.is_some(),
+            "an observable one-shot sender retains its channel"
+        );
         self.channel.as_ref().is_none_or(oneshot::Sender::is_closed)
     }
 }

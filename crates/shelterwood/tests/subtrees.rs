@@ -10,8 +10,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet, poll_once,
-    poll_until, waiting::task as waiting_task,
+    ReleaseGate, advance_time, assert_eventually, assert_quiet, next_event, poll_once, poll_until,
+    startup_failed_child, waiting::task as waiting_task,
 };
 use shelterwood::{
     Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DefaultsInheritance,
@@ -109,16 +109,12 @@ async fn one_shot_subtree_lowering_failure_retains_structured_provenance() {
     root.add_subtree_once("nested", SubtreeOnceDef::new(nested))
         .expect("valid subtree edge");
     let system = root.spawn().expect("runtime is available");
-    let StartupError::StartupFailed(failure) = system
-        .wait_started()
-        .await
-        .expect_err("nested lowering fails")
-    else {
-        panic!("expected structured startup failure");
-    };
-    let StartupFailureCause::Child { id, exit, .. } = failure.cause else {
-        panic!("root failure must name its nested child");
-    };
+    let (id, exit) = startup_failed_child(
+        system
+            .wait_started()
+            .await
+            .expect_err("nested lowering fails"),
+    );
     assert_eq!(id.as_str(), "nested");
     let ExitKind::Failed(error) = exit.kind() else {
         panic!("nested lowering is a child failure");
@@ -156,16 +152,12 @@ async fn subtree_intensity_trip_retains_structured_provenance() {
     root.add_subtree_once("nested", SubtreeOnceDef::new(nested))
         .expect("valid subtree edge");
     let system = root.spawn().expect("runtime is available");
-    let StartupError::StartupFailed(failure) = system
-        .wait_started()
-        .await
-        .expect_err("nested budget trips during startup")
-    else {
-        panic!("expected structured startup failure");
-    };
-    let StartupFailureCause::Child { id, exit, .. } = failure.cause else {
-        panic!("root failure must name its nested child");
-    };
+    let (id, exit) = startup_failed_child(
+        system
+            .wait_started()
+            .await
+            .expect_err("nested budget trips during startup"),
+    );
     assert_eq!(id.as_str(), "nested");
     let ExitKind::Failed(error) = exit.kind() else {
         panic!("a tripped subtree is a child failure");
@@ -231,13 +223,7 @@ async fn over_budget_restart_is_charged_but_never_spawned() {
     let mut trace = Vec::new();
     let mut scheduled = 0usize;
     loop {
-        let item = tokio::time::timeout(POLL_TIMEOUT, events.recv())
-            .await
-            .expect("the next lifecycle event arrives promptly")
-            .expect("the lifecycle stream remains open through scope failure");
-        let LifecycleItem::Event(event) = item else {
-            panic!("the short restart trace cannot lag");
-        };
+        let event = next_event(&mut events).await;
         match event.kind {
             LifecycleEventKind::Exited { .. } => trace.push("exited"),
             LifecycleEventKind::RestartScheduled { attempt, .. } => {
@@ -783,12 +769,7 @@ async fn locally_requested_subtree_shutdown_reads_cancelled() {
         .wait_started()
         .await
         .expect_err("the nested self-shutdown aborts parent startup pre-ready");
-    let StartupError::StartupFailed(failure) = startup else {
-        panic!("unexpected startup error: {startup:?}");
-    };
-    let StartupFailureCause::Child { id, exit, .. } = &failure.cause else {
-        panic!("unexpected failure cause: {:?}", failure.cause);
-    };
+    let (id, exit) = startup_failed_child(startup);
     assert_eq!(id.as_str(), "nested");
     assert!(matches!(exit.kind(), ExitKind::Completed));
     assert_eq!(
@@ -818,12 +799,7 @@ async fn shutdown_latched_before_a_subtree_lowering_failure_reads_cancelled() {
         .wait_started()
         .await
         .expect_err("the nested stop aborts parent startup pre-ready");
-    let StartupError::StartupFailed(failure) = startup else {
-        panic!("unexpected startup error: {startup:?}");
-    };
-    let StartupFailureCause::Child { id, exit, .. } = &failure.cause else {
-        panic!("unexpected failure cause: {:?}", failure.cause);
-    };
+    let (id, exit) = startup_failed_child(startup);
     assert_eq!(id.as_str(), "nested");
     assert!(
         matches!(exit.kind(), ExitKind::Completed),

@@ -14,13 +14,13 @@ use std::{
 
 use crate::common::{
     DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually,
-    policy::never, poll_once,
+    next_event, policy::never, poll_once,
 };
 use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult,
-    Jitter, LifecycleEventKind, LifecycleItem, Mailbox, RawActor, RawContext, RawDef, RawOnceDef,
-    Readiness, ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition,
-    RestartPolicy, ScopeState, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    Jitter, LifecycleEventKind, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
+    ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition, RestartPolicy,
+    ScopeState, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe {
@@ -294,11 +294,7 @@ async fn panicking_unread_messages_are_all_disposed_without_reclassifying_the_ac
     )
     .await;
     let exit = loop {
-        let Some(item) = lifecycle.recv().await else {
-            panic!("actor exit was not published")
-        };
-        if let LifecycleItem::Event(event) = item
-            && let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+        if let LifecycleEventKind::Exited { id, exit, .. } = next_event(&mut lifecycle).await.kind
             && id.as_str() == "unread"
         {
             break exit;
@@ -1602,11 +1598,7 @@ async fn blocking_offload_panic_remains_primary_over_factory_destructor_panic() 
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 
     let exit = loop {
-        let Some(item) = lifecycle.recv().await else {
-            panic!("actor exit was not published")
-        };
-        if let LifecycleItem::Event(event) = item
-            && let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+        if let LifecycleEventKind::Exited { id, exit, .. } = next_event(&mut lifecycle).await.kind
             && id.as_str() == "offload-precedence"
         {
             break exit;

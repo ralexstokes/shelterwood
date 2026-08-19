@@ -8,10 +8,12 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, advance_time, assert_eventually, assert_quiet, poll_once};
+use crate::common::{
+    GatedRecorder, MessageRecorder, ReleaseGate, advance_time, assert_eventually, assert_quiet,
+    poll_once,
+};
 use shelterwood::{
-    CallErrorKind, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor, RawContext, RawDef,
-    Reply, ReplyError, SendErrorKind, Tree,
+    CallErrorKind, Mailbox, PolicyError, RawDef, Reply, ReplyError, SendErrorKind, Tree,
 };
 
 #[test]
@@ -41,15 +43,16 @@ impl Drop for CountedReplyDrop {
 }
 
 struct Recorder {
-    gate: Option<ReleaseGate>,
     values: Arc<Mutex<Vec<usize>>>,
     asks: Arc<AtomicUsize>,
     reply_mode: ReplyMode,
     held: Option<Reply<usize>>,
 }
 
-impl Recorder {
-    fn handle(&mut self, message: Message) {
+impl MessageRecorder for Recorder {
+    type Message = Message;
+
+    fn record(&mut self, message: Message) {
         match message {
             Message::Value(value) => self
                 .values
@@ -68,38 +71,22 @@ impl Recorder {
     }
 }
 
-impl RawActor for Recorder {
-    type Msg = Message;
-
-    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
-        if let Some(gate) = self.gate.take() {
-            gate.wait().await;
-        }
-        while let Some(message) = context.recv().await {
-            self.handle(message);
-        }
-        if context.mailbox_shutdown() == MailboxShutdown::Drain {
-            while let Some(message) = context.try_recv() {
-                self.handle(message);
-            }
-        }
-        Ok(())
-    }
-}
-
 fn recorder(
     gate: Option<ReleaseGate>,
     values: &Arc<Mutex<Vec<usize>>>,
     asks: &Arc<AtomicUsize>,
     reply_mode: ReplyMode,
-) -> Recorder {
-    Recorder {
+) -> GatedRecorder<Recorder> {
+    GatedRecorder::new(
         gate,
-        values: Arc::clone(values),
-        asks: Arc::clone(asks),
-        reply_mode,
-        held: None,
-    }
+        Recorder {
+            values: Arc::clone(values),
+            asks: Arc::clone(asks),
+            reply_mode,
+            held: None,
+        },
+    )
+    .drain_on_shutdown()
 }
 
 #[tokio::test(start_paused = true)]

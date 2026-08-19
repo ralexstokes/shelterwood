@@ -150,25 +150,11 @@ fn signalled_waiting_tree(
     liveness: Option<(ReleaseGate, Arc<AtomicBool>)>,
 ) -> Tree {
     let mut tree = Tree::new();
-    let (_, completion) = tree
-        .add_task_once(
-            "worker",
-            TaskOnceDef::new(move |context| async move {
-                started.store(true, Ordering::SeqCst);
-                if let Some((gate, observed)) = liveness {
-                    if !liveness_probe(context.shutdown_token(), gate).await {
-                        cancelled.store(true, Ordering::SeqCst);
-                        return Ok::<_, ExitError>(());
-                    }
-                    observed.store(true, Ordering::SeqCst);
-                }
-                context.shutdown_token().cancelled().await;
-                cancelled.store(true, Ordering::SeqCst);
-                Ok::<_, ExitError>(())
-            }),
-        )
-        .expect("valid signalled task");
-    drop(completion);
+    let task = match liveness {
+        Some((gate, observed)) => liveness_probed_waiting_task(started, cancelled, gate, observed),
+        None => signalled_waiting_task(started, cancelled),
+    };
+    tree.add_task("worker", task).expect("valid signalled task");
     tree
 }
 

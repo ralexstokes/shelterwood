@@ -8,12 +8,13 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually, assert_quiet};
+use crate::common::{
+    POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually, assert_quiet, next_event,
+};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
-    Guard, Handler, LifecycleEventKind, LifecycleItem, Mailbox, MailboxShutdown, RawActor,
-    RawContext, RawOnceDef, Readiness, Shutdown, StartupError, StartupFailureCause, StopContext,
-    Tree,
+    Guard, Handler, LifecycleEventKind, Mailbox, MailboxShutdown, RawActor, RawContext, RawOnceDef,
+    Readiness, Shutdown, StartupError, StartupFailureCause, StopContext, Tree,
 };
 
 enum ZeroMessage {
@@ -1021,10 +1022,7 @@ async fn cancellation_destructor_panic_wakes_an_otherwise_idle_actor() {
 
     let exit = tokio::time::timeout(POLL_TIMEOUT, async {
         loop {
-            let item = events.recv().await.expect("lifecycle remains open");
-            let LifecycleItem::Event(event) = item else {
-                panic!("small fixture must not lag");
-            };
+            let event = next_event(&mut events).await;
             if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
                 && id.as_str() == "idle-offload"
             {
@@ -1567,18 +1565,15 @@ async fn externally_stopped_recv_resumes_a_pending_offload_panic() {
         .await
         .expect("failed actor shuts down");
 
-    let mut panic_message = None;
-    while let Some(item) = events.recv().await {
-        let LifecycleItem::Event(event) = item else {
-            panic!("small fixture must not lag");
-        };
+    let panic_message = loop {
+        let event = next_event(&mut events).await;
         if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
             && id.as_str() == "external-stop-recv-panic"
             && let ExitKind::Panicked { message } = exit.kind()
         {
-            panic_message = message.clone();
+            break message.clone();
         }
-    }
+    };
     assert_eq!(
         panic_message.as_deref(),
         Some("external-stop recv offload panic")
@@ -1802,18 +1797,15 @@ async fn queued_offload_panic_survives_hard_abort() {
         .await
         .expect("hard abort bounds shutdown");
 
-    let mut panic_message = None;
-    while let Some(item) = events.recv().await {
-        let LifecycleItem::Event(event) = item else {
-            panic!("small fixture must not lag");
-        };
+    let panic_message = loop {
+        let event = next_event(&mut events).await;
         if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
             && id.as_str() == "panic"
             && let ExitKind::Panicked { message } = exit.kind()
         {
-            panic_message = message.clone();
+            break message.clone();
         }
-    }
+    };
     assert_eq!(panic_message.as_deref(), Some("owned offload panic"));
 }
 
@@ -1876,18 +1868,15 @@ async fn hard_abort_preserves_owned_offload_panic_over_handler_destructor() {
         .await
         .expect("the two panics remain contained");
 
-    let mut panic_message = None;
-    while let Some(item) = events.recv().await {
-        let LifecycleItem::Event(event) = item else {
-            panic!("small fixture must not lag");
-        };
+    let panic_message = loop {
+        let event = next_event(&mut events).await;
         if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
             && id.as_str() == "handler-double-panic"
             && let ExitKind::Panicked { message } = exit.kind()
         {
-            panic_message = message.clone();
+            break message.clone();
         }
-    }
+    };
     assert_eq!(
         panic_message.as_deref(),
         Some("handler owned offload panic")

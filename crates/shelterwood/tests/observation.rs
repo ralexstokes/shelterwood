@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, poll_once,
+    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, next_event, next_item, poll_once,
     waiting::{gate_released_manual_ready_task, task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
@@ -20,20 +20,6 @@ use shelterwood::{
     RestartPolicy, Retention, ScopeKind, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef,
     SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, TotalRestarts, Tree, WaitError,
 };
-
-async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
-    tokio::time::timeout(Duration::from_secs(2), events.recv())
-        .await
-        .expect("lifecycle receive is bounded")
-        .expect("lifecycle stream remains open")
-}
-
-async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
-    match next_item(events).await {
-        LifecycleItem::Event(event) => event,
-        LifecycleItem::Lagged { dropped } => panic!("unexpected lag marker dropping {dropped}"),
-    }
-}
 
 fn event_watermark(scope: &ScopeRef, event: &LifecycleEvent) -> Option<LifecycleSeq> {
     let snapshot = scope.snapshot();

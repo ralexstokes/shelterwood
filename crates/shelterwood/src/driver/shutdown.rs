@@ -235,7 +235,7 @@ impl ScopeRuntime {
             // remains, and the fold above found no completion reported for
             // it. Hard escalation detaches that cleanup and keeps the
             // recorded verdict.
-            self.handle_construction_disposed(key, None);
+            panics.run(|| self.handle_construction_disposed(key, None));
         }
     }
 

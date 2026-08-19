@@ -553,17 +553,14 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         // ownership and immediate post-join availability without ever
         // blocking this runtime worker.
         let report = report_claim.receive();
-        let _ = runtime::unbounded_mpsc_send(
-            &exit_sender,
-            DriverEvent::Child(ChildEvent::Exited {
-                child: key,
-                incarnation,
-                recorded: report.outcome,
-                join,
-                cancellation: report.cancellation,
-                readiness_signal_seen: report.readiness_signal_seen,
-            }),
-        );
+        let _ = exit_sender.send(DriverEvent::Child(ChildEvent::Exited {
+            child: key,
+            incarnation,
+            recorded: report.outcome,
+            join,
+            cancellation: report.cancellation,
+            readiness_signal_seen: report.readiness_signal_seen,
+        }));
     });
 
     let completion = ready.clone();
@@ -575,13 +572,10 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                 runtime::select_two(ready.fired(), ready_completion.completed()).await,
                 runtime::Either::Left(())
             ) {
-                let _ = runtime::unbounded_mpsc_send(
-                    &ready_sender,
-                    DriverEvent::Child(ChildEvent::Ready {
-                        child: key,
-                        incarnation,
-                    }),
-                );
+                let _ = ready_sender.send(DriverEvent::Child(ChildEvent::Ready {
+                    child: key,
+                    incarnation,
+                }));
             }
         });
     }
@@ -591,13 +585,10 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
             runtime::select_two(local_stop.fired(), completion.completed()).await,
             runtime::Either::Left(())
         ) {
-            let _ = runtime::unbounded_mpsc_send(
-                &events,
-                DriverEvent::Child(ChildEvent::SelfStop {
-                    child: key,
-                    incarnation,
-                }),
-            );
+            let _ = events.send(DriverEvent::Child(ChildEvent::SelfStop {
+                child: key,
+                incarnation,
+            }));
         }
     });
 
@@ -1175,11 +1166,12 @@ impl ScopeRuntime {
         let sender = self.disposal_events.clone();
         let signal = self.root.signal().clone();
         runtime::dispose_then(construction, move |panic| {
-            if runtime::unbounded_mpsc_send(
-                &sender,
-                DriverEvent::Child(ChildEvent::ConstructionDisposed { child: key, panic }),
-            )
-            .is_ok()
+            if sender
+                .send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
+                    child: key,
+                    panic,
+                }))
+                .is_ok()
             {
                 signal.pulse();
             }

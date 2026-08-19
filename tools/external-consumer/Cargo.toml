@@ -7,8 +7,10 @@ publish = false
 [workspace]
 
 [features]
+exit-new = []
 from-latch = []
 installable-seams = []
+lifecycle-capacity = []
 sealed-mailbox-seams = ["dep:shelterwood-core", "dep:shelterwood-mailbox"]
 private-seal-module = ["dep:shelterwood-mailbox"]
 

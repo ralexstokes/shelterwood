@@ -929,7 +929,7 @@ fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent
     let first_exit = Exit::never_started();
     let probe = Arc::new(ObserveMemberOnMailboxWake {
         member: Arc::clone(&member),
-        competing_exit: Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        competing_exit: Exit::completed(Cancellation::NotObserved),
         observed: Mutex::new(None),
     });
     let waker = Waker::from(Arc::clone(&probe));
@@ -970,7 +970,7 @@ fn attach_during_terminal_publication_finishes_record_before_mailbox_wake() {
     member.stage_terminal_before_mailbox(first_exit.clone());
     let probe = Arc::new(ObserveMemberOnMailboxWake {
         member: Arc::clone(&member),
-        competing_exit: Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        competing_exit: Exit::completed(Cancellation::NotObserved),
         observed: Mutex::new(None),
     });
     let waker = Waker::from(Arc::clone(&probe));
@@ -1008,7 +1008,7 @@ fn concurrent_terminalizers_return_after_one_consistent_record_is_visible() {
     let start = Arc::new(Barrier::new(3));
     let workers = [
         Exit::never_started(),
-        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        Exit::completed(Cancellation::NotObserved),
     ]
     .into_iter()
     .map(|exit| {
@@ -1041,7 +1041,7 @@ fn a_losing_terminalizer_does_not_reclassify_or_republish_startup() {
         id.clone(),
         identity.mint_membership(&id).expect("membership available"),
     );
-    let winner = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+    let winner = Exit::completed(Cancellation::NotObserved);
     member.terminalize(winner, StartupDisposition::NotAborted);
     let winning_record = member.record();
 
@@ -1055,10 +1055,7 @@ fn a_losing_terminalizer_does_not_reclassify_or_republish_startup() {
         "the watcher starts at the winning terminal publication"
     );
 
-    member.terminalize(
-        Exit::new(ExitKind::NeverStarted, Cancellation::NotObserved),
-        StartupDisposition::Aborted,
-    );
+    member.terminalize(Exit::never_started(), StartupDisposition::Aborted);
 
     assert_eq!(
         member.record(),

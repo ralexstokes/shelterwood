@@ -906,7 +906,7 @@ async fn queued_removal_suppresses_replayed_self_stop_readiness() {
         })
         .classified(),
     ];
-    while let Some(event) = crate::runtime::unbounded_mpsc_try_recv(&mut control_event_receiver) {
+    while let Some(event) = control_event_receiver.try_recv() {
         pending.push(Pending::from(event).classified());
     }
     arbitrate(&mut pending);

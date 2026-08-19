@@ -1343,7 +1343,24 @@ mod tests {
 
         for cancellation in [Cancellation::NotObserved, Cancellation::Observed] {
             for (kind, failure) in &cases {
-                let exit = Exit::new(kind.clone(), cancellation);
+                // Built through the per-kind constructors rather than a generic
+                // `Exit::new`, which no longer exists. `NeverStarted` pairs only
+                // with `NotObserved`: SPEC declares that pair the sole
+                // unconstructible combination, so the matrix covers the eleven
+                // reachable ones.
+                let exit = match kind {
+                    ExitKind::Completed => Exit::completed(cancellation),
+                    ExitKind::Failed(error) => Exit::failed(error.clone(), cancellation),
+                    ExitKind::Panicked { message } => Exit::panicked(message.clone(), cancellation),
+                    ExitKind::ReadinessTimedOut { deadline } => {
+                        Exit::readiness_timed_out(*deadline, cancellation)
+                    }
+                    ExitKind::Aborted { phase } => Exit::aborted(*phase, cancellation),
+                    ExitKind::NeverStarted => match cancellation {
+                        Cancellation::NotObserved => Exit::never_started(),
+                        Cancellation::Observed => continue,
+                    },
+                };
                 assert_eq!(exit.is_failure(), *failure);
                 for (condition, restart_completed, restart_failure) in policies {
                     let policy = RestartPolicy::new(condition, Backoff::Immediate);

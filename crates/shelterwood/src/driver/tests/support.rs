@@ -14,11 +14,12 @@ pub(super) use std::{
 
 pub(super) use crate::{
     ActorRef, Backoff, Cancellation, ChildId, ChildState, DynamicTree, Exit, ExitError, ExitKind,
-    GracePhase, Incarnation, Intensity, LIFECYCLE_EVENT_CAPACITY, LifecycleEventKind,
-    LifecycleItem, LifecycleTryRecvError, Mailbox, MembershipStatus, RawOnceDef, Readiness,
-    ReadinessDeadline, RemoveOutcome, ReserveError, RestartCondition, RestartCount, RestartPolicy,
-    Retention, ScopeRef, ScopeState, SendErrorKind, StartupError, StartupFailure,
-    StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
+    GracePhase, Incarnation, Intensity, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError,
+    Mailbox, MembershipStatus, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome,
+    ReserveError, RestartCondition, RestartCount, RestartPolicy, Retention, ScopeRef, ScopeState,
+    SendErrorKind, StartupError, StartupFailure, StartupFailureCause, StopReason, SubtreeDef,
+    SubtreeOnceDef, TaskDef, Tree,
+    cells::LIFECYCLE_EVENT_CAPACITY,
     engine::{ChildKey, Epoch, Event as SupervisorEvent, ScopeLifecycle, StopLadder, arbitrate},
     exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
@@ -551,12 +552,12 @@ pub(super) struct GateProbeError {
 /// Builds a failed exit whose payload reports where it was destroyed.
 pub(super) fn gate_probe_exit(scope: &Arc<ScopeCell>) -> (Exit, Arc<Mutex<Option<bool>>>) {
     let held_at_drop = Arc::new(Mutex::new(None));
-    let exit = Exit::new(
-        ExitKind::Failed(ExitError::from(GateProbeError {
+    let exit = Exit::failed(
+        ExitError::from(GateProbeError {
             gate: scope.observation_gate(),
             retiring_thread: std::thread::current().id(),
             held_at_drop: Arc::clone(&held_at_drop),
-        })),
+        }),
         Cancellation::NotObserved,
     );
     (exit, held_at_drop)

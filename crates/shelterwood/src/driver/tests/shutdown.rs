@@ -75,7 +75,7 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
     assert!(scope.children[key].pending_terminal.is_some());
 
     let arrived = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
-        while crate::runtime::unbounded_mpsc_is_empty(&scope.disposal_event_receiver) {
+        while scope.disposal_event_receiver.is_empty() {
             crate::runtime::yield_now().await;
         }
     })
@@ -362,7 +362,7 @@ async fn hard_force_preserves_the_first_terminal_observer_panic_across_its_fallb
     }
     gate.wait_entered().await;
     let arrived_completion = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
-        while crate::runtime::unbounded_mpsc_is_empty(&scope.disposal_event_receiver) {
+        while scope.disposal_event_receiver.is_empty() {
             crate::runtime::yield_now().await;
         }
     })

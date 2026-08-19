@@ -1780,8 +1780,15 @@ API-shape rules:
 - The spec surface for one kind names operations identically across kinds —
   the one-shot operation is the `_once` twin, never a differently-named
   `spawn_once`.
-- Adding a new child kind or mode extends the shared record, not a
-  hand-maintained matrix.
+- Adding a new child kind or mode extends the shared record and the private
+  declaration dispatch, not duplicated reserve/add/define choreography. The
+  dispatch is deliberately sealed inside the façade: its associated handle
+  set and slot kind let the implementation share that choreography, but the
+  eight public add entry points and the nominal slot methods above it remain
+  concrete. Making the dispatch public would admit an oversized extension
+  surface and turn per-kind parameter errors into generic trait-bound errors;
+  collapsing the reserve methods would also be false because actor mailbox
+  type and subtree flavor are fixed before a definition exists.
 
 **Slots — the reserve-before-define surface.** §3.2's cell machinery has
 one public face, uniform across the three kinds and both scope flavors.

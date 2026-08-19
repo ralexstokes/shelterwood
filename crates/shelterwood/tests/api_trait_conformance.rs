@@ -235,7 +235,10 @@ fn actor_types_obey_resource_and_payload_trait_contracts() {
 
 #[test]
 #[allow(clippy::type_complexity)]
-fn slot_method_signatures_remain_nominal_and_parallel() {
+fn nominal_slot_signatures_hide_generic_definition_dispatch() {
+    // Keep both endpoint flavors explicit here. The implementation shares one
+    // private Definition path, but callers must still get concrete parameter
+    // and return types at every named method.
     let _: fn(&ActorSlot<Cell<()>>) -> ActorRef<Cell<()>> = ActorSlot::actor_ref;
     let _: fn(ActorSlot<Cell<()>>, ActorDef<OpaqueActor>) -> ActorRef<Cell<()>> = ActorSlot::define;
     let _: fn(ActorSlot<Cell<()>>, ActorOnceDef<OpaqueActor>) -> ActorRef<Cell<()>> =
@@ -293,7 +296,7 @@ impl RawActor for OpaqueRaw {
 }
 
 #[test]
-fn ordered_and_dynamic_builders_expose_the_parallel_typed_surface() {
+fn nominal_add_methods_preserve_the_parallel_typed_surface() {
     let mut ordered = Tree::new();
     let _: &mut Tree = ordered.intensity(Intensity::default());
     let _: &mut Tree = ordered.defaults(ScopeDefaults::default());

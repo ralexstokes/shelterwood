@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId, Intensity, ScopeDefaults,
     admission::ReserveError,
-    plan::{BuilderCore, LowerError, SlotCell},
+    plan::{BuilderCore, LowerError},
     policy::{ResolvedDefaults, ScopeFlavor},
     raw::{RawDef, RawOnceDef},
     runtime,
@@ -13,10 +13,7 @@ use crate::{
 
 use super::{
     ActorSlot, Subtree, SubtreeDef, SubtreeOnceDef, SubtreeSlot, System, TaskSlot,
-    slots::{
-        ActorSlotCore, StaticSlotEndpoint, SubtreeSlotCore, TaskSlotCore, attach_actor_mailbox,
-    },
-    system::sealed,
+    slots::{ActorKind, Definition, SubtreeKind, TaskKind, reserve_static},
 };
 
 /// A root lowering error.
@@ -49,10 +46,15 @@ pub(super) fn dispose_rejected<D: Send + 'static>(
     error
 }
 
-fn attach_actor_slot<M: Send + 'static>(slot: Arc<SlotCell>) -> ActorSlot<M> {
-    let mailbox = attach_actor_mailbox(&slot);
-    ActorSlot {
-        core: ActorSlotCore::new(StaticSlotEndpoint(slot), mailbox),
+fn add_definition<D: Definition>(
+    core: &mut BuilderCore,
+    id: impl Into<ChildId>,
+    definition: D,
+) -> Result<D::Handles, ReserveError> {
+    let mut definition = runtime::Isolated::new(definition);
+    match reserve_static::<D::Kind>(core, id) {
+        Ok(slot) => Ok(slot.define(definition.take().expect("isolated definition is available"))),
+        Err(error) => Err(dispose_rejected(definition, error)),
     }
 }
 
@@ -83,7 +85,7 @@ macro_rules! impl_common_builder_surface {
             &mut self,
             id: impl Into<ChildId>,
         ) -> Result<ActorSlot<M>, ReserveError> {
-            self.core.reserve(id, None).map(attach_actor_slot)
+            reserve_static::<ActorKind<M>>(&mut self.core, id).map(|core| ActorSlot { core })
         }
 
         /// Adds a restartable callback-oriented actor.
@@ -93,13 +95,7 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: ActorDef<A>,
         ) -> Result<ActorRef<A::Msg>, ReserveError> {
-            let mut definition = runtime::Isolated::new(definition);
-            match self.reserve_actor(id) {
-                Ok(slot) => Ok(slot.define(
-                    definition.take().expect("isolated definition is available"),
-                )),
-                Err(error) => Err(dispose_rejected(definition, error)),
-            }
+            add_definition(&mut self.core, id, definition)
         }
 
         /// Adds a consuming one-shot callback-oriented actor.
@@ -109,13 +105,7 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: ActorOnceDef<A>,
         ) -> Result<ActorRef<A::Msg>, ReserveError> {
-            let mut definition = runtime::Isolated::new(definition);
-            match self.reserve_actor(id) {
-                Ok(slot) => Ok(slot.define_once(
-                    definition.take().expect("isolated definition is available"),
-                )),
-                Err(error) => Err(dispose_rejected(definition, error)),
-            }
+            add_definition(&mut self.core, id, definition)
         }
 
         /// Adds a restartable raw actor.
@@ -125,13 +115,7 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: RawDef<R>,
         ) -> Result<ActorRef<R::Msg>, ReserveError> {
-            let mut definition = runtime::Isolated::new(definition);
-            match self.reserve_actor(id) {
-                Ok(slot) => Ok(slot.define_raw(
-                    definition.take().expect("isolated definition is available"),
-                )),
-                Err(error) => Err(dispose_rejected(definition, error)),
-            }
+            add_definition(&mut self.core, id, definition)
         }
 
         /// Adds a consuming one-shot raw actor.
@@ -141,21 +125,13 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: RawOnceDef<R>,
         ) -> Result<ActorRef<R::Msg>, ReserveError> {
-            let mut definition = runtime::Isolated::new(definition);
-            match self.reserve_actor(id) {
-                Ok(slot) => Ok(slot.define_once_raw(
-                    definition.take().expect("isolated definition is available"),
-                )),
-                Err(error) => Err(dispose_rejected(definition, error)),
-            }
+            add_definition(&mut self.core, id, definition)
         }
 
         /// Reserves a task membership and returns its pre-spawn handle slot.
         #[doc = $member_note]
         pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
-            self.core.reserve(id, None).map(|slot| TaskSlot {
-                core: TaskSlotCore::new(StaticSlotEndpoint(slot)),
-            })
+            reserve_static::<TaskKind>(&mut self.core, id).map(|core| TaskSlot { core })
         }
 
         /// Adds a restartable task.
@@ -165,13 +141,7 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: TaskDef,
         ) -> Result<TaskRef, ReserveError> {
-            let mut definition = runtime::Isolated::new(definition);
-            match self.reserve_task(id) {
-                Ok(slot) => Ok(slot.define(
-                    definition.take().expect("isolated definition is available"),
-                )),
-                Err(error) => Err(dispose_rejected(definition, error)),
-            }
+            add_definition(&mut self.core, id, definition)
         }
 
         /// Adds a consuming one-shot task and its typed completion claim.
@@ -181,13 +151,7 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: TaskOnceDef<T>,
         ) -> Result<(TaskRef, OneShotTaskRef<T>), ReserveError> {
-            let mut definition = runtime::Isolated::new(definition);
-            match self.reserve_task(id) {
-                Ok(slot) => Ok(slot.define_once(
-                    definition.take().expect("isolated definition is available"),
-                )),
-                Err(error) => Err(dispose_rejected(definition, error)),
-            }
+            add_definition(&mut self.core, id, definition)
         }
 
         /// Reserves a typed subtree membership.
@@ -196,11 +160,7 @@ macro_rules! impl_common_builder_surface {
             &mut self,
             id: impl Into<ChildId>,
         ) -> Result<SubtreeSlot<T>, ReserveError> {
-            self.core
-                .reserve(id, Some(<T as sealed::Sealed>::FLAVOR))
-                .map(|slot| SubtreeSlot {
-                    core: SubtreeSlotCore::new(StaticSlotEndpoint(slot)),
-                })
+            reserve_static::<SubtreeKind<T>>(&mut self.core, id).map(|core| SubtreeSlot { core })
         }
 
         /// Adds a restartable subtree.
@@ -210,13 +170,7 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: SubtreeDef<T>,
         ) -> Result<T::Ref, ReserveError> {
-            let mut definition = runtime::Isolated::new(definition);
-            match self.reserve_subtree::<T>(id) {
-                Ok(slot) => Ok(slot.define(
-                    definition.take().expect("isolated definition is available"),
-                )),
-                Err(error) => Err(dispose_rejected(definition, error)),
-            }
+            add_definition(&mut self.core, id, definition)
         }
 
         /// Adds a consuming one-shot subtree.
@@ -226,13 +180,7 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: SubtreeOnceDef<T>,
         ) -> Result<T::Ref, ReserveError> {
-            let mut definition = runtime::Isolated::new(definition);
-            match self.reserve_subtree::<T>(id) {
-                Ok(slot) => Ok(slot.define_once(
-                    definition.take().expect("isolated definition is available"),
-                )),
-                Err(error) => Err(dispose_rejected(definition, error)),
-            }
+            add_definition(&mut self.core, id, definition)
         }
     };
 }

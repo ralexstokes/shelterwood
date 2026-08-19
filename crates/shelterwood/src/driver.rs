@@ -52,7 +52,7 @@ use crate::{
         structured_startup_failure_error,
     },
     identity::IncarnationCounter,
-    mailbox::MailboxControl,
+    mailbox::{MailboxBindToken, MailboxControl, MailboxEffectQueue},
     observe::LifecycleEventKind,
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
@@ -386,10 +386,16 @@ impl Drop for ScopeRuntime {
             };
             if let Some(active) = child.active.take() {
                 if let Some(mailbox) = &child.mailbox {
-                    panics.run(|| mailbox.freeze(active.incarnation));
-                    let mut teardown = None;
-                    panics.run(|| teardown = mailbox.close(active.incarnation));
-                    if let Some(teardown) = teardown {
+                    // Both control calls defer their effects into one queue, so
+                    // a panic from either still leaves the other to run and the
+                    // flush below to publish everything already collected.
+                    let mut effects = MailboxEffectQueue::default();
+                    let mut closed = None;
+                    panics.run(|| mailbox.freeze(active.incarnation, &mut effects));
+                    panics.run(|| closed = mailbox.close(active.incarnation, &mut effects));
+                    panics.run(move || drop(effects));
+                    if let Some(closed) = closed {
+                        let (_token, teardown) = closed.into_parts();
                         runtime::dispose_detached(teardown);
                     }
                 }

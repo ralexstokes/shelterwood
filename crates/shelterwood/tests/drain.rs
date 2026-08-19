@@ -417,10 +417,6 @@ async fn run_fault_fixture(
         .await
         .expect("hold message is accepted");
     hold_entered.wait().await;
-    hold_draining.assert_observed(
-        &[false],
-        "the held handler observes live delivery before its gate is released",
-    );
     if let Some(message) = queued {
         actor
             .send(message)
@@ -432,6 +428,14 @@ async fn run_fault_fixture(
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(30)));
     shutdown_seen.wait().await;
     hold_release.release();
+    // `hold_entered` published this observation before the test resumed, so
+    // the verdict was fixed well before here; it is judged only once the
+    // queued payload belongs to the actor, so a failure unwinds the test
+    // rather than aborting inside a panicking payload destructor.
+    hold_draining.assert_observed(
+        &[false],
+        "the held handler observes live delivery before its gate is released",
+    );
     if matches!(mode, FaultMode::SharedGrace) {
         drain_entered.wait().await;
         assert!(

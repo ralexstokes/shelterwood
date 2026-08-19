@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use shelterwood::{
-    Backoff, BackoffFactor, BoundedReadinessDeadline, ExponentialBackoff, FixedBackoff, Intensity,
-    Jitter, Mailbox, PolicyError, ReadinessDeadline,
+    Backoff, BackoffFactor, ExponentialBackoff, FixedBackoff, Intensity, Jitter, Mailbox,
+    NonZeroDuration, PolicyError, ReadinessDeadline,
 };
 
 #[test]
@@ -102,9 +102,9 @@ fn sealed_payloads_expose_only_constructor_validated_values() {
     else {
         panic!("bounded constructor returned another variant");
     };
-    let bounded: BoundedReadinessDeadline = bounded;
-    assert_eq!(bounded.duration(), deadline);
-    assert!(!bounded.duration().is_zero());
+    let bounded: NonZeroDuration = bounded;
+    assert_eq!(bounded.get(), deadline);
+    assert!(!bounded.get().is_zero());
 
     let intensity =
         Intensity::new(3, Duration::from_secs(30)).expect("the intensity window is non-zero");

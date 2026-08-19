@@ -1,8 +1,9 @@
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{future::Future, time::Duration};
 
 use tokio::time;
 
 use shelterwood_core::deadline::Deadline;
+pub use shelterwood_mailbox::BoxedSleep;
 
 /// Advances a paused test clock, keeping timer control in this module.
 #[cfg(any(test, feature = "test-util"))]
@@ -37,19 +38,8 @@ fn next_timer_deadline(
     )
 }
 
-pub type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-
-pub fn deadline(duration: Duration) -> Deadline {
+fn deadline(duration: Duration) -> Deadline {
     Deadline::after(now(), duration)
-}
-
-pub fn sleep_deadline(deadline: Deadline) -> BoxedSleep {
-    Box::pin(async move {
-        match deadline.instant() {
-            Some(deadline) => sleep_until_std(deadline).await,
-            None => std::future::pending().await,
-        }
-    })
 }
 
 pub fn sleep_until(deadline: std::time::Instant) -> BoxedSleep {
@@ -88,7 +78,7 @@ where
     // deadline addition overflows outright; a representable deadline flush
     // against the clock limit would still panic at arming. Route the
     // budget through Deadline so an unarmable timeout never elapses,
-    // matching sleep_deadline's overflow semantics.
+    // matching the runtime's absolute-deadline overflow semantics.
     let Some(deadline) = deadline(duration).instant() else {
         return Timeout::Completed(future.await);
     };

@@ -119,16 +119,6 @@ impl DynamicEntry {
         matches!(self.state, DynamicMembershipState::Removing { .. })
     }
 
-    fn removal_requested(&self) -> bool {
-        match &self.state {
-            DynamicMembershipState::Resident { fused_cancel, .. } => {
-                fused_cancel.as_ref().is_some_and(Latch::is_fired)
-            }
-            DynamicMembershipState::Removing { .. } => true,
-            DynamicMembershipState::Reserved => false,
-        }
-    }
-
     pub(super) fn key(&self) -> Option<ChildKey> {
         match self.state {
             DynamicMembershipState::Reserved => None,
@@ -350,7 +340,7 @@ fn reserve_dynamic_slot(
         return Err(ReserveError::NotAdmitting(NotAdmittingCause::Draining));
     }
     if let Some(existing) = state.entry(&id) {
-        if existing.removal_requested() {
+        if existing.removal_latched() {
             return Err(ReserveError::RemovalInProgress(id));
         }
         return Err(ReserveError::DuplicateId(id));

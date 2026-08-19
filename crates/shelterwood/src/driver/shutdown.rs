@@ -100,7 +100,7 @@ impl ScopeRuntime {
                 }
                 _ => continue,
             };
-            if self.supervisor.membership_terminal(key)
+            if self.supervisor.joined(key)
                 || self.supervisor.is_disposing(key)
                 || self
                     .children

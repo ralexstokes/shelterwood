@@ -43,8 +43,25 @@ impl RemovalResponses {
     }
 }
 
+/// Fail-closed response when the admission completion route is lost.
+///
+/// One literal serves both sides of the [`crate::Admission`] contract: this
+/// crate's request obligation publishes it from its drop fallback, and the
+/// facade's `Admission` future assumes it when even that publication never
+/// arrives. Splitting them let the reachable value drift away from the
+/// documented one while the unreachable literal stayed pinned.
+pub(crate) const LOST_ADMISSION_RESPONSE_ERROR: ReserveError =
+    ReserveError::NotAdmitting(NotAdmittingCause::Terminal);
+
+/// The outcome a latched dynamic removal resolves to.
+///
+/// Shared for the same reason: the removal obligation publishes it on every
+/// destruction path, and the facade's `Removal` future falls back to it when
+/// that publication is lost.
+pub(crate) const LATCHED_REMOVAL_OUTCOME: RemoveOutcome = RemoveOutcome::Removed;
+
 pub(super) fn complete_removals(responses: RemovalResponses) {
-    responses.complete(RemoveOutcome::Removed);
+    responses.complete(LATCHED_REMOVAL_OUTCOME);
 }
 
 fn completed_removal(outcome: RemoveOutcome) -> RemovalResponse {
@@ -433,7 +450,7 @@ fn start_dynamic_admission(
         slot,
         fused_cancel,
         response: Obligation::new(sender, |sender| {
-            let _ = sender.send(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
+            let _ = sender.send(Err(LOST_ADMISSION_RESPONSE_ERROR));
         }),
     };
     // Queue synchronously so dropping a split-admission future immediately
@@ -590,13 +607,13 @@ impl DynamicRoute for DynamicControl {
 fn queue_driver_event(control: &DynamicControl, event: DriverEvent) {
     // Synchronous and runtime-independent: admission detaches at its first
     // poll, and removal may be signalled from a foreign thread.
-    let _ = runtime::unbounded_mpsc_send(&control.requests, event);
+    let _ = control.requests.send(event);
 }
 
 fn defer_driver_event(txn: &mut ObservationTxn<'_>, control: &DynamicControl, event: DriverEvent) {
     let requests = control.requests.clone();
     txn.defer(move || {
-        let _ = runtime::unbounded_mpsc_send(&requests, event);
+        let _ = requests.send(event);
     });
 }
 

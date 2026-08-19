@@ -18,6 +18,7 @@ use shelterwood_runtime as runtime;
 use crate::cells::RetainedExit;
 
 /// Number of lifecycle events retained independently for each subscriber.
+#[doc(hidden)]
 pub const LIFECYCLE_EVENT_CAPACITY: usize = 128;
 
 // Tokio rounds broadcast capacity up to a power of two. `try_recv` compares
@@ -75,7 +76,7 @@ pub struct LifecycleEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RetainedLifecycleEvent {
+pub(crate) struct RetainedLifecycleEvent {
     // Keep the public event before its guards. Ring eviction therefore drops
     // every raw exit projection while a retained copy still protects its user
     // error, and only the guards' later drop submits destruction to isolated
@@ -86,14 +87,20 @@ struct RetainedLifecycleEvent {
 }
 
 impl RetainedLifecycleEvent {
-    fn new(event: LifecycleEvent) -> Self {
+    /// Retention guards protecting every user error one lifecycle edge
+    /// carries.
+    ///
+    /// Split out of [`Self::new`] so a producer can mint the guards *before*
+    /// the fallible framework bookkeeping that decides whether the edge is
+    /// ever assembled. The single exhaustive `match` stays here either way.
+    pub(crate) fn retain_guards(kind: &LifecycleEventKind) -> Vec<RetainedExit> {
         // Exhaustive with no wildcard arm on purpose: `LifecycleEventKind` is
         // non-exhaustive for downstream crates but not here, so a new variant
         // fails to compile until its retention is declared. A variant that
         // carries an `Exit` and slipped through with no guard would let ring
         // eviction drop a user error under the observation gate.
         let mut guards = Vec::new();
-        match &event.kind {
+        match kind {
             LifecycleEventKind::Exited { exit, .. } => {
                 RetainedExit::retain_exit(&mut guards, exit);
             }
@@ -106,10 +113,39 @@ impl RetainedLifecycleEvent {
             | LifecycleEventKind::RestartScheduled { .. }
             | LifecycleEventKind::Removed { .. } => {}
         }
+        guards
+    }
+
+    fn new(event: LifecycleEvent) -> Self {
+        let guards = Self::retain_guards(&event.kind);
         Self {
             event,
             guards: Arc::new(guards),
         }
+    }
+
+    /// Assembles a leaf edge from a kind whose guards were already minted by
+    /// [`Self::retain_guards`].
+    pub(crate) fn from_parts(
+        scope: Membership,
+        seq: LifecycleSeq,
+        kind: LifecycleEventKind,
+        guards: Vec<RetainedExit>,
+    ) -> Self {
+        Self {
+            event: LifecycleEvent {
+                scope_path: Vec::new(),
+                scope,
+                seq,
+                kind,
+            },
+            guards: Arc::new(guards),
+        }
+    }
+
+    /// Extends the scope path towards the subscribed ancestor.
+    pub(crate) fn prepend_scope(&mut self, id: ChildId) {
+        self.event.scope_path.insert(0, id);
     }
 
     fn into_public(self) -> LifecycleEvent {
@@ -127,6 +163,12 @@ impl RetainedLifecycleEvent {
             drop(guard.into_exit());
         }
         event
+    }
+}
+
+impl From<LifecycleEvent> for RetainedLifecycleEvent {
+    fn from(event: LifecycleEvent) -> Self {
+        Self::new(event)
     }
 }
 
@@ -400,6 +442,12 @@ impl SnapshotReceiver {
     }
 
     /// Borrows the newest snapshot and terminal flag from one retained state.
+    // This method bridges the lower cell crate to the downstream façade's
+    // `ScopeRef` implementation. It remains callable on the façade-public
+    // receiver, but its signature is entirely supported façade data and grants
+    // no construction or implementation capability. Hiding it from generated
+    // docs is the explicit boundary ruling; the rustdoc-JSON walk deliberately
+    // does not grow a second hidden-item graph for this benign bridge.
     #[must_use]
     #[doc(hidden)]
     pub fn borrow_latest_and_closed(&self) -> (Arc<ScopeSnapshot>, bool) {
@@ -886,9 +934,9 @@ impl LifecycleHub {
     pub(crate) fn publish(
         &self,
         txn: &mut crate::cells::ObservationTxn<'_>,
-        event: LifecycleEvent,
+        event: impl Into<RetainedLifecycleEvent>,
     ) {
-        let event = RetainedLifecycleEvent::new(event);
+        let event = event.into();
         let mut published = false;
         let mut undelivered = None;
         self.channels.signal.modify_silently(|signal| {

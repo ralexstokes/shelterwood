@@ -2678,6 +2678,7 @@ or lifetime paragraph is unmapped.
   handles report terminal. Dynamic membership that must survive an
   ancestor restart is application state (own the roster; re-add on
   restart), not framework state.
+  (`integration::restarted_dynamic_subtree_does_not_recreate_runtime_children`.)
 - **The lowering rule.** Lowering is where tree validation happens, on
   every flavor; `spawn()` is simply the root's lowering and the only
   lowering with a builder caller to hand `BuildError` to. Every other
@@ -3123,6 +3124,18 @@ integration toolkit for the driver shell and the end-to-end invariants.
     hidden items rather than taught to descend into hidden methods on
     exported types; the façade-absence probe in
     `tools/check-external-consumer.sh` is what enforces this boundary.
+    `SnapshotReceiver::borrow_latest_and_closed` is the explicit benign
+    exception: the downstream façade needs this lower-crate bridge, its
+    signature contains only supported observation data, and it grants no
+    construction or installation capability. It therefore remains callable
+    on the façade-public receiver but is hidden from generated documentation;
+    the JSON walk deliberately does not gain a second hidden-item graph for
+    it. `MailboxCell::new` is likewise a hidden cross-crate constructor, but
+    the façade exports neither `MailboxCell` nor the `MailboxRuntime`
+    capability required to call it, so direct lower-crate construction remains
+    outside the supported boundary. The driver event lane's public adapter
+    types are opaque wrappers rather than Tokio aliases, and the lifecycle
+    ring capacity is an internal implementation choice rather than façade API.
 14. **Event-woken observers see consistent-or-newer snapshots.** Subscribe
    to lifecycle events; *synchronously inside the event arm*, read the
    snapshot and assert it already reflects the event — at both ends of the
@@ -3633,7 +3646,7 @@ implementation rather than interpreting a bare duration locally:
 |---|---|---|---|
 | no attempt | `send_timeout`, `call`, `ReplyReceiver::recv`, `offload`, `offload_scoped` | do not submit/poll work or observe completion; return/deliver the timeout result | `mailbox::deadline::a_zero_budget_short_circuits_without_polling_the_operation`, `integration::zero_deadlines_short_circuit_without_acceptance_or_message_construction`, `integration::reply_receiver_reports_drop_and_is_safe_to_abandon`, `integration::zero_budget_offload_never_polls_work_and_times_out_on_actor_task` |
 | poll once | `wait_for_child` | evaluate the current snapshot once with precedence match → terminal scope → timeout; never await | `integration::zero_duration_wait_observes_an_already_satisfied_child`, `integration::wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_termination` |
-| immediate escalation | `System::shutdown`, `ScopeRef::shutdown_and_wait`, `start_or_shutdown` rollback | request cooperative cancellation, skip only the cooperative wait, then run the ordinary abort tail | `integration::zero_shutdown_reports_the_live_child_but_detaches_blocking_factory_disposal` (the discriminating pin: a child that *could* settle on the skipped poll is still reported as a straggler), `integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`, `integration::start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stragglers` |
+| immediate escalation | `System::shutdown`, `ScopeRef::shutdown_and_wait`, `start_or_shutdown` rollback | request cooperative cancellation, skip only the cooperative wait, then run the ordinary abort tail | `integration::zero_shutdown_reports_the_live_child_but_detaches_blocking_factory_disposal` (the discriminating pin: a child that *could* settle on the skipped poll is still reported as a straggler), `integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`, `integration::subtree_shutdown_and_wait_zero_escalates_and_joins_its_target_incarnation` (the scope-handle sibling: relative straggler paths, and the abort tail still joined before the call returns), `integration::start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stragglers` |
 
 For a no-attempt offload, whose timeout outcome is a delivery rather than a
 call failure, the work future is never polled and the total continuation
@@ -3959,6 +3972,12 @@ pre-release, which does make the payload values themselves constructible by
 an application; that is deliberate and costs nothing, because authentication
 lives in the provenance structure rather than in the payload's privacy.
 Adding a cause or field must update every façade match.
+Construction is one named constructor per kind: `completed`, `failed`,
+`panicked`, `readiness_timed_out`, and `aborted` take the kind payload plus
+the orthogonal cancellation observation; `never_started` fixes cancellation
+to `NotObserved`. There is no public constructor that accepts an arbitrary
+`ExitKind`, so applications cannot construct the semantically impossible
+`NeverStarted`/`Observed` pair. The external-consumer probe pins that absence.
 Scope-level shutdown-timeout errors carry the affected children as
 structured data: child-id paths plus membership tokens (§7) — never
 bare ids, which sibling scopes may reuse (§2).

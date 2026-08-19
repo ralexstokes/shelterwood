@@ -13,16 +13,16 @@ use crate::common::{
     policy::never,
     poll_once,
     waiting::{
-        liveness_probe, liveness_probed_waiting_task, signalled_waiting_task, task as waiting_task,
-        tree as waiting_tree,
+        liveness_probe, liveness_probed_waiting_task, signalled_waiting_once_task,
+        signalled_waiting_task, task as waiting_task, tree as waiting_tree,
     },
 };
 use shelterwood::{
-    Actor, ActorOnceDef, Backoff, ChildState, Context as ActorContext, DynamicScopeRef,
-    DynamicTree, ExitError, ExitKind, ExitResult, NotAdmittingCause, RawActor, RawContext, RawDef,
-    RawOnceDef, Readiness, RemoveOutcome, ReserveError, RestartCondition, RestartPolicy, Retention,
-    ScopeRef, ScopeState, SendErrorKind, Shutdown, StopReason, SubtreeDef, SubtreeOnceDef, System,
-    TaskDef, TaskOnceDef, Tree,
+    Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context as ActorContext,
+    DynamicScopeRef, DynamicTree, ExitError, ExitKind, ExitResult, NotAdmittingCause, RawActor,
+    RawContext, RawDef, RawOnceDef, Readiness, RemoveOutcome, ReserveError, RestartCondition,
+    RestartPolicy, Retention, ScopeRef, ScopeState, SendErrorKind, Shutdown, StopReason,
+    SubtreeDef, SubtreeOnceDef, System, TaskDef, TaskOnceDef, Tree,
 };
 
 /// Waits until a fused drop has finished releasing its id.
@@ -153,19 +153,7 @@ fn signalled_waiting_tree(
     let (_, completion) = tree
         .add_task_once(
             "worker",
-            TaskOnceDef::new(move |context| async move {
-                started.store(true, Ordering::SeqCst);
-                if let Some((gate, observed)) = liveness {
-                    if !liveness_probe(context.shutdown_token(), gate).await {
-                        cancelled.store(true, Ordering::SeqCst);
-                        return Ok::<_, ExitError>(());
-                    }
-                    observed.store(true, Ordering::SeqCst);
-                }
-                context.shutdown_token().cancelled().await;
-                cancelled.store(true, Ordering::SeqCst);
-                Ok::<_, ExitError>(())
-            }),
+            signalled_waiting_once_task(started, cancelled, liveness),
         )
         .expect("valid signalled task");
     drop(completion);
@@ -1315,6 +1303,89 @@ async fn dynamic_scope_rejects_reservations_between_incarnations() {
         .expect("the replacement incarnation admits");
     assert_eq!(
         scope.remove_task(&runtime_task).await,
+        RemoveOutcome::Removed
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+}
+
+#[tokio::test]
+async fn restarted_dynamic_subtree_does_not_recreate_runtime_children() {
+    let factories = Arc::new(AtomicUsize::new(0));
+    let fail_first = ReleaseGate::default();
+    let definition = SubtreeDef::factory({
+        let factories = Arc::clone(&factories);
+        let fail_first = fail_first.clone();
+        move || {
+            let generation = factories.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut tree = DynamicTree::new();
+            if generation == 1 {
+                tree.add_task(
+                    "trigger",
+                    TaskDef::new({
+                        let fail_first = fail_first.clone();
+                        move |_| {
+                            let fail_first = fail_first.clone();
+                            async move {
+                                fail_first.wait().await;
+                                Err(ExitError::message("restart the dynamic subtree"))
+                            }
+                        }
+                    })
+                    .restart(never())
+                    .readiness(Readiness::Manual)
+                    .expect("manual readiness"),
+                )
+                .expect("valid trigger");
+            }
+            tree
+        }
+    })
+    .restart(RestartPolicy::new(
+        RestartCondition::OnFailure,
+        Backoff::Immediate,
+    ));
+    let mut root = Tree::new();
+    let nested = root
+        .add_subtree("dynamic", definition)
+        .expect("valid dynamic subtree");
+    let system = root.spawn().expect("runtime is available");
+
+    nested
+        .as_scope()
+        .wait_for_child("trigger", |_| true, POLL_TIMEOUT)
+        .await
+        .expect("the first incarnation installs its trigger");
+    let runtime_child = nested
+        .add_task("runtime", waiting_task())
+        .await
+        .expect("runtime admission resolves during startup");
+    let old_membership = runtime_child.membership();
+
+    fail_first.release();
+    system
+        .wait_started()
+        .await
+        .expect("the replacement dynamic subtree starts");
+    assert_eq!(factories.load(Ordering::SeqCst), 2);
+    let old_exit = tokio::time::timeout(POLL_TIMEOUT, runtime_child.wait())
+        .await
+        .expect("the outgoing runtime child terminalizes");
+    assert!(matches!(old_exit.kind(), ExitKind::Completed));
+    assert_eq!(old_exit.cancellation(), Cancellation::Observed);
+    assert!(nested.as_scope().snapshot().child("runtime").is_none());
+
+    let replacement = nested
+        .add_task("runtime", waiting_task())
+        .await
+        .expect("the replacement has no recreated runtime child");
+    assert_ne!(replacement.membership(), old_membership);
+    assert!(!replacement.membership().supersedes(old_membership));
+    assert!(!old_membership.supersedes(replacement.membership()));
+    assert_eq!(
+        nested.remove_task(&replacement).await,
         RemoveOutcome::Removed
     );
     system

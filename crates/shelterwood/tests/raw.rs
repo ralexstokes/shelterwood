@@ -8,7 +8,9 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, assert_eventually, assert_quiet, waiting::task as waiting_task};
+use crate::common::{
+    ReleaseGate, assert_eventually, assert_quiet, last_panic_message, waiting::task as waiting_task,
+};
 use shelterwood::{
     DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
     RawContext, RawDef, RawOnceDef, Readiness, ReadinessDeadline, RemoveOutcome, ScopeDefaults,
@@ -430,23 +432,12 @@ async fn live_try_recv_resumes_a_retained_offload_panic() {
     system.wait_started().await.expect("manual readiness fires");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 
-    let mut observed_exit = None;
-    while let Some(item) = events.recv().await {
-        let shelterwood::LifecycleItem::Event(event) = item else {
-            panic!("small fixture must not lag");
-        };
-        if let shelterwood::LifecycleEventKind::Exited { id, exit, .. } = event.kind
-            && id.as_str() == "try-recv-panic"
-        {
-            observed_exit = Some(exit);
-        }
-    }
-    let exit = observed_exit.expect("panic exit is observable on the lifecycle stream");
-    assert!(matches!(
-        exit.kind(),
-        shelterwood::ExitKind::Panicked { message }
-            if message.as_deref() == Some("try_recv retained offload panic")
-    ));
+    let panic_message = last_panic_message(&mut events, "try-recv-panic").await;
+    assert_eq!(
+        panic_message.as_deref(),
+        Some("try_recv retained offload panic"),
+        "the panic exit is observable on the lifecycle stream"
+    );
     assert!(panic_queued.load(Ordering::SeqCst));
 }
 
@@ -658,18 +649,7 @@ async fn hard_abort_offload_panic_with_panicking_raw_destructor_is_contained() {
         .await
         .expect("the two panics remain contained");
 
-    let mut panic_message = None;
-    while let Some(item) = events.recv().await {
-        let shelterwood::LifecycleItem::Event(event) = item else {
-            panic!("small fixture must not lag");
-        };
-        if let shelterwood::LifecycleEventKind::Exited { id, exit, .. } = event.kind
-            && id.as_str() == "double-panic"
-            && let shelterwood::ExitKind::Panicked { message } = exit.kind()
-        {
-            panic_message = message.clone();
-        }
-    }
+    let panic_message = last_panic_message(&mut events, "double-panic").await;
     assert_eq!(panic_message.as_deref(), Some("injected offload panic"));
 }
 

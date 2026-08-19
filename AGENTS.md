@@ -16,7 +16,7 @@ panic and a process abort.
 
 Two types implement the rule and are the shapes to reach for:
 
-- **`ObservationTxn`** (`shelterwood-cells/src/cells.rs`) holds the
+- **`ObservationTxn`** (`shelterwood-cells/src/cells/gate.rs`) holds the
   observation-gate guard plus a deferred-effect list. `defer`/`pulse` queue
   work; `commit` drops the guard *then* runs the queue through a
   `PanicAccumulator`. Its `Drop` runs the same path during an unwind, so a

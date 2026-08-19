@@ -759,16 +759,20 @@ impl MemberCell {
             }
         };
         if let Some(losing_exit) = losing_exit {
+            // This is framework-retained ownership, not a value returned to a
+            // user. Route a failed exit's possibly-blocking user destructor
+            // through the critical-disposal lane after the gate is released.
+            let losing_exit = RetainedExit::new(losing_exit);
             txn.defer(move || drop(losing_exit));
         }
         let mut published = false;
         self.record.modify_silently(|record| {
-            match startup {
-                StartupDisposition::Unchanged => {}
-                StartupDisposition::NotAborted => record.startup_aborted = false,
-                StartupDisposition::Aborted => record.startup_aborted = true,
-            }
             if !matches!(record.stage, MemberStage::Terminal(_)) {
+                match startup {
+                    StartupDisposition::Unchanged => {}
+                    StartupDisposition::NotAborted => record.startup_aborted = false,
+                    StartupDisposition::Aborted => record.startup_aborted = true,
+                }
                 record.incarnation = None;
                 record.restart_at = None;
                 record.last_exit = Some(terminal_exit.clone());
@@ -780,7 +784,6 @@ impl MemberCell {
             // keeps the inline drops refcount-only.
             record.refresh_retained_exits();
         });
-        let record_changed = published || startup != StartupDisposition::Unchanged;
         // Store before discharge so reentrant mailbox wakers observe the
         // winning exit. Notification-driven readers still see
         // discharge-before-pulse; tree-scoped publication defers both until
@@ -798,10 +801,10 @@ impl MemberCell {
                 }
             });
         }
-        // A supervised terminal edge updates `startup_aborted` even if a
-        // competing terminalizer won the stage transition. Its record pulse
-        // remains required, but mailbox discharge must lead it.
-        if record_changed {
+        // First terminalizer wins. A losing edge neither reclassifies startup
+        // nor publishes a second record edge; a future caller that needs
+        // different semantics must make that race explicit at its boundary.
+        if published {
             txn.pulse(&self.record);
         }
         terminal_exit
@@ -1689,6 +1692,13 @@ impl ScopeCell {
         self.with_observation_gate(|wakes| {
             let record = member.record();
             if matches!(record.stage, MemberStage::Terminal(_)) {
+                // The outer guard defines losing supervised terminalization:
+                // no record or lifecycle edge is published. Keep the incoming
+                // failed exit behind the same isolated-disposal boundary as a
+                // losing direct terminalizer, and do not destroy it under the
+                // observation gate.
+                let exit = RetainedExit::new(exit);
+                wakes.defer(move || drop(exit));
                 return false;
             }
             // Nested publication and closure are reached only through this
@@ -2116,6 +2126,14 @@ impl ScopeCell {
                     wakes.pulse(&self.observation.record);
                     self.close_observation_locked(wakes);
                 }
+                // `StopReason::StartupFailed` recursively owns the failed
+                // child's user error. A stale verdict is unused, but the
+                // framework still owns this copy: retaining it before the
+                // deferred drop sends a possibly-blocking or panicking user
+                // destructor to `dispose_critical` instead of running it
+                // inline on the committing thread once the gate is released.
+                let reason = RetainedStopReason::new(reason);
+                wakes.defer(move || drop(reason));
                 return;
             }
             if control
@@ -2639,6 +2657,102 @@ mod tests {
             disposal_thread, retiring_thread,
             "a retained failed exit must not run its user destructor inline"
         );
+    }
+
+    #[test]
+    fn a_losing_failed_terminal_exit_disposes_off_the_retiring_thread() {
+        let retiring_thread = std::thread::current().id();
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity
+                .mint_membership(&id)
+                .expect("membership is available"),
+        );
+        member.terminalize(
+            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+            StartupDisposition::Unchanged,
+        );
+        let (dropped, observed) = mpsc::sync_channel(1);
+
+        member.terminalize(
+            Exit::new(
+                ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+                Cancellation::NotObserved,
+            ),
+            StartupDisposition::Unchanged,
+        );
+
+        let disposal_thread = observed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("losing exit disposal completes");
+        assert_ne!(
+            disposal_thread, retiring_thread,
+            "a losing failed exit must not run its user destructor on the committing thread"
+        );
+    }
+
+    #[test]
+    fn a_stale_scope_verdict_disposes_its_nested_exit_off_the_finishing_thread() {
+        let finishing_thread = std::thread::current().id();
+        let mut identity = ScopeIdentity::new();
+        let root_id = ChildId::from("root");
+        let root = MemberCell::new(
+            root_id.clone(),
+            identity
+                .mint_membership(&root_id)
+                .expect("root membership is available"),
+        );
+        let scope = ScopeCell::new(root, ScopeFlavor::Ordered, ScopeIdentity::new());
+        let child_id = ChildId::from("worker");
+        let child = MemberCell::new(
+            child_id.clone(),
+            identity
+                .mint_membership(&child_id)
+                .expect("child membership is available"),
+        );
+
+        let stale = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("first scope epoch is available");
+        scope.finish_incarnation(stale, StopReason::Finished);
+        let live = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("second scope epoch is available");
+
+        // The stale epoch is declined, so this structured verdict is never
+        // published — but the framework still owns the failed child `Exit` it
+        // recursively carries, and must not run that user destructor inline.
+        let (dropped, observed) = mpsc::sync_channel(1);
+        scope.finish_incarnation(
+            stale,
+            StopReason::StartupFailed(StartupFailure {
+                cause: StartupFailureCause::Child {
+                    id: child_id,
+                    membership: child.membership(),
+                    exit: Exit::new(
+                        ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+                        Cancellation::NotObserved,
+                    ),
+                },
+            }),
+        );
+
+        let disposal_thread = observed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the stale verdict's nested exit is destroyed");
+        assert_ne!(
+            disposal_thread, finishing_thread,
+            "a declined stop reason must not run its nested user destructor on the \
+             finishing thread"
+        );
+        assert_eq!(
+            scope.record().state,
+            ScopeState::Starting,
+            "the stale verdict must not rewrite the newer incarnation"
+        );
+        scope.finish_incarnation(live, StopReason::Finished);
     }
 
     #[test]

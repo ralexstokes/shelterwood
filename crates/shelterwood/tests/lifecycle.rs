@@ -12,8 +12,10 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, policy::never, poll_once,
-    waiting::task as waiting_task,
+    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, next_event,
+    policy::never,
+    poll_once,
+    waiting::{cancellation_signalled_waiting_task, task as waiting_task},
 };
 use shelterwood::{
     Actor, ActorOnceDef, Cancellation, Context, DynamicTree, ExitError, ExitKind, ExitResult,
@@ -43,17 +45,7 @@ async fn non_owners_are_quiet_and_an_empty_root_needs_its_owner() {
     let task = tree
         .add_task(
             "worker",
-            TaskDef::new({
-                let cancelled = Arc::clone(&cancelled);
-                move |context| {
-                    let cancelled = Arc::clone(&cancelled);
-                    async move {
-                        context.shutdown_token().cancelled().await;
-                        cancelled.store(true, Ordering::SeqCst);
-                        Ok(())
-                    }
-                }
-            }),
+            cancellation_signalled_waiting_task(Arc::clone(&cancelled)),
         )
         .expect("valid task");
     let spare = task.clone();
@@ -444,17 +436,7 @@ async fn ordered_teardown_keeps_its_frontier_when_an_earlier_child_exits() {
     let mut tree = Tree::new();
     tree.add_task(
         "first",
-        TaskDef::new({
-            let first_stopping = Arc::clone(&first_stopping);
-            move |context| {
-                let first_stopping = Arc::clone(&first_stopping);
-                async move {
-                    context.shutdown_token().cancelled().await;
-                    first_stopping.store(true, Ordering::SeqCst);
-                    Ok(())
-                }
-            }
-        }),
+        cancellation_signalled_waiting_task(Arc::clone(&first_stopping)),
     )
     .expect("valid first task");
     let middle = tree
@@ -583,13 +565,7 @@ async fn concurrent_initial_failures_publish_one_startup_failed_scope_edge() {
     let mut exits = 0;
     let mut startup_failed_edges = 0;
     while exits < 2 {
-        let item = tokio::time::timeout(Duration::from_secs(2), lifecycle.recv())
-            .await
-            .expect("both concurrent exits are bounded")
-            .expect("the root lifecycle remains open");
-        let LifecycleItem::Event(event) = item else {
-            panic!("the small fixture cannot lag");
-        };
+        let event = next_event(&mut lifecycle).await;
         match event.kind {
             LifecycleEventKind::Exited { .. } => exits += 1,
             LifecycleEventKind::ScopeState {
@@ -599,14 +575,17 @@ async fn concurrent_initial_failures_publish_one_startup_failed_scope_edge() {
         }
     }
     while let Ok(item) = lifecycle.try_recv() {
+        let LifecycleItem::Event(event) = item else {
+            panic!("unexpected lifecycle lag while draining the startup trace")
+        };
         if matches!(
-            item,
-            LifecycleItem::Event(shelterwood::LifecycleEvent {
+            event,
+            shelterwood::LifecycleEvent {
                 kind: LifecycleEventKind::ScopeState {
                     state: ScopeState::StartupFailed,
                 },
                 ..
-            })
+            }
         ) {
             startup_failed_edges += 1;
         }
@@ -662,26 +641,14 @@ async fn plain_restart_publishes_exited_old_before_started_new() {
     fail_first.release();
 
     loop {
-        let item = tokio::time::timeout(POLL_TIMEOUT, lifecycle.recv())
-            .await
-            .expect("restart lifecycle is bounded")
-            .expect("lifecycle stream remains open");
-        let LifecycleItem::Event(event) = item else {
-            panic!("small restart fixture must not lag");
-        };
+        let event = next_event(&mut lifecycle).await;
         match event.kind {
             LifecycleEventKind::Exited { incarnation, .. } if incarnation == first => break,
             _ => {}
         }
     }
     let second = loop {
-        let item = tokio::time::timeout(POLL_TIMEOUT, lifecycle.recv())
-            .await
-            .expect("replacement lifecycle is bounded")
-            .expect("lifecycle stream remains open");
-        let LifecycleItem::Event(event) = item else {
-            panic!("small restart fixture must not lag");
-        };
+        let event = next_event(&mut lifecycle).await;
         if let LifecycleEventKind::Started { incarnation, .. } = event.kind
             && incarnation.supersedes(first)
         {

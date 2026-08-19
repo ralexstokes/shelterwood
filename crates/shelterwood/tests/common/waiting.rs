@@ -55,6 +55,14 @@ pub(crate) fn signalled_waiting_task(
     })
 }
 
+pub(crate) fn start_signalled_waiting_task(started: Arc<AtomicBool>) -> TaskDef {
+    signalled_waiting_task(started, Arc::new(AtomicBool::new(false)))
+}
+
+pub(crate) fn cancellation_signalled_waiting_task(cancelled: Arc<AtomicBool>) -> TaskDef {
+    signalled_waiting_task(Arc::new(AtomicBool::new(false)), cancelled)
+}
+
 /// [`signalled_waiting_task`] plus a liveness probe.
 ///
 /// The task races its shutdown token against `liveness_gate` with a biased

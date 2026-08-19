@@ -17,7 +17,7 @@ use crate::{
     },
     raw::RawConstruction,
     runtime::{self, Isolated, Latch},
-    task::{OnceTask, TaskDef},
+    task::TaskConstruction,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -28,8 +28,7 @@ struct ScopeConfig {
 
 pub(crate) enum ChildConstruction {
     Raw(RawConstruction),
-    Task(TaskDef),
-    TaskOnce(OnceTask),
+    Task(TaskConstruction),
     Scope(Box<ScopeConstruction>),
 }
 
@@ -258,13 +257,8 @@ impl SlotCell {
                 definition.readiness(),
             ),
             ChildConstruction::Task(definition) => (
-                &definition.options,
-                ChildMode::Restartable,
-                Readiness::Immediate,
-            ),
-            ChildConstruction::TaskOnce(definition) => (
-                &definition.options,
-                ChildMode::OneShot,
+                definition.options(),
+                definition.mode(),
                 Readiness::Immediate,
             ),
             ChildConstruction::Scope(definition) => {
@@ -607,14 +601,14 @@ mod tests {
         policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
         raw::RawConstruction,
         runtime::{self, Timeout},
-        task::TaskDef,
+        task::{TaskConstruction, TaskDef},
     };
 
     use super::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeConstruction, SlotCell,
     };
 
-    fn configured_task() -> TaskDef {
+    fn configured_task() -> TaskConstruction {
         TaskDef::new(|_| async { Ok(()) })
             .restart(RestartPolicy::new(
                 RestartCondition::Always,
@@ -624,6 +618,7 @@ mod tests {
             .readiness(Readiness::Manual)
             .expect("manual task readiness is valid")
             .retention(Retention::Remove)
+            .erase()
     }
 
     struct PanicWake(&'static str);
@@ -790,12 +785,14 @@ mod tests {
         // definition carries the mode already resolved from its actor type's
         // metadata at erasure.
         assert_eq!(
-            resolved_readiness(ChildConstruction::Task(TaskDef::new(|_| async { Ok(()) }))),
+            resolved_readiness(ChildConstruction::Task(
+                TaskDef::new(|_| async { Ok(()) }).erase()
+            )),
             Readiness::Immediate
         );
         let (completion, _claim) = runtime::oneshot();
         assert_eq!(
-            resolved_readiness(ChildConstruction::TaskOnce(
+            resolved_readiness(ChildConstruction::Task(
                 TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }).erase(completion)
             )),
             Readiness::Immediate
@@ -817,12 +814,13 @@ mod tests {
                 TaskDef::new(|_| async { Ok(()) })
                     .readiness(Readiness::Manual)
                     .expect("manual task readiness is valid")
+                    .erase()
             )),
             Readiness::Manual
         );
         let (completion, _claim) = runtime::oneshot();
         assert_eq!(
-            resolved_readiness(ChildConstruction::TaskOnce(
+            resolved_readiness(ChildConstruction::Task(
                 TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) })
                     .readiness(Readiness::Manual)
                     .expect("manual task readiness is valid")
@@ -966,7 +964,7 @@ mod tests {
         let slot = declaration
             .reserve("one-shot", None)
             .expect("reservation succeeds");
-        slot.define(ChildConstruction::TaskOnce(construction));
+        slot.define(ChildConstruction::Task(construction));
         let defaults = ResolvedDefaults::default();
         let options = slot
             .resolve_policy(&defaults)

@@ -391,7 +391,9 @@ async fn conversion_unwind_evicts_never_started_child_identities() {
         let slot = rebuild
             .reserve(id, None)
             .expect("re-added id is reservable");
-        slot.define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+        slot.define(ChildConstruction::Task(
+            TaskDef::new(|_| future::pending()).erase(),
+        ));
     }
     let replacement = rebuild
         .lower(ResolvedDefaults::default(), Some(Arc::clone(&root)))

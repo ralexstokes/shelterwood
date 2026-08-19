@@ -315,17 +315,29 @@ impl<'a, A: Actor> StopContext<'a, A> {
 /// actors. It also encapsulates the callback loop's error-path resource
 /// teardown, so decorators need no framework-internal teardown operations.
 /// Its declared readiness is read before [`RawActor::run`] is polled.
+///
+/// Like every [`RawActor`], one `Handler` value owns exactly one call to
+/// [`RawActor::run`]. The call consumes its `Uninit` state even when
+/// initialization returns an error or its future is cancelled; a second call
+/// is a contract violation and panics.
 pub struct Handler<A: Actor> {
-    args: Option<A::Args>,
-    actor: Option<A>,
+    state: HandlerState<A>,
+}
+
+enum HandlerState<A: Actor> {
+    // The inner Option is the one-run sentinel while initialization owns the
+    // arguments and after any path that returns without constructing an
+    // actor. Unlike the former parallel Options, the enum makes the handler's
+    // phase structural.
+    Uninit(Option<A::Args>),
+    Running(A),
 }
 
 impl<A: Actor> Handler<A> {
     /// Wraps owned args using the callback-actor default `AfterInit` readiness.
     pub fn new(args: A::Args) -> Self {
         Self {
-            args: Some(args),
-            actor: None,
+            state: HandlerState::Uninit(Some(args)),
         }
     }
 }
@@ -350,17 +362,22 @@ impl<A: Actor> RawActor for Handler<A> {
     /// returns, and it must not observe still-live incarnation resources;
     /// every error exit therefore freezes and joins them here first.
     async fn run(&mut self, raw: &mut RawContext<Self::Msg>) -> ExitResult {
-        let args = self
-            .args
+        let HandlerState::Uninit(args) = &mut self.state else {
+            panic!("handler actor initialization invoked more than once");
+        };
+        let args = args
             .take()
             .expect("handler actor initialization invoked more than once");
         let initialized = {
             let mut context = Context::<A>::new(raw, DeliveryStage::Live);
             A::init(args, &mut context).await
         };
-        let actor = match initialized {
-            Ok(actor) => self.actor.insert(actor),
+        match initialized {
+            Ok(actor) => self.state = HandlerState::Running(actor),
             Err(error) => return fail_after_teardown(raw, error).await,
+        }
+        let HandlerState::Running(actor) = &mut self.state else {
+            unreachable!("successful initialization installs the running actor")
         };
         if raw.readiness() == Readiness::AfterInit {
             raw.mark_ready();

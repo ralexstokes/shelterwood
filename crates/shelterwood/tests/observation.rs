@@ -14,12 +14,17 @@ use crate::common::{
     waiting::{gate_released_manual_ready_task, task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
-    Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LIFECYCLE_EVENT_CAPACITY,
-    LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleSeq,
-    LifecycleTryRecvError, MembershipStatus, RemoveOutcome, RestartCondition, RestartCount,
-    RestartPolicy, Retention, ScopeKind, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef,
-    SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, TotalRestarts, Tree, WaitError,
+    Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LifecycleEvent,
+    LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleSeq, LifecycleTryRecvError,
+    MembershipStatus, RemoveOutcome, RestartCondition, RestartCount, RestartPolicy, Retention,
+    ScopeKind, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef, SubtreeOnceDef, TaskDef,
+    TaskOnceDef, TaskRef, TotalRestarts, Tree, WaitError,
 };
+
+// The ring width is an implementation choice, not façade API. This black-box
+// overflow regression deliberately pins the current behavior without asking
+// applications to compile against that tuning constant.
+const LIFECYCLE_EVENT_CAPACITY: usize = 128;
 
 async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
     tokio::time::timeout(Duration::from_secs(2), events.recv())

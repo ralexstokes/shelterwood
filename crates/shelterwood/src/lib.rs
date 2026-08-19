@@ -39,9 +39,9 @@ pub use mailbox::{
     ReplyReceiver, SendError, SendErrorKind, SendFuture, SendTimeout,
 };
 pub use observe::{
-    ChildSnapshot, ChildState, LIFECYCLE_EVENT_CAPACITY, LifecycleEvent, LifecycleEventKind,
-    LifecycleEvents, LifecycleItem, LifecycleSeq, LifecycleTryRecvError, ScopeKind, ScopeSnapshot,
-    SnapshotClosed, SnapshotReceiver, WaitError,
+    ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem,
+    LifecycleSeq, LifecycleTryRecvError, ScopeKind, ScopeSnapshot, SnapshotClosed,
+    SnapshotReceiver, WaitError,
 };
 pub use policy::{
     Backoff, BackoffFactor, BoundedReadinessDeadline, DefaultsInheritance, ExponentialBackoff,

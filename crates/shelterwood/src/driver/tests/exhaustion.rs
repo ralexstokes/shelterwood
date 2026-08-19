@@ -24,7 +24,7 @@ fn member_transitions_own_their_complete_record_projection() {
     member.transition(MemberTransition::Stopping);
     assert_eq!(member.record().stage, MemberStage::Stopping);
 
-    let exit = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+    let exit = Exit::completed(Cancellation::NotObserved);
     let restart_count = RestartCount::ZERO.bump();
     let restart_at = crate::runtime::now();
     member.transition(MemberTransition::RestartScheduled {
@@ -51,7 +51,7 @@ fn member_transitions_own_their_complete_record_projection() {
     assert_eq!(record.restart_at, None);
     assert_eq!(
         record.last_exit,
-        Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved))
+        Some(Exit::completed(Cancellation::NotObserved))
     );
     assert_eq!(record.restart_count, restart_count);
 }
@@ -62,8 +62,8 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
     let id = ChildId::from("worker");
     let membership = identity.mint_membership(&id).expect("membership available");
     let member = MemberCell::new(id, membership);
-    let previous = Exit::new(
-        ExitKind::Failed(ExitError::message("last completed incarnation")),
+    let previous = Exit::failed(
+        ExitError::message("last completed incarnation"),
         Cancellation::NotObserved,
     );
     // Walk the record along the production path so the transition-source
@@ -128,8 +128,8 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
         .incarnations
         .mint()
         .expect("the last usable incarnation mints");
-    let previous = Exit::new(
-        ExitKind::Failed(ExitError::message("last completed incarnation")),
+    let previous = Exit::failed(
+        ExitError::message("last completed incarnation"),
         Cancellation::NotObserved,
     );
     root.transition_child(
@@ -173,7 +173,7 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
     };
     assert!(matches!(
         event_receiver.try_recv(),
-        Ok(DriverEvent::Child(ChildEvent::Ready { .. }))
+        Some(DriverEvent::Child(ChildEvent::Ready { .. }))
     ));
     scope.handle_construction_disposed(child, panic);
 
@@ -566,7 +566,7 @@ async fn scope_incarnation_exhaustion_closes_nested_observation() {
     member.update(|record| {
         record.stage = MemberStage::Restarting;
         record.last_incarnation = Some(first);
-        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
+        record.last_exit = Some(Exit::completed(Cancellation::NotObserved));
     });
     scope.set_state(ScopeState::Stopped {
         reason: StopReason::Finished,
@@ -588,7 +588,7 @@ async fn scope_incarnation_exhaustion_closes_nested_observation() {
     assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
     assert!(parent.terminalize_child(
         &member,
-        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        Exit::completed(Cancellation::NotObserved),
         None,
         StartupDisposition::NotAborted,
     ));

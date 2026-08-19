@@ -1079,8 +1079,8 @@ mod tests {
     };
 
     use crate::{
-        Cancellation, Exit, ExitKind, GracePhase, Intensity, JitterSample, RestartAttempt,
-        RestartCondition, RestartCount, RestartPolicy, Shutdown, TotalRestarts,
+        Cancellation, Exit, GracePhase, Intensity, JitterSample, RestartAttempt, RestartCondition,
+        RestartCount, RestartPolicy, Shutdown, TotalRestarts,
         identity::PoisonedCounter,
         policy::{Backoff, ScopeFlavor},
     };
@@ -1323,10 +1323,7 @@ mod tests {
 
     #[test]
     fn funnel_dispatch_depends_on_mode_and_membership_state() {
-        let failure = Exit::new(
-            ExitKind::Failed(crate::ExitError::message("boom")),
-            Cancellation::NotObserved,
-        );
+        let failure = Exit::failed(crate::ExitError::message("boom"), Cancellation::NotObserved);
         let restart = RestartPolicy::new(RestartCondition::OnFailure, Backoff::Immediate);
         assert_eq!(
             dispatch_exit(
@@ -1346,7 +1343,7 @@ mod tests {
             ),
             ExitDispatch::Terminal
         );
-        let success = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+        let success = Exit::completed(Cancellation::NotObserved);
         assert_eq!(
             dispatch_exit(
                 &success,

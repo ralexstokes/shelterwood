@@ -327,11 +327,13 @@ pub(crate) fn submit_blocking_job<J: BlockingPoolJob>(job: &Arc<J>) -> bool {
 /// the reference count — rerouting the latter would place already-empty jobs
 /// behind live ones.
 ///
-/// This pins Tokio's `spawn_task` shutdown path: a rejected closure is
-/// destroyed synchronously, before `spawn_blocking` returns. A future Tokio
-/// that deferred that drop would leave the count at two and degrade fail-safe
-/// to the old inline behavior rather than misroute a live closure. The
-/// end-to-end regressions in this crate pin the behavior we rely on.
+/// This pins Tokio 1.53.1's `spawn_task` shutdown path: a rejected closure is
+/// destroyed synchronously, before `spawn_blocking` returns. The workspace
+/// pins that exact release so an upgrade requires an explicit re-audit. A
+/// future Tokio that deferred that drop would leave the count at two and
+/// degrade fail-safe to the old inline behavior rather than misroute a live
+/// closure. The end-to-end regressions in this crate pin the behavior we rely
+/// on.
 pub(crate) fn blocking_pool_accepted<J: BlockingPoolJob>(job: &Arc<J>) -> bool {
     Arc::strong_count(job) > 1 || !job.is_pending()
 }
@@ -385,7 +387,8 @@ where
     }
 }
 
-pub fn spawn_blocking<F, T>(operation: F) -> JoinHandle<T>
+#[cfg(any(test, feature = "test-util"))]
+fn spawn_blocking<F, T>(operation: F) -> JoinHandle<T>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -447,19 +450,53 @@ pub async fn yield_now() {
     task::yield_now().await;
 }
 
-pub type UnboundedMpscSender<T> = mpsc::UnboundedSender<T>;
-pub type UnboundedMpscReceiver<T> = mpsc::UnboundedReceiver<T>;
+/// Runtime-neutral publishing half of an unbounded driver event lane.
+pub struct UnboundedMpscSender<T>(mpsc::UnboundedSender<T>);
+
+impl<T> Clone for UnboundedMpscSender<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> UnboundedMpscSender<T> {
+    /// Sends one value, returning it when the receive lane is closed.
+    pub fn send(&self, value: T) -> Result<(), T> {
+        self.0.send(value).map_err(|error| error.0)
+    }
+}
+
+/// Runtime-neutral receiving half of an unbounded driver event lane.
+pub struct UnboundedMpscReceiver<T>(mpsc::UnboundedReceiver<T>);
+
+impl<T> UnboundedMpscReceiver<T> {
+    /// Waits for the next value, or returns `None` when every sender is gone.
+    pub async fn recv(&mut self) -> Option<T> {
+        self.0.recv().await
+    }
+
+    /// Receives one immediately available value.
+    pub fn try_recv(&mut self) -> Option<T> {
+        self.0.try_recv().ok()
+    }
+
+    /// Reports whether the receive lane currently contains no values.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 pub fn unbounded_mpsc<T>() -> (UnboundedMpscSender<T>, UnboundedMpscReceiver<T>) {
-    mpsc::unbounded_channel()
+    let (sender, receiver) = mpsc::unbounded_channel();
+    (UnboundedMpscSender(sender), UnboundedMpscReceiver(receiver))
 }
 
 pub fn unbounded_mpsc_send<T>(sender: &UnboundedMpscSender<T>, value: T) -> Result<(), T> {
-    sender.send(value).map_err(|error| error.0)
+    sender.send(value)
 }
 
 pub fn unbounded_mpsc_try_recv<T>(receiver: &mut UnboundedMpscReceiver<T>) -> Option<T> {
-    receiver.try_recv().ok()
+    receiver.try_recv()
 }
 
 pub fn unbounded_mpsc_is_empty<T>(receiver: &UnboundedMpscReceiver<T>) -> bool {
@@ -670,7 +707,10 @@ mod tests {
         .await;
 
         assert!(matches!(wake, super::ScopeWake::Message(Some(999))));
-        assert_eq!(control_receiver.try_recv(), Ok(0));
+        assert_eq!(
+            super::unbounded_mpsc_try_recv(&mut control_receiver),
+            Some(0)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

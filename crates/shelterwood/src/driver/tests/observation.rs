@@ -259,12 +259,7 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
 
     assert!(parent.terminalize_child(
         &nested.member,
-        Exit::new(
-            ExitKind::Aborted {
-                phase: GracePhase::WithinGrace,
-            },
-            Cancellation::Observed,
-        ),
+        Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed,),
         Some(incarnation),
         StartupDisposition::NotAborted,
     ));
@@ -355,12 +350,7 @@ async fn terminal_scope_in_drain_waits_for_its_live_incarnation_to_stop() {
 
     assert!(parent.terminalize_child(
         &nested.member,
-        Exit::new(
-            ExitKind::Aborted {
-                phase: GracePhase::WithinGrace,
-            },
-            Cancellation::Observed,
-        ),
+        Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed,),
         Some(incarnation),
         StartupDisposition::NotAborted,
     ));
@@ -424,12 +414,7 @@ impl AbortedNestedDriverFixture {
     fn terminalize_from_parent(&self) {
         assert!(self.parent.terminalize_child(
             &self.nested.member,
-            Exit::new(
-                ExitKind::Aborted {
-                    phase: GracePhase::WithinGrace,
-                },
-                Cancellation::Observed,
-            ),
+            Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed,),
             Some(self.incarnation),
             StartupDisposition::NotAborted,
         ));
@@ -592,7 +577,7 @@ async fn wait_for_child_reloads_after_its_predicate_closes_the_snapshot_stream()
                     closing_scope.finish_root_incarnation(
                         epoch,
                         StopReason::Finished,
-                        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+                        Exit::completed(Cancellation::NotObserved),
                     );
                 }
                 false
@@ -624,7 +609,7 @@ async fn terminality_fallback_preserves_restart_window_scope_reason() {
         record.stage = MemberStage::Restarting;
         record.incarnation = None;
         record.last_incarnation = Some(last_incarnation);
-        record.last_exit = Some(Exit::new(ExitKind::Completed, Cancellation::NotObserved));
+        record.last_exit = Some(Exit::completed(Cancellation::NotObserved));
     });
     nested.set_state(ScopeState::Stopped {
         reason: StopReason::Finished,
@@ -922,12 +907,7 @@ fn a_declined_epoch_still_publishes_its_owned_terminal_exit() {
     scope.finish_root_incarnation(
         epoch,
         StopReason::ShutdownRequested,
-        Exit::new(
-            ExitKind::Aborted {
-                phase: GracePhase::WithinGrace,
-            },
-            Cancellation::Observed,
-        ),
+        Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed),
     );
     assert!(matches!(
         scope.member.record().stage,
@@ -1374,7 +1354,7 @@ fn gate_handoff_rejects_a_scope_with_an_unadmitted_dynamic_reservation() {
 fn a_losing_terminal_exit_payload_is_destroyed_outside_the_gate() {
     let scope = isolated_scope("scope", ScopeFlavor::Ordered);
     scope.member.terminalize(
-        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        Exit::completed(Cancellation::NotObserved),
         StartupDisposition::Unchanged,
     );
 
@@ -1401,7 +1381,7 @@ fn a_losing_supervised_terminal_exit_is_a_complete_noop_outside_the_gate() {
     resolve_fixture_options(&member);
     root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
     member.terminalize(
-        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        Exit::completed(Cancellation::NotObserved),
         StartupDisposition::NotAborted,
     );
     let winning_record = member.record();
@@ -1488,7 +1468,7 @@ fn a_superseded_restart_exit_payload_is_destroyed_outside_the_gate() {
         incarnation: second,
     });
     member.transition(MemberTransition::RestartScheduled {
-        exit: Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        exit: Exit::completed(Cancellation::NotObserved),
         restart_count: RestartCount::ZERO.bump().bump(),
         restart_at: None,
     });
@@ -1517,7 +1497,7 @@ fn a_restart_exit_payload_superseded_by_terminalization_outlives_the_gate() {
     );
 
     member.terminalize(
-        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        Exit::completed(Cancellation::NotObserved),
         StartupDisposition::Unchanged,
     );
     assert!(

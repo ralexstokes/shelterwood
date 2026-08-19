@@ -322,7 +322,7 @@ mod tests {
     };
 
     use crate::{
-        Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase,
+        Cancellation, ChildId, Exit, ExitError, GracePhase,
         cells::MemberCell,
         identity::ScopeIdentity,
         runtime::{self, CompletionGatedLatch, Latch},
@@ -449,7 +449,7 @@ mod tests {
 
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
         member.terminalize(
-            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+            Exit::completed(Cancellation::NotObserved),
             crate::cells::StartupDisposition::Unchanged,
         );
         assert_eq!(waiting.await, Ok(42));
@@ -461,12 +461,7 @@ mod tests {
         sender.send(42_u8).expect("claim remains open");
         let mut waiting = Box::pin(claim.wait());
         let mut context = Context::from_waker(Waker::noop());
-        let exit = Exit::new(
-            ExitKind::Aborted {
-                phase: GracePhase::WithinGrace,
-            },
-            Cancellation::Observed,
-        );
+        let exit = Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed);
 
         assert!(matches!(waiting.as_mut().poll(&mut context), Poll::Pending));
         member.terminalize(exit.clone(), crate::cells::StartupDisposition::Unchanged);
@@ -479,7 +474,7 @@ mod tests {
         let (sender, claim, member) = one_shot_claim::<u8>();
         drop(sender);
         member.terminalize(
-            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+            Exit::completed(Cancellation::NotObserved),
             crate::cells::StartupDisposition::Unchanged,
         );
 

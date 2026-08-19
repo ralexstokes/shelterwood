@@ -2631,8 +2631,7 @@ mod tests {
     };
 
     use shelterwood_core::{
-        Cancellation, Exit, ExitError, ExitKind, ScopeState, StartupFailure, StartupFailureCause,
-        StopReason,
+        Cancellation, Exit, ExitError, ScopeState, StartupFailure, StartupFailureCause, StopReason,
     };
 
     use crate::{
@@ -2719,8 +2718,8 @@ mod tests {
     fn retained_failed_exit_disposes_off_the_retiring_thread() {
         let retiring_thread = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let retained = RetainedExit::new(Exit::new(
-            ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+        let retained = RetainedExit::new(Exit::failed(
+            ExitError::from(ThreadProbe(dropped)),
             Cancellation::NotObserved,
         ));
 
@@ -2747,14 +2746,14 @@ mod tests {
                 .expect("membership is available"),
         );
         member.terminalize(
-            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+            Exit::completed(Cancellation::NotObserved),
             StartupDisposition::Unchanged,
         );
         let (dropped, observed) = mpsc::sync_channel(1);
 
         member.terminalize(
-            Exit::new(
-                ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+            Exit::failed(
+                ExitError::from(ThreadProbe(dropped)),
                 Cancellation::NotObserved,
             ),
             StartupDisposition::Unchanged,
@@ -2835,8 +2834,8 @@ mod tests {
     fn retained_exit_conversion_preserves_the_callers_drop_thread() {
         let caller = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);
-        let retained = RetainedExit::new(Exit::new(
-            ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+        let retained = RetainedExit::new(Exit::failed(
+            ExitError::from(ThreadProbe(dropped)),
             Cancellation::NotObserved,
         ));
 
@@ -2867,8 +2866,8 @@ mod tests {
             cause: StartupFailureCause::Child {
                 id,
                 membership: member.membership(),
-                exit: Exit::new(
-                    ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+                exit: Exit::failed(
+                    ExitError::from(ThreadProbe(dropped)),
                     Cancellation::NotObserved,
                 ),
             },
@@ -2898,8 +2897,8 @@ mod tests {
                 .expect("membership is available"),
         );
         member.terminalize(
-            Exit::new(
-                ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+            Exit::failed(
+                ExitError::from(ThreadProbe(dropped)),
                 Cancellation::NotObserved,
             ),
             StartupDisposition::Unchanged,
@@ -3061,8 +3060,8 @@ mod tests {
             id,
             membership,
             incarnation: incarnations.mint().expect("incarnation available"),
-            exit: Exit::new(
-                ExitKind::Failed(ExitError::from(GateDropError { gate, dropped })),
+            exit: Exit::failed(
+                ExitError::from(GateDropError { gate, dropped }),
                 Cancellation::NotObserved,
             ),
         });

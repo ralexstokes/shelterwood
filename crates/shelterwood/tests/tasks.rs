@@ -23,26 +23,19 @@ fn task_families_reject_after_init_readiness_eagerly() {
 }
 
 #[test]
-fn public_exit_constructor_preserves_evidence_and_classifies_failures() {
-    let completed = Exit::new(ExitKind::Completed, Cancellation::Observed);
+fn public_exit_constructors_preserve_evidence_and_classify_failures() {
+    let completed = Exit::completed(Cancellation::Observed);
     assert_eq!(completed.cancellation(), Cancellation::Observed);
     assert!(matches!(completed.kind(), ExitKind::Completed));
     assert!(!completed.is_failure());
 
-    for kind in [
-        ExitKind::Failed(ExitError::message("failed")),
-        ExitKind::Panicked {
-            message: Some("panicked".to_owned()),
-        },
-        ExitKind::ReadinessTimedOut {
-            deadline: std::time::Instant::now(),
-        },
-        ExitKind::Aborted {
-            phase: GracePhase::AfterGrace,
-        },
-        ExitKind::NeverStarted,
+    for exit in [
+        Exit::failed(ExitError::message("failed"), Cancellation::NotObserved),
+        Exit::panicked(Some("panicked".to_owned()), Cancellation::NotObserved),
+        Exit::readiness_timed_out(std::time::Instant::now(), Cancellation::NotObserved),
+        Exit::aborted(GracePhase::AfterGrace, Cancellation::NotObserved),
+        Exit::never_started(),
     ] {
-        let exit = Exit::new(kind, Cancellation::NotObserved);
         assert_eq!(exit.cancellation(), Cancellation::NotObserved);
         assert!(exit.is_failure(), "non-completed exit: {:?}", exit.kind());
     }

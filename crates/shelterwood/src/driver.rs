@@ -1109,10 +1109,15 @@ async fn run_scope_incarnation(
             )
             .await
             {
-                runtime::ScopeWake::Signal
-                | runtime::ScopeWake::ParentShutdown
-                | runtime::ScopeWake::Message(None)
-                | runtime::ScopeWake::ControlMessage(None) => {}
+                runtime::ScopeWake::Signal | runtime::ScopeWake::ParentShutdown => {}
+                runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
+                    // Every lane sender is retained by the scope runtime or
+                    // one of its registered children until this loop exits.
+                    // A closed receiver would otherwise make this select arm
+                    // permanently ready and spin, so diagnose any future
+                    // ownership change where it is first observable.
+                    debug_assert!(false, "a driver event lane outlives its receive loop");
+                }
                 runtime::ScopeWake::Deadline => {
                     // A producer becoming ready at the same instant owns the
                     // tie over its deadline. Give tasks woken by that clock

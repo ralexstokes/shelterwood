@@ -15,6 +15,7 @@ use crate::{
 };
 
 /// Number of lifecycle events retained independently for each subscriber.
+#[doc(hidden)]
 pub const LIFECYCLE_EVENT_CAPACITY: usize = 128;
 
 // Tokio rounds broadcast capacity up to a power of two. `try_recv` compares
@@ -572,6 +573,12 @@ impl SnapshotReceiver {
     }
 
     /// Borrows the newest snapshot and terminal flag from one retained state.
+    // This method bridges the lower cell crate to the downstream façade's
+    // `ScopeRef` implementation. It remains callable on the façade-public
+    // receiver, but its signature is entirely supported façade data and grants
+    // no construction or implementation capability. Hiding it from generated
+    // docs is the explicit boundary ruling; the rustdoc-JSON walk deliberately
+    // does not grow a second hidden-item graph for this benign bridge.
     #[must_use]
     #[doc(hidden)]
     pub fn borrow_latest_and_closed(&self) -> (Arc<ScopeSnapshot>, bool) {

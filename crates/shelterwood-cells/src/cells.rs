@@ -3,8 +3,8 @@
 //! These cells are the neutral synchronization and observation projection
 //! layer shared by public handles, mailboxes, actor/task contexts, and the
 //! mutable supervision driver. In particular, this module does not depend on
-//! mutable driver state. Its dynamic-route interface names declaration slots
-//! only as opaque capability payloads; their state remains owned elsewhere.
+//! mutable driver state. Its dynamic-route interface retains only the one
+//! close-admission hook needed by restart-stable scope transitions.
 
 use std::{
     any::Any,
@@ -20,23 +20,23 @@ use std::{
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::AtomicUsize;
 
-use crate::{
+use shelterwood_core::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartCount, Strategy, TotalRestarts,
-    admission::{RemoveOutcome, ReserveError},
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{
         ExitKind, StartupError, StartupFailure, StartupFailureCause, StopReason,
         stop_reason_precedence,
     },
     identity::{AtomicPoisonedCounter, IncarnationCounter, MintedMembership, ScopeIdentity},
-    mailbox::{ActorIdentity, MailboxControl, MailboxTermination},
-    observe::{
-        ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-        LifecycleHub, LifecycleSeq, RetainedScopeSnapshot, ScopeKind, ScopeSnapshot, SnapshotHub,
-        SnapshotPublication, SnapshotReceiver,
-    },
     policy::{ResolvedCommonOptions, ScopeFlavor},
-    runtime::{self, Latch},
+};
+use shelterwood_mailbox::{ActorIdentity, MailboxControl, MailboxTermination};
+use shelterwood_runtime as runtime;
+
+use crate::observe::{
+    ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleHub,
+    LifecycleSeq, RetainedScopeSnapshot, ScopeSnapshot, SnapshotHub, SnapshotPublication,
+    SnapshotReceiver,
 };
 
 /// An exit copy retained by framework state.
@@ -59,14 +59,6 @@ impl RetainedExit {
 
     pub fn into_exit(mut self) -> Exit {
         self.0.take().expect("retained exit was already taken")
-    }
-
-    pub fn kind(&self) -> &ExitKind {
-        self.as_exit().kind()
-    }
-
-    pub fn cancellation(&self) -> crate::exit::Cancellation {
-        self.as_exit().cancellation()
     }
 
     pub(crate) fn retain_scope_state(exits: &mut Vec<Self>, state: &ScopeState) {
@@ -573,7 +565,7 @@ impl MemberCell {
         loop {
             let gate = self.current_observation_gate();
             let guard = gate.lock();
-            if gate.same_gate(&self.current_observation_gate()) {
+            if gate.shares_gate(&self.current_observation_gate()) {
                 let mut txn = ObservationTxn::new(guard);
                 return operation
                     .take()
@@ -602,11 +594,11 @@ impl MemberCell {
             .observation_gate
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if installed.same_gate(previous) {
+        if installed.shares_gate(previous) {
             *installed = gate.clone();
         } else {
             assert!(
-                installed.same_gate(gate),
+                installed.shares_gate(gate),
                 "a resident member must share its tree observation gate"
             );
         }
@@ -615,11 +607,11 @@ impl MemberCell {
     fn adopt_observation_gate(&self, gate: &ObservationGate, _txn: &mut ObservationTxn<'_>) {
         loop {
             let current = self.current_observation_gate();
-            if current.same_gate(gate) {
+            if current.shares_gate(gate) {
                 return;
             }
             let current_guard = current.lock();
-            if current.same_gate(&self.current_observation_gate()) {
+            if current.shares_gate(&self.current_observation_gate()) {
                 self.install_observation_gate_locked(&current, gate);
                 drop(current_guard);
                 return;
@@ -759,16 +751,20 @@ impl MemberCell {
             }
         };
         if let Some(losing_exit) = losing_exit {
+            // This is framework-retained ownership, not a value returned to a
+            // user. Route a failed exit's possibly-blocking user destructor
+            // through the critical-disposal lane after the gate is released.
+            let losing_exit = RetainedExit::new(losing_exit);
             txn.defer(move || drop(losing_exit));
         }
         let mut published = false;
         self.record.modify_silently(|record| {
-            match startup {
-                StartupDisposition::Unchanged => {}
-                StartupDisposition::NotAborted => record.startup_aborted = false,
-                StartupDisposition::Aborted => record.startup_aborted = true,
-            }
             if !matches!(record.stage, MemberStage::Terminal(_)) {
+                match startup {
+                    StartupDisposition::Unchanged => {}
+                    StartupDisposition::NotAborted => record.startup_aborted = false,
+                    StartupDisposition::Aborted => record.startup_aborted = true,
+                }
                 record.incarnation = None;
                 record.restart_at = None;
                 record.last_exit = Some(terminal_exit.clone());
@@ -780,7 +776,6 @@ impl MemberCell {
             // keeps the inline drops refcount-only.
             record.refresh_retained_exits();
         });
-        let record_changed = published || startup != StartupDisposition::Unchanged;
         // Store before discharge so reentrant mailbox wakers observe the
         // winning exit. Notification-driven readers still see
         // discharge-before-pulse; tree-scoped publication defers both until
@@ -798,10 +793,10 @@ impl MemberCell {
                 }
             });
         }
-        // A supervised terminal edge updates `startup_aborted` even if a
-        // competing terminalizer won the stage transition. Its record pulse
-        // remains required, but mailbox discharge must lead it.
-        if record_changed {
+        // First terminalizer wins. A losing edge neither reclassifies startup
+        // nor publishes a second record edge; a future caller that needs
+        // different semantics must make that race explicit at its boundary.
+        if published {
             txn.pulse(&self.record);
         }
         terminal_exit
@@ -844,66 +839,17 @@ impl ScopeRecord {
     }
 }
 
-/// Type-erased declaration slot carried by the restart-stable cell layer.
-///
-/// The route implementation chooses the concrete slot allocation. Erasing it
-/// here lets [`ScopeCell`] retain the route without depending on the plan
-/// layer that owns declaration state.
-pub type ErasedDynamicSlot = dyn Any + Send + Sync;
-
-/// Object-safe dynamic route retained by a restart-stable scope cell.
-pub type ErasedDynamicRoute = dyn DynamicRoute<Slot = ErasedDynamicSlot>;
-
-/// Cross-crate implementation seam for the façade's dynamic declaration
-/// route.
+/// Cross-crate close-admission hook retained by a restart-stable scope cell.
 ///
 /// # Implementation boundary
 ///
 /// This is not a user extension point. Only Shelterwood's façade implements
-/// and installs this trait. Its methods may run while the restart-stable tree
+/// and installs this trait. The callback runs while the restart-stable tree
 /// owns its observation gate, so a foreign implementation invalidates the
-/// framework's lock-rule guarantees.
-pub trait DynamicRoute: Send + Sync {
-    type Slot: ?Sized + Send + Sync;
-
-    fn reserve(
-        &self,
-        scope: &Arc<ScopeCell>,
-        id: ChildId,
-        child_scope: Option<ScopeFlavor>,
-        txn: &mut ObservationTxn<'_>,
-    ) -> Result<Arc<Self::Slot>, ReserveError>;
-
+/// framework's lock-rule guarantees. Requiring the transaction capability in
+/// the signature keeps that critical-section boundary explicit.
+pub trait DynamicRoute: Any + Send + Sync {
     fn close_admission(&self, txn: &mut ObservationTxn<'_>);
-
-    fn start_admission(
-        self: Arc<Self>,
-        slot: Arc<Self::Slot>,
-        fused_cancel: Option<Latch>,
-    ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError>;
-
-    fn cancel_reservation(
-        &self,
-        scope: &Arc<ScopeCell>,
-        slot: &Self::Slot,
-        txn: &mut ObservationTxn<'_>,
-    );
-
-    fn signal_fused_cancel(
-        &self,
-        scope: &Arc<ScopeCell>,
-        slot: &Self::Slot,
-        latch: &Latch,
-        txn: &mut ObservationTxn<'_>,
-    );
-
-    fn remove(
-        &self,
-        scope: &Arc<ScopeCell>,
-        id: &ChildId,
-        exact: Option<Membership>,
-        txn: &mut ObservationTxn<'_>,
-    ) -> runtime::OneShotReceiver<RemoveOutcome>;
 }
 
 /// Shared critical section for one resident tree's observation projection.
@@ -919,8 +865,13 @@ impl ObservationGate {
         Self(Arc::new(Mutex::new(())))
     }
 
-    pub fn same_gate(&self, other: &Self) -> bool {
+    fn shares_gate(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn same_gate(&self, other: &Self) -> bool {
+        self.shares_gate(other)
     }
 
     pub fn lock(&self) -> MutexGuard<'_, ()> {
@@ -1111,7 +1062,6 @@ impl Drop for ResidentChild {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct ObservationConfig {
-    strategy: Strategy,
     intensity: Intensity,
 }
 
@@ -1182,7 +1132,7 @@ pub struct ScopeCell {
     me: Weak<ScopeCell>,
     child_identity: Mutex<ScopeIdentity>,
     control: Mutex<ScopeControl>,
-    dynamic_route: Mutex<Option<Arc<ErasedDynamicRoute>>>,
+    dynamic_route: Mutex<Option<Arc<dyn DynamicRoute>>>,
     observation: ScopeObservation,
     #[cfg(any(test, feature = "test-util"))]
     ancestor_parent_reads: AtomicUsize,
@@ -1421,12 +1371,12 @@ impl ScopeCell {
         // Re-homing the parent would first have to acquire that same gate, so
         // rereading its installed pointer here cannot race a parent handoff.
         debug_assert!(
-            gate.same_gate(&parent.current_observation_gate()),
+            gate.shares_gate(&parent.current_observation_gate()),
             "observation gates are adopted only in the parent-to-child direction"
         );
         loop {
             let current = self.current_observation_gate();
-            if current.same_gate(gate) {
+            if current.shares_gate(gate) {
                 return;
             }
             debug_assert!(
@@ -1442,7 +1392,7 @@ impl ScopeCell {
             // that merely captured this obsolete gate retries after acquiring
             // it and observing the replacement.
             let current_guard = current.lock();
-            if current.same_gate(&self.current_observation_gate()) {
+            if current.shares_gate(&self.current_observation_gate()) {
                 self.member.install_observation_gate_locked(&current, gate);
                 self.adopt_descendant_observation_gates_locked(&current, gate, txn);
                 drop(current_guard);
@@ -1506,7 +1456,7 @@ impl ScopeCell {
             #[cfg(any(test, feature = "test-util"))]
             self.report_gate_capture(GateCapture::Observation);
             let guard = gate.lock();
-            if gate.same_gate(&self.current_observation_gate()) {
+            if gate.shares_gate(&self.current_observation_gate()) {
                 let operation = operation
                     .take()
                     .expect("observation operation runs exactly once");
@@ -1560,7 +1510,7 @@ impl ScopeCell {
             for member in terminal_disposals {
                 debug_assert!(
                     self.current_observation_gate()
-                        .same_gate(&member.current_observation_gate()),
+                        .shares_gate(&member.current_observation_gate()),
                     "a drain entry may mark only a resident member on its observation gate"
                 );
                 member.set_terminal_disposal_pending(true);
@@ -1595,16 +1545,14 @@ impl ScopeCell {
         self.emit_locked(txn, LifecycleEventKind::ScopeState { state });
     }
 
-    pub fn set_observation_config(&self, strategy: Strategy, intensity: Intensity) {
+    pub fn set_observation_config(&self, intensity: Intensity) {
         self.with_observation_gate(|wakes| {
             *self
                 .observation
                 .config
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = ObservationConfig {
-                strategy,
-                intensity,
-            };
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                ObservationConfig { intensity };
             self.publish_snapshot_chain_locked(wakes);
         });
     }
@@ -1689,6 +1637,13 @@ impl ScopeCell {
         self.with_observation_gate(|wakes| {
             let record = member.record();
             if matches!(record.stage, MemberStage::Terminal(_)) {
+                // The outer guard defines losing supervised terminalization:
+                // no record or lifecycle edge is published. Keep the incoming
+                // failed exit behind the same isolated-disposal boundary as a
+                // losing direct terminalizer, and do not destroy it under the
+                // observation gate.
+                let exit = RetainedExit::new(exit);
+                wakes.defer(move || drop(exit));
                 return false;
             }
             // Nested publication and closure are reached only through this
@@ -1821,11 +1776,8 @@ impl ScopeCell {
         }
         let snapshot = Arc::new(ScopeSnapshot {
             state: record.state,
-            kind: match self.flavor {
-                ScopeFlavor::Ordered => ScopeKind::Ordered,
-                ScopeFlavor::Dynamic => ScopeKind::Dynamic,
-            },
-            strategy: (self.flavor == ScopeFlavor::Ordered).then_some(config.strategy),
+            kind: self.flavor,
+            strategy: (self.flavor == ScopeFlavor::Ordered).then_some(Strategy::default()),
             intensity: config.intensity,
             total_restarts: record.total_restarts,
             lifecycle_seq: LifecycleSeq::new(
@@ -2116,6 +2068,14 @@ impl ScopeCell {
                     wakes.pulse(&self.observation.record);
                     self.close_observation_locked(wakes);
                 }
+                // `StopReason::StartupFailed` recursively owns the failed
+                // child's user error. A stale verdict is unused, but the
+                // framework still owns this copy: retaining it before the
+                // deferred drop sends a possibly-blocking or panicking user
+                // destructor to `dispose_critical` instead of running it
+                // inline on the committing thread once the gate is released.
+                let reason = RetainedStopReason::new(reason);
+                wakes.defer(move || drop(reason));
                 return;
             }
             if control
@@ -2415,7 +2375,7 @@ impl ScopeCell {
         }
     }
 
-    pub fn set_dynamic_route(&self, route: Option<Arc<ErasedDynamicRoute>>) {
+    pub fn set_dynamic_route(&self, route: Option<Arc<dyn DynamicRoute>>) {
         self.with_observation_gate(|txn| {
             self.set_dynamic_route_locked(route, txn);
         });
@@ -2423,7 +2383,7 @@ impl ScopeCell {
 
     pub fn set_dynamic_route_locked(
         &self,
-        route: Option<Arc<ErasedDynamicRoute>>,
+        route: Option<Arc<dyn DynamicRoute>>,
         txn: &mut ObservationTxn<'_>,
     ) {
         let previous = std::mem::replace(
@@ -2437,7 +2397,7 @@ impl ScopeCell {
         txn.pulse(&self.member.record);
     }
 
-    pub fn dynamic_route_in(&self, _txn: &ObservationTxn<'_>) -> Option<Arc<ErasedDynamicRoute>> {
+    pub fn dynamic_route_in(&self, _txn: &ObservationTxn<'_>) -> Option<Arc<dyn DynamicRoute>> {
         self.dynamic_route
             .lock()
             .expect("scope dynamic-route mutex poisoned")
@@ -2445,7 +2405,7 @@ impl ScopeCell {
     }
 
     #[cfg(any(test, feature = "test-util"))]
-    pub fn dynamic_route(&self) -> Option<Arc<ErasedDynamicRoute>> {
+    pub fn dynamic_route(&self) -> Option<Arc<dyn DynamicRoute>> {
         self.with_observation_gate(|txn| self.dynamic_route_in(txn))
     }
 
@@ -2590,14 +2550,11 @@ mod tests {
     };
 
     use shelterwood_core::{
-        Cancellation, Exit, ExitError, ExitKind, ScopeState, StartupFailure, StartupFailureCause,
-        StopReason,
+        Cancellation, ChildId, Exit, ExitError, ExitKind, ScopeState, StartupFailure,
+        StartupFailureCause, StopReason, identity::ScopeIdentity, policy::ScopeFlavor,
     };
 
-    use crate::{
-        ChildId, MemberCell, RetainedExit, RetainedStopReason, ScopeCell, StartupDisposition,
-        identity::ScopeIdentity, policy::ScopeFlavor,
-    };
+    use crate::{MemberCell, RetainedExit, RetainedStopReason, ScopeCell, StartupDisposition};
 
     struct ThreadProbe(mpsc::SyncSender<std::thread::ThreadId>);
 
@@ -2639,6 +2596,102 @@ mod tests {
             disposal_thread, retiring_thread,
             "a retained failed exit must not run its user destructor inline"
         );
+    }
+
+    #[test]
+    fn a_losing_failed_terminal_exit_disposes_off_the_retiring_thread() {
+        let retiring_thread = std::thread::current().id();
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("worker");
+        let member = MemberCell::new(
+            id.clone(),
+            identity
+                .mint_membership(&id)
+                .expect("membership is available"),
+        );
+        member.terminalize(
+            Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+            StartupDisposition::Unchanged,
+        );
+        let (dropped, observed) = mpsc::sync_channel(1);
+
+        member.terminalize(
+            Exit::new(
+                ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+                Cancellation::NotObserved,
+            ),
+            StartupDisposition::Unchanged,
+        );
+
+        let disposal_thread = observed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("losing exit disposal completes");
+        assert_ne!(
+            disposal_thread, retiring_thread,
+            "a losing failed exit must not run its user destructor on the committing thread"
+        );
+    }
+
+    #[test]
+    fn a_stale_scope_verdict_disposes_its_nested_exit_off_the_finishing_thread() {
+        let finishing_thread = std::thread::current().id();
+        let mut identity = ScopeIdentity::new();
+        let root_id = ChildId::from("root");
+        let root = MemberCell::new(
+            root_id.clone(),
+            identity
+                .mint_membership(&root_id)
+                .expect("root membership is available"),
+        );
+        let scope = ScopeCell::new(root, ScopeFlavor::Ordered, ScopeIdentity::new());
+        let child_id = ChildId::from("worker");
+        let child = MemberCell::new(
+            child_id.clone(),
+            identity
+                .mint_membership(&child_id)
+                .expect("child membership is available"),
+        );
+
+        let stale = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("first scope epoch is available");
+        scope.finish_incarnation(stale, StopReason::Finished);
+        let live = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("second scope epoch is available");
+
+        // The stale epoch is declined, so this structured verdict is never
+        // published — but the framework still owns the failed child `Exit` it
+        // recursively carries, and must not run that user destructor inline.
+        let (dropped, observed) = mpsc::sync_channel(1);
+        scope.finish_incarnation(
+            stale,
+            StopReason::StartupFailed(StartupFailure {
+                cause: StartupFailureCause::Child {
+                    id: child_id,
+                    membership: child.membership(),
+                    exit: Exit::new(
+                        ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+                        Cancellation::NotObserved,
+                    ),
+                },
+            }),
+        );
+
+        let disposal_thread = observed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the stale verdict's nested exit is destroyed");
+        assert_ne!(
+            disposal_thread, finishing_thread,
+            "a declined stop reason must not run its nested user destructor on the \
+             finishing thread"
+        );
+        assert_eq!(
+            scope.record().state,
+            ScopeState::Starting,
+            "the stale verdict must not rewrite the newer incarnation"
+        );
+        scope.finish_incarnation(live, StopReason::Finished);
     }
 
     #[test]

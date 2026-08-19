@@ -1,8 +1,9 @@
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{future::Future, time::Duration};
 
 use tokio::time;
 
 use shelterwood_core::deadline::Deadline;
+pub use shelterwood_mailbox::BoxedSleep;
 
 /// Advances a paused test clock, keeping timer control in this module.
 #[cfg(any(test, feature = "test-util"))]
@@ -37,19 +38,8 @@ fn next_timer_deadline(
     )
 }
 
-pub type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-
-pub fn deadline(duration: Duration) -> Deadline {
+fn deadline(duration: Duration) -> Deadline {
     Deadline::after(now(), duration)
-}
-
-pub fn sleep_deadline(deadline: Deadline) -> BoxedSleep {
-    Box::pin(async move {
-        match deadline.instant() {
-            Some(deadline) => sleep_until_std(deadline).await,
-            None => std::future::pending().await,
-        }
-    })
 }
 
 pub fn sleep_until(deadline: std::time::Instant) -> BoxedSleep {
@@ -88,7 +78,7 @@ where
     // deadline addition overflows outright; a representable deadline flush
     // against the clock limit would still panic at arming. Route the
     // budget through Deadline so an unarmable timeout never elapses,
-    // matching sleep_deadline's overflow semantics.
+    // matching the runtime's absolute-deadline overflow semantics.
     let Some(deadline) = deadline(duration).instant() else {
         return Timeout::Completed(future.await);
     };
@@ -151,6 +141,28 @@ mod tests {
         assert!(sleep.as_mut().poll(&mut context).is_pending());
     }
 
+    /// Reports an `Instant` domain too narrow for Tokio's u64-millisecond tick
+    /// boundary, roughly 584 million years out.
+    ///
+    /// Linux's `Instant` is a `timespec` whose seconds field spans that;
+    /// targets counting nanoseconds in a `u64` overflow long before. CI runs
+    /// Linux only, so there the skip is a defect rather than a platform fact
+    /// and must be loud: nextest prints captured output for failing tests
+    /// only, so a bare diagnostic on a supported target reports as an
+    /// ordinary pass and hides the lost coverage.
+    fn skip_unrepresentable_tick_boundary(test: &str) {
+        #[cfg(target_os = "linux")]
+        panic!(
+            "{test}: this target's Instant must represent Tokio's \
+             u64-millisecond boundary, so it must be exercised, not skipped"
+        );
+        #[cfg(not(target_os = "linux"))]
+        eprintln!(
+            "skipping {test}: this platform's Instant cannot represent \
+             Tokio's u64-millisecond boundary"
+        );
+    }
+
     #[test]
     fn deadline_beyond_tokios_tick_range_is_armed_in_a_bounded_slice() {
         // Tokio 1.53 reserves the top three u64 millisecond ticks. The exact
@@ -161,9 +173,8 @@ mod tests {
         let Some(requested) = current.checked_add(beyond_tokio_ticks) else {
             // Some platforms have a narrower Instant domain than Tokio's
             // u64 millisecond tick range, so this boundary cannot be tested.
-            eprintln!(
-                "skipping deadline_beyond_tokios_tick_range_is_armed_in_a_bounded_slice: \
-                 this platform's Instant cannot represent Tokio's u64-millisecond boundary"
+            skip_unrepresentable_tick_boundary(
+                "deadline_beyond_tokios_tick_range_is_armed_in_a_bounded_slice",
             );
             return;
         };
@@ -179,9 +190,8 @@ mod tests {
         let current = super::now();
         let Some(requested) = current.checked_add(Duration::from_millis(u64::MAX - 2)) else {
             // See `deadline_beyond_tokios_tick_range_is_armed_in_a_bounded_slice`.
-            eprintln!(
-                "skipping deadline_beyond_tokios_tick_range_does_not_fire_at_the_first_slice: \
-                 this platform's Instant cannot represent Tokio's u64-millisecond boundary"
+            skip_unrepresentable_tick_boundary(
+                "deadline_beyond_tokios_tick_range_does_not_fire_at_the_first_slice",
             );
             return;
         };

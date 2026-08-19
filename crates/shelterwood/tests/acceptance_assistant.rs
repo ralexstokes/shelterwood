@@ -643,6 +643,11 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     let mut saw_control_restart = false;
     let mut saw_tool_restart = false;
     let mut saw_gateway_restart = false;
+    // Lag here is a fixture defect, not load: this trace publishes a bounded
+    // number of edges — three restarts and one temporary child on top of a
+    // fixed tree — against the 128-event subscriber capacity, and nothing but
+    // this drain and the wait above reads it. A marker would mean dropped
+    // edges silently deciding the flags below, so it fails loudly instead.
     while let Ok(item) = lifecycle.try_recv() {
         let LifecycleItem::Event(event) = item else {
             panic!("the bounded assistant trace must not lag")

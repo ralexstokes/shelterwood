@@ -291,6 +291,7 @@ mod tests {
             panic!("hostile observation waker");
         }
     }
+
     #[test]
     fn lost_admission_response_policy_fails_closed() {
         assert!(matches!(

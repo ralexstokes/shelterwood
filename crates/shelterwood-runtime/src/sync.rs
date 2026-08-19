@@ -1,15 +1,108 @@
 use std::{
     fmt,
+    future::Future,
     pin::Pin,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
+    task::{Context, Poll, Waker},
 };
 
-use tokio::sync::{Notify, broadcast, oneshot, watch};
+use tokio::sync::{broadcast, oneshot};
 
-use super::dispose_detached;
+use super::{PanicAccumulator, dispose_detached};
+
+/// A caller-waker registry whose lock protects only inert storage changes.
+///
+/// Registration clones happen before entering the registry. Removal and
+/// draining only move wakers out; their vtables run after unlock, one behind
+/// each accumulator boundary. The opaque identity is retained by its waiter,
+/// so its `Arc` traffic under the lock cannot destroy even framework data.
+#[derive(Default)]
+struct WaiterRegistry {
+    waiters: Mutex<Vec<RegisteredWaker>>,
+}
+
+struct RegisteredWaker {
+    identity: Arc<()>,
+    waker: Waker,
+}
+
+impl WaiterRegistry {
+    fn register(&self, identity: &Arc<()>, waker: Waker) -> Option<RegisteredWaker> {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .expect("waiter registry lock is never held across caller code");
+        if let Some(index) = waiters
+            .iter()
+            .position(|waiter| Arc::ptr_eq(&waiter.identity, identity))
+        {
+            Some(std::mem::replace(
+                &mut waiters[index],
+                RegisteredWaker {
+                    identity: Arc::clone(identity),
+                    waker,
+                },
+            ))
+        } else {
+            waiters.push(RegisteredWaker {
+                identity: Arc::clone(identity),
+                waker,
+            });
+            None
+        }
+    }
+
+    fn remove(&self, identity: &Arc<()>) -> Option<RegisteredWaker> {
+        let mut waiters = self
+            .waiters
+            .lock()
+            .expect("waiter registry lock is never held across caller code");
+        waiters
+            .iter()
+            .position(|waiter| Arc::ptr_eq(&waiter.identity, identity))
+            .map(|index| waiters.swap_remove(index))
+    }
+
+    fn wake_all(&self) {
+        let waiters = {
+            let mut waiters = self
+                .waiters
+                .lock()
+                .expect("waiter registry lock is never held across caller code");
+            std::mem::take(&mut *waiters)
+        };
+        let mut panics = PanicAccumulator::default();
+        for RegisteredWaker { waker, .. } in waiters {
+            panics.run(|| waker.wake());
+        }
+    }
+
+    fn drop_registered(waiters: impl IntoIterator<Item = Option<RegisteredWaker>>) {
+        let mut panics = PanicAccumulator::default();
+        for waiter in waiters.into_iter().flatten() {
+            panics.run(|| drop(waiter));
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.waiters
+            .lock()
+            .expect("waiter registry lock is never held across caller code")
+            .len()
+    }
+}
+
+impl fmt::Debug for WaiterRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WaiterRegistry")
+            .field("waiters", &self.len())
+            .finish()
+    }
+}
 
 #[derive(Debug)]
 pub struct Signal {
@@ -56,14 +149,13 @@ impl SignalWatcher {
         self.inner.changed().await;
     }
 }
-/// A one-shot, multi-waiter signal backed by Tokio's waiter queue.
+/// A one-shot, multi-waiter signal backed by a contained waiter registry.
 ///
 /// The atomic provides a linearizable, idempotent transition and retains the
-/// fired state for future waiters. [`Notify`] wakes the waiters that already
-/// exist and removes cancelled waits from its intrusive queue. Creating the
-/// notification before rechecking the atomic is essential: Tokio guarantees
-/// that such a notification observes a subsequent `notify_waiters`, even when
-/// it has not been polled yet.
+/// fired state for future waiters. A wait registers before rechecking that
+/// state, so it either observes the transition or is present in the registry
+/// drained by the publisher. Each drained waker runs independently after the
+/// registry lock is released.
 ///
 /// This deliberately does not use `tokio_util::sync::CancellationToken`.
 /// Shelterwood also uses latches for readiness and completion, needs `fire` to
@@ -80,7 +172,7 @@ pub struct Latch {
 #[derive(Debug, Default)]
 struct LatchState {
     fired: AtomicBool,
-    notify: Notify,
+    waiters: WaiterRegistry,
 }
 
 impl Latch {
@@ -98,11 +190,9 @@ impl Latch {
     /// Splitting the transition from the wake lets an observation-gate
     /// transaction linearize the fire inside its critical section while
     /// deferring the waker-visible [`Self::notify`] until after the gate is
-    /// released. Deferral cannot strand a waiter: [`Self::fired`] rechecks
-    /// `is_fired` after creating its notification, so a waiter either
-    /// observes the committed transition directly or holds a notification
-    /// created before the deferred `notify_waiters`, which Tokio guarantees
-    /// to be observed even when it has not been polled yet.
+    /// released. Deferral cannot strand a waiter: [`Self::fired`] registers
+    /// before rechecking `is_fired`, so a waiter either observes the committed
+    /// transition directly or is present for the deferred drain.
     pub fn fire_silently(&self) -> bool {
         self.state
             .fired
@@ -116,24 +206,61 @@ impl Latch {
     /// won `fire_silently` inside an observation-gate transaction defer this
     /// wake past the gate release.
     pub fn notify(&self) {
-        self.state.notify.notify_waiters();
+        self.state.waiters.wake_all();
     }
 
     pub fn is_fired(&self) -> bool {
         self.state.fired.load(Ordering::Acquire)
     }
 
-    pub async fn fired(&self) {
-        if self.is_fired() {
-            return;
+    pub fn fired(&self) -> LatchWait<'_> {
+        LatchWait {
+            latch: self,
+            identity: Arc::new(()),
+        }
+    }
+}
+
+/// Future returned by [`Latch::fired`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct LatchWait<'a> {
+    latch: &'a Latch,
+    identity: Arc<()>,
+}
+
+impl Future for LatchWait<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.latch.is_fired() {
+            let registered = this.latch.state.waiters.remove(&this.identity);
+            WaiterRegistry::drop_registered([registered]);
+            return Poll::Ready(());
         }
 
-        let notified = self.state.notify.notified();
-        if self.is_fired() {
-            return;
+        // Caller code runs before the registry lock is acquired.
+        let waker = context.waker().clone();
+        let displaced = this.latch.state.waiters.register(&this.identity, waker);
+        let fired = this.latch.is_fired();
+        let registered = fired
+            .then(|| this.latch.state.waiters.remove(&this.identity))
+            .flatten();
+        // Finish the register/recheck protocol before a hostile displaced
+        // waker destructor is allowed to resume its panic.
+        WaiterRegistry::drop_registered([displaced, registered]);
+        if fired {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
-        notified.await;
-        debug_assert!(self.is_fired());
+    }
+}
+
+impl Drop for LatchWait<'_> {
+    fn drop(&mut self) {
+        let registered = self.latch.state.waiters.remove(&self.identity);
+        WaiterRegistry::drop_registered([registered]);
     }
 }
 
@@ -306,6 +433,15 @@ impl<T> OneShotSender<T> {
     }
 
     pub fn is_closed(&self) -> bool {
+        // Observed under the observation gate and the dynamic-state mutex
+        // (`RemovalResponses::subscribe`), so the missing-channel verdict
+        // cannot be raised as a panic without poisoning both for every later
+        // caller. The total form reports the taken channel as closed, which
+        // is what a sender past `send` is.
+        debug_assert!(
+            self.channel.is_some(),
+            "an observable one-shot sender retains its channel"
+        );
         self.channel.as_ref().is_none_or(oneshot::Sender::is_closed)
     }
 }
@@ -451,40 +587,112 @@ impl<T> Drop for DisposingReceiver<T> {
     }
 }
 
+/// Shared state for the framework's conflating watch channel.
+///
+/// The value lock never contains wakers. Versions and endpoint counts are
+/// atomic so waiter registration can use the same register/recheck protocol
+/// as [`Latch`] without nesting locks.
+struct WatchShared<T> {
+    value: Mutex<T>,
+    version: AtomicU64,
+    senders: AtomicUsize,
+    receivers: AtomicUsize,
+    waiters: WaiterRegistry,
+}
+
+impl<T> WatchShared<T> {
+    /// Acquires the retained value, tolerating poisoning.
+    ///
+    /// `modify_silently` and `read_with` run a caller closure under this
+    /// guard, and those closures do real work: a lifecycle publication sends
+    /// on a broadcast channel here, and a snapshot installation evaluates a
+    /// `debug_assert!` and mints a generation. A panic in any of them would
+    /// otherwise wedge every later read, publication, subscription and
+    /// terminal wait on the channel. The guarded data is plain framework
+    /// state with no invariant spanning the closure, so the surviving value
+    /// stays usable; this matches `ObservationGate::lock`, which tolerates
+    /// poisoning for the same reason.
+    fn value(&self) -> MutexGuard<'_, T> {
+        self.value.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Publishing half of a runtime-backed conflating state channel.
-pub struct WatchSender<T>(watch::Sender<T>);
+pub struct WatchSender<T> {
+    shared: Arc<WatchShared<T>>,
+}
 
 /// Observing half of a runtime-backed conflating state channel.
-pub struct WatchReceiver<T>(watch::Receiver<T>);
+pub struct WatchReceiver<T> {
+    shared: Arc<WatchShared<T>>,
+    seen: u64,
+}
+
+fn retain_endpoint(counter: &AtomicUsize, endpoint: &str) {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            count.checked_add(1)
+        })
+        .unwrap_or_else(|_| panic!("{endpoint} count exhausted"));
+}
 
 impl<T> Clone for WatchSender<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        retain_endpoint(&self.shared.senders, "watch sender");
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl<T> Drop for WatchSender<T> {
+    fn drop(&mut self) {
+        let previous = self.shared.senders.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "a watch sender is released at most once");
+        if previous == 1 {
+            self.shared.waiters.wake_all();
+        }
     }
 }
 
 pub fn watch<T>(initial: T) -> (WatchSender<T>, WatchReceiver<T>) {
-    let (sender, receiver) = watch::channel(initial);
-    (WatchSender(sender), WatchReceiver(receiver))
+    let shared = Arc::new(WatchShared {
+        value: Mutex::new(initial),
+        version: AtomicU64::new(0),
+        senders: AtomicUsize::new(1),
+        receivers: AtomicUsize::new(1),
+        waiters: WaiterRegistry::default(),
+    });
+    (
+        WatchSender {
+            shared: Arc::clone(&shared),
+        },
+        WatchReceiver { shared, seen: 0 },
+    )
 }
 
 impl<T> WatchSender<T> {
     /// Whether both senders address the same watch channel.
     #[must_use]
     pub fn same_channel(&self, other: &Self) -> bool {
-        self.0.same_channel(&other.0)
+        Arc::ptr_eq(&self.shared, &other.shared)
     }
 
     pub fn watcher(&self) -> WatchReceiver<T> {
-        WatchReceiver(self.0.subscribe())
+        retain_endpoint(&self.shared.receivers, "watch receiver");
+        WatchReceiver {
+            shared: Arc::clone(&self.shared),
+            seen: self.shared.version.load(Ordering::Acquire),
+        }
     }
 
     pub fn receiver_count(&self) -> usize {
-        self.0.receiver_count()
+        self.shared.receivers.load(Ordering::Acquire)
     }
 
     pub fn pulse(&self) {
-        self.0.send_modify(|_| {});
+        self.shared.version.fetch_add(1, Ordering::AcqRel);
+        self.shared.waiters.wake_all();
     }
 
     /// Mutates the retained value without advancing the watch version.
@@ -493,31 +701,130 @@ impl<T> WatchSender<T> {
     /// synchronous state transition before receivers are notified. The caller
     /// must follow a successful logical mutation with [`Self::pulse`].
     pub fn modify_silently(&self, update: impl FnOnce(&mut T)) {
-        let notified = self.0.send_if_modified(|value| {
-            update(value);
-            false
-        });
-        debug_assert!(!notified);
+        let mut value = self.shared.value();
+        update(&mut value);
     }
 
     /// Reads a projection of the retained value without cloning it.
     ///
-    /// `project` runs under the watch's read guard, so it must stay cheap and
+    /// `project` runs under the watch's value guard, so it must stay cheap and
     /// must not touch the same channel.
     pub fn read_with<R>(&self, project: impl FnOnce(&T) -> R) -> R {
-        project(&self.0.borrow())
+        let value = self.shared.value();
+        project(&value)
     }
 }
 
 impl<T: Clone> WatchSender<T> {
     pub fn read_cloned(&self) -> T {
-        self.0.borrow().clone()
+        self.shared.value().clone()
     }
 }
 
 impl<T> Clone for WatchReceiver<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        retain_endpoint(&self.shared.receivers, "watch receiver");
+        Self {
+            shared: Arc::clone(&self.shared),
+            seen: self.seen,
+        }
+    }
+}
+
+impl<T> Drop for WatchReceiver<T> {
+    fn drop(&mut self) {
+        let previous = self.shared.receivers.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "a watch receiver is released at most once");
+    }
+}
+
+enum WatchWaitOutcome {
+    Changed,
+    Closed,
+}
+
+struct WatchWait<'a, T> {
+    receiver: &'a mut WatchReceiver<T>,
+    identity: Arc<()>,
+}
+
+impl<T> WatchWait<'_, T> {
+    fn poll(&mut self, context: &mut Context<'_>) -> Poll<WatchWaitOutcome> {
+        let version = self.receiver.shared.version.load(Ordering::Acquire);
+        if version != self.receiver.seen {
+            self.receiver.seen = version;
+            let registered = self.receiver.shared.waiters.remove(&self.identity);
+            WaiterRegistry::drop_registered([registered]);
+            return Poll::Ready(WatchWaitOutcome::Changed);
+        }
+        if self.receiver.shared.senders.load(Ordering::Acquire) == 0 {
+            let registered = self.receiver.shared.waiters.remove(&self.identity);
+            WaiterRegistry::drop_registered([registered]);
+            return Poll::Ready(WatchWaitOutcome::Closed);
+        }
+
+        // Caller code runs before the registry lock is acquired.
+        let waker = context.waker().clone();
+        let displaced = self.receiver.shared.waiters.register(&self.identity, waker);
+        let version = self.receiver.shared.version.load(Ordering::Acquire);
+        let outcome = if version != self.receiver.seen {
+            self.receiver.seen = version;
+            Some(WatchWaitOutcome::Changed)
+        } else if self.receiver.shared.senders.load(Ordering::Acquire) == 0 {
+            Some(WatchWaitOutcome::Closed)
+        } else {
+            None
+        };
+        let registered = outcome
+            .is_some()
+            .then(|| self.receiver.shared.waiters.remove(&self.identity))
+            .flatten();
+        // Complete the publication recheck before a hostile displaced waker
+        // destructor is allowed to resume its panic.
+        WaiterRegistry::drop_registered([displaced, registered]);
+        outcome.map_or(Poll::Pending, Poll::Ready)
+    }
+}
+
+impl<T> Drop for WatchWait<'_, T> {
+    fn drop(&mut self) {
+        let registered = self.receiver.shared.waiters.remove(&self.identity);
+        WaiterRegistry::drop_registered([registered]);
+    }
+}
+
+/// Future returned by [`WatchReceiver::changed`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct WatchChanged<'a, T> {
+    wait: WatchWait<'a, T>,
+}
+
+impl<T> Future for WatchChanged<'_, T> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut().wait.poll(context) {
+            Poll::Ready(WatchWaitOutcome::Changed) => Poll::Ready(()),
+            Poll::Ready(WatchWaitOutcome::Closed) | Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Future returned by [`WatchReceiver::changed_or_closed`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct WatchChangedOrClosed<'a, T> {
+    wait: WatchWait<'a, T>,
+}
+
+impl<T> Future for WatchChangedOrClosed<'_, T> {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut().wait.poll(context) {
+            Poll::Ready(WatchWaitOutcome::Changed) => Poll::Ready(true),
+            Poll::Ready(WatchWaitOutcome::Closed) => Poll::Ready(false),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -527,42 +834,54 @@ impl<T> WatchReceiver<T> {
     /// Callers that need to observe publisher closure must use
     /// [`Self::changed_or_closed`] instead. Parking here prevents a loop that
     /// intentionally ignores closure from becoming permanently always-ready.
-    pub async fn changed(&mut self) {
-        if self.0.changed().await.is_err() {
-            std::future::pending().await
+    pub fn changed(&mut self) -> WatchChanged<'_, T> {
+        WatchChanged {
+            wait: WatchWait {
+                receiver: self,
+                identity: Arc::new(()),
+            },
         }
     }
 
-    pub async fn changed_or_closed(&mut self) -> bool {
-        self.0.changed().await.is_ok()
+    pub fn changed_or_closed(&mut self) -> WatchChangedOrClosed<'_, T> {
+        WatchChangedOrClosed {
+            wait: WatchWait {
+                receiver: self,
+                identity: Arc::new(()),
+            },
+        }
     }
 }
 
 impl<T: Clone> WatchReceiver<T> {
     pub fn borrow_cloned(&self) -> T {
-        self.0.borrow().clone()
+        self.shared.value().clone()
     }
 
     pub fn borrow_and_update_cloned(&mut self) -> T {
-        self.0.borrow_and_update().clone()
+        let value = self.shared.value();
+        // Sampling the version before cloning may produce a harmless extra
+        // wake if a pulse races this read, but cannot mark an unseen value as
+        // observed. Publication writes the value before advancing the version.
+        self.seen = self.shared.version.load(Ordering::Acquire);
+        value.clone()
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for WatchSender<T> {
+impl<T> fmt::Debug for WatchSender<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WatchSender")
-            .field("value", &*self.0.borrow())
-            .field("receivers", &self.0.receiver_count())
-            .finish()
+            .field("receivers", &self.receiver_count())
+            .finish_non_exhaustive()
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for WatchReceiver<T> {
+impl<T> fmt::Debug for WatchReceiver<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WatchReceiver")
-            .field("value", &*self.0.borrow())
+            .field("seen", &self.seen)
             .finish_non_exhaustive()
     }
 }
@@ -642,6 +961,7 @@ impl<T> fmt::Debug for BroadcastReceiver<T> {
 mod tests {
     use std::{
         future::Future,
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -661,6 +981,30 @@ mod tests {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    struct CountPanicWake {
+        wakes: Arc<AtomicUsize>,
+        message: &'static str,
+    }
+
+    impl Wake for CountPanicWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(self.message);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(self.message);
+        }
+    }
+
+    fn assert_panic_message(payload: &(dyn std::any::Any + Send), expected: &'static str) {
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -784,6 +1128,137 @@ mod tests {
     }
 
     #[test]
+    fn hostile_latch_waiter_cannot_strand_a_well_behaved_waiter() {
+        const PANIC: &str = "injected latch waker panic";
+
+        let latch = Latch::default();
+        let hostile_wakes = Arc::new(AtomicUsize::new(0));
+        let ordinary_wakes = Arc::new(AtomicUsize::new(0));
+        let hostile = Waker::from(Arc::new(CountPanicWake {
+            wakes: Arc::clone(&hostile_wakes),
+            message: PANIC,
+        }));
+        let ordinary = Waker::from(Arc::new(CountWake(Arc::clone(&ordinary_wakes))));
+        let mut hostile_wait = Box::pin(latch.fired());
+        let mut ordinary_wait = Box::pin(latch.fired());
+        assert!(
+            hostile_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        assert!(
+            ordinary_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&ordinary))
+                .is_pending()
+        );
+
+        let result = catch_unwind(AssertUnwindSafe(|| latch.fire()));
+
+        let payload = result.expect_err("the hostile latch wake still surfaces");
+        assert_panic_message(&*payload, PANIC);
+        assert!(latch.is_fired());
+        assert_eq!(hostile_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(ordinary_wakes.load(Ordering::SeqCst), 1);
+        assert!(
+            ordinary_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&ordinary))
+                .is_ready()
+        );
+    }
+
+    #[test]
+    fn hostile_watch_waiter_cannot_strand_a_well_behaved_pulse_waiter() {
+        const PANIC: &str = "injected watch pulse waker panic";
+
+        let (sender, mut hostile_receiver) = super::watch(0_u8);
+        let mut ordinary_receiver = sender.watcher();
+        let hostile_wakes = Arc::new(AtomicUsize::new(0));
+        let ordinary_wakes = Arc::new(AtomicUsize::new(0));
+        let hostile = Waker::from(Arc::new(CountPanicWake {
+            wakes: Arc::clone(&hostile_wakes),
+            message: PANIC,
+        }));
+        let ordinary = Waker::from(Arc::new(CountWake(Arc::clone(&ordinary_wakes))));
+        let mut hostile_wait = Box::pin(hostile_receiver.changed_or_closed());
+        let mut ordinary_wait = Box::pin(ordinary_receiver.changed_or_closed());
+        assert!(
+            hostile_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        assert!(
+            ordinary_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&ordinary))
+                .is_pending()
+        );
+        sender.modify_silently(|value| *value = 1);
+
+        let result = catch_unwind(AssertUnwindSafe(|| sender.pulse()));
+
+        let payload = result.expect_err("the hostile watch pulse still surfaces");
+        assert_panic_message(&*payload, PANIC);
+        assert_eq!(hostile_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(ordinary_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ordinary_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&ordinary)),
+            Poll::Ready(true)
+        );
+        drop(hostile_wait);
+        drop(ordinary_wait);
+        assert_eq!(hostile_receiver.borrow_and_update_cloned(), 1);
+        assert_eq!(ordinary_receiver.borrow_and_update_cloned(), 1);
+    }
+
+    #[test]
+    fn hostile_watch_waiter_cannot_strand_a_well_behaved_close_waiter() {
+        const PANIC: &str = "injected watch close waker panic";
+
+        let (sender, mut hostile_receiver) = super::watch(());
+        let mut ordinary_receiver = sender.watcher();
+        let hostile_wakes = Arc::new(AtomicUsize::new(0));
+        let ordinary_wakes = Arc::new(AtomicUsize::new(0));
+        let hostile = Waker::from(Arc::new(CountPanicWake {
+            wakes: Arc::clone(&hostile_wakes),
+            message: PANIC,
+        }));
+        let ordinary = Waker::from(Arc::new(CountWake(Arc::clone(&ordinary_wakes))));
+        let mut hostile_wait = Box::pin(hostile_receiver.changed_or_closed());
+        let mut ordinary_wait = Box::pin(ordinary_receiver.changed_or_closed());
+        assert!(
+            hostile_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        assert!(
+            ordinary_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&ordinary))
+                .is_pending()
+        );
+
+        let result = catch_unwind(AssertUnwindSafe(|| drop(sender)));
+
+        let payload = result.expect_err("the hostile watch close still surfaces");
+        assert_panic_message(&*payload, PANIC);
+        assert_eq!(hostile_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(ordinary_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ordinary_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&ordinary)),
+            Poll::Ready(false)
+        );
+    }
+
+    #[test]
     fn completion_waiters_cover_parked_and_already_completed_paths() {
         let parked = CompletionGatedLatch::default();
         let wakes = Arc::new(AtomicUsize::new(0));
@@ -847,6 +1322,28 @@ mod tests {
             assert_eq!(latch.is_fired(), completion_saw_fire);
             assert!(!latch.fire(), "completion closes later publication");
         }
+    }
+
+    #[test]
+    fn a_panicking_watch_closure_leaves_the_channel_usable() {
+        let (sender, mut receiver) = super::watch(0u8);
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            sender.modify_silently(|value| {
+                *value = 1;
+                panic!("injected watch mutation panic");
+            });
+        }));
+        assert!(panicked.is_err());
+
+        // The guard is poisoned; every later reader must still see the
+        // surviving framework state rather than inheriting the panic.
+        assert_eq!(sender.read_cloned(), 1);
+        assert_eq!(sender.read_with(|value| *value), 1);
+        assert_eq!(receiver.borrow_cloned(), 1);
+        assert_eq!(receiver.borrow_and_update_cloned(), 1);
+        sender.modify_silently(|value| *value = 2);
+        sender.pulse();
+        assert_eq!(receiver.borrow_cloned(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -17,7 +17,7 @@ use shelterwood::{
     Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LIFECYCLE_EVENT_CAPACITY,
     LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleSeq,
     LifecycleTryRecvError, MembershipStatus, RemoveOutcome, RestartCondition, RestartCount,
-    RestartPolicy, Retention, ScopeKind, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef,
+    RestartPolicy, Retention, ScopeFlavor, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef,
     SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, TotalRestarts, Tree, WaitError,
 };
 
@@ -1267,7 +1267,6 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
         Backoff::fixed(Duration::from_secs(5), Jitter::None).expect("valid backoff"),
     );
     let mut nested = Tree::new();
-    nested.strategy(Strategy::OneForOne);
     nested.intensity(Intensity::new(3, Duration::from_secs(45)).expect("valid intensity"));
     nested
         .add_task(
@@ -1332,7 +1331,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
 
     let running = scope.as_scope().snapshot();
     assert_eq!(running.state, ScopeState::Running);
-    assert_eq!(running.kind, ScopeKind::Dynamic);
+    assert_eq!(running.kind, ScopeFlavor::Dynamic);
     assert_eq!(
         running.strategy, None,
         "dynamic scopes have no fate-sharing strategy"
@@ -1369,7 +1368,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     let recursive = nested_row.nested.as_ref().expect("nested scope is live");
     assert_eq!(nested_row.scope_seq, Some(recursive.lifecycle_seq));
     assert_eq!(recursive.state, ScopeState::Running);
-    assert_eq!(recursive.kind, ScopeKind::Ordered);
+    assert_eq!(recursive.kind, ScopeFlavor::Ordered);
     assert_eq!(recursive.strategy, Some(Strategy::OneForOne));
     assert_eq!(
         recursive.intensity,

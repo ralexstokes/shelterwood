@@ -167,6 +167,42 @@ fn stale_scope_driver_cannot_stop_a_newer_live_incarnation_projection() {
 }
 
 #[test]
+fn a_stale_scope_verdict_destroys_its_nested_exit_outside_the_gate() {
+    let scope = isolated_scope("scope", ScopeFlavor::Ordered);
+    let first = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("first scope epoch is available");
+    scope.finish_incarnation(first, StopReason::Finished);
+    let second = scope
+        .begin_incarnation(ScopeState::Starting)
+        .expect("second scope epoch is available");
+    scope.set_state(ScopeState::Running);
+
+    let (exit, held_at_drop) = gate_probe_exit(&scope);
+    scope.finish_incarnation(
+        first,
+        StopReason::StartupFailed(StartupFailure {
+            cause: StartupFailureCause::Child {
+                id: ChildId::from("worker"),
+                membership: scope.member.membership(),
+                exit,
+            },
+        }),
+    );
+
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
+        "a stale structured stop reason must outlive the observation gate"
+    );
+    assert_eq!(
+        scope.record().state,
+        ScopeState::Running,
+        "the stale verdict must not rewrite the newer incarnation"
+    );
+    scope.finish_incarnation(second, StopReason::Finished);
+}
+
+#[test]
 fn a_new_incarnation_owns_an_unpublished_startup_verdict() {
     let scope = isolated_scope("scope", ScopeFlavor::Ordered);
     let first = scope
@@ -808,8 +844,9 @@ async fn panicking_nested_factory_releases_its_pre_driver_epoch() {
             crate::policy::ResolvedDefaults::default(),
             NestedScopeLatches {
                 parent_ready: CompletionGatedLatch::default(),
+                child_shutdown: Latch::default(),
                 ancestor: AncestorCommandLatches {
-                    shutdown: Latch::default(),
+                    framework_shutdown: Latch::default(),
                     abort: Latch::default(),
                     abort_ack: Latch::default(),
                 },
@@ -961,7 +998,7 @@ fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
     let scope = isolated_scope("scope", ScopeFlavor::Ordered);
     let first = Intensity::new(1, Duration::from_secs(1)).expect("valid first intensity");
     let second = Intensity::new(2, Duration::from_secs(2)).expect("valid second intensity");
-    scope.set_observation_config(Default::default(), first);
+    scope.set_observation_config(first);
 
     let start = Arc::new(Barrier::new(2));
     let (first_update, first_update_seen) = std::sync::mpsc::sync_channel(0);
@@ -972,7 +1009,7 @@ fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
         writer_start.wait();
         for update in 0..UPDATES {
             let intensity = if update % 2 == 0 { second } else { first };
-            writer_scope.set_observation_config(Default::default(), intensity);
+            writer_scope.set_observation_config(intensity);
             if update == 0 {
                 first_update
                     .send(())
@@ -1149,7 +1186,7 @@ fn plain_parent_state_preserves_nested_snapshot_propagation() {
     let snapshots = root.subscribe_snapshots();
     let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
 
-    nested.set_observation_config(Default::default(), intensity);
+    nested.set_observation_config(intensity);
 
     assert_eq!(
         snapshots
@@ -1346,6 +1383,46 @@ fn a_losing_terminal_exit_payload_is_destroyed_outside_the_gate() {
     assert!(
         !wait_for_gate_probe(&held_at_drop),
         "a competing terminalizer's exit payload must outlive the gate"
+    );
+}
+
+#[test]
+fn a_losing_supervised_terminal_exit_is_a_complete_noop_outside_the_gate() {
+    let root = isolated_scope("root", ScopeFlavor::Ordered);
+    let child_id = ChildId::from("worker");
+    let member = MemberCell::new(
+        child_id.clone(),
+        root.mint_membership(&child_id)
+            .expect("child membership available"),
+    );
+    resolve_fixture_options(&member);
+    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    member.terminalize(
+        Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+        StartupDisposition::NotAborted,
+    );
+    let winning_record = member.record();
+    let mut events = root.subscribe_lifecycle();
+
+    let (losing, held_at_drop) = gate_probe_exit(&root);
+    assert!(
+        !root.terminalize_child(&member, losing, None, StartupDisposition::Aborted),
+        "the outer guard rejects a losing supervised terminalizer"
+    );
+
+    assert!(
+        !wait_for_gate_probe(&held_at_drop),
+        "the rejected exit payload must leave through post-gate disposal"
+    );
+    assert_eq!(
+        member.record(),
+        winning_record,
+        "the rejected edge cannot reclassify the winning terminal record"
+    );
+    assert_eq!(
+        events.try_recv(),
+        Err(LifecycleTryRecvError::Empty),
+        "the rejected edge publishes no Exited event"
     );
 }
 

@@ -1,6 +1,7 @@
 //! Dynamic membership control-plane transport and bookkeeping.
 
 use std::{
+    any::Any,
     collections::HashMap,
     sync::{Arc, Mutex, Weak},
 };
@@ -8,13 +9,8 @@ use std::{
 use crate::{
     ChildId, Membership, ScopeState,
     admission::{NotAdmittingCause, RemoveOutcome, ReserveError},
-    cells::{
-        DynamicRoute, ErasedDynamicRoute, ErasedDynamicSlot, MemberStage, ObservationTxn, ScopeCell,
-    },
-    plan::{
-        ChildConstruction, SlotCell, checked_id, concrete_dynamic_slot, concrete_dynamic_slot_ref,
-        erase_dynamic_slot, mint_reserved_slot,
-    },
+    cells::{DynamicRoute, MemberStage, ObservationTxn, ScopeCell},
+    plan::{ChildConstruction, SlotCell, checked_id, mint_reserved_slot},
     policy::ScopeFlavor,
     runtime::{self, Latch},
 };
@@ -38,8 +34,11 @@ impl RemovalResponses {
     }
 
     fn complete(self, outcome: RemoveOutcome) {
+        let mut panics = runtime::PanicAccumulator::default();
         for sender in self.0 {
-            let _ = sender.send(outcome);
+            panics.run(|| {
+                let _ = sender.send(outcome);
+            });
         }
     }
 }
@@ -133,16 +132,6 @@ impl DynamicEntry {
         matches!(self.state, DynamicMembershipState::Removing { .. })
     }
 
-    fn removal_requested(&self) -> bool {
-        match &self.state {
-            DynamicMembershipState::Resident { fused_cancel, .. } => {
-                fused_cancel.as_ref().is_some_and(Latch::is_fired)
-            }
-            DynamicMembershipState::Removing { .. } => true,
-            DynamicMembershipState::Reserved => false,
-        }
-    }
-
     pub(super) fn key(&self) -> Option<ChildKey> {
         match self.state {
             DynamicMembershipState::Reserved => None,
@@ -227,7 +216,7 @@ impl DynamicState {
     }
 }
 
-pub(super) struct DynamicControl {
+pub(crate) struct DynamicControl {
     requests: runtime::UnboundedMpscSender<DriverEvent>,
     pub(super) state: Mutex<DynamicState>,
 }
@@ -256,6 +245,72 @@ impl DynamicControl {
                 _txn,
             );
         }
+    }
+
+    /// Recovers the façade-owned control from the restart-stable route slot.
+    ///
+    /// The lookup retains its transaction token: selecting the live
+    /// incarnation's control and acting on it are one observation-gated edge.
+    ///
+    /// A foreign route reads as no live incarnation rather than a panic. The
+    /// caller always holds the tree's outermost gate, so unwinding here would
+    /// poison it for every later operation instead of failing this one; both
+    /// call sites already have a graceful answer for `None`.
+    fn in_scope(scope: &ScopeCell, txn: &ObservationTxn<'_>) -> Option<Arc<DynamicControl>> {
+        let route: Arc<dyn Any + Send + Sync> = scope.dynamic_route_in(txn)?;
+        let control = Arc::downcast(route).ok();
+        debug_assert!(
+            control.is_some(),
+            "the façade installs only its concrete dynamic control"
+        );
+        control
+    }
+
+    pub(super) fn reserve(
+        &self,
+        scope: &Arc<ScopeCell>,
+        id: ChildId,
+        child_scope: Option<ScopeFlavor>,
+        txn: &mut ObservationTxn<'_>,
+    ) -> Result<Arc<SlotCell>, ReserveError> {
+        reserve_dynamic_slot(self, scope, id, child_scope, txn)
+    }
+
+    pub(super) fn start_admission(
+        self: Arc<Self>,
+        slot: Arc<SlotCell>,
+        fused_cancel: Option<Latch>,
+    ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
+        start_dynamic_admission(self, slot, fused_cancel)
+    }
+
+    pub(super) fn cancel_reservation(
+        &self,
+        scope: &ScopeCell,
+        slot: &SlotCell,
+        txn: &mut ObservationTxn<'_>,
+    ) {
+        cancel_dynamic_reservation_impl(scope, self, slot, txn);
+    }
+
+    pub(super) fn signal_fused_cancel(
+        &self,
+        scope: &Arc<ScopeCell>,
+        slot: &SlotCell,
+        latch: &Latch,
+        txn: &mut ObservationTxn<'_>,
+    ) {
+        signal_fused_cancel_impl(self, scope, slot, latch, txn);
+    }
+
+    pub(super) fn remove(
+        &self,
+        scope: &Arc<ScopeCell>,
+        id: &ChildId,
+        exact: Option<Membership>,
+        txn: &mut ObservationTxn<'_>,
+    ) -> RemovalResponse {
+        remove_dynamic_impl(self, scope, id, exact, txn)
     }
 
     fn close_admission_in(&self, _txn: &mut ObservationTxn<'_>) {
@@ -301,7 +356,7 @@ fn take_terminal_reservation(
 pub(crate) struct DynamicReservation {
     pub(crate) scope: Arc<ScopeCell>,
     pub(crate) slot: Arc<SlotCell>,
-    pub(crate) control: Arc<ErasedDynamicRoute>,
+    pub(crate) control: Arc<DynamicControl>,
 }
 
 pub(crate) fn reserve_dynamic(
@@ -325,11 +380,9 @@ pub(super) fn reserve_dynamic_in(
     if matches!(scope.member.record().stage, MemberStage::Terminal(_)) {
         return Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal));
     }
-    let control = scope
-        .dynamic_route_in(txn)
-        .ok_or(ReserveError::NotAdmitting(
-            NotAdmittingCause::NoLiveIncarnation,
-        ))?;
+    let control = DynamicControl::in_scope(scope, txn).ok_or(ReserveError::NotAdmitting(
+        NotAdmittingCause::NoLiveIncarnation,
+    ))?;
     match scope.record().state {
         ScopeState::Starting | ScopeState::Running => {}
         ScopeState::Draining => {
@@ -344,7 +397,7 @@ pub(super) fn reserve_dynamic_in(
             ));
         }
     }
-    let slot = concrete_dynamic_slot(control.reserve(scope, id, child_scope, txn)?);
+    let slot = control.reserve(scope, id, child_scope, txn)?;
     Ok(DynamicReservation {
         scope: Arc::clone(scope),
         slot,
@@ -364,7 +417,7 @@ fn reserve_dynamic_slot(
         return Err(ReserveError::NotAdmitting(NotAdmittingCause::Draining));
     }
     if let Some(existing) = state.entry(&id) {
-        if existing.removal_requested() {
+        if existing.removal_latched() {
             return Err(ReserveError::RemovalInProgress(id));
         }
         return Err(ReserveError::DuplicateId(id));
@@ -376,11 +429,11 @@ fn reserve_dynamic_slot(
 }
 
 pub(crate) fn start_admission(
-    control: Arc<ErasedDynamicRoute>,
+    control: Arc<DynamicControl>,
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
 ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
-    control.start_admission(erase_dynamic_slot(slot), fused_cancel)
+    control.start_admission(slot, fused_cancel)
 }
 
 fn start_dynamic_admission(
@@ -430,7 +483,7 @@ pub(super) fn cancel_dynamic_reservation_parts(
 
 pub(crate) fn cancel_dynamic_reservation(
     scope: &Arc<ScopeCell>,
-    control: &ErasedDynamicRoute,
+    control: &DynamicControl,
     slot: &Arc<SlotCell>,
 ) {
     scope.with_observation_gate(|txn| control.cancel_reservation(scope, slot.as_ref(), txn));
@@ -450,7 +503,7 @@ fn cancel_dynamic_reservation_impl(
 
 pub(crate) fn signal_fused_cancel(
     scope: &Arc<ScopeCell>,
-    control: &ErasedDynamicRoute,
+    control: &DynamicControl,
     slot: &Arc<SlotCell>,
     latch: &Latch,
 ) {
@@ -501,7 +554,7 @@ pub(crate) fn remove_dynamic(
         ) {
             return completed_removal(RemoveOutcome::AlreadyAbsent);
         }
-        let Some(control) = scope.dynamic_route_in(txn) else {
+        let Some(control) = DynamicControl::in_scope(scope, txn) else {
             return completed_removal(RemoveOutcome::AlreadyAbsent);
         };
         control.remove(scope, id, exact, txn)
@@ -546,57 +599,8 @@ fn remove_dynamic_impl(
 }
 
 impl DynamicRoute for DynamicControl {
-    type Slot = ErasedDynamicSlot;
-
-    fn reserve(
-        &self,
-        scope: &Arc<ScopeCell>,
-        id: ChildId,
-        child_scope: Option<ScopeFlavor>,
-        txn: &mut ObservationTxn<'_>,
-    ) -> Result<Arc<Self::Slot>, ReserveError> {
-        reserve_dynamic_slot(self, scope, id, child_scope, txn).map(erase_dynamic_slot)
-    }
-
     fn close_admission(&self, txn: &mut ObservationTxn<'_>) {
         self.close_admission_in(txn);
-    }
-
-    fn start_admission(
-        self: Arc<Self>,
-        slot: Arc<Self::Slot>,
-        fused_cancel: Option<Latch>,
-    ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
-        start_dynamic_admission(self, concrete_dynamic_slot(slot), fused_cancel)
-    }
-
-    fn cancel_reservation(
-        &self,
-        scope: &Arc<ScopeCell>,
-        slot: &Self::Slot,
-        txn: &mut ObservationTxn<'_>,
-    ) {
-        cancel_dynamic_reservation_impl(scope, self, concrete_dynamic_slot_ref(slot), txn);
-    }
-
-    fn signal_fused_cancel(
-        &self,
-        scope: &Arc<ScopeCell>,
-        slot: &Self::Slot,
-        latch: &Latch,
-        txn: &mut ObservationTxn<'_>,
-    ) {
-        signal_fused_cancel_impl(self, scope, concrete_dynamic_slot_ref(slot), latch, txn);
-    }
-
-    fn remove(
-        &self,
-        scope: &Arc<ScopeCell>,
-        id: &ChildId,
-        exact: Option<Membership>,
-        txn: &mut ObservationTxn<'_>,
-    ) -> RemovalResponse {
-        remove_dynamic_impl(self, scope, id, exact, txn)
     }
 }
 
@@ -661,9 +665,35 @@ fn dispose_definition_then(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Wake, Waker},
+    };
+
     use crate::RemoveOutcome;
 
     use super::RemovalResponses;
+
+    struct CountedPanicWake {
+        message: &'static str,
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountedPanicWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(self.message);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(self.message);
+        }
+    }
 
     #[test]
     fn removal_subscription_discards_abandoned_waiters() {
@@ -679,5 +709,48 @@ mod tests {
         );
         responses.complete(RemoveOutcome::Removed);
         assert_eq!(retained.try_receive(), Some(RemoveOutcome::Removed));
+    }
+
+    #[test]
+    fn removal_completion_delivers_to_two_hostile_waiters_before_resuming() {
+        const FIRST_PANIC: &str = "injected first removal wake panic";
+
+        let mut responses = RemovalResponses::default();
+        let mut first = responses.subscribe();
+        let mut second = responses.subscribe();
+        let first_wakes = Arc::new(AtomicUsize::new(0));
+        let second_wakes = Arc::new(AtomicUsize::new(0));
+        let first_waker = Waker::from(Arc::new(CountedPanicWake {
+            message: FIRST_PANIC,
+            wakes: Arc::clone(&first_wakes),
+        }));
+        let second_waker = Waker::from(Arc::new(CountedPanicWake {
+            message: "injected second removal wake panic",
+            wakes: Arc::clone(&second_wakes),
+        }));
+        assert!(
+            first
+                .poll_receive(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        assert!(
+            second
+                .poll_receive(&mut Context::from_waker(&second_waker))
+                .is_pending()
+        );
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            responses.complete(RemoveOutcome::Removed);
+        }));
+
+        let payload = result.expect_err("the first hostile removal wake still surfaces");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some(FIRST_PANIC)
+        );
+        assert_eq!(first_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(second_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(first.try_receive(), Some(RemoveOutcome::Removed));
+        assert_eq!(second.try_receive(), Some(RemoveOutcome::Removed));
     }
 }

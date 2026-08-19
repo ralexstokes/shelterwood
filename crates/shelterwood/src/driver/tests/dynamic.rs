@@ -24,16 +24,20 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
             )
             .await
             .expect("task admission");
-        let storage = cell.runtime_storage();
+        // `deadline_slots` is exact, not a band. The removal below pins the
+        // queue empty, and arming one readiness deadline pushes exactly one
+        // heap entry, so two slots here means the arm leaked a second,
+        // never-registered entry — the leak this cycle exists to catch, and
+        // one that `deadlines..=deadlines * 2` would admit unnoticed.
         assert_eq!(
-            (storage.children, storage.child_slots, storage.deadlines),
-            (1, 1, 1),
+            cell.runtime_storage(),
+            RuntimeStorage {
+                children: 1,
+                child_slots: 1,
+                deadlines: 1,
+                deadline_slots: 1,
+            },
             "cycle {cycle} stores exactly the live child and readiness deadline"
-        );
-        assert!(
-            storage.deadline_slots >= storage.deadlines
-                && storage.deadline_slots <= storage.deadlines * 2,
-            "cycle {cycle} bounds raw deadline storage by the live heap policy: {storage:?}"
         );
 
         assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
@@ -340,11 +344,10 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
     let response = worker.join().expect("removal transition completes");
     drop(response);
 
-    let route = root
-        .dynamic_route()
-        .expect("the fixture exposes its dynamic route");
     assert!(matches!(
-        root.with_observation_gate(|txn| route.reserve(&root, child_id.clone(), None, txn)),
+        root.with_observation_gate(|txn| {
+            control.reserve(&root, child_id.clone(), None, txn)
+        }),
         Err(crate::ReserveError::RemovalInProgress(id)) if id == child_id
     ));
 }

@@ -231,6 +231,96 @@ async fn root_driver_panic_mid_drain_upgrades_to_the_join_monitor_verdict() {
     assert!(snapshots.changed().await.is_err());
 }
 
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scope_runtime_drop_finishes_every_child_and_epoch_after_a_hostile_wake() {
+    const PANIC: &str = "injected child shutdown wake panic";
+
+    let mut tree = Tree::new();
+    for id in ["first", "second"] {
+        tree.add_task(id, TaskDef::new(|_| future::pending()))
+            .expect("the child declaration is valid");
+    }
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let epoch_id = fixture.epoch();
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state_and_startup(ScopeState::Running, Ok(()));
+    let keys = fixture.children.keys().collect::<Vec<_>>();
+    let members = keys
+        .iter()
+        .map(|key| Arc::clone(&fixture.children[*key].slot.member))
+        .collect::<Vec<_>>();
+    let (mut scope, mut event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
+    for key in &keys {
+        scope.spawn_child(*key);
+    }
+    let cancellation = keys
+        .iter()
+        .map(|key| {
+            let active = scope.children[*key]
+                .active
+                .as_ref()
+                .expect("the child is active");
+            (active.shutdown.clone(), active.abort.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut hostile_waiter = Box::pin(cancellation[0].0.fired());
+    let hostile = Waker::from(Arc::new(PanicWake(PANIC)));
+    assert!(
+        hostile_waiter
+            .as_mut()
+            .poll(&mut Context::from_waker(&hostile))
+            .is_pending()
+    );
+
+    let result = catch_unwind(AssertUnwindSafe(|| drop(scope)));
+
+    let payload = result.expect_err("the first hostile shutdown wake still surfaces");
+    assert_eq!(payload.downcast_ref::<&'static str>().copied(), Some(PANIC));
+    for (shutdown, abort) in &cancellation {
+        assert!(shutdown.is_fired(), "every child receives shutdown");
+        assert!(abort.is_fired(), "every child receives forced cancellation");
+    }
+    for member in &members {
+        assert!(
+            matches!(member.record().stage, MemberStage::Terminal(_)),
+            "every child terminality obligation is discharged"
+        );
+    }
+    assert!(
+        root.snapshot().children.is_empty(),
+        "resident clearing runs after every child terminalizes"
+    );
+    assert!(
+        root.settled(Some(epoch_id)),
+        "the scope epoch retires after child and residency teardown"
+    );
+    assert!(matches!(
+        root.record().state,
+        ScopeState::Stopped {
+            reason: StopReason::ShutdownRequested
+        }
+    ));
+
+    let exits = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
+        let mut exits = 0;
+        while exits < members.len() {
+            match event_receiver.recv().await {
+                Some(DriverEvent::Child(ChildEvent::Exited { .. })) => exits += 1,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        exits
+    })
+    .await;
+    assert!(
+        matches!(exits, crate::runtime::Timeout::Completed(count) if count == members.len()),
+        "every child task is aborted even when an earlier shutdown waiter panics"
+    );
+}
+
 /// Drives one pair of competing stopped publications through the shared
 /// publisher and reports the settled record plus every `ScopeState` edge the
 /// lifecycle stream carried.
@@ -941,6 +1031,47 @@ fn concurrent_terminalizers_return_after_one_consistent_record_is_visible() {
         panic!("one terminal record must be visible");
     };
     assert_eq!(record.last_exit, Some(exit));
+}
+
+#[test]
+fn a_losing_terminalizer_does_not_reclassify_or_republish_startup() {
+    let mut identity = ScopeIdentity::new();
+    let id = ChildId::from("worker");
+    let member = MemberCell::new(
+        id.clone(),
+        identity.mint_membership(&id).expect("membership available"),
+    );
+    let winner = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+    member.terminalize(winner, StartupDisposition::NotAborted);
+    let winning_record = member.record();
+
+    let mut watcher = member.record_watcher();
+    let mut changed = Box::pin(watcher.changed());
+    assert!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "the watcher starts at the winning terminal publication"
+    );
+
+    member.terminalize(
+        Exit::new(ExitKind::NeverStarted, Cancellation::NotObserved),
+        StartupDisposition::Aborted,
+    );
+
+    assert_eq!(
+        member.record(),
+        winning_record,
+        "first terminalizer wins the whole terminal record, including startup classification"
+    );
+    assert!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "a losing terminalizer publishes no second record edge"
+    );
 }
 
 #[test]

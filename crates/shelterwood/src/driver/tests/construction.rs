@@ -95,8 +95,9 @@ async fn task_aborted_scope_driver_resolves_startup() {
         plan,
         ScopeRole::Nested(NestedScopeLatches {
             parent_ready: CompletionGatedLatch::default(),
+            child_shutdown: Latch::default(),
             ancestor: AncestorCommandLatches {
-                shutdown: Latch::default(),
+                framework_shutdown: Latch::default(),
                 abort: Latch::default(),
                 abort_ack: Latch::default(),
             },
@@ -267,8 +268,9 @@ async fn scope_plan_conversion_panic_terminalizes_every_child() {
         plan,
         ScopeRole::Nested(NestedScopeLatches {
             parent_ready: CompletionGatedLatch::default(),
+            child_shutdown: Latch::default(),
             ancestor: AncestorCommandLatches {
-                shutdown: Latch::default(),
+                framework_shutdown: Latch::default(),
                 abort: Latch::default(),
                 abort_ack: Latch::default(),
             },
@@ -355,8 +357,9 @@ async fn conversion_unwind_evicts_never_started_child_identities() {
         plan,
         ScopeRole::Nested(NestedScopeLatches {
             parent_ready: CompletionGatedLatch::default(),
+            child_shutdown: Latch::default(),
             ancestor: AncestorCommandLatches {
-                shutdown: Latch::default(),
+                framework_shutdown: Latch::default(),
                 abort: Latch::default(),
                 abort_ack: Latch::default(),
             },

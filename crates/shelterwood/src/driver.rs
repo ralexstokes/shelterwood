@@ -18,7 +18,7 @@ mod storage;
 
 use storage::Obligation;
 
-use child::ChildRuntime;
+use child::{ChildRuntime, fire_shutdown_edges};
 #[cfg(test)]
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
 use events::{
@@ -41,8 +41,10 @@ use crate::{
         ArbitrationClass, ChildKey, DeadlineHandle, DeadlineQueue, Effect as SupervisorEffect,
         Epoch, Event as SupervisorEvent, ExitDispatch, IncarnationRun, IntensityState,
         MembershipStatus, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState,
-        ScopeLifecycle, ScopeMode, StopAction, StopLadder, SupervisorState, arbitrate,
-        dispatch_exit, schedule_restart, step as supervisor_step,
+        ScopeLifecycle, ScopeMode, StopAction, StopLadder, SupervisorState,
+        admit as supervisor_admit, arbitrate, begin_drain as supervisor_begin_drain, dispatch_exit,
+        fail_startup as supervisor_fail_startup, force as supervisor_force, schedule_restart,
+        step as supervisor_step,
     },
     exit::{
         RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
@@ -168,13 +170,14 @@ fn monitor_root_driver(
 }
 
 struct AncestorCommandLatches {
-    shutdown: Latch,
+    framework_shutdown: Latch,
     abort: Latch,
     abort_ack: Latch,
 }
 
 struct NestedScopeLatches {
     parent_ready: CompletionGatedLatch,
+    child_shutdown: Latch,
     ancestor: AncestorCommandLatches,
 }
 
@@ -255,7 +258,6 @@ struct ScopeRuntimeWiring {
     intensity_policy: Intensity,
     children: ChildResources<ChildRuntime>,
     supervisor: SupervisorState,
-    supervisor_effects: Vec<SupervisorEffect>,
     events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_event_receiver: runtime::UnboundedMpscReceiver<DriverEvent>,
@@ -284,37 +286,21 @@ impl<T> Default for ChildResources<T> {
     }
 }
 
-trait ChildKeyArg {
-    fn child_key(self) -> ChildKey;
-}
-
-impl ChildKeyArg for ChildKey {
-    fn child_key(self) -> ChildKey {
-        self
-    }
-}
-
-impl ChildKeyArg for &ChildKey {
-    fn child_key(self) -> ChildKey {
-        *self
-    }
-}
-
 impl<T> ChildResources<T> {
     fn insert(&mut self, key: ChildKey, child: T) -> Option<T> {
         self.0.insert(key, child)
     }
 
-    fn get(&self, key: impl ChildKeyArg) -> Option<&T> {
-        self.0.get(&key.child_key())
+    fn get(&self, key: ChildKey) -> Option<&T> {
+        self.0.get(&key)
     }
 
-    fn get_mut(&mut self, key: impl ChildKeyArg) -> Option<&mut T> {
-        self.0.get_mut(&key.child_key())
+    fn get_mut(&mut self, key: ChildKey) -> Option<&mut T> {
+        self.0.get_mut(&key)
     }
 
-    fn remove(&mut self, key: impl ChildKeyArg) -> Option<T> {
-        self.0.remove(&key.child_key())
+    fn remove(&mut self, key: ChildKey) -> Option<T> {
+        self.0.remove(&key)
     }
 
     fn iter(&self) -> impl Iterator<Item = (ChildKey, &T)> {
@@ -348,22 +334,8 @@ impl<T> Index<ChildKey> for ChildResources<T> {
     }
 }
 
-impl<T> Index<&ChildKey> for ChildResources<T> {
-    type Output = T;
-
-    fn index(&self, key: &ChildKey) -> &Self::Output {
-        self.get(key).expect("live child resource key")
-    }
-}
-
 impl<T> IndexMut<ChildKey> for ChildResources<T> {
     fn index_mut(&mut self, key: ChildKey) -> &mut Self::Output {
-        self.get_mut(key).expect("live child resource key")
-    }
-}
-
-impl<T> IndexMut<&ChildKey> for ChildResources<T> {
-    fn index_mut(&mut self, key: &ChildKey) -> &mut Self::Output {
         self.get_mut(key).expect("live child resource key")
     }
 }
@@ -375,16 +347,19 @@ struct ScopeCompletion {
 
 impl Drop for ScopeRuntime {
     fn drop(&mut self) {
-        let dynamic_entries = if let Some(dynamic) = &self.dynamic {
-            let entries = self.root.with_observation_gate(|txn| {
-                let entries = dynamic.close(&self.root, txn);
-                self.root.set_dynamic_route_locked(None, txn);
-                entries
+        let mut panics = runtime::PanicAccumulator::default();
+        let mut dynamic_entries = None;
+        if let Some(dynamic) = &self.dynamic {
+            panics.run(|| {
+                self.root.with_observation_gate(|txn| {
+                    // Retain the entries before the transaction flushes its
+                    // wakes. If one is hostile, removal completion must still
+                    // remain ordered after terminality and residency cleanup.
+                    dynamic_entries = Some(dynamic.close(&self.root, txn));
+                    self.root.set_dynamic_route_locked(None, txn);
+                });
             });
-            Some(entries)
-        } else {
-            None
-        };
+        }
         // An exited child can be waiting only for retained user construction
         // to finish disposal. Its exit is already classified, so driver death
         // must publish that verdict before the terminality fallback gets a
@@ -394,7 +369,7 @@ impl Drop for ScopeRuntime {
         // publication. A completion that has already been reported is
         // available without waiting, however, so fold everything reported
         // before falling back to the stored verdict.
-        self.drain_arrived_disposal_events();
+        self.drain_arrived_disposal_events(&mut panics);
         let child_keys: Vec<_> = self.children.iter().map(|(key, _)| key).collect();
         for key in child_keys {
             if self
@@ -402,7 +377,7 @@ impl Drop for ScopeRuntime {
                 .get(key)
                 .is_some_and(|child| child.pending_terminal.is_some())
             {
-                self.handle_construction_disposed(key, None);
+                panics.run(|| self.handle_construction_disposed(key, None));
             }
             let Some(child) = self.children.get_mut(key) else {
                 // Terminal publication can reclaim a remove-retained dynamic
@@ -412,27 +387,33 @@ impl Drop for ScopeRuntime {
             };
             if let Some(active) = child.active.take() {
                 if let Some(mailbox) = &child.mailbox {
-                    mailbox.freeze(active.incarnation);
-                    if let Some(teardown) = mailbox.close(active.incarnation) {
+                    panics.run(|| mailbox.freeze(active.incarnation));
+                    let mut teardown = None;
+                    panics.run(|| teardown = mailbox.close(active.incarnation));
+                    if let Some(teardown) = teardown {
                         runtime::dispose_detached(teardown);
                     }
                 }
-                active.shutdown.fire();
-                active.abort.fire();
-                active.abort_handle.abort();
+                panics.run(|| {
+                    fire_shutdown_edges(&active.shutdown, active.framework_shutdown.as_ref());
+                });
+                panics.run(|| {
+                    active.abort.fire();
+                });
+                panics.run(|| active.abort_handle.abort());
             }
             // Driver destruction consumes the same owned terminality
             // completion as the orderly path. Its fallback publishes the
             // coarse kill verdict synchronously.
-            child.terminality.discharge();
+            panics.run(|| child.terminality.discharge());
         }
         // Residency owns the matching Removed edges. Clearing the set after
         // terminality discharges them all before the scope's final event.
-        self.root.clear_residents();
+        panics.run(|| self.root.clear_residents());
         // Dynamic entries own removal completions. Keep them armed until the
         // corresponding members are terminal and no longer resident.
-        drop(dynamic_entries);
-        self.children.clear();
+        panics.run(|| drop(dynamic_entries.take()));
+        panics.run(|| self.children.clear());
         // Unconditional: the publisher is the idempotence point, joining this
         // verdict into the stopped-reason lattice, but epoch retirement is not
         // idempotent and has no other owner. Skipping the call on an
@@ -443,12 +424,14 @@ impl Drop for ScopeRuntime {
             .map(|completion| completion.reason.as_reason().clone())
             .or_else(|| self.supervisor.lifecycle().draining_reason().cloned())
             .unwrap_or(StopReason::ShutdownRequested);
-        if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
-            self.root
-                .finish_root_incarnation(self.epoch, reason, exit.into_exit());
-        } else {
-            self.root.finish_incarnation(self.epoch, reason);
-        }
+        panics.run(|| {
+            if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
+                self.root
+                    .finish_root_incarnation(self.epoch, reason, exit.into_exit());
+            } else {
+                self.root.finish_incarnation(self.epoch, reason);
+            }
+        });
     }
 }
 
@@ -461,7 +444,7 @@ impl ScopeRuntime {
             intensity: IntensityState::default(),
             children: wiring.children,
             supervisor: wiring.supervisor,
-            supervisor_effects: wiring.supervisor_effects,
+            supervisor_effects: Vec::new(),
             restart_shutdown_retries: Vec::new(),
             events: wiring.events,
             disposal_events: wiring.disposal_events,
@@ -488,19 +471,10 @@ impl ScopeRuntime {
     #[cfg(test)]
     fn for_test(wiring: ScopeRuntimeTestWiring, epoch: ScopeEpochGuard) -> Self {
         let mut supervisor = SupervisorState::new(wiring.root.flavor, wiring.lifecycle);
-        let mut supervisor_effects = Vec::new();
         let mut children = ChildResources::default();
         for (expected, child) in wiring.children {
-            supervisor_step(
-                &mut supervisor,
-                SupervisorEvent::Admit {
-                    membership: child.slot.member.membership(),
-                    initial: true,
-                    start_immediately: false,
-                },
-                &mut supervisor_effects,
-            );
-            let Some(SupervisorEffect::Admitted { child: actual }) = supervisor_effects.pop()
+            let Some(actual) =
+                supervisor_admit(&mut supervisor, child.slot.member.membership(), true)
             else {
                 panic!("fixture admission produces one key")
             };
@@ -526,7 +500,6 @@ impl ScopeRuntime {
                 intensity_policy: wiring.intensity_policy,
                 children,
                 supervisor,
-                supervisor_effects,
                 events: wiring.events,
                 disposal_events,
                 disposal_event_receiver,
@@ -594,7 +567,7 @@ impl ScopeRuntime {
     /// Non-blocking by construction, so a disposal still running on the
     /// blocking pool stays detached and its unknowable result cannot delay
     /// the kill path.
-    fn drain_arrived_disposal_events(&mut self) {
+    fn drain_arrived_disposal_events(&mut self, panics: &mut runtime::PanicAccumulator) {
         while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut self.disposal_event_receiver)
         {
             // The lane has one producer, which sends exactly one variant.
@@ -618,7 +591,7 @@ impl ScopeRuntime {
         // `pending_terminal`.
         while let Some(child) = self.arrived_disposal_panics.keys().next().copied() {
             let panic = self.take_arrived_disposal_panic(child);
-            self.handle_construction_disposed(child, panic);
+            panics.run(|| self.handle_construction_disposed(child, panic));
         }
     }
 
@@ -631,9 +604,6 @@ impl ScopeRuntime {
             let effects = std::mem::take(&mut self.supervisor_effects);
             for effect in effects {
                 match effect {
-                    SupervisorEffect::Admitted { .. } => {
-                        unreachable!("admission consumes its key synchronously")
-                    }
                     SupervisorEffect::StartChild { child } => self.spawn_child(child),
                     SupervisorEffect::StopChild { child } => self.begin_stop_child(child, None),
                     SupervisorEffect::ForceChild { child } => self.force_child(child),
@@ -643,10 +613,6 @@ impl ScopeRuntime {
                     }
                     SupervisorEffect::Finished { reason } => {
                         self.finished.get_or_insert(reason);
-                    }
-                    SupervisorEffect::StartupFailed { .. }
-                    | SupervisorEffect::DrainStarted { .. } => {
-                        unreachable!("the transition owner publishes its contextual result")
                     }
                 }
             }
@@ -672,18 +638,9 @@ impl ScopeRuntime {
         initial: bool,
     ) -> Result<ChildKey, Box<ChildRuntime>> {
         let membership = child.slot.member.membership();
-        let before = self.supervisor_effects.len();
-        self.reduce(SupervisorEvent::Admit {
-            membership,
-            initial,
-            start_immediately: false,
-        });
-        let key = match self.supervisor_effects.get(before) {
-            Some(SupervisorEffect::Admitted { child }) => *child,
-            None => return Err(Box::new(child)),
-            Some(effect) => unreachable!("admission emitted {effect:?} before its key"),
+        let Some(key) = supervisor_admit(&mut self.supervisor, membership, initial) else {
+            return Err(Box::new(child));
         };
-        self.supervisor_effects.remove(before);
         let replaced = self.children.insert(key, child);
         debug_assert!(
             replaced.is_none(),
@@ -970,15 +927,19 @@ async fn run_nested_tree_with_epoch(
             // The ancestor *abort* latch needs no separate arm: it is the
             // framework-abort edge, fired only by `StopAction::AbortFramework`,
             // and the stop ladder unconditionally passes through
-            // `StopAction::Cancel` — which fires this same ancestor shutdown
+            // `StopAction::Cancel` — which fires this same framework shutdown
             // latch — before it can reach that phase.
-            if scope.has_stop_request(epoch.epoch()) || latches.ancestor.shutdown.is_fired() {
+            let self_shutdown = scope.has_stop_request(epoch.epoch());
+            if self_shutdown || latches.ancestor.framework_shutdown.is_fired() {
                 // Mirror the loop's `Pending::Shutdown` arm: firing the
-                // ancestor shutdown latch is what makes this scope's exit read
+                // child-facing shutdown latch is what makes this scope's exit read
                 // `Cancellation::Observed` at its parent, as a requested stop
-                // must (§11). The latch is level-triggered, so re-firing an
-                // ancestor-driven stop is a no-op.
-                latches.ancestor.shutdown.fire();
+                // must (§11). An ancestor-driven stop already fired that latch
+                // independently; do not couple its framework observer back to
+                // user-installable cancellation waiters.
+                if self_shutdown {
+                    latches.child_shutdown.fire();
+                }
                 epoch.lifecycle.begin_drain(StopReason::ShutdownRequested);
             }
             // Both drain effects are deliberately discarded: this path
@@ -1068,22 +1029,12 @@ async fn run_scope_incarnation(
     // child's obligation before fallible setup. Thus a panic at any point has
     // exactly one terminality owner for every child.
     let mut supervisor = SupervisorState::new(root.flavor, epoch.lifecycle());
-    let mut supervisor_effects = Vec::new();
     let mut children = ChildResources::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
         let child = ChildRuntime::from_plan(child, &root);
         let membership = child.slot.member.membership();
-        supervisor_step(
-            &mut supervisor,
-            SupervisorEvent::Admit {
-                membership,
-                initial: true,
-                start_immediately: false,
-            },
-            &mut supervisor_effects,
-        );
-        let Some(SupervisorEffect::Admitted { child: key }) = supervisor_effects.pop() else {
+        let Some(key) = supervisor_admit(&mut supervisor, membership, true) else {
             unreachable!("a fresh child-key domain accommodates an in-memory child collection")
         };
         let replaced = children.insert(key, child);
@@ -1101,7 +1052,6 @@ async fn run_scope_incarnation(
             intensity_policy: plan.intensity_policy(),
             children,
             supervisor,
-            supervisor_effects,
             events,
             disposal_events,
             disposal_event_receiver,
@@ -1136,7 +1086,7 @@ async fn run_scope_incarnation(
             && scope
                 .role
                 .ancestor()
-                .is_some_and(|latches| latches.shutdown.is_fired())
+                .is_some_and(|latches| latches.framework_shutdown.is_fired())
         {
             scope.ancestor_shutdown_seen = true;
             pending.push(Pending::AncestorShutdown.classified());
@@ -1174,7 +1124,7 @@ async fn run_scope_incarnation(
                 .role
                 .ancestor()
                 .filter(|_| !scope.ancestor_shutdown_seen)
-                .map(|latches| latches.shutdown.clone());
+                .map(|latches| latches.framework_shutdown.clone());
             let ancestor_abort = scope
                 .role
                 .ancestor()
@@ -1237,8 +1187,8 @@ async fn run_scope_incarnation(
         for (_, event) in pending.drain(..) {
             match event {
                 Pending::Shutdown => {
-                    if let Some(latches) = scope.role.ancestor() {
-                        latches.shutdown.fire();
+                    if let ScopeRole::Nested(nested) = &scope.role {
+                        nested.child_shutdown.fire();
                         scope.ancestor_shutdown_seen = true;
                     }
                     scope.begin_drain(StopReason::ShutdownRequested);

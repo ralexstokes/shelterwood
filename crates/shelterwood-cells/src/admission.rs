@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::identity::ChildId;
+use shelterwood_core::ChildId;
 
 /// A child reservation or dynamic admission error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

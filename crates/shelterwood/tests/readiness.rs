@@ -12,8 +12,9 @@ use crate::common::{
     POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet,
     policy::never,
     waiting::{
-        cancellation_signalled_waiting_task, gate_released_manual_ready_task,
-        signalled_waiting_task, start_signalled_waiting_task, task as waiting_task,
+        cancellation_signalled_waiting_task, construction_signalled_waiting_task,
+        gate_released_manual_ready_task, signalled_waiting_task, start_signalled_waiting_task,
+        task as waiting_task,
     },
 };
 use shelterwood::{
@@ -1284,7 +1285,7 @@ async fn immediate_raw_construction_panic_classifies_post_ready() {
     .expect("valid raw actor");
     tree.add_task(
         "sibling",
-        start_signalled_waiting_task(Arc::clone(&sibling_started)),
+        construction_signalled_waiting_task(Arc::clone(&sibling_started)),
     )
     .expect("valid sibling");
 

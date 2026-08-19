@@ -75,7 +75,7 @@ fn declaration_errors_are_eager_and_root_lowering_is_the_only_other_build_error(
         assert!(matches!(
             tree.spawn(),
             Err(BuildError::UnfilledReservations { ref paths })
-                if paths.len() == 1 && paths[0][0].as_str() == "duplicate"
+                if paths.len() == 1 && paths[0].as_str() == "duplicate"
         ));
         assert!(matches!(task.wait().await.kind(), ExitKind::NeverStarted));
     });

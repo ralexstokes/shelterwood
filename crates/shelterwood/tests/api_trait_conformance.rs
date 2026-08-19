@@ -9,7 +9,7 @@ use shelterwood::{
     NonZeroDuration, OneShotTaskRef, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
     ReadinessDeadline, Removal, Reply, ReplyReceive, ReplyReceiver, ReserveError, RestartAttempt,
     RestartCount, RestartPolicy, Retention, ScopeDefaults, ScopeRef, SendError, SendFuture,
-    SendTimeout, Shutdown, SnapshotClosed, SnapshotReceiver, StopContext, Strategy, SubtreeDef,
+    SendTimeout, Shutdown, SnapshotClosed, SnapshotReceiver, StopContext, SubtreeDef,
     SubtreeOnceDef, SubtreeSlot, System, TaskDef, TaskOnceDef, TaskRef, TaskSlot, TotalRestarts,
     Tree, WaitError,
 };
@@ -295,7 +295,6 @@ impl RawActor for OpaqueRaw {
 #[test]
 fn ordered_and_dynamic_builders_expose_the_parallel_typed_surface() {
     let mut ordered = Tree::new();
-    let _: &mut Tree = ordered.strategy(Strategy::default());
     let _: &mut Tree = ordered.intensity(Intensity::default());
     let _: &mut Tree = ordered.defaults(ScopeDefaults::default());
     let _: Result<ActorSlot<Cell<()>>, ReserveError> = ordered.reserve_actor("ordered-actor-slot");

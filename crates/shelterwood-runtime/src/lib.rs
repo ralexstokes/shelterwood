@@ -9,6 +9,8 @@ mod disposal;
 mod mailbox;
 mod spawn;
 mod sync;
+#[cfg(test)]
+mod test_support;
 mod timer;
 
 pub use disposal::*;
@@ -16,7 +18,7 @@ pub use mailbox::*;
 // Unwind handling is plain `std::panic`, so it lives in the runtime-neutral
 // core. Re-exported here because the adapter's own modules and the façade
 // reach it as a runtime facility.
-pub use shelterwood_core::{exit::JoinVerdict as JoinOutcome, panic::*};
+pub use shelterwood_core::{exit::JoinOutcome, panic::*};
 pub use spawn::*;
 pub use sync::*;
 pub use timer::*;

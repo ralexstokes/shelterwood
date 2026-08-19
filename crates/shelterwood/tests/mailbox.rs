@@ -4,14 +4,17 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, advance_time, assert_eventually, assert_quiet, poll_once};
+use crate::common::{
+    GatedRecorder, MessageRecorder, ReleaseGate, advance_time, assert_eventually, assert_quiet,
+    poll_once,
+};
 use shelterwood::{
-    CallErrorKind, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor, RawContext, RawDef,
-    Reply, ReplyError, SendErrorKind, Tree,
+    CallErrorKind, Mailbox, PolicyError, RawDef, Reply, ReplyError, SendErrorKind, Tree,
 };
 
 #[test]
@@ -32,16 +35,36 @@ enum ReplyMode {
     Hold,
 }
 
+/// A discarded reply payload that publishes its own destruction.
+///
+/// Both the counter and the notification are shared across every instance, so
+/// the test can judge the exact total and then watch one real-time window for
+/// a duplicate rather than re-reading a per-value counter that no correct or
+/// incorrect run could move again.
+struct CountedReplyDrop {
+    drops: Arc<AtomicUsize>,
+    disposed: mpsc::Sender<&'static str>,
+    label: &'static str,
+}
+
+impl Drop for CountedReplyDrop {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+        let _ = self.disposed.send(self.label);
+    }
+}
+
 struct Recorder {
-    gate: Option<ReleaseGate>,
     values: Arc<Mutex<Vec<usize>>>,
     asks: Arc<AtomicUsize>,
     reply_mode: ReplyMode,
     held: Option<Reply<usize>>,
 }
 
-impl Recorder {
-    fn handle(&mut self, message: Message) {
+impl MessageRecorder for Recorder {
+    type Message = Message;
+
+    fn record(&mut self, message: Message) {
         match message {
             Message::Value(value) => self
                 .values
@@ -60,38 +83,22 @@ impl Recorder {
     }
 }
 
-impl RawActor for Recorder {
-    type Msg = Message;
-
-    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
-        if let Some(gate) = self.gate.take() {
-            gate.wait().await;
-        }
-        while let Some(message) = context.recv().await {
-            self.handle(message);
-        }
-        if context.mailbox_shutdown() == MailboxShutdown::Drain {
-            while let Some(message) = context.try_recv() {
-                self.handle(message);
-            }
-        }
-        Ok(())
-    }
-}
-
 fn recorder(
     gate: Option<ReleaseGate>,
     values: &Arc<Mutex<Vec<usize>>>,
     asks: &Arc<AtomicUsize>,
     reply_mode: ReplyMode,
-) -> Recorder {
-    Recorder {
+) -> GatedRecorder<Recorder> {
+    GatedRecorder::new(
         gate,
-        values: Arc::clone(values),
-        asks: Arc::clone(asks),
-        reply_mode,
-        held: None,
-    }
+        Recorder {
+            values: Arc::clone(values),
+            asks: Arc::clone(asks),
+            reply_mode,
+            held: None,
+        },
+    )
+    .drain_on_shutdown()
 }
 
 #[tokio::test(start_paused = true)]
@@ -318,14 +325,60 @@ async fn reply_receiver_is_consuming_and_late_replies_are_discarded() {
         )
         .expect("valid actor");
     let width = Duration::from_secs(10);
+    // Both discards are destroyed off-runtime by isolated disposal, which
+    // costs a blocking-pool or fallback thread start. A polling wait would be
+    // worthless here: this test runs on a paused clock, where every
+    // `tokio::time::sleep` auto-advances the moment the runtime idles, so a
+    // nominal five-second poll budget collapses to milliseconds of wall time.
+    // Wait on the destructor's own notification in real time instead.
+    const DISPOSAL_WAIT: Duration = Duration::from_secs(5);
+    // The test keeps `disposed` alive, so this window is a real-time wait for
+    // a third notification and not an immediate `Disconnected`.
+    const DUPLICATE_DISPOSAL_WINDOW: Duration = Duration::from_millis(50);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (disposed, disposals) = mpsc::channel();
+
     let (reply, receiver) = actor.reply_channel();
     let mut waiter = Box::pin(receiver.recv(width));
     assert!(poll_once(waiter.as_mut()).is_pending());
     advance_time(width).await;
-    assert_eq!(waiter.await, Err(ReplyError::Timeout));
-    reply.send(1);
+    assert!(matches!(waiter.await, Err(ReplyError::Timeout)));
+    reply.send(CountedReplyDrop {
+        drops: Arc::clone(&drops),
+        disposed: disposed.clone(),
+        label: "timed-out receiver",
+    });
+    assert_eq!(
+        disposals
+            .recv_timeout(DISPOSAL_WAIT)
+            .expect("isolated disposal destroys the reply a timed-out receiver rejected"),
+        "timed-out receiver"
+    );
 
-    let (reply, receiver) = actor.reply_channel::<usize>();
+    let (reply, receiver) = actor.reply_channel::<CountedReplyDrop>();
     drop(receiver);
-    reply.send(2);
+    reply.send(CountedReplyDrop {
+        drops: Arc::clone(&drops),
+        disposed: disposed.clone(),
+        label: "dropped receiver",
+    });
+    assert_eq!(
+        disposals
+            .recv_timeout(DISPOSAL_WAIT)
+            .expect("isolated disposal destroys the reply a dropped receiver rejected"),
+        "dropped receiver"
+    );
+
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        2,
+        "each discarded reply is destroyed exactly once"
+    );
+    assert!(
+        matches!(
+            disposals.recv_timeout(DUPLICATE_DISPOSAL_WINDOW),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "no reply is disposed twice"
+    );
 }

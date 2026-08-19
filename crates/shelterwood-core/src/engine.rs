@@ -364,7 +364,10 @@ impl Default for RestartState {
     }
 }
 
-/// Complete restart verdict consumed verbatim by the scope driver.
+/// Complete restart verdict consumed verbatim by the cross-crate scope driver.
+///
+/// Its public visibility is required by [`schedule_restart`]'s sibling-crate
+/// return edge; the supported façade neither names nor exports this type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RestartDecision {
     attempt: RestartAttempt,
@@ -733,29 +736,18 @@ struct ScopeDrain {
     startup: StartupPhase,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DrainEffect {
-    startup_pending: bool,
-    /// Always [`ScopeState::Draining`] by construction; carried so the driver
-    /// publishes exactly the state the machine returned.
-    state: ScopeState,
-}
-
-impl DrainEffect {
-    pub fn startup_pending(&self) -> bool {
-        self.startup_pending
-    }
-
-    pub fn state(&self) -> ScopeState {
-        self.state.clone()
-    }
-}
-
 /// The child state relevant to deciding whether a scope can finish.
+///
+/// The two fields are both booleans and answer different questions, so a
+/// positional pair would transpose silently at the one call site
+/// (`SupervisorState::settle`) and quietly change the finish predicate.
+/// Naming them is what makes that transposition a compile error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ChildCompletionState {
-    pub has_children: bool,
-    pub all_terminal: bool,
+pub(crate) struct ChildCompletionState {
+    /// Whether the scope holds any child registration at all.
+    pub(crate) has_children: bool,
+    /// Whether every child registration has reached the joined terminal.
+    pub(crate) all_terminal: bool,
 }
 
 /// Authoritative lifecycle and finish policy for one scope incarnation.
@@ -819,7 +811,7 @@ impl ScopeLifecycle {
                     StartupPhase::Complete => 1,
                     StartupPhase::Failed => 2,
                 },
-                stop_reason_precedence(reason) as u8,
+                stop_reason_precedence(reason),
             ),
         }
     }
@@ -888,7 +880,7 @@ impl ScopeLifecycle {
     /// resolve competing reasons in opposite directions. The returned effect
     /// exists only for the initial transition: upgrades change the eventual
     /// verdict without repeating teardown side effects.
-    pub fn begin_drain(&mut self, reason: StopReason) -> Option<DrainEffect> {
+    pub fn begin_drain(&mut self, reason: StopReason) -> Option<(bool, ScopeState)> {
         debug_assert!(
             !matches!(reason, StopReason::NeverStarted),
             "NeverStarted is not a live-incarnation drain reason"
@@ -907,13 +899,10 @@ impl ScopeLifecycle {
         };
         let startup_pending = startup == StartupPhase::Pending;
         self.state = ScopeLifecycleState::Draining(ScopeDrain { reason, startup });
-        Some(DrainEffect {
-            startup_pending,
-            state: self.state(),
-        })
+        Some((startup_pending, self.state()))
     }
 
-    pub fn finish_if_ready(
+    pub(crate) fn finish_if_ready(
         &self,
         flavor: ScopeFlavor,
         children: ChildCompletionState,
@@ -1622,11 +1611,11 @@ mod tests {
             ),
             None
         );
-        let drain = lifecycle
+        let (startup_pending, state) = lifecycle
             .begin_drain(crate::exit::StopReason::ShutdownRequested)
             .expect("a failed startup can begin draining");
-        assert!(!drain.startup_pending);
-        assert_eq!(drain.state, ScopeState::Draining);
+        assert!(!startup_pending);
+        assert_eq!(state, ScopeState::Draining);
         assert_eq!(
             lifecycle.finish_if_ready(
                 ScopeFlavor::Dynamic,
@@ -1662,11 +1651,11 @@ mod tests {
         );
 
         let mut starting = ScopeLifecycle::starting();
-        let drain = starting
+        let (startup_pending, state) = starting
             .begin_drain(crate::exit::StopReason::ShutdownRequested)
             .expect("starting can begin draining");
-        assert!(drain.startup_pending);
-        assert_eq!(drain.state, ScopeState::Draining);
+        assert!(startup_pending);
+        assert_eq!(state, ScopeState::Draining);
     }
 
     #[test]

@@ -6,12 +6,12 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet};
+use crate::common::{POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, next_event};
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DeadlineElapsed, DynamicScopeRef,
-    DynamicTree, ExitError, ExitResult, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-    LifecycleItem, Mailbox, Membership, RemoveOutcome, Reply, ReserveError, RestartCount,
-    RestartPolicy, ScopeState, StopContext, SubtreeOnceDef, Tree,
+    DynamicTree, ExitError, ExitResult, LifecycleEvent, LifecycleEventKind, LifecycleItem, Mailbox,
+    Membership, RemoveOutcome, Reply, ReserveError, RestartCount, RestartPolicy, ScopeState,
+    StopContext, SubtreeOnceDef, Tree,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
@@ -24,18 +24,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 // tighter bound anywhere only relocates the flake rather than removing it.
 // The idle-eviction test further down runs on `start_paused` and keeps its
 // virtual durations, which are load-bearing rather than defensive.
-
-async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
-    loop {
-        let item = tokio::time::timeout(POLL_TIMEOUT, events.recv())
-            .await
-            .expect("lifecycle wait is bounded")
-            .expect("lifecycle stream remains open");
-        if let LifecycleItem::Event(event) = item {
-            return event;
-        }
-    }
-}
 
 #[derive(Clone)]
 struct TransportState {
@@ -655,9 +643,14 @@ async fn assistant_control_plane_composes_nested_recovery_redelivery_streaming_a
     let mut saw_control_restart = false;
     let mut saw_tool_restart = false;
     let mut saw_gateway_restart = false;
+    // Lag here is a fixture defect, not load: this trace publishes a bounded
+    // number of edges — three restarts and one temporary child on top of a
+    // fixed tree — against the 128-event subscriber capacity, and nothing but
+    // this drain and the wait above reads it. A marker would mean dropped
+    // edges silently deciding the flags below, so it fails loudly instead.
     while let Ok(item) = lifecycle.try_recv() {
         let LifecycleItem::Event(event) = item else {
-            continue;
+            panic!("the bounded assistant trace must not lag")
         };
         saw_control_restart |= event_is_restart_for(&event, control.membership());
         saw_tool_restart |= event_is_restart_for(&event, tool.membership());

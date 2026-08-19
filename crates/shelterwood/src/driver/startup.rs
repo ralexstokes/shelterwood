@@ -124,20 +124,15 @@ impl ScopeRuntime {
                 exit,
             },
         };
-        let before = self.supervisor_effects.len();
-        self.reduce(SupervisorEvent::FailStartup);
-        let Some(SupervisorEffect::StartupFailed { state }) =
-            self.supervisor_effects.get(before).cloned()
-        else {
+        let Some(state) = supervisor_fail_startup(&mut self.supervisor) else {
             return;
         };
-        self.supervisor_effects.remove(before);
         if self.root.flavor == ScopeFlavor::Ordered {
             let later_children: Vec<_> = self.supervisor.keys_after(key).collect();
             for later in later_children {
                 if !self.supervisor.spawned_once(later)
                     && !self.supervisor.is_disposing(later)
-                    && !self.supervisor.membership_terminal(later)
+                    && !self.supervisor.joined(later)
                 {
                     self.begin_terminal_disposal(
                         later,

@@ -65,15 +65,22 @@ rests on:
   owner of a mailbox containing unread user messages, which `RetainedExit`
   does not cover.
 - **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination`,
-  `MailboxRuntime`, `ActorIdentity` and `DynamicRoute` are implementation seams
+  `MailboxRuntime`, `MailboxEffectSink`, `ActorIdentity` and `DynamicRoute` are
+  implementation seams
   with framework-only impls, not user traits; where the framework invokes one
   under a lock, no caller code runs. `MailboxControl` and
   `MailboxTermination` are private-supertrait sealed because their legitimate
-  implementations live in the defining mailbox crate. The other three hold
+  implementations live in the defining mailbox crate. The other four hold
   their boundary by convention rather than by construction, and so do the
   sub-capabilities `MailboxRuntime` mints: `MailboxSignal`,
   `MailboxSignalWatcher` and the `ErasedOneShot*` family are public unsealed
-  cross-crate traits for the same reason and ride under the same ruling. Rust
+  cross-crate traits for the same reason and ride under the same ruling.
+  `MailboxEffectSink` is the sharpest case: the framework calls
+  `defer_mailbox_effect` while holding both the resident-tree observation gate
+  and `MemberCell::mailbox`, and its `MailboxEffectQueue` implementation is
+  `pub` and `Default`, so an unsupported direct dependent could both construct
+  a sink and supply its own. The supported façade re-exports neither, which is
+  what keeps the ruling true. Rust
   cannot private-seal a trait in the lower crate while permitting its
   legitimate implementation in a downstream sibling, and a public capability
   token would be obtainable by the same unsupported direct dependent. The

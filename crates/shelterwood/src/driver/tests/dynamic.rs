@@ -24,6 +24,11 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
             )
             .await
             .expect("task admission");
+        // `deadline_slots` is exact, not a band. The removal below pins the
+        // queue empty, and arming one readiness deadline pushes exactly one
+        // heap entry, so two slots here means the arm leaked a second,
+        // never-registered entry — the leak this cycle exists to catch, and
+        // one that `deadlines..=deadlines * 2` would admit unnoticed.
         assert_eq!(
             cell.runtime_storage(),
             RuntimeStorage {
@@ -32,7 +37,7 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
                 deadlines: 1,
                 deadline_slots: 1,
             },
-            "cycle {cycle} stores only the live child"
+            "cycle {cycle} stores exactly the live child and readiness deadline"
         );
 
         assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
@@ -82,39 +87,20 @@ async fn latched_removal_suppresses_a_queued_start_effect() {
     let (mut scope, _events, mut dynamic_events, control) = running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
     let starts = Arc::new(AtomicUsize::new(0));
-    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
-        .expect("running dynamic scope reserves the child");
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new({
+    let (reservation, key) = insert_dynamic_fixture(
+        &mut scope,
+        &control,
+        "worker",
+        ChildConstruction::Task(TaskDef::new({
             let starts = Arc::clone(&starts);
             move |_| {
                 starts.fetch_add(1, Ordering::SeqCst);
                 future::pending()
             }
-        })));
-    let (definition, resolved) = reservation
-        .slot
-        .resolve_and_take_defined(&scope.defaults)
-        .expect("the slot is defined");
-    let plan =
-        crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
-    let child = ChildRuntime::from_plan(plan, &root);
-    let key = root.with_observation_gate(|txn| {
-        let key = scope
-            .insert_child(child, false)
-            .unwrap_or_else(|_| panic!("the empty arena accepts its first child"));
-        control
-            .state
-            .lock()
-            .expect("dynamic-state mutex poisoned")
-            .entries
-            .get_mut(reservation.slot.member.id())
-            .expect("the reservation remains registered")
-            .promote(key, None, txn);
-        root.admit_child_locked(resident_projection(&reservation.slot), txn);
-        key
-    });
+        })),
+        |_| {},
+        DynamicFixtureState::Resident,
+    );
 
     let _removal = super::super::remove_dynamic(
         &root,
@@ -215,6 +201,10 @@ fn dynamic_close_evicts_a_terminal_reservation_before_readd() {
         .expect("the first incarnation reserves the child");
     let first_membership = first.slot.member.membership();
     let retained = root.with_observation_gate(|txn| control.close(&root, txn));
+    assert!(matches!(
+        first.slot.member.record().stage,
+        MemberStage::Terminal(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+    ));
     assert!(
         retained.is_empty(),
         "reservations are terminalized on close"
@@ -354,11 +344,10 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
     let response = worker.join().expect("removal transition completes");
     drop(response);
 
-    let route = root
-        .dynamic_route()
-        .expect("the fixture exposes its dynamic route");
     assert!(matches!(
-        root.with_observation_gate(|txn| route.reserve(&root, child_id.clone(), None, txn)),
+        root.with_observation_gate(|txn| {
+            control.reserve(&root, child_id.clone(), None, txn)
+        }),
         Err(crate::ReserveError::RemovalInProgress(id)) if id == child_id
     ));
 }
@@ -367,35 +356,15 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
 async fn final_removal_holds_the_id_until_removed_publication_commits() {
     let (mut scope, _events, _dynamic_events, control) = running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
-    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
-        .expect("running dynamic scope reserves the child");
+    let (reservation, key) = insert_dynamic_fixture(
+        &mut scope,
+        &control,
+        "worker",
+        ChildConstruction::Task(TaskDef::new(|_| future::pending())),
+        |_| {},
+        DynamicFixtureState::Resident,
+    );
     let member = Arc::clone(&reservation.slot.member);
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
-    let (definition, resolved) = reservation
-        .slot
-        .resolve_and_take_defined(&scope.defaults)
-        .expect("the slot is defined");
-    let plan =
-        crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
-    let child = ChildRuntime::from_plan(plan, &root);
-    let key = root.with_observation_gate(|txn| {
-        let key = match scope.insert_child(child, false) {
-            Ok(key) => key,
-            Err(_) => panic!("the empty arena accepts its first child"),
-        };
-        control
-            .state
-            .lock()
-            .expect("dynamic-state mutex poisoned")
-            .entries
-            .get_mut(member.id())
-            .expect("the reservation remains registered")
-            .promote(key, None, txn);
-        root.admit_child_locked(resident_projection(&reservation.slot), txn);
-        key
-    });
     assert!(scope.terminalize_child(
         key,
         Exit::never_started(),
@@ -454,45 +423,19 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
 async fn removal_tolerates_synchronous_reclaim_from_the_stop_funnel() {
     let (mut scope, _events, _dynamic_events, control) = running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
-    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
-        .expect("running dynamic scope reserves the child");
-    let member = Arc::clone(&reservation.slot.member);
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
-    let (definition, resolved) = reservation
-        .slot
-        .resolve_and_take_defined(&scope.defaults)
-        .expect("the slot is defined");
-    let plan =
-        crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
-    let mut child = ChildRuntime::from_plan(plan, &root);
-    // Model the latent restart-gap shape: there is no active incarnation and
-    // no retained construction, so a hard-force stop can terminalize and
-    // reclaim this Removing member synchronously from `begin_stop_child`.
-    drop(child.construction.take());
-    let key = root.with_observation_gate(|txn| {
-        let key = scope
-            .insert_child(child, false)
-            .unwrap_or_else(|_| panic!("the empty arena accepts its first child"));
-        {
-            let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-            let entry = state
-                .entries
-                .get_mut(member.id())
-                .expect("the reservation remains registered");
-            entry.promote(key, None, txn);
-            // Removal requests are now published at the authoritative
-            // `Resident -> Removing` transition rather than by the driver, so
-            // drive the entry through it exactly as `remove_dynamic` would
-            // before the synthetic request below reaches `handle_removal`.
-            entry
-                .mark_removing(txn)
-                .expect("the promoted resident transitions to Removing");
-        }
-        root.admit_child_locked(resident_projection(&reservation.slot), txn);
-        key
-    });
+    let (_reservation, key) = insert_dynamic_fixture(
+        &mut scope,
+        &control,
+        "worker",
+        ChildConstruction::Task(TaskDef::new(|_| future::pending())),
+        |child| {
+            // Model the latent restart-gap shape: there is no active
+            // incarnation and no retained construction, so a hard-force stop
+            // can terminalize and reclaim this Removing member synchronously.
+            drop(child.construction.take());
+        },
+        DynamicFixtureState::Removing,
+    );
     scope.supervisor.set_hard_forced_for_test(true);
 
     scope.handle_removal(RemovalRequest { key });
@@ -606,24 +549,19 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
     .join()
     .expect("foreign-thread removal signaling succeeds");
 
-    let event = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
-        crate::runtime::Timeout::Completed(event) => event.expect("the driver lane remains open"),
-        crate::runtime::Timeout::Elapsed => {
-            panic!("the off-runtime removal edge must not be lost")
-        }
-    };
-    let DriverEvent::Removal(observed) = event else {
-        panic!("the queued event is the requested removal");
-    };
+    let observed = recv_removal(
+        &mut event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the off-runtime removal edge",
+    )
+    .await;
     assert_eq!(observed.key, key);
 }
 
 #[crate::runtime::test]
 async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
     root.set_state(ScopeState::Running);
@@ -631,8 +569,6 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
 
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
-    root.set_dynamic_route(Some(control.clone()));
-    root.set_admitted_children(Vec::new());
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_lifecycle(ScopeLifecycle::running())
         .with_dynamic(Some(control.clone()))
@@ -781,7 +717,7 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
     scope.handle_admission(request);
     assert!(matches!(response.try_receive(), Some(Ok(()))));
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(2), started.fired()).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, started.fired()).await,
         crate::runtime::Timeout::Completed(())
     ));
 
@@ -810,35 +746,26 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
 
     let removal_response =
         super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
-    let removal = match crate::runtime::timeout(
-        Duration::from_secs(2),
-        dynamic_event_receiver.recv(),
+    let removal = recv_removal(
+        &mut dynamic_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the removal reaches the driver",
     )
-    .await
-    {
-        crate::runtime::Timeout::Completed(Some(DriverEvent::Removal(removal))) => removal,
-        crate::runtime::Timeout::Completed(_) => panic!("the removal reaches the driver"),
-        crate::runtime::Timeout::Elapsed => panic!("the removal must reach the driver"),
-    };
+    .await;
     scope.handle_removal(removal);
     recv_child_exit(
         &mut event_receiver,
-        Duration::from_secs(2),
+        DRIVER_PROGRESS_WAIT,
         "the stopped child exit",
     )
     .await
     .dispatch(&mut scope);
-    let disposal =
-        match crate::runtime::timeout(Duration::from_secs(2), scope.disposal_event_receiver.recv())
-            .await
-        {
-            crate::runtime::Timeout::Completed(Some(event)) => event,
-            crate::runtime::Timeout::Completed(None) => panic!("the disposal lane remains open"),
-            crate::runtime::Timeout::Elapsed => panic!("retained construction disposal completes"),
-        };
-    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = disposal else {
-        panic!("the stop path reports retained construction disposal")
-    };
+    let (child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "retained construction disposal completes",
+    )
+    .await;
     scope.handle_construction_disposed(child, panic);
     assert_eq!(
         removal_response.receive().await,
@@ -888,43 +815,46 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
             .state
             .lock()
             .expect("dynamic-state mutex remains healthy");
-        let runtime = tokio::runtime::Handle::current();
-        let (scope, annul) = std::thread::scope(|threads| {
-            let annul_ready = contender_ready.clone();
-            let annul_control = Arc::clone(&reservation.control);
-            let annul_slot = Arc::clone(&reservation.slot);
-            let annul_scope = Arc::clone(&reservation.scope);
-            let annul = threads.spawn(move || {
-                annul_ready
-                    .send(())
-                    .expect("the race coordinator remains available");
-                cancel_dynamic_reservation(&annul_scope, annul_control.as_ref(), &annul_slot);
-            });
-            let admission = threads.spawn(move || {
-                let _runtime = runtime.enter();
-                contender_ready
-                    .send(())
-                    .expect("the race coordinator remains available");
-                scope.handle_admission(request);
-                scope
-            });
-            // Both contenders are running before the dynamic-state mutex is
-            // released, so neither can finish ahead of the other: the guard,
-            // not the rendezvous, is what forces them to overlap. The
-            // rendezvous only proves each thread reached its send — the
-            // channel is shared, so neither receive names a contender.
-            contenders_ready
-                .recv()
-                .expect("a contender starts before the mutex is released");
-            contenders_ready
-                .recv()
-                .expect("both contenders start before the mutex is released");
-            drop(state);
-            let annul = annul.join();
-            let scope = admission.join().expect("the admission contender completes");
-            (scope, annul)
+        let annul_ready = contender_ready.clone();
+        let annul_control = Arc::clone(&reservation.control);
+        let annul_slot = Arc::clone(&reservation.slot);
+        let annul_scope = Arc::clone(&reservation.scope);
+        let annul = std::thread::spawn(move || {
+            annul_ready
+                .send(())
+                .expect("the race coordinator remains available");
+            cancel_dynamic_reservation(&annul_scope, annul_control.as_ref(), &annul_slot);
         });
-        annul.expect("the annul contender completes");
+        let (admission_runtime, admission) = DedicatedRuntime::spawn(async move {
+            contender_ready
+                .send(())
+                .expect("the race coordinator remains available");
+            scope.handle_admission(request);
+            scope
+        });
+        // Both contenders are running before the dynamic-state mutex is
+        // released, so neither can finish ahead of the other: the guard,
+        // not the rendezvous, is what forces them to overlap. The
+        // rendezvous only proves each contender reached its send — the
+        // channel is shared, so neither receive names a contender.
+        contenders_ready
+            .recv()
+            .expect("a contender starts before the mutex is released");
+        contenders_ready
+            .recv()
+            .expect("both contenders start before the mutex is released");
+        drop(state);
+        annul.join().expect("the annul contender completes");
+        let scope = match crate::runtime::join(admission).await {
+            crate::runtime::JoinOutcome::Ok { value } => value,
+            crate::runtime::JoinOutcome::Panic { message } => {
+                panic!("the admission contender panicked: {message:?}")
+            }
+            crate::runtime::JoinOutcome::Cancelled => {
+                panic!("the admission contender was cancelled")
+            }
+        };
+        admission_runtime.shutdown().await;
 
         // Whichever side won the dynamic-state mutex, exactly one owner
         // published terminality (or none, if the admission won): the record,
@@ -1159,7 +1089,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
     scope.handle_admission(request);
     assert!(matches!(admission_response.try_receive(), Some(Ok(()))));
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(2), started.fired()).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, started.fired()).await,
         crate::runtime::Timeout::Completed(())
     ));
 
@@ -1198,16 +1128,12 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
         ));
     }
 
-    let removal = match crate::runtime::timeout(
-        Duration::from_secs(2),
-        dynamic_event_receiver.recv(),
+    let removal = recv_removal(
+        &mut dynamic_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "one removal request reaches the driver",
     )
-    .await
-    {
-        crate::runtime::Timeout::Completed(Some(DriverEvent::Removal(removal))) => removal,
-        crate::runtime::Timeout::Completed(_) => panic!("one removal request reaches the driver"),
-        crate::runtime::Timeout::Elapsed => panic!("the removal request reaches the driver"),
-    };
+    .await;
     assert_eq!(removal.key, key);
     if source == RemovalSource::FusedAndExplicit {
         assert!(
@@ -1250,7 +1176,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
 
     recv_child_exit(
         &mut event_receiver,
-        Duration::from_secs(2),
+        DRIVER_PROGRESS_WAIT,
         "the stopped child exit",
     )
     .await
@@ -1265,21 +1191,12 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
         );
     }
 
-    let disposal =
-        match crate::runtime::timeout(Duration::from_secs(2), scope.disposal_event_receiver.recv())
-            .await
-        {
-            crate::runtime::Timeout::Completed(Some(event)) => event,
-            crate::runtime::Timeout::Completed(None) => {
-                panic!("the disposal lane remains open")
-            }
-            crate::runtime::Timeout::Elapsed => {
-                panic!("retained construction disposal completes")
-            }
-        };
-    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = disposal else {
-        panic!("the stop path reports retained construction disposal")
-    };
+    let (child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "retained construction disposal completes",
+    )
+    .await;
     assert_eq!(child, key);
     scope.handle_construction_disposed(child, panic);
 
@@ -1324,9 +1241,7 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     A: Future,
 {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
     root.set_state(ScopeState::Running);
@@ -1334,8 +1249,6 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
 
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
-    root.set_dynamic_route(Some(control.clone()));
-    root.set_admitted_children(Vec::new());
     let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_lifecycle(ScopeLifecycle::running())
         .with_dynamic(Some(control.clone()))
@@ -1388,7 +1301,7 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     release_failure.fire();
     let exit = recv_child_exit(
         &mut event_receiver,
-        Duration::from_secs(2),
+        DRIVER_PROGRESS_WAIT,
         "the first incarnation exit",
     )
     .await;
@@ -1446,22 +1359,20 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
         Some(DriverEvent::Removal(queued))
             if queued.key == ChildKey::fixture(u64::MAX - 1)
     ));
-    let forwarded =
-        match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
-            crate::runtime::Timeout::Completed(Some(event)) => event,
-            crate::runtime::Timeout::Completed(None) => panic!("the driver lane remains open"),
-            crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
-        };
-    let DriverEvent::Removal(removal) = forwarded else {
-        panic!("the queued event is the fused removal")
-    };
+    let removal = recv_removal(
+        &mut event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the fused removal edge",
+    )
+    .await;
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
-    let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        scope.disposal_event_receiver.recv().await
-    else {
-        panic!("removal joins retained construction disposal")
-    };
+    let (child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "removal joins retained construction disposal",
+    )
+    .await;
     scope.handle_construction_disposed(child, panic);
     assert!(scope.children.get(key).is_none());
 }

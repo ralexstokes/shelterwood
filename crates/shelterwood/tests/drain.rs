@@ -8,11 +8,11 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, assert_eventually, assert_quiet, poll_until};
+use crate::common::{ReleaseGate, assert_eventually, assert_quiet, next_event, poll_until};
 use shelterwood::{
     Actor, ActorOnceDef, Cancellation, Context, Exit, ExitError, ExitKind, ExitResult, GracePhase,
-    LifecycleEventKind, LifecycleEvents, LifecycleItem, Mailbox, MailboxShutdown, SendErrorKind,
-    Shutdown, StopContext, Tree,
+    LifecycleEventKind, LifecycleEvents, Mailbox, MailboxShutdown, SendErrorKind, Shutdown,
+    StopContext, Tree,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -24,8 +24,42 @@ enum Message {
     Offload,
 }
 
+/// Publishes a handler's `is_draining()` observations for judgement in the
+/// test body.
+///
+/// An assertion inside a supervised handler is inert: supervision catches the
+/// panic and the test reads a later, weaker symptom. Recording every visit
+/// instead keeps the verdict in the test, and the recorded count is itself
+/// evidence — an empty log never satisfies an expectation, so no default can
+/// stand in for an observation that never happened.
+#[derive(Clone, Default)]
+struct DrainingProbe(Arc<Mutex<Vec<bool>>>);
+
+impl DrainingProbe {
+    fn record(&self, draining: bool) {
+        self.0
+            .lock()
+            .expect("draining probe mutex poisoned")
+            .push(draining);
+    }
+
+    fn observations(&self) -> Vec<bool> {
+        self.0
+            .lock()
+            .expect("draining probe mutex poisoned")
+            .clone()
+    }
+
+    #[track_caller]
+    fn assert_observed(&self, expected: &[bool], context: &str) {
+        assert_eq!(self.observations(), expected, "{context}");
+    }
+}
+
 struct Args {
     stop_entered: Arc<AtomicBool>,
+    stop_draining: DrainingProbe,
+    value_draining: DrainingProbe,
     allow_stop: ReleaseGate,
     drain_entered: Arc<AtomicBool>,
     allow_drain: ReleaseGate,
@@ -46,14 +80,14 @@ impl Actor for DrainActor {
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         match message {
             Message::Stop => {
-                assert!(!context.is_draining());
+                self.0.stop_draining.record(context.is_draining());
                 self.0.log.lock().expect("log mutex poisoned").push(0);
                 self.0.stop_entered.store(true, Ordering::SeqCst);
                 self.0.allow_stop.wait().await;
                 context.stop();
             }
             Message::Value(value) => {
-                assert!(context.is_draining());
+                self.0.value_draining.record(context.is_draining());
                 self.0.log.lock().expect("log mutex poisoned").push(value);
                 if !self.0.drain_entered.swap(true, Ordering::SeqCst) {
                     let continuation = context
@@ -119,6 +153,8 @@ impl Actor for DrainActor {
 
 async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
     let stop_entered = Arc::new(AtomicBool::new(false));
+    let stop_draining = DrainingProbe::default();
+    let value_draining = DrainingProbe::default();
     let allow_stop = ReleaseGate::default();
     let drain_entered = Arc::new(AtomicBool::new(false));
     let allow_drain = ReleaseGate::default();
@@ -131,6 +167,8 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
             "drain",
             ActorOnceDef::<DrainActor>::new(Args {
                 stop_entered: Arc::clone(&stop_entered),
+                stop_draining: stop_draining.clone(),
+                value_draining: value_draining.clone(),
                 allow_stop: allow_stop.clone(),
                 drain_entered: Arc::clone(&drain_entered),
                 allow_drain: allow_drain.clone(),
@@ -145,6 +183,10 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
 
     let accepting_incarnation = actor.send(Message::Stop).await.expect("stop accepted");
     assert_eventually!(|| stop_entered.load(Ordering::SeqCst)).await;
+    stop_draining.assert_observed(
+        &[false],
+        "the initiating handler runs before mailbox drain begins",
+    );
     actor
         .send(Message::Value(1))
         .await
@@ -186,6 +228,12 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
         .expect_err("one-shot membership terminalizes");
     assert_eq!(terminal.kind, SendErrorKind::Terminated);
     assert_eq!(*log.lock().expect("log mutex poisoned"), expected);
+    // Every entry after the initiating `Stop` is one drained `Value`, and
+    // each of those handlers must have seen the draining phase.
+    value_draining.assert_observed(
+        &vec![true; expected.len() - 1],
+        "every drained delivery observes the draining phase",
+    );
     assert!(!deferred_ran.load(Ordering::SeqCst));
 }
 
@@ -230,6 +278,8 @@ struct FaultArgs {
     mode: FaultMode,
     hold_entered: ReleaseGate,
     hold_release: ReleaseGate,
+    hold_draining: DrainingProbe,
+    fault_draining: DrainingProbe,
     shutdown_seen: ReleaseGate,
     drain_entered: ReleaseGate,
     stop_entered: Arc<AtomicBool>,
@@ -256,13 +306,13 @@ impl Actor for FaultActor {
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         match message {
             FaultMessage::Hold => {
-                assert!(!context.is_draining());
+                self.0.hold_draining.record(context.is_draining());
                 self.0.hold_entered.release();
                 self.0.hold_release.wait().await;
                 Ok(())
             }
             FaultMessage::Fault => {
-                assert!(context.is_draining());
+                self.0.fault_draining.record(context.is_draining());
                 self.0.drained.fetch_add(1, Ordering::SeqCst);
                 self.0.drain_entered.release();
                 match self.0.mode {
@@ -313,15 +363,13 @@ struct FaultOutcome {
 }
 
 async fn exited_actor(events: &mut LifecycleEvents) -> Exit {
-    while let Some(item) = events.recv().await {
-        if let LifecycleItem::Event(event) = item
-            && let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+    loop {
+        if let LifecycleEventKind::Exited { id, exit, .. } = next_event(events).await.kind
             && id.as_str() == "actor"
         {
             return exit;
         }
     }
-    panic!("actor exit must precede lifecycle closure");
 }
 
 async fn run_fault_fixture(
@@ -332,6 +380,8 @@ async fn run_fault_fixture(
 ) -> FaultOutcome {
     let hold_entered = ReleaseGate::default();
     let hold_release = ReleaseGate::default();
+    let hold_draining = DrainingProbe::default();
+    let fault_draining = DrainingProbe::default();
     let shutdown_seen = ReleaseGate::default();
     let drain_entered = ReleaseGate::default();
     let stop_entered = Arc::new(AtomicBool::new(false));
@@ -345,6 +395,8 @@ async fn run_fault_fixture(
                 mode,
                 hold_entered: hold_entered.clone(),
                 hold_release: hold_release.clone(),
+                hold_draining: hold_draining.clone(),
+                fault_draining: fault_draining.clone(),
                 shutdown_seen: shutdown_seen.clone(),
                 drain_entered: drain_entered.clone(),
                 stop_entered: Arc::clone(&stop_entered),
@@ -374,6 +426,14 @@ async fn run_fault_fixture(
     let shutdown = tokio::spawn(system.shutdown(Duration::from_secs(30)));
     shutdown_seen.wait().await;
     hold_release.release();
+    // `hold_entered` published this observation before the test resumed, so
+    // the verdict was fixed well before here; it is judged only once the
+    // queued payload belongs to the actor, so a failure unwinds the test
+    // rather than aborting inside a panicking payload destructor.
+    hold_draining.assert_observed(
+        &[false],
+        "the held handler observes live delivery before its gate is released",
+    );
     if matches!(mode, FaultMode::SharedGrace) {
         drain_entered.wait().await;
         assert!(
@@ -390,11 +450,18 @@ async fn run_fault_fixture(
         .expect("the child policy bounds shutdown");
     let elapsed = tokio::time::Instant::now() - started_at;
     let exit = exited_actor(&mut events).await;
+    let drained = drained.load(Ordering::SeqCst);
+    // Tying the observation count to `drained` keeps an absent handler from
+    // passing: a mode that never drains records nothing and expects nothing.
+    fault_draining.assert_observed(
+        &vec![true; drained],
+        "every drained fault handler observes the draining phase",
+    );
     FaultOutcome {
         exit,
         elapsed,
         stop_entered: stop_entered.load(Ordering::SeqCst),
-        drained: drained.load(Ordering::SeqCst),
+        drained,
         blocking_result: blocking_result.load(Ordering::SeqCst),
     }
 }

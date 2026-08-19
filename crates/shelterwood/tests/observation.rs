@@ -10,14 +10,14 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, poll_once,
+    POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, next_event, next_item, poll_once,
     waiting::{gate_released_manual_ready_task, task as waiting_task, tree as waiting_tree},
 };
 use shelterwood::{
     Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LifecycleEvent,
     LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleSeq, LifecycleTryRecvError,
     MembershipStatus, RemoveOutcome, RestartCondition, RestartCount, RestartPolicy, Retention,
-    ScopeKind, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef, SubtreeOnceDef, TaskDef,
+    ScopeFlavor, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef, SubtreeOnceDef, TaskDef,
     TaskOnceDef, TaskRef, TotalRestarts, Tree, WaitError,
 };
 
@@ -25,20 +25,6 @@ use shelterwood::{
 // overflow regression deliberately pins the current behavior without asking
 // applications to compile against that tuning constant.
 const LIFECYCLE_EVENT_CAPACITY: usize = 128;
-
-async fn next_item(events: &mut LifecycleEvents) -> LifecycleItem {
-    tokio::time::timeout(Duration::from_secs(2), events.recv())
-        .await
-        .expect("lifecycle receive is bounded")
-        .expect("lifecycle stream remains open")
-}
-
-async fn next_event(events: &mut LifecycleEvents) -> LifecycleEvent {
-    match next_item(events).await {
-        LifecycleItem::Event(event) => event,
-        LifecycleItem::Lagged { dropped } => panic!("unexpected lag marker dropping {dropped}"),
-    }
-}
 
 fn event_watermark(scope: &ScopeRef, event: &LifecycleEvent) -> Option<LifecycleSeq> {
     let snapshot = scope.snapshot();
@@ -1286,7 +1272,6 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
         Backoff::fixed(Duration::from_secs(5), Jitter::None).expect("valid backoff"),
     );
     let mut nested = Tree::new();
-    nested.strategy(Strategy::OneForOne);
     nested.intensity(Intensity::new(3, Duration::from_secs(45)).expect("valid intensity"));
     nested
         .add_task(
@@ -1351,7 +1336,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
 
     let running = scope.as_scope().snapshot();
     assert_eq!(running.state, ScopeState::Running);
-    assert_eq!(running.kind, ScopeKind::Dynamic);
+    assert_eq!(running.kind, ScopeFlavor::Dynamic);
     assert_eq!(
         running.strategy, None,
         "dynamic scopes have no fate-sharing strategy"
@@ -1388,7 +1373,7 @@ async fn end_to_end_snapshot_projects_kinds_policies_membership_status_and_stopp
     let recursive = nested_row.nested.as_ref().expect("nested scope is live");
     assert_eq!(nested_row.scope_seq, Some(recursive.lifecycle_seq));
     assert_eq!(recursive.state, ScopeState::Running);
-    assert_eq!(recursive.kind, ScopeKind::Ordered);
+    assert_eq!(recursive.kind, ScopeFlavor::Ordered);
     assert_eq!(recursive.strategy, Some(Strategy::OneForOne));
     assert_eq!(
         recursive.intensity,

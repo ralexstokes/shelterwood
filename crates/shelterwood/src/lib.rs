@@ -40,14 +40,14 @@ pub use mailbox::{
 };
 pub use observe::{
     ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleItem,
-    LifecycleSeq, LifecycleTryRecvError, ScopeKind, ScopeSnapshot, SnapshotClosed,
-    SnapshotReceiver, WaitError,
+    LifecycleSeq, LifecycleTryRecvError, ScopeSnapshot, SnapshotClosed, SnapshotReceiver,
+    WaitError,
 };
 pub use policy::{
-    Backoff, BackoffFactor, BoundedReadinessDeadline, DefaultsInheritance, ExponentialBackoff,
-    FixedBackoff, Intensity, Jitter, JitterSample, Mailbox, MailboxShutdown, NonZeroDuration,
-    PolicyError, Readiness, ReadinessDeadline, RestartAttempt, RestartCondition, RestartCount,
-    RestartPolicy, Retention, ScopeDefaults, Shutdown, Strategy, TotalRestarts,
+    Backoff, BackoffFactor, DefaultsInheritance, ExponentialBackoff, FixedBackoff, Intensity,
+    Jitter, JitterSample, Mailbox, MailboxShutdown, NonZeroDuration, PolicyError, Readiness,
+    ReadinessDeadline, RestartAttempt, RestartCondition, RestartCount, RestartPolicy, Retention,
+    ScopeDefaults, ScopeFlavor, Shutdown, Strategy, TotalRestarts,
 };
 pub use raw::{
     Blocking, DeadlineElapsed, Guard, RawActor, RawContext, RawDef, RawOnceDef, Rejected,

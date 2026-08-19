@@ -102,6 +102,7 @@ pub(super) struct ActiveChild {
     pub(super) readiness: ReadinessGate,
     pub(super) readiness_deadline: Option<DeadlineHandle>,
     pub(super) ready_signal: CompletionGatedLatch,
+    pub(super) framework_shutdown: Option<Latch>,
     pub(super) framework_abort: Option<Latch>,
     pub(super) framework_abort_ack: Option<Latch>,
     pub(super) stop_deadline: Option<DeadlineHandle>,
@@ -277,16 +278,46 @@ enum SpawnBody {
     },
 }
 
+enum PendingSpawnBody {
+    /// Restartable bodies hold only framework data and clones of state that
+    /// remains retained by `ChildConstruction`, so unwinding can only release
+    /// a non-last owner.
+    Retained(SpawnBody),
+    /// One-shot bodies carry the sole user-owned construction payload.
+    Isolated(runtime::Isolated<SpawnBody>),
+}
+
+impl PendingSpawnBody {
+    fn restartable(body: SpawnBody) -> Self {
+        Self::Retained(body)
+    }
+
+    fn one_shot(body: SpawnBody) -> Self {
+        Self::Isolated(runtime::Isolated::new(body))
+    }
+
+    fn into_body(self) -> SpawnBody {
+        match self {
+            Self::Retained(body) => body,
+            Self::Isolated(mut body) => body
+                .take()
+                .expect("a child spawn retains its one-shot construction body"),
+        }
+    }
+}
+
 struct SpawnDispatch {
-    body: SpawnBody,
+    body: PendingSpawnBody,
     construction_spent: bool,
 }
 
 /// Latches have deliberately separate ownership:
 ///
 /// - `shutdown`/`abort` are the child-facing cooperative ladder;
-/// - `framework_abort`/`framework_abort_ack` bound a nested scope driver's
-///   recursive drain before its task is aborted;
+/// - `framework_shutdown` is the nested scope driver's private observation
+///   edge, separate from user-installable shutdown-token waiters;
+/// - `framework_abort`/`framework_abort_ack` bound that driver's recursive
+///   drain before its task is aborted;
 /// - `ready` also carries the completion edge that makes readiness and
 ///   self-stop watcher tasks finite.
 struct SpawnLatches {
@@ -294,6 +325,7 @@ struct SpawnLatches {
     abort: Latch,
     ready: CompletionGatedLatch,
     local_stop: Latch,
+    framework_shutdown: Option<Latch>,
     framework_abort: Option<Latch>,
     framework_abort_ack: Option<Latch>,
 }
@@ -305,6 +337,7 @@ impl SpawnLatches {
             abort: Latch::default(),
             ready: CompletionGatedLatch::default(),
             local_stop: Latch::default(),
+            framework_shutdown: scope_child.then(Latch::default),
             framework_abort: scope_child.then(Latch::default),
             framework_abort_ack: scope_child.then(Latch::default),
         }
@@ -321,8 +354,12 @@ impl SpawnLatches {
     fn nested_scope(&self) -> NestedScopeLatches {
         NestedScopeLatches {
             parent_ready: self.ready.clone(),
+            child_shutdown: self.shutdown.clone(),
             ancestor: AncestorCommandLatches {
-                shutdown: self.shutdown.clone(),
+                framework_shutdown: self
+                    .framework_shutdown
+                    .clone()
+                    .expect("scope incarnations own a framework-shutdown latch"),
                 abort: self
                     .framework_abort
                     .clone()
@@ -333,6 +370,23 @@ impl SpawnLatches {
                     .expect("scope incarnations own a framework-abort acknowledgement"),
             },
         }
+    }
+}
+
+pub(super) fn fire_shutdown_edges(shutdown: &Latch, framework_shutdown: Option<&Latch>) {
+    let mut panics = runtime::PanicAccumulator::default();
+    // Commit the child-facing cancellation evidence before waking the nested
+    // driver. That observer may finish on another worker and have completion
+    // sample this bit as soon as its wake runs. User waiters remain last so a
+    // hostile one cannot strand framework progress.
+    let notify_shutdown = shutdown.fire_silently();
+    if let Some(framework_shutdown) = framework_shutdown {
+        panics.run(|| {
+            framework_shutdown.fire();
+        });
+    }
+    if notify_shutdown {
+        panics.run(|| shutdown.notify());
     }
 }
 
@@ -359,39 +413,44 @@ fn dispatch_child_construction(
     match construction {
         ChildConstruction::Raw(definition) => {
             let construction_spent = definition.one_shot();
-            SpawnDispatch {
-                body: SpawnBody::Raw {
-                    spawn: definition.take_spawn(),
-                    context: RawRunContext {
-                        id,
-                        incarnation,
-                        member: Arc::clone(&child.slot.member),
-                        scope: crate::scope::ScopeRef {
-                            cell: Arc::clone(root),
-                        },
-                        shutdown: latches.shutdown.clone(),
-                        abort: latches.abort.clone(),
-                        ready: latches.ready.clone(),
-                        local_stop: latches.local_stop.clone(),
-                        mailbox_shutdown: child.options.mailbox_shutdown,
+            let body = SpawnBody::Raw {
+                spawn: definition.take_spawn(),
+                context: RawRunContext {
+                    id,
+                    incarnation,
+                    member: Arc::clone(&child.slot.member),
+                    scope: crate::scope::ScopeRef {
+                        cell: Arc::clone(root),
                     },
-                    readiness: child.options.readiness,
+                    shutdown: latches.shutdown.clone(),
+                    abort: latches.abort.clone(),
+                    ready: latches.ready.clone(),
+                    local_stop: latches.local_stop.clone(),
+                    mailbox_shutdown: child.options.mailbox_shutdown,
+                },
+                readiness: child.options.readiness,
+            };
+            SpawnDispatch {
+                body: if construction_spent {
+                    PendingSpawnBody::one_shot(body)
+                } else {
+                    PendingSpawnBody::restartable(body)
                 },
                 construction_spent,
             }
         }
         ChildConstruction::Task(definition) => SpawnDispatch {
-            body: SpawnBody::TaskRestartable {
+            body: PendingSpawnBody::restartable(SpawnBody::TaskRestartable {
                 factory: Arc::clone(&definition.factory),
                 context: TaskContext::new(id, incarnation, latches.task_context()),
-            },
+            }),
             construction_spent: false,
         },
         ChildConstruction::TaskOnce(definition) => SpawnDispatch {
-            body: SpawnBody::TaskOnce {
+            body: PendingSpawnBody::one_shot(SpawnBody::TaskOnce {
                 body: definition.take_body(),
                 context: TaskContext::new(id, incarnation, latches.task_context()),
-            },
+            }),
             construction_spent: true,
         },
         ChildConstruction::Scope(definition) => {
@@ -430,7 +489,11 @@ fn dispatch_child_construction(
                 )
             };
             SpawnDispatch {
-                body,
+                body: if construction_spent {
+                    PendingSpawnBody::one_shot(body)
+                } else {
+                    PendingSpawnBody::restartable(body)
+                },
                 construction_spent,
             }
         }
@@ -545,7 +608,7 @@ impl ScopeRuntime {
         // already-joined boundary directly, so normalize them through the
         // same reducer predecessor instead of allowing `Terminalized` to
         // skip arbitrary incarnation states.
-        if !self.supervisor.is_disposing(key) && !self.supervisor.membership_terminal(key) {
+        if !self.supervisor.is_disposing(key) && !self.supervisor.joined(key) {
             self.reduce(SupervisorEvent::DisposalStarted { child: key });
         }
         let changed = self
@@ -582,7 +645,7 @@ impl ScopeRuntime {
         };
         if self.supervisor.lifecycle().is_draining()
             || child.active.is_some()
-            || self.supervisor.membership_terminal(key)
+            || self.supervisor.joined(key)
             || self.supervisor.is_disposing(key)
         {
             return;
@@ -621,7 +684,9 @@ impl ScopeRuntime {
         // - ready and local_stop flow from application code back to helpers;
         // - ready's completion edge terminates those helpers when the child
         //   exits first and orders late retained readiness capabilities;
-        // - framework_abort/ack join nested-scope escalation before exit.
+        // - framework_shutdown keeps the nested driver observer separate from
+        //   user waiters, while framework_abort/ack joins escalation before
+        //   exit.
         // Each edge is level-triggered, so helper startup cannot lose a pulse.
         let scope_child = matches!(child.construction.get_mut(), ChildConstruction::Scope(_));
         let latches = SpawnLatches::new(scope_child);
@@ -666,6 +731,11 @@ impl ScopeRuntime {
             // terminal publication or restart-window arbitration.
             drop(child.construction.take());
         }
+        // Binding and Started publication can both resume hostile waker
+        // panics. Keep one-shot construction state behind isolated disposal
+        // until those effects have completed, then transfer it at the task
+        // launch boundary.
+        let body = body.into_body();
         let abort_handle = spawn_child_tasks(ChildTaskLaunch {
             events: self.events.clone(),
             key,
@@ -689,6 +759,7 @@ impl ScopeRuntime {
             readiness,
             readiness_deadline: None,
             ready_signal: latches.ready,
+            framework_shutdown: latches.framework_shutdown,
             framework_abort: latches.framework_abort,
             framework_abort_ack: latches.framework_abort_ack,
             stop_deadline: None,
@@ -707,7 +778,7 @@ impl ScopeRuntime {
         let Some(child) = self.children.get(key) else {
             return;
         };
-        if self.supervisor.membership_terminal(key) || self.supervisor.is_disposing(key) {
+        if self.supervisor.joined(key) || self.supervisor.is_disposing(key) {
             return;
         }
         if child
@@ -794,7 +865,11 @@ impl ScopeRuntime {
         while let Some(action) = ladder.advance(now) {
             match action {
                 StopAction::Cancel => {
-                    active.shutdown.fire();
+                    // Publish the framework-only edge independently so a
+                    // hostile user cancellation waiter cannot strand the
+                    // nested scope driver. The latch implementation itself
+                    // finishes every waiter before this call resumes a panic.
+                    fire_shutdown_edges(&active.shutdown, active.framework_shutdown.as_ref());
                 }
                 StopAction::Escalate => {
                     active.abort.fire();
@@ -1047,7 +1122,7 @@ impl ScopeRuntime {
     ) {
         if !self.supervisor.contains(key)
             || self.supervisor.is_disposing(key)
-            || self.supervisor.membership_terminal(key)
+            || self.supervisor.joined(key)
         {
             return;
         }
@@ -1152,13 +1227,147 @@ impl ScopeRuntime {
             && !self.supervisor.lifecycle().is_draining()
         {
             self.fail_startup(key, exit);
-            if self.children[&key].options.retention == crate::Retention::Remove {
+            if self.children[key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
             }
         } else {
-            if self.children[&key].options.retention == crate::Retention::Remove {
+            if self.children[key].options.retention == crate::Retention::Remove {
                 self.prune_terminal(key);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod latch_topology_tests {
+    use std::{
+        future::Future,
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        task::{Context, Wake, Waker},
+    };
+
+    use super::{SpawnLatches, fire_shutdown_edges};
+
+    struct PanicWake(&'static str);
+
+    impl Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            std::panic::panic_any(self.0);
+        }
+    }
+
+    struct CountWake(Arc<AtomicUsize>);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ObserveShutdownWake {
+        shutdown: crate::runtime::Latch,
+        observed: Arc<AtomicBool>,
+    }
+
+    impl Wake for ObserveShutdownWake {
+        fn wake(self: Arc<Self>) {
+            self.observed
+                .store(self.shutdown.is_fired(), Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn nested_scope_shutdown_observer_is_not_a_user_cancellation_waiter() {
+        let latches = SpawnLatches::new(true);
+        let nested = latches.nested_scope();
+
+        assert!(latches.shutdown.fire());
+        assert!(latches.shutdown.is_fired());
+        assert!(
+            !nested.ancestor.framework_shutdown.is_fired(),
+            "firing the user cancellation edge cannot fire the framework observer"
+        );
+
+        let latches = SpawnLatches::new(true);
+        let nested = latches.nested_scope();
+        assert!(nested.ancestor.framework_shutdown.fire());
+        assert!(nested.ancestor.framework_shutdown.is_fired());
+        assert!(
+            !latches.shutdown.is_fired(),
+            "firing the framework observer cannot publish user cancellation"
+        );
+    }
+
+    #[test]
+    fn non_scope_children_do_not_allocate_framework_shutdown_observers() {
+        let latches = SpawnLatches::new(false);
+
+        assert!(latches.framework_shutdown.is_none());
+        assert!(latches.framework_abort.is_none());
+        assert!(latches.framework_abort_ack.is_none());
+    }
+
+    #[test]
+    fn hostile_user_shutdown_waiter_cannot_strand_the_framework_observer() {
+        const PANIC: &str = "injected user cancellation waker panic";
+
+        let latches = SpawnLatches::new(true);
+        let nested = latches.nested_scope();
+        let mut user_wait = Box::pin(latches.shutdown.fired());
+        let mut framework_wait = Box::pin(nested.ancestor.framework_shutdown.fired());
+        let hostile = Waker::from(Arc::new(PanicWake(PANIC)));
+        let framework_wakes = Arc::new(AtomicUsize::new(0));
+        let framework = Waker::from(Arc::new(CountWake(Arc::clone(&framework_wakes))));
+        assert!(
+            user_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        assert!(
+            framework_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&framework))
+                .is_pending()
+        );
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            fire_shutdown_edges(&latches.shutdown, Some(&nested.ancestor.framework_shutdown));
+        }));
+
+        let payload = result.expect_err("the hostile user wake still surfaces");
+        assert_eq!(payload.downcast_ref::<&'static str>().copied(), Some(PANIC));
+        assert!(latches.shutdown.is_fired());
+        assert!(nested.ancestor.framework_shutdown.is_fired());
+        assert_eq!(framework_wakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn framework_shutdown_wake_observes_child_cancellation_already_committed() {
+        let latches = SpawnLatches::new(true);
+        let nested = latches.nested_scope();
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut framework_wait = Box::pin(nested.ancestor.framework_shutdown.fired());
+        let framework = Waker::from(Arc::new(ObserveShutdownWake {
+            shutdown: latches.shutdown.clone(),
+            observed: Arc::clone(&observed),
+        }));
+        assert!(
+            framework_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&framework))
+                .is_pending()
+        );
+
+        fire_shutdown_edges(&latches.shutdown, Some(&nested.ancestor.framework_shutdown));
+
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "the nested driver cannot run before child cancellation is visible"
+        );
     }
 }

@@ -10,17 +10,104 @@ use std::{
 };
 
 use crate::common::{
-    ReleaseGate, advance_time, assert_eventually, assert_quiet, next_event, poll_once, poll_until,
-    startup_failed_child, waiting::task as waiting_task,
+    POLL_TIMEOUT, ReleaseGate, advance_time, assert_eventually, assert_quiet, next_event,
+    poll_once, poll_until, startup_failed_child, waiting::task as waiting_task,
 };
 use shelterwood::{
-    Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DefaultsInheritance,
-    DynamicTree, ExitError, ExitKind, ExitResult, GracePhase, Intensity, LifecycleEventKind,
-    LifecycleItem, LifecycleTryRecvError, Mailbox, MailboxShutdown, Readiness, ReadinessDeadline,
-    RestartAttempt, RestartCondition, RestartPolicy, ScopeDefaults, ScopeRef, SendErrorKind,
-    Shutdown, StartupError, StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef,
-    TaskOnceDef, TaskRef, Tree,
+    Actor, ActorOnceDef, Backoff, CallErrorKind, Cancellation, ChildState, Context,
+    DefaultsInheritance, DynamicTree, ExitError, ExitKind, ExitResult, GracePhase, Intensity,
+    LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, Mailbox, MailboxShutdown, RawActor,
+    RawContext, RawOnceDef, Readiness, ReadinessDeadline, Reply, RestartAttempt, RestartCondition,
+    RestartPolicy, ScopeDefaults, ScopeRef, SendErrorKind, Shutdown, StartupError,
+    StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef,
+    Tree,
 };
+
+#[tokio::test]
+async fn static_subtree_slot_preserves_its_handle_through_definition_and_spawn() {
+    let mut nested = Tree::new();
+    nested
+        .add_task("worker", waiting_task())
+        .expect("valid nested task");
+
+    let mut root = Tree::new();
+    let slot = root
+        .reserve_subtree::<Tree>("nested")
+        .expect("static subtree reservation succeeds");
+    let reserved = slot.scope_ref();
+    let defined = slot.define_once(SubtreeOnceDef::new(nested));
+    assert_eq!(defined.membership(), reserved.membership());
+
+    let system = root.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("reserved subtree starts");
+    let snapshot = reserved.snapshot();
+    assert!(matches!(snapshot.state, shelterwood::ScopeState::Running));
+    assert!(snapshot.child("worker").is_some());
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("reserved subtree shuts down");
+}
+
+enum ParkedMailboxMessage {
+    Value,
+    Ask { _reply: Reply<()> },
+}
+
+struct NeverReceives;
+
+impl RawActor for NeverReceives {
+    type Msg = ParkedMailboxMessage;
+
+    async fn run(&mut self, _: &mut RawContext<Self::Msg>) -> ExitResult {
+        future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn owner_drop_and_nested_driver_abort_resolve_already_parked_mailbox_futures() {
+    let mut nested = Tree::new();
+    let actor = nested
+        .add_raw_once(
+            "mailbox",
+            RawOnceDef::new(NeverReceives).mailbox(Mailbox::queue(1).expect("non-zero capacity")),
+        )
+        .expect("valid nested actor");
+    let mut root = Tree::new();
+    root.add_subtree_once(
+        "nested",
+        SubtreeOnceDef::new(nested).shutdown(Shutdown::Abort),
+    )
+    .expect("valid aborting subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("nested actor starts");
+
+    actor
+        .try_send(ParkedMailboxMessage::Value)
+        .expect("the queue is filled");
+    let mut send = Box::pin(actor.send(ParkedMailboxMessage::Value));
+    let mut call = Box::pin(actor.call(
+        |reply| ParkedMailboxMessage::Ask { _reply: reply },
+        Duration::from_secs(30),
+    ));
+    assert!(poll_once(send.as_mut()).is_pending());
+    assert!(poll_once(call.as_mut()).is_pending());
+
+    drop(system);
+    let send_error = tokio::time::timeout(POLL_TIMEOUT, send)
+        .await
+        .expect("owner drop cannot strand the parked send")
+        .expect_err("the aborted nested mailbox terminalizes");
+    assert_eq!(send_error.kind, SendErrorKind::Terminated);
+    let call_error = tokio::time::timeout(POLL_TIMEOUT, call)
+        .await
+        .expect("nested-driver abort cannot strand the parked call")
+        .expect_err("the aborted nested mailbox terminalizes");
+    assert_eq!(call_error.kind, CallErrorKind::Terminated);
+}
 
 #[tokio::test]
 async fn a_restartable_subtree_can_heal_an_unfilled_lowering_failure() {
@@ -654,6 +741,40 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
         weak.upgrade().is_none(),
         "shutdown returns only after every nested driver and active future drops"
     );
+}
+
+#[tokio::test]
+async fn subtree_shutdown_and_wait_zero_escalates_and_joins_its_target_incarnation() {
+    let mut nested = Tree::new();
+    let leaf = nested
+        .add_task(
+            "leaf",
+            TaskDef::new(|_| future::pending()).shutdown(Shutdown::Abort),
+        )
+        .expect("valid leaf");
+    let mut root = Tree::new();
+    let subtree = root
+        .add_subtree_once("nested", SubtreeOnceDef::new(nested))
+        .expect("valid subtree");
+    let system = root.spawn().expect("runtime is available");
+    system.wait_started().await.expect("subtree starts");
+
+    let timeout = subtree
+        .shutdown_and_wait(Duration::ZERO)
+        .await
+        .expect_err("zero budget immediately escalates the live leaf");
+    assert_eq!(timeout.stragglers.len(), 1);
+    assert_eq!(
+        timeout.stragglers[0]
+            .path
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>(),
+        ["leaf"],
+        "scope-handle timeout paths are relative to the targeted subtree"
+    );
+    assert!(matches!(leaf.wait().await.kind(), ExitKind::Aborted { .. }));
+    assert_eq!(system.wait().await, StopReason::Finished);
 }
 
 #[tokio::test]

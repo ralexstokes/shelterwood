@@ -1,5 +1,60 @@
 use super::support::*;
 
+#[crate::runtime::test]
+async fn reserve_error_identity_exhausted_maps_the_membership_domain() {
+    let mut root_identity = ScopeIdentity::new();
+    let root_id = ChildId::from("root");
+    let root_member = MemberCell::new(
+        root_id.clone(),
+        root_identity
+            .mint_membership(&root_id)
+            .expect("root membership available"),
+    );
+    let worker_id = ChildId::from("worker");
+    let child_identity = ScopeIdentity::near_exhaustion(worker_id.clone(), 7);
+    let root = ScopeCell::new(root_member, ScopeFlavor::Dynamic, child_identity);
+    let _epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("scope epoch available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state(ScopeState::Running);
+    root.set_startup(Ok(()));
+    let (events, _receiver) = crate::runtime::unbounded_mpsc();
+    let control = DynamicControl::new(events);
+    root.set_dynamic_route(Some(control));
+    root.set_admitted_children(Vec::new());
+
+    root.mint_membership(&worker_id)
+        .expect("the final membership is usable");
+    let Err(error) = reserve_dynamic(&root, worker_id, None) else {
+        panic!("the exhausted membership domain rejects the reservation")
+    };
+    assert!(matches!(error, ReserveError::IdentityExhausted));
+}
+
+#[crate::runtime::test]
+async fn reserve_error_identity_exhausted_maps_the_child_key_domain() {
+    let (mut scope, _events, mut dynamic_events, _control) = running_dynamic_fixture();
+    let reservation = reserve_dynamic(&scope.root, ChildId::from("worker"), None)
+        .expect("the membership domain still has capacity");
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    let (response, request) = begin_admission(&reservation, &mut dynamic_events, None).await;
+    scope.supervisor.exhaust_child_keys_for_test();
+    scope.handle_admission(request);
+
+    assert!(matches!(
+        response.receive().await,
+        Some(Err(ReserveError::IdentityExhausted))
+    ));
+    assert!(matches!(
+        reservation.slot.member.record().stage,
+        MemberStage::Terminal(ref exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+    ));
+}
+
 #[test]
 fn member_transitions_own_their_complete_record_projection() {
     let mut identity = ScopeIdentity::new();

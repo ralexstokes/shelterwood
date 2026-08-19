@@ -2,8 +2,34 @@ use std::time::Duration;
 
 use shelterwood::{
     Backoff, BackoffFactor, BoundedReadinessDeadline, ExponentialBackoff, FixedBackoff, Intensity,
-    Jitter, Mailbox, PolicyError, ReadinessDeadline,
+    Jitter, JitterSample, Mailbox, PolicyError, ReadinessDeadline, RestartAttempt,
 };
+
+#[test]
+fn jitter_sample_facade_clamps_and_drives_equal_jitter() {
+    let zero = JitterSample::new(0.0);
+    assert_eq!(JitterSample::new(-1.0), zero);
+    assert_eq!(JitterSample::new(f64::NAN), zero);
+    assert_eq!(JitterSample::new(f64::INFINITY), zero);
+    assert_eq!(JitterSample::from_u64_ratio(1, 0), zero);
+    assert_eq!(
+        JitterSample::new(1.0),
+        JitterSample::new(1.0 - f64::EPSILON),
+        "the public sample clamps to the documented half-open range"
+    );
+
+    let backoff =
+        Backoff::fixed(Duration::from_nanos(100), Jitter::Equal).expect("the delay is non-zero");
+    assert_eq!(
+        backoff.next_delay(RestartAttempt::ZERO.bump(), zero),
+        Duration::from_nanos(50)
+    );
+    assert_eq!(
+        backoff.next_delay(RestartAttempt::ZERO.bump(), JitterSample::new(0.5)),
+        Duration::from_nanos(75),
+        "the supplied sample, rather than hidden randomness, selects the delay"
+    );
+}
 
 #[test]
 fn backoff_constructors_reject_every_invalid_boundary() {

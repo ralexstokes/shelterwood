@@ -31,6 +31,13 @@ pub struct Admission<H> {
 
 type AdmissionWait = Pin<Box<dyn Future<Output = Result<(), ReserveError>> + Send + 'static>>;
 
+/// Fail-closed error when the admission response obligation never completes.
+///
+/// Named separately from the polling path so the release-only fallback policy
+/// remains directly assertable in debug CI.
+const LOST_ADMISSION_RESPONSE_ERROR: ReserveError =
+    ReserveError::NotAdmitting(crate::NotAdmittingCause::Terminal);
+
 struct PendingAdmission<H> {
     reservation: DynamicReservation,
     handles: H,
@@ -52,9 +59,7 @@ impl<H> PendingAdmission<H> {
                 // never stranded, but fail loudly in debug builds: silence
                 // here would mask an obligation regression.
                 debug_assert!(false, "admission response obligation must complete");
-                Err(ReserveError::NotAdmitting(
-                    crate::NotAdmittingCause::Terminal,
-                ))
+                Err(LOST_ADMISSION_RESPONSE_ERROR)
             })
         }))
     }
@@ -300,6 +305,14 @@ mod tests {
             panic!("hostile observation waker");
         }
     }
+    #[test]
+    fn lost_admission_response_policy_fails_closed() {
+        assert!(matches!(
+            super::LOST_ADMISSION_RESPONSE_ERROR,
+            crate::ReserveError::NotAdmitting(crate::NotAdmittingCause::Terminal)
+        ));
+    }
+
     #[test]
     fn lost_removal_response_policy_fails_closed() {
         // Profile-independent: the release fallback below is unreachable in

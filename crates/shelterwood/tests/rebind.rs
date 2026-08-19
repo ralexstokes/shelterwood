@@ -77,6 +77,7 @@ struct EvidenceRestartActor {
     generation: usize,
     fail_first: ReleaseGate,
     hold_replacement: ReleaseGate,
+    complete_first: bool,
 }
 
 impl RawActor for EvidenceRestartActor {
@@ -85,7 +86,11 @@ impl RawActor for EvidenceRestartActor {
     async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
         if self.generation == 1 {
             self.fail_first.wait().await;
-            return Err(ExitError::message("replace first incarnation"));
+            return if self.complete_first {
+                Ok(())
+            } else {
+                Err(ExitError::message("replace first incarnation"))
+            };
         }
         self.hold_replacement.wait().await;
         while let Some(message) = context.recv().await {
@@ -102,6 +107,8 @@ fn evidence_restarting_definition(
     factories: &Arc<AtomicUsize>,
     fail_first: &ReleaseGate,
     hold_replacement: &ReleaseGate,
+    complete_first: bool,
+    restart: RestartPolicy,
 ) -> RawDef<EvidenceRestartActor> {
     RawDef::factory({
         let factories = Arc::clone(factories);
@@ -111,10 +118,11 @@ fn evidence_restarting_definition(
             generation: factories.fetch_add(1, Ordering::SeqCst) + 1,
             fail_first: fail_first.clone(),
             hold_replacement: hold_replacement.clone(),
+            complete_first,
         }
     })
     .mailbox(Mailbox::queue(1).expect("non-zero capacity"))
-    .restart(RestartPolicy::default())
+    .restart(restart)
 }
 
 async fn wait_for_destructor(destructor: &DestructorGate) {
@@ -133,7 +141,13 @@ async fn rebind_refreshes_all_overflow_waiter_incarnation_evidence() {
     let actor = tree
         .add_raw(
             "evidence-worker",
-            evidence_restarting_definition(&factories, &fail_first, &hold_replacement),
+            evidence_restarting_definition(
+                &factories,
+                &fail_first,
+                &hold_replacement,
+                false,
+                RestartPolicy::default(),
+            ),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -184,6 +198,49 @@ async fn rebind_refreshes_all_overflow_waiter_incarnation_evidence() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("actor stops");
+}
+
+#[tokio::test]
+async fn always_restart_carries_parked_send_and_call_across_a_clean_exit() {
+    let factories = Arc::new(AtomicUsize::new(0));
+    let finish_first = ReleaseGate::default();
+    let hold_replacement = ReleaseGate::default();
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_raw(
+            "always-worker",
+            evidence_restarting_definition(
+                &factories,
+                &finish_first,
+                &hold_replacement,
+                true,
+                RestartPolicy::new(RestartCondition::Always, Backoff::Immediate),
+            ),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("first actor starts");
+    let first = actor
+        .try_send(EvidenceMessage::Value)
+        .expect("first incarnation queue fills");
+    let mut send = Box::pin(actor.send(EvidenceMessage::Value));
+    let mut call = Box::pin(actor.call(EvidenceMessage::Ask, Duration::from_secs(30)));
+    assert!(poll_once(send.as_mut()).is_pending());
+    assert!(poll_once(call.as_mut()).is_pending());
+
+    finish_first.release();
+    assert_eventually!(|| factories.load(Ordering::SeqCst) == 2).await;
+    hold_replacement.release();
+    let accepting = send.await.expect("parked send enters the replacement");
+    let replied = call.await.expect("parked call enters the replacement");
+    assert!(accepting.supersedes(first));
+    assert_eq!(replied.incarnation, accepting);
+    assert_eq!(replied.value, 17);
+    assert_eq!(factories.load(Ordering::SeqCst), 2);
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("replacement stops");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

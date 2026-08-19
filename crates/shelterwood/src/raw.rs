@@ -707,20 +707,6 @@ impl<M> TimerStore<M> {
     }
 
     fn unlink(&mut self, location: TimerLocation) -> TimerEntry<M> {
-        let arming_order = self
-            .keyed
-            .get(&location.hash)
-            .and_then(|bucket| bucket.get(location.index))
-            .expect("a timer location must reference a timer")
-            .arming_order;
-        let indexed_hash = self
-            .armings
-            .get(&arming_order)
-            .expect("a timer must have an arming index");
-        assert_eq!(
-            *indexed_hash, location.hash,
-            "a timer's key and arming indexes must agree"
-        );
         let (entry, empty) = {
             let bucket = self
                 .keyed
@@ -729,6 +715,17 @@ impl<M> TimerStore<M> {
             let entry = bucket.swap_remove(location.index);
             (entry, bucket.is_empty())
         };
+        // `replace` writes the key bucket and the arming index in one window
+        // that cannot panic between them — the user `Hash`/`Eq` callbacks run
+        // strictly before it — and an entry never migrates buckets except
+        // through this method. Their agreement is therefore structural, so
+        // check it where a broken invariant is cheap to see rather than
+        // paying two extra map lookups on every removal.
+        debug_assert_eq!(
+            self.armings.get(&entry.arming_order),
+            Some(&location.hash),
+            "a timer's key and arming indexes must agree"
+        );
         if empty {
             self.keyed.remove(&location.hash);
         }
@@ -739,19 +736,31 @@ impl<M> TimerStore<M> {
         entry
     }
 
-    fn remove_arming(&mut self, arming_order: ArmingOrder) -> Option<TimerEntry<M>> {
+    /// Resolves an arming index to its key-bucket location.
+    ///
+    /// `None` means the arming order is unknown, which is an ordinary miss.
+    /// A known arming order whose bucket or entry is absent is index
+    /// corruption; the two shapes panic distinctly so a failure names which
+    /// half of the pair went missing.
+    fn locate_arming(&self, arming_order: ArmingOrder) -> Option<TimerLocation> {
         let hash = *self.armings.get(&arming_order)?;
-        let location = self
-            .locate(hash, |entry| entry.arming_order == arming_order)
+        let index = self
+            .keyed
+            .get(&hash)
+            .expect("an arming index must reference a key bucket")
+            .iter()
+            .position(|entry| entry.arming_order == arming_order)
             .expect("an arming index must reference a timer");
+        Some(TimerLocation { hash, index })
+    }
+
+    fn remove_arming(&mut self, arming_order: ArmingOrder) -> Option<TimerEntry<M>> {
+        let location = self.locate_arming(arming_order)?;
         Some(self.unlink(location))
     }
 
     fn entry_mut(&mut self, arming_order: ArmingOrder) -> Option<&mut TimerEntry<M>> {
-        let hash = *self.armings.get(&arming_order)?;
-        let location = self
-            .locate(hash, |entry| entry.arming_order == arming_order)
-            .expect("an arming index must reference a timer");
+        let location = self.locate_arming(arming_order)?;
         Some(
             self.keyed
                 .get_mut(&location.hash)
@@ -1659,8 +1668,8 @@ impl<M: Send + 'static> RawContext<M> {
         Ok(guard)
     }
 
-    fn pop_continuation(&mut self, batch: &mut ReadyBatch, allow_lead: bool) -> Option<M> {
-        if (!allow_lead || !self.resources.continuation_needs_external)
+    fn pop_continuation(&mut self, batch: &mut ReadyBatch, is_lead_slot: bool) -> Option<M> {
+        if (!is_lead_slot || !self.resources.continuation_needs_external)
             && batch.continuation_is_eligible()
             && let Some(message) = self.resources.continuations.pop_front()
         {

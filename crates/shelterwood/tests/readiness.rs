@@ -94,6 +94,22 @@ impl Actor for FailAfterStopInInit {
     }
 }
 
+struct PanicAfterStopInInit;
+
+impl Actor for PanicAfterStopInInit {
+    type Msg = ();
+    type Args = ();
+
+    async fn init((): (), context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        context.stop();
+        panic!("init panicked after requesting stop");
+    }
+
+    async fn handle(&mut self, (): (), _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
 struct DelayedStopDecorator {
     inner: GatedStopInInit,
 }
@@ -290,6 +306,43 @@ async fn after_init_stop_waits_for_success_then_advances_the_ordered_suffix() {
 }
 
 #[tokio::test]
+async fn immediate_stop_in_init_is_published_before_the_initializer_returns() {
+    let init_entered = ReleaseGate::default();
+    let release_init = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "immediate-stop-in-init",
+        ActorOnceDef::<GatedStopInInit>::new((init_entered.clone(), release_init.clone()))
+            .readiness(Readiness::Immediate),
+    )
+    .expect("valid immediate actor");
+
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    init_entered.wait().await;
+    system
+        .wait_started()
+        .await
+        .expect("immediate readiness does not wait for initialization");
+    scope
+        .wait_for_child(
+            "immediate-stop-in-init",
+            |child| matches!(child.state, ChildState::Stopping),
+            POLL_TIMEOUT,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "an Immediate override publishes self-stop before init returns: {error:?}; snapshot: {:?}",
+                scope.snapshot()
+            )
+        });
+
+    release_init.release();
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+#[tokio::test]
 async fn manual_stop_in_init_remains_a_terminal_pre_ready_failure() {
     let init_entered = ReleaseGate::default();
     let release_init = ReleaseGate::default();
@@ -316,7 +369,21 @@ async fn manual_stop_in_init_remains_a_terminal_pre_ready_failure() {
         .expect("valid suffix");
 
     let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
     init_entered.wait().await;
+    scope
+        .wait_for_child(
+            "manual-stop-in-init",
+            |child| matches!(child.state, ChildState::Stopping),
+            POLL_TIMEOUT,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "a Manual override publishes self-stop before init returns: {error:?}; snapshot: {:?}",
+                scope.snapshot()
+            )
+        });
     release_init.release();
     let (id, exit) = crate::common::startup_failed_child(
         system
@@ -329,6 +396,38 @@ async fn manual_stop_in_init_remains_a_terminal_pre_ready_failure() {
     assert_eq!(exit.cancellation(), Cancellation::Observed);
     assert!(!suffix_started.load(Ordering::SeqCst));
     assert!(matches!(suffix.wait().await.kind(), ExitKind::NeverStarted));
+    system
+        .shutdown(Duration::ZERO)
+        .await
+        .expect("failed tree has no straggler");
+}
+
+#[tokio::test]
+async fn after_init_stop_survives_init_panic_without_manufacturing_readiness() {
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "panicked-stop-in-init",
+        ActorOnceDef::<PanicAfterStopInInit>::new(()),
+    )
+    .expect("valid actor");
+
+    let system = tree.spawn().expect("runtime is available");
+    let (id, exit) = crate::common::startup_failed_child(
+        system
+            .wait_started()
+            .await
+            .expect_err("an init panic remains a terminal pre-ready failure"),
+    );
+    assert_eq!(id.as_str(), "panicked-stop-in-init");
+    assert!(
+        matches!(exit.kind(), ExitKind::Panicked { message: Some(message) } if message.contains("init panicked after requesting stop")),
+        "the initializer panic remains authoritative: {exit:?}"
+    );
+    assert_eq!(
+        exit.cancellation(),
+        Cancellation::Observed,
+        "dropping the initializer context publishes its deferred stop"
+    );
     system
         .shutdown(Duration::ZERO)
         .await

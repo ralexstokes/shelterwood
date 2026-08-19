@@ -598,8 +598,11 @@ trait Actor: Sized + Send + 'static {
   the normal supervision path, classified as a startup failure.
 - `on_stop` is best-effort teardown; it runs under the child's shutdown
   grace and its context is the narrowed `StopContext` (§5.4, Appendix B.1).
-  A panic in `on_stop` is classified `Panicked` by the fallback report
-  token, superseding the run's outcome (§7).
+  `StopContext` exposes no `myself()`: an `ActorRef` is a send handle, and
+  posting from `on_stop` is futile. Self-identity for teardown MUST be
+  captured from `Context::myself()` during the live phase and carried in
+  actor state [#324]. A panic in `on_stop` is classified `Panicked` by
+  the fallback report token, superseding the run's outcome (§7).
 
 ### 4.2 One-shot is primitive; restartable is proven
 
@@ -3705,7 +3708,13 @@ the same series during shutdown drain; **Stop** = `StopContext<'_, A>` in
 | Re-entry/mapping: `for_actor` (same-`Msg`, core); `project` *(II §17)* | — | ✓ | ✓ | `for_actor` only |
 
 `StopContext` withholds everything that queues future work for this
-incarnation — there is no one left to deliver to, so `myself()` is absent.
+incarnation. `myself()` is in that set: `ActorRef<M>` is the send surface
+(`send` / `call`, and `Eq`/`Hash` by slot identity), intake is already
+frozen, and no callback remains to receive posted work. Absence is the
+contract, not a documented-don't-post on a still-present accessor [#324].
+Scope-local `id()` and the `Incarnation` / `Membership` tokens are not
+substitutes for an `ActorRef` map key (B.8). Capture `Context::myself()`
+while live and carry it in actor state; `on_stop` exposes no self-handle.
 
 ### B.2 `TaskContext`
 

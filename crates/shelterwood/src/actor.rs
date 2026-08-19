@@ -33,6 +33,12 @@ pub trait Actor: Sized + Send + 'static {
     ) -> impl Future<Output = ExitResult> + Send;
 
     /// Performs best-effort cooperative teardown.
+    ///
+    /// Runs under the child's shutdown grace with a narrowed [`StopContext`].
+    /// Not called when `init` failed, when a handler returned `Err` or
+    /// panicked, or on hard abort. [`StopContext`] has no self-handle;
+    /// capture [`Context::myself`] during the live phase if teardown needs
+    /// this actor's slot identity.
     fn on_stop(&mut self, _context: &mut StopContext<'_, Self>) -> impl Future<Output = ()> + Send {
         async {}
     }
@@ -102,6 +108,9 @@ macro_rules! actor_context_forwarders {
         context_common_forwarders!();
 
         /// Returns a membership-addressed handle to this actor.
+        ///
+        /// Absent from [`StopContext`]. Capture it during [`Actor::init`] or
+        /// [`Actor::handle`] if [`Actor::on_stop`] needs the slot identity.
         #[must_use]
         pub fn myself(&self) -> ActorRef<$actor::Msg> {
             self.raw.myself()
@@ -275,6 +284,12 @@ impl<'a, A: Actor> Context<'a, A> {
 }
 
 /// Narrowed context supplied only to [`Actor::on_stop`].
+///
+/// Work that queues delivery to this incarnation is unrepresentable: no
+/// continuations, timers, offloads, or [`Context::myself`]. [`ActorRef`] is
+/// a send handle; posting from `on_stop` is futile, so there is no
+/// self-handle here. Capture [`Context::myself`] during [`Actor::init`] or
+/// [`Actor::handle`] if teardown needs the slot identity.
 pub struct StopContext<'a, A: Actor> {
     raw: &'a mut RawContext<A::Msg>,
     actor: PhantomData<fn() -> A>,

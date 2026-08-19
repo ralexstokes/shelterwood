@@ -30,6 +30,18 @@ boundary. Durable correctness must already survive a crash. Size a resource
 owner's grace for drain plus close, or choose `Discard` when draining is less
 important than allowing the close its full budget.
 
+## Self-identity is captured while live
+
+`StopContext` has no `myself()`. `ActorRef` is a send handle, and posting to
+this incarnation from `on_stop` is futile: intake is already frozen and no
+callback remains to receive the work. `id()` is unique only within one scope,
+and `incarnation()` / `membership()` are not `ActorRef` map keys.
+
+If teardown needs this actor as a registry key, capture `context.myself()` in
+`init` or `handle` and keep it in actor state. Unregister that must also cover
+init failure, handler error or panic, or hard abort belongs in `Drop` or on a
+`Removed` lifecycle event — `on_stop` does not run on those paths.
+
 ## Teardown communication uses `try_send`
 
 Ordinary `send` waits through rebind windows. During teardown, that can park

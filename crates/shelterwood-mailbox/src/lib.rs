@@ -240,16 +240,6 @@ pub trait ActorIdentity: Send + Sync {
     fn membership(&self) -> Membership;
 }
 
-impl<T: ActorIdentity + ?Sized> ActorIdentity for Arc<T> {
-    fn id(&self) -> &ChildId {
-        (**self).id()
-    }
-
-    fn membership(&self) -> Membership {
-        (**self).membership()
-    }
-}
-
 /// The Tokio adapter, reachable only as a dev-dependency.
 ///
 /// `shelterwood-runtime` depends on this crate, so this is a dev-only cycle

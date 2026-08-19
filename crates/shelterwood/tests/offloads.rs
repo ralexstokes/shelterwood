@@ -22,6 +22,18 @@ enum ZeroMessage {
 
 struct ZeroDeadlineActor;
 
+#[derive(Debug, Eq, PartialEq)]
+struct ZeroDeadlineObservation {
+    result: Result<usize, DeadlineElapsed>,
+    /// The tasks `init` and the continuation ran on. `tokio::task::Id` is
+    /// `Copy + Eq`, so both ids travel whole rather than as a pre-collapsed
+    /// comparison: a failure then names the two tasks instead of printing
+    /// `false`, and the judgement does not rest on `Debug` output this
+    /// repository treats as non-contractual.
+    actor_task: tokio::task::Id,
+    continuation_task: tokio::task::Id,
+}
+
 struct ZeroDeadlinePanickingDrop {
     polled: Arc<AtomicBool>,
     drops: Arc<AtomicUsize>,
@@ -50,10 +62,16 @@ struct ZeroDeadlinePanickingDropActor;
 
 impl Actor for ZeroDeadlineActor {
     type Msg = ZeroMessage;
-    type Args = Arc<AtomicBool>;
+    type Args = (
+        Arc<AtomicBool>,
+        std::sync::mpsc::Sender<ZeroDeadlineObservation>,
+    );
 
-    async fn init(polled: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
-        let actor_task = format!("{:?}", tokio::task::id());
+    async fn init(
+        (polled, observed): Self::Args,
+        context: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        let actor_task = tokio::task::id();
         context
             .offload(
                 async move {
@@ -61,8 +79,13 @@ impl Actor for ZeroDeadlineActor {
                     7usize
                 },
                 move |result| {
-                    assert_eq!(result, Err(DeadlineElapsed));
-                    assert_eq!(format!("{:?}", tokio::task::id()), actor_task);
+                    observed
+                        .send(ZeroDeadlineObservation {
+                            result,
+                            actor_task,
+                            continuation_task: tokio::task::id(),
+                        })
+                        .expect("the test retains the observation receiver");
                     ZeroMessage::Done
                 },
                 Duration::ZERO,
@@ -111,15 +134,40 @@ impl Actor for ZeroDeadlinePanickingDropActor {
 #[tokio::test]
 async fn zero_budget_offload_never_polls_work_and_times_out_on_actor_task() {
     let polled = Arc::new(AtomicBool::new(false));
+    let (observed, observations) = std::sync::mpsc::channel();
     let mut tree = Tree::new();
     tree.add_actor_once(
         "zero",
-        ActorOnceDef::<ZeroDeadlineActor>::new(Arc::clone(&polled)),
+        ActorOnceDef::<ZeroDeadlineActor>::new((Arc::clone(&polled), observed)),
     )
     .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
-    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    // The actor stops only on receipt of the continuation's message, so a
+    // dropped completion would park here forever and report as a harness
+    // timeout instead of a failed assertion.
+    assert_eq!(
+        tokio::time::timeout(POLL_TIMEOUT, system.wait())
+            .await
+            .expect("the zero-budget continuation is delivered"),
+        shelterwood::StopReason::Finished
+    );
     assert!(!polled.load(Ordering::SeqCst));
+    let observation = observations
+        .recv_timeout(POLL_TIMEOUT)
+        .expect("the continuation publishes its result");
+    assert_eq!(
+        observation.result,
+        Err(DeadlineElapsed),
+        "a zero-budget offload times out without polling its work"
+    );
+    assert_eq!(
+        observation.continuation_task, observation.actor_task,
+        "the continuation runs on the actor task"
+    );
+    assert!(
+        observations.try_recv().is_err(),
+        "the continuation publishes exactly one observation"
+    );
 }
 
 #[tokio::test]
@@ -2001,22 +2049,22 @@ enum FloodMessage {
 }
 
 struct FloodActor {
-    seen: Vec<bool>,
     delivered: usize,
     completed_work: Arc<AtomicUsize>,
+    delivered_indices: Arc<Mutex<Vec<usize>>>,
     release: ReleaseGate,
 }
 
 impl Actor for FloodActor {
     type Msg = FloodMessage;
-    type Args = (Arc<AtomicUsize>, ReleaseGate);
+    type Args = (Arc<AtomicUsize>, Arc<Mutex<Vec<usize>>>, ReleaseGate);
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
         Ok(Self {
-            seen: vec![false; FLOOD],
             delivered: 0,
             completed_work: args.0,
-            release: args.1,
+            delivered_indices: args.1,
+            release: args.2,
         })
     }
 
@@ -2047,11 +2095,10 @@ impl Actor for FloodActor {
                 Ok(())
             }
             FloodMessage::Completed(index) => {
-                assert!(
-                    !self.seen[index],
-                    "each flooded completion is delivered exactly once"
-                );
-                self.seen[index] = true;
+                self.delivered_indices
+                    .lock()
+                    .expect("delivery evidence mutex remains healthy")
+                    .push(index);
                 self.delivered += 1;
                 if self.delivered == FLOOD {
                     context.stop();
@@ -2068,12 +2115,17 @@ impl Actor for FloodActor {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offload_completion_flood_is_absorbed_and_fully_delivered() {
     let completed_work = Arc::new(AtomicUsize::new(0));
+    let delivered_indices = Arc::new(Mutex::new(Vec::new()));
     let release = ReleaseGate::default();
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "flood",
-            ActorOnceDef::<FloodActor>::new((Arc::clone(&completed_work), release.clone())),
+            ActorOnceDef::<FloodActor>::new((
+                Arc::clone(&completed_work),
+                Arc::clone(&delivered_indices),
+                release.clone(),
+            )),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -2081,7 +2133,22 @@ async fn offload_completion_flood_is_absorbed_and_fully_delivered() {
     actor.send(FloodMessage::Start).await.expect("actor live");
     assert_eventually!(|| completed_work.load(Ordering::SeqCst) == FLOOD).await;
     release.release();
-    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(
+        tokio::time::timeout(POLL_TIMEOUT, system.wait())
+            .await
+            .expect("every flooded completion is delivered"),
+        shelterwood::StopReason::Finished
+    );
+    let mut delivered = delivered_indices
+        .lock()
+        .expect("delivery evidence mutex remains healthy")
+        .clone();
+    delivered.sort_unstable();
+    assert_eq!(
+        delivered,
+        (0..FLOOD).collect::<Vec<_>>(),
+        "every flooded completion identity is delivered exactly once"
+    );
 }
 
 const CYCLES: usize = 64;
@@ -2093,6 +2160,7 @@ enum CycleMessage {
 
 struct CycleActor {
     next: usize,
+    delivered: Arc<Mutex<Vec<usize>>>,
 }
 
 impl CycleActor {
@@ -2110,17 +2178,20 @@ impl CycleActor {
 
 impl Actor for CycleActor {
     type Msg = CycleMessage;
-    type Args = ();
+    type Args = Arc<Mutex<Vec<usize>>>;
 
-    async fn init((): Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
-        Ok(Self { next: 0 })
+    async fn init(delivered: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self { next: 0, delivered })
     }
 
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         match message {
             CycleMessage::Start => self.offload_next(context),
             CycleMessage::Completed(value) => {
-                assert_eq!(value, self.next, "steady-state cycles deliver in order");
+                self.delivered
+                    .lock()
+                    .expect("cycle evidence mutex remains healthy")
+                    .push(value);
                 self.next += 1;
                 if self.next == CYCLES {
                     context.stop();
@@ -2139,14 +2210,30 @@ impl Actor for CycleActor {
 /// cycle's completion is delivered.
 #[tokio::test]
 async fn sequential_offload_cycles_deliver_every_completion() {
+    let delivered = Arc::new(Mutex::new(Vec::new()));
     let mut tree = Tree::new();
     let actor = tree
-        .add_actor_once("cycles", ActorOnceDef::<CycleActor>::new(()))
+        .add_actor_once(
+            "cycles",
+            ActorOnceDef::<CycleActor>::new(Arc::clone(&delivered)),
+        )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
     actor.send(CycleMessage::Start).await.expect("actor live");
-    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(
+        tokio::time::timeout(POLL_TIMEOUT, system.wait())
+            .await
+            .expect("every sequential completion is delivered"),
+        shelterwood::StopReason::Finished
+    );
+    assert_eq!(
+        *delivered
+            .lock()
+            .expect("cycle evidence mutex remains healthy"),
+        (0..CYCLES).collect::<Vec<_>>(),
+        "steady-state cycles deliver every completion exactly once and in order"
+    );
 }
 
 const SATURATE: usize = 64;
@@ -2160,11 +2247,12 @@ struct SaturatedActor {
     issued: usize,
     delivered: usize,
     peak_backlog: Arc<AtomicUsize>,
+    timed_out: Arc<AtomicUsize>,
 }
 
 impl Actor for SaturatedActor {
     type Msg = SaturateMessage;
-    type Args = (ReleaseGate, Arc<AtomicUsize>);
+    type Args = (ReleaseGate, Arc<AtomicUsize>, Arc<AtomicUsize>);
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
         args.0.wait().await;
@@ -2172,6 +2260,7 @@ impl Actor for SaturatedActor {
             issued: 0,
             delivered: 0,
             peak_backlog: args.1,
+            timed_out: args.2,
         })
     }
 
@@ -2181,11 +2270,14 @@ impl Actor for SaturatedActor {
                 self.peak_backlog
                     .fetch_max(self.issued - self.delivered, Ordering::SeqCst);
                 self.issued += 1;
+                let timed_out = Arc::clone(&self.timed_out);
                 context
                     .offload(
                         async {},
-                        |result| {
-                            assert_eq!(result, Err(DeadlineElapsed));
+                        move |result| {
+                            if result == Err(DeadlineElapsed) {
+                                timed_out.fetch_add(1, Ordering::SeqCst);
+                            }
                             SaturateMessage::Completed
                         },
                         Duration::ZERO,
@@ -2214,12 +2306,17 @@ impl Actor for SaturatedActor {
 async fn saturated_mailbox_does_not_grow_the_completion_backlog() {
     let gate = ReleaseGate::default();
     let peak_backlog = Arc::new(AtomicUsize::new(0));
+    let timed_out = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "saturated",
-            ActorOnceDef::<SaturatedActor>::new((gate.clone(), Arc::clone(&peak_backlog)))
-                .mailbox(Mailbox::queue(SATURATE).expect("non-zero capacity")),
+            ActorOnceDef::<SaturatedActor>::new((
+                gate.clone(),
+                Arc::clone(&peak_backlog),
+                Arc::clone(&timed_out),
+            ))
+            .mailbox(Mailbox::queue(SATURATE).expect("non-zero capacity")),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -2237,6 +2334,11 @@ async fn saturated_mailbox_does_not_grow_the_completion_backlog() {
     assert!(
         peak_backlog.load(Ordering::SeqCst) < SATURATE - 1,
         "the completion backlog must not reach the queued mailbox history"
+    );
+    assert_eq!(
+        timed_out.load(Ordering::SeqCst),
+        SATURATE,
+        "every zero-budget offload is classified as deadline elapsed"
     );
 }
 

@@ -29,7 +29,7 @@ fn independent_systems_do_not_share_an_observation_critical_section() {
         second.set_state(ScopeState::Starting);
         completed.send(()).expect("test receiver remains available");
     });
-    let result = receiver.recv_timeout(Duration::from_secs(2));
+    let result = receiver.recv_timeout(CAPTURE_PROBE_WAIT);
     drop(held);
     worker.join().expect("independent transition succeeds");
     assert_eq!(
@@ -55,7 +55,7 @@ fn snapshot_subscription_waker_can_reenter_snapshot() {
 
     let publisher = std::thread::spawn(move || scope.set_state(ScopeState::Starting));
     assert_eq!(
-        observed.recv_timeout(Duration::from_secs(2)),
+        observed.recv_timeout(CAPTURE_PROBE_WAIT),
         Ok(ScopeState::Starting),
         "the watch waker must run only after snapshot can reacquire the gate"
     );
@@ -84,7 +84,7 @@ fn lifecycle_subscription_waker_can_reenter_snapshot() {
 
     let publisher = std::thread::spawn(move || scope.set_state(ScopeState::Starting));
     assert_eq!(
-        observed.recv_timeout(Duration::from_secs(2)),
+        observed.recv_timeout(CAPTURE_PROBE_WAIT),
         Ok(ScopeState::Starting),
         "the lifecycle waker must run only after snapshot can reacquire the gate"
     );
@@ -112,7 +112,7 @@ fn scope_wait_waker_can_reenter_snapshot_at_terminality() {
 
     let terminalizer = std::thread::spawn(move || scope.terminalize_never_started());
     assert!(matches!(
-        stopped_observed.recv_timeout(Duration::from_secs(2)),
+        stopped_observed.recv_timeout(CAPTURE_PROBE_WAIT),
         Ok(ScopeState::Stopped { .. })
     ));
     terminalizer.join().expect("terminal publication completes");
@@ -493,7 +493,7 @@ async fn aborted_nested_driver_epilogue_wakes_a_parked_shutdown_task() {
     crate::runtime::yield_now().await;
     drop(fixture.driver);
 
-    match crate::runtime::timeout(Duration::from_secs(5), crate::runtime::join(waiter)).await {
+    match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, crate::runtime::join(waiter)).await {
         crate::runtime::Timeout::Completed(crate::runtime::JoinOutcome::Ok { value }) => {
             value.expect("the target incarnation settled");
         }
@@ -686,7 +686,7 @@ async fn blocked_initial_scope_factory_owns_its_stop_epilogue() {
     let abort = driver.abort_handle();
 
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(2), gate.wait_entered()).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, gate.wait_entered()).await,
         crate::runtime::Timeout::Completed(())
     ));
     let factory_state = nested.snapshot().state.clone();
@@ -707,7 +707,7 @@ async fn blocked_initial_scope_factory_owns_its_stop_epilogue() {
         "an executing initial factory still owns the final scope epilogue"
     );
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(2), waiter).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, waiter).await,
         crate::runtime::Timeout::Completed(StopReason::ShutdownRequested)
     ));
 }
@@ -738,7 +738,7 @@ async fn hard_aborted_incarnation_fences_shutdown_and_wait_without_arming_its_bu
     let driver = crate::runtime::spawn(run_scope_incarnation(plan, ScopeRole::Root, epoch));
     let abort = driver.abort_handle();
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(2), gate.wait_entered()).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, gate.wait_entered()).await,
         crate::runtime::Timeout::Completed(())
     ));
 
@@ -760,7 +760,7 @@ async fn hard_aborted_incarnation_fences_shutdown_and_wait_without_arming_its_bu
         "shutdown_and_wait resolved inside the terminal-before-epilogue window"
     );
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(5), shutdown).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, shutdown).await,
         crate::runtime::Timeout::Completed(Ok(()))
     ));
     assert!(matches!(
@@ -802,7 +802,7 @@ async fn blocked_restart_scope_factory_supersedes_the_stale_stopped_projection()
     let abort = driver.abort_handle();
 
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(2), gate.wait_entered()).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, gate.wait_entered()).await,
         crate::runtime::Timeout::Completed(())
     ));
     let factory_calls = calls.load(Ordering::SeqCst);
@@ -829,7 +829,7 @@ async fn blocked_restart_scope_factory_supersedes_the_stale_stopped_projection()
         "an executing restart factory still owns the final scope epilogue"
     );
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(2), waiter).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, waiter).await,
         crate::runtime::Timeout::Completed(StopReason::ShutdownRequested)
     ));
 }
@@ -1001,7 +1001,7 @@ fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
     let scope = isolated_scope("scope", ScopeFlavor::Ordered);
     let first = Intensity::new(1, Duration::from_secs(1)).expect("valid first intensity");
     let second = Intensity::new(2, Duration::from_secs(2)).expect("valid second intensity");
-    scope.set_observation_config(Default::default(), first);
+    scope.set_observation_config(first);
 
     let start = Arc::new(Barrier::new(2));
     let (first_update, first_update_seen) = std::sync::mpsc::sync_channel(0);
@@ -1012,7 +1012,7 @@ fn receiverless_config_state_is_atomic_under_concurrent_snapshots() {
         writer_start.wait();
         for update in 0..UPDATES {
             let intensity = if update % 2 == 0 { second } else { first };
-            writer_scope.set_observation_config(Default::default(), intensity);
+            writer_scope.set_observation_config(intensity);
             if update == 0 {
                 first_update
                     .send(())
@@ -1189,7 +1189,7 @@ fn plain_parent_state_preserves_nested_snapshot_propagation() {
     let snapshots = root.subscribe_snapshots();
     let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
 
-    nested.set_observation_config(Default::default(), intensity);
+    nested.set_observation_config(intensity);
 
     assert_eq!(
         snapshots

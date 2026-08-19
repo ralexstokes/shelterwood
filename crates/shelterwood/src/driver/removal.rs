@@ -41,7 +41,7 @@ impl ScopeRuntime {
         let Some(control) = &self.dynamic else {
             return;
         };
-        let member = Arc::clone(&self.children[&key].slot.member);
+        let member = Arc::clone(&self.children[key].slot.member);
         let id = member.id().clone();
         let root = Arc::clone(&self.root);
         let entry = root.with_observation_gate(|txn| {
@@ -87,7 +87,7 @@ impl ScopeRuntime {
     }
 
     pub(super) fn prune_terminal(&mut self, key: ChildKey) {
-        let member = Arc::clone(&self.children[&key].slot.member);
+        let member = Arc::clone(&self.children[key].slot.member);
         let root = Arc::clone(&self.root);
         let removed = root.with_observation_gate(|txn| {
             let mut state = self

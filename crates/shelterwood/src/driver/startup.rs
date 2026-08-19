@@ -137,7 +137,7 @@ impl ScopeRuntime {
             for later in later_children {
                 if !self.supervisor.spawned_once(later)
                     && !self.supervisor.is_disposing(later)
-                    && !self.supervisor.membership_terminal(later)
+                    && !self.supervisor.joined(later)
                 {
                     self.begin_terminal_disposal(
                         later,

@@ -6,13 +6,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{
+use shelterwood_core::{
     ChildId, Exit, Incarnation, Intensity, Membership, RestartAttempt, RestartCount, RestartPolicy,
     Retention, Strategy, TotalRestarts,
-    cells::RetainedExit,
     engine::{MembershipStatus, ScopeState},
-    runtime,
+    identity::PoisonedCounter,
+    policy::ScopeFlavor,
 };
+use shelterwood_runtime as runtime;
+
+use crate::cells::RetainedExit;
 
 /// Number of lifecycle events retained independently for each subscriber.
 pub const LIFECYCLE_EVENT_CAPACITY: usize = 128;
@@ -395,15 +398,6 @@ impl ChildState {
     }
 }
 
-/// Static flavor of a scope snapshot.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ScopeKind {
-    /// Fixed, readiness-ordered membership.
-    Ordered,
-    /// Runtime-dynamic membership.
-    Dynamic,
-}
-
 /// Recursive current-state projection for one child membership.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChildSnapshot {
@@ -440,7 +434,7 @@ pub struct ScopeSnapshot {
     /// Current scope state.
     pub state: ScopeState,
     /// Ordered or dynamic scope flavor.
-    pub kind: ScopeKind,
+    pub kind: ScopeFlavor,
     /// Fate-sharing strategy for ordered scopes; `None` for dynamic scopes.
     pub strategy: Option<Strategy>,
     /// Scope-wide restart budget.
@@ -627,7 +621,7 @@ pub(crate) struct SnapshotHub {
 #[derive(Clone, Debug)]
 struct SnapshotHubState {
     snapshot: RetainedScopeSnapshot,
-    generation: crate::identity::PoisonedCounter,
+    generation: PoisonedCounter,
     closed: bool,
 }
 
@@ -790,7 +784,7 @@ impl SnapshotHub {
             initialized = true;
             runtime::watch(SnapshotHubState {
                 snapshot: initial.clone(),
-                generation: crate::identity::PoisonedCounter::new(),
+                generation: PoisonedCounter::new(),
                 closed: false,
             })
             .0
@@ -881,7 +875,7 @@ impl SnapshotHub {
                 snapshot: final_snapshot
                     .take()
                     .expect("final snapshot is built exactly once")(),
-                generation: crate::identity::PoisonedCounter::new(),
+                generation: PoisonedCounter::new(),
                 closed: true,
             })
             .0
@@ -1146,13 +1140,15 @@ mod tests {
         },
     };
 
-    use crate::{
-        Intensity,
-        identity::ScopeIdentity,
-        observe::{
-            LifecycleEvent, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, ScopeKind,
-            ScopeSnapshot,
-        },
+    use shelterwood_core::{
+        ChildId, Intensity, TotalRestarts,
+        identity::{PoisonedCounter, ScopeIdentity},
+        policy::ScopeFlavor,
+    };
+    use shelterwood_runtime as runtime;
+
+    use crate::observe::{
+        LifecycleEvent, LifecycleEventKind, LifecycleItem, LifecycleTryRecvError, ScopeSnapshot,
     };
     use shelterwood_core::{ScopeState, StopReason};
 
@@ -1164,10 +1160,10 @@ mod tests {
         RetainedScopeSnapshot::new(
             Arc::new(ScopeSnapshot {
                 state,
-                kind: ScopeKind::Dynamic,
+                kind: ScopeFlavor::Dynamic,
                 strategy: None,
                 intensity: Intensity::default(),
-                total_restarts: crate::TotalRestarts::ZERO,
+                total_restarts: TotalRestarts::ZERO,
                 lifecycle_seq: LifecycleSeq::new(0),
                 children: Arc::from([]),
             }),
@@ -1210,7 +1206,7 @@ mod tests {
 
         let sender = hub.sender.get().expect("subscription initializes the hub");
         sender.modify_silently(|state| {
-            state.generation = crate::identity::PoisonedCounter::near_exhaustion();
+            state.generation = PoisonedCounter::near_exhaustion();
         });
 
         let mut txn = crate::cells::ObservationTxn::detached();
@@ -1330,7 +1326,7 @@ mod tests {
         ));
     }
 
-    #[crate::runtime::test]
+    #[shelterwood_runtime::test]
     async fn snapshot_publication_before_close_is_drained() {
         let hub = SnapshotHub::default();
         let mut txn = crate::cells::ObservationTxn::detached();
@@ -1397,7 +1393,7 @@ mod tests {
         assert!(after_close.changed().await.is_err());
     }
 
-    #[crate::runtime::test]
+    #[shelterwood_runtime::test]
     async fn receiverless_snapshot_close_installs_the_terminal_state() {
         let hub = SnapshotHub::default();
         let mut txn = crate::cells::ObservationTxn::detached();
@@ -1420,7 +1416,7 @@ mod tests {
         assert!(receiver.changed().await.is_err());
     }
 
-    #[crate::runtime::test]
+    #[shelterwood_runtime::test]
     async fn initialized_receiverless_snapshot_close_refreshes_the_terminal_state() {
         let hub = SnapshotHub::default();
         let mut txn = crate::cells::ObservationTxn::detached();
@@ -1448,7 +1444,7 @@ mod tests {
         assert!(receiver.changed().await.is_err());
     }
 
-    #[crate::runtime::test]
+    #[shelterwood_runtime::test]
     async fn snapshot_close_installs_the_terminal_state_even_with_live_receivers() {
         // A close site may terminalize without publishing a `Stopped`
         // projection first; the retained value is what every later subscriber
@@ -1482,25 +1478,25 @@ mod tests {
         assert!(later.changed().await.is_err());
     }
 
-    #[crate::runtime::test]
+    #[shelterwood_runtime::test]
     async fn lifecycle_close_wakes_parked_receivers() {
         let hub = Arc::new(LifecycleHub::default());
         let mut events = hub.subscribe();
-        let waiter = crate::runtime::spawn(async move { events.recv().await });
-        crate::runtime::yield_now().await;
+        let waiter = runtime::spawn(async move { events.recv().await });
+        runtime::yield_now().await;
 
         let mut txn = crate::cells::ObservationTxn::detached();
         hub.close(&mut txn);
         drop(txn);
 
-        assert_eq!(crate::runtime::join_resuming(waiter).await, None);
+        assert_eq!(runtime::join_resuming(waiter).await, None);
     }
 
     #[test]
     fn lifecycle_publication_after_close_appends_nothing() {
         let mut identity = ScopeIdentity::new();
         let membership = identity
-            .mint_membership(&crate::ChildId::from("scope"))
+            .mint_membership(&ChildId::from("scope"))
             .expect("membership available")
             .membership();
         let hub = LifecycleHub::default();
@@ -1531,7 +1527,7 @@ mod tests {
     fn a_retained_event_after_explicit_lag_remains_subject_to_later_overflow() {
         let mut identity = ScopeIdentity::new();
         let membership = identity
-            .mint_membership(&crate::ChildId::from("scope"))
+            .mint_membership(&ChildId::from("scope"))
             .expect("membership available")
             .membership();
         let event = |seq| LifecycleEvent {
@@ -1573,7 +1569,7 @@ mod tests {
     fn lifecycle_close_drains_the_queued_prefix_and_rejects_late_publication() {
         let mut identity = ScopeIdentity::new();
         let membership = identity
-            .mint_membership(&crate::ChildId::from("scope"))
+            .mint_membership(&ChildId::from("scope"))
             .expect("membership available")
             .membership();
         let event = |seq| LifecycleEvent {

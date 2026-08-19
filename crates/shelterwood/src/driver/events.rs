@@ -255,10 +255,7 @@ impl ScopeRuntime {
         let Some(child) = self.children.get_mut(key) else {
             return;
         };
-        if !target_is_pending
-            || self.supervisor.membership_terminal(key)
-            || self.supervisor.is_disposing(key)
-        {
+        if !target_is_pending || self.supervisor.joined(key) || self.supervisor.is_disposing(key) {
             child.restart_shutdown_pending = None;
             return;
         }
@@ -267,9 +264,8 @@ impl ScopeRuntime {
             return;
         }
         if !self.supervisor.spawned_once(key) {
-            // Only a member in the restart gap may be expedited. The wake-start
-            // scan this path replaced required `MemberStage::Restarting`; with
-            // no active incarnation and the terminal/disposing cases excluded
+            // Only a member in the restart gap may be expedited. With no active
+            // incarnation and the terminal/disposing cases excluded
             // above, `spawned_once` is that stage bit — false means the member
             // is still `Admitted` and has never run. Expediting it would let a
             // shutdown request against the first (pending) incarnation start an

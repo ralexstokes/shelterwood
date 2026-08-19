@@ -38,8 +38,8 @@ pub trait Actor: Sized + Send + 'static {
     }
 }
 
-macro_rules! actor_context_forwarders {
-    ($actor:ident) => {
+macro_rules! context_common_forwarders {
+    () => {
         /// Returns this actor's child id.
         #[must_use]
         pub fn id(&self) -> &ChildId {
@@ -50,15 +50,6 @@ macro_rules! actor_context_forwarders {
         #[must_use]
         pub fn incarnation(&self) -> Incarnation {
             self.raw.incarnation()
-        }
-
-        /// Returns a membership-addressed handle to this actor.
-        ///
-        /// During [`Actor::on_stop`], do not post work to this handle: no
-        /// callback remains to receive it.
-        #[must_use]
-        pub fn myself(&self) -> ActorRef<$actor::Msg> {
-            self.raw.myself()
         }
 
         /// Returns this actor's supervising scope.
@@ -102,6 +93,18 @@ macro_rules! actor_context_forwarders {
             T: Send + 'static,
         {
             self.raw.run_blocking(operation)
+        }
+    };
+}
+
+macro_rules! actor_context_forwarders {
+    ($actor:ident) => {
+        context_common_forwarders!();
+
+        /// Returns a membership-addressed handle to this actor.
+        #[must_use]
+        pub fn myself(&self) -> ActorRef<$actor::Msg> {
+            self.raw.myself()
         }
     };
 }
@@ -295,7 +298,7 @@ impl<'a, A: Actor> StopContext<'a, A> {
         }
     }
 
-    actor_context_forwarders!(A);
+    context_common_forwarders!();
 
     /// Re-enters a same-message actor with the same narrowed stop context.
     pub fn for_actor<B: Actor<Msg = A::Msg>>(&mut self) -> StopContext<'_, B> {

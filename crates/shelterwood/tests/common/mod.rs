@@ -12,7 +12,7 @@ mod timing;
 pub(crate) mod waiting;
 
 pub(crate) use gates::{DestructorBlocker, DestructorGate, ReleaseGate};
-pub(crate) use lifecycle::{next_event, next_item};
+pub(crate) use lifecycle::{last_panic_message, next_event, next_item};
 pub(crate) use ownership::{ConsumeCount, ConsumeGuard, LiveFlag, PanicOnDrop};
 pub(crate) use recorder::{GatedRecorder, MessageRecorder};
 pub(crate) use startup::startup_failed_child;

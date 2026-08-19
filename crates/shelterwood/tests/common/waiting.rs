@@ -3,7 +3,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use shelterwood::{CancellationToken, Readiness, TaskDef, Tree};
+use shelterwood::{
+    CancellationToken, ExitResult, Readiness, TaskContext, TaskDef, TaskOnceDef, Tree,
+};
 
 pub(crate) async fn liveness_probe(shutdown: CancellationToken, gate: super::ReleaseGate) -> bool {
     tokio::select! {
@@ -39,20 +41,50 @@ pub(crate) fn task() -> TaskDef {
     })
 }
 
+/// The body every signalled waiting fixture shares.
+///
+/// `liveness`, when present, races the shutdown token against a release gate
+/// before the task parks, so a released gate proves the incarnation is still
+/// being polled rather than merely un-cancelled.
+async fn signalled_waiting_body(
+    context: TaskContext,
+    started: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    liveness: Option<(super::ReleaseGate, Arc<AtomicBool>)>,
+) -> ExitResult {
+    started.store(true, Ordering::SeqCst);
+    if let Some((gate, seen)) = liveness {
+        if !liveness_probe(context.shutdown_token(), gate).await {
+            cancelled.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+        seen.store(true, Ordering::SeqCst);
+    }
+    context.shutdown_token().cancelled().await;
+    cancelled.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
 pub(crate) fn signalled_waiting_task(
     started: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
 ) -> TaskDef {
     TaskDef::new(move |context| {
-        let started = Arc::clone(&started);
-        let cancelled = Arc::clone(&cancelled);
-        async move {
-            started.store(true, Ordering::SeqCst);
-            context.shutdown_token().cancelled().await;
-            cancelled.store(true, Ordering::SeqCst);
-            Ok(())
-        }
+        signalled_waiting_body(context, Arc::clone(&started), Arc::clone(&cancelled), None)
     })
+}
+
+/// [`signalled_waiting_task`] as a consuming one-shot definition.
+///
+/// One-shot is the child *kind*, not a detail: it has no restart edge and its
+/// completion claim is the caller's, which is what fixtures proving handle
+/// ownership depend on.
+pub(crate) fn signalled_waiting_once_task(
+    started: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    liveness: Option<(super::ReleaseGate, Arc<AtomicBool>)>,
+) -> TaskOnceDef<()> {
+    TaskOnceDef::new(move |context| signalled_waiting_body(context, started, cancelled, liveness))
 }
 
 pub(crate) fn start_signalled_waiting_task(started: Arc<AtomicBool>) -> TaskDef {
@@ -61,6 +93,25 @@ pub(crate) fn start_signalled_waiting_task(started: Arc<AtomicBool>) -> TaskDef 
 
 pub(crate) fn cancellation_signalled_waiting_task(cancelled: Arc<AtomicBool>) -> TaskDef {
     signalled_waiting_task(Arc::new(AtomicBool::new(false)), cancelled)
+}
+
+/// A waiting task that signals `constructed` from its *factory*, not from the
+/// body.
+///
+/// [`signalled_waiting_task`] stores at the first poll of the task future,
+/// which is a later and scheduler-dependent moment: a caller that only knows
+/// the child was spawned cannot assert the flag without polling for it. The
+/// factory instead runs synchronously while the driver starts the child, so a
+/// caller that has observed startup advance past this child may assert the
+/// flag outright.
+pub(crate) fn construction_signalled_waiting_task(constructed: Arc<AtomicBool>) -> TaskDef {
+    TaskDef::new(move |context| {
+        constructed.store(true, Ordering::SeqCst);
+        async move {
+            context.shutdown_token().cancelled().await;
+            Ok(())
+        }
+    })
 }
 
 /// [`signalled_waiting_task`] plus a liveness probe.
@@ -77,21 +128,12 @@ pub(crate) fn liveness_probed_waiting_task(
     liveness_seen: Arc<AtomicBool>,
 ) -> TaskDef {
     TaskDef::new(move |context| {
-        let started = Arc::clone(&started);
-        let cancelled = Arc::clone(&cancelled);
-        let liveness_gate = liveness_gate.clone();
-        let liveness_seen = Arc::clone(&liveness_seen);
-        async move {
-            started.store(true, Ordering::SeqCst);
-            if !liveness_probe(context.shutdown_token(), liveness_gate).await {
-                cancelled.store(true, Ordering::SeqCst);
-                return Ok(());
-            }
-            liveness_seen.store(true, Ordering::SeqCst);
-            context.shutdown_token().cancelled().await;
-            cancelled.store(true, Ordering::SeqCst);
-            Ok(())
-        }
+        signalled_waiting_body(
+            context,
+            Arc::clone(&started),
+            Arc::clone(&cancelled),
+            Some((liveness_gate.clone(), Arc::clone(&liveness_seen))),
+        )
     })
 }
 

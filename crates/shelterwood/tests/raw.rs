@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::common::{
-    ReleaseGate, assert_eventually, assert_quiet, next_event, waiting::task as waiting_task,
+    ReleaseGate, assert_eventually, assert_quiet, last_panic_message, waiting::task as waiting_task,
 };
 use shelterwood::{
     DynamicTree, ExitError, ExitResult, Mailbox, MailboxShutdown, PolicyError, RawActor,
@@ -432,20 +432,12 @@ async fn live_try_recv_resumes_a_retained_offload_panic() {
     system.wait_started().await.expect("manual readiness fires");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
 
-    let observed_exit = loop {
-        let event = next_event(&mut events).await;
-        if let shelterwood::LifecycleEventKind::Exited { id, exit, .. } = event.kind
-            && id.as_str() == "try-recv-panic"
-        {
-            break Some(exit);
-        }
-    };
-    let exit = observed_exit.expect("panic exit is observable on the lifecycle stream");
-    assert!(matches!(
-        exit.kind(),
-        shelterwood::ExitKind::Panicked { message }
-            if message.as_deref() == Some("try_recv retained offload panic")
-    ));
+    let panic_message = last_panic_message(&mut events, "try-recv-panic").await;
+    assert_eq!(
+        panic_message.as_deref(),
+        Some("try_recv retained offload panic"),
+        "the panic exit is observable on the lifecycle stream"
+    );
     assert!(panic_queued.load(Ordering::SeqCst));
 }
 
@@ -657,15 +649,7 @@ async fn hard_abort_offload_panic_with_panicking_raw_destructor_is_contained() {
         .await
         .expect("the two panics remain contained");
 
-    let panic_message = loop {
-        let event = next_event(&mut events).await;
-        if let shelterwood::LifecycleEventKind::Exited { id, exit, .. } = event.kind
-            && id.as_str() == "double-panic"
-            && let shelterwood::ExitKind::Panicked { message } = exit.kind()
-        {
-            break message.clone();
-        }
-    };
+    let panic_message = last_panic_message(&mut events, "double-panic").await;
     assert_eq!(panic_message.as_deref(), Some("injected offload panic"));
 }
 

@@ -13,8 +13,8 @@ use crate::common::{
     policy::never,
     poll_once,
     waiting::{
-        liveness_probe, liveness_probed_waiting_task, signalled_waiting_task, task as waiting_task,
-        tree as waiting_tree,
+        liveness_probe, liveness_probed_waiting_task, signalled_waiting_once_task,
+        signalled_waiting_task, task as waiting_task, tree as waiting_tree,
     },
 };
 use shelterwood::{
@@ -150,11 +150,13 @@ fn signalled_waiting_tree(
     liveness: Option<(ReleaseGate, Arc<AtomicBool>)>,
 ) -> Tree {
     let mut tree = Tree::new();
-    let task = match liveness {
-        Some((gate, observed)) => liveness_probed_waiting_task(started, cancelled, gate, observed),
-        None => signalled_waiting_task(started, cancelled),
-    };
-    tree.add_task("worker", task).expect("valid signalled task");
+    let (_, completion) = tree
+        .add_task_once(
+            "worker",
+            signalled_waiting_once_task(started, cancelled, liveness),
+        )
+        .expect("valid signalled task");
+    drop(completion);
     tree
 }
 

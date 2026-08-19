@@ -9,7 +9,8 @@ use std::{
 };
 
 use crate::common::{
-    POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually, assert_quiet, next_event,
+    POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually, assert_quiet, last_panic_message,
+    next_event,
 };
 use shelterwood::{
     Actor, ActorDef, ActorOnceDef, Context, DeadlineElapsed, ExitError, ExitKind, ExitResult,
@@ -1581,15 +1582,7 @@ async fn externally_stopped_recv_resumes_a_pending_offload_panic() {
         .await
         .expect("failed actor shuts down");
 
-    let panic_message = loop {
-        let event = next_event(&mut events).await;
-        if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
-            && id.as_str() == "external-stop-recv-panic"
-            && let ExitKind::Panicked { message } = exit.kind()
-        {
-            break message.clone();
-        }
-    };
+    let panic_message = last_panic_message(&mut events, "external-stop-recv-panic").await;
     assert_eq!(
         panic_message.as_deref(),
         Some("external-stop recv offload panic")
@@ -1813,15 +1806,7 @@ async fn queued_offload_panic_survives_hard_abort() {
         .await
         .expect("hard abort bounds shutdown");
 
-    let panic_message = loop {
-        let event = next_event(&mut events).await;
-        if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
-            && id.as_str() == "panic"
-            && let ExitKind::Panicked { message } = exit.kind()
-        {
-            break message.clone();
-        }
-    };
+    let panic_message = last_panic_message(&mut events, "panic").await;
     assert_eq!(panic_message.as_deref(), Some("owned offload panic"));
 }
 
@@ -1884,15 +1869,7 @@ async fn hard_abort_preserves_owned_offload_panic_over_handler_destructor() {
         .await
         .expect("the two panics remain contained");
 
-    let panic_message = loop {
-        let event = next_event(&mut events).await;
-        if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
-            && id.as_str() == "handler-double-panic"
-            && let ExitKind::Panicked { message } = exit.kind()
-        {
-            break message.clone();
-        }
-    };
+    let panic_message = last_panic_message(&mut events, "handler-double-panic").await;
     assert_eq!(
         panic_message.as_deref(),
         Some("handler owned offload panic")

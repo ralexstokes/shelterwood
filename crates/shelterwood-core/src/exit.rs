@@ -1149,7 +1149,22 @@ mod tests {
     }
 
     #[test]
-    fn stop_reason_precedence_is_an_explicit_exhaustive_table() {
+    fn stop_reason_precedence_is_severity_ascending() {
+        use super::StopPrecedence;
+
+        // `StopPrecedence` derives `Ord` from declaration order, and both
+        // consumers resolve competing verdicts with strictly-greater, so the
+        // order is the contract. Pin the two boundaries the doc calls out by
+        // name.
+        assert!(
+            StopPrecedence::StartupFailed < StopPrecedence::ShutdownRequested,
+            "a requested stop supersedes the structured failures"
+        );
+        assert!(
+            StopPrecedence::ShutdownRequested < StopPrecedence::NeverStarted,
+            "a membership that never started is the top element"
+        );
+
         let trip = IntensityTrip {
             max_restarts: 1,
             observed_restarts: 2,
@@ -1160,28 +1175,33 @@ mod tests {
                 id: ChildId::from("nested"),
             },
         };
-        let cases = [
-            (StopReason::Finished, super::StopPrecedence::Finished),
-            (
-                StopReason::IntensityTripped(trip),
-                super::StopPrecedence::IntensityTripped,
-            ),
-            (
-                StopReason::StartupFailed(startup),
-                super::StopPrecedence::StartupFailed,
-            ),
-            (
-                StopReason::ShutdownRequested,
-                super::StopPrecedence::ShutdownRequested,
-            ),
-            (
-                StopReason::NeverStarted,
-                super::StopPrecedence::NeverStarted,
-            ),
+        let ascending = [
+            StopReason::Finished,
+            StopReason::IntensityTripped(trip),
+            StopReason::StartupFailed(startup),
+            StopReason::ShutdownRequested,
+            StopReason::NeverStarted,
         ];
 
-        for (reason, expected) in cases {
-            assert_eq!(stop_reason_precedence(&reason), expected as u8);
+        for reason in &ascending {
+            // Exhaustive over `StopReason` without restating the mapping: a
+            // new variant does not compile until it is placed in the list
+            // above, which is what the ordering below then checks.
+            match reason {
+                StopReason::Finished
+                | StopReason::IntensityTripped(_)
+                | StopReason::StartupFailed(_)
+                | StopReason::ShutdownRequested
+                | StopReason::NeverStarted => {}
+            }
+        }
+        for pair in ascending.windows(2) {
+            assert!(
+                stop_reason_precedence(&pair[0]) < stop_reason_precedence(&pair[1]),
+                "{:?} must outrank {:?}",
+                pair[1],
+                pair[0]
+            );
         }
     }
 

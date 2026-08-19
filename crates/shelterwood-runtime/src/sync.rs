@@ -437,15 +437,26 @@ impl<T> OneShotSending<T> {
             .channel
             .take()
             .expect("a staged one-shot send publishes at most once");
-        match channel.send(value) {
-            Ok(()) => {
-                self.state.store(ONESHOT_SENT, Ordering::Release);
-                Ok(())
-            }
-            Err(value) => {
-                self.state.store(ONESHOT_RECEIVER_CLOSED, Ordering::Release);
-                Err(value)
-            }
+        publish_oneshot(channel, &self.state, value)
+    }
+}
+
+/// Publishes into a one-shot channel whose `ONESHOT_SENDING` window the
+/// caller already owns, then closes that window with the outcome.
+///
+/// `OneShotSender::send` and the staged `OneShotSending::publish` differ only
+/// in how they enter the window — `send` wins it with a CAS from
+/// `ONESHOT_OPEN`, the test half is constructed inside it — so they share the
+/// tail rather than restating it.
+fn publish_oneshot<T>(channel: oneshot::Sender<T>, state: &AtomicU8, value: T) -> Result<(), T> {
+    match channel.send(value) {
+        Ok(()) => {
+            state.store(ONESHOT_SENT, Ordering::Release);
+            Ok(())
+        }
+        Err(value) => {
+            state.store(ONESHOT_RECEIVER_CLOSED, Ordering::Release);
+            Err(value)
         }
     }
 }
@@ -468,16 +479,7 @@ impl<T> OneShotSender<T> {
             .channel
             .take()
             .expect("a live one-shot sender retains its channel");
-        match sender.send(value) {
-            Ok(()) => {
-                self.state.store(ONESHOT_SENT, Ordering::Release);
-                Ok(())
-            }
-            Err(value) => {
-                self.state.store(ONESHOT_RECEIVER_CLOSED, Ordering::Release);
-                Err(value)
-            }
-        }
+        publish_oneshot(sender, &self.state, value)
     }
 
     pub fn is_closed(&self) -> bool {

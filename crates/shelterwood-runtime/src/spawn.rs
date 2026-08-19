@@ -684,6 +684,79 @@ mod tests {
         assert!(matches!(wake, super::ScopeWake::ParentShutdown));
     }
 
+    /// Each arm alone only pins its own `ScopeWake` mapping; the `biased;`
+    /// precedence is a property of ties. Walk the chain
+    /// `signal > parent_shutdown > message > control > deadline` with every
+    /// weaker arm simultaneously ready, so dropping `biased;` cannot pass.
+    #[tokio::test]
+    async fn scope_wait_resolves_simultaneous_arms_in_declaration_order() {
+        let elapsed = crate::now();
+        let (sender, mut receiver) = super::unbounded_mpsc();
+        let (control_sender, mut control_receiver) = super::unbounded_mpsc();
+        assert!(sender.send(1_u8).is_ok());
+        assert!(control_sender.send(2_u8).is_ok());
+
+        let wake = super::wait_scope(
+            super::ScopeWait {
+                signal: std::future::ready(()),
+                parent_shutdown: std::future::ready(()),
+            },
+            &mut receiver,
+            Some(&mut control_receiver),
+            Some(elapsed),
+        )
+        .await;
+        assert!(matches!(wake, super::ScopeWake::Signal));
+
+        let wake = super::wait_scope(
+            super::ScopeWait {
+                signal: std::future::pending(),
+                parent_shutdown: std::future::ready(()),
+            },
+            &mut receiver,
+            Some(&mut control_receiver),
+            Some(elapsed),
+        )
+        .await;
+        assert!(matches!(wake, super::ScopeWake::ParentShutdown));
+
+        let wake = super::wait_scope(
+            super::ScopeWait {
+                signal: std::future::pending(),
+                parent_shutdown: std::future::pending(),
+            },
+            &mut receiver,
+            Some(&mut control_receiver),
+            Some(elapsed),
+        )
+        .await;
+        assert!(matches!(wake, super::ScopeWake::Message(Some(1))));
+
+        let wake = super::wait_scope(
+            super::ScopeWait {
+                signal: std::future::pending(),
+                parent_shutdown: std::future::pending(),
+            },
+            &mut receiver,
+            Some(&mut control_receiver),
+            Some(elapsed),
+        )
+        .await;
+        assert!(matches!(wake, super::ScopeWake::ControlMessage(Some(2))));
+
+        let wake = super::wait_scope(
+            super::ScopeWait {
+                signal: std::future::pending(),
+                parent_shutdown: std::future::pending(),
+            },
+            &mut receiver,
+            Some(&mut control_receiver),
+            Some(elapsed),
+        )
+        .await;
+        assert!(matches!(wake, super::ScopeWake::Deadline));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn scope_wait_reports_deadline_and_keeps_an_absent_deadline_pending() {
         let (_sender, mut receiver) = super::unbounded_mpsc::<()>();

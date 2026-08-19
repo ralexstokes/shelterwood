@@ -838,11 +838,18 @@ mod tests {
             "the timed-out call was withdrawn"
         );
 
-        let (_mailbox, frozen_actor, incarnation, receiver) = bound_call_actor(1);
+        let (mailbox, frozen_actor, incarnation, receiver) = bound_call_actor(1);
         receiver.freeze();
         let mut frozen =
             Box::pin(frozen_actor.call(|reply| CallRequest { reply: Some(reply) }, width));
         assert!(poll_once(frozen.as_mut()).is_pending());
+        // A frozen submission parks as a waiter and never enters the queue,
+        // so `try_recv` reads `None` whether or not the withdrawal happened.
+        // The waiter list is the artifact the withdrawal actually unlinks.
+        assert!(
+            !frozen_waiters_empty(&mailbox),
+            "the frozen call parks as a waiter"
+        );
         crate::runtime::advance(width * 2).await;
         let error = frozen
             .await
@@ -850,9 +857,21 @@ mod tests {
         assert_eq!(error.kind, CallErrorKind::AcceptanceTimedOut);
         assert_eq!(error.incarnation_observed, Some(incarnation));
         assert!(
-            receiver.try_recv().is_none(),
+            frozen_waiters_empty(&mailbox),
             "the frozen call was withdrawn"
         );
+    }
+
+    /// Reports whether a frozen mailbox holds any parked waiter, read
+    /// through the state guard the way `MailboxState::waiters` intends.
+    fn frozen_waiters_empty(mailbox: &MailboxCell<CallRequest>) -> bool {
+        mailbox
+            .state
+            .lock()
+            .expect("mailbox mutex poisoned")
+            .waiters()
+            .expect("a frozen mailbox owns its parked waiters")
+            .is_empty()
     }
 
     #[crate::runtime::test(start_paused = true)]

@@ -2127,8 +2127,12 @@ impl ScopeCell {
                     self.close_observation_locked(wakes);
                 }
                 // `StopReason::StartupFailed` recursively owns the failed
-                // child's user error. A stale verdict is unused, but it still
-                // leaves only after the observation gate is released.
+                // child's user error. A stale verdict is unused, but the
+                // framework still owns this copy: retaining it before the
+                // deferred drop sends a possibly-blocking or panicking user
+                // destructor to `dispose_critical` instead of running it
+                // inline on the committing thread once the gate is released.
+                let reason = RetainedStopReason::new(reason);
                 wakes.defer(move || drop(reason));
                 return;
             }
@@ -2687,6 +2691,68 @@ mod tests {
             disposal_thread, retiring_thread,
             "a losing failed exit must not run its user destructor on the committing thread"
         );
+    }
+
+    #[test]
+    fn a_stale_scope_verdict_disposes_its_nested_exit_off_the_finishing_thread() {
+        let finishing_thread = std::thread::current().id();
+        let mut identity = ScopeIdentity::new();
+        let root_id = ChildId::from("root");
+        let root = MemberCell::new(
+            root_id.clone(),
+            identity
+                .mint_membership(&root_id)
+                .expect("root membership is available"),
+        );
+        let scope = ScopeCell::new(root, ScopeFlavor::Ordered, ScopeIdentity::new());
+        let child_id = ChildId::from("worker");
+        let child = MemberCell::new(
+            child_id.clone(),
+            identity
+                .mint_membership(&child_id)
+                .expect("child membership is available"),
+        );
+
+        let stale = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("first scope epoch is available");
+        scope.finish_incarnation(stale, StopReason::Finished);
+        let live = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("second scope epoch is available");
+
+        // The stale epoch is declined, so this structured verdict is never
+        // published — but the framework still owns the failed child `Exit` it
+        // recursively carries, and must not run that user destructor inline.
+        let (dropped, observed) = mpsc::sync_channel(1);
+        scope.finish_incarnation(
+            stale,
+            StopReason::StartupFailed(StartupFailure {
+                cause: StartupFailureCause::Child {
+                    id: child_id,
+                    membership: child.membership(),
+                    exit: Exit::new(
+                        ExitKind::Failed(ExitError::from(ThreadProbe(dropped))),
+                        Cancellation::NotObserved,
+                    ),
+                },
+            }),
+        );
+
+        let disposal_thread = observed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the stale verdict's nested exit is destroyed");
+        assert_ne!(
+            disposal_thread, finishing_thread,
+            "a declined stop reason must not run its nested user destructor on the \
+             finishing thread"
+        );
+        assert_eq!(
+            scope.record().state,
+            ScopeState::Starting,
+            "the stale verdict must not rewrite the newer incarnation"
+        );
+        scope.finish_incarnation(live, StopReason::Finished);
     }
 
     #[test]

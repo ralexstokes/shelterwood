@@ -370,14 +370,19 @@ impl SpawnLatches {
 
 pub(super) fn fire_shutdown_edges(shutdown: &Latch, framework_shutdown: Option<&Latch>) {
     let mut panics = runtime::PanicAccumulator::default();
+    // Commit the child-facing cancellation evidence before waking the nested
+    // driver. That observer may finish on another worker and have completion
+    // sample this bit as soon as its wake runs. User waiters remain last so a
+    // hostile one cannot strand framework progress.
+    let notify_shutdown = shutdown.fire_silently();
     if let Some(framework_shutdown) = framework_shutdown {
         panics.run(|| {
             framework_shutdown.fire();
         });
     }
-    panics.run(|| {
-        shutdown.fire();
-    });
+    if notify_shutdown {
+        panics.run(|| shutdown.notify());
+    }
 }
 
 struct ChildTaskLaunch {
@@ -1237,7 +1242,7 @@ mod latch_topology_tests {
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{Context, Wake, Waker},
     };
@@ -1257,6 +1262,18 @@ mod latch_topology_tests {
     impl Wake for CountWake {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ObserveShutdownWake {
+        shutdown: crate::runtime::Latch,
+        observed: Arc<AtomicBool>,
+    }
+
+    impl Wake for ObserveShutdownWake {
+        fn wake(self: Arc<Self>) {
+            self.observed
+                .store(self.shutdown.is_fired(), Ordering::SeqCst);
         }
     }
 
@@ -1324,5 +1341,30 @@ mod latch_topology_tests {
         assert!(latches.shutdown.is_fired());
         assert!(nested.ancestor.framework_shutdown.is_fired());
         assert_eq!(framework_wakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn framework_shutdown_wake_observes_child_cancellation_already_committed() {
+        let latches = SpawnLatches::new(true);
+        let nested = latches.nested_scope();
+        let observed = Arc::new(AtomicBool::new(false));
+        let mut framework_wait = Box::pin(nested.ancestor.framework_shutdown.fired());
+        let framework = Waker::from(Arc::new(ObserveShutdownWake {
+            shutdown: latches.shutdown.clone(),
+            observed: Arc::clone(&observed),
+        }));
+        assert!(
+            framework_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&framework))
+                .is_pending()
+        );
+
+        fire_shutdown_edges(&latches.shutdown, Some(&nested.ancestor.framework_shutdown));
+
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "the nested driver cannot run before child cancellation is visible"
+        );
     }
 }

@@ -85,10 +85,9 @@ pub(super) use super::super::{
     MemberCell, MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest,
     RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent,
     ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
-    cancel_dynamic_reservation, discharge_child_terminality,
-    events::collect_driver_events, monitor_root_driver, report_slot,
-    reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
-    run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
+    cancel_dynamic_reservation, discharge_child_terminality, events::collect_driver_events,
+    monitor_root_driver, report_slot, reserve_dynamic, resident_projection, restart_shutdown_work,
+    run_nested_factory, run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
 };
 
 pub(super) async fn begin_admission(

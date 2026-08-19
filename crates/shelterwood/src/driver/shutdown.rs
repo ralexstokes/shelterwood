@@ -231,9 +231,9 @@ impl ScopeRuntime {
         self.drain_arrived_disposal_events();
         if self.supervisor.is_disposing(key) {
             // The incarnation has already exited; only its retained factory
-            // remains, and the drain above found no completion queued for it.
-            // Hard escalation detaches that cleanup and keeps the recorded
-            // verdict.
+            // remains, and the fold above found no completion reported for
+            // it. Hard escalation detaches that cleanup and keeps the
+            // recorded verdict.
             self.handle_construction_disposed(key, None);
         }
     }

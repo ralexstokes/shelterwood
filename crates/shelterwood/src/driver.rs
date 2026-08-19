@@ -363,8 +363,8 @@ impl Drop for ScopeRuntime {
         // chance to synthesize a coarse cancellation. The disposal job stays
         // detached; as on hard escalation, teardown does not wait for it and
         // cannot incorporate a destructor panic that has not completed at
-        // publication. A completion already queued on the disposal lane is
-        // available without waiting, however, so consume that arrived prefix
+        // publication. A completion that has already been reported is
+        // available without waiting, however, so fold everything reported
         // before falling back to the stored verdict.
         self.drain_arrived_disposal_events();
         let child_keys: Vec<_> = self.children.iter().map(|(key, _)| key).collect();

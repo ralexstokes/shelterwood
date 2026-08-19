@@ -539,6 +539,12 @@ enum IntervalRearm<M> {
     Interval(M),
 }
 
+#[derive(Clone, Copy)]
+struct TimerLocation {
+    hash: KeyHash,
+    index: usize,
+}
+
 /// Type-aware keyed timer lookup paired with an independently ordered
 /// deadline index.
 ///
@@ -634,32 +640,20 @@ impl<M> TimerStore<M> {
     where
         K: Eq + 'static,
     {
-        let (entry, empty) = {
-            let bucket = self.keyed.get_mut(&hash)?;
-            #[cfg(test)]
-            let mut probes = 0;
-            let index = bucket.iter().position(|entry| {
-                #[cfg(test)]
-                {
-                    probes += 1;
-                }
-                entry.key.downcast_ref::<K>() == Some(key)
-            })?;
+        #[cfg(test)]
+        let mut probes = 0;
+        let location = self.locate(hash, |entry| {
             #[cfg(test)]
             {
-                self.lookup_probes = self.lookup_probes.saturating_add(probes);
+                probes += 1;
             }
-            let entry = bucket.swap_remove(index);
-            (entry, bucket.is_empty())
-        };
-        if empty {
-            self.keyed.remove(&hash);
+            entry.key.downcast_ref::<K>() == Some(key)
+        })?;
+        #[cfg(test)]
+        {
+            self.lookup_probes = self.lookup_probes.saturating_add(probes);
         }
-        self.armings.remove(&entry.arming_order);
-        if let Some(deadline) = entry.deadline {
-            self.deadlines.remove(&(deadline, entry.arming_order));
-        }
-        Some(entry)
+        Some(self.unlink(location))
     }
 
     fn remove<K>(&mut self, key: &K) -> bool
@@ -703,39 +697,68 @@ impl<M> TimerStore<M> {
         self.disposal.dispose(message);
     }
 
-    fn remove_arming(&mut self, arming_order: ArmingOrder) -> Option<TimerEntry<M>> {
-        let hash = self.armings.remove(&arming_order)?;
+    fn locate(
+        &self,
+        hash: KeyHash,
+        mut predicate: impl FnMut(&TimerEntry<M>) -> bool,
+    ) -> Option<TimerLocation> {
+        let index = self.keyed.get(&hash)?.iter().position(&mut predicate)?;
+        Some(TimerLocation { hash, index })
+    }
+
+    fn unlink(&mut self, location: TimerLocation) -> TimerEntry<M> {
+        let arming_order = self
+            .keyed
+            .get(&location.hash)
+            .and_then(|bucket| bucket.get(location.index))
+            .expect("a timer location must reference a timer")
+            .arming_order;
+        let indexed_hash = self
+            .armings
+            .get(&arming_order)
+            .expect("a timer must have an arming index");
+        assert_eq!(
+            *indexed_hash, location.hash,
+            "a timer's key and arming indexes must agree"
+        );
         let (entry, empty) = {
             let bucket = self
                 .keyed
-                .get_mut(&hash)
-                .expect("an arming index must reference a key bucket");
-            let index = bucket
-                .iter()
-                .position(|entry| entry.arming_order == arming_order)
-                .expect("an arming index must reference a timer");
-            let entry = bucket.swap_remove(index);
+                .get_mut(&location.hash)
+                .expect("a timer location must reference a key bucket");
+            let entry = bucket.swap_remove(location.index);
             (entry, bucket.is_empty())
         };
         if empty {
-            self.keyed.remove(&hash);
+            self.keyed.remove(&location.hash);
         }
+        self.armings.remove(&entry.arming_order);
         if let Some(deadline) = entry.deadline {
-            self.deadlines.remove(&(deadline, arming_order));
+            self.deadlines.remove(&(deadline, entry.arming_order));
         }
-        Some(entry)
+        entry
+    }
+
+    fn remove_arming(&mut self, arming_order: ArmingOrder) -> Option<TimerEntry<M>> {
+        let hash = *self.armings.get(&arming_order)?;
+        let location = self
+            .locate(hash, |entry| entry.arming_order == arming_order)
+            .expect("an arming index must reference a timer");
+        Some(self.unlink(location))
     }
 
     fn entry_mut(&mut self, arming_order: ArmingOrder) -> Option<&mut TimerEntry<M>> {
         let hash = *self.armings.get(&arming_order)?;
-        let entry = self
-            .keyed
-            .get_mut(&hash)
-            .expect("an arming index must reference a key bucket")
-            .iter_mut()
-            .find(|entry| entry.arming_order == arming_order)
+        let location = self
+            .locate(hash, |entry| entry.arming_order == arming_order)
             .expect("an arming index must reference a timer");
-        Some(entry)
+        Some(
+            self.keyed
+                .get_mut(&location.hash)
+                .expect("a timer location must reference a key bucket")
+                .get_mut(location.index)
+                .expect("a timer location must reference a timer"),
+        )
     }
 
     fn take_due(&mut self, now: Instant) -> VecDeque<ArmingOrder> {
@@ -1636,6 +1659,18 @@ impl<M: Send + 'static> RawContext<M> {
         Ok(guard)
     }
 
+    fn pop_continuation(&mut self, batch: &mut ReadyBatch, allow_lead: bool) -> Option<M> {
+        if (!allow_lead || !self.resources.continuation_needs_external)
+            && batch.continuation_is_eligible()
+            && let Some(message) = self.resources.continuations.pop_front()
+        {
+            batch.record_continuation_delivery();
+            self.resources.continuation_needs_external = true;
+            return Some(message);
+        }
+        None
+    }
+
     /// Selects one live-incarnation input without awaiting.
     ///
     /// Every selection runs through one bounded arbitration batch. Steady
@@ -1678,12 +1713,7 @@ impl<M: Send + 'static> RawContext<M> {
                 .ready_batch
                 .take()
                 .expect("ready selection always owns an arbitration batch");
-            if !self.resources.continuation_needs_external
-                && batch.continuation_is_eligible()
-                && let Some(message) = self.resources.continuations.pop_front()
-            {
-                batch.record_continuation_delivery();
-                self.resources.continuation_needs_external = true;
+            if let Some(message) = self.pop_continuation(&mut batch, true) {
                 self.resources.ready_batch = Some(batch);
                 return Some(message);
             }
@@ -1733,11 +1763,7 @@ impl<M: Send + 'static> RawContext<M> {
                 continue;
             }
 
-            if batch.continuation_is_eligible()
-                && let Some(message) = self.resources.continuations.pop_front()
-            {
-                batch.record_continuation_delivery();
-                self.resources.continuation_needs_external = true;
+            if let Some(message) = self.pop_continuation(&mut batch, false) {
                 self.resources.ready_batch = Some(batch);
                 return Some(message);
             }
@@ -3050,7 +3076,7 @@ mod timer_store_tests {
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -3087,6 +3113,29 @@ mod timer_store_tests {
         fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
             self.hashes.fetch_add(1, Ordering::SeqCst);
             std::hash::Hash::hash(&self.value, state);
+        }
+    }
+
+    struct PanickingEqKey {
+        value: u8,
+        panic_on_eq: Arc<AtomicBool>,
+    }
+
+    impl PartialEq for PanickingEqKey {
+        fn eq(&self, other: &Self) -> bool {
+            assert!(
+                !self.panic_on_eq.load(Ordering::SeqCst),
+                "timer key equality panic"
+            );
+            self.value == other.value
+        }
+    }
+
+    impl Eq for PanickingEqKey {}
+
+    impl std::hash::Hash for PanickingEqKey {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            self.value.hash(state);
         }
     }
 
@@ -3274,6 +3323,52 @@ mod timer_store_tests {
             "replacement"
         );
         assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn equality_panic_leaves_timer_indexes_and_probe_count_coherent() {
+        let panic_on_eq = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let mut timers = TimerStore::default();
+        timers.replace(
+            PanickingEqKey {
+                value: 7,
+                panic_on_eq: Arc::clone(&panic_on_eq),
+            },
+            Some(deadline),
+            order(1),
+            TimerMessage::Once("message"),
+            None,
+        );
+        let query = PanickingEqKey {
+            value: 7,
+            panic_on_eq: Arc::clone(&panic_on_eq),
+        };
+
+        panic_on_eq.store(true, Ordering::SeqCst);
+        let panic = catch_unwind(AssertUnwindSafe(|| timers.take(&query)))
+            .err()
+            .expect("user equality panic escapes the timer lookup");
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("timer key equality panic")
+        );
+        assert_eq!(timers.lookup_probes, 0, "a panicked scan is not committed");
+        assert_eq!(
+            timers.armings.get(&order(1)),
+            Some(&timers.hash_key(&query))
+        );
+        assert_eq!(timers.next_deadline(), Some(deadline));
+
+        panic_on_eq.store(false, Ordering::SeqCst);
+        assert_eq!(
+            once(timers.take(&query).expect("the timer remains linked")),
+            "message"
+        );
+        assert_eq!(timers.lookup_probes, 1);
+        assert!(timers.is_empty());
+        assert!(timers.deadlines.is_empty());
     }
 
     #[test]

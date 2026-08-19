@@ -6,26 +6,22 @@ pub(super) struct RemovalRequest {
 }
 
 impl ScopeRuntime {
-    pub(super) fn with_dynamic_entry<R>(
-        &self,
-        key: ChildKey,
-        inspect: impl FnOnce(&DynamicEntry) -> R,
-    ) -> Option<R> {
-        let child = self.children.get(key)?;
-        let control = self.dynamic.as_ref()?;
-        let state = control.state.lock().expect("dynamic-state mutex poisoned");
-        state
-            .entry(child.slot.member.id())
-            .filter(|entry| entry.slot.member.membership() == child.slot.member.membership())
-            .filter(|entry| entry.matches_key(key))
-            .map(inspect)
-    }
-
     pub(super) fn removal_latched(&self, key: ChildKey) -> bool {
-        self.supervisor.membership_status(key) == MembershipStatus::Removing
-            || self
-                .with_dynamic_entry(key, DynamicEntry::removal_latched)
-                .unwrap_or(false)
+        if self.supervisor.membership_status(key) == MembershipStatus::Removing {
+            return true;
+        }
+        let Some(child) = self.children.get(key) else {
+            return false;
+        };
+        let Some(control) = &self.dynamic else {
+            return false;
+        };
+        let state = control.state.lock().expect("dynamic-state mutex poisoned");
+        state.entry(child.slot.member.id()).is_some_and(|entry| {
+            entry.slot.member.membership() == child.slot.member.membership()
+                && entry.matches_key(key)
+                && entry.removal_latched()
+        })
     }
 
     pub(super) fn handle_removal(&mut self, removal: RemovalRequest) {
@@ -113,10 +109,10 @@ impl ScopeRuntime {
         }
         // The entry's release completes any in-flight removal response; it
         // must follow the Removed edge so a woken remover never sees the
-        // child resident. A removal that latches between this path's
-        // `dynamic_membership_is_removing` check and the gate above lands its
-        // response here rather than in `finalize_removal`, so it takes the
-        // same starting-phase retention.
+        // child resident. A removal that latches between a terminal route's
+        // membership-status check and the gate above lands its response here
+        // rather than in `finalize_removal`, so it takes the same
+        // starting-phase retention.
         if let Some(entry) = removed {
             self.release_removed_entry(entry);
         }

@@ -254,6 +254,7 @@ impl SupervisorState {
         self.children.get(&child).map(|record| record.state)
     }
 
+    /// Missing keys have already been reclaimed and fail closed as removing.
     pub fn membership_status(&self, child: ChildKey) -> MembershipStatus {
         self.child_state(child)
             .map_or(MembershipStatus::Removing, ChildState::membership_status)

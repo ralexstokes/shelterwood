@@ -2257,7 +2257,7 @@ mod tests {
         );
         let mailbox = MailboxCell::new(id.clone(), crate::runtime::mailbox_runtime());
         member.attach_mailbox(mailbox.clone());
-        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox);
+        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox());
         let incarnation = member
             .take_incarnation_counter()
             .mint()

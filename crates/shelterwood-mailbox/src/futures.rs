@@ -792,7 +792,7 @@ mod tests {
         let (mailbox, actor) = actor();
         MailboxControl::configure(
             &*mailbox,
-            crate::policy::ResolvedDefaults::default().mailbox,
+            crate::policy::ResolvedDefaults::default().mailbox(),
         );
         let mut identity = ScopeIdentity::new();
         let (_, mut incarnations) = identity

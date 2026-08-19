@@ -27,7 +27,10 @@ use shelterwood_core::{
         ExitKind, StartupError, StartupFailure, StartupFailureCause, StopReason,
         stop_reason_precedence,
     },
-    identity::{AtomicPoisonedCounter, IncarnationCounter, MintedMembership, ScopeIdentity},
+    identity::{
+        AtomicPoisonedCounter, IncarnationCounter, MembershipReconciliation, MintedMembership,
+        ScopeIdentity,
+    },
     policy::{ResolvedCommonOptions, ScopeFlavor},
 };
 use shelterwood_mailbox::{ActorIdentity, MailboxControl, MailboxTermination};
@@ -1179,7 +1182,7 @@ impl ScopeCell {
         &self,
         id: &ChildId,
         provisional: Membership,
-    ) -> Option<Option<MintedMembership>> {
+    ) -> MembershipReconciliation {
         self.child_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

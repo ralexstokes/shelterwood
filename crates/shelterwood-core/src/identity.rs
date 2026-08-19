@@ -306,6 +306,17 @@ pub struct MintedMembership {
     incarnation_counter: IncarnationCounter,
 }
 
+/// Result of reconciling a provisional membership with a stable scope.
+#[derive(Debug)]
+pub enum MembershipReconciliation {
+    /// The stable scope adopted the provisional lineage unchanged.
+    Adopted,
+    /// The stable scope already tracked the id and minted its successor.
+    Minted(MintedMembership),
+    /// The stable scope's membership generation was exhausted.
+    Exhausted,
+}
+
 impl MintedMembership {
     fn new(membership: Membership) -> Self {
         Self {
@@ -412,16 +423,18 @@ impl ScopeIdentity {
         &mut self,
         id: &ChildId,
         provisional: Membership,
-    ) -> Option<Option<MintedMembership>> {
+    ) -> MembershipReconciliation {
         match self.memberships.entry(id.clone()) {
             Entry::Occupied(mut entry) => {
-                let membership = entry.get_mut().mint().map(Membership)?;
-                Some(Some(MintedMembership::new(membership)))
+                let Some(membership) = entry.get_mut().mint().map(Membership) else {
+                    return MembershipReconciliation::Exhausted;
+                };
+                MembershipReconciliation::Minted(MintedMembership::new(membership))
             }
             Entry::Vacant(entry) => {
                 debug_assert_ne!(provisional.0.generation, Generation::POISON);
                 entry.insert(FenceCounter::from_fence(provisional.0));
-                Some(None)
+                MembershipReconciliation::Adopted
             }
         }
     }
@@ -449,7 +462,8 @@ mod tests {
     use crate::ChildId;
 
     use super::{
-        AtomicPoisonedCounter, Generation, IncarnationCounter, PoisonedCounter, ScopeIdentity,
+        AtomicPoisonedCounter, Generation, IncarnationCounter, MembershipReconciliation,
+        PoisonedCounter, ScopeIdentity,
     };
 
     #[test]
@@ -563,7 +577,7 @@ mod tests {
         let mut stable = ScopeIdentity::new();
         assert!(matches!(
             stable.adopt_or_mint_membership(&id, provisional),
-            Some(None)
+            MembershipReconciliation::Adopted
         ));
         let direct = stable
             .mint_membership(&id)
@@ -575,11 +589,12 @@ mod tests {
             .mint_membership(&id)
             .expect("rebuilt provisional membership available")
             .membership();
-        let reconciled = stable
-            .adopt_or_mint_membership(&id, rebuilt)
-            .expect("stable identity is not exhausted")
-            .expect("an occupied stable identity mints a successor")
-            .membership();
+        let MembershipReconciliation::Minted(reconciled) =
+            stable.adopt_or_mint_membership(&id, rebuilt)
+        else {
+            panic!("an occupied stable identity mints a successor")
+        };
+        let reconciled = reconciled.membership();
 
         assert!(direct.supersedes(provisional));
         assert!(reconciled.supersedes(direct));
@@ -610,17 +625,18 @@ mod tests {
         let mut stable = ScopeIdentity::new();
         assert!(matches!(
             stable.adopt_or_mint_membership(&id, first),
-            Some(None)
+            MembershipReconciliation::Adopted
         ));
         assert!(matches!(
             stable.adopt_or_mint_membership(&other_id, other),
-            Some(None)
+            MembershipReconciliation::Adopted
         ));
-        let successor = stable
-            .adopt_or_mint_membership(&id, rebuilt)
-            .expect("stable identity is not exhausted")
-            .expect("stable identity mints a rebuilt successor")
-            .membership();
+        let MembershipReconciliation::Minted(successor) =
+            stable.adopt_or_mint_membership(&id, rebuilt)
+        else {
+            panic!("stable identity mints a rebuilt successor")
+        };
+        let successor = successor.membership();
 
         assert!(successor.supersedes(first));
         assert!(!first.supersedes(successor));
@@ -692,8 +708,14 @@ mod tests {
             .expect("provisional membership available")
             .membership();
 
-        assert!(stable.adopt_or_mint_membership(&id, provisional).is_none());
-        assert!(stable.adopt_or_mint_membership(&id, provisional).is_none());
+        assert!(matches!(
+            stable.adopt_or_mint_membership(&id, provisional),
+            MembershipReconciliation::Exhausted
+        ));
+        assert!(matches!(
+            stable.adopt_or_mint_membership(&id, provisional),
+            MembershipReconciliation::Exhausted
+        ));
         assert!(
             stable.mint_membership(&ChildId::from("other")).is_some(),
             "exhaustion remains local to one child id"

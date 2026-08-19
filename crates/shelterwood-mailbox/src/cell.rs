@@ -1672,7 +1672,7 @@ pub(super) mod tests {
     #[should_panic(expected = "mailbox must close the prior incarnation before rebinding")]
     fn rebinding_before_close_trips_the_driver_contract() {
         let (mailbox, _) = actor();
-        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox);
+        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox());
         let mut identity = ScopeIdentity::new();
         let (_, mut incarnations) = identity
             .mint_membership(&ChildId::from("actor"))
@@ -1897,7 +1897,7 @@ pub(super) mod tests {
         park_with(&mut first, &first_panicking);
         park_with(&mut second, &second_panicking);
         park_with(&mut third, &counting);
-        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox);
+        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox());
         let mut generations = {
             let mut identity = ScopeIdentity::new();
             let (_, generations) = identity

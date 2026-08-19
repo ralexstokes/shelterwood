@@ -18,7 +18,7 @@ mod storage;
 
 use storage::Obligation;
 
-use child::ChildRuntime;
+use child::{ChildRuntime, fire_shutdown_edges};
 #[cfg(test)]
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
 use events::{
@@ -169,13 +169,14 @@ fn monitor_root_driver(
 }
 
 struct AncestorCommandLatches {
-    shutdown: Latch,
+    framework_shutdown: Latch,
     abort: Latch,
     abort_ack: Latch,
 }
 
 struct NestedScopeLatches {
     parent_ready: CompletionGatedLatch,
+    child_shutdown: Latch,
     ancestor: AncestorCommandLatches,
 }
 
@@ -367,7 +368,7 @@ impl Drop for ScopeRuntime {
                     }
                 }
                 panics.run(|| {
-                    active.shutdown.fire();
+                    fire_shutdown_edges(&active.shutdown, active.framework_shutdown.as_ref());
                 });
                 panics.run(|| {
                     active.abort.fire();
@@ -805,15 +806,19 @@ async fn run_nested_tree_with_epoch(
             // The ancestor *abort* latch needs no separate arm: it is the
             // framework-abort edge, fired only by `StopAction::AbortFramework`,
             // and the stop ladder unconditionally passes through
-            // `StopAction::Cancel` — which fires this same ancestor shutdown
+            // `StopAction::Cancel` — which fires this same framework shutdown
             // latch — before it can reach that phase.
-            if scope.has_stop_request(epoch.epoch()) || latches.ancestor.shutdown.is_fired() {
+            let self_shutdown = scope.has_stop_request(epoch.epoch());
+            if self_shutdown || latches.ancestor.framework_shutdown.is_fired() {
                 // Mirror the loop's `Pending::Shutdown` arm: firing the
-                // ancestor shutdown latch is what makes this scope's exit read
+                // child-facing shutdown latch is what makes this scope's exit read
                 // `Cancellation::Observed` at its parent, as a requested stop
-                // must (§11). The latch is level-triggered, so re-firing an
-                // ancestor-driven stop is a no-op.
-                latches.ancestor.shutdown.fire();
+                // must (§11). An ancestor-driven stop already fired that latch
+                // independently; do not couple its framework observer back to
+                // user-installable cancellation waiters.
+                if self_shutdown {
+                    latches.child_shutdown.fire();
+                }
                 epoch.lifecycle.begin_drain(StopReason::ShutdownRequested);
             }
             // Both drain effects are deliberately discarded: this path
@@ -990,7 +995,7 @@ async fn run_scope_incarnation(
             && scope
                 .role
                 .ancestor()
-                .is_some_and(|latches| latches.shutdown.is_fired())
+                .is_some_and(|latches| latches.framework_shutdown.is_fired())
         {
             scope.ancestor_shutdown_seen = true;
             pending.push(Pending::AncestorShutdown.classified());
@@ -1028,7 +1033,7 @@ async fn run_scope_incarnation(
                 .role
                 .ancestor()
                 .filter(|_| !scope.ancestor_shutdown_seen)
-                .map(|latches| latches.shutdown.clone());
+                .map(|latches| latches.framework_shutdown.clone());
             let ancestor_abort = scope
                 .role
                 .ancestor()
@@ -1091,8 +1096,8 @@ async fn run_scope_incarnation(
         for (_, event) in pending.drain(..) {
             match event {
                 Pending::Shutdown => {
-                    if let Some(latches) = scope.role.ancestor() {
-                        latches.shutdown.fire();
+                    if let ScopeRole::Nested(nested) = &scope.role {
+                        nested.child_shutdown.fire();
                         scope.ancestor_shutdown_seen = true;
                     }
                     scope.begin_drain(StopReason::ShutdownRequested);

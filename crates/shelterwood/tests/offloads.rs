@@ -1,10 +1,12 @@
 mod common;
 
 use std::{
+    future::Future,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context as TaskContext, Wake, Waker},
     time::Duration,
 };
 
@@ -1283,6 +1285,109 @@ async fn polled_cancellation_destructor_panic_does_not_poison_offload_state() {
 #[tokio::test]
 async fn cancellation_destructor_panic_does_not_mask_actor_panic() {
     assert_cancellation_drop_panic(CancellationDropMode::Actor, "primary actor panic").await;
+}
+
+struct HostileFinishedWake;
+
+impl Wake for HostileFinishedWake {
+    fn wake(self: Arc<Self>) {
+        panic!("hostile offload finished wake");
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        panic!("hostile offload finished wake");
+    }
+}
+
+struct HostileFinishedActor {
+    later_drops: Arc<AtomicUsize>,
+}
+
+impl Actor for HostileFinishedActor {
+    type Msg = ();
+    type Args = Arc<AtomicUsize>;
+
+    async fn init(later_drops: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self { later_drops })
+    }
+
+    async fn handle(&mut self, (): (), context: &mut Context<'_, Self>) -> ExitResult {
+        let first = context
+            .offload_scoped(std::future::pending::<()>(), |_| (), Duration::MAX)
+            .expect("first offload accepted");
+        let second = context
+            .offload_scoped(
+                PendingDropFuture {
+                    drops: Arc::clone(&self.later_drops),
+                    panic_on_drop: false,
+                    polled: None,
+                    dropped: None,
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("second offload accepted");
+
+        let mut finished = Box::pin(first.finished());
+        let hostile = Waker::from(Arc::new(HostileFinishedWake));
+        assert!(
+            finished
+                .as_mut()
+                .poll(&mut TaskContext::from_waker(&hostile))
+                .is_pending(),
+            "the hostile waker is registered before the freeze"
+        );
+        // Keep the waiter registered without polling it again. Its wake is
+        // the supported `Guard::finished` path that must not cut cleanup short.
+        std::mem::forget(finished);
+        first.detach();
+        second.detach();
+        context.stop();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn hostile_finished_waker_cannot_strand_later_offload_or_exit_publication() {
+    let later_drops = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "hostile-finished",
+            ActorOnceDef::<HostileFinishedActor>::new(Arc::clone(&later_drops)),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    let mut events = system.scope().subscribe_lifecycle();
+
+    actor.send(()).await.expect("actor is live");
+    let exit = tokio::time::timeout(POLL_TIMEOUT, async {
+        loop {
+            let event = next_event(&mut events).await;
+            if let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+                && id.as_str() == "hostile-finished"
+            {
+                break exit;
+            }
+        }
+    })
+    .await
+    .expect("the incarnation publishes its exit without parent shutdown");
+
+    let ExitKind::Panicked { message } = exit.kind() else {
+        panic!("expected hostile-waker panic exit, got {:?}", exit.kind());
+    };
+    assert_eq!(message.as_deref(), Some("hostile offload finished wake"));
+    assert_eq!(
+        later_drops.load(Ordering::SeqCst),
+        1,
+        "the later offload is cancelled and disposed before exit publication"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed actor scope shuts down");
 }
 
 #[tokio::test]

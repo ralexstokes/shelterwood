@@ -8,7 +8,7 @@ use std::{
     task::{Context as TaskPollContext, Poll},
 };
 
-use crate::runtime::{ActorWork, Latch, PanicPayload, catch_panic};
+use crate::runtime::{ActorWork, Latch, PanicAccumulator, PanicPayload, catch_panic};
 
 use super::disposal::RawDisposal;
 
@@ -263,10 +263,13 @@ pub(super) struct OffloadResource {
 }
 
 impl OffloadResource {
-    pub(super) fn cancel(&mut self) {
-        self.cancellation.fire();
+    pub(super) fn cancel(&mut self) -> Option<PanicPayload> {
+        let mut panics = PanicAccumulator::default();
+        panics.run(|| {
+            self.cancellation.fire();
+        });
         if let Some(state) = &self.state {
-            state.cancel();
+            panics.run(|| state.cancel());
         }
         if let Some(task) = &self.task {
             // These are complementary: `state.cancel()` synchronously
@@ -274,8 +277,11 @@ impl OffloadResource {
             // in-progress poll to dispose on return, while abort independently
             // requests cancellation of the runtime task driving that poll.
             // Neither substitutes for the other.
-            task.abort();
+            panics.run(|| task.abort());
         }
-        self.finished.fire();
+        panics.run(|| {
+            self.finished.fire();
+        });
+        panics.take()
     }
 }

@@ -702,15 +702,24 @@ impl<M> RawResources<M> {
         }
         self.accepting = false;
         let dropped_continuations = self.continuations.len();
-        // Cancellation catches each future's destructor independently, so a
-        // failure cannot prevent later offloads from being cancelled/signalled.
+        // Treat the whole freeze as one cleanup transaction. Cancellation
+        // contains each latch wake, future disposal and task abort
+        // independently, while this outer accumulator keeps one failure from
+        // skipping later offloads or any of the collection drains.
+        let mut panics = PanicAccumulator::default();
         for offload in &mut self.offloads {
-            offload.cancel();
+            panics.record(offload.cancel());
         }
-        self.continuations.clear();
-        self.timers.clear();
-        self.ready_batch = None;
-        self.events.clear();
+        panics.run(|| self.continuations.clear());
+        panics.run(|| self.timers.clear());
+        panics.run(|| self.ready_batch = None);
+        panics.run(|| self.events.clear());
+        if let Some(payload) = panics.take() {
+            // The owned raw-incarnation epilogue drains this slot after the
+            // freeze and before joining, so publication is delayed until all
+            // synchronous cleanup has completed without losing the diagnostic.
+            self.disposal.panic.record(payload);
+        }
         dropped_continuations
     }
 
@@ -1129,6 +1138,10 @@ impl<M: Send + 'static> RawContext<M> {
     /// resuming the loop.
     pub fn try_recv(&mut self) -> Option<M> {
         if self.is_stopping() {
+            // Establish the receive boundary locally just as `recv` does. Do
+            // not rely on the driver's mailbox-freeze ordering relative to
+            // the shutdown latch this call observes.
+            self.receiver.freeze();
             self.freeze_and_report();
             self.resources.resume_pending_panic();
             self.receiver.try_recv()
@@ -2067,6 +2080,73 @@ mod tests {
                 .expect_err("recv's local freeze closes the acceptance boundary")
                 .kind,
             crate::SendErrorKind::NotRunning
+        );
+    }
+
+    #[test]
+    fn try_recv_freezes_its_mailbox_when_it_observes_shutdown() {
+        let (mut context, actor, shutdown) = bound_raw_context_for::<u8>();
+        actor
+            .try_send(1)
+            .expect("the live mailbox accepts before shutdown");
+        shutdown.fire();
+
+        assert_eq!(
+            context.try_recv(),
+            Some(1),
+            "drain mode still reads the prefix accepted before the local freeze"
+        );
+        assert_eq!(
+            actor
+                .try_send(2)
+                .expect_err("try_recv's local freeze closes the acceptance boundary")
+                .kind,
+            crate::SendErrorKind::NotRunning
+        );
+    }
+
+    #[test]
+    fn cancelled_queued_event_is_disposed_without_materializing_its_message() {
+        let (mut context, _actor, _shutdown) = bound_raw_context_for::<u8>();
+        let cancellation = Latch::default();
+        cancellation.fire();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let event_payload = PanickingDrop(Arc::clone(&drops));
+        let invoked_by_event = Arc::clone(&invoked);
+        context.resources.events.push(QueuedEvent {
+            cancellation,
+            make_message: Box::new(move || {
+                invoked_by_event.fetch_add(1, Ordering::SeqCst);
+                drop(event_payload);
+                7
+            }),
+        });
+
+        assert_eq!(
+            context.try_recv(),
+            None,
+            "a completion cancelled after queueing does not deliver a message"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "the cancelled completion never runs its message builder"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the queued completion is disposed at materialization time"
+        );
+        let payload = context
+            .resources
+            .disposal
+            .panic
+            .take()
+            .expect("the hostile event destructor is retained by raw disposal");
+        assert_eq!(
+            panic_message(&payload),
+            Some("contained raw payload destructor panic")
         );
     }
 

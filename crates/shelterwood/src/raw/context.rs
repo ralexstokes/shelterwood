@@ -836,6 +836,11 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     /// Returns a membership-addressed handle to this actor.
+    ///
+    /// Available for the whole raw incarnation, teardown included. The
+    /// high-level [`crate::StopContext`] withholds its equivalent, so
+    /// callback-actor authors capture [`crate::Context::myself`] while live
+    /// instead.
     #[must_use]
     pub fn myself(&self) -> ActorRef<M> {
         self.myself.clone()

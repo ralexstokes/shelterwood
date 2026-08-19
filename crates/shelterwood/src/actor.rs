@@ -33,6 +33,13 @@ pub trait Actor: Sized + Send + 'static {
     ) -> impl Future<Output = ExitResult> + Send;
 
     /// Performs best-effort cooperative teardown.
+    ///
+    /// Runs under the child's shutdown grace with a narrowed [`StopContext`].
+    /// Not called when `init` failed, when a handler returned `Err` or
+    /// panicked, or on hard abort. [`StopContext`] has no self-handle;
+    /// capture [`Context::myself`] during the live phase if teardown needs
+    /// the handle itself. Identity alone needs no capture — the stop
+    /// context still exposes [`StopContext::incarnation`].
     fn on_stop(&mut self, _context: &mut StopContext<'_, Self>) -> impl Future<Output = ()> + Send {
         async {}
     }
@@ -102,6 +109,10 @@ macro_rules! actor_context_forwarders {
         context_common_forwarders!();
 
         /// Returns a membership-addressed handle to this actor.
+        ///
+        /// Absent from [`StopContext`]. Capture it during [`Actor::init`] or
+        /// [`Actor::handle`] if [`Actor::on_stop`] needs the handle itself;
+        /// for identity alone the stop context keeps `incarnation()`.
         #[must_use]
         pub fn myself(&self) -> ActorRef<$actor::Msg> {
             self.raw.myself()
@@ -275,6 +286,67 @@ impl<'a, A: Actor> Context<'a, A> {
 }
 
 /// Narrowed context supplied only to [`Actor::on_stop`].
+///
+/// Work that queues delivery to this incarnation is unrepresentable: no
+/// continuations, timers, offloads, or [`Context::myself`]. [`ActorRef`] is
+/// a send handle; posting from `on_stop` is futile, so there is no
+/// self-handle here. The absence is structural — `myself` is forwarded only
+/// onto [`Context`] — and this fence is what keeps it so:
+///
+/// ```compile_fail,E0599
+/// use shelterwood::{Actor, Context, ExitError, ExitResult, StopContext};
+///
+/// struct Teardown;
+///
+/// impl Actor for Teardown {
+///     type Msg = ();
+///     type Args = ();
+///
+///     async fn init((): Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+///         Ok(Self)
+///     }
+///
+///     async fn handle(&mut self, (): Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+///         Ok(())
+///     }
+///
+///     async fn on_stop(&mut self, context: &mut StopContext<'_, Self>) {
+///         let _self_handle = context.myself();
+///     }
+/// }
+/// ```
+///
+/// A `compile_fail` fence passes for *any* compilation error, so the same
+/// actor compiles here with the one supported teardown identity in place of
+/// that call — which is what isolates the fence above to the missing method:
+///
+/// ```
+/// use shelterwood::{Actor, Context, ExitError, ExitResult, Membership, StopContext};
+///
+/// struct Teardown;
+///
+/// impl Actor for Teardown {
+///     type Msg = ();
+///     type Args = ();
+///
+///     async fn init((): Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+///         Ok(Self)
+///     }
+///
+///     async fn handle(&mut self, (): Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+///         Ok(())
+///     }
+///
+///     async fn on_stop(&mut self, context: &mut StopContext<'_, Self>) {
+///         // Process-wide unique, so it keys a registry no `ActorRef` needs
+///         // to have been captured for.
+///         let _key: Membership = context.incarnation().membership();
+///     }
+/// }
+/// ```
+///
+/// Capture [`Context::myself`] during [`Actor::init`] or [`Actor::handle`]
+/// only when teardown needs the handle itself.
 pub struct StopContext<'a, A: Actor> {
     raw: &'a mut RawContext<A::Msg>,
     actor: PhantomData<fn() -> A>,

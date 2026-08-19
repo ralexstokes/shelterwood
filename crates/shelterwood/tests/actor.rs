@@ -12,9 +12,9 @@ use crate::common::{
     POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, waiting::task as waiting_task,
 };
 use shelterwood::{
-    Actor, ActorDef, ActorOnceDef, ActorRef, ChildId, ChildState, Context, DynamicTree, ExitError,
-    ExitKind, ExitResult, Handler, Mailbox, RawActor, RawContext, RawOnceDef, Readiness, Retention,
-    ScopeRef, SendErrorKind, StopContext, TaskDef, Tree,
+    Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DynamicTree, ExitError, ExitKind,
+    ExitResult, Handler, Mailbox, RawActor, RawContext, RawOnceDef, Readiness, Retention, ScopeRef,
+    SendErrorKind, StopContext, TaskDef, Tree,
 };
 
 #[derive(Clone)]
@@ -532,8 +532,9 @@ enum ContextSurfaceMessage {
 struct ContextSurfaceActor {
     entered: ReleaseGate,
     release: ReleaseGate,
+    myself: ActorRef<ContextSurfaceMessage>,
     observed: Option<tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>>,
-    stopped: Option<tokio::sync::oneshot::Sender<(ChildId, ScopeRef)>>,
+    stopped: Option<tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>>,
 }
 
 impl Actor for ContextSurfaceActor {
@@ -542,16 +543,17 @@ impl Actor for ContextSurfaceActor {
         ReleaseGate,
         ReleaseGate,
         tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>,
-        tokio::sync::oneshot::Sender<(ChildId, ScopeRef)>,
+        tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>,
     );
 
     async fn init(
         (entered, release, observed, stopped): Self::Args,
-        _: &mut Context<'_, Self>,
+        context: &mut Context<'_, Self>,
     ) -> Result<Self, ExitError> {
         Ok(Self {
             entered,
             release,
+            myself: context.myself(),
             observed: Some(observed),
             stopped: Some(stopped),
         })
@@ -585,16 +587,17 @@ impl Actor for ContextSurfaceActor {
     }
 
     async fn on_stop(&mut self, context: &mut StopContext<'_, Self>) {
-        let id = context.id().clone();
         let scope: ScopeRef = context.scope();
         self.stopped
             .take()
             .expect("stop-context observation is sent once")
-            .send((id, scope))
-            .expect("test still awaits typed stop-context identity");
+            .send((self.myself.clone(), scope))
+            .expect("test still awaits the live-phase self-handle");
     }
 }
 
+/// Live context preserves slot identity and self-send capacity. Stop context
+/// has no `myself()`; the handle reported from `on_stop` is captured in `init`.
 #[tokio::test]
 async fn typed_context_handles_preserve_identity_and_self_send_capacity() {
     let entered = ReleaseGate::default();
@@ -631,10 +634,10 @@ async fn typed_context_handles_preserve_identity_and_self_send_capacity() {
     assert_eq!(myself, actor);
     assert_eq!(scope, system.scope());
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    let (stopping_id, stopping_scope) = stop_observation
+    let (stopping_myself, stopping_scope) = stop_observation
         .await
-        .expect("actor reports stop-context identity");
-    assert_eq!(&stopping_id, actor.id());
+        .expect("actor reports the captured self-handle from stop");
+    assert_eq!(stopping_myself, actor);
     assert_eq!(stopping_scope, scope);
 }
 

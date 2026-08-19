@@ -598,8 +598,15 @@ trait Actor: Sized + Send + 'static {
   the normal supervision path, classified as a startup failure.
 - `on_stop` is best-effort teardown; it runs under the child's shutdown
   grace and its context is the narrowed `StopContext` (§5.4, Appendix B.1).
-  A panic in `on_stop` is classified `Panicked` by the fallback report
-  token, superseding the run's outcome (§7).
+  `StopContext` exposes no `myself()`: an `ActorRef` is a send handle, and
+  posting from `on_stop` is futile. Teardown that needs the handle itself
+  — a map keyed by `ActorRef`, or a send — MUST capture it from
+  `Context::myself()` during the live phase and carry it in actor state
+  [#324]. Teardown that needs only identity captures nothing: the stop
+  context still exposes `incarnation()`, and `Incarnation::membership()`
+  is a process-wide unique key (§3.2, Appendix B.1). A panic in `on_stop`
+  is classified `Panicked` by the fallback report token, superseding the
+  run's outcome (§7).
 
 ### 4.2 One-shot is primitive; restartable is proven
 
@@ -3705,7 +3712,19 @@ the same series during shutdown drain; **Stop** = `StopContext<'_, A>` in
 | Re-entry/mapping: `for_actor` (same-`Msg`, core); `project` *(II §17)* | — | ✓ | ✓ | `for_actor` only |
 
 `StopContext` withholds everything that queues future work for this
-incarnation — there is no one left to deliver to, so `myself()` is absent.
+incarnation. `myself()` is in that set: `ActorRef<M>` is the send surface
+(`send` / `call`, and `Eq`/`Hash` by slot identity), intake is already
+frozen, and no callback remains to receive posted work. Absence is the
+contract, not a documented-don't-post on a still-present accessor [#324].
+Identity is not withheld with it. `incarnation()` remains, and
+`Incarnation::membership()` yields a process-wide unique `Copy` key —
+unlike scope-local `id()` — stable across restart and reborn on
+remove-and-re-add (§3.2, §3.4), so a `Membership`-keyed registry
+deregisters from `on_stop` with no capture at all; such a registry evicts
+by key equality, since the rebirth leaves `supersedes` incomparable
+across a re-add. Only an `ActorRef`-keyed map (B.8) or a teardown that
+must send needs `Context::myself()` captured while live and carried in
+actor state.
 
 ### B.2 `TaskContext`
 

@@ -136,9 +136,8 @@ async fn terminal_stop_paths_share_one_complete_observation_transition() {
 #[crate::runtime::test]
 async fn root_driver_panic_mid_drain_upgrades_to_the_join_monitor_verdict() {
     let scope = isolated_scope("root", ScopeFlavor::Ordered);
-    let epoch = scope
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
+    let epoch = ScopeEpochGuard::begin(&scope).expect("test scope epoch is available");
+    let epoch_id = epoch.epoch();
     scope
         .member
         .update(|record| record.stage = MemberStage::Running);
@@ -189,7 +188,7 @@ async fn root_driver_panic_mid_drain_upgrades_to_the_join_monitor_verdict() {
         "the unwind epilogue leaves root terminality to the join monitor"
     );
     assert!(
-        scope.settled(Some(epoch)),
+        scope.settled(Some(epoch_id)),
         "the unwind epilogue retires its epoch, so the join monitor must take \
          the no-live-epoch fallback this test is named for"
     );

@@ -36,33 +36,14 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
         .retention(Retention::Retain),
     )
     .expect("valid task");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
     root.member
         .update(|record| record.stage = MemberStage::Running);
     root.set_state_and_startup(ScopeState::Running, Ok(()));
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let member = Arc::clone(&child.slot.member);
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(root, epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_children(children)
-        .with_lifecycle(ScopeLifecycle::running())
-        .build();
-    plan.finish_transfer();
+    let key = fixture.children.keys().next().expect("one child plan");
+    let member = Arc::clone(&fixture.children[key].slot.member);
+    let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     scope.spawn_child(key);
     let active = scope.children[key]
@@ -300,32 +281,12 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
         TaskDef::new(|_| future::pending::<crate::ExitResult>()),
     )
     .expect("valid task");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
     root.set_state(ScopeState::Running);
     root.set_startup(Ok(()));
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
-        .with_lifecycle(ScopeLifecycle::running())
-        .build();
-    plan.finish_transfer();
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     scope.spawn_child(key);
     let active = scope.children[key]
@@ -372,32 +333,12 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
         TaskDef::new(|_| future::pending::<crate::ExitResult>()),
     )
     .expect("valid task");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
     root.set_state(ScopeState::Running);
     root.set_startup(Ok(()));
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
-    let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
-        .with_lifecycle(ScopeLifecycle::running())
-        .build();
-    plan.finish_transfer();
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     scope.spawn_child(key);
     let active = scope.children[key]
@@ -445,33 +386,9 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
     let second = tree
         .add_raw("second", crate::RawDef::factory(|| PendingRaw))
         .expect("valid second actor");
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let mut children = ChildArena::default();
-    plan.children.reverse();
-    while let Some(child) = plan.children.pop() {
-        children
-            .insert(ChildRuntime::from_plan(child, &root))
-            .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
-    }
-    let keys = children.keys().collect::<Vec<_>>();
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
-        .with_lifecycle(ScopeLifecycle::running())
-        .build();
-    plan.finish_transfer();
+    let fixture = OrderedScopeFixture::new(tree);
+    let keys = fixture.children.keys().collect::<Vec<_>>();
+    let (mut scope, _event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
 
     for key in &keys {
         scope.spawn_child(*key);
@@ -554,39 +471,17 @@ fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
         )
         .expect("unique child declaration");
     }
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let mut children = ChildArena::default();
-    plan.children.reverse();
-    while let Some(child) = plan.children.pop() {
-        children
-            .insert(ChildRuntime::from_plan(child, &root))
-            .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
-    }
+    let mut fixture = OrderedScopeFixture::new(tree);
     // Model restart-window children: no incarnation and no retained
     // construction remains, so forced terminalization completes inline.
     // This used to re-enter `stop_next_ordered` once per child.
-    for child in children.values_mut() {
+    for child in fixture.children.values_mut() {
         drop(child.construction.take());
     }
-    let mut scope = ScopeRuntimeBuilder::new(root, epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_intensity_policy(plan.intensity_policy())
-        .with_children(children)
+    let (mut scope, _event_receiver) = fixture
         .with_lifecycle(ScopeLifecycle::running())
         .with_hard_forced(true)
         .build();
-    plan.finish_transfer();
 
     scope.begin_drain(StopReason::ShutdownRequested);
 

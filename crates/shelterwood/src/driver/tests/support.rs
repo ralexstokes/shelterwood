@@ -19,10 +19,7 @@ pub(super) use crate::{
     ReadinessDeadline, RemoveOutcome, ReserveError, RestartCondition, RestartCount, RestartPolicy,
     Retention, ScopeRef, ScopeState, SendErrorKind, StartupError, StartupFailure,
     StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
-    engine::{
-        ChildKey, Effect as SupervisorEffect, Epoch, Event as SupervisorEvent, ScopeLifecycle,
-        StopLadder, SupervisorState, arbitrate, step as supervisor_step,
-    },
+    engine::{ChildKey, Epoch, Event as SupervisorEvent, ScopeLifecycle, StopLadder, arbitrate},
     exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
     mailbox::{MailboxCell, actor_ref_from_parts},
@@ -53,20 +50,45 @@ impl ObservedExit {
     }
 }
 
+pub(super) async fn recv_driver_event(
+    receiver: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    timeout: Duration,
+    expectation: &str,
+) -> DriverEvent {
+    match crate::runtime::timeout(timeout, receiver.recv()).await {
+        crate::runtime::Timeout::Completed(Some(event)) => event,
+        crate::runtime::Timeout::Completed(None) => {
+            panic!("event lane closed while waiting for {expectation}")
+        }
+        crate::runtime::Timeout::Elapsed => panic!("timed out waiting for {expectation}"),
+    }
+}
+
+pub(super) async fn recv_child_event(
+    receiver: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    timeout: Duration,
+    expectation: &str,
+) -> ChildEvent {
+    let DriverEvent::Child(event) = recv_driver_event(receiver, timeout, expectation).await else {
+        panic!("expected {expectation}")
+    };
+    event
+}
+
 pub(super) async fn recv_child_exit(
     receiver: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
     timeout: Duration,
     expectation: &str,
 ) -> ObservedExit {
-    match crate::runtime::timeout(timeout, receiver.recv()).await {
-        crate::runtime::Timeout::Completed(Some(DriverEvent::Child(ChildEvent::Exited {
+    match recv_child_event(receiver, timeout, expectation).await {
+        ChildEvent::Exited {
             child,
             incarnation,
             recorded,
             join,
             cancellation,
             readiness_signal_seen,
-        }))) => ObservedExit {
+        } => ObservedExit {
             child,
             incarnation,
             recorded,
@@ -74,17 +96,41 @@ pub(super) async fn recv_child_exit(
             cancellation,
             readiness_signal_seen,
         },
-        crate::runtime::Timeout::Completed(_) => panic!("expected {expectation}"),
-        crate::runtime::Timeout::Elapsed => panic!("timed out waiting for {expectation}"),
+        _ => panic!("expected {expectation}"),
     }
 }
 
+pub(super) async fn recv_removal(
+    receiver: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    timeout: Duration,
+    expectation: &str,
+) -> RemovalRequest {
+    let DriverEvent::Removal(removal) = recv_driver_event(receiver, timeout, expectation).await
+    else {
+        panic!("expected {expectation}")
+    };
+    removal
+}
+
+pub(super) async fn recv_construction_disposed(
+    receiver: &mut crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    timeout: Duration,
+    expectation: &str,
+) -> (ChildKey, Option<crate::runtime::DisposalPanic>) {
+    let ChildEvent::ConstructionDisposed { child, panic } =
+        recv_child_event(receiver, timeout, expectation).await
+    else {
+        panic!("expected {expectation}")
+    };
+    (child, panic)
+}
+
 pub(super) use super::super::{
-    AdmissionRequest, AncestorCommandLatches, ChildEvent, ChildResources, ChildRuntime,
-    ChildTerminality, DriverEvent, DynamicControl, DynamicEntry, DynamicReservation, GateCapture,
-    MemberCell, MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest,
-    RemovalResponses, ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent,
-    ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, StartupDisposition,
+    AdmissionRequest, AncestorCommandLatches, ChildEvent, ChildRuntime, ChildTerminality,
+    DriverEvent, DynamicControl, DynamicEntry, DynamicReservation, GateCapture, MemberCell,
+    MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
+    ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard, ScopeFlavor,
+    ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring, StartupDisposition,
     cancel_dynamic_reservation, discharge_child_terminality, events::collect_driver_events,
     monitor_root_driver, report_slot, reserve_dynamic, resident_projection, restart_shutdown_work,
     run_nested_factory, run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
@@ -110,6 +156,54 @@ pub(super) async fn begin_admission(
     (response, request)
 }
 
+pub(super) enum DynamicFixtureState {
+    Resident,
+    Removing,
+}
+
+pub(super) fn insert_dynamic_fixture(
+    scope: &mut ScopeRuntime,
+    control: &Arc<DynamicControl>,
+    id: impl Into<ChildId>,
+    construction: ChildConstruction,
+    prepare: impl FnOnce(&mut ChildRuntime),
+    state: DynamicFixtureState,
+) -> (DynamicReservation, ChildKey) {
+    let root = Arc::clone(&scope.root);
+    let reservation = reserve_dynamic(&root, id.into(), None)
+        .expect("running dynamic scope reserves the fixture child");
+    reservation.slot.define(construction);
+    let (definition, resolved) = reservation
+        .slot
+        .resolve_and_take_defined(&scope.defaults)
+        .expect("the fixture slot is defined");
+    let plan =
+        crate::plan::ChildPlan::with_options(Arc::clone(&reservation.slot), definition, resolved);
+    let mut child = ChildRuntime::from_plan(plan, &root);
+    prepare(&mut child);
+    let key = root.with_observation_gate(|txn| {
+        let key = scope
+            .insert_child(child, false)
+            .unwrap_or_else(|_| panic!("the fixture child-key domain is available"));
+        {
+            let mut dynamic = control.state.lock().expect("dynamic-state mutex poisoned");
+            let entry = dynamic
+                .entries
+                .get_mut(reservation.slot.member.id())
+                .expect("the fixture reservation remains registered");
+            entry.promote(key, None, txn);
+            if matches!(state, DynamicFixtureState::Removing) {
+                entry
+                    .mark_removing(txn)
+                    .expect("the promoted fixture resident transitions to Removing");
+            }
+        }
+        root.admit_child_locked(resident_projection(&reservation.slot), txn);
+        key
+    });
+    (reservation, key)
+}
+
 pub(super) struct ChildArena<T> {
     children: BTreeMap<ChildKey, T>,
     next: u64,
@@ -125,11 +219,11 @@ impl<T> Default for ChildArena<T> {
 }
 
 impl<T> ChildArena<T> {
-    pub(super) fn insert(&mut self, child: T) -> Result<ChildKey, Box<T>> {
+    pub(super) fn insert(&mut self, child: T) -> ChildKey {
         self.next += 1;
         let key = ChildKey::fixture(self.next);
         self.children.insert(key, child);
-        Ok(key)
+        key
     }
 
     pub(super) fn keys(&self) -> impl DoubleEndedIterator<Item = ChildKey> + '_ {
@@ -138,10 +232,6 @@ impl<T> ChildArena<T> {
 
     pub(super) fn values_mut(&mut self) -> impl Iterator<Item = &mut T> {
         self.children.values_mut()
-    }
-
-    pub(super) fn iter(&self) -> impl Iterator<Item = (ChildKey, &T)> {
-        self.children.iter().map(|(key, child)| (*key, child))
     }
 
     fn into_iter(self) -> impl Iterator<Item = (ChildKey, T)> {
@@ -165,10 +255,8 @@ impl<T> IndexMut<ChildKey> for ChildArena<T> {
 
 pub(super) struct ScopeRuntimeBuilder {
     root: Arc<ScopeCell>,
-    epoch: Epoch,
+    epoch: ScopeEpochGuard,
     events: crate::runtime::UnboundedMpscSender<DriverEvent>,
-    disposal_events: crate::runtime::UnboundedMpscSender<DriverEvent>,
-    disposal_event_receiver: crate::runtime::UnboundedMpscReceiver<DriverEvent>,
     defaults: ResolvedDefaults,
     intensity_policy: Intensity,
     children: ChildArena<ChildRuntime>,
@@ -176,21 +264,19 @@ pub(super) struct ScopeRuntimeBuilder {
     next_ordered_start: Option<Option<ChildKey>>,
     dynamic: Option<Arc<DynamicControl>>,
     hard_forced: bool,
+    transferred_plan: Option<crate::plan::ScopePlan>,
 }
 
 impl ScopeRuntimeBuilder {
     pub(super) fn new(
         root: Arc<ScopeCell>,
-        epoch: Epoch,
+        epoch: ScopeEpochGuard,
         events: crate::runtime::UnboundedMpscSender<DriverEvent>,
     ) -> Self {
-        let (disposal_events, disposal_event_receiver) = crate::runtime::unbounded_mpsc();
         Self {
             root,
             epoch,
             events,
-            disposal_events,
-            disposal_event_receiver,
             defaults: ResolvedDefaults::default(),
             intensity_policy: Intensity::default(),
             children: ChildArena::default(),
@@ -198,6 +284,7 @@ impl ScopeRuntimeBuilder {
             next_ordered_start: None,
             dynamic: None,
             hard_forced: false,
+            transferred_plan: None,
         }
     }
 
@@ -236,56 +323,104 @@ impl ScopeRuntimeBuilder {
         self
     }
 
+    pub(super) fn with_transferred_plan(mut self, plan: crate::plan::ScopePlan) -> Self {
+        self.transferred_plan = Some(plan);
+        self
+    }
+
     pub(super) fn build(self) -> ScopeRuntime {
-        let mut supervisor = SupervisorState::new(self.root.flavor, self.lifecycle);
-        let mut supervisor_effects = Vec::new();
-        let mut children = ChildResources::default();
-        for (expected, child) in self.children.into_iter() {
-            supervisor_step(
-                &mut supervisor,
-                SupervisorEvent::Admit {
-                    membership: child.slot.member.membership(),
-                    initial: true,
-                    start_immediately: false,
-                },
-                &mut supervisor_effects,
-            );
-            let Some(SupervisorEffect::Admitted { child: actual }) = supervisor_effects.pop()
-            else {
-                panic!("fixture admission produces one key")
-            };
-            assert_eq!(actual, expected);
-            children.insert(actual, child);
+        let scope = ScopeRuntime::for_test(
+            ScopeRuntimeTestWiring {
+                root: self.root,
+                defaults: self.defaults,
+                intensity_policy: self.intensity_policy,
+                children: self.children.into_iter().collect(),
+                lifecycle: self.lifecycle,
+                next_ordered_start: self.next_ordered_start,
+                events: self.events,
+                dynamic: self.dynamic,
+                hard_forced: self.hard_forced,
+            },
+            self.epoch,
+        );
+        if let Some(plan) = self.transferred_plan {
+            plan.finish_transfer();
         }
-        if let Some(next) = self.next_ordered_start {
-            supervisor.set_next_ordered_start_for_test(next);
+        scope.publish_initial_children();
+        scope
+    }
+}
+
+pub(super) struct OrderedScopeFixture {
+    pub(super) root: Arc<ScopeCell>,
+    pub(super) children: ChildArena<ChildRuntime>,
+    plan: crate::plan::ScopePlan,
+    epoch: ScopeEpochGuard,
+    events: crate::runtime::UnboundedMpscSender<DriverEvent>,
+    event_receiver: crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    lifecycle: ScopeLifecycle,
+    next_ordered_start: Option<Option<ChildKey>>,
+    hard_forced: bool,
+}
+
+impl OrderedScopeFixture {
+    pub(super) fn new(tree: Tree) -> Self {
+        let mut plan = tree.lower_for_test();
+        assert_eq!(plan.root.flavor, ScopeFlavor::Ordered);
+        let root = Arc::clone(&plan.root);
+        let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
+        let (events, event_receiver) = crate::runtime::unbounded_mpsc();
+        let mut children = ChildArena::default();
+        plan.children.reverse();
+        while let Some(child) = plan.children.pop() {
+            children.insert(ChildRuntime::from_plan(child, &root));
         }
-        supervisor.set_hard_forced_for_test(self.hard_forced);
-        ScopeRuntime {
-            root: self.root,
-            defaults: self.defaults,
-            intensity_policy: self.intensity_policy,
-            intensity: super::super::IntensityState::default(),
-            restart_shutdown_retries: Vec::new(),
+        Self {
+            root,
             children,
-            supervisor,
-            supervisor_effects,
-            events: self.events,
-            disposal_events: self.disposal_events,
-            disposal_event_receiver: self.disposal_event_receiver,
-            arrived_disposal_panics: BTreeMap::new(),
-            deadlines: super::super::DeadlineQueue::default(),
-            jitter: crate::runtime::JitterRng::new(),
-            role: ScopeRole::Root,
-            dynamic: self.dynamic,
-            pending_startup_removals: Vec::new(),
-            epoch: self.epoch,
-            ancestor_shutdown_seen: false,
-            ancestor_abort_seen: false,
-            completion: None,
-            finished: None,
-            retained_exits: Vec::new(),
+            plan,
+            epoch,
+            events,
+            event_receiver,
+            lifecycle: ScopeLifecycle::starting(),
+            next_ordered_start: None,
+            hard_forced: false,
         }
+    }
+
+    pub(super) fn with_lifecycle(mut self, lifecycle: ScopeLifecycle) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    pub(super) fn with_next_ordered_start(mut self, next: Option<ChildKey>) -> Self {
+        self.next_ordered_start = Some(next);
+        self
+    }
+
+    pub(super) fn with_hard_forced(mut self, hard_forced: bool) -> Self {
+        self.hard_forced = hard_forced;
+        self
+    }
+
+    pub(super) fn build(
+        self,
+    ) -> (
+        ScopeRuntime,
+        crate::runtime::UnboundedMpscReceiver<DriverEvent>,
+    ) {
+        let mut builder = ScopeRuntimeBuilder::new(Arc::clone(&self.root), self.epoch, self.events)
+            .with_defaults(self.plan.defaults.clone())
+            .with_intensity_policy(self.plan.intensity_policy())
+            .with_children(self.children)
+            .with_lifecycle(self.lifecycle)
+            .with_hard_forced(self.hard_forced)
+            .with_transferred_plan(self.plan);
+        if let Some(next) = self.next_ordered_start {
+            builder = builder.with_next_ordered_start(next);
+        }
+        let scope = builder.build();
+        (scope, self.event_receiver)
     }
 }
 
@@ -321,9 +456,7 @@ pub(super) fn running_dynamic_fixture() -> (
     Arc<DynamicControl>,
 ) {
     let root = isolated_scope("root", ScopeFlavor::Dynamic);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
     root.member
         .update(|record| record.stage = MemberStage::Running);
     root.set_state(ScopeState::Running);
@@ -332,8 +465,6 @@ pub(super) fn running_dynamic_fixture() -> (
     let (events, event_receiver) = crate::runtime::unbounded_mpsc();
     let (dynamic_events, dynamic_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(dynamic_events);
-    root.set_dynamic_route(Some(control.clone()));
-    root.set_admitted_children(Vec::new());
     let scope = ScopeRuntimeBuilder::new(root, epoch, events)
         .with_lifecycle(ScopeLifecycle::running())
         .with_dynamic(Some(control.clone()))

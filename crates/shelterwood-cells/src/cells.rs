@@ -30,9 +30,7 @@ use shelterwood_core::{
     identity::{AtomicPoisonedCounter, IncarnationCounter, MintedMembership, ScopeIdentity},
     policy::{ResolvedCommonOptions, ScopeFlavor},
 };
-use shelterwood_mailbox::{
-    ActorIdentity, MailboxControl, MailboxEffectSink, MailboxTermination,
-};
+use shelterwood_mailbox::{ActorIdentity, MailboxControl, MailboxEffectSink, MailboxTermination};
 use shelterwood_runtime::{self as runtime, Latch};
 
 use crate::{

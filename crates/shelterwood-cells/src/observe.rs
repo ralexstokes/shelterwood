@@ -87,12 +87,24 @@ struct RetainedLifecycleEvent {
 
 impl RetainedLifecycleEvent {
     fn new(event: LifecycleEvent) -> Self {
+        // Exhaustive with no wildcard arm on purpose: `LifecycleEventKind` is
+        // non-exhaustive for downstream crates but not here, so a new variant
+        // fails to compile until its retention is declared. A variant that
+        // carries an `Exit` and slipped through with no guard would let ring
+        // eviction drop a user error under the observation gate.
         let mut guards = Vec::new();
-        if let LifecycleEventKind::Exited { exit, .. } = &event.kind {
-            RetainedExit::retain_exit(&mut guards, exit);
-        }
-        if let LifecycleEventKind::ScopeState { state } = &event.kind {
-            RetainedExit::retain_scope_state(&mut guards, state);
+        match &event.kind {
+            LifecycleEventKind::Exited { exit, .. } => {
+                RetainedExit::retain_exit(&mut guards, exit);
+            }
+            LifecycleEventKind::ScopeState { state } => {
+                RetainedExit::retain_scope_state(&mut guards, state);
+            }
+            LifecycleEventKind::Added { .. }
+            | LifecycleEventKind::Started { .. }
+            | LifecycleEventKind::Ready { .. }
+            | LifecycleEventKind::RestartScheduled { .. }
+            | LifecycleEventKind::Removed { .. } => {}
         }
         Self {
             event,
@@ -102,10 +114,18 @@ impl RetainedLifecycleEvent {
 
     fn into_public(self) -> LifecycleEvent {
         let Self { event, guards } = self;
-        // A broadcast receive owns a clone of the retained wrapper. Moving the
-        // public event out first leaves its raw exits protected while this
-        // cloned guard allocation is released as refcount traffic.
-        drop(guards);
+        // The public event owns a raw clone corresponding to every guard, so
+        // retiring these copies inline is provably refcount-only. Unwrapping
+        // the guard allocation first matters: a broadcast receive is often the
+        // last owner, and letting the arc drop the guards would route a live
+        // user error through isolated disposal for nothing.
+        let guards = match Arc::try_unwrap(guards) {
+            Ok(guards) => guards,
+            Err(shared) => shared.as_ref().clone(),
+        };
+        for guard in guards {
+            drop(guard.into_exit());
+        }
         event
     }
 }

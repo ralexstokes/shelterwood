@@ -2,7 +2,7 @@ mod common;
 
 use std::time::Duration;
 
-use crate::common::LiveFlag;
+use crate::common::{LiveFlag, assert_eventually};
 use shelterwood::{
     BuildError, Cancellation, DynamicTree, Exit, ExitError, ExitKind, GracePhase, PolicyError,
     Readiness, ReadinessDeadline, RemoveOutcome, ReserveError, Shutdown, StopReason, TaskDef,
@@ -325,13 +325,7 @@ async fn dropping_the_owner_requests_cooperative_shutdown() {
     assert_eq!(exit.cancellation(), Cancellation::Observed);
     assert!(matches!(exit.kind(), ExitKind::Completed));
     assert_eq!(completion.wait().await, Ok(()));
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while live.is_live() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("task future dropped");
+    assert_eventually!(|| !live.is_live(), "task future dropped").await;
 }
 
 #[tokio::test]

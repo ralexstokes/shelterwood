@@ -8,11 +8,11 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, assert_eventually, assert_quiet, poll_until};
+use crate::common::{ReleaseGate, assert_eventually, assert_quiet, next_event, poll_until};
 use shelterwood::{
     Actor, ActorOnceDef, Cancellation, Context, Exit, ExitError, ExitKind, ExitResult, GracePhase,
-    LifecycleEventKind, LifecycleEvents, LifecycleItem, Mailbox, MailboxShutdown, SendErrorKind,
-    Shutdown, StopContext, Tree,
+    LifecycleEventKind, LifecycleEvents, Mailbox, MailboxShutdown, SendErrorKind, Shutdown,
+    StopContext, Tree,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -363,15 +363,13 @@ struct FaultOutcome {
 }
 
 async fn exited_actor(events: &mut LifecycleEvents) -> Exit {
-    while let Some(item) = events.recv().await {
-        if let LifecycleItem::Event(event) = item
-            && let LifecycleEventKind::Exited { id, exit, .. } = event.kind
+    loop {
+        if let LifecycleEventKind::Exited { id, exit, .. } = next_event(events).await.kind
             && id.as_str() == "actor"
         {
             return exit;
         }
     }
-    panic!("actor exit must precede lifecycle closure");
 }
 
 async fn run_fault_fixture(

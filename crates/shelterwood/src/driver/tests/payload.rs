@@ -32,27 +32,17 @@ fn one_shot_raw_scope(
     let mut plan = tree.lower_for_test();
     let root = Arc::clone(&plan.root);
     let member = Arc::clone(&plan.children[0].slot.member);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("the test scope has a live epoch");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
+    let epoch = ScopeEpochGuard::begin(&root).expect("the test scope has a live epoch");
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
-    let key = children
-        .insert(child)
-        .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
+    let key = children.insert(child);
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
     let scope = ScopeRuntimeBuilder::new(root, epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_lifecycle(ScopeLifecycle::running())
         .with_children(children)
+        .with_transferred_plan(plan)
         .build();
-    plan.finish_transfer();
     (scope, key, member, actor)
 }
 

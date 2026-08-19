@@ -18,7 +18,7 @@ mod storage;
 
 use storage::Obligation;
 
-use child::ChildRuntime;
+use child::{ChildRuntime, fire_shutdown_edges};
 #[cfg(test)]
 use child::{ChildTerminality, discharge_child_terminality, report_slot};
 use events::{
@@ -57,7 +57,7 @@ use crate::{
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
     },
-    policy::{DefaultsInheritance, ResolvedDefaults, ScopeFlavor},
+    policy::{DefaultsInheritance, Intensity, ResolvedDefaults, ScopeFlavor},
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
     runtime::{self, CompletionGatedLatch, Latch},
     task::{TaskContext, TaskContextLatches, TaskFactory},
@@ -169,13 +169,14 @@ fn monitor_root_driver(
 }
 
 struct AncestorCommandLatches {
-    shutdown: Latch,
+    framework_shutdown: Latch,
     abort: Latch,
     abort_ack: Latch,
 }
 
 struct NestedScopeLatches {
     parent_ready: CompletionGatedLatch,
+    child_shutdown: Latch,
     ancestor: AncestorCommandLatches,
 }
 
@@ -248,6 +249,32 @@ struct ScopeRuntime {
     // a child's raw Exit. Their fields retire before these guards detach the
     // corresponding failed payloads.
     retained_exits: Vec<RetainedExit>,
+}
+
+struct ScopeRuntimeWiring {
+    root: Arc<ScopeCell>,
+    defaults: ResolvedDefaults,
+    intensity_policy: Intensity,
+    children: ChildResources<ChildRuntime>,
+    supervisor: SupervisorState,
+    events: runtime::UnboundedMpscSender<DriverEvent>,
+    disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
+    disposal_event_receiver: runtime::UnboundedMpscReceiver<DriverEvent>,
+    role: ScopeRole,
+    dynamic: Option<Arc<DynamicControl>>,
+}
+
+#[cfg(test)]
+struct ScopeRuntimeTestWiring {
+    root: Arc<ScopeCell>,
+    defaults: ResolvedDefaults,
+    intensity_policy: Intensity,
+    children: Vec<(ChildKey, ChildRuntime)>,
+    lifecycle: ScopeLifecycle,
+    next_ordered_start: Option<Option<ChildKey>>,
+    events: runtime::UnboundedMpscSender<DriverEvent>,
+    dynamic: Option<Arc<DynamicControl>>,
+    hard_forced: bool,
 }
 
 struct ChildResources<T>(BTreeMap<ChildKey, T>);
@@ -367,7 +394,7 @@ impl Drop for ScopeRuntime {
                     }
                 }
                 panics.run(|| {
-                    active.shutdown.fire();
+                    fire_shutdown_edges(&active.shutdown, active.framework_shutdown.as_ref());
                 });
                 panics.run(|| {
                     active.abort.fire();
@@ -408,6 +435,100 @@ impl Drop for ScopeRuntime {
 }
 
 impl ScopeRuntime {
+    fn new(wiring: ScopeRuntimeWiring, epoch: ScopeEpochGuard) -> Self {
+        Self {
+            root: wiring.root,
+            defaults: wiring.defaults,
+            intensity_policy: wiring.intensity_policy,
+            intensity: IntensityState::default(),
+            children: wiring.children,
+            supervisor: wiring.supervisor,
+            supervisor_effects: Vec::new(),
+            restart_shutdown_retries: Vec::new(),
+            events: wiring.events,
+            disposal_events: wiring.disposal_events,
+            disposal_event_receiver: wiring.disposal_event_receiver,
+            arrived_disposal_panics: BTreeMap::new(),
+            deadlines: DeadlineQueue::default(),
+            jitter: runtime::JitterRng::new(),
+            role: wiring.role,
+            dynamic: wiring.dynamic,
+            pending_startup_removals: Vec::new(),
+            ancestor_shutdown_seen: false,
+            ancestor_abort_seen: false,
+            completion: None,
+            finished: None,
+            retained_exits: Vec::new(),
+            // Transfer last: every fallible setup expression above remains
+            // covered by the pre-driver guard, and completed construction
+            // moves the raw epoch directly into ScopeRuntime's synchronous
+            // epilogue.
+            epoch: epoch.transfer(),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(wiring: ScopeRuntimeTestWiring, epoch: ScopeEpochGuard) -> Self {
+        let mut supervisor = SupervisorState::new(wiring.root.flavor, wiring.lifecycle);
+        let mut children = ChildResources::default();
+        for (expected, child) in wiring.children {
+            let Some(actual) =
+                supervisor_admit(&mut supervisor, child.slot.member.membership(), true)
+            else {
+                panic!("fixture admission produces one key")
+            };
+            assert_eq!(actual, expected);
+            let replaced = children.insert(actual, child);
+            assert!(replaced.is_none(), "fixture child keys are unique");
+        }
+        if let Some(next) = wiring.next_ordered_start {
+            supervisor.set_next_ordered_start_for_test(next);
+        }
+        supervisor.set_hard_forced_for_test(wiring.hard_forced);
+        if let Some(control) = &wiring.dynamic {
+            wiring.root.with_observation_gate(|txn| {
+                control
+                    .register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
+            });
+        }
+        let (disposal_events, disposal_event_receiver) = runtime::unbounded_mpsc();
+        Self::new(
+            ScopeRuntimeWiring {
+                root: wiring.root,
+                defaults: wiring.defaults,
+                intensity_policy: wiring.intensity_policy,
+                children,
+                supervisor,
+                events: wiring.events,
+                disposal_events,
+                disposal_event_receiver,
+                role: ScopeRole::Root,
+                dynamic: wiring.dynamic,
+            },
+            epoch,
+        )
+    }
+
+    fn publish_initial_children(&self) {
+        // ScopeRuntime owns teardown before the route becomes public. If
+        // either route notification or initial-child publication unwinds, its
+        // epilogue closes dynamic state, terminalizes every child, and clears
+        // any resident prefix. Install the fully keyed route before publishing
+        // Added so a synchronous observer never sees membership without its
+        // control plane.
+        if let Some(control) = &self.dynamic {
+            self.root.set_dynamic_route(Some(control.clone()));
+        }
+        self.root.set_admitted_children(
+            self.children
+                .values()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        );
+        #[cfg(test)]
+        self.record_storage();
+    }
+
     /// Moves the payload of every construction-disposal completion in a
     /// collected batch onto the scope.
     ///
@@ -805,15 +926,19 @@ async fn run_nested_tree_with_epoch(
             // The ancestor *abort* latch needs no separate arm: it is the
             // framework-abort edge, fired only by `StopAction::AbortFramework`,
             // and the stop ladder unconditionally passes through
-            // `StopAction::Cancel` — which fires this same ancestor shutdown
+            // `StopAction::Cancel` — which fires this same framework shutdown
             // latch — before it can reach that phase.
-            if scope.has_stop_request(epoch.epoch()) || latches.ancestor.shutdown.is_fired() {
+            let self_shutdown = scope.has_stop_request(epoch.epoch());
+            if self_shutdown || latches.ancestor.framework_shutdown.is_fired() {
                 // Mirror the loop's `Pending::Shutdown` arm: firing the
-                // ancestor shutdown latch is what makes this scope's exit read
+                // child-facing shutdown latch is what makes this scope's exit read
                 // `Cancellation::Observed` at its parent, as a requested stop
-                // must (§11). The latch is level-triggered, so re-firing an
-                // ancestor-driven stop is a no-op.
-                latches.ancestor.shutdown.fire();
+                // must (§11). An ancestor-driven stop already fired that latch
+                // independently; do not couple its framework observer back to
+                // user-installable cancellation waiters.
+                if self_shutdown {
+                    latches.child_shutdown.fire();
+                }
                 epoch.lifecycle.begin_drain(StopReason::ShutdownRequested);
             }
             // Both drain effects are deliberately discarded: this path
@@ -919,53 +1044,23 @@ async fn run_scope_incarnation(
             control.register_initial(children.iter().map(|(key, child)| (&child.slot, key)), txn);
         });
     }
-    let mut scope = ScopeRuntime {
-        root: Arc::clone(&root),
-        defaults: plan.defaults.clone(),
-        intensity_policy: plan.intensity_policy(),
-        intensity: IntensityState::default(),
-        children,
-        supervisor,
-        supervisor_effects: Vec::new(),
-        restart_shutdown_retries: Vec::new(),
-        events,
-        disposal_events,
-        disposal_event_receiver,
-        arrived_disposal_panics: BTreeMap::new(),
-        deadlines: DeadlineQueue::default(),
-        jitter: runtime::JitterRng::new(),
-        role,
-        dynamic,
-        pending_startup_removals: Vec::new(),
-        ancestor_shutdown_seen: false,
-        ancestor_abort_seen: false,
-        completion: None,
-        finished: None,
-        retained_exits: Vec::new(),
-        // Transfer last: every fallible setup expression above remains
-        // covered by the pre-driver guard, and completed construction moves
-        // the raw epoch directly into ScopeRuntime's synchronous epilogue.
-        epoch: epoch.transfer(),
-    };
-    plan.finish_transfer();
-
-    // ScopeRuntime owns teardown before the route becomes public. If either
-    // route notification or initial-child publication unwinds, its epilogue
-    // closes dynamic state, terminalizes every child, and clears any resident
-    // prefix. Install the fully keyed route before publishing Added so a
-    // synchronous observer never sees membership without its control plane.
-    if let Some(control) = &scope.dynamic {
-        scope.root.set_dynamic_route(Some(control.clone()));
-    }
-    scope.root.set_admitted_children(
-        scope
-            .children
-            .values()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
+    let mut scope = ScopeRuntime::new(
+        ScopeRuntimeWiring {
+            root: Arc::clone(&root),
+            defaults: plan.defaults.clone(),
+            intensity_policy: plan.intensity_policy(),
+            children,
+            supervisor,
+            events,
+            disposal_events,
+            disposal_event_receiver,
+            role,
+            dynamic,
+        },
+        epoch,
     );
-    #[cfg(test)]
-    scope.record_storage();
+    plan.finish_transfer();
+    scope.publish_initial_children();
 
     scope.settle_supervisor();
 
@@ -990,7 +1085,7 @@ async fn run_scope_incarnation(
             && scope
                 .role
                 .ancestor()
-                .is_some_and(|latches| latches.shutdown.is_fired())
+                .is_some_and(|latches| latches.framework_shutdown.is_fired())
         {
             scope.ancestor_shutdown_seen = true;
             pending.push(Pending::AncestorShutdown.classified());
@@ -1028,7 +1123,7 @@ async fn run_scope_incarnation(
                 .role
                 .ancestor()
                 .filter(|_| !scope.ancestor_shutdown_seen)
-                .map(|latches| latches.shutdown.clone());
+                .map(|latches| latches.framework_shutdown.clone());
             let ancestor_abort = scope
                 .role
                 .ancestor()
@@ -1091,8 +1186,8 @@ async fn run_scope_incarnation(
         for (_, event) in pending.drain(..) {
             match event {
                 Pending::Shutdown => {
-                    if let Some(latches) = scope.role.ancestor() {
-                        latches.shutdown.fire();
+                    if let ScopeRole::Nested(nested) = &scope.role {
+                        nested.child_shutdown.fire();
                         scope.ancestor_shutdown_seen = true;
                     }
                     scope.begin_drain(StopReason::ShutdownRequested);

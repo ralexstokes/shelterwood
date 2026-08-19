@@ -130,6 +130,8 @@ impl Deadline {
 mod tests {
     use std::time::{Duration, Instant};
 
+    use crate::test_support::latest_representable;
+
     use super::{Deadline, DeadlineBudget};
 
     #[test]
@@ -141,21 +143,6 @@ mod tests {
             expires.is_due(started_at),
             "the poll-once surfaces read their zero budget through this rule"
         );
-    }
-
-    fn latest_representable(started_at: Instant) -> Instant {
-        let mut low = Duration::ZERO;
-        let mut high = Duration::MAX;
-        assert!(started_at.checked_add(high).is_none());
-        while high - low > Duration::from_nanos(1) {
-            let mid = low + (high - low) / 2;
-            if started_at.checked_add(mid).is_some() {
-                low = mid;
-            } else {
-                high = mid;
-            }
-        }
-        started_at + low
     }
 
     #[test]

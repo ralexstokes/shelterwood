@@ -10,13 +10,13 @@ use std::{
 };
 
 use crate::common::{
-    ReleaseGate, advance_time, assert_eventually, assert_quiet, poll_once,
-    waiting::task as waiting_task,
+    GatedRecorder, MessageRecorder, ReleaseGate, advance_time, assert_eventually, assert_quiet,
+    poll_once, waiting::task as waiting_task,
 };
 use shelterwood::{
-    Backoff, CallErrorKind, ChildState, ExitError, ExitResult, Jitter, Mailbox, RawActor,
-    RawContext, RawOnceDef, Readiness, ReadinessDeadline, Reply, ReplyError, RestartCondition,
-    RestartPolicy, SendErrorKind, Shutdown, TaskDef, Tree,
+    Backoff, CallErrorKind, ChildState, ExitError, ExitResult, Jitter, Mailbox, RawOnceDef,
+    Readiness, ReadinessDeadline, Reply, ReplyError, RestartCondition, RestartPolicy,
+    SendErrorKind, Shutdown, TaskDef, Tree,
 };
 
 #[derive(Debug)]
@@ -26,7 +26,6 @@ enum Message {
 }
 
 struct BoundaryActor {
-    gate: Option<ReleaseGate>,
     call_seen: Option<ReleaseGate>,
     values: Arc<Mutex<Vec<usize>>>,
     calls: Arc<AtomicUsize>,
@@ -42,34 +41,28 @@ impl Drop for DropFlag {
     }
 }
 
-impl RawActor for BoundaryActor {
-    type Msg = Message;
+impl MessageRecorder for BoundaryActor {
+    type Message = Message;
 
-    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
-        if let Some(gate) = self.gate.take() {
-            gate.wait().await;
-        }
-        while let Some(message) = context.recv().await {
-            match message {
-                Message::Value(value) => self
-                    .values
-                    .lock()
-                    .expect("values mutex poisoned")
-                    .push(value),
-                Message::Ask(reply) => {
-                    self.calls.fetch_add(1, Ordering::SeqCst);
-                    if let Some(call_seen) = &self.call_seen {
-                        call_seen.release();
-                    }
-                    if self.hold_reply {
-                        self.held = Some(reply);
-                    } else {
-                        reply.send(17);
-                    }
+    fn record(&mut self, message: Message) {
+        match message {
+            Message::Value(value) => self
+                .values
+                .lock()
+                .expect("values mutex poisoned")
+                .push(value),
+            Message::Ask(reply) => {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(call_seen) = &self.call_seen {
+                    call_seen.release();
+                }
+                if self.hold_reply {
+                    self.held = Some(reply);
+                } else {
+                    reply.send(17);
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -78,15 +71,27 @@ fn boundary_actor(
     values: &Arc<Mutex<Vec<usize>>>,
     calls: &Arc<AtomicUsize>,
     hold_reply: bool,
-) -> BoundaryActor {
-    BoundaryActor {
+) -> GatedRecorder<BoundaryActor> {
+    boundary_actor_with_call_seen(gate, values, calls, hold_reply, None)
+}
+
+fn boundary_actor_with_call_seen(
+    gate: Option<ReleaseGate>,
+    values: &Arc<Mutex<Vec<usize>>>,
+    calls: &Arc<AtomicUsize>,
+    hold_reply: bool,
+    call_seen: Option<ReleaseGate>,
+) -> GatedRecorder<BoundaryActor> {
+    GatedRecorder::new(
         gate,
-        call_seen: None,
-        values: Arc::clone(values),
-        calls: Arc::clone(calls),
-        hold_reply,
-        held: None,
-    }
+        BoundaryActor {
+            call_seen,
+            values: Arc::clone(values),
+            calls: Arc::clone(calls),
+            hold_reply,
+            held: None,
+        },
+    )
 }
 
 #[tokio::test(start_paused = true)]
@@ -357,8 +362,13 @@ async fn call_uses_one_budget_across_acceptance_and_response() {
     let values = Arc::new(Mutex::new(Vec::new()));
     let calls = Arc::new(AtomicUsize::new(0));
     let mut tree = Tree::new();
-    let mut definition = boundary_actor(Some(gate.clone()), &values, &calls, true);
-    definition.call_seen = Some(call_seen.clone());
+    let definition = boundary_actor_with_call_seen(
+        Some(gate.clone()),
+        &values,
+        &calls,
+        true,
+        Some(call_seen.clone()),
+    );
     let actor = tree
         .add_raw_once(
             "one-budget",

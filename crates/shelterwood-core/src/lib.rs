@@ -14,6 +14,8 @@ pub mod identity;
 pub mod panic;
 pub mod policy;
 pub mod supervisor;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_support;
 
 pub use deadline::*;
 pub use engine::{MembershipStatus, ScopeState};

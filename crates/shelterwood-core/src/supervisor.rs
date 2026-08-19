@@ -2,8 +2,8 @@
 //!
 //! Runtime adapters sample latches and clocks before constructing an
 //! [`Event`]. The reducer owns membership, startup, and ordered-stop state and
-//! emits commands through an [`EffectSink`]; it never runs user code, reads a
-//! clock, samples randomness, or performs I/O.
+//! appends commands to a caller-owned effect vector; it never runs user code,
+//! reads a clock, samples randomness, or performs I/O.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -140,7 +140,6 @@ pub enum Event {
     Admit {
         membership: Membership,
         initial: bool,
-        start_immediately: bool,
     },
     Spawned {
         child: ChildKey,
@@ -188,45 +187,12 @@ pub enum Event {
 /// A command for the runtime shell or observation projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect {
-    Admitted {
-        child: ChildKey,
-    },
-    StartChild {
-        child: ChildKey,
-    },
-    StopChild {
-        child: ChildKey,
-    },
-    ForceChild {
-        child: ChildKey,
-    },
-    FinalizeRemoval {
-        child: ChildKey,
-    },
-    StartupCompleted {
-        state: ScopeState,
-    },
-    StartupFailed {
-        state: ScopeState,
-    },
-    DrainStarted {
-        state: ScopeState,
-        startup_pending: bool,
-    },
-    Finished {
-        reason: StopReason,
-    },
-}
-
-/// Destination for effects emitted synchronously by [`step`].
-pub trait EffectSink {
-    fn push(&mut self, effect: Effect);
-}
-
-impl EffectSink for Vec<Effect> {
-    fn push(&mut self, effect: Effect) {
-        Vec::push(self, effect);
-    }
+    StartChild { child: ChildKey },
+    StopChild { child: ChildKey },
+    ForceChild { child: ChildKey },
+    FinalizeRemoval { child: ChildKey },
+    StartupCompleted { state: ScopeState },
+    Finished { reason: StopReason },
 }
 
 /// Authoritative structural state for one scope incarnation.
@@ -385,19 +351,11 @@ impl SupervisorState {
         Some(record.state.incarnation())
     }
 
-    fn admit(
-        &mut self,
-        membership: Membership,
-        initial: bool,
-        start_immediately: bool,
-        effects: &mut impl EffectSink,
-    ) {
+    fn admit(&mut self, membership: Membership, initial: bool) -> Option<ChildKey> {
         if self.child_keys.contains_key(&membership) {
-            return;
+            return None;
         }
-        let Some(raw) = self.keys.mint() else {
-            return;
-        };
+        let raw = self.keys.mint()?;
         let child = ChildKey(raw);
         let replaced = self.children.insert(
             child,
@@ -421,13 +379,10 @@ impl SupervisorState {
         if initial && self.flavor == ScopeFlavor::Ordered && self.next_ordered_start.is_none() {
             self.next_ordered_start = Some(child);
         }
-        effects.push(Effect::Admitted { child });
-        if start_immediately && !self.lifecycle.is_draining() && !self.lifecycle.startup_failed() {
-            effects.push(Effect::StartChild { child });
-        }
+        Some(child)
     }
 
-    fn settle_startup(&mut self, effects: &mut impl EffectSink) {
+    fn settle_startup(&mut self, effects: &mut Vec<Effect>) {
         if !self.lifecycle.is_starting() {
             return;
         }
@@ -487,14 +442,16 @@ impl SupervisorState {
         }
     }
 
-    fn begin_drain(&mut self, reason: StopReason, effects: &mut impl EffectSink) {
-        let Some((startup_pending, state)) = self.lifecycle.begin_drain(reason) else {
-            return;
-        };
-        effects.push(Effect::DrainStarted {
-            state,
-            startup_pending,
-        });
+    fn fail_startup(&mut self) -> Option<ScopeState> {
+        self.lifecycle.fail_startup()
+    }
+
+    fn begin_drain(
+        &mut self,
+        reason: StopReason,
+        effects: &mut Vec<Effect>,
+    ) -> Option<(bool, ScopeState)> {
+        let effect = self.lifecycle.begin_drain(reason)?;
         match self.flavor {
             ScopeFlavor::Ordered => {
                 self.ordered_stop_cursor = self.children.keys().next_back().copied();
@@ -507,9 +464,21 @@ impl SupervisorState {
                 }
             }
         }
+        Some(effect)
     }
 
-    fn settle_ordered_stop(&mut self, effects: &mut impl EffectSink) {
+    fn force(&mut self, effects: &mut Vec<Effect>) -> Option<(bool, ScopeState)> {
+        self.hard_forced = true;
+        let drain = self.begin_drain(StopReason::ShutdownRequested, effects);
+        for child in self.children.keys().copied() {
+            if !self.children[&child].state.joined() {
+                effects.push(Effect::ForceChild { child });
+            }
+        }
+        drain
+    }
+
+    fn settle_ordered_stop(&mut self, effects: &mut Vec<Effect>) {
         if self.flavor != ScopeFlavor::Ordered || !self.lifecycle.is_draining() {
             return;
         }
@@ -534,7 +503,7 @@ impl SupervisorState {
         }
     }
 
-    fn settle_finish(&mut self, effects: &mut impl EffectSink) {
+    fn settle_finish(&mut self, effects: &mut Vec<Effect>) {
         if self.finish_emitted {
             return;
         }
@@ -551,13 +520,14 @@ impl SupervisorState {
         }
     }
 
-    fn apply(&mut self, event: Event, effects: &mut impl EffectSink) {
+    fn apply(&mut self, event: Event, effects: &mut Vec<Effect>) {
         match event {
             Event::Admit {
                 membership,
                 initial,
-                start_immediately,
-            } => self.admit(membership, initial, start_immediately, effects),
+            } => {
+                let _ = self.admit(membership, initial);
+            }
             Event::Spawned { child } => {
                 if let Some(record) = self.children.get_mut(&child)
                     && matches!(record.state, ChildState::Resident(_))
@@ -672,19 +642,13 @@ impl SupervisorState {
                 debug_assert_eq!(removed, Some(child));
             }
             Event::FailStartup => {
-                if let Some(state) = self.lifecycle.fail_startup() {
-                    effects.push(Effect::StartupFailed { state });
-                }
+                let _ = self.fail_startup();
             }
-            Event::BeginDrain { reason } => self.begin_drain(reason, effects),
+            Event::BeginDrain { reason } => {
+                let _ = self.begin_drain(reason, effects);
+            }
             Event::Force => {
-                self.hard_forced = true;
-                self.begin_drain(StopReason::ShutdownRequested, effects);
-                for child in self.children.keys().copied() {
-                    if !self.children[&child].state.joined() {
-                        effects.push(Effect::ForceChild { child });
-                    }
-                }
+                let _ = self.force(effects);
             }
             Event::Settle => {
                 self.settle_startup(effects);
@@ -745,8 +709,39 @@ impl SupervisorState {
 }
 
 /// Applies one total transition to [`SupervisorState`].
-pub fn step(state: &mut SupervisorState, event: Event, effects: &mut impl EffectSink) {
+pub fn step(state: &mut SupervisorState, event: Event, effects: &mut Vec<Effect>) {
     state.apply(event, effects);
+}
+
+/// Admits one membership and returns its never-reused registration key.
+///
+/// Admission policy lives in the runtime facade. This structural operation
+/// rejects only a duplicate live membership or an exhausted key domain.
+pub fn admit(
+    state: &mut SupervisorState,
+    membership: Membership,
+    initial: bool,
+) -> Option<ChildKey> {
+    state.admit(membership, initial)
+}
+
+/// Records the first startup failure and returns the state its owner must publish.
+pub fn fail_startup(state: &mut SupervisorState) -> Option<ScopeState> {
+    state.fail_startup()
+}
+
+/// Begins a drain and returns the transition its owner must publish.
+pub fn begin_drain(
+    state: &mut SupervisorState,
+    reason: StopReason,
+    effects: &mut Vec<Effect>,
+) -> Option<(bool, ScopeState)> {
+    state.begin_drain(reason, effects)
+}
+
+/// Hard-forces all incomplete children and returns a newly entered drain.
+pub fn force(state: &mut SupervisorState, effects: &mut Vec<Effect>) -> Option<(bool, ScopeState)> {
+    state.force(effects)
 }
 
 #[cfg(test)]
@@ -771,20 +766,7 @@ mod tests {
     }
 
     fn admit(state: &mut SupervisorState, membership: Membership, initial: bool) -> ChildKey {
-        let mut effects = Vec::new();
-        step(
-            state,
-            Event::Admit {
-                membership,
-                initial,
-                start_immediately: false,
-            },
-            &mut effects,
-        );
-        let [Effect::Admitted { child }] = effects.as_slice() else {
-            panic!("admission emits exactly one key")
-        };
-        *child
+        super::admit(state, membership, initial).expect("fixture admission mints one key")
     }
 
     #[test]
@@ -1077,15 +1059,15 @@ mod tests {
         }
 
         let mut effects = Vec::new();
-        step(
-            &mut state,
-            Event::BeginDrain {
-                reason: StopReason::ShutdownRequested,
-            },
-            &mut effects,
+        let (startup_pending, drain_state) =
+            super::begin_drain(&mut state, StopReason::ShutdownRequested, &mut effects)
+                .expect("the first drain returns its publication result");
+        assert_eq!(drain_state, ScopeState::Draining);
+        assert!(!startup_pending);
+        assert!(
+            effects.is_empty(),
+            "an ordered drain exposes its first stop through settlement"
         );
-        assert!(matches!(effects.as_slice(), [Effect::DrainStarted { .. }]));
-        effects.clear();
 
         for &expected in keys.iter().rev() {
             step(&mut state, Event::Settle, &mut effects);
@@ -1124,6 +1106,53 @@ mod tests {
     }
 
     #[test]
+    fn transition_owner_results_are_separate_from_commands() {
+        let members = memberships(2);
+
+        let mut failed = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::starting());
+        assert_eq!(
+            super::fail_startup(&mut failed),
+            Some(ScopeState::StartupFailed)
+        );
+        assert_eq!(
+            super::fail_startup(&mut failed),
+            None,
+            "only the winning startup failure publishes the transition"
+        );
+
+        let mut draining = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::starting());
+        let child = admit(&mut draining, members[0], true);
+        let mut effects = Vec::new();
+        let (startup_pending, drain_state) =
+            super::begin_drain(&mut draining, StopReason::ShutdownRequested, &mut effects)
+                .expect("the first drain returns its publication result");
+        assert_eq!(drain_state, ScopeState::Draining);
+        assert!(startup_pending);
+        assert_eq!(effects, [Effect::StopChild { child }]);
+        effects.clear();
+        assert!(
+            super::begin_drain(&mut draining, StopReason::ShutdownRequested, &mut effects,)
+                .is_none(),
+            "a drain upgrade does not republish its entry result"
+        );
+        assert!(effects.is_empty());
+
+        let mut forced = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::running());
+        let child = admit(&mut forced, members[1], false);
+        let (startup_pending, drain_state) = super::force(&mut forced, &mut effects)
+            .expect("forcing a live scope returns its initial drain");
+        assert_eq!(drain_state, ScopeState::Draining);
+        assert!(!startup_pending);
+        assert_eq!(
+            effects,
+            [Effect::StopChild { child }, Effect::ForceChild { child }]
+        );
+        effects.clear();
+        assert!(super::force(&mut forced, &mut effects).is_none());
+        assert_eq!(effects, [Effect::ForceChild { child }]);
+    }
+
+    #[test]
     fn registration_keys_are_monotonic_and_exhaustion_is_fail_closed() {
         let members = memberships(4);
         let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::running());
@@ -1145,29 +1174,10 @@ mod tests {
         state.keys = PoisonedCounter::near_exhaustion();
         let last = admit(&mut state, members[2], false);
         assert_eq!(last, ChildKey(u64::MAX - 1));
-        let mut effects = Vec::new();
-        step(
-            &mut state,
-            Event::Admit {
-                membership: members[3],
-                initial: false,
-                start_immediately: false,
-            },
-            &mut effects,
-        );
-        assert!(effects.is_empty());
+        assert_eq!(super::admit(&mut state, members[3], false), None);
         assert_eq!(state.key_for(members[3]), None);
-        step(
-            &mut state,
-            Event::Admit {
-                membership: members[3],
-                initial: false,
-                start_immediately: false,
-            },
-            &mut effects,
-        );
         assert!(
-            effects.is_empty(),
+            super::admit(&mut state, members[3], false).is_none(),
             "poisoned exhaustion remains fail closed"
         );
         state.check_invariants();
@@ -1179,12 +1189,12 @@ mod tests {
         let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::running());
         let child = admit(&mut state, membership, false);
         let mut effects = Vec::new();
+        assert_eq!(super::admit(&mut state, membership, false), None);
         step(
             &mut state,
             Event::Admit {
                 membership,
                 initial: false,
-                start_immediately: true,
             },
             &mut effects,
         );

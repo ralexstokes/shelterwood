@@ -219,9 +219,9 @@ normative so that "pure" is not misread into pessimization:
 
 - `step` MAY take `&mut State` — pure means no I/O, clocks, randomness, or
   awaits; it does not mean persistent data structures or defensive clones.
-- Effects MAY flow through a sink (`step(&mut state, event, &mut impl
-  EffectSink)`) rather than a returned `Vec` — tests pass a `Vec`,
-  production passes an inline executor; hot steps allocate nothing.
+- Effects MAY flow through a caller-owned buffer
+  (`step(&mut state, event, &mut Vec<Effect>)`) rather than a returned `Vec`;
+  tests and production can reuse that buffer, so hot steps allocate nothing.
 - The actor loop's next-action decision is a small `Copy` enum, not a
   boxed plan.
 

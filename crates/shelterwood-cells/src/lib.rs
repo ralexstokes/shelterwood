@@ -28,34 +28,12 @@ mod observe;
 pub use admission::*;
 pub use cancellation::*;
 #[doc(hidden)]
-pub use cells::*;
-pub use observe::*;
-
-pub(crate) use shelterwood_core::{
-    ChildId, Exit, Incarnation, Intensity, Membership, RestartAttempt, RestartCount, RestartPolicy,
-    Retention, Strategy, TotalRestarts,
+pub use cells::{
+    DynamicRoute, ErasedDynamicRoute, ErasedDynamicSlot, MemberCell, MemberStage, MemberTransition,
+    ObservationGate, ObservationTxn, ResidentProjection, RetainedExit, RetainedStopReason,
+    ScopeCell, ScopeControlEvent, StartupDisposition,
 };
-
-mod engine {
-    pub(crate) use shelterwood_core::engine::*;
-}
-
-mod exit {
-    pub(crate) use shelterwood_core::exit::*;
-}
-
-mod identity {
-    pub(crate) use shelterwood_core::identity::*;
-}
-
-mod mailbox {
-    pub(crate) use shelterwood_mailbox::*;
-}
-
-mod policy {
-    pub(crate) use shelterwood_core::policy::*;
-}
-
-mod runtime {
-    pub(crate) use shelterwood_runtime::*;
-}
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub use cells::{GateCapture, RuntimeStorage};
+pub use observe::*;

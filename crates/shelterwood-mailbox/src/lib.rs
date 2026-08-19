@@ -15,7 +15,7 @@
 //! foreign implementations may be called from framework critical sections and
 //! therefore invalidate the framework's lock-rule guarantees.
 
-use std::{fmt, sync::Arc};
+use std::fmt;
 
 use shelterwood_core::policy::ResolvedMailbox;
 pub use shelterwood_core::{ChildId, Incarnation, Membership};
@@ -117,16 +117,6 @@ pub trait MailboxControl: private::SealedMailboxControl + fmt::Debug + Send + Sy
 pub trait ActorIdentity: Send + Sync {
     fn id(&self) -> &ChildId;
     fn membership(&self) -> Membership;
-}
-
-impl<T: ActorIdentity + ?Sized> ActorIdentity for Arc<T> {
-    fn id(&self) -> &ChildId {
-        (**self).id()
-    }
-
-    fn membership(&self) -> Membership {
-        (**self).membership()
-    }
 }
 
 /// The Tokio adapter, reachable only as a dev-dependency.

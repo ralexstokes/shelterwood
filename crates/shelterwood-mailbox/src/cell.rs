@@ -4,6 +4,7 @@ use std::{
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
     sync::{Arc, Mutex, MutexGuard, atomic::Ordering},
+    time::Instant,
 };
 
 use crate::{
@@ -102,9 +103,9 @@ mod waker_slot {
     /// The only storage surface for a caller-owned waker.
     ///
     /// Its value is private even from the parent mailbox module, and every
-    /// mutating operation requires an effects sink. The old #202 spelling --
-    /// replacing or taking an `Option<Waker>` and accidentally dropping it
-    /// beside a guard -- therefore does not type-check.
+    /// mutating operation requires an effects sink, so replacing or taking an
+    /// `Option<Waker>` and accidentally dropping it beside a guard does not
+    /// type-check.
     #[derive(Default)]
     pub(super) struct WakerSlot(Option<Waker>);
 
@@ -556,10 +557,9 @@ impl<M: Send + 'static> Drop for MailboxEffects<'_, M> {
         if self.pulse {
             panics.run(|| self.cell.changed.pulse());
         }
-        // Binding a latest-value mailbox historically handed displaced
-        // payloads to isolated disposal before accepted senders were woken.
-        // Preserve that observable ownership edge: a woken sender may run
-        // immediately and must not race ahead of disposal submission.
+        // Submit displaced latest-value payloads to isolated disposal before
+        // waking accepted senders: a woken sender may run immediately and must
+        // not race ahead of disposal submission.
         if self.isolate_displaced && !self.displaced.is_empty() {
             let displaced = std::mem::take(&mut self.displaced);
             panics.run(|| {
@@ -928,6 +928,14 @@ impl<M: Send + 'static> MailboxCell<M> {
 impl<M> MailboxCell<M> {
     pub(super) fn runtime(&self) -> Arc<dyn MailboxRuntime> {
         Arc::clone(&self.runtime)
+    }
+
+    pub(super) fn now(&self) -> Instant {
+        self.runtime.now()
+    }
+
+    pub(super) fn dispose<T: Send + 'static>(&self, value: T) {
+        dispose_value(self.runtime.as_ref(), value);
     }
 }
 
@@ -1404,6 +1412,10 @@ impl<M: Send + 'static> MailboxReceiver<M> {
         self.mailbox.freeze(self.incarnation);
     }
 
+    /// Waits for mailbox activity in the façade's merged raw-actor event loop.
+    ///
+    /// This remains public only as the cross-crate receiver seam used by
+    /// `RawContext`; it is not reachable from Shelterwood's supported API.
     pub async fn changed(&mut self) {
         self.watcher.changed().await;
     }

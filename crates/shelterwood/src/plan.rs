@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults, Strategy,
+    ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults,
     admission::ReserveError,
     cells::{ErasedDynamicSlot, MemberCell, ObservationTxn, ScopeCell},
     definition::DefinitionSource,
@@ -22,7 +22,6 @@ use crate::{
 
 #[derive(Clone, Debug, Default)]
 struct ScopeConfig {
-    strategy: Strategy,
     intensity: Intensity,
     defaults: ScopeDefaults,
 }
@@ -160,6 +159,11 @@ impl SlotCell {
     /// terminal predecessor. Taking the owning scope here keeps the pairing
     /// structural instead of repeated at each call site.
     pub(crate) fn terminalize_never_started(&self, owner: &ScopeCell) {
+        self.publish_never_started();
+        owner.evict_child_identity(&self.member);
+    }
+
+    fn publish_never_started(&self) {
         if let Some(scope) = &self.scope {
             scope.terminalize_never_started();
         } else {
@@ -168,7 +172,17 @@ impl SlotCell {
                 crate::cells::StartupDisposition::Unchanged,
             );
         }
-        owner.evict_child_identity(&self.member);
+    }
+
+    fn terminalize_never_started_contained(
+        &self,
+        owner: &ScopeCell,
+        panics: &mut runtime::PanicAccumulator,
+    ) {
+        // Publication can resume a hostile observer. Identity eviction is a
+        // distinct teardown effect and must still run before the next slot.
+        panics.run(|| self.publish_never_started());
+        panics.run(|| owner.evict_child_identity(&self.member));
     }
 
     pub(crate) fn terminalize_never_started_locked(
@@ -220,6 +234,15 @@ impl SlotCell {
         self.resolve_and_take_defined_with(defaults, || {})
     }
 
+    /// The body of [`Self::resolve_and_take_defined`], with a seam between
+    /// resolution and claim.
+    ///
+    /// Production always passes an empty closure; the sole consumer of a
+    /// non-empty one is
+    /// `dynamic_policy_resolution_and_definition_claim_are_atomic`, which
+    /// releases a competing remover through it. Delegating rather than
+    /// duplicating is what keeps that test pinned to the shipped path: an
+    /// unlock injected here fails it.
     fn resolve_and_take_defined_with(
         &self,
         defaults: &ResolvedDefaults,
@@ -264,7 +287,11 @@ impl SlotCell {
                 Readiness::Immediate,
             ),
             ChildConstruction::Scope(definition) => {
-                (&definition.options, definition.mode(), Readiness::Manual)
+                let options = CommonOptions {
+                    readiness: None,
+                    ..definition.options.clone()
+                };
+                return resolve_common(&options, defaults, definition.mode(), Readiness::Manual);
             }
         };
         resolve_common(options, defaults, mode, default_readiness)
@@ -286,10 +313,6 @@ pub(crate) struct BuilderCore {
 }
 
 impl BuilderCore {
-    pub(crate) fn set_strategy(&mut self, strategy: Strategy) {
-        self.config.strategy = strategy;
-    }
-
     pub(crate) fn set_intensity(&mut self, intensity: Intensity) {
         self.config.intensity = intensity;
     }
@@ -356,7 +379,7 @@ impl BuilderCore {
             .slots
             .iter()
             .filter(|slot| slot.is_undefined())
-            .map(|slot| vec![slot.member.id().clone()])
+            .map(|slot| slot.member.id().clone())
             .collect();
         if !undefined.is_empty() {
             let disposal = self.begin_failed_disposal();
@@ -384,7 +407,7 @@ impl BuilderCore {
                 }
             }
         }
-        root.set_observation_config(self.config.strategy, self.config.intensity);
+        root.set_observation_config(self.config.intensity);
         let mut children = Vec::with_capacity(self.slots.len());
         debug_assert_eq!(
             self.slots.len(),
@@ -434,10 +457,11 @@ impl BuilderCore {
         // Slots past the failure point never left `self.root`'s map, so their
         // eviction from the override is a fence-mismatch no-op (fail closed).
         let identity_root = self.adopting_root.as_ref().unwrap_or(&self.root);
+        let mut panics = runtime::PanicAccumulator::default();
         for slot in &self.slots {
-            slot.terminalize_never_started(identity_root);
+            slot.terminalize_never_started_contained(identity_root, &mut panics);
         }
-        self.root.terminalize_never_started();
+        panics.run(|| self.root.terminalize_never_started());
     }
 }
 
@@ -472,15 +496,20 @@ fn terminalize_plan(
     terminality: &mut Option<ScopePlanTerminality>,
 ) {
     if terminality.take().is_some() {
+        let mut panics = runtime::PanicAccumulator::default();
         for child in children {
-            child.slot.terminalize_never_started(root);
+            child
+                .slot
+                .terminalize_never_started_contained(root, &mut panics);
         }
-        root.with_observation_gate(|txn| {
-            // Lowering can publish the planned children before ScopeRuntime
-            // takes ownership. The plan fallback commits residency withdrawal
-            // and root closure as one root-scope observation.
-            root.clear_residents_locked(txn);
-            root.terminalize_never_started_locked(txn);
+        panics.run(|| {
+            root.with_observation_gate(|txn| {
+                // Lowering can publish the planned children before ScopeRuntime
+                // takes ownership. The plan fallback commits residency withdrawal
+                // and root closure as one root-scope observation.
+                root.clear_residents_locked(txn);
+                root.terminalize_never_started_locked(txn);
+            });
         });
     }
 }
@@ -530,7 +559,7 @@ impl ChildPlan {
 #[derive(Debug)]
 pub(crate) enum LowerError {
     Undefined {
-        paths: Vec<Vec<ChildId>>,
+        paths: Vec<ChildId>,
         disposal: Latch,
     },
     IdentityExhausted {
@@ -577,17 +606,20 @@ pub(crate) fn checked_id(id: impl Into<ChildId>) -> Result<ChildId, ReserveError
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc, Barrier,
             atomic::{AtomicBool, Ordering},
         },
+        task::{Context, Wake, Waker},
         time::Duration,
     };
 
     use crate::{
         Backoff, ChildId, DefaultsInheritance, ExitError, Readiness, RestartCondition,
         RestartPolicy, Retention, Shutdown, TaskOnceDef,
-        cells::{MemberCell, ScopeCell},
+        cells::{MemberCell, MemberStage, ResidentProjection, ScopeCell},
         definition::DefinitionSource,
         identity::ScopeIdentity,
         policy::{CommonOptions, ResolvedDefaults, ScopeFlavor},
@@ -611,6 +643,104 @@ mod tests {
             .readiness(Readiness::Manual)
             .expect("manual task readiness is valid")
             .retention(Retention::Remove)
+    }
+
+    struct PanicWake(&'static str);
+
+    impl Wake for PanicWake {
+        fn wake(self: Arc<Self>) {
+            std::panic::panic_any(self.0);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            std::panic::panic_any(self.0);
+        }
+    }
+
+    fn two_slot_builder() -> (BuilderCore, Vec<Arc<SlotCell>>) {
+        let mut builder = BuilderCore::new(ScopeFlavor::Ordered);
+        let mut slots = Vec::new();
+        for id in ["first", "second"] {
+            let slot = builder.reserve(id, None).expect("reservation succeeds");
+            slot.define(ChildConstruction::Task(configured_task()));
+            slots.push(slot);
+        }
+        (builder, slots)
+    }
+
+    #[test]
+    fn builder_drop_terminalizes_every_slot_and_root_after_a_hostile_wake() {
+        const PANIC: &str = "injected builder terminalization wake panic";
+
+        let (builder, slots) = two_slot_builder();
+        let root = Arc::clone(&builder.root);
+        let mut first_terminal = Box::pin(slots[0].member.wait_terminal());
+        let hostile = Waker::from(Arc::new(PanicWake(PANIC)));
+        assert!(
+            first_terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+
+        let result = catch_unwind(AssertUnwindSafe(|| drop(builder)));
+
+        let payload = result.expect_err("the first hostile slot wake still surfaces");
+        assert_eq!(payload.downcast_ref::<&'static str>().copied(), Some(PANIC));
+        for slot in &slots {
+            assert!(
+                matches!(slot.member.record().stage, MemberStage::Terminal(_)),
+                "builder teardown terminalizes every declared slot"
+            );
+        }
+        assert!(
+            matches!(root.member.record().stage, MemberStage::Terminal(_)),
+            "builder teardown terminalizes its root after every slot"
+        );
+    }
+
+    #[test]
+    fn plan_drop_terminalizes_every_child_and_root_after_a_hostile_wake() {
+        const PANIC: &str = "injected plan terminalization wake panic";
+
+        let (builder, slots) = two_slot_builder();
+        let plan = builder
+            .lower(ResolvedDefaults::default(), None)
+            .expect("the defined builder lowers");
+        let root = Arc::clone(&plan.root);
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| ResidentProjection::new(Arc::clone(&child.slot.member), None))
+                .collect(),
+        );
+        let mut first_terminal = Box::pin(slots[0].member.wait_terminal());
+        let hostile = Waker::from(Arc::new(PanicWake(PANIC)));
+        assert!(
+            first_terminal
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+
+        let result = catch_unwind(AssertUnwindSafe(|| drop(plan)));
+
+        let payload = result.expect_err("the first hostile child wake still surfaces");
+        assert_eq!(payload.downcast_ref::<&'static str>().copied(), Some(PANIC));
+        for slot in &slots {
+            assert!(
+                matches!(slot.member.record().stage, MemberStage::Terminal(_)),
+                "plan teardown terminalizes every transferred child"
+            );
+        }
+        assert!(
+            matches!(root.member.record().stage, MemberStage::Terminal(_)),
+            "plan teardown closes the root after every child"
+        );
+        assert!(
+            root.snapshot().children.is_empty(),
+            "plan teardown withdraws every published residency before root closure"
+        );
     }
 
     #[test]
@@ -713,7 +843,9 @@ mod tests {
             Readiness::Manual
         );
 
-        // A declared override wins over every per-kind default.
+        // Task and raw declarations expose readiness overrides. Scope
+        // readiness is structural even if an internal fixture forges the
+        // otherwise-unreachable common-options field.
         assert_eq!(
             resolved_readiness(ChildConstruction::Task(
                 TaskDef::new(|_| async { Ok(()) })
@@ -737,7 +869,7 @@ mod tests {
                 readiness: Some(Readiness::Immediate),
                 ..CommonOptions::default()
             })),
-            Readiness::Immediate
+            Readiness::Manual
         );
         assert_eq!(
             resolved_readiness(raw_construction(CommonOptions {

@@ -388,11 +388,7 @@ fn check_r5_effects_are_acknowledgeable(transition: &Transition<'_>) {
                     "removal is finalized only once disposal has joined"
                 );
             }
-            Effect::Admitted { .. }
-            | Effect::StartupCompleted { .. }
-            | Effect::StartupFailed { .. }
-            | Effect::DrainStarted { .. }
-            | Effect::Finished { .. } => {}
+            Effect::StartupCompleted { .. } | Effect::Finished { .. } => {}
         }
     }
 }

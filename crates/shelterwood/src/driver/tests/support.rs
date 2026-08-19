@@ -20,8 +20,8 @@ pub(super) use crate::{
     Retention, ScopeRef, ScopeState, SendErrorKind, StartupError, StartupFailure,
     StartupFailureCause, StopReason, SubtreeDef, SubtreeOnceDef, TaskDef, Tree,
     engine::{
-        ChildKey, Effect as SupervisorEffect, Epoch, Event as SupervisorEvent, ScopeLifecycle,
-        StopLadder, SupervisorState, arbitrate, step as supervisor_step,
+        ChildKey, Epoch, Event as SupervisorEvent, ScopeLifecycle, StopLadder, SupervisorState,
+        admit as supervisor_admit, arbitrate,
     },
     exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
@@ -238,19 +238,10 @@ impl ScopeRuntimeBuilder {
 
     pub(super) fn build(self) -> ScopeRuntime {
         let mut supervisor = SupervisorState::new(self.root.flavor, self.lifecycle);
-        let mut supervisor_effects = Vec::new();
         let mut children = ChildResources::default();
         for (expected, child) in self.children.into_iter() {
-            supervisor_step(
-                &mut supervisor,
-                SupervisorEvent::Admit {
-                    membership: child.slot.member.membership(),
-                    initial: true,
-                    start_immediately: false,
-                },
-                &mut supervisor_effects,
-            );
-            let Some(SupervisorEffect::Admitted { child: actual }) = supervisor_effects.pop()
+            let Some(actual) =
+                supervisor_admit(&mut supervisor, child.slot.member.membership(), true)
             else {
                 panic!("fixture admission produces one key")
             };
@@ -269,7 +260,7 @@ impl ScopeRuntimeBuilder {
             restart_shutdown_retries: Vec::new(),
             children,
             supervisor,
-            supervisor_effects,
+            supervisor_effects: Vec::new(),
             events: self.events,
             disposal_events: self.disposal_events,
             disposal_event_receiver: self.disposal_event_receiver,

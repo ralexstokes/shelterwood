@@ -4,6 +4,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     time::Duration,
 };
@@ -30,6 +31,25 @@ enum ReplyMode {
     Answer,
     Drop,
     Hold,
+}
+
+/// A discarded reply payload that publishes its own destruction.
+///
+/// Both the counter and the notification are shared across every instance, so
+/// the test can judge the exact total and then watch one real-time window for
+/// a duplicate rather than re-reading a per-value counter that no correct or
+/// incorrect run could move again.
+struct CountedReplyDrop {
+    drops: Arc<AtomicUsize>,
+    disposed: mpsc::Sender<&'static str>,
+    label: &'static str,
+}
+
+impl Drop for CountedReplyDrop {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+        let _ = self.disposed.send(self.label);
+    }
 }
 
 struct Recorder {
@@ -318,14 +338,60 @@ async fn reply_receiver_is_consuming_and_late_replies_are_discarded() {
         )
         .expect("valid actor");
     let width = Duration::from_secs(10);
+    // Both discards are destroyed off-runtime by isolated disposal, which
+    // costs a blocking-pool or fallback thread start. A polling wait would be
+    // worthless here: this test runs on a paused clock, where every
+    // `tokio::time::sleep` auto-advances the moment the runtime idles, so a
+    // nominal five-second poll budget collapses to milliseconds of wall time.
+    // Wait on the destructor's own notification in real time instead.
+    const DISPOSAL_WAIT: Duration = Duration::from_secs(5);
+    // The test keeps `disposed` alive, so this window is a real-time wait for
+    // a third notification and not an immediate `Disconnected`.
+    const DUPLICATE_DISPOSAL_WINDOW: Duration = Duration::from_millis(50);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (disposed, disposals) = mpsc::channel();
+
     let (reply, receiver) = actor.reply_channel();
     let mut waiter = Box::pin(receiver.recv(width));
     assert!(poll_once(waiter.as_mut()).is_pending());
     advance_time(width).await;
-    assert_eq!(waiter.await, Err(ReplyError::Timeout));
-    reply.send(1);
+    assert!(matches!(waiter.await, Err(ReplyError::Timeout)));
+    reply.send(CountedReplyDrop {
+        drops: Arc::clone(&drops),
+        disposed: disposed.clone(),
+        label: "timed-out receiver",
+    });
+    assert_eq!(
+        disposals
+            .recv_timeout(DISPOSAL_WAIT)
+            .expect("isolated disposal destroys the reply a timed-out receiver rejected"),
+        "timed-out receiver"
+    );
 
-    let (reply, receiver) = actor.reply_channel::<usize>();
+    let (reply, receiver) = actor.reply_channel::<CountedReplyDrop>();
     drop(receiver);
-    reply.send(2);
+    reply.send(CountedReplyDrop {
+        drops: Arc::clone(&drops),
+        disposed: disposed.clone(),
+        label: "dropped receiver",
+    });
+    assert_eq!(
+        disposals
+            .recv_timeout(DISPOSAL_WAIT)
+            .expect("isolated disposal destroys the reply a dropped receiver rejected"),
+        "dropped receiver"
+    );
+
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        2,
+        "each discarded reply is destroyed exactly once"
+    );
+    assert!(
+        matches!(
+            disposals.recv_timeout(DUPLICATE_DISPOSAL_WINDOW),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "no reply is disposed twice"
+    );
 }

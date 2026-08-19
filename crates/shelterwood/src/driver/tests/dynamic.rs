@@ -24,6 +24,11 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
             )
             .await
             .expect("task admission");
+        // `deadline_slots` is exact, not a band. The removal below pins the
+        // queue empty, and arming one readiness deadline pushes exactly one
+        // heap entry, so two slots here means the arm leaked a second,
+        // never-registered entry — the leak this cycle exists to catch, and
+        // one that `deadlines..=deadlines * 2` would admit unnoticed.
         assert_eq!(
             cell.runtime_storage(),
             RuntimeStorage {
@@ -32,7 +37,7 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
                 deadlines: 1,
                 deadline_slots: 1,
             },
-            "cycle {cycle} stores only the live child"
+            "cycle {cycle} stores exactly the live child and readiness deadline"
         );
 
         assert_eq!(scope.remove_task(&task).await, RemoveOutcome::Removed);
@@ -215,6 +220,10 @@ fn dynamic_close_evicts_a_terminal_reservation_before_readd() {
         .expect("the first incarnation reserves the child");
     let first_membership = first.slot.member.membership();
     let retained = root.with_observation_gate(|txn| control.close(&root, txn));
+    assert!(matches!(
+        first.slot.member.record().stage,
+        MemberStage::Terminal(exit) if matches!(exit.kind(), ExitKind::NeverStarted)
+    ));
     assert!(
         retained.is_empty(),
         "reservations are terminalized on close"
@@ -606,7 +615,7 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
     .join()
     .expect("foreign-thread removal signaling succeeds");
 
-    let event = match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
+    let event = match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, event_receiver.recv()).await {
         crate::runtime::Timeout::Completed(event) => event.expect("the driver lane remains open"),
         crate::runtime::Timeout::Elapsed => {
             panic!("the off-runtime removal edge must not be lost")
@@ -781,7 +790,7 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
     scope.handle_admission(request);
     assert!(matches!(response.try_receive(), Some(Ok(()))));
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(2), started.fired()).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, started.fired()).await,
         crate::runtime::Timeout::Completed(())
     ));
 
@@ -810,26 +819,22 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
 
     let removal_response =
         super::super::remove_dynamic(&root, member.id(), Some(member.membership()));
-    let removal = match crate::runtime::timeout(
-        Duration::from_secs(2),
-        dynamic_event_receiver.recv(),
-    )
-    .await
-    {
-        crate::runtime::Timeout::Completed(Some(DriverEvent::Removal(removal))) => removal,
-        crate::runtime::Timeout::Completed(_) => panic!("the removal reaches the driver"),
-        crate::runtime::Timeout::Elapsed => panic!("the removal must reach the driver"),
-    };
+    let removal =
+        match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, dynamic_event_receiver.recv()).await {
+            crate::runtime::Timeout::Completed(Some(DriverEvent::Removal(removal))) => removal,
+            crate::runtime::Timeout::Completed(_) => panic!("the removal reaches the driver"),
+            crate::runtime::Timeout::Elapsed => panic!("the removal must reach the driver"),
+        };
     scope.handle_removal(removal);
     recv_child_exit(
         &mut event_receiver,
-        Duration::from_secs(2),
+        DRIVER_PROGRESS_WAIT,
         "the stopped child exit",
     )
     .await
     .dispatch(&mut scope);
     let disposal =
-        match crate::runtime::timeout(Duration::from_secs(2), scope.disposal_event_receiver.recv())
+        match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, scope.disposal_event_receiver.recv())
             .await
         {
             crate::runtime::Timeout::Completed(Some(event)) => event,
@@ -888,43 +893,46 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
             .state
             .lock()
             .expect("dynamic-state mutex remains healthy");
-        let runtime = tokio::runtime::Handle::current();
-        let (scope, annul) = std::thread::scope(|threads| {
-            let annul_ready = contender_ready.clone();
-            let annul_control = Arc::clone(&reservation.control);
-            let annul_slot = Arc::clone(&reservation.slot);
-            let annul_scope = Arc::clone(&reservation.scope);
-            let annul = threads.spawn(move || {
-                annul_ready
-                    .send(())
-                    .expect("the race coordinator remains available");
-                cancel_dynamic_reservation(&annul_scope, annul_control.as_ref(), &annul_slot);
-            });
-            let admission = threads.spawn(move || {
-                let _runtime = runtime.enter();
-                contender_ready
-                    .send(())
-                    .expect("the race coordinator remains available");
-                scope.handle_admission(request);
-                scope
-            });
-            // Both contenders are running before the dynamic-state mutex is
-            // released, so neither can finish ahead of the other: the guard,
-            // not the rendezvous, is what forces them to overlap. The
-            // rendezvous only proves each thread reached its send — the
-            // channel is shared, so neither receive names a contender.
-            contenders_ready
-                .recv()
-                .expect("a contender starts before the mutex is released");
-            contenders_ready
-                .recv()
-                .expect("both contenders start before the mutex is released");
-            drop(state);
-            let annul = annul.join();
-            let scope = admission.join().expect("the admission contender completes");
-            (scope, annul)
+        let annul_ready = contender_ready.clone();
+        let annul_control = Arc::clone(&reservation.control);
+        let annul_slot = Arc::clone(&reservation.slot);
+        let annul_scope = Arc::clone(&reservation.scope);
+        let annul = std::thread::spawn(move || {
+            annul_ready
+                .send(())
+                .expect("the race coordinator remains available");
+            cancel_dynamic_reservation(&annul_scope, annul_control.as_ref(), &annul_slot);
         });
-        annul.expect("the annul contender completes");
+        let (admission_runtime, admission) = DedicatedRuntime::spawn(async move {
+            contender_ready
+                .send(())
+                .expect("the race coordinator remains available");
+            scope.handle_admission(request);
+            scope
+        });
+        // Both contenders are running before the dynamic-state mutex is
+        // released, so neither can finish ahead of the other: the guard,
+        // not the rendezvous, is what forces them to overlap. The
+        // rendezvous only proves each contender reached its send — the
+        // channel is shared, so neither receive names a contender.
+        contenders_ready
+            .recv()
+            .expect("a contender starts before the mutex is released");
+        contenders_ready
+            .recv()
+            .expect("both contenders start before the mutex is released");
+        drop(state);
+        annul.join().expect("the annul contender completes");
+        let scope = match crate::runtime::join(admission).await {
+            crate::runtime::JoinOutcome::Ok { value } => value,
+            crate::runtime::JoinOutcome::Panic { message } => {
+                panic!("the admission contender panicked: {message:?}")
+            }
+            crate::runtime::JoinOutcome::Cancelled => {
+                panic!("the admission contender was cancelled")
+            }
+        };
+        admission_runtime.shutdown().await;
 
         // Whichever side won the dynamic-state mutex, exactly one owner
         // published terminality (or none, if the admission won): the record,
@@ -1159,7 +1167,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
     scope.handle_admission(request);
     assert!(matches!(admission_response.try_receive(), Some(Ok(()))));
     assert!(matches!(
-        crate::runtime::timeout(Duration::from_secs(2), started.fired()).await,
+        crate::runtime::timeout(DRIVER_PROGRESS_WAIT, started.fired()).await,
         crate::runtime::Timeout::Completed(())
     ));
 
@@ -1198,11 +1206,8 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
         ));
     }
 
-    let removal = match crate::runtime::timeout(
-        Duration::from_secs(2),
-        dynamic_event_receiver.recv(),
-    )
-    .await
+    let removal = match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, dynamic_event_receiver.recv())
+        .await
     {
         crate::runtime::Timeout::Completed(Some(DriverEvent::Removal(removal))) => removal,
         crate::runtime::Timeout::Completed(_) => panic!("one removal request reaches the driver"),
@@ -1250,7 +1255,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
 
     recv_child_exit(
         &mut event_receiver,
-        Duration::from_secs(2),
+        DRIVER_PROGRESS_WAIT,
         "the stopped child exit",
     )
     .await
@@ -1266,7 +1271,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
     }
 
     let disposal =
-        match crate::runtime::timeout(Duration::from_secs(2), scope.disposal_event_receiver.recv())
+        match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, scope.disposal_event_receiver.recv())
             .await
         {
             crate::runtime::Timeout::Completed(Some(event)) => event,
@@ -1388,7 +1393,7 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     release_failure.fire();
     let exit = recv_child_exit(
         &mut event_receiver,
-        Duration::from_secs(2),
+        DRIVER_PROGRESS_WAIT,
         "the first incarnation exit",
     )
     .await;
@@ -1447,12 +1452,12 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
         Some(DriverEvent::Removal(queued))
             if queued.key == ChildKey::fixture(u64::MAX - 1)
     ));
-    let forwarded =
-        match crate::runtime::timeout(Duration::from_secs(2), event_receiver.recv()).await {
-            crate::runtime::Timeout::Completed(Some(event)) => event,
-            crate::runtime::Timeout::Completed(None) => panic!("the driver lane remains open"),
-            crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
-        };
+    let forwarded = match crate::runtime::timeout(DRIVER_PROGRESS_WAIT, event_receiver.recv()).await
+    {
+        crate::runtime::Timeout::Completed(Some(event)) => event,
+        crate::runtime::Timeout::Completed(None) => panic!("the driver lane remains open"),
+        crate::runtime::Timeout::Elapsed => panic!("the fused removal edge is forwarded"),
+    };
     let DriverEvent::Removal(removal) = forwarded else {
         panic!("the queued event is the fused removal")
     };

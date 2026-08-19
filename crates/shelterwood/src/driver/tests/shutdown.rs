@@ -50,7 +50,7 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let member = Arc::clone(&child.slot.member);
     let mut children = ChildArena::default();
@@ -71,6 +71,16 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
         .expect("worker is active");
     let incarnation = active.incarnation;
     active.abort_handle.abort();
+    let _joined = recv_child_exit(
+        &mut event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the aborted fixture task to join",
+    )
+    .await;
+    // `handle_exit` is a post-join operation in production. Wait for that
+    // boundary before injecting the synthetic application verdict so the
+    // spawned body has released its factory clone and retained-construction
+    // disposal is the sole owner whose panic this fixture observes.
     scope.handle_exit(
         key,
         incarnation,
@@ -289,6 +299,148 @@ async fn hard_force_folds_an_arrived_factory_disposal_panic() {
 
     assert!(!scope.supervisor.is_disposing(key));
     assert_arrived_disposal_panic_published(&member);
+}
+
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_force_preserves_the_first_terminal_observer_panic_across_its_fallback() {
+    const FIRST_PANIC: &str = "arrived disposal terminal observer panic";
+    const SECOND_PANIC: &str = "hard-force fallback terminal observer panic";
+
+    let gate = Arc::new(FactoryGate::default());
+    let mut tree = Tree::new();
+    tree.add_task(
+        "arrived",
+        TaskDef::new({
+            let capture = PanickingFactoryDrop;
+            move |_| {
+                let _ = &capture;
+                future::pending::<crate::ExitResult>()
+            }
+        })
+        .restart(RestartPolicy::new(
+            RestartCondition::Never,
+            Backoff::Immediate,
+        ))
+        .retention(Retention::Retain),
+    )
+    .expect("valid arrived child");
+    tree.add_task(
+        "fallback",
+        TaskDef::new({
+            let capture = BlockingFactoryDrop(Arc::clone(&gate));
+            move |_| {
+                let _ = &capture;
+                future::pending::<crate::ExitResult>()
+            }
+        })
+        .restart(RestartPolicy::new(
+            RestartCondition::Never,
+            Backoff::Immediate,
+        ))
+        .retention(Retention::Retain),
+    )
+    .expect("valid fallback child");
+
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state_and_startup(ScopeState::Running, Ok(()));
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
+    let mut children = ChildArena::default();
+    let mut arrived = None;
+    let mut fallback = None;
+    for child in plan.children.drain(..) {
+        let id = child.slot.member.id().as_str().to_owned();
+        let member = Arc::clone(&child.slot.member);
+        let key = children
+            .insert(ChildRuntime::from_plan(child, &root))
+            .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+        match id.as_str() {
+            "arrived" => arrived = Some((key, member)),
+            "fallback" => fallback = Some((key, member)),
+            _ => unreachable!("the fixture declares exactly two known children"),
+        }
+    }
+    let (arrived_key, arrived_member) = arrived.expect("arrived child is present");
+    let (fallback_key, fallback_member) = fallback.expect("fallback child is present");
+    let mut scope = ScopeRuntimeBuilder::new(root, epoch, events)
+        .with_defaults(plan.defaults.clone())
+        .with_children(children)
+        .with_lifecycle(ScopeLifecycle::running())
+        .build();
+    plan.finish_transfer();
+
+    for key in [arrived_key, fallback_key] {
+        scope.spawn_child(key);
+        scope.children[key]
+            .active
+            .as_ref()
+            .expect("child is active")
+            .abort_handle
+            .abort();
+    }
+    for _ in 0..2 {
+        recv_child_exit(
+            &mut event_receiver,
+            DRIVER_PROGRESS_WAIT,
+            "an aborted fixture child to join",
+        )
+        .await
+        .dispatch(&mut scope);
+    }
+    gate.wait_entered().await;
+    let arrived_completion = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
+        while crate::runtime::unbounded_mpsc_is_empty(&scope.disposal_event_receiver) {
+            crate::runtime::yield_now().await;
+        }
+    })
+    .await;
+    assert!(matches!(
+        arrived_completion,
+        crate::runtime::Timeout::Completed(())
+    ));
+
+    let mut arrived_terminal = Box::pin(arrived_member.wait_terminal());
+    let mut fallback_terminal = Box::pin(fallback_member.wait_terminal());
+    assert!(
+        arrived_terminal
+            .as_mut()
+            .poll(&mut Context::from_waker(&Waker::from(Arc::new(PanicWake(
+                FIRST_PANIC
+            )))))
+            .is_pending()
+    );
+    assert!(
+        fallback_terminal
+            .as_mut()
+            .poll(&mut Context::from_waker(&Waker::from(Arc::new(PanicWake(
+                SECOND_PANIC
+            )))))
+            .is_pending()
+    );
+
+    let result = catch_unwind(AssertUnwindSafe(|| scope.force_child(fallback_key)));
+    gate.release();
+
+    let payload = result.expect_err("both hostile terminal wakes are contained");
+    assert_eq!(
+        payload.downcast_ref::<&'static str>().copied(),
+        Some(FIRST_PANIC),
+        "the earlier arrived-disposal panic remains primary"
+    );
+    for member in [&arrived_member, &fallback_member] {
+        assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
+    }
 }
 
 #[crate::runtime::test]

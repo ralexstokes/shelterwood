@@ -977,7 +977,7 @@ mod tests {
     unsafe fn drop_panicking_drop_waker(data: *const ()) {
         // SAFETY: drop consumes the reference represented by this raw waker.
         let probe = unsafe { Arc::<EveryWakerDropPanics>::from_raw(data.cast()) };
-        *probe.0.lock().expect("waker disposal recorder mutex") = Some(std::thread::current().id());
+        record_disposal(&probe.0);
         panic!("injected call waker drop panic");
     }
 
@@ -1082,7 +1082,7 @@ mod tests {
         let waker_thread = disposal_thread();
         let mut call = Box::pin(actor.call(
             {
-                let message_thread = Arc::clone(&message_thread);
+                let message_thread = message_thread.clone();
                 move |reply| CallMessage {
                     _reply: reply,
                     _payload: ThreadRecordingDrop(message_thread),
@@ -1090,7 +1090,7 @@ mod tests {
             },
             Duration::from_secs(1),
         ));
-        let hostile = panicking_drop_waker(Arc::clone(&waker_thread));
+        let hostile = panicking_drop_waker(waker_thread.clone());
         let mut context = Context::from_waker(&hostile);
         let deadline = crate::deadline::Deadline::after(
             crate::capability::tests::runtime().now(),

@@ -153,6 +153,12 @@ impl<M: Send + 'static> ActorRef<M> {
     /// actor handler deadlocks because the blocked handler is also the only code
     /// that can produce the reply; use an actor-local continuation or an
     /// incarnation-owned offload instead.
+    ///
+    /// A timeout before acceptance has no caller to hand the request back to,
+    /// so it destroys both the recovered request and the waker it registered
+    /// through isolated disposal, as cancelling a parked [`send`](Self::send)
+    /// does. A panicking waker destructor is contained there rather than
+    /// resuming on the awaiting task.
     pub fn call<T: Send + 'static>(
         &self,
         make_msg: impl FnOnce(Reply<T>) -> M + Send + 'static,
@@ -428,6 +434,13 @@ impl<M> fmt::Debug for SendTimeout<M> {
     }
 }
 
+/// Withdraws an unaccepted send and classifies its outcome under the
+/// caller's chosen waker disposition.
+///
+/// The outcome is taken before `finish()` releases the registered waker, so
+/// under either disposition the recovered message already belongs to
+/// `result` and a hostile waker destructor can neither divert nor destroy
+/// it.
 fn withdraw_send_with<M: Send + 'static>(
     send: &mut SendFuture<M>,
     disposition: WithdrawalDisposition,
@@ -454,12 +467,11 @@ fn withdraw_send_with<M: Send + 'static>(
 }
 
 fn withdraw_send<M: Send + 'static>(send: &mut SendFuture<M>) -> Result<Incarnation, SendError<M>> {
-    let result = withdraw_send_with(send, WithdrawalDisposition::Inline);
     // Unlike the cancellation path this is a normal return on the caller's own
-    // task, so the caller's waker destructor stays inline and its panic stays
-    // visible; no core lock is held and the recovered message already belongs
-    // to `result`.
-    result
+    // task, and the recovered message goes back to that same caller. No core
+    // lock is held, so the caller's waker destructor stays inline and its
+    // panic stays visible.
+    withdraw_send_with(send, WithdrawalDisposition::Inline)
 }
 
 impl<M: Send + 'static> DeadlineOperation for TimedSend<M> {

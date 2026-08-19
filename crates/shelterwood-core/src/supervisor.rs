@@ -12,7 +12,7 @@ use std::{
 
 use crate::{
     Membership, MembershipStatus, PoisonedCounter, ScopeFlavor, ScopeState, StopReason,
-    engine::ScopeLifecycle,
+    engine::{ChildCompletionState, ScopeLifecycle},
 };
 
 /// A never-reused child registration.
@@ -540,8 +540,10 @@ impl SupervisorState {
         }
         let reason = self.lifecycle.finish_if_ready(
             self.flavor,
-            !self.children.is_empty(),
-            self.all_children_joined(),
+            ChildCompletionState {
+                has_children: !self.children.is_empty(),
+                all_terminal: self.all_children_joined(),
+            },
         );
         if let Some(reason) = reason {
             self.finish_emitted = true;

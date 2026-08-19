@@ -103,11 +103,18 @@ pub struct ActorWork {
 
 impl ActorWork {
     pub fn abort(&self) {
-        self.handle
-            .as_ref()
-            .expect("actor work retains its join handle until join")
-            .inner
-            .abort();
+        // A handle is taken only by `join`, which consumes the work, so the
+        // slot is populated on every reachable call. Assert rather than
+        // panic: this shares its shape with the locked callers of
+        // `OneShotSender::is_closed`, and aborting nothing is the harmless
+        // reading of an already-joined handle.
+        debug_assert!(
+            self.handle.is_some(),
+            "actor work retains its join handle until join"
+        );
+        if let Some(handle) = &self.handle {
+            handle.inner.abort();
+        }
     }
 
     pub async fn join(mut self) -> JoinOutcome<()> {

@@ -5,9 +5,11 @@ use std::{fmt, num::NonZeroUsize, time::Duration};
 use crate::Exit;
 
 /// Whether a scope has fixed ordered membership or runtime-dynamic membership.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ScopeFlavor {
+    /// Fixed, readiness-ordered membership.
     Ordered,
+    /// Runtime-dynamic membership.
     Dynamic,
 }
 

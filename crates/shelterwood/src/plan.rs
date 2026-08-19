@@ -216,20 +216,18 @@ impl SlotCell {
         &self,
         defaults: &ResolvedDefaults,
     ) -> Option<(Isolated<ChildConstruction>, ResolvedCommonOptions)> {
-        let mut state = self.definition.lock().expect("definition mutex poisoned");
-        let DefinitionState::Defined(definition) = &*state else {
-            return None;
-        };
-        let resolved = self.resolve_defined_policy(definition, defaults);
-        let DefinitionState::Defined(definition) =
-            std::mem::replace(&mut *state, DefinitionState::Lowered)
-        else {
-            unreachable!("the definition lock keeps resolution and claim atomic")
-        };
-        Some((definition, resolved))
+        self.resolve_and_take_defined_with(defaults, || {})
     }
 
-    #[cfg(test)]
+    /// The body of [`Self::resolve_and_take_defined`], with a seam between
+    /// resolution and claim.
+    ///
+    /// Production always passes an empty closure; the sole consumer of a
+    /// non-empty one is
+    /// `dynamic_policy_resolution_and_definition_claim_are_atomic`, which
+    /// releases a competing remover through it. Delegating rather than
+    /// duplicating is what keeps that test pinned to the shipped path: an
+    /// unlock injected here fails it.
     fn resolve_and_take_defined_with(
         &self,
         defaults: &ResolvedDefaults,

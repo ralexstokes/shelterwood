@@ -260,8 +260,9 @@ Scope flavors:
 - **Ordered** — declared membership fixed at build time; sequential,
   readiness-gated startup in declaration order; reverse-order teardown.
 - **Dynamic** — runtime membership; concurrent start/stop; per-child
-  fate-sharing only (strategy is structurally `OneForOne`; the strategy knob
-  does not exist on dynamic scopes [#371]).
+  fate-sharing only (strategy is structurally `OneForOne`, and a dynamic
+  scope carries no strategy at all — not in its builder, its config, or its
+  snapshot [#371]; §9.1).
 
 **Child ids.** Every child has an id: a non-empty UTF-8 string, unique among
 the **resident** memberships of its containing scope — live *or*
@@ -2021,7 +2022,14 @@ single largest block of deferred engine complexity, and §10's mode-based
 exit funnel is designed so they land without restructuring. The `Strategy`
 type is non-exhaustive from day one, is a property of **ordered** scopes
 only (§2), and does not exist on dynamic scope builders, configs, or
-snapshots.
+snapshots. While `OneForOne` is the sole variant, ordered builders carry no
+strategy setter either: a knob whose only value is its default selects
+nothing, and offering it would pin a call shape no caller can vary. The
+setter is deferred until a second `Strategy` variant lands with Part II §19;
+until then the type is reachable only where it is *read* — `ScopeSnapshot`
+reports `Some(OneForOne)` for an ordered scope and `None` for a dynamic one
+(B.6). Adding the setter back is an additive change, and the type staying
+non-exhaustive is what keeps it one.
 
 ### 9.2 Restart policy and intensity [#371]
 
@@ -2502,8 +2510,9 @@ or lifetime paragraph is unmapped.
 - **Builder operation inventory** (content-normative; Appendix B's
   naming latitude applies). One constructor per flavor — `Tree` for an
   ordered root, `DynamicTree` for a dynamic one. Per-scope
-  configuration setters: `strategy` (ordered only, §9.1), `intensity`
-  (§9.2), `defaults(ScopeDefaults)` (§9.3). Membership declaration:
+  configuration setters: `intensity` (§9.2), `defaults(ScopeDefaults)`
+  (§9.3) — there is no strategy setter on either flavor, per §9.1.
+  Membership declaration:
   the eight `add_*` entry points and the `reserve_*` slot family (§8) —
   on an ordered builder, declaration order is start order (§2); nested
   scopes declare through `add_subtree` / `add_subtree_once`, whose

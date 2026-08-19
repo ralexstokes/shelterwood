@@ -3,6 +3,7 @@ mod dynamic;
 mod events;
 mod exhaustion;
 mod observation;
+mod payload;
 mod reports;
 mod shutdown;
 mod startup;

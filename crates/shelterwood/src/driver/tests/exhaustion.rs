@@ -492,10 +492,13 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
         }
         PreLoopStopSource::ScopeForce => scope.force_shutdown(epoch.epoch()),
         PreLoopStopSource::AncestorShutdown => {
-            ancestor_shutdown.fire();
             // Parent cancellation publishes the user-facing edge separately
-            // from the nested driver's framework-only observation edge.
-            child_shutdown.fire();
+            // from the nested driver's framework-only observation edge. The
+            // fixture deliberately withholds that separate parent-published
+            // edge so the post-call assertion observes only what this path
+            // fires: the ancestor arm must not couple its framework observer
+            // back to user-installable cancellation waiters.
+            ancestor_shutdown.fire();
         }
     }
     let ready = CompletionGatedLatch::default();
@@ -517,10 +520,16 @@ async fn assert_pre_loop_stop_upgrades_a_nested_lowering_failure(source: PreLoop
     .await;
 
     assert!(result.is_ok());
-    assert!(
-        child_shutdown.is_fired(),
-        "the upgraded verdict fires the user-facing latch that classifies the exit as cancelled"
-    );
+    match source {
+        PreLoopStopSource::ScopeShutdown | PreLoopStopSource::ScopeForce => assert!(
+            child_shutdown.is_fired(),
+            "a self-requested stop fires the user-facing latch that classifies the exit as cancelled"
+        ),
+        PreLoopStopSource::AncestorShutdown => assert!(
+            !child_shutdown.is_fired(),
+            "an ancestor-driven stop leaves the user-facing latch to the parent that published it"
+        ),
+    }
     assert!(matches!(
         scope.record().startup,
         Some(Err(StartupError::ShutdownRequested))

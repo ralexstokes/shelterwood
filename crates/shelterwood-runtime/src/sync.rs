@@ -3,7 +3,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
@@ -222,6 +222,7 @@ impl Latch {
 }
 
 /// Future returned by [`Latch::fired`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct LatchWait<'a> {
     latch: &'a Latch,
     identity: Arc<()>,
@@ -599,6 +600,23 @@ struct WatchShared<T> {
     waiters: WaiterRegistry,
 }
 
+impl<T> WatchShared<T> {
+    /// Acquires the retained value, tolerating poisoning.
+    ///
+    /// `modify_silently` and `read_with` run a caller closure under this
+    /// guard, and those closures do real work: a lifecycle publication sends
+    /// on a broadcast channel here, and a snapshot installation evaluates a
+    /// `debug_assert!` and mints a generation. A panic in any of them would
+    /// otherwise wedge every later read, publication, subscription and
+    /// terminal wait on the channel. The guarded data is plain framework
+    /// state with no invariant spanning the closure, so the surviving value
+    /// stays usable; this matches `ObservationGate::lock`, which tolerates
+    /// poisoning for the same reason.
+    fn value(&self) -> MutexGuard<'_, T> {
+        self.value.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Publishing half of a runtime-backed conflating state channel.
 pub struct WatchSender<T> {
     shared: Arc<WatchShared<T>>,
@@ -683,11 +701,7 @@ impl<T> WatchSender<T> {
     /// synchronous state transition before receivers are notified. The caller
     /// must follow a successful logical mutation with [`Self::pulse`].
     pub fn modify_silently(&self, update: impl FnOnce(&mut T)) {
-        let mut value = self
-            .shared
-            .value
-            .lock()
-            .expect("framework watch mutation does not panic");
+        let mut value = self.shared.value();
         update(&mut value);
     }
 
@@ -696,22 +710,14 @@ impl<T> WatchSender<T> {
     /// `project` runs under the watch's value guard, so it must stay cheap and
     /// must not touch the same channel.
     pub fn read_with<R>(&self, project: impl FnOnce(&T) -> R) -> R {
-        let value = self
-            .shared
-            .value
-            .lock()
-            .expect("framework watch mutation does not panic");
+        let value = self.shared.value();
         project(&value)
     }
 }
 
 impl<T: Clone> WatchSender<T> {
     pub fn read_cloned(&self) -> T {
-        self.shared
-            .value
-            .lock()
-            .expect("framework watch mutation does not panic")
-            .clone()
+        self.shared.value().clone()
     }
 }
 
@@ -788,6 +794,7 @@ impl<T> Drop for WatchWait<'_, T> {
 }
 
 /// Future returned by [`WatchReceiver::changed`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct WatchChanged<'a, T> {
     wait: WatchWait<'a, T>,
 }
@@ -804,6 +811,7 @@ impl<T> Future for WatchChanged<'_, T> {
 }
 
 /// Future returned by [`WatchReceiver::changed_or_closed`].
+#[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct WatchChangedOrClosed<'a, T> {
     wait: WatchWait<'a, T>,
 }
@@ -847,19 +855,11 @@ impl<T> WatchReceiver<T> {
 
 impl<T: Clone> WatchReceiver<T> {
     pub fn borrow_cloned(&self) -> T {
-        self.shared
-            .value
-            .lock()
-            .expect("framework watch mutation does not panic")
-            .clone()
+        self.shared.value().clone()
     }
 
     pub fn borrow_and_update_cloned(&mut self) -> T {
-        let value = self
-            .shared
-            .value
-            .lock()
-            .expect("framework watch mutation does not panic");
+        let value = self.shared.value();
         // Sampling the version before cloning may produce a harmless extra
         // wake if a pulse races this read, but cannot mark an unseen value as
         // observed. Publication writes the value before advancing the version.

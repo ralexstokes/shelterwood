@@ -38,8 +38,11 @@ impl RemovalResponses {
     }
 
     fn complete(self, outcome: RemoveOutcome) {
+        let mut panics = runtime::PanicAccumulator::default();
         for sender in self.0 {
-            let _ = sender.send(outcome);
+            panics.run(|| {
+                let _ = sender.send(outcome);
+            });
         }
     }
 }
@@ -644,9 +647,35 @@ fn dispose_definition_then(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Wake, Waker},
+    };
+
     use crate::RemoveOutcome;
 
     use super::RemovalResponses;
+
+    struct CountedPanicWake {
+        message: &'static str,
+        wakes: Arc<AtomicUsize>,
+    }
+
+    impl Wake for CountedPanicWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(self.message);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any(self.message);
+        }
+    }
 
     #[test]
     fn removal_subscription_discards_abandoned_waiters() {
@@ -662,5 +691,48 @@ mod tests {
         );
         responses.complete(RemoveOutcome::Removed);
         assert_eq!(retained.try_receive(), Some(RemoveOutcome::Removed));
+    }
+
+    #[test]
+    fn removal_completion_delivers_to_two_hostile_waiters_before_resuming() {
+        const FIRST_PANIC: &str = "injected first removal wake panic";
+
+        let mut responses = RemovalResponses::default();
+        let mut first = responses.subscribe();
+        let mut second = responses.subscribe();
+        let first_wakes = Arc::new(AtomicUsize::new(0));
+        let second_wakes = Arc::new(AtomicUsize::new(0));
+        let first_waker = Waker::from(Arc::new(CountedPanicWake {
+            message: FIRST_PANIC,
+            wakes: Arc::clone(&first_wakes),
+        }));
+        let second_waker = Waker::from(Arc::new(CountedPanicWake {
+            message: "injected second removal wake panic",
+            wakes: Arc::clone(&second_wakes),
+        }));
+        assert!(
+            first
+                .poll_receive(&mut Context::from_waker(&first_waker))
+                .is_pending()
+        );
+        assert!(
+            second
+                .poll_receive(&mut Context::from_waker(&second_waker))
+                .is_pending()
+        );
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            responses.complete(RemoveOutcome::Removed);
+        }));
+
+        let payload = result.expect_err("the first hostile removal wake still surfaces");
+        assert_eq!(
+            payload.downcast_ref::<&'static str>().copied(),
+            Some(FIRST_PANIC)
+        );
+        assert_eq!(first_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(second_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(first.try_receive(), Some(RemoveOutcome::Removed));
+        assert_eq!(second.try_receive(), Some(RemoveOutcome::Removed));
     }
 }

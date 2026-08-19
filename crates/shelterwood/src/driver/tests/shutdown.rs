@@ -50,7 +50,7 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
             .map(|child| resident_projection(&child.slot))
             .collect(),
     );
-    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let member = Arc::clone(&child.slot.member);
     let mut children = ChildArena::default();
@@ -71,6 +71,16 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
         .expect("worker is active");
     let incarnation = active.incarnation;
     active.abort_handle.abort();
+    let _joined = recv_child_exit(
+        &mut event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the aborted fixture task to join",
+    )
+    .await;
+    // `handle_exit` is a post-join operation in production. Wait for that
+    // boundary before injecting the synthetic application verdict so the
+    // spawned body has released its factory clone and retained-construction
+    // disposal is the sole owner whose panic this fixture observes.
     scope.handle_exit(
         key,
         incarnation,

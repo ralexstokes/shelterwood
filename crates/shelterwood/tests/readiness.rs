@@ -18,10 +18,10 @@ use crate::common::{
     },
 };
 use shelterwood::{
-    Actor, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DynamicTree, ExitError,
-    ExitKind, ExitResult, Jitter, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
-    ReadinessDeadline, RestartCondition, RestartPolicy, ScopeState, Shutdown, StartupError,
-    StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
+    Actor, ActorDef, ActorOnceDef, Backoff, Cancellation, ChildState, Context, DynamicTree,
+    ExitError, ExitKind, ExitResult, Jitter, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
+    ReadinessDeadline, RestartCondition, RestartPolicy, Retention, ScopeState, Shutdown,
+    StartupError, StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
 };
 
 struct ReadyThenStop;
@@ -37,6 +37,88 @@ impl RawActor for ReadyThenStop {
         context.mark_ready();
         context.stop();
         Ok(())
+    }
+}
+
+struct GatedStopInInit;
+
+impl Actor for GatedStopInInit {
+    type Msg = ();
+    type Args = (ReleaseGate, ReleaseGate);
+
+    async fn init(
+        (entered, release): Self::Args,
+        context: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        context.stop();
+        entered.release();
+        release.wait().await;
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
+struct RepeatingStopInInit;
+
+impl Actor for RepeatingStopInInit {
+    type Msg = ();
+    type Args = Arc<AtomicUsize>;
+
+    async fn init(starts: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        starts.fetch_add(1, Ordering::SeqCst);
+        context.stop();
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): (), _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
+struct FailAfterStopInInit;
+
+impl Actor for FailAfterStopInInit {
+    type Msg = ();
+    type Args = ();
+
+    async fn init((): (), context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        context.stop();
+        Err(ExitError::message("init failed after requesting stop"))
+    }
+
+    async fn handle(&mut self, (): (), _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
+struct DelayedStopDecorator {
+    inner: GatedStopInInit,
+}
+
+impl Actor for DelayedStopDecorator {
+    type Msg = ();
+    type Args = ((ReleaseGate, ReleaseGate), ReleaseGate, ReleaseGate);
+
+    async fn init(
+        (inner_args, decorator_entered, release_decorator): Self::Args,
+        context: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        let inner = {
+            let mut inner_context = context.for_actor::<GatedStopInInit>();
+            GatedStopInInit::init(inner_args, &mut inner_context).await?
+        };
+        decorator_entered.release();
+        release_decorator.wait().await;
+        Ok(Self { inner })
+    }
+
+    async fn handle(&mut self, (): (), context: &mut Context<'_, Self>) -> ExitResult {
+        self.inner
+            .handle((), &mut context.for_actor::<GatedStopInInit>())
+            .await
     }
 }
 
@@ -122,6 +204,201 @@ async fn readiness_fired_before_clean_self_stop_counts_for_startup() {
         .await
         .expect("ready-before-stop completes startup");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+#[tokio::test]
+async fn after_init_stop_waits_for_success_then_advances_the_ordered_suffix() {
+    let init_entered = ReleaseGate::default();
+    let release_init = ReleaseGate::default();
+    let decorator_entered = ReleaseGate::default();
+    let release_decorator = ReleaseGate::default();
+    let suffix_started = ReleaseGate::default();
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "stop-in-init",
+        ActorOnceDef::<DelayedStopDecorator>::new((
+            (init_entered.clone(), release_init.clone()),
+            decorator_entered.clone(),
+            release_decorator.clone(),
+        ))
+        .retention(Retention::Retain),
+    )
+    .expect("valid actor");
+    tree.add_task(
+        "suffix",
+        TaskDef::new({
+            let suffix_started = suffix_started.clone();
+            move |context| {
+                let suffix_started = suffix_started.clone();
+                async move {
+                    suffix_started.release();
+                    context.shutdown_token().cancelled().await;
+                    Ok(())
+                }
+            }
+        }),
+    )
+    .expect("valid suffix");
+
+    let system = tree.spawn().expect("runtime is available");
+    let scope = system.scope();
+    init_entered.wait().await;
+    assert_quiet(Duration::from_millis(20), || {
+        scope
+            .child("suffix")
+            .is_some_and(|child| !matches!(child.state, ChildState::Admitted))
+    })
+    .await;
+
+    release_init.release();
+    decorator_entered.wait().await;
+    assert_quiet(Duration::from_millis(20), || {
+        scope
+            .child("suffix")
+            .is_some_and(|child| !matches!(child.state, ChildState::Admitted))
+    })
+    .await;
+    release_decorator.release();
+    suffix_started.wait().await;
+    system
+        .wait_started()
+        .await
+        .expect("successful AfterInit initialization publishes readiness before self-stop");
+    let stopped = scope
+        .wait_for_child(
+            "stop-in-init",
+            |child| child.state.is_terminal(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "self-stopping actor terminalizes: {error:?}; snapshot: {:?}",
+                scope.snapshot()
+            )
+        });
+    let ChildState::Stopped { exit } = stopped.state else {
+        panic!("ready self-stop is not a startup abort: {stopped:?}");
+    };
+    assert!(matches!(exit.kind(), ExitKind::Completed));
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("ordered suffix cooperates");
+}
+
+#[tokio::test]
+async fn manual_stop_in_init_remains_a_terminal_pre_ready_failure() {
+    let init_entered = ReleaseGate::default();
+    let release_init = ReleaseGate::default();
+    let suffix_started = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "manual-stop-in-init",
+        ActorOnceDef::<GatedStopInInit>::new((init_entered.clone(), release_init.clone()))
+            .readiness(Readiness::Manual)
+            .readiness_deadline(ReadinessDeadline::Unbounded),
+    )
+    .expect("valid manually gated actor");
+    let suffix = tree
+        .add_task(
+            "suffix",
+            TaskDef::new({
+                let suffix_started = Arc::clone(&suffix_started);
+                move |_| {
+                    suffix_started.store(true, Ordering::SeqCst);
+                    async { Ok(()) }
+                }
+            }),
+        )
+        .expect("valid suffix");
+
+    let system = tree.spawn().expect("runtime is available");
+    init_entered.wait().await;
+    release_init.release();
+    let (id, exit) = crate::common::startup_failed_child(
+        system
+            .wait_started()
+            .await
+            .expect_err("manual pre-ready self-stop still aborts startup"),
+    );
+    assert_eq!(id.as_str(), "manual-stop-in-init");
+    assert!(matches!(exit.kind(), ExitKind::Completed));
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
+    assert!(!suffix_started.load(Ordering::SeqCst));
+    assert!(matches!(suffix.wait().await.kind(), ExitKind::NeverStarted));
+    system
+        .shutdown(Duration::ZERO)
+        .await
+        .expect("failed tree has no straggler");
+}
+
+#[tokio::test]
+async fn after_init_stop_does_not_publish_readiness_when_init_fails() {
+    let suffix_started = Arc::new(AtomicBool::new(false));
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "failed-stop-in-init",
+        ActorOnceDef::<FailAfterStopInInit>::new(()),
+    )
+    .expect("valid actor");
+    let suffix = tree
+        .add_task(
+            "suffix",
+            TaskDef::new({
+                let suffix_started = Arc::clone(&suffix_started);
+                move |_| {
+                    suffix_started.store(true, Ordering::SeqCst);
+                    async { Ok(()) }
+                }
+            }),
+        )
+        .expect("valid suffix");
+
+    let system = tree.spawn().expect("runtime is available");
+    let (id, exit) = crate::common::startup_failed_child(
+        system
+            .wait_started()
+            .await
+            .expect_err("only a successful AfterInit initializer becomes ready"),
+    );
+    assert_eq!(id.as_str(), "failed-stop-in-init");
+    assert!(matches!(exit.kind(), ExitKind::Failed(_)));
+    assert_eq!(exit.cancellation(), Cancellation::Observed);
+    assert!(!suffix_started.load(Ordering::SeqCst));
+    assert!(matches!(suffix.wait().await.kind(), ExitKind::NeverStarted));
+    system
+        .shutdown(Duration::ZERO)
+        .await
+        .expect("failed tree has no straggler");
+}
+
+#[tokio::test]
+async fn repeated_after_init_self_stops_are_post_ready_until_intensity_trips() {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    tree.add_actor(
+        "restarting-stop-in-init",
+        ActorDef::<RepeatingStopInInit>::cloned(Arc::clone(&starts)).restart(RestartPolicy::new(
+            RestartCondition::Always,
+            Backoff::Immediate,
+        )),
+    )
+    .expect("valid restarting actor");
+
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("the first successful init establishes aggregate readiness");
+    let reason = system.wait().await;
+    assert!(
+        matches!(reason, shelterwood::StopReason::IntensityTripped(_)),
+        "the restart loop ends through intensity, not StartupFailed: {reason:?}"
+    );
+    assert!(starts.load(Ordering::SeqCst) > 1);
 }
 
 #[tokio::test]

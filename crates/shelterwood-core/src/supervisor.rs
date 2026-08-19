@@ -137,10 +137,6 @@ impl ChildRecord {
 /// One input to the structural reducer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
-    Admit {
-        membership: Membership,
-        initial: bool,
-    },
     Spawned {
         child: ChildKey,
     },
@@ -522,12 +518,6 @@ impl SupervisorState {
 
     fn apply(&mut self, event: Event, effects: &mut Vec<Effect>) {
         match event {
-            Event::Admit {
-                membership,
-                initial,
-            } => {
-                let _ = self.admit(membership, initial);
-            }
             Event::Spawned { child } => {
                 if let Some(record) = self.children.get_mut(&child)
                     && matches!(record.state, ChildState::Resident(_))
@@ -731,6 +721,11 @@ pub fn fail_startup(state: &mut SupervisorState) -> Option<ScopeState> {
 }
 
 /// Begins a drain and returns the transition its owner must publish.
+///
+/// The tuple is `(startup_pending, state)`: `startup_pending` reports whether
+/// startup was still in flight when the drain opened, so the owner knows a
+/// startup result accompanies this publication. `None` means no transition —
+/// a drain was already in progress and only its reason may have been upgraded.
 pub fn begin_drain(
     state: &mut SupervisorState,
     reason: StopReason,
@@ -740,6 +735,10 @@ pub fn begin_drain(
 }
 
 /// Hard-forces all incomplete children and returns a newly entered drain.
+///
+/// The tuple is `(startup_pending, state)`, exactly as `begin_drain` returns
+/// it; `None` means the force landed on an already-draining scope and there is
+/// no new transition to publish.
 pub fn force(state: &mut SupervisorState, effects: &mut Vec<Effect>) -> Option<(bool, ScopeState)> {
     state.force(effects)
 }
@@ -1190,14 +1189,6 @@ mod tests {
         let child = admit(&mut state, membership, false);
         let mut effects = Vec::new();
         assert_eq!(super::admit(&mut state, membership, false), None);
-        step(
-            &mut state,
-            Event::Admit {
-                membership,
-                initial: false,
-            },
-            &mut effects,
-        );
         assert!(effects.is_empty());
         assert_eq!(state.len(), 1);
 

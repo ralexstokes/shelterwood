@@ -220,8 +220,10 @@ normative so that "pure" is not misread into pessimization:
 - `step` MAY take `&mut State` — pure means no I/O, clocks, randomness, or
   awaits; it does not mean persistent data structures or defensive clones.
 - Effects MAY flow through a caller-owned buffer
-  (`step(&mut state, event, &mut Vec<Effect>)`) rather than a returned `Vec`;
-  tests and production can reuse that buffer, so hot steps allocate nothing.
+  (`step(&mut state, event, &mut Vec<Effect>)`) rather than a returned `Vec`,
+  which a caller MAY reuse across steps. Reuse is a permission, not a
+  guarantee: a caller that drains the buffer by moving out of it gives the
+  allocation back on every flush.
 - The actor loop's next-action decision is a small `Copy` enum, not a
   boxed plan.
 

@@ -843,21 +843,6 @@ pub enum ResolvedMailbox {
     Latest,
 }
 
-impl ResolvedMailbox {
-    fn resolve(
-        value: Option<Mailbox>,
-        inherited: Self,
-        inherited_queue_capacity: NonZeroUsize,
-    ) -> Self {
-        match value {
-            None => inherited,
-            Some(Mailbox::Queue(None)) => Self::Queue(inherited_queue_capacity),
-            Some(Mailbox::Queue(Some(capacity))) => Self::Queue(capacity),
-            Some(Mailbox::Latest) => Self::Latest,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResolvedReadinessDeadline {
     Bounded(NonZeroDuration),
@@ -909,6 +894,21 @@ impl ResolvedDefaults {
         match self.mailbox_kind {
             ResolvedMailboxKind::Queue => ResolvedMailbox::Queue(self.queue_capacity),
             ResolvedMailboxKind::Latest => ResolvedMailbox::Latest,
+        }
+    }
+
+    /// Resolves a child's mailbox override against these defaults.
+    ///
+    /// Kept on `ResolvedDefaults` for the same reason `overlay` resolves the
+    /// kind and the capacity together: an inherited `Queue` and the capacity
+    /// it inherits come from one value, so the contradictory pairing of
+    /// `Queue(a)` with a capacity `b != a` has no way to be written.
+    pub fn resolve_child_mailbox(&self, value: Option<Mailbox>) -> ResolvedMailbox {
+        match value {
+            None => self.mailbox(),
+            Some(Mailbox::Queue(None)) => ResolvedMailbox::Queue(self.queue_capacity),
+            Some(Mailbox::Queue(Some(capacity))) => ResolvedMailbox::Queue(capacity),
+            Some(Mailbox::Latest) => ResolvedMailbox::Latest,
         }
     }
 
@@ -970,11 +970,7 @@ pub fn resolve_common(
             resolve(options.restart, defaults.child_restart)
         },
         shutdown: resolve(options.shutdown, defaults.child_shutdown),
-        mailbox: ResolvedMailbox::resolve(
-            options.mailbox,
-            defaults.mailbox(),
-            defaults.queue_capacity,
-        ),
+        mailbox: defaults.resolve_child_mailbox(options.mailbox),
         mailbox_shutdown: resolve(options.mailbox_shutdown, defaults.mailbox_shutdown),
         readiness: resolve(options.readiness, default_readiness),
         readiness_deadline: ResolvedReadinessDeadline::resolve(

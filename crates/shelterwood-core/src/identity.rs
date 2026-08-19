@@ -307,7 +307,12 @@ pub struct MintedMembership {
 }
 
 /// Result of reconciling a provisional membership with a stable scope.
+///
+/// Dropping a `Minted` outcome strands the slot on its provisional lineage
+/// while the stable scope has already issued the successor, so the
+/// reconciliation is never optional to consume.
 #[derive(Debug)]
+#[must_use]
 pub enum MembershipReconciliation {
     /// The stable scope adopted the provisional lineage unchanged.
     Adopted,

@@ -467,8 +467,7 @@ impl ScopeRuntime {
     /// blocking pool stays detached and its unknowable result cannot delay
     /// the kill path.
     fn drain_arrived_disposal_events(&mut self) {
-        while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut self.disposal_event_receiver)
-        {
+        while let Some(event) = self.disposal_event_receiver.try_recv() {
             // The lane has one producer, which sends exactly one variant.
             // Assert rather than let a pattern-matching loop condition drop
             // an unexpected event and silently abandon the rest of the
@@ -1116,7 +1115,10 @@ async fn run_scope_incarnation(
                     // A closed receiver would otherwise make this select arm
                     // permanently ready and spin, so diagnose any future
                     // ownership change where it is first observable.
-                    debug_assert!(false, "a driver event lane outlives its receive loop");
+                    debug_assert!(
+                        false,
+                        "a driver event lane closed before its receive loop exited"
+                    );
                 }
                 runtime::ScopeWake::Deadline => {
                     // A producer becoming ready at the same instant owns the

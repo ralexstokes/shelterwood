@@ -259,7 +259,7 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
 
     assert!(parent.terminalize_child(
         &nested.member,
-        Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed,),
+        Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed),
         Some(incarnation),
         StartupDisposition::NotAborted,
     ));
@@ -350,7 +350,7 @@ async fn terminal_scope_in_drain_waits_for_its_live_incarnation_to_stop() {
 
     assert!(parent.terminalize_child(
         &nested.member,
-        Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed,),
+        Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed),
         Some(incarnation),
         StartupDisposition::NotAborted,
     ));
@@ -414,7 +414,7 @@ impl AbortedNestedDriverFixture {
     fn terminalize_from_parent(&self) {
         assert!(self.parent.terminalize_child(
             &self.nested.member,
-            Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed,),
+            Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed),
             Some(self.incarnation),
             StartupDisposition::NotAborted,
         ));

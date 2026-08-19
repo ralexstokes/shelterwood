@@ -491,18 +491,6 @@ pub fn unbounded_mpsc<T>() -> (UnboundedMpscSender<T>, UnboundedMpscReceiver<T>)
     (UnboundedMpscSender(sender), UnboundedMpscReceiver(receiver))
 }
 
-pub fn unbounded_mpsc_send<T>(sender: &UnboundedMpscSender<T>, value: T) -> Result<(), T> {
-    sender.send(value)
-}
-
-pub fn unbounded_mpsc_try_recv<T>(receiver: &mut UnboundedMpscReceiver<T>) -> Option<T> {
-    receiver.try_recv()
-}
-
-pub fn unbounded_mpsc_is_empty<T>(receiver: &UnboundedMpscReceiver<T>) -> bool {
-    receiver.is_empty()
-}
-
 pub enum ScopeWake<T> {
     Signal,
     ParentShutdown,
@@ -691,9 +679,9 @@ mod tests {
         let (sender, mut receiver) = super::unbounded_mpsc();
         let (control_sender, mut control_receiver) = super::unbounded_mpsc();
         for value in 0..128 {
-            assert!(super::unbounded_mpsc_send(&control_sender, value).is_ok());
+            assert!(control_sender.send(value).is_ok());
         }
-        assert!(super::unbounded_mpsc_send(&sender, 999).is_ok());
+        assert!(sender.send(999).is_ok());
 
         let wake = super::wait_scope(
             super::ScopeWait {
@@ -707,10 +695,7 @@ mod tests {
         .await;
 
         assert!(matches!(wake, super::ScopeWake::Message(Some(999))));
-        assert_eq!(
-            super::unbounded_mpsc_try_recv(&mut control_receiver),
-            Some(0)
-        );
+        assert_eq!(control_receiver.try_recv(), Some(0));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

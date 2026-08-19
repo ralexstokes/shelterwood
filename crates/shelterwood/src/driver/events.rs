@@ -167,7 +167,7 @@ pub(super) fn collect_driver_events(
     pending: &mut Vec<(ArbitrationClass, Pending)>,
 ) -> bool {
     for _ in 0..limit {
-        let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
+        let Some(event) = receiver.try_recv() else {
             return false;
         };
         pending.push(Pending::from(event).classified());
@@ -176,7 +176,7 @@ pub(super) fn collect_driver_events(
     // lane. Probe once more so a lane that drained right at the limit skips
     // the full-batch yield; a probed event joins this batch rather than
     // being deferred a wake.
-    let Some(event) = runtime::unbounded_mpsc_try_recv(receiver) else {
+    let Some(event) = receiver.try_recv() else {
         return false;
     };
     pending.push(Pending::from(event).classified());

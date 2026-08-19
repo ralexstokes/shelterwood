@@ -586,13 +586,13 @@ impl DynamicRoute for DynamicControl {
 fn queue_driver_event(control: &DynamicControl, event: DriverEvent) {
     // Synchronous and runtime-independent: admission detaches at its first
     // poll, and removal may be signalled from a foreign thread.
-    let _ = runtime::unbounded_mpsc_send(&control.requests, event);
+    let _ = control.requests.send(event);
 }
 
 fn defer_driver_event(txn: &mut ObservationTxn<'_>, control: &DynamicControl, event: DriverEvent) {
     let requests = control.requests.clone();
     txn.defer(move || {
-        let _ = runtime::unbounded_mpsc_send(&requests, event);
+        let _ = requests.send(event);
     });
 }
 

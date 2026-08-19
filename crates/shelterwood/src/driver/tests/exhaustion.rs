@@ -144,14 +144,13 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
     );
 
     assert!(
-        crate::runtime::unbounded_mpsc_send(
-            &scope.events,
-            DriverEvent::Child(ChildEvent::Ready {
+        scope
+            .events
+            .send(DriverEvent::Child(ChildEvent::Ready {
                 child: key,
                 incarnation: first,
-            }),
-        )
-        .is_ok(),
+            }))
+            .is_ok(),
         "the driver lane remains open"
     );
 

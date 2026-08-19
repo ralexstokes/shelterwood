@@ -151,7 +151,7 @@ fn every_event_lane_is_capped_and_a_saturated_lane_forces_a_yield() {
         "disposal completions trail both lifecycle lanes so they stay batch-tail events"
     );
     assert!(
-        crate::runtime::unbounded_mpsc_try_recv(&mut disposal_receiver).is_some(),
+        disposal_receiver.try_recv().is_some(),
         "the disposal suffix remains for a later scheduler turn"
     );
 }

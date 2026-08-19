@@ -754,7 +754,7 @@ async fn abort_policy_task_exits_aborted_without_grace() {
     assert_eq!(exit.cancellation(), Cancellation::Observed);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn completion_during_the_tidy_beat_is_not_reclassified_as_abort() {
     let mut tree = Tree::new();
     let task = tree

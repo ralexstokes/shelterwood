@@ -705,8 +705,8 @@ mod tests {
         Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, IntensityTrip, JoinOutcome,
         RecordedOutcome, StartupError, StartupFailure, StartupFailureCause, StopReason,
         classify_disposal_panic, classify_exit, exit_kind_eq, prefer_earlier,
-        reconcile_recorded_outcomes, stop_reason_into_nested_result, stop_reason_root_exit,
-        structured_intensity_trip_error, structured_startup_failure_error,
+        reconcile_recorded_outcomes, stop_reason_into_nested_result, stop_reason_precedence,
+        stop_reason_root_exit, structured_intensity_trip_error, structured_startup_failure_error,
     };
 
     fn exit(kind: ExitKind, cancellation: Cancellation) -> Exit {
@@ -1146,6 +1146,63 @@ mod tests {
             never_started.as_error().to_string(),
             "nested scope never started"
         );
+    }
+
+    #[test]
+    fn stop_reason_precedence_is_severity_ascending() {
+        use super::StopPrecedence;
+
+        // `StopPrecedence` derives `Ord` from declaration order, and both
+        // consumers resolve competing verdicts with strictly-greater, so the
+        // order is the contract. Pin the two boundaries the doc calls out by
+        // name.
+        assert!(
+            StopPrecedence::StartupFailed < StopPrecedence::ShutdownRequested,
+            "a requested stop supersedes the structured failures"
+        );
+        assert!(
+            StopPrecedence::ShutdownRequested < StopPrecedence::NeverStarted,
+            "a membership that never started is the top element"
+        );
+
+        let trip = IntensityTrip {
+            max_restarts: 1,
+            observed_restarts: 2,
+            within: Duration::from_secs(10),
+        };
+        let startup = StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: ChildId::from("nested"),
+            },
+        };
+        let ascending = [
+            StopReason::Finished,
+            StopReason::IntensityTripped(trip),
+            StopReason::StartupFailed(startup),
+            StopReason::ShutdownRequested,
+            StopReason::NeverStarted,
+        ];
+
+        for reason in &ascending {
+            // Exhaustive over `StopReason` without restating the mapping: a
+            // new variant does not compile until it is placed in the list
+            // above, which is what the ordering below then checks.
+            match reason {
+                StopReason::Finished
+                | StopReason::IntensityTripped(_)
+                | StopReason::StartupFailed(_)
+                | StopReason::ShutdownRequested
+                | StopReason::NeverStarted => {}
+            }
+        }
+        for pair in ascending.windows(2) {
+            assert!(
+                stop_reason_precedence(&pair[0]) < stop_reason_precedence(&pair[1]),
+                "{:?} must outrank {:?}",
+                pair[1],
+                pair[0]
+            );
+        }
     }
 
     #[test]

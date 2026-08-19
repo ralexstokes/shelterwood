@@ -640,19 +640,25 @@ async fn plain_restart_publishes_exited_old_before_started_new() {
     let mut lifecycle = system.scope().subscribe_lifecycle();
     fail_first.release();
 
+    let mut exited = Vec::new();
     loop {
         let event = next_event(&mut lifecycle).await;
         match event.kind {
-            LifecycleEventKind::Exited { incarnation, .. } if incarnation == first => break,
+            LifecycleEventKind::Exited { incarnation, .. } if incarnation == first => {
+                exited.push(incarnation);
+                break;
+            }
             _ => {}
         }
     }
     let second = loop {
         let event = next_event(&mut lifecycle).await;
-        if let LifecycleEventKind::Started { incarnation, .. } = event.kind
-            && incarnation.supersedes(first)
-        {
-            break incarnation;
+        match event.kind {
+            LifecycleEventKind::Started { incarnation, .. } if incarnation.supersedes(first) => {
+                break incarnation;
+            }
+            LifecycleEventKind::Exited { incarnation, .. } => exited.push(incarnation),
+            _ => {}
         }
     };
     assert!(second.supersedes(first));
@@ -661,6 +667,23 @@ async fn plain_restart_publishes_exited_old_before_started_new() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("replacement stops");
+    loop {
+        let item = tokio::time::timeout(POLL_TIMEOUT, lifecycle.recv())
+            .await
+            .expect("terminal lifecycle closure is bounded");
+        let Some(item) = item else { break };
+        let LifecycleItem::Event(event) = item else {
+            panic!("small restart fixture must not lag");
+        };
+        if let LifecycleEventKind::Exited { incarnation, .. } = event.kind {
+            exited.push(incarnation);
+        }
+    }
+    assert_eq!(
+        exited,
+        [first, second],
+        "the public stream emits exactly one Exited edge for each incarnation"
+    );
 }
 
 #[tokio::test]

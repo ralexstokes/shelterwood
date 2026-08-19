@@ -2678,6 +2678,7 @@ or lifetime paragraph is unmapped.
   handles report terminal. Dynamic membership that must survive an
   ancestor restart is application state (own the roster; re-add on
   restart), not framework state.
+  (`integration::restarted_dynamic_subtree_does_not_recreate_runtime_children`.)
 - **The lowering rule.** Lowering is where tree validation happens, on
   every flavor; `spawn()` is simply the root's lowering and the only
   lowering with a builder caller to hand `BuildError` to. Every other
@@ -3633,7 +3634,7 @@ implementation rather than interpreting a bare duration locally:
 |---|---|---|---|
 | no attempt | `send_timeout`, `call`, `ReplyReceiver::recv`, `offload`, `offload_scoped` | do not submit/poll work or observe completion; return/deliver the timeout result | `mailbox::deadline::a_zero_budget_short_circuits_without_polling_the_operation`, `integration::zero_deadlines_short_circuit_without_acceptance_or_message_construction`, `integration::reply_receiver_reports_drop_and_is_safe_to_abandon`, `integration::zero_budget_offload_never_polls_work_and_times_out_on_actor_task` |
 | poll once | `wait_for_child` | evaluate the current snapshot once with precedence match → terminal scope → timeout; never await | `integration::zero_duration_wait_observes_an_already_satisfied_child`, `integration::wait_for_child_handles_later_ids_terminal_children_timeouts_and_scope_termination` |
-| immediate escalation | `System::shutdown`, `ScopeRef::shutdown_and_wait`, `start_or_shutdown` rollback | request cooperative cancellation, skip only the cooperative wait, then run the ordinary abort tail | `integration::zero_shutdown_reports_the_live_child_but_detaches_blocking_factory_disposal` (the discriminating pin: a child that *could* settle on the skipped poll is still reported as a straggler), `integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`, `integration::start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stragglers` |
+| immediate escalation | `System::shutdown`, `ScopeRef::shutdown_and_wait`, `start_or_shutdown` rollback | request cooperative cancellation, skip only the cooperative wait, then run the ordinary abort tail | `integration::zero_shutdown_reports_the_live_child_but_detaches_blocking_factory_disposal` (the discriminating pin: a child that *could* settle on the skipped poll is still reported as a straggler), `integration::zero_timeout_reports_recursive_straggler_paths_and_joins_them`, `integration::subtree_shutdown_and_wait_zero_escalates_and_joins_its_target_incarnation` (the scope-handle sibling: relative straggler paths, and the abort tail still joined before the call returns), `integration::start_or_shutdown_rollback_timeout_preserves_the_startup_cause_and_stragglers` |
 
 For a no-attempt offload, whose timeout outcome is a delivery rather than a
 call failure, the work future is never polled and the total continuation

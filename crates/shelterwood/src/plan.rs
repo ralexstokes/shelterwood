@@ -8,7 +8,7 @@ use std::{
 use crate::{
     ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults,
     admission::ReserveError,
-    cells::{ErasedDynamicSlot, MemberCell, ObservationTxn, ScopeCell},
+    cells::{MemberCell, ObservationTxn, ScopeCell},
     definition::DefinitionSource,
     identity::ScopeIdentity,
     policy::{
@@ -76,25 +76,6 @@ pub(crate) struct SlotCell {
     pub(crate) member: Arc<MemberCell>,
     pub(crate) scope: Option<Arc<ScopeCell>>,
     definition: Mutex<DefinitionState>,
-}
-
-/// Erases a plan-owned slot without replacing its canonical `Arc` allocation.
-///
-/// Dynamic-route calls cross the lower cell layer through this representation;
-/// only the paired recovery helpers below consume values from that boundary.
-pub(crate) fn erase_dynamic_slot(slot: Arc<SlotCell>) -> Arc<ErasedDynamicSlot> {
-    slot
-}
-
-/// Recovers the plan-owned slot returned by the crate's dynamic route.
-pub(crate) fn concrete_dynamic_slot(slot: Arc<ErasedDynamicSlot>) -> Arc<SlotCell> {
-    Arc::downcast(slot).expect("the dynamic route must return its plan-owned slot type")
-}
-
-/// Borrows the plan-owned slot passed back to the crate's dynamic route.
-pub(crate) fn concrete_dynamic_slot_ref(slot: &ErasedDynamicSlot) -> &SlotCell {
-    slot.downcast_ref()
-        .expect("the dynamic route must receive its plan-owned slot type")
 }
 
 impl SlotCell {
@@ -630,7 +611,6 @@ mod tests {
 
     use super::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeConstruction, SlotCell,
-        concrete_dynamic_slot, concrete_dynamic_slot_ref, erase_dynamic_slot,
     };
 
     fn configured_task() -> TaskDef {
@@ -741,21 +721,6 @@ mod tests {
             root.snapshot().children.is_empty(),
             "plan teardown withdraws every published residency before root closure"
         );
-    }
-
-    #[test]
-    fn dynamic_slot_erasure_preserves_the_canonical_allocation() {
-        let declaration = BuilderCore::new(ScopeFlavor::Dynamic);
-        let slot = SlotCell::new(Arc::clone(&declaration.root.member), None);
-
-        let erased = erase_dynamic_slot(Arc::clone(&slot));
-        assert!(std::ptr::eq(
-            concrete_dynamic_slot_ref(erased.as_ref()),
-            slot.as_ref(),
-        ));
-
-        let restored = concrete_dynamic_slot(erased);
-        assert!(Arc::ptr_eq(&restored, &slot));
     }
 
     #[test]

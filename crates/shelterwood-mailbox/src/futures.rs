@@ -153,6 +153,12 @@ impl<M: Send + 'static> ActorRef<M> {
     /// actor handler deadlocks because the blocked handler is also the only code
     /// that can produce the reply; use an actor-local continuation or an
     /// incarnation-owned offload instead.
+    ///
+    /// A timeout before acceptance has no caller to hand the request back to,
+    /// so it destroys both the recovered request and the waker it registered
+    /// through isolated disposal, as cancelling a parked [`send`](Self::send)
+    /// does. A panicking waker destructor is contained there rather than
+    /// resuming on the awaiting task.
     pub fn call<T: Send + 'static>(
         &self,
         make_msg: impl FnOnce(Reply<T>) -> M + Send + 'static,
@@ -428,9 +434,19 @@ impl<M> fmt::Debug for SendTimeout<M> {
     }
 }
 
-fn withdraw_send<M: Send + 'static>(send: &mut SendFuture<M>) -> Result<Incarnation, SendError<M>> {
+/// Withdraws an unaccepted send and classifies its outcome under the
+/// caller's chosen waker disposition.
+///
+/// The outcome is taken before `finish()` releases the registered waker, so
+/// under either disposition the recovered message already belongs to
+/// `result` and a hostile waker destructor can neither divert nor destroy
+/// it.
+fn withdraw_send_with<M: Send + 'static>(
+    send: &mut SendFuture<M>,
+    disposition: WithdrawalDisposition,
+) -> Result<Incarnation, SendError<M>> {
     let actor_id = send.mailbox.actor_id.clone();
-    let mut withdrawal = send.withdraw(WithdrawalDisposition::Inline);
+    let mut withdrawal = send.withdraw(disposition);
     let result = match withdrawal.take_outcome() {
         WithdrawalOutcome::Withdrawn { message, observed } => Err(SendError {
             actor_id,
@@ -446,12 +462,16 @@ fn withdraw_send<M: Send + 'static>(send: &mut SendFuture<M>) -> Result<Incarnat
             kind: SendErrorKind::Terminated,
         }),
     };
-    // Unlike the cancellation path this is a normal return on the caller's own
-    // task, so the caller's waker destructor stays inline and its panic stays
-    // visible; no core lock is held and the recovered message already belongs
-    // to `result`.
     withdrawal.finish();
     result
+}
+
+fn withdraw_send<M: Send + 'static>(send: &mut SendFuture<M>) -> Result<Incarnation, SendError<M>> {
+    // Unlike the cancellation path this is a normal return on the caller's own
+    // task, and the recovered message goes back to that same caller. No core
+    // lock is held, so the caller's waker destructor stays inline and its
+    // panic stays visible.
+    withdraw_send_with(send, WithdrawalDisposition::Inline)
 }
 
 impl<M: Send + 'static> DeadlineOperation for TimedSend<M> {
@@ -641,10 +661,14 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             return Poll::Pending;
         }
 
-        let result = withdraw_send(
+        // A call cannot return a recovered message to its caller. Isolate the
+        // registered waker before taking that message so a hostile waker
+        // destructor cannot unwind through and destroy the message inline.
+        let result = withdraw_send_with(
             self.send
                 .as_mut()
                 .expect("an unaccepted call retains its send future"),
+            WithdrawalDisposition::Isolated,
         );
         self.send = None;
         match result {
@@ -710,7 +734,8 @@ mod tests {
 
     use super::{
         super::cell::tests::{actor, actor_for},
-        ActorRef, MailboxCell, SendFuture, SendFutureState, SendOperation,
+        ActorRef, DeadlineOperation, DeadlinePhase, MailboxCell, SendFuture, SendFutureState,
+        SendOperation,
     };
 
     #[derive(Default)]
@@ -922,6 +947,56 @@ mod tests {
         }
     }
 
+    struct CallMessage {
+        _reply: crate::Reply<u8>,
+        _payload: ThreadRecordingDrop,
+    }
+
+    struct EveryWakerDropPanics(DisposalThread);
+
+    unsafe fn clone_panicking_drop_waker(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the reference represented by
+        // `data`; the returned raw waker owns only the new clone.
+        let probe =
+            ManuallyDrop::new(unsafe { Arc::<EveryWakerDropPanics>::from_raw(data.cast()) });
+        RawWaker::new(
+            Arc::into_raw(Arc::clone(&probe)).cast(),
+            &PANICKING_DROP_WAKER_VTABLE,
+        )
+    }
+
+    unsafe fn wake_panicking_drop_waker(data: *const ()) {
+        // SAFETY: wake consumes the reference represented by this raw waker.
+        drop(unsafe { Arc::<EveryWakerDropPanics>::from_raw(data.cast()) });
+    }
+
+    unsafe fn wake_by_ref_panicking_drop_waker(_data: *const ()) {}
+
+    unsafe fn drop_panicking_drop_waker(data: *const ()) {
+        // SAFETY: drop consumes the reference represented by this raw waker.
+        let probe = unsafe { Arc::<EveryWakerDropPanics>::from_raw(data.cast()) };
+        *probe.0.lock().expect("waker disposal recorder mutex") = Some(std::thread::current().id());
+        panic!("injected call waker drop panic");
+    }
+
+    static PANICKING_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_panicking_drop_waker,
+        wake_panicking_drop_waker,
+        wake_by_ref_panicking_drop_waker,
+        drop_panicking_drop_waker,
+    );
+
+    fn panicking_drop_waker(recorder: DisposalThread) -> Waker {
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::new(EveryWakerDropPanics(recorder))).cast(),
+            &PANICKING_DROP_WAKER_VTABLE,
+        );
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
+
     /// Parks `send` behind a hostile waker and releases the caller's own
     /// reference, leaving the registered clone as the last owner.
     fn park_behind_hostile_waker<M: Send + 'static>(
@@ -997,6 +1072,68 @@ mod tests {
             "a hostile waker destructor cannot divert the message from isolated disposal"
         );
         assert_ne!(await_disposal(&waker_thread), here);
+    }
+
+    #[test]
+    fn call_acceptance_timeout_isolates_message_before_hostile_waker_drop() {
+        let (_mailbox, actor): (Arc<MailboxCell<CallMessage>>, ActorRef<CallMessage>) = actor_for();
+        let message_thread = disposal_thread();
+        let waker_thread = disposal_thread();
+        let mut call = Box::pin(actor.call(
+            {
+                let message_thread = Arc::clone(&message_thread);
+                move |reply| CallMessage {
+                    _reply: reply,
+                    _payload: ThreadRecordingDrop(message_thread),
+                }
+            },
+            Duration::from_secs(1),
+        ));
+        let hostile = panicking_drop_waker(Arc::clone(&waker_thread));
+        let mut context = Context::from_waker(&hostile);
+        let deadline = crate::deadline::Deadline::after(
+            crate::capability::tests::runtime().now(),
+            Duration::from_secs(1),
+        );
+
+        assert!(
+            call.deadlined
+                .operation
+                .poll_deadlined(&mut context, deadline, DeadlinePhase::InitialAttempt)
+                .is_pending()
+        );
+        let polling_thread = std::thread::current().id();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            call.deadlined.operation.poll_deadlined(
+                &mut context,
+                deadline,
+                DeadlinePhase::TimeoutArbitration,
+            )
+        }));
+        // The context's raw waker is deliberately leaked: its separately
+        // registered clone is the object whose disposal boundary this test
+        // observes, and dropping this caller-owned instance would invoke the
+        // same intentionally hostile vtable on the test thread.
+        std::mem::forget(hostile);
+
+        let outcome = result.expect("isolated withdrawal contains the hostile waker destructor");
+        assert!(matches!(
+            outcome,
+            Poll::Ready(Err(crate::CallError {
+                kind: crate::CallErrorKind::AcceptanceTimedOut,
+                ..
+            }))
+        ));
+        assert_ne!(
+            await_disposal(&waker_thread),
+            polling_thread,
+            "the pre-acceptance withdrawal disposes its registered waker off the polling task"
+        );
+        assert_ne!(
+            await_disposal(&message_thread),
+            polling_thread,
+            "the recovered call message reaches isolated disposal before any waker panic can unwind"
+        );
     }
 
     #[test]

@@ -272,8 +272,36 @@ enum SpawnBody {
     },
 }
 
+enum PendingSpawnBody {
+    /// Restartable bodies hold only framework data and clones of state that
+    /// remains retained by `ChildConstruction`, so unwinding can only release
+    /// a non-last owner.
+    Retained(SpawnBody),
+    /// One-shot bodies carry the sole user-owned construction payload.
+    Isolated(runtime::Isolated<SpawnBody>),
+}
+
+impl PendingSpawnBody {
+    fn restartable(body: SpawnBody) -> Self {
+        Self::Retained(body)
+    }
+
+    fn one_shot(body: SpawnBody) -> Self {
+        Self::Isolated(runtime::Isolated::new(body))
+    }
+
+    fn into_body(self) -> SpawnBody {
+        match self {
+            Self::Retained(body) => body,
+            Self::Isolated(mut body) => body
+                .take()
+                .expect("a child spawn retains its one-shot construction body"),
+        }
+    }
+}
+
 struct SpawnDispatch {
-    body: SpawnBody,
+    body: PendingSpawnBody,
     construction_spent: bool,
 }
 
@@ -354,39 +382,44 @@ fn dispatch_child_construction(
     match construction {
         ChildConstruction::Raw(definition) => {
             let construction_spent = definition.one_shot();
-            SpawnDispatch {
-                body: SpawnBody::Raw {
-                    spawn: definition.take_spawn(),
-                    context: RawRunContext {
-                        id,
-                        incarnation,
-                        member: Arc::clone(&child.slot.member),
-                        scope: crate::scope::ScopeRef {
-                            cell: Arc::clone(root),
-                        },
-                        shutdown: latches.shutdown.clone(),
-                        abort: latches.abort.clone(),
-                        ready: latches.ready.clone(),
-                        local_stop: latches.local_stop.clone(),
-                        mailbox_shutdown: child.options.mailbox_shutdown,
+            let body = SpawnBody::Raw {
+                spawn: definition.take_spawn(),
+                context: RawRunContext {
+                    id,
+                    incarnation,
+                    member: Arc::clone(&child.slot.member),
+                    scope: crate::scope::ScopeRef {
+                        cell: Arc::clone(root),
                     },
-                    readiness: child.options.readiness,
+                    shutdown: latches.shutdown.clone(),
+                    abort: latches.abort.clone(),
+                    ready: latches.ready.clone(),
+                    local_stop: latches.local_stop.clone(),
+                    mailbox_shutdown: child.options.mailbox_shutdown,
+                },
+                readiness: child.options.readiness,
+            };
+            SpawnDispatch {
+                body: if construction_spent {
+                    PendingSpawnBody::one_shot(body)
+                } else {
+                    PendingSpawnBody::restartable(body)
                 },
                 construction_spent,
             }
         }
         ChildConstruction::Task(definition) => SpawnDispatch {
-            body: SpawnBody::TaskRestartable {
+            body: PendingSpawnBody::restartable(SpawnBody::TaskRestartable {
                 factory: Arc::clone(&definition.factory),
                 context: TaskContext::new(id, incarnation, latches.task_context()),
-            },
+            }),
             construction_spent: false,
         },
         ChildConstruction::TaskOnce(definition) => SpawnDispatch {
-            body: SpawnBody::TaskOnce {
+            body: PendingSpawnBody::one_shot(SpawnBody::TaskOnce {
                 body: definition.take_body(),
                 context: TaskContext::new(id, incarnation, latches.task_context()),
-            },
+            }),
             construction_spent: true,
         },
         ChildConstruction::Scope(definition) => {
@@ -425,7 +458,11 @@ fn dispatch_child_construction(
                 )
             };
             SpawnDispatch {
-                body,
+                body: if construction_spent {
+                    PendingSpawnBody::one_shot(body)
+                } else {
+                    PendingSpawnBody::restartable(body)
+                },
                 construction_spent,
             }
         }
@@ -670,6 +707,11 @@ impl ScopeRuntime {
             // terminal publication or restart-window arbitration.
             drop(child.construction.take());
         }
+        // Binding and Started publication can both resume hostile waker
+        // panics. Keep one-shot construction state behind isolated disposal
+        // until those effects have completed, then transfer it at the task
+        // launch boundary.
+        let body = body.into_body();
         let abort_handle = spawn_child_tasks(ChildTaskLaunch {
             events: self.events.clone(),
             key,

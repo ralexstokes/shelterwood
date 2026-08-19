@@ -947,6 +947,47 @@ fn concurrent_terminalizers_return_after_one_consistent_record_is_visible() {
 }
 
 #[test]
+fn a_losing_terminalizer_does_not_reclassify_or_republish_startup() {
+    let mut identity = ScopeIdentity::new();
+    let id = ChildId::from("worker");
+    let member = MemberCell::new(
+        id.clone(),
+        identity.mint_membership(&id).expect("membership available"),
+    );
+    let winner = Exit::new(ExitKind::Completed, Cancellation::NotObserved);
+    member.terminalize(winner, StartupDisposition::NotAborted);
+    let winning_record = member.record();
+
+    let mut watcher = member.record_watcher();
+    let mut changed = Box::pin(watcher.changed());
+    assert!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "the watcher starts at the winning terminal publication"
+    );
+
+    member.terminalize(
+        Exit::new(ExitKind::NeverStarted, Cancellation::NotObserved),
+        StartupDisposition::Aborted,
+    );
+
+    assert_eq!(
+        member.record(),
+        winning_record,
+        "first terminalizer wins the whole terminal record, including startup classification"
+    );
+    assert!(
+        changed
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "a losing terminalizer publishes no second record edge"
+    );
+}
+
+#[test]
 fn terminal_startup_wake_follows_member_and_incarnation_publication() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("root");

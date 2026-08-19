@@ -10,8 +10,7 @@ use std::{
 use shelterwood_core::DeadlineBudget;
 
 use crate::{
-    ActorIdentity, ChildId, Incarnation, MailboxRuntime, Membership,
-    capability::{DisposingReceiver, dispose},
+    ActorIdentity, ChildId, Incarnation, MailboxRuntime, Membership, capability::DisposingReceiver,
 };
 
 use super::{
@@ -163,12 +162,10 @@ impl<M: Send + 'static> ActorRef<M> {
             deadlined: Deadlined::no_attempt(
                 CallOperation {
                     actor: self.clone(),
-                    runtime: Arc::clone(&runtime),
                     make_msg: Some(Box::new(make_msg)),
                     send: None,
                     reply: None,
                     accepted: None,
-                    dispose_constructor: dispose::<MessageConstructor<M, T>>,
                 },
                 deadline,
                 runtime,
@@ -214,18 +211,10 @@ impl<M> Hash for ActorRef<M> {
 
 /// Cancellation-safe future returned by [`ActorRef::send`].
 #[must_use]
-pub struct SendFuture<M> {
+pub struct SendFuture<M: Send + 'static> {
     mailbox: Arc<MailboxCell<M>>,
-    runtime: Arc<dyn MailboxRuntime>,
     state: SendFutureState<M>,
-    // Captured where `M: Send + 'static` holds so the unbounded `Drop` impl
-    // can route a withdrawn message through isolated disposal.
-    dispose: fn(&Arc<dyn MailboxRuntime>, M),
-    withdraw_operation: WithdrawOperation<M>,
 }
-
-type WithdrawOperation<M> =
-    fn(&MailboxCell<M>, &Arc<SendOperation<M>>, WithdrawalDisposition) -> Withdrawal<M>;
 
 enum SendFutureState<M> {
     Immediate(Option<M>),
@@ -239,17 +228,13 @@ enum SendFutureState<M> {
 
 // No field is structurally pinned. In particular, the immediate message may
 // move when first poll hands it to the mailbox.
-impl<M> Unpin for SendFuture<M> {}
+impl<M: Send + 'static> Unpin for SendFuture<M> {}
 
 impl<M: Send + 'static> SendFuture<M> {
     fn new(mailbox: Arc<MailboxCell<M>>, message: M) -> Self {
-        let runtime = mailbox.runtime();
         Self {
             mailbox,
-            runtime,
             state: SendFutureState::Immediate(Some(message)),
-            dispose: dispose::<M>,
-            withdraw_operation: MailboxCell::withdraw,
         }
     }
 
@@ -273,7 +258,7 @@ impl<M: Send + 'static> SendFuture<M> {
     }
 }
 
-impl<M> fmt::Debug for SendFuture<M> {
+impl<M: Send + 'static> fmt::Debug for SendFuture<M> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SendFuture")
@@ -370,7 +355,7 @@ impl<M: Send + 'static> Future for SendFuture<M> {
     }
 }
 
-impl<M> Drop for SendFuture<M> {
+impl<M: Send + 'static> Drop for SendFuture<M> {
     fn drop(&mut self) {
         // Cancellation recovers the unaccepted message with no caller left to
         // hand it to. Destroying it inline would run a possibly blocking or
@@ -379,19 +364,17 @@ impl<M> Drop for SendFuture<M> {
         match std::mem::replace(&mut self.state, SendFutureState::Done) {
             SendFutureState::Immediate(mut message) => {
                 if let Some(message) = message.take() {
-                    (self.dispose)(&self.runtime, message);
+                    self.mailbox.dispose(message);
                 }
             }
             SendFutureState::Parked(operation) => {
-                let mut withdrawal = (self.withdraw_operation)(
-                    &self.mailbox,
-                    &operation,
-                    WithdrawalDisposition::Isolated,
-                );
+                let mut withdrawal = self
+                    .mailbox
+                    .withdraw(&operation, WithdrawalDisposition::Isolated);
                 match withdrawal.take_outcome() {
                     WithdrawalOutcome::Withdrawn { message, .. }
                     | WithdrawalOutcome::Terminated { message, .. } => {
-                        (self.dispose)(&self.runtime, message);
+                        self.mailbox.dispose(message);
                     }
                     WithdrawalOutcome::Accepted(_) => {}
                 }
@@ -411,15 +394,15 @@ impl<M> Drop for SendFuture<M> {
 
 /// Cancellation-safe future returned by [`ActorRef::send_timeout`].
 #[must_use]
-pub struct SendTimeout<M> {
+pub struct SendTimeout<M: Send + 'static> {
     deadlined: Deadlined<TimedSend<M>>,
 }
 
-struct TimedSend<M> {
+struct TimedSend<M: Send + 'static> {
     send: SendFuture<M>,
 }
 
-impl<M> fmt::Debug for SendTimeout<M> {
+impl<M: Send + 'static> fmt::Debug for SendTimeout<M> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SendTimeout")
@@ -491,38 +474,33 @@ impl<M: Send + 'static> Future for SendTimeout<M> {
 
 /// Cancellation-safe future returned by [`ActorRef::call`].
 #[must_use]
-pub struct CallFuture<M, T> {
+pub struct CallFuture<M: Send + 'static, T: Send + 'static> {
     deadlined: Deadlined<CallOperation<M, T>>,
 }
 
 type MessageConstructor<M, T> = Box<dyn FnOnce(Reply<T>) -> M + Send + 'static>;
 
-struct CallOperation<M, T> {
+struct CallOperation<M: Send + 'static, T: Send + 'static> {
     actor: ActorRef<M>,
-    runtime: Arc<dyn MailboxRuntime>,
     make_msg: Option<MessageConstructor<M, T>>,
     send: Option<SendFuture<M>>,
     reply: Option<DisposingReceiver<T>>,
     accepted: Option<Incarnation>,
-    // Captured where `M: Send + 'static` holds so the unbounded `Drop` impl
-    // can route an unused constructor and its captures through isolated
-    // disposal.
-    dispose_constructor: fn(&Arc<dyn MailboxRuntime>, MessageConstructor<M, T>),
 }
 
-impl<M, T> Drop for CallOperation<M, T> {
+impl<M: Send + 'static, T: Send + 'static> Drop for CallOperation<M, T> {
     fn drop(&mut self) {
         if let Some(make_msg) = self.make_msg.take() {
             // An unstarted or short-circuited call discards its constructor
             // without ever building a message. Destroying the captures inline
             // would run possibly blocking or panicking user destructors in
             // this drop glue, so route them through isolated disposal.
-            (self.dispose_constructor)(&self.runtime, make_msg);
+            self.actor.mailbox.dispose(make_msg);
         }
     }
 }
 
-impl<M, T> fmt::Debug for CallFuture<M, T> {
+impl<M: Send + 'static, T: Send + 'static> fmt::Debug for CallFuture<M, T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CallFuture")
@@ -532,7 +510,7 @@ impl<M, T> fmt::Debug for CallFuture<M, T> {
     }
 }
 
-impl<M, T: Send + 'static> CallOperation<M, T> {
+impl<M: Send + 'static, T: Send + 'static> CallOperation<M, T> {
     fn poll_reply(
         &mut self,
         context: &mut Context<'_>,
@@ -576,9 +554,6 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
         phase: DeadlinePhase,
     ) -> Poll<Self::Output> {
         if self.make_msg.is_some() {
-            if phase == DeadlinePhase::TimeoutArbitration {
-                return Poll::Ready(self.short_circuit());
-            }
             // Capture the one overall budget before invoking user code. A
             // slow message constructor consumes acceptance/response time. The
             // shared scaffold captured `budget` before this callback runs.
@@ -591,11 +566,11 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
             // at the exact deadline win. Construction is different: no send
             // existed before it completed, so do not start one after the
             // captured budget is strictly in the past.
-            if budget.is_overdue(self.runtime.now()) {
+            if budget.is_overdue(self.actor.mailbox.now()) {
                 // Construction completed, but timeout cleanup owns the
                 // unsubmitted message. Keep its potentially blocking or
                 // panicking destructor off the caller task.
-                dispose(&self.runtime, message);
+                self.actor.mailbox.dispose(message);
                 return Poll::Ready(self.short_circuit());
             }
             self.reply = Some(receiver.receiver);
@@ -617,7 +592,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
                     // The call surface has no way to hand the recovered
                     // message back; route the discard through isolated
                     // disposal.
-                    dispose(&self.runtime, error.message);
+                    self.actor.mailbox.dispose(error.message);
                     return Poll::Ready(Err(CallError {
                         actor_id: error.actor_id,
                         incarnation_observed: error.incarnation_observed,
@@ -656,7 +631,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
                 self.close_reply();
                 // The call surface has no way to hand the recovered message
                 // back; route the discard through isolated disposal.
-                dispose(&self.runtime, error.message);
+                self.actor.mailbox.dispose(error.message);
                 Poll::Ready(Err(CallError {
                     actor_id: error.actor_id,
                     incarnation_observed: error.incarnation_observed,

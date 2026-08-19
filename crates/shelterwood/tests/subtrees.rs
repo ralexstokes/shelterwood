@@ -129,7 +129,7 @@ async fn one_shot_subtree_lowering_failure_retains_structured_provenance() {
     assert!(matches!(
         nested.cause,
         StartupFailureCause::Lowering { ref undefined }
-            if undefined.len() == 1 && undefined[0][0].as_str() == "missing"
+            if undefined.len() == 1 && undefined[0].as_str() == "missing"
     ));
     system
         .shutdown(Duration::from_secs(1))

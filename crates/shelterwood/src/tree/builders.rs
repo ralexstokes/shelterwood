@@ -1,7 +1,7 @@
 use std::{fmt, sync::Arc};
 
 use crate::{
-    ActorDef, ActorOnceDef, ActorRef, ChildId, Intensity, ScopeDefaults, Strategy,
+    ActorDef, ActorOnceDef, ActorRef, ChildId, Intensity, ScopeDefaults,
     admission::ReserveError,
     mailbox::MailboxCell,
     plan::{BuilderCore, LowerError, SlotCell},
@@ -27,8 +27,8 @@ pub enum BuildError {
     /// One or more reserved slots were left undefined.
     #[error("tree contains undefined reserved slots")]
     UnfilledReservations {
-        /// Child-id paths of every undefined reservation.
-        paths: Vec<Vec<ChildId>>,
+        /// Child ids of every undefined reservation.
+        paths: Vec<ChildId>,
     },
 }
 /// Routes a definition rejected before admission through isolated disposal.
@@ -238,12 +238,6 @@ impl Tree {
         Self {
             core: BuilderCore::new(ScopeFlavor::Ordered),
         }
-    }
-
-    /// Sets the ordered scope's fate-sharing strategy.
-    pub fn strategy(&mut self, strategy: Strategy) -> &mut Self {
-        self.core.set_strategy(strategy);
-        self
     }
 
     /// Lowers and starts this tree synchronously.

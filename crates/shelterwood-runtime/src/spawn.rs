@@ -8,7 +8,7 @@ use std::{
 
 use tokio::{sync::mpsc, task};
 
-use shelterwood_core::exit::JoinVerdict as JoinOutcome;
+use shelterwood_core::exit::JoinOutcome;
 
 use super::{
     DisposingReceiver, OneShotReceiver, OneShotSender, PanicPayload, catch_panic, discard_panic,
@@ -99,34 +99,38 @@ impl DedicatedRuntime {
 
 pub struct ActorWork {
     handle: Option<JoinHandle<()>>,
-    abort: AbortHandle,
 }
 
 impl ActorWork {
     pub fn abort(&self) {
-        self.abort.abort();
+        self.handle
+            .as_ref()
+            .expect("actor work retains its join handle until join")
+            .inner
+            .abort();
     }
 
     pub async fn join(mut self) -> JoinOutcome<()> {
-        let Some(handle) = self.handle.take() else {
-            return JoinOutcome::Cancelled;
-        };
+        let handle = self
+            .handle
+            .take()
+            .expect("actor work retains its join handle until join");
         join(handle).await
     }
 }
 
 impl Drop for ActorWork {
     fn drop(&mut self) {
-        self.abort.abort();
+        if let Some(handle) = &self.handle {
+            handle.inner.abort();
+        }
     }
 }
 
 pub fn spawn_actor_work(future: impl Future<Output = ()> + Send + 'static) -> ActorWork {
     let handle = spawn(future);
-    let abort = handle.abort_handle();
     ActorWork {
         handle: Some(handle),
-        abort,
     }
 }
 

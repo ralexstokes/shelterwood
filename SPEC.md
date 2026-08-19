@@ -840,8 +840,8 @@ runs under either mutex. The one carve-out is a framework invariant break
 the payload still under the guard, and they poison the mutex regardless, so the
 transition is abandoned rather than completed.
 The registered-waker slot exposes no operation that returns or replaces a
-`Waker` without an effects sink, making the #202 failure shape structurally
-unrepresentable rather than a call-site convention. Cancellation returns one
+`Waker` without an effects sink, making an under-lock caller-code drop
+structurally unrepresentable rather than a call-site convention. Cancellation returns one
 withdrawal outcome plus its post-unlock effects object, never a tuple carrying
 a raw waker across the boundary.
 
@@ -1083,8 +1083,8 @@ zero-cost reborrow of the same underlying context — no boxing, no
 mapping layer (Part II §17's `project` is the paying, boxed cousin; the
 `Msg`-equality bound is what makes the free identity possible). The
 returned context therefore *is* the outer actor's: same incarnation and
-identity (`id()`, `incarnation()`, `myself()`), same mailbox and shared
-resources, same incarnation-owned timer table (§5.3's heterogeneous keys
+identity (`id()`, `incarnation()`), same mailbox and shared resources, same
+incarnation-owned timer table (§5.3's heterogeneous keys
 keep an inner actor's keys collision-free by type), and every operation
 through it — sends, timers, offloads, `stop()` — attributes to the one
 outer actor (one mailbox, one identity, one lifecycle: §17's attribution
@@ -1289,7 +1289,7 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   exception: their readiness is structural (below), so the subtree veneer
   carries no mode override — only the deadline.
 - The deadline is not part of the mode: it lives on the shared options
-  record (§8) as `ReadinessDeadline: Inherit | Bounded(Duration) |
+  record (§8) as `ReadinessDeadline: Inherit | Bounded(NonZeroDuration) |
   Unbounded`, defaulting to `Inherit` — resolution is declaration → scope
   default → library default (Appendix A). Unbounded gating exists only via
   the explicit `Unbounded` value; no `None` does double duty as both
@@ -2680,7 +2680,7 @@ or lifetime paragraph is unmapped.
   cells terminalize exactly as a dropped unspawned tree's do (§3.2),
   and the incarnation exits `Failed` carrying the structured
   startup-failure payload with a **lowering cause** naming the
-  undefined slots' child-id paths — the same data
+  undefined slots' child ids relative to that subtree root — the same data
   `BuildError::UnfilledReservations` carries, reached through B.5's
   `startup_failure()` accessor (§7 provenance, non-forgeable). The
   scope publishes `Stopped { reason: StartupFailed }` (B.6) and exits
@@ -2965,7 +2965,7 @@ integration toolkit for the driver shell and the end-to-end invariants.
    Provoke each verdict (readiness expiry, grace-expiry abort, cancelled
    completion) and match the typed variant — never a stringly `Failed`.
    Enforce the mechanism structurally: core classification consumes typed
-   `RecordedOutcome` and `JoinVerdict` values and contains no `Any` or
+   `RecordedOutcome` and `JoinOutcome` values and contains no `Any` or
    downcast path; the runtime adapter converts its join result before core
    sees it, while user error erasure stays at the façade boundary. The former
    grep-level exit-path check is retired with the crate split because the
@@ -3664,7 +3664,8 @@ the same series during shutdown drain; **Stop** = `StopContext<'_, A>` in
 
 | Operation | Raw | Live | Drain | Stop |
 |---|---|---|---|---|
-| `id()`, `incarnation()`, `myself()`, `scope()`, `shutdown_token()` | ✓ | ✓ | ✓ | ✓ |
+| `id()`, `incarnation()`, `scope()`, `shutdown_token()` | ✓ | ✓ | ✓ | ✓ |
+| `myself()` | ✓ | ✓ | ✓ | — |
 | `request_scope_shutdown()` (fire-and-forget; awaiting your own scope's shutdown deadlocks — documented) | ✓ | ✓ | ✓ | ✓ |
 | `run_blocking(f)` | ✓ | ✓ | ✓ | ✓ |
 | `recv()` / `try_recv()` (the merged event source: mailbox, offload completions, fired timers, queued continuations, §5.2 priority; `recv` yields `None` on stop request, biased; `try_recv` ignores the stop token — the drain primitive for raw loops: under `Drain`, exhaust the frozen prefix via `try_recv` after `recv` yields `None`, §10's raw-loop obligation) | ✓ | — | — | — |
@@ -3680,8 +3681,7 @@ the same series during shutdown drain; **Stop** = `StopContext<'_, A>` in
 | Re-entry/mapping: `for_actor` (same-`Msg`, core); `project` *(II §17)* | — | ✓ | ✓ | `for_actor` only |
 
 `StopContext` withholds everything that queues future work for this
-incarnation — there is no one left to deliver to; `myself()` is present but
-documented "do not post work to yourself."
+incarnation — there is no one left to deliver to, so `myself()` is absent.
 
 ### B.2 `TaskContext`
 
@@ -4135,8 +4135,8 @@ and their defines cannot fail (§8).
 
 `BuildError` (spawn-time, §11) is enumerated and exhaustive pre-release:
 `NoRuntime` (no ambient async runtime reachable through the private façade
-over `shelterwood-runtime`) and `UnfilledReservations` (the child-id paths of
-every undefined reserved slot, §8). Nothing else lives there by design:
+over `shelterwood-runtime`) and `UnfilledReservations` (the child ids of every
+undefined reserved slot at that root, §8). Nothing else lives there by design:
 everything decidable earlier fails at declaration (§9.3's eager validation),
 and everything later is the child's ordinary supervision story — spawn is not
 a third validation point. `BuildError` is spawn-only because spawn

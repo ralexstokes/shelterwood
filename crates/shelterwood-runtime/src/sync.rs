@@ -306,7 +306,10 @@ impl<T> OneShotSender<T> {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.channel.as_ref().is_none_or(oneshot::Sender::is_closed)
+        self.channel
+            .as_ref()
+            .expect("an observable one-shot sender retains its channel")
+            .is_closed()
     }
 }
 

@@ -54,14 +54,14 @@ pub fn stop_reason_root_exit(reason: &StopReason) -> Exit {
     }
 }
 
-pub fn stop_reason_precedence(reason: &StopReason) -> StopPrecedence {
-    match reason {
+pub fn stop_reason_precedence(reason: &StopReason) -> u8 {
+    (match reason {
         StopReason::Finished => StopPrecedence::Finished,
         StopReason::IntensityTripped(_) => StopPrecedence::IntensityTripped,
         StopReason::StartupFailed(_) => StopPrecedence::StartupFailed,
         StopReason::ShutdownRequested => StopPrecedence::ShutdownRequested,
         StopReason::NeverStarted => StopPrecedence::NeverStarted,
-    }
+    }) as u8
 }
 
 /// Total precedence order over stop reasons: the single lattice that resolves
@@ -85,7 +85,7 @@ pub fn stop_reason_precedence(reason: &StopReason) -> StopPrecedence {
 /// without ever spawning, the scope-state projection must agree with the
 /// membership exit, in either arrival order.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum StopPrecedence {
+enum StopPrecedence {
     Finished,
     IntensityTripped,
     StartupFailed,
@@ -171,7 +171,7 @@ impl ExitError {
 /// rather than a privacy rule — hidden from documentation so it does not read
 /// as supported API.
 #[doc(hidden)]
-pub fn structured_intensity_trip_error(value: IntensityTrip) -> ExitError {
+fn structured_intensity_trip_error(value: IntensityTrip) -> ExitError {
     ExitError(Arc::new(ExitErrorInner::IntensityTrip(
         StructuredIntensityTrip(value),
     )))
@@ -354,8 +354,8 @@ pub enum StartupFailureCause {
     },
     /// A produced subtree contained undefined reservations.
     Lowering {
-        /// Undefined child-id paths relative to the subtree root.
-        undefined: Vec<Vec<ChildId>>,
+        /// Undefined child ids relative to the subtree root.
+        undefined: Vec<ChildId>,
     },
     /// The stable scope could mint no identity for a declared child.
     IdentityExhausted {
@@ -506,7 +506,7 @@ pub enum ExitKind {
 }
 
 /// Runtime-neutral result of joining one supervised operation.
-pub enum JoinVerdict<T> {
+pub enum JoinOutcome<T> {
     Ok { value: T },
     Panic { message: Option<String> },
     Cancelled,
@@ -581,15 +581,15 @@ pub fn reconcile_recorded_outcomes(
 /// [`GracePhase::WithinGrace`].
 pub fn classify_exit(
     recorded: Option<RecordedOutcome>,
-    join: JoinVerdict<()>,
+    join: JoinOutcome<()>,
     hard_abort_phase: Option<GracePhase>,
     cancellation: Cancellation,
 ) -> Exit {
     let recorded_kind = recorded.map(RecordedOutcome::into_kind);
     let join_kind = match join {
-        JoinVerdict::Ok { .. } => None,
-        JoinVerdict::Panic { message } => Some(ExitKind::Panicked { message }),
-        JoinVerdict::Cancelled => Some(ExitKind::Aborted {
+        JoinOutcome::Ok { .. } => None,
+        JoinOutcome::Panic { message } => Some(ExitKind::Panicked { message }),
+        JoinOutcome::Cancelled => Some(ExitKind::Aborted {
             phase: hard_abort_phase.unwrap_or(GracePhase::WithinGrace),
         }),
     };
@@ -670,11 +670,11 @@ mod tests {
     use crate::identity::ScopeIdentity;
 
     use super::{
-        Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, IntensityTrip,
-        JoinVerdict as JoinOutcome, RecordedOutcome, StartupError, StartupFailure,
-        StartupFailureCause, StopReason, classify_disposal_panic, classify_exit, exit_kind_eq,
-        prefer_earlier, reconcile_recorded_outcomes, stop_reason_into_nested_result,
-        stop_reason_root_exit, structured_intensity_trip_error, structured_startup_failure_error,
+        Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, IntensityTrip, JoinOutcome,
+        RecordedOutcome, StartupError, StartupFailure, StartupFailureCause, StopReason,
+        classify_disposal_panic, classify_exit, exit_kind_eq, prefer_earlier,
+        reconcile_recorded_outcomes, stop_reason_into_nested_result, stop_reason_root_exit,
+        structured_intensity_trip_error, structured_startup_failure_error,
     };
 
     #[test]

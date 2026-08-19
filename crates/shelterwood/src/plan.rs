@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::{
-    ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults, Strategy,
+    ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults,
     admission::ReserveError,
     cells::{ErasedDynamicSlot, MemberCell, ObservationTxn, ScopeCell},
     definition::DefinitionSource,
@@ -22,7 +22,6 @@ use crate::{
 
 #[derive(Clone, Debug, Default)]
 struct ScopeConfig {
-    strategy: Strategy,
     intensity: Intensity,
     defaults: ScopeDefaults,
 }
@@ -217,9 +216,20 @@ impl SlotCell {
         &self,
         defaults: &ResolvedDefaults,
     ) -> Option<(Isolated<ChildConstruction>, ResolvedCommonOptions)> {
-        self.resolve_and_take_defined_with(defaults, || {})
+        let mut state = self.definition.lock().expect("definition mutex poisoned");
+        let DefinitionState::Defined(definition) = &*state else {
+            return None;
+        };
+        let resolved = self.resolve_defined_policy(definition, defaults);
+        let DefinitionState::Defined(definition) =
+            std::mem::replace(&mut *state, DefinitionState::Lowered)
+        else {
+            unreachable!("the definition lock keeps resolution and claim atomic")
+        };
+        Some((definition, resolved))
     }
 
+    #[cfg(test)]
     fn resolve_and_take_defined_with(
         &self,
         defaults: &ResolvedDefaults,
@@ -264,7 +274,11 @@ impl SlotCell {
                 Readiness::Immediate,
             ),
             ChildConstruction::Scope(definition) => {
-                (&definition.options, definition.mode(), Readiness::Manual)
+                let options = CommonOptions {
+                    readiness: None,
+                    ..definition.options.clone()
+                };
+                return resolve_common(&options, defaults, definition.mode(), Readiness::Manual);
             }
         };
         resolve_common(options, defaults, mode, default_readiness)
@@ -286,10 +300,6 @@ pub(crate) struct BuilderCore {
 }
 
 impl BuilderCore {
-    pub(crate) fn set_strategy(&mut self, strategy: Strategy) {
-        self.config.strategy = strategy;
-    }
-
     pub(crate) fn set_intensity(&mut self, intensity: Intensity) {
         self.config.intensity = intensity;
     }
@@ -356,7 +366,7 @@ impl BuilderCore {
             .slots
             .iter()
             .filter(|slot| slot.is_undefined())
-            .map(|slot| vec![slot.member.id().clone()])
+            .map(|slot| slot.member.id().clone())
             .collect();
         if !undefined.is_empty() {
             let disposal = self.begin_failed_disposal();
@@ -384,7 +394,7 @@ impl BuilderCore {
                 }
             }
         }
-        root.set_observation_config(self.config.strategy, self.config.intensity);
+        root.set_observation_config(self.config.intensity);
         let mut children = Vec::with_capacity(self.slots.len());
         debug_assert_eq!(
             self.slots.len(),
@@ -530,7 +540,7 @@ impl ChildPlan {
 #[derive(Debug)]
 pub(crate) enum LowerError {
     Undefined {
-        paths: Vec<Vec<ChildId>>,
+        paths: Vec<ChildId>,
         disposal: Latch,
     },
     IdentityExhausted {
@@ -713,7 +723,9 @@ mod tests {
             Readiness::Manual
         );
 
-        // A declared override wins over every per-kind default.
+        // Task and raw declarations expose readiness overrides. Scope
+        // readiness is structural even if an internal fixture forges the
+        // otherwise-unreachable common-options field.
         assert_eq!(
             resolved_readiness(ChildConstruction::Task(
                 TaskDef::new(|_| async { Ok(()) })
@@ -737,7 +749,7 @@ mod tests {
                 readiness: Some(Readiness::Immediate),
                 ..CommonOptions::default()
             })),
-            Readiness::Immediate
+            Readiness::Manual
         );
         assert_eq!(
             resolved_readiness(raw_construction(CommonOptions {

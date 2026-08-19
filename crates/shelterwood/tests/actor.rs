@@ -12,9 +12,9 @@ use crate::common::{
     POLL_TIMEOUT, ReleaseGate, assert_eventually, assert_quiet, waiting::task as waiting_task,
 };
 use shelterwood::{
-    Actor, ActorDef, ActorOnceDef, ActorRef, ChildState, Context, DynamicTree, ExitError, ExitKind,
-    ExitResult, Handler, Mailbox, RawActor, RawContext, RawOnceDef, Readiness, Retention, ScopeRef,
-    SendErrorKind, StopContext, TaskDef, Tree,
+    Actor, ActorDef, ActorOnceDef, ActorRef, ChildId, ChildState, Context, DynamicTree, ExitError,
+    ExitKind, ExitResult, Handler, Mailbox, RawActor, RawContext, RawOnceDef, Readiness, Retention,
+    ScopeRef, SendErrorKind, StopContext, TaskDef, Tree,
 };
 
 #[derive(Clone)]
@@ -533,7 +533,7 @@ struct ContextSurfaceActor {
     entered: ReleaseGate,
     release: ReleaseGate,
     observed: Option<tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>>,
-    stopped: Option<tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>>,
+    stopped: Option<tokio::sync::oneshot::Sender<(ChildId, ScopeRef)>>,
 }
 
 impl Actor for ContextSurfaceActor {
@@ -542,7 +542,7 @@ impl Actor for ContextSurfaceActor {
         ReleaseGate,
         ReleaseGate,
         tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>,
-        tokio::sync::oneshot::Sender<(ActorRef<ContextSurfaceMessage>, ScopeRef)>,
+        tokio::sync::oneshot::Sender<(ChildId, ScopeRef)>,
     );
 
     async fn init(
@@ -585,13 +585,13 @@ impl Actor for ContextSurfaceActor {
     }
 
     async fn on_stop(&mut self, context: &mut StopContext<'_, Self>) {
-        let myself: ActorRef<ContextSurfaceMessage> = context.myself();
+        let id = context.id().clone();
         let scope: ScopeRef = context.scope();
         self.stopped
             .take()
             .expect("stop-context observation is sent once")
-            .send((myself, scope))
-            .expect("test still awaits typed stop-context handles");
+            .send((id, scope))
+            .expect("test still awaits typed stop-context identity");
     }
 }
 
@@ -631,10 +631,10 @@ async fn typed_context_handles_preserve_identity_and_self_send_capacity() {
     assert_eq!(myself, actor);
     assert_eq!(scope, system.scope());
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
-    let (stopping_myself, stopping_scope) = stop_observation
+    let (stopping_id, stopping_scope) = stop_observation
         .await
-        .expect("actor reports stop-context handles");
-    assert_eq!(stopping_myself, actor);
+        .expect("actor reports stop-context identity");
+    assert_eq!(&stopping_id, actor.id());
     assert_eq!(stopping_scope, scope);
 }
 

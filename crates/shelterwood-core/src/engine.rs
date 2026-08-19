@@ -362,7 +362,10 @@ impl Default for RestartState {
     }
 }
 
-/// Complete restart verdict consumed verbatim by the scope driver.
+/// Complete restart verdict consumed verbatim by the cross-crate scope driver.
+///
+/// Its public visibility is required by [`schedule_restart`]'s sibling-crate
+/// return edge; the supported façade neither names nor exports this type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RestartDecision {
     attempt: RestartAttempt,
@@ -731,31 +734,6 @@ struct ScopeDrain {
     startup: StartupPhase,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DrainEffect {
-    startup_pending: bool,
-    /// Always [`ScopeState::Draining`] by construction; carried so the driver
-    /// publishes exactly the state the machine returned.
-    state: ScopeState,
-}
-
-impl DrainEffect {
-    pub fn startup_pending(&self) -> bool {
-        self.startup_pending
-    }
-
-    pub fn state(&self) -> ScopeState {
-        self.state.clone()
-    }
-}
-
-/// The child state relevant to deciding whether a scope can finish.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ChildCompletionState {
-    pub has_children: bool,
-    pub all_terminal: bool,
-}
-
 /// Authoritative lifecycle and finish policy for one scope incarnation.
 ///
 /// `ScopeRecord` is only this machine's observation projection; epoch-tagged
@@ -817,7 +795,7 @@ impl ScopeLifecycle {
                     StartupPhase::Complete => 1,
                     StartupPhase::Failed => 2,
                 },
-                stop_reason_precedence(reason) as u8,
+                stop_reason_precedence(reason),
             ),
         }
     }
@@ -886,7 +864,7 @@ impl ScopeLifecycle {
     /// resolve competing reasons in opposite directions. The returned effect
     /// exists only for the initial transition: upgrades change the eventual
     /// verdict without repeating teardown side effects.
-    pub fn begin_drain(&mut self, reason: StopReason) -> Option<DrainEffect> {
+    pub fn begin_drain(&mut self, reason: StopReason) -> Option<(bool, ScopeState)> {
         debug_assert!(
             !matches!(reason, StopReason::NeverStarted),
             "NeverStarted is not a live-incarnation drain reason"
@@ -905,24 +883,19 @@ impl ScopeLifecycle {
         };
         let startup_pending = startup == StartupPhase::Pending;
         self.state = ScopeLifecycleState::Draining(ScopeDrain { reason, startup });
-        Some(DrainEffect {
-            startup_pending,
-            state: self.state(),
-        })
+        Some((startup_pending, self.state()))
     }
 
     pub fn finish_if_ready(
         &self,
         flavor: ScopeFlavor,
-        children: ChildCompletionState,
+        has_children: bool,
+        all_terminal: bool,
     ) -> Option<StopReason> {
         if let Some(reason) = self.draining_reason() {
-            return children.all_terminal.then(|| reason.clone());
+            return all_terminal.then(|| reason.clone());
         }
-        (!self.startup_failed()
-            && flavor == ScopeFlavor::Ordered
-            && children.has_children
-            && children.all_terminal)
+        (!self.startup_failed() && flavor == ScopeFlavor::Ordered && has_children && all_terminal)
             .then_some(StopReason::Finished)
     }
 }
@@ -1084,11 +1057,10 @@ mod tests {
     };
 
     use super::{
-        ArbitrationClass, ChildCompletionState, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch,
-        IncarnationRun, IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent,
-        ReadinessGate, RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode,
-        ScopeState, StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart,
-        tidy_abort_beat,
+        ArbitrationClass, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch, IncarnationRun,
+        IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent, ReadinessGate,
+        RequestTarget, RestartState, ScopeEpochs, ScopeLifecycle, ScopeMode, ScopeState,
+        StopAction, StopLadder, arbitrate, dispatch_exit, schedule_restart, tidy_abort_beat,
     };
 
     #[test]
@@ -1610,51 +1582,27 @@ mod tests {
             "simultaneous initial failures publish one transition"
         );
         assert_eq!(
-            lifecycle.finish_if_ready(
-                ScopeFlavor::Ordered,
-                ChildCompletionState {
-                    has_children: true,
-                    all_terminal: true,
-                },
-            ),
+            lifecycle.finish_if_ready(ScopeFlavor::Ordered, true, true),
             None
         );
         let drain = lifecycle
             .begin_drain(crate::exit::StopReason::ShutdownRequested)
             .expect("a failed startup can begin draining");
-        assert!(!drain.startup_pending);
-        assert_eq!(drain.state, ScopeState::Draining);
+        assert!(!drain.0);
+        assert_eq!(drain.1, ScopeState::Draining);
         assert_eq!(
-            lifecycle.finish_if_ready(
-                ScopeFlavor::Dynamic,
-                ChildCompletionState {
-                    has_children: true,
-                    all_terminal: true,
-                },
-            ),
+            lifecycle.finish_if_ready(ScopeFlavor::Dynamic, true, true),
             Some(crate::exit::StopReason::ShutdownRequested)
         );
 
         let mut running = ScopeLifecycle::starting();
         assert_eq!(running.complete_startup(), Some(ScopeState::Running));
         assert_eq!(
-            running.finish_if_ready(
-                ScopeFlavor::Ordered,
-                ChildCompletionState {
-                    has_children: false,
-                    all_terminal: true,
-                },
-            ),
+            running.finish_if_ready(ScopeFlavor::Ordered, false, true),
             None
         );
         assert_eq!(
-            running.finish_if_ready(
-                ScopeFlavor::Ordered,
-                ChildCompletionState {
-                    has_children: true,
-                    all_terminal: true,
-                },
-            ),
+            running.finish_if_ready(ScopeFlavor::Ordered, true, true),
             Some(crate::exit::StopReason::Finished)
         );
 
@@ -1662,8 +1610,8 @@ mod tests {
         let drain = starting
             .begin_drain(crate::exit::StopReason::ShutdownRequested)
             .expect("starting can begin draining");
-        assert!(drain.startup_pending);
-        assert_eq!(drain.state, ScopeState::Draining);
+        assert!(drain.0);
+        assert_eq!(drain.1, ScopeState::Draining);
     }
 
     #[test]

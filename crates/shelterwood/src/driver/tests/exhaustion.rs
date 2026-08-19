@@ -38,9 +38,9 @@ async fn reserve_error_identity_exhausted_maps_the_child_key_domain() {
     let (mut scope, _events, mut dynamic_events, _control) = running_dynamic_fixture();
     let reservation = reserve_dynamic(&scope.root, ChildId::from("worker"), None)
         .expect("the membership domain still has capacity");
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
     let (response, request) = begin_admission(&reservation, &mut dynamic_events, None).await;
     scope.supervisor.exhaust_child_keys_for_test();
     scope.handle_admission(request);

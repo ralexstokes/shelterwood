@@ -141,7 +141,7 @@ impl<E: SlotEndpoint> TaskSlotCore<E> {
     pub(super) fn define(self, definition: TaskDef) -> E::Output<TaskRef> {
         let task = self.task_ref();
         self.endpoint
-            .define(task, ChildConstruction::Task(definition))
+            .define(task, ChildConstruction::Task(definition.erase()))
     }
 
     pub(super) fn define_once<T: Send + 'static>(
@@ -153,7 +153,7 @@ impl<E: SlotEndpoint> TaskSlotCore<E> {
         let claim = OneShotTaskRef::new(receiver, task.clone());
         self.endpoint.define(
             (task, claim),
-            ChildConstruction::TaskOnce(definition.erase(completion)),
+            ChildConstruction::Task(definition.erase(completion)),
         )
     }
 }

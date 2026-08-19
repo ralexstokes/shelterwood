@@ -91,13 +91,16 @@ async fn latched_removal_suppresses_a_queued_start_effect() {
         &mut scope,
         &control,
         "worker",
-        ChildConstruction::Task(TaskDef::new({
-            let starts = Arc::clone(&starts);
-            move |_| {
-                starts.fetch_add(1, Ordering::SeqCst);
-                future::pending()
-            }
-        })),
+        ChildConstruction::Task(
+            TaskDef::new({
+                let starts = Arc::clone(&starts);
+                move |_| {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    future::pending()
+                }
+            })
+            .erase(),
+        ),
         |_| {},
         DynamicFixtureState::Resident,
     );
@@ -360,7 +363,7 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
         &mut scope,
         &control,
         "worker",
-        ChildConstruction::Task(TaskDef::new(|_| future::pending())),
+        ChildConstruction::Task(TaskDef::new(|_| future::pending()).erase()),
         |_| {},
         DynamicFixtureState::Resident,
     );
@@ -427,7 +430,7 @@ async fn removal_tolerates_synchronous_reclaim_from_the_stop_funnel() {
         &mut scope,
         &control,
         "worker",
-        ChildConstruction::Task(TaskDef::new(|_| future::pending())),
+        ChildConstruction::Task(TaskDef::new(|_| future::pending()).erase()),
         |child| {
             // Model the latent restart-gap shape: there is no active
             // incarnation and no retained construction, so a hard-force stop
@@ -577,9 +580,9 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
     let (response, request) = begin_admission(&reservation, &mut event_receiver, None).await;
 
     assert!(
@@ -639,9 +642,9 @@ async fn a_dropped_admission_request_publishes_the_fail_closed_response() {
     let root = Arc::clone(&scope.root);
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
     let (mut response, request) =
         begin_admission(&reservation, &mut dynamic_event_receiver, None).await;
 
@@ -670,9 +673,9 @@ async fn annulment_before_admission_owns_never_started_terminality() {
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
     let (response, request) =
         begin_admission(&reservation, &mut dynamic_event_receiver, None).await;
 
@@ -734,9 +737,8 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new({
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new({
             let started = started.clone();
             move |context| {
                 let started = started.clone();
@@ -746,7 +748,9 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
                     Ok(())
                 }
             }
-        })));
+        })
+        .erase(),
+    ));
     let (mut response, request) =
         begin_admission(&reservation, &mut dynamic_event_receiver, None).await;
     scope.handle_admission(request);
@@ -838,9 +842,9 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
         let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
             .expect("running dynamic scope reserves the child");
         let member = Arc::clone(&reservation.slot.member);
-        reservation
-            .slot
-            .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+        reservation.slot.define(ChildConstruction::Task(
+            TaskDef::new(|_| future::pending()).erase(),
+        ));
         let (response, request) =
             begin_admission(&reservation, &mut dynamic_event_receiver, None).await;
 
@@ -940,9 +944,9 @@ async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
     let fused_cancel = Latch::default();
     let (response, request) = begin_admission(
         &reservation,
@@ -1007,9 +1011,9 @@ async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_rech
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
     let fused_cancel = Latch::default();
     let (response, request) = begin_admission(
         &reservation,
@@ -1101,9 +1105,8 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new({
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new({
             let started = started.clone();
             move |context| {
                 let started = started.clone();
@@ -1113,7 +1116,9 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
                     Ok(())
                 }
             }
-        })));
+        })
+        .erase(),
+    ));
     let fused_cancel = Latch::default();
     let (mut admission_response, request) = begin_admission(
         &reservation,
@@ -1294,9 +1299,8 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
     let member = Arc::clone(&reservation.slot.member);
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new({
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new({
             let release_failure = release_failure.clone();
             let starts = Arc::clone(&starts);
             move |_| {
@@ -1311,7 +1315,9 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
                     }
                 }
             }
-        })));
+        })
+        .erase(),
+    ));
     let mut admission = Box::pin(make_admission(reservation));
     assert!(
         admission

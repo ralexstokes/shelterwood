@@ -439,20 +439,36 @@ fn dispatch_child_construction(
                 construction_spent,
             }
         }
-        ChildConstruction::Task(definition) => SpawnDispatch {
-            body: PendingSpawnBody::restartable(SpawnBody::TaskRestartable {
-                factory: Arc::clone(&definition.factory),
-                context: TaskContext::new(id, incarnation, latches.task_context()),
-            }),
-            construction_spent: false,
-        },
-        ChildConstruction::TaskOnce(definition) => SpawnDispatch {
-            body: PendingSpawnBody::one_shot(SpawnBody::TaskOnce {
-                body: definition.take_body(),
-                context: TaskContext::new(id, incarnation, latches.task_context()),
-            }),
-            construction_spent: true,
-        },
+        ChildConstruction::Task(definition) => {
+            let context = TaskContext::new(id, incarnation, latches.task_context());
+            let (body, construction_spent) = if let Some(factory) = definition.restartable() {
+                (
+                    SpawnBody::TaskRestartable {
+                        factory: Arc::clone(factory),
+                        context,
+                    },
+                    false,
+                )
+            } else {
+                (
+                    SpawnBody::TaskOnce {
+                        body: definition
+                            .take_one_shot()
+                            .expect("one-shot task construction invoked more than once"),
+                        context,
+                    },
+                    true,
+                )
+            };
+            SpawnDispatch {
+                body: if construction_spent {
+                    PendingSpawnBody::one_shot(body)
+                } else {
+                    PendingSpawnBody::restartable(body)
+                },
+                construction_spent,
+            }
+        }
         ChildConstruction::Scope(definition) => {
             let inherited = match definition.defaults {
                 DefaultsInheritance::Inherit => defaults.clone(),
@@ -498,6 +514,30 @@ fn dispatch_child_construction(
             }
         }
     }
+}
+
+/// Test-only entry point to the construction dispatch, which the driver
+/// otherwise reaches only through `spawn_child`. `spawn_child` releases a
+/// spent construction before it can be dispatched again, so this is the one
+/// way to exercise the one-shot invariant panics directly.
+#[cfg(test)]
+pub(super) fn dispatch_child_construction_for_test(
+    child: &mut ChildRuntime,
+    root: &Arc<ScopeCell>,
+    defaults: &ResolvedDefaults,
+    incarnation: Incarnation,
+) {
+    let latches = SpawnLatches::new(matches!(
+        child.construction.get_mut(),
+        ChildConstruction::Scope(_)
+    ));
+    drop(dispatch_child_construction(
+        child,
+        root,
+        defaults,
+        incarnation,
+        &latches,
+    ));
 }
 
 fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {

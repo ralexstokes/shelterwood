@@ -391,7 +391,9 @@ async fn conversion_unwind_evicts_never_started_child_identities() {
         let slot = rebuild
             .reserve(id, None)
             .expect("re-added id is reservable");
-        slot.define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+        slot.define(ChildConstruction::Task(
+            TaskDef::new(|_| future::pending()).erase(),
+        ));
     }
     let replacement = rebuild
         .lower(ResolvedDefaults::default(), Some(Arc::clone(&root)))
@@ -492,4 +494,43 @@ async fn initial_added_wake_observes_the_keyed_dynamic_route() {
         crate::runtime::join(driver).await,
         crate::runtime::JoinOutcome::Cancelled
     ));
+}
+
+// `spawn_child` releases a spent one-shot construction before it could be
+// dispatched a second time, so the invariant panic is only reachable through
+// the dispatch helper directly.
+#[crate::runtime::test]
+#[should_panic(expected = "one-shot task construction invoked more than once")]
+async fn dispatching_a_spent_one_shot_task_construction_panics() {
+    let mut tree = Tree::new();
+    let (_task, _claim) = tree
+        .add_task_once(
+            "worker",
+            TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }),
+        )
+        .expect("valid one-shot task");
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let _epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let defaults = plan.defaults.clone();
+    let mut child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    plan.finish_transfer();
+    let incarnation = child
+        .incarnations
+        .mint()
+        .expect("the first incarnation mints");
+
+    dispatch_child_construction_for_test(&mut child, &root, &defaults, incarnation);
+    // The child never started, so discharge terminality before the panic
+    // rather than leaving the obligation to run its fallback under the unwind.
+    child.complete_terminality();
+    dispatch_child_construction_for_test(&mut child, &root, &defaults, incarnation);
 }

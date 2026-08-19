@@ -13,7 +13,8 @@ use crate::{
     ReadinessDeadline, RestartPolicy, Retention, Shutdown,
     cancellation::{CancellationToken, ParentCancellationToken},
     cells::MemberCell,
-    policy::CommonOptions,
+    definition::DefinitionSource,
+    policy::{ChildMode, CommonOptions},
     runtime::{self, CompletionGatedLatch, Latch},
 };
 
@@ -122,6 +123,13 @@ impl TaskDef {
         task_readiness_deadline,
         retention,
     );
+
+    pub(crate) fn erase(self) -> TaskConstruction {
+        TaskConstruction {
+            source: DefinitionSource::Restartable(self.factory),
+            options: self.options,
+        }
+    }
 }
 
 type OnceTaskFuture<T> = Pin<Box<dyn Future<Output = Result<T, ExitError>> + Send + 'static>>;
@@ -159,10 +167,10 @@ impl<T: Send + 'static> TaskOnceDef<T> {
 
     common_options_setters!(shutdown, task_readiness, task_readiness_deadline, retention,);
 
-    pub(crate) fn erase(self, completion: runtime::OneShotSender<T>) -> OnceTask {
+    pub(crate) fn erase(self, completion: runtime::OneShotSender<T>) -> TaskConstruction {
         let body = self.body;
-        OnceTask {
-            body: Some(Box::new(move |context| {
+        TaskConstruction {
+            source: DefinitionSource::OneShot(Box::new(move |context| {
                 Box::pin(async move {
                     match body(context).await {
                         Ok(value) => {
@@ -185,18 +193,32 @@ impl<T: Send + 'static> TaskOnceDef<T> {
     }
 }
 
-pub(crate) struct OnceTask {
-    body: Option<OnceTaskFactory>,
-    pub(crate) options: CommonOptions,
-}
-
 type OnceTaskFactory = Box<dyn FnOnce(TaskContext) -> TaskFuture + Send + 'static>;
 
-impl OnceTask {
-    pub(crate) fn take_body(&mut self) -> OnceTaskFactory {
-        self.body
-            .take()
-            .expect("one-shot task construction invoked more than once")
+pub(crate) struct TaskConstruction {
+    source: DefinitionSource<TaskFactory, OnceTaskFactory>,
+    options: CommonOptions,
+}
+
+impl TaskConstruction {
+    pub(crate) fn options(&self) -> &CommonOptions {
+        &self.options
+    }
+
+    pub(crate) fn mode(&self) -> ChildMode {
+        if self.source.is_one_shot() {
+            ChildMode::OneShot
+        } else {
+            ChildMode::Restartable
+        }
+    }
+
+    pub(crate) fn restartable(&self) -> Option<&TaskFactory> {
+        self.source.restartable()
+    }
+
+    pub(crate) fn take_one_shot(&mut self) -> Option<OnceTaskFactory> {
+        self.source.take_one_shot()
     }
 }
 
@@ -408,7 +430,7 @@ mod tests {
         })
         .erase(completion);
 
-        let body = task.take_body();
+        let body = task.take_one_shot();
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(task);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
@@ -417,13 +439,12 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "one-shot task construction invoked more than once")]
-    fn taking_one_shot_body_twice_preserves_the_invariant_panic() {
+    fn taking_one_shot_body_spends_the_definition_source() {
         let (completion, _claim) = runtime::oneshot::<()>();
         let mut task = TaskOnceDef::new(|_| async { Ok::<_, ExitError>(()) }).erase(completion);
 
-        drop(task.take_body());
-        drop(task.take_body());
+        assert!(task.take_one_shot().is_some());
+        assert!(task.take_one_shot().is_none());
     }
 
     fn one_shot_claim<T: Send + 'static>() -> (

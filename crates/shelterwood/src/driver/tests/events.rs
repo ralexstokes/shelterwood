@@ -180,9 +180,8 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
     let starts = Arc::new(AtomicUsize::new(0));
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
-    reservation
-        .slot
-        .define(ChildConstruction::Task(TaskDef::new({
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new({
             let starts = Arc::clone(&starts);
             move |_| {
                 let invocation = starts.fetch_add(1, Ordering::SeqCst) + 1;
@@ -194,7 +193,9 @@ async fn restart_deadline_gate_suppresses_a_fused_cancel_landing_after_schedulin
                     }
                 }
             }
-        })));
+        })
+        .erase(),
+    ));
     let fused_cancel = Latch::default();
     let (mut response, request) = begin_admission(
         &reservation,

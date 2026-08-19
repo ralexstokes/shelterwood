@@ -87,6 +87,13 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
         Some(ARRIVED_FACTORY_DISPOSAL_PANIC)
     );
     assert!(
+        scope.disposal_event_receiver.is_empty(),
+        "a terminal disposes its retained construction exactly once"
+    );
+    // Replay the validated completion, pulse included, so runtime teardown,
+    // batch collection and the hard-force fallback still meet it exactly as
+    // `handle_terminal_disposal` leaves it.
+    assert!(
         scope
             .disposal_events
             .send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
@@ -96,6 +103,7 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
             .is_ok(),
         "the validated disposal completion returns to the live lane"
     );
+    scope.root.signal().pulse();
     (scope, key, member)
 }
 

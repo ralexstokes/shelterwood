@@ -37,8 +37,8 @@ use crate::{
     admission::{RemoveOutcome, ReserveError},
     observe::{
         ChildSnapshot, ChildState, LifecycleEventKind, LifecycleEvents, LifecycleHub, LifecycleSeq,
-        RetainedLifecycleEvent, RetainedLifecycleEventKind, RetainedScopeSnapshot, ScopeSnapshot,
-        SnapshotHub, SnapshotPublication, SnapshotReceiver,
+        RetainedLifecycleEvent, RetainedScopeSnapshot, ScopeSnapshot, SnapshotHub,
+        SnapshotPublication, SnapshotReceiver,
     },
 };
 
@@ -1971,10 +1971,10 @@ impl ScopeCell {
     }
 
     fn emit_locked(&self, wakes: &mut ObservationTxn<'_>, kind: LifecycleEventKind) {
-        // Convert every user-error-bearing edge to retained form before any
-        // fallible framework bookkeeping. A sequence-exhaustion path can now
-        // defer the retained value instead of unwinding with a raw `Exit`.
-        let kind = RetainedLifecycleEventKind::new(kind);
+        // Mint the retention guards before any fallible framework bookkeeping.
+        // A sequence-exhaustion path can then defer a *guarded* edge instead
+        // of destroying a raw `Exit` under the observation gate.
+        let guards = RetainedLifecycleEvent::retain_guards(&kind);
         // Parent links cannot change under the resident-tree observation gate.
         // Resolve them once for snapshot and lifecycle propagation so one leaf
         // edge does not repeatedly lock every ancestor's parent mutex.
@@ -1989,7 +1989,13 @@ impl ScopeCell {
             .lifecycle_seq
             .mint(Ordering::Release, Ordering::Relaxed);
         let Some(seq) = seq.map(LifecycleSeq::new) else {
-            wakes.defer(move || drop(kind));
+            // Raw projection first, guards last, so the guards are the final
+            // owner and destruction is submitted to isolated disposal — the
+            // same field-order argument `RetainedLifecycleEvent` makes.
+            wakes.defer(move || {
+                drop(kind);
+                drop(guards);
+            });
             self.publish_snapshot_chain_through_locked(wakes, &ancestors);
             self.observation.lifecycle.publish_lagged(wakes, 1);
             for ancestor in &ancestors {
@@ -2000,7 +2006,7 @@ impl ScopeCell {
         self.publish_snapshot_chain_through_locked(wakes, &ancestors);
 
         let scope = self.member.membership();
-        let mut event = RetainedLifecycleEvent::from_retained_kind(scope, seq, kind);
+        let mut event = RetainedLifecycleEvent::from_parts(scope, seq, kind, guards);
         self.observation.lifecycle.publish(wakes, event.clone());
         let mut child_id = self.member.id().clone();
         for ancestor in ancestors {

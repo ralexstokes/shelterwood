@@ -74,13 +74,28 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
     );
     assert!(scope.children[key].pending_terminal.is_some());
 
-    let arrived = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
-        while scope.disposal_event_receiver.is_empty() {
-            crate::runtime::yield_now().await;
-        }
-    })
+    let (disposed_child, panic) = recv_construction_disposed(
+        &mut scope.disposal_event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the retained factory disposal panic to arrive",
+    )
     .await;
-    assert!(matches!(arrived, crate::runtime::Timeout::Completed(())));
+    assert_eq!(disposed_child, key);
+    let panic = panic.expect("the retained factory disposal panics");
+    assert_eq!(
+        panic.message.as_deref(),
+        Some(ARRIVED_FACTORY_DISPOSAL_PANIC)
+    );
+    assert!(
+        scope
+            .disposal_events
+            .send(DriverEvent::Child(ChildEvent::ConstructionDisposed {
+                child: disposed_child,
+                panic: Some(panic),
+            }))
+            .is_ok(),
+        "the validated disposal completion returns to the live lane"
+    );
     (scope, key, member)
 }
 

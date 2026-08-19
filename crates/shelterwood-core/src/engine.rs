@@ -278,6 +278,7 @@ impl Default for IntensityState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IntensityCharge {
+    policy: Intensity,
     in_window: u64,
     total_restarts: TotalRestarts,
     tripped: bool,
@@ -306,6 +307,7 @@ impl IntensityState {
         self.total_restarts = self.total_restarts.bump();
         let in_window = u64::try_from(self.charges.len()).unwrap_or(u64::MAX);
         IntensityCharge {
+            policy,
             in_window,
             total_restarts: self.total_restarts,
             tripped: in_window > policy.max_restarts(),
@@ -398,10 +400,10 @@ impl RestartDecision {
         self.charge.total_restarts
     }
 
-    pub fn intensity_trip(&self, policy: Intensity) -> Option<IntensityTrip> {
+    pub fn intensity_trip(&self) -> Option<IntensityTrip> {
         self.charge
             .tripped
-            .then(|| IntensityTrip::new(policy, self.charge))
+            .then(|| IntensityTrip::new(self.charge.policy, self.charge))
     }
 }
 
@@ -1453,6 +1455,10 @@ mod tests {
         assert_eq!(decision.restart_at, Some(now));
         assert_eq!(decision.charge.total_restarts, TotalRestarts::ZERO.bump());
         assert!(decision.charge.tripped);
+        assert_eq!(
+            decision.intensity_trip(),
+            Some(crate::IntensityTrip::new(intensity_policy, decision.charge))
+        );
     }
 
     #[test]

@@ -977,6 +977,15 @@ mod tests {
 
     struct CountWake(Arc<AtomicUsize>);
 
+    struct DebugProbe(Arc<AtomicUsize>);
+
+    impl std::fmt::Debug for DebugProbe {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            formatter.write_str("DebugProbe")
+        }
+    }
+
     impl Wake for CountWake {
         fn wake(self: Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -1066,6 +1075,29 @@ mod tests {
         let mut changed = Box::pin(receiver.changed_or_closed());
         let mut context = Context::from_waker(Waker::noop());
         assert_eq!(changed.as_mut().poll(&mut context), Poll::Ready(false));
+    }
+
+    #[test]
+    fn watch_sender_debug_never_formats_the_guarded_value() {
+        let formats = Arc::new(AtomicUsize::new(0));
+        let (sender, _receiver) = super::watch(DebugProbe(Arc::clone(&formats)));
+
+        // Assert the omission, not the rendering: `Debug` output is not
+        // contractual, but formatting the guarded value under the watch mutex
+        // would be a lock-rule violation.
+        let rendered = format!("{sender:?}");
+        assert!(!rendered.contains("DebugProbe"), "rendered as {rendered}");
+        assert_eq!(formats.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn watch_receiver_debug_never_formats_the_guarded_value() {
+        let formats = Arc::new(AtomicUsize::new(0));
+        let (_sender, receiver) = super::watch(DebugProbe(Arc::clone(&formats)));
+
+        let rendered = format!("{receiver:?}");
+        assert!(!rendered.contains("DebugProbe"), "rendered as {rendered}");
+        assert_eq!(formats.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

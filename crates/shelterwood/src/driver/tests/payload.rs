@@ -1,4 +1,5 @@
 use super::support::*;
+use crate::mailbox::MailboxEffectQueue;
 
 struct ThreadRecordingRaw {
     dropped: crate::runtime::UnboundedMpscSender<std::thread::ThreadId>,
@@ -108,12 +109,23 @@ async fn rebind_waker_panic_keeps_one_shot_body_isolated() {
         .incarnations
         .mint()
         .expect("a prior incarnation is available");
+    let token = child
+        .mailbox_bind
+        .take()
+        .expect("configuration supplies the first bind token");
+    let mut effects = MailboxEffectQueue::default();
     let mailbox = child.mailbox.as_ref().expect("raw actors own a mailbox");
-    mailbox.bind(prior);
-    mailbox.freeze(prior);
-    if let Some(teardown) = mailbox.close(prior) {
-        crate::runtime::dispose_detached(teardown);
-    }
+    mailbox.bind(token, prior, &mut effects);
+    mailbox.freeze(prior, &mut effects);
+    let close = mailbox
+        .close(prior, &mut effects)
+        .expect("closing the live prior incarnation returns the next bind token");
+    // Hand the rebind token back to the driver before dropping the effect
+    // queue, so `spawn_child` below still takes the restart path.
+    let (rebind, teardown) = close.into_parts();
+    child.mailbox_bind = Some(rebind);
+    drop(effects);
+    crate::runtime::dispose_detached(teardown);
 
     let hostile = Waker::from(Arc::new(PanicWake(PANIC)));
     let mut parked = Box::pin(actor.send(1));

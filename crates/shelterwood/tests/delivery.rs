@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{ReleaseGate, assert_eventually, poll_once};
+use crate::common::{GatedRecorder, MessageRecorder, ReleaseGate, assert_eventually, poll_once};
 use shelterwood::{
     CallErrorKind, ExitError, ExitResult, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Reply,
     SendErrorKind, Shutdown, SubtreeOnceDef, Tree,
@@ -259,23 +259,27 @@ async fn queue_preserves_per_sender_fifo_under_interleaved_senders() {
 }
 
 struct CallRecorder {
-    gate: ReleaseGate,
     calls: Arc<AtomicUsize>,
 }
 
-impl RawActor for CallRecorder {
-    type Msg = CallMessage;
+impl MessageRecorder for CallRecorder {
+    type Message = CallMessage;
 
-    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
-        self.gate.wait().await;
-        while let Some(message) = context.recv().await {
-            if let CallMessage::Ask(reply) = message {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                reply.send(7);
-            }
+    fn record(&mut self, message: CallMessage) {
+        if let CallMessage::Ask(reply) = message {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            reply.send(7);
         }
-        Ok(())
     }
+}
+
+fn call_recorder(gate: ReleaseGate, calls: &Arc<AtomicUsize>) -> GatedRecorder<CallRecorder> {
+    GatedRecorder::new(
+        Some(gate),
+        CallRecorder {
+            calls: Arc::clone(calls),
+        },
+    )
 }
 
 #[tokio::test]
@@ -286,11 +290,7 @@ async fn latest_conflation_drops_replaced_call_and_keeps_newest_value() {
     let actor = tree
         .add_raw_once(
             "latest-call",
-            RawOnceDef::new(CallRecorder {
-                gate: gate.clone(),
-                calls: Arc::clone(&calls),
-            })
-            .mailbox(Mailbox::latest()),
+            RawOnceDef::new(call_recorder(gate.clone(), &calls)).mailbox(Mailbox::latest()),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -381,11 +381,8 @@ async fn call_cancellation_withdraws_before_acceptance_but_processes_after() {
         let actor = tree
             .add_raw_once(
                 "cancel-call",
-                RawOnceDef::new(CallRecorder {
-                    gate: gate.clone(),
-                    calls: Arc::clone(&calls),
-                })
-                .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
+                RawOnceDef::new(call_recorder(gate.clone(), &calls))
+                    .mailbox(Mailbox::queue(1).expect("non-zero capacity")),
             )
             .expect("valid actor");
         let system = tree.spawn().expect("runtime is available");

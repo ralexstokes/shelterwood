@@ -234,9 +234,19 @@ impl DynamicControl {
     ///
     /// The lookup retains its transaction token: selecting the live
     /// incarnation's control and acting on it are one observation-gated edge.
+    ///
+    /// A foreign route reads as no live incarnation rather than a panic. The
+    /// caller always holds the tree's outermost gate, so unwinding here would
+    /// poison it for every later operation instead of failing this one; both
+    /// call sites already have a graceful answer for `None`.
     fn in_scope(scope: &ScopeCell, txn: &ObservationTxn<'_>) -> Option<Arc<DynamicControl>> {
         let route: Arc<dyn Any + Send + Sync> = scope.dynamic_route_in(txn)?;
-        Some(Arc::downcast(route).expect("the façade installs only its concrete dynamic control"))
+        let control = Arc::downcast(route).ok();
+        debug_assert!(
+            control.is_some(),
+            "the façade installs only its concrete dynamic control"
+        );
+        control
     }
 
     pub(super) fn reserve(

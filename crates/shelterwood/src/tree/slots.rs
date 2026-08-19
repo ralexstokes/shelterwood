@@ -96,6 +96,12 @@ pub(super) struct ActorSlotCore<E, M> {
     mailbox: Arc<MailboxCell<M>>,
 }
 
+pub(super) fn attach_actor_mailbox<M: Send + 'static>(slot: &SlotCell) -> Arc<MailboxCell<M>> {
+    let mailbox = MailboxCell::new(slot.member.id().clone(), crate::runtime::mailbox_runtime());
+    slot.member.attach_mailbox(mailbox.clone());
+    mailbox
+}
+
 macro_rules! impl_actor_core_definition {
     ($method:ident, $definition:ident) => {
         pub(super) fn $method<R>(self, definition: $definition<R>) -> E::Output<ActorRef<M>>

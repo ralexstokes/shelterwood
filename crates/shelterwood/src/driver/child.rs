@@ -1263,17 +1263,15 @@ impl ScopeRuntime {
         member.set_terminal_disposal_pending(false);
         if self.supervisor.membership_status(key) == MembershipStatus::Removing {
             self.flush_supervisor_effects();
-        } else if terminal.startup == StartupDisposition::Aborted
+            return;
+        }
+        if terminal.startup == StartupDisposition::Aborted
             && !self.supervisor.lifecycle().is_draining()
         {
             self.fail_startup(key, exit);
-            if self.children[key].options.retention == crate::Retention::Remove {
-                self.prune_terminal(key);
-            }
-        } else {
-            if self.children[key].options.retention == crate::Retention::Remove {
-                self.prune_terminal(key);
-            }
+        }
+        if self.children[key].options.retention == crate::Retention::Remove {
+            self.prune_terminal(key);
         }
     }
 }

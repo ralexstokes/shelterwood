@@ -564,9 +564,18 @@ impl MemberCell {
     }
 
     fn with_observation_txn<R>(&self, operation: impl FnOnce(&mut ObservationTxn<'_>) -> R) -> R {
+        self.with_observation_txn_probed(|| {}, operation)
+    }
+
+    fn with_observation_txn_probed<R>(
+        &self,
+        mut report_capture: impl FnMut(),
+        operation: impl FnOnce(&mut ObservationTxn<'_>) -> R,
+    ) -> R {
         let mut operation = Some(operation);
         loop {
             let gate = self.current_observation_gate();
+            report_capture();
             let guard = gate.lock();
             if gate.shares_gate(&self.current_observation_gate()) {
                 let mut txn = ObservationTxn::new(guard);
@@ -608,14 +617,38 @@ impl MemberCell {
     }
 
     fn adopt_observation_gate(&self, gate: &ObservationGate, _txn: &mut ObservationTxn<'_>) {
+        self.adopt_observation_gate_with(
+            gate,
+            || {},
+            |previous| {
+                self.install_observation_gate_locked(previous, gate);
+            },
+        );
+    }
+
+    fn adopt_observation_gate_with(
+        &self,
+        gate: &ObservationGate,
+        mut report_capture: impl FnMut(),
+        install: impl FnOnce(&ObservationGate),
+    ) {
+        let mut install = Some(install);
         loop {
             let current = self.current_observation_gate();
             if current.shares_gate(gate) {
                 return;
             }
+            report_capture();
+            // An operation that passed the pointer check may finish its
+            // complete edge before handoff. One that merely captured this
+            // obsolete gate retries after acquiring it and observing the
+            // replacement.
             let current_guard = current.lock();
             if current.shares_gate(&self.current_observation_gate()) {
-                self.install_observation_gate_locked(&current, gate);
+                let install = install
+                    .take()
+                    .expect("observation gate adoption installs exactly once");
+                install(&current);
                 drop(current_guard);
                 return;
             }
@@ -1398,32 +1431,21 @@ impl ScopeCell {
             gate.shares_gate(&parent.current_observation_gate()),
             "observation gates are adopted only in the parent-to-child direction"
         );
-        loop {
-            let current = self.current_observation_gate();
-            if current.shares_gate(gate) {
-                return;
-            }
-            debug_assert!(
-                self.dynamic_route_in(txn).is_none(),
-                "a scope with a live dynamic route is never re-homed"
-            );
-
-            #[cfg(any(test, feature = "test-util"))]
-            self.report_gate_capture(GateCapture::Adoption);
-
-            // An operation that passed `with_observation_gate`'s pointer
-            // check may finish its complete edge before handoff. An operation
-            // that merely captured this obsolete gate retries after acquiring
-            // it and observing the replacement.
-            let current_guard = current.lock();
-            if current.shares_gate(&self.current_observation_gate()) {
-                self.member.install_observation_gate_locked(&current, gate);
-                self.adopt_descendant_observation_gates_locked(&current, gate, txn);
-                drop(current_guard);
-                return;
-            }
-            drop(current_guard);
-        }
+        self.member.adopt_observation_gate_with(
+            gate,
+            || {
+                #[cfg(any(test, feature = "test-util"))]
+                self.report_gate_capture(GateCapture::Adoption);
+            },
+            |current| {
+                debug_assert!(
+                    self.dynamic_route_in(txn).is_none(),
+                    "a scope with a live dynamic route is never re-homed"
+                );
+                self.member.install_observation_gate_locked(current, gate);
+                self.adopt_descendant_observation_gates_locked(current, gate, txn);
+            },
+        );
     }
 
     pub fn adopt_child_observation_gate(
@@ -1474,23 +1496,13 @@ impl ScopeCell {
         &self,
         operation: impl FnOnce(&mut ObservationTxn<'_>) -> R,
     ) -> R {
-        let mut operation = Some(operation);
-        loop {
-            let gate = self.current_observation_gate();
-            #[cfg(any(test, feature = "test-util"))]
-            self.report_gate_capture(GateCapture::Observation);
-            let guard = gate.lock();
-            if gate.shares_gate(&self.current_observation_gate()) {
-                let operation = operation
-                    .take()
-                    .expect("observation operation runs exactly once");
-                let mut txn = ObservationTxn::new(guard);
-                let result = operation(&mut txn);
-                drop(txn);
-                return result;
-            }
-            drop(guard);
-        }
+        self.member.with_observation_txn_probed(
+            || {
+                #[cfg(any(test, feature = "test-util"))]
+                self.report_gate_capture(GateCapture::Observation);
+            },
+            operation,
+        )
     }
 
     pub fn set_state(&self, state: ScopeState) {

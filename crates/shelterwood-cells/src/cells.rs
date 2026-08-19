@@ -2783,7 +2783,7 @@ mod tests {
         assert_eq!(
             *order.lock().expect("probe mutex remains healthy"),
             [1, 2],
-            "the transaction's Drop sees an already-drained effect list"
+            "a second commit from Drop is a no-op"
         );
     }
 
@@ -2847,16 +2847,24 @@ mod tests {
                 let mut txn = ObservationTxn::new(gate.lock());
                 let first = Arc::clone(&effects);
                 let first_gate = gate.clone();
+                // An assertion here would be inert: `PanicAccumulator`
+                // captures it and `resume_preferred_panic` discards captures
+                // raised while a primary unwind is already in flight. The
+                // observation is published instead and judged in the body.
                 txn.defer(move || {
-                    assert!(!first_gate.is_held());
-                    first.lock().expect("probe mutex remains healthy").push(1);
+                    first
+                        .lock()
+                        .expect("probe mutex remains healthy")
+                        .push((1, first_gate.is_held()));
                     std::panic::panic_any("cleanup panic");
                 });
                 let second = Arc::clone(&effects);
                 let second_gate = gate.clone();
                 txn.defer(move || {
-                    assert!(!second_gate.is_held());
-                    second.lock().expect("probe mutex remains healthy").push(2);
+                    second
+                        .lock()
+                        .expect("probe mutex remains healthy")
+                        .push((2, second_gate.is_held()));
                 });
                 std::panic::panic_any("primary panic");
             }
@@ -2866,8 +2874,9 @@ mod tests {
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"primary panic"));
         assert_eq!(
             *effects.lock().expect("probe mutex remains healthy"),
-            [1, 2],
-            "Drop flushes all committed effects even during an existing unwind"
+            [(1, false), (2, false)],
+            "Drop flushes every committed effect with the gate released, even \
+             during an existing unwind"
         );
     }
 
@@ -2918,6 +2927,14 @@ mod tests {
         let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
         let leaf_scope = child_scope(&nested, "leaf-scope", ScopeFlavor::Ordered);
         let leaf_member = child_member(&nested, "leaf-member");
+        // Depth 2. The one-level loop in
+        // `adopt_descendant_observation_gates_locked` re-homes `leaf_scope`'s
+        // own member, and `ScopeCell::observation_gate` reads that member, so
+        // a subtree of depth 1 cannot tell the loop from the recursion. Only
+        // this grandchild is reachable exclusively through the recursive call.
+        let grandchild = child_member(&leaf_scope, "grandchild");
+        leaf_scope
+            .set_admitted_children(vec![ResidentProjection::new(Arc::clone(&grandchild), None)]);
         nested.set_admitted_children(vec![
             ResidentProjection::new(
                 Arc::clone(&leaf_scope.member),
@@ -2936,6 +2953,7 @@ mod tests {
             nested.observation_gate(),
             leaf_scope.observation_gate(),
             leaf_member.observation_gate(),
+            grandchild.observation_gate(),
         ] {
             assert!(
                 root_gate.same_gate(&gate),
@@ -3173,7 +3191,7 @@ mod tests {
         assert_eq!(
             observed.try_recv(),
             Err(mpsc::TryRecvError::Empty),
-            "probe guards retire as refcount traffic while the installed set owns the exit"
+            "the failure payload still has owners here, so no retirement can reach it"
         );
         drop(exit);
         drop(original);

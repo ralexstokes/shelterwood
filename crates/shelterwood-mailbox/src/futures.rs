@@ -1353,7 +1353,11 @@ mod tests {
         let waker_thread = disposal_thread();
         let mut send =
             Box::pin(actor.send_timeout(ThreadRecordingDrop(message_thread.clone()), width));
-        let hostile = panicking_drop_waker(waker_thread.clone());
+        // Keep the caller-owned raw waker permanently inert: if an assertion
+        // below fails, dropping it during that unwind would create a second
+        // panic and abort the test process. Only its registered clone is the
+        // subject of this regression.
+        let hostile = ManuallyDrop::new(panicking_drop_waker(waker_thread.clone()));
         let mut context = Context::from_waker(&hostile);
         let deadline =
             crate::deadline::Deadline::after(crate::capability::tests::runtime().now(), width);
@@ -1374,11 +1378,6 @@ mod tests {
             )
         }))
         .expect_err("inline waker destruction surfaces its panic from the timeout poll");
-        // The caller-owned raw waker uses the same deliberately panicking
-        // vtable as its registered clone. Leak only this test-owned reference
-        // so the assertion observes the clone released by withdrawal.
-        std::mem::forget(hostile);
-
         assert_eq!(
             panic.downcast_ref::<&'static str>().copied(),
             Some("injected call waker drop panic")

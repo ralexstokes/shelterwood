@@ -2485,6 +2485,9 @@ pub(super) mod tests {
             first.poll(None, Waker::noop()),
             super::OperationPoll::Accepted(bound) if bound == incarnation
         ));
+        let closed = close(&mailbox, incarnation).expect("the bound incarnation closes");
+        let (_token, payload) = closed.into_parts();
+        drop(payload);
 
         let mut withdrawal = mailbox.withdraw(&second, super::WithdrawalDisposition::Inline);
         assert!(matches!(
@@ -2526,38 +2529,57 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn repeated_withdrawal_panics_after_releasing_both_guards() {
+    fn withdrawal_invariant_panics_release_both_guards() {
         let (mailbox, _) = actor();
-        let operation = match mailbox.submit(1) {
+        let withdrawn = match mailbox.submit(1) {
             super::Submission::Parked(operation) => operation,
             super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
                 panic!("an unbound mailbox parks the send")
             }
         };
         mailbox
-            .withdraw(&operation, super::WithdrawalDisposition::Inline)
+            .withdraw(&withdrawn, super::WithdrawalDisposition::Inline)
             .finish();
 
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
+        let missing_waiting = super::SendOperation::new(2_u8);
+        {
+            let mut state = missing_waiting.state.lock().expect("operation state");
+            state.outcome = super::OperationOutcome::Waiting {
+                message: None,
+                newest_observed: None,
+            };
+        }
+        let missing_terminal = super::SendOperation::new(3_u8);
+        {
+            let mut state = missing_terminal.state.lock().expect("operation state");
+            state.outcome = super::OperationOutcome::Terminated {
+                message: None,
+                final_incarnation: None,
+            };
+        }
+
+        for operation in [&withdrawn, &missing_waiting, &missing_terminal] {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    mailbox
+                        .withdraw(operation, super::WithdrawalDisposition::Inline)
+                        .finish();
+                }))
+                .is_err()
+            );
+            drop(
+                operation
+                    .state
+                    .lock()
+                    .expect("withdrawal verdict panic releases the operation guard"),
+            );
+            drop(
                 mailbox
-                    .withdraw(&operation, super::WithdrawalDisposition::Inline)
-                    .finish();
-            }))
-            .is_err()
-        );
-        drop(
-            operation
-                .state
-                .lock()
-                .expect("repeated withdrawal panic releases the operation guard"),
-        );
-        drop(
-            mailbox
-                .state
-                .lock()
-                .expect("repeated withdrawal panic releases the mailbox guard"),
-        );
+                    .state
+                    .lock()
+                    .expect("withdrawal verdict panic releases the mailbox guard"),
+            );
+        }
     }
 
     #[test]

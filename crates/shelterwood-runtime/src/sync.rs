@@ -1324,6 +1324,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_panicking_watch_closure_leaves_the_channel_usable() {
+        let (sender, mut receiver) = super::watch(0u8);
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            sender.modify_silently(|value| {
+                *value = 1;
+                panic!("injected watch mutation panic");
+            });
+        }));
+        assert!(panicked.is_err());
+
+        // The guard is poisoned; every later reader must still see the
+        // surviving framework state rather than inheriting the panic.
+        assert_eq!(sender.read_cloned(), 1);
+        assert_eq!(sender.read_with(|value| *value), 1);
+        assert_eq!(receiver.borrow_cloned(), 1);
+        assert_eq!(receiver.borrow_and_update_cloned(), 1);
+        sender.modify_silently(|value| *value = 2);
+        sender.pulse();
+        assert_eq!(receiver.borrow_cloned(), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn all_pre_fire_waiters_wake() {
         const WAITERS: usize = 32;

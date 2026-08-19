@@ -91,14 +91,16 @@ async fn latched_removal_suppresses_a_queued_start_effect() {
         &mut scope,
         &control,
         "worker",
-        ChildConstruction::Task(TaskDef::new({
-            let starts = Arc::clone(&starts);
-            move |_| {
-                starts.fetch_add(1, Ordering::SeqCst);
-                future::pending()
-            }
-        })
-        .erase()),
+        ChildConstruction::Task(
+            TaskDef::new({
+                let starts = Arc::clone(&starts);
+                move |_| {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    future::pending()
+                }
+            })
+            .erase(),
+        ),
         |_| {},
         DynamicFixtureState::Resident,
     );
@@ -640,11 +642,9 @@ async fn a_dropped_admission_request_publishes_the_fail_closed_response() {
     let root = Arc::clone(&scope.root);
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
-    reservation
-        .slot
-        .define(ChildConstruction::Task(
-            TaskDef::new(|_| future::pending()).erase(),
-        ));
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
     let (mut response, request) =
         begin_admission(&reservation, &mut dynamic_event_receiver, None).await;
 

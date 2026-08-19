@@ -325,19 +325,20 @@ pub struct Handler<A: Actor> {
 }
 
 enum HandlerState<A: Actor> {
-    // The inner Option is the one-run sentinel while initialization owns the
-    // arguments and after any path that returns without constructing an
-    // actor. Unlike the former parallel Options, the enum makes the handler's
-    // phase structural.
-    Uninit(Option<A::Args>),
+    Uninit(A::Args),
     Running(A),
+    // The one-run sentinel. Initialization moves the arguments out and leaves
+    // `Spent` behind, so every path that returns without constructing an
+    // actor is already observably spent and a second run has exactly one
+    // panic site to reach.
+    Spent,
 }
 
 impl<A: Actor> Handler<A> {
     /// Wraps owned args using the callback-actor default `AfterInit` readiness.
     pub fn new(args: A::Args) -> Self {
         Self {
-            state: HandlerState::Uninit(Some(args)),
+            state: HandlerState::Uninit(args),
         }
     }
 }
@@ -362,12 +363,10 @@ impl<A: Actor> RawActor for Handler<A> {
     /// returns, and it must not observe still-live incarnation resources;
     /// every error exit therefore freezes and joins them here first.
     async fn run(&mut self, raw: &mut RawContext<Self::Msg>) -> ExitResult {
-        let HandlerState::Uninit(args) = &mut self.state else {
+        let HandlerState::Uninit(args) = std::mem::replace(&mut self.state, HandlerState::Spent)
+        else {
             panic!("handler actor initialization invoked more than once");
         };
-        let args = args
-            .take()
-            .expect("handler actor initialization invoked more than once");
         let initialized = {
             let mut context = Context::<A>::new(raw, DeliveryStage::Live);
             A::init(args, &mut context).await

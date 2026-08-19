@@ -3002,6 +3002,45 @@ mod tests {
             Some("contained raw payload destructor panic")
         );
     }
+
+    /// A callback actor whose initialization always fails, so `Handler::run`
+    /// takes the error path that returns without installing an actor.
+    struct RefusingInit;
+
+    impl crate::Actor for RefusingInit {
+        type Msg = u8;
+        type Args = ();
+
+        async fn init(
+            _args: Self::Args,
+            _context: &mut crate::Context<'_, Self>,
+        ) -> Result<Self, crate::ExitError> {
+            Err(crate::ExitError::message("initialization refused"))
+        }
+
+        async fn handle(
+            &mut self,
+            _message: Self::Msg,
+            _context: &mut crate::Context<'_, Self>,
+        ) -> crate::ExitResult {
+            Ok(())
+        }
+    }
+
+    // The handler lives in `crate::actor`, but its one-run contract is only
+    // observable against a live raw incarnation, which this module's fixture
+    // owns. A failed initialization spends the handler exactly as a
+    // successful one does.
+    #[crate::runtime::test]
+    #[should_panic(expected = "handler actor initialization invoked more than once")]
+    async fn handler_initialization_runs_at_most_once() {
+        let (mut context, _myself) = bound_raw_context();
+        let mut handler = crate::actor::Handler::<RefusingInit>::new(());
+        crate::RawActor::run(&mut handler, &mut context)
+            .await
+            .expect_err("initialization failure exits the incarnation");
+        let _ = crate::RawActor::run(&mut handler, &mut context).await;
+    }
 }
 
 #[cfg(test)]

@@ -516,6 +516,30 @@ fn dispatch_child_construction(
     }
 }
 
+/// Test-only entry point to the construction dispatch, which the driver
+/// otherwise reaches only through `spawn_child`. `spawn_child` releases a
+/// spent construction before it can be dispatched again, so this is the one
+/// way to exercise the one-shot invariant panics directly.
+#[cfg(test)]
+pub(super) fn dispatch_child_construction_for_test(
+    child: &mut ChildRuntime,
+    root: &Arc<ScopeCell>,
+    defaults: &ResolvedDefaults,
+    incarnation: Incarnation,
+) {
+    let latches = SpawnLatches::new(matches!(
+        child.construction.get_mut(),
+        ChildConstruction::Scope(_)
+    ));
+    drop(dispatch_child_construction(
+        child,
+        root,
+        defaults,
+        incarnation,
+        &latches,
+    ));
+}
+
 fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
     let ChildTaskLaunch {
         events,

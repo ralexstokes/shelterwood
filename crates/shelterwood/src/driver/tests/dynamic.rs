@@ -363,11 +363,10 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
     let response = worker.join().expect("removal transition completes");
     drop(response);
 
-    let route = root
-        .dynamic_route()
-        .expect("the fixture exposes its dynamic route");
     assert!(matches!(
-        root.with_observation_gate(|txn| route.reserve(&root, child_id.clone(), None, txn)),
+        root.with_observation_gate(|txn| {
+            control.reserve(&root, child_id.clone(), None, txn)
+        }),
         Err(crate::ReserveError::RemovalInProgress(id)) if id == child_id
     ));
 }

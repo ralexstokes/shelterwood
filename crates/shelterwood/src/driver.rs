@@ -68,8 +68,9 @@ use admission_control::{
     reject_admission_after_disposal,
 };
 pub(crate) use admission_control::{
-    DynamicReservation, RemovalResponse, cancel_dynamic_reservation, remove_dynamic,
-    reserve_dynamic, signal_fused_cancel, start_admission,
+    DynamicReservation, LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR, RemovalResponse,
+    cancel_dynamic_reservation, remove_dynamic, reserve_dynamic, signal_fused_cancel,
+    start_admission,
 };
 
 #[cfg(test)]

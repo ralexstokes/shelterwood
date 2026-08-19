@@ -9,6 +9,8 @@ mod disposal;
 mod mailbox;
 mod spawn;
 mod sync;
+#[cfg(test)]
+mod test_support;
 mod timer;
 
 pub use disposal::*;

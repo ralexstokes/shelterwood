@@ -707,7 +707,7 @@ mod tests {
         time::Duration,
     };
 
-    use crate::{ChildId, MailboxControl, identity::ScopeIdentity};
+    use crate::{MailboxControl, test_support::mint_actor_incarnation};
 
     use super::{
         super::cell::tests::{actor, actor_for},
@@ -794,12 +794,7 @@ mod tests {
             &*mailbox,
             crate::policy::ResolvedDefaults::default().mailbox,
         );
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        let incarnation = incarnations.mint().expect("incarnation available");
+        let incarnation = mint_actor_incarnation();
         MailboxControl::bind(&*mailbox, incarnation);
 
         let mut send = Box::pin(actor.send(1));

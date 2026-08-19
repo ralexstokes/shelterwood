@@ -136,22 +136,9 @@ mod tests {
         time::Duration,
     };
 
-    use super::{MAX_TIMER_SLICE, next_timer_deadline, timeout};
+    use shelterwood_core::test_support::latest_representable;
 
-    fn latest_representable(started_at: std::time::Instant) -> std::time::Instant {
-        let mut low = Duration::ZERO;
-        let mut high = Duration::MAX;
-        assert!(started_at.checked_add(high).is_none());
-        while high - low > Duration::from_nanos(1) {
-            let mid = low + (high - low) / 2;
-            if started_at.checked_add(mid).is_some() {
-                low = mid;
-            } else {
-                high = mid;
-            }
-        }
-        started_at + low
-    }
+    use super::{MAX_TIMER_SLICE, next_timer_deadline, timeout};
 
     #[tokio::test(start_paused = true)]
     async fn unarmable_absolute_deadline_stays_pending_without_substitution() {

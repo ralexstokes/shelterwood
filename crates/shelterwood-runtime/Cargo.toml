@@ -23,4 +23,5 @@ shelterwood-mailbox.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+shelterwood-core = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

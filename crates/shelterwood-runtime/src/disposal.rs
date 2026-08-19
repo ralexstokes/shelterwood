@@ -368,37 +368,26 @@ pub fn dispose_all<T: Send + 'static>(values: Vec<T>) -> Latch {
 mod tests {
     use std::{
         sync::{
-            Arc, Condvar, Mutex,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
         thread::{self, ThreadId},
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use super::{
         DisposalJob, DisposalPanic, FallbackDisposals, Isolated, dispose_detached,
         retain_fallback_disposal_with,
     };
-    use crate::spawn::{BlockingPoolJob, blocking_pool_accepted};
-
-    /// Name of the shared non-runtime disposal thread, asserted on to pin
-    /// *where* isolated destruction lands rather than merely where it does not.
-    const FALLBACK_THREAD: &str = "shelterwood-disposal";
-
-    /// Deadlock escape hatch for the hostile destructors below. A correct run
-    /// releases them in microseconds and never reaches this bound; a
-    /// regression that runs them inline reaches it and then fails the thread
-    /// assertions, so the suite reports a diagnosis instead of a hang.
-    const DESTRUCTOR_ESCAPE: Duration = Duration::from_secs(5);
-
-    /// The thread a user destructor ran on.
-    type DestructorThread = (ThreadId, Option<String>);
-
-    fn describe_current_thread() -> DestructorThread {
-        let current = thread::current();
-        (current.id(), current.name().map(str::to_owned))
-    }
+    use crate::{
+        spawn::BlockingPoolJob,
+        test_support::{
+            BlockingDrop, DESTRUCTOR_ESCAPE, DISPOSAL_THREAD as FALLBACK_THREAD, RecordingDrop,
+            assert_blocking_pool_outcomes, drop_gate, release,
+            submit_during_blocking_pool_shutdown,
+        },
+    };
 
     struct PanickingDrop(Arc<AtomicUsize>);
 
@@ -460,14 +449,6 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
-    struct ReportingDrop(mpsc::Sender<DestructorThread>);
-
-    impl Drop for ReportingDrop {
-        fn drop(&mut self) {
-            let _ = self.0.send(describe_current_thread());
-        }
-    }
-
     /// The teardown race `dispose_critical` cannot sample its way out of:
     /// Tokio may drop an accepted closure after acceptance was observed,
     /// leaving the submitter with the last still-pending reference. Dropping
@@ -477,7 +458,7 @@ mod tests {
     fn dropping_the_last_critical_job_reroutes_off_the_owning_thread() {
         let owning_thread = thread::current().id();
         let (destroyed, destroyed_rx) = mpsc::channel();
-        let job = DisposalJob::critical(ReportingDrop(destroyed), |_| {});
+        let job = DisposalJob::critical(RecordingDrop(destroyed), |_| {});
 
         drop(job);
 
@@ -498,60 +479,9 @@ mod tests {
     #[test]
     fn fallback_detection_distinguishes_blocking_spawn_outcomes() {
         let accepted = DisposalJob::new((), |_| {});
-        let accepted_worker = Arc::clone(&accepted);
-        assert!(
-            blocking_pool_accepted(&accepted),
-            "an accepted closure still owned by Tokio must stay on its blocking pool"
-        );
-        drop(accepted_worker);
-
         let rejected = DisposalJob::new((), |_| {});
-        let rejected_worker = Arc::clone(&rejected);
-        drop(rejected_worker);
-        assert!(
-            !blocking_pool_accepted(&rejected),
-            "a synchronously dropped closure must move to the fallback queue"
-        );
-
         let completed = DisposalJob::new((), |_| {});
-        let completed_worker = Arc::clone(&completed);
-        completed_worker.run();
-        drop(completed_worker);
-        assert!(
-            blocking_pool_accepted(&completed),
-            "an already-completed closure must not enqueue an empty job"
-        );
-    }
-
-    struct BlockingDrop {
-        entered: mpsc::Sender<DestructorThread>,
-        release: Arc<(Mutex<bool>, Condvar)>,
-        finished: mpsc::Sender<()>,
-    }
-
-    impl Drop for BlockingDrop {
-        fn drop(&mut self) {
-            let _ = self.entered.send(describe_current_thread());
-            let (released, wake) = &*self.release;
-            let mut released = released.lock().expect("release mutex available");
-            let deadline = Instant::now() + DESTRUCTOR_ESCAPE;
-            while !*released {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    break;
-                };
-                released = wake
-                    .wait_timeout(released, remaining)
-                    .expect("release mutex available")
-                    .0;
-            }
-            let _ = self.finished.send(());
-        }
-    }
-
-    fn release(gate: &Arc<(Mutex<bool>, Condvar)>) {
-        let (released, wake) = &**gate;
-        *released.lock().expect("release mutex available") = true;
-        wake.notify_all();
+        assert_blocking_pool_outcomes(accepted, rejected, completed);
     }
 
     struct DisposeOnDrop {
@@ -574,46 +504,24 @@ mod tests {
 
     #[test]
     fn shut_down_blocking_pool_falls_back_off_the_teardown_thread() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .max_blocking_threads(1)
-            .build()
-            .expect("test runtime");
-        let (worker_started, worker_started_rx) = mpsc::channel();
-        let (release_worker, release_worker_rx) = mpsc::channel();
-        drop(runtime.spawn_blocking(move || {
-            worker_started
-                .send(())
-                .expect("test observes the occupied blocking worker");
-            release_worker_rx
-                .recv()
-                .expect("test releases the occupied blocking worker");
-        }));
-        worker_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("the sole blocking worker starts");
-
         let (submitted, submitted_rx) = mpsc::channel();
         let (returned, returned_rx) = mpsc::channel();
         let (entered, entered_rx) = mpsc::channel();
         let (finished, finished_rx) = mpsc::channel();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate = drop_gate();
         let trigger = DisposeOnDrop {
-            value: Some(BlockingDrop {
+            value: Some(BlockingDrop::with_completion(
                 entered,
-                release: Arc::clone(&gate),
+                Arc::clone(&gate),
                 finished,
-            }),
+            )),
             submitted,
             returned,
         };
         // With the only worker occupied, this outer task stays queued. After
         // shutdown begins, Tokio runs it while draining the worker queue; its
         // nested disposal submission is then synchronously rejected.
-        drop(runtime.spawn_blocking(move || drop(trigger)));
-        runtime.shutdown_background();
-        release_worker
-            .send(())
-            .expect("the blocking-pool teardown may proceed");
+        submit_during_blocking_pool_shutdown(move || drop(trigger));
 
         let teardown_thread = submitted_rx.recv_timeout(Duration::from_secs(1));
         let destructor_thread = entered_rx.recv_timeout(Duration::from_secs(1));
@@ -655,12 +563,12 @@ mod tests {
         let embedder_thread = thread::current().id();
         let (entered, entered_rx) = mpsc::channel();
         let (finished, finished_rx) = mpsc::channel();
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let held = Isolated::new(BlockingDrop {
+        let gate = drop_gate();
+        let held = Isolated::new(BlockingDrop::with_completion(
             entered,
-            release: Arc::clone(&gate),
+            Arc::clone(&gate),
             finished,
-        });
+        ));
         runtime.spawn(async move {
             let _held = held;
             std::future::pending::<()>().await;

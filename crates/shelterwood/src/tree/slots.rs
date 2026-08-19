@@ -153,7 +153,8 @@ impl<E: SlotEndpoint, K: SlotKind> SlotCore<E, K> {
     where
         D: Definition<Kind = K>,
     {
-        definition.define(self)
+        let (handles, construction) = definition.lower(&self);
+        self.endpoint.define(handles, construction)
     }
 }
 
@@ -177,13 +178,19 @@ pub(super) fn reserve_dynamic<K: SlotKind>(
 /// Sealed semantic lowering for each nominal public definition type.
 ///
 /// `Kind` chooses the reservation shape; `Handles` pins the return type. The
-/// eight public add methods remain concrete wrappers, so this trait cannot
-/// enlarge the accepted public surface or weaken inference.
+/// borrowed slot lets each implementation construct its typed handles without
+/// gaining authority to bind or admit the endpoint; [`SlotCore::define`] owns
+/// that single final transition. The eight public add methods remain concrete
+/// wrappers, so this trait cannot enlarge the accepted public surface or
+/// weaken inference.
 pub(super) trait Definition: Send + 'static + Sized {
     type Kind: SlotKind;
     type Handles;
 
-    fn define<E: SlotEndpoint>(self, slot: SlotCore<E, Self::Kind>) -> E::Output<Self::Handles>;
+    fn lower<E: SlotEndpoint>(
+        self,
+        slot: &SlotCore<E, Self::Kind>,
+    ) -> (Self::Handles, ChildConstruction);
 }
 
 impl<E: SlotEndpoint, M: Send + 'static> SlotCore<E, ActorKind<M>> {
@@ -201,20 +208,16 @@ macro_rules! impl_raw_definition {
             type Kind = ActorKind<R::Msg>;
             type Handles = ActorRef<R::Msg>;
 
-            fn define<E: SlotEndpoint>(
+            fn lower<E: SlotEndpoint>(
                 self,
-                slot: SlotCore<E, Self::Kind>,
-            ) -> E::Output<Self::Handles> {
+                slot: &SlotCore<E, Self::Kind>,
+            ) -> (Self::Handles, ChildConstruction) {
                 let actor = slot.actor_ref();
-                let SlotCore {
-                    endpoint,
-                    kind: ActorKind { mailbox },
-                } = slot;
-                endpoint.define(
+                (
                     actor,
                     ChildConstruction::Raw($definition::erase(
                         runtime::Isolated::new(self),
-                        mailbox,
+                        Arc::clone(&slot.kind.mailbox),
                     )),
                 )
             }
@@ -229,8 +232,11 @@ impl<A: crate::Actor> Definition for ActorDef<A> {
     type Kind = ActorKind<A::Msg>;
     type Handles = ActorRef<A::Msg>;
 
-    fn define<E: SlotEndpoint>(self, slot: SlotCore<E, Self::Kind>) -> E::Output<Self::Handles> {
-        slot.define(self.into_raw())
+    fn lower<E: SlotEndpoint>(
+        self,
+        slot: &SlotCore<E, Self::Kind>,
+    ) -> (Self::Handles, ChildConstruction) {
+        self.into_raw().lower(slot)
     }
 }
 
@@ -238,8 +244,11 @@ impl<A: crate::Actor> Definition for ActorOnceDef<A> {
     type Kind = ActorKind<A::Msg>;
     type Handles = ActorRef<A::Msg>;
 
-    fn define<E: SlotEndpoint>(self, slot: SlotCore<E, Self::Kind>) -> E::Output<Self::Handles> {
-        slot.define(self.into_raw())
+    fn lower<E: SlotEndpoint>(
+        self,
+        slot: &SlotCore<E, Self::Kind>,
+    ) -> (Self::Handles, ChildConstruction) {
+        self.into_raw().lower(slot)
     }
 }
 
@@ -253,10 +262,12 @@ impl Definition for TaskDef {
     type Kind = TaskKind;
     type Handles = TaskRef;
 
-    fn define<E: SlotEndpoint>(self, slot: SlotCore<E, Self::Kind>) -> E::Output<Self::Handles> {
+    fn lower<E: SlotEndpoint>(
+        self,
+        slot: &SlotCore<E, Self::Kind>,
+    ) -> (Self::Handles, ChildConstruction) {
         let task = slot.task_ref();
-        slot.endpoint
-            .define(task, ChildConstruction::Task(self.erase()))
+        (task, ChildConstruction::Task(self.erase()))
     }
 }
 
@@ -264,11 +275,14 @@ impl<T: Send + 'static> Definition for TaskOnceDef<T> {
     type Kind = TaskKind;
     type Handles = (TaskRef, OneShotTaskRef<T>);
 
-    fn define<E: SlotEndpoint>(self, slot: SlotCore<E, Self::Kind>) -> E::Output<Self::Handles> {
+    fn lower<E: SlotEndpoint>(
+        self,
+        slot: &SlotCore<E, Self::Kind>,
+    ) -> (Self::Handles, ChildConstruction) {
         let task = slot.task_ref();
         let (completion, receiver) = runtime::oneshot();
         let claim = OneShotTaskRef::new(receiver, task.clone());
-        slot.endpoint.define(
+        (
             (task, claim),
             ChildConstruction::Task(self.erase(completion)),
         )
@@ -295,13 +309,12 @@ macro_rules! impl_subtree_definition {
             type Kind = SubtreeKind<T>;
             type Handles = T::Ref;
 
-            fn define<E: SlotEndpoint>(
+            fn lower<E: SlotEndpoint>(
                 self,
-                slot: SlotCore<E, Self::Kind>,
-            ) -> E::Output<Self::Handles> {
+                slot: &SlotCore<E, Self::Kind>,
+            ) -> (Self::Handles, ChildConstruction) {
                 let scope = slot.scope_ref();
-                slot.endpoint
-                    .define(scope, ChildConstruction::Scope(Box::new(self.erase())))
+                (scope, ChildConstruction::Scope(Box::new(self.erase())))
             }
         }
     };

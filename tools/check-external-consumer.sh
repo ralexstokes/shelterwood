@@ -7,6 +7,7 @@ diagnostics="$(mktemp)"
 trap 'rm -f "$diagnostics"' EXIT
 
 cargo check --locked --manifest-path "$manifest"
+cargo test --locked --manifest-path "$manifest"
 
 if cargo check --locked --manifest-path "$manifest" --features from-latch >"$diagnostics" 2>&1; then
     echo "external consumers can call CancellationToken::from_latch" >&2

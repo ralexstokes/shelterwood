@@ -13,5 +13,6 @@ pub use shelterwood_mailbox::{
 };
 
 pub(crate) use shelterwood_mailbox::{
-    AcceptedSequence, MailboxCell, MailboxControl, MailboxReceiver, actor_ref_from_parts,
+    AcceptedSequence, MailboxBindToken, MailboxCell, MailboxControl, MailboxEffectQueue,
+    MailboxReceiver, actor_ref_from_parts,
 };

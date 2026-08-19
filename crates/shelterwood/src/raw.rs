@@ -20,7 +20,8 @@ use crate::{
     definition::DefinitionSource,
     identity::PoisonedCounter,
     mailbox::{
-        AcceptedSequence, MailboxCell, MailboxControl, MailboxReceiver, actor_ref_from_parts,
+        AcceptedSequence, MailboxCell, MailboxControl, MailboxEffectQueue, MailboxReceiver,
+        actor_ref_from_parts,
     },
     policy::{ChildMode, CommonOptions},
     runtime::{
@@ -1461,6 +1462,7 @@ impl<M: Send + 'static> RawContext<M> {
     pub async fn recv(&mut self) -> Option<M> {
         loop {
             if self.local_stop.is_fired() {
+                self.receiver.freeze();
                 self.freeze_and_report();
                 // `stop()` originates on this task, but the configured
                 // shutdown ladder is owned by the driver. The driver's helper
@@ -1474,10 +1476,10 @@ impl<M: Send + 'static> RawContext<M> {
                 return None;
             }
             if self.shutdown.is_cancelled() {
-                // Every driver path freezes (or closes) this incarnation's
-                // mailbox before firing its shutdown token. That ordering is
-                // what makes the frozen accepted prefix a complete drain
-                // boundary once cancellation is observable here.
+                // Freeze locally as part of observing shutdown. The driver
+                // also freezes before cancellation, but correctness of this
+                // receive boundary does not depend on that remote ordering.
+                self.receiver.freeze();
                 self.freeze_and_report();
                 self.resources.resume_pending_panic();
                 return None;
@@ -2105,7 +2107,11 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
                     None
                 }
             };
-            let mailbox_freeze_panic = catch_panic(|| mailbox.freeze(incarnation)).err();
+            let mailbox_freeze_panic = catch_panic(|| {
+                let mut effects = MailboxEffectQueue::default();
+                mailbox.freeze(incarnation, &mut effects);
+            })
+            .err();
             let resource_freeze_panic = catch_panic(|| owner.raw().freeze_resources()).err();
             let mut cleanup_panic = owner.raw().take_resource_panic();
             keep_first_panic(&mut cleanup_panic, mailbox_freeze_panic);
@@ -2237,7 +2243,9 @@ mod tests {
         ChildId, MailboxShutdown, Readiness,
         cells::{MemberCell, ScopeCell},
         identity::ScopeIdentity,
-        mailbox::{ActorRef, MailboxCell, MailboxControl, actor_ref_from_parts},
+        mailbox::{
+            ActorRef, MailboxCell, MailboxControl, MailboxEffectQueue, actor_ref_from_parts,
+        },
         policy::{ResolvedDefaults, ScopeFlavor},
         runtime::{
             CompletionGatedLatch, Latch, PanicPayload, Signal, UnwindPanics,
@@ -2247,8 +2255,9 @@ mod tests {
     };
 
     /// Builds a live raw incarnation context whose mailbox is configured and
-    /// bound, so `next_ready` can take the busy path without a driver.
-    fn bound_raw_context_for<M: Send + 'static>() -> (RawContext<M>, ActorRef<M>) {
+    /// bound, so `next_ready` can take the busy path without a driver. The
+    /// returned latch is the context's own shutdown token.
+    fn bound_raw_context_for<M: Send + 'static>() -> (RawContext<M>, ActorRef<M>, Latch) {
         let mut identity = ScopeIdentity::new();
         let id = ChildId::from("raw-actor");
         let member = MemberCell::new(
@@ -2257,12 +2266,17 @@ mod tests {
         );
         let mailbox = MailboxCell::new(id.clone(), crate::runtime::mailbox_runtime());
         member.attach_mailbox(mailbox.clone());
-        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox());
+        let mut effects = MailboxEffectQueue::default();
+        let token = MailboxControl::configure(
+            &*mailbox,
+            ResolvedDefaults::default().mailbox(),
+            &mut effects,
+        );
         let incarnation = member
             .take_incarnation_counter()
             .mint()
             .expect("incarnation available");
-        MailboxControl::bind(&*mailbox, incarnation);
+        MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
 
         let mut scope_identity = ScopeIdentity::new();
         let scope_id = ChildId::from("scope");
@@ -2275,13 +2289,14 @@ mod tests {
         let scope = ScopeCell::new(scope_member, ScopeFlavor::Ordered, ScopeIdentity::new());
 
         let myself = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
+        let shutdown = Latch::default();
         let context = RawContext::new(
             RawRunContext {
                 id,
                 incarnation,
                 member,
                 scope: ScopeRef { cell: scope },
-                shutdown: Latch::default(),
+                shutdown: shutdown.clone(),
                 abort: Latch::default(),
                 ready: CompletionGatedLatch::default(),
                 local_stop: Latch::default(),
@@ -2291,11 +2306,12 @@ mod tests {
             mailbox,
             Readiness::Immediate,
         );
-        (context, myself)
+        (context, myself, shutdown)
     }
 
     fn bound_raw_context() -> (RawContext<u8>, ActorRef<u8>) {
-        bound_raw_context_for()
+        let (context, actor, _shutdown) = bound_raw_context_for();
+        (context, actor)
     }
 
     fn marker(value: usize) -> QueuedEvent<usize> {
@@ -2726,6 +2742,24 @@ mod tests {
             "the ready-selection turn reclaimed both finished ledger entries"
         );
         assert!(!context.resources.offloads[0].finished.is_fired());
+    }
+
+    #[crate::runtime::test]
+    async fn recv_freezes_its_mailbox_when_it_observes_shutdown() {
+        let (mut context, actor, shutdown) = bound_raw_context_for::<u8>();
+        actor
+            .try_send(1)
+            .expect("the live mailbox accepts before shutdown");
+        shutdown.fire();
+
+        assert_eq!(context.recv().await, None);
+        assert_eq!(
+            actor
+                .try_send(2)
+                .expect_err("recv's local freeze closes the acceptance boundary")
+                .kind,
+            crate::SendErrorKind::NotRunning
+        );
     }
 
     #[test]

@@ -136,9 +136,8 @@ async fn terminal_stop_paths_share_one_complete_observation_transition() {
 #[crate::runtime::test]
 async fn root_driver_panic_mid_drain_upgrades_to_the_join_monitor_verdict() {
     let scope = isolated_scope("root", ScopeFlavor::Ordered);
-    let epoch = scope
-        .begin_incarnation(ScopeState::Starting)
-        .expect("test scope epoch is available");
+    let epoch = ScopeEpochGuard::begin(&scope).expect("test scope epoch is available");
+    let epoch_id = epoch.epoch();
     scope
         .member
         .update(|record| record.stage = MemberStage::Running);
@@ -189,7 +188,7 @@ async fn root_driver_panic_mid_drain_upgrades_to_the_join_monitor_verdict() {
         "the unwind epilogue leaves root terminality to the join monitor"
     );
     assert!(
-        scope.settled(Some(epoch)),
+        scope.settled(Some(epoch_id)),
         "the unwind epilogue retires its epoch, so the join monitor must take \
          the no-live-epoch fallback this test is named for"
     );
@@ -241,40 +240,18 @@ async fn scope_runtime_drop_finishes_every_child_and_epoch_after_a_hostile_wake(
         tree.add_task(id, TaskDef::new(|_| future::pending()))
             .expect("the child declaration is valid");
     }
-    let mut plan = tree.lower_for_test();
-    let root = Arc::clone(&plan.root);
-    let epoch = root
-        .begin_incarnation(ScopeState::Starting)
-        .expect("the test scope has a live epoch");
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    let epoch_id = fixture.epoch();
     root.member
         .update(|record| record.stage = MemberStage::Running);
     root.set_state_and_startup(ScopeState::Running, Ok(()));
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
-    );
-    let members = plan
-        .children
+    let keys = fixture.children.keys().collect::<Vec<_>>();
+    let members = keys
         .iter()
-        .map(|child| Arc::clone(&child.slot.member))
+        .map(|key| Arc::clone(&fixture.children[*key].slot.member))
         .collect::<Vec<_>>();
-    let mut children = ChildArena::default();
-    plan.children.reverse();
-    while let Some(child) = plan.children.pop() {
-        children
-            .insert(ChildRuntime::from_plan(child, &root))
-            .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
-    }
-    let keys = children.keys().collect::<Vec<_>>();
-    let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
-        .with_defaults(plan.defaults.clone())
-        .with_children(children)
-        .with_lifecycle(ScopeLifecycle::running())
-        .build();
-    plan.finish_transfer();
+    let (mut scope, mut event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
     for key in &keys {
         scope.spawn_child(*key);
     }
@@ -316,7 +293,7 @@ async fn scope_runtime_drop_finishes_every_child_and_epoch_after_a_hostile_wake(
         "resident clearing runs after every child terminalizes"
     );
     assert!(
-        root.settled(Some(epoch)),
+        root.settled(Some(epoch_id)),
         "the scope epoch retires after child and residency teardown"
     );
     assert!(matches!(

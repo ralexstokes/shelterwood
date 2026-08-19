@@ -7,7 +7,7 @@ struct ThreadRecordingRaw {
 
 impl Drop for ThreadRecordingRaw {
     fn drop(&mut self) {
-        let _ = crate::runtime::unbounded_mpsc_send(&self.dropped, std::thread::current().id());
+        let _ = self.dropped.send(std::thread::current().id());
     }
 }
 

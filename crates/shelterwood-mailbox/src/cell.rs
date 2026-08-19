@@ -893,6 +893,11 @@ impl<M> fmt::Debug for MailboxCell<M> {
 }
 
 impl<M: Send + 'static> MailboxCell<M> {
+    // This constructor bridges the lower mailbox crate to the downstream
+    // façade and therefore cannot be crate-private. Direct construction is
+    // outside the supported API; the façade does not export either this type
+    // or the `MailboxRuntime` capability in its signature.
+    #[doc(hidden)]
     pub fn new(actor_id: ChildId, runtime: Arc<dyn MailboxRuntime>) -> Arc<Self> {
         let changed = runtime.signal();
         Arc::new(Self {

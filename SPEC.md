@@ -3124,6 +3124,18 @@ integration toolkit for the driver shell and the end-to-end invariants.
     hidden items rather than taught to descend into hidden methods on
     exported types; the façade-absence probe in
     `tools/check-external-consumer.sh` is what enforces this boundary.
+    `SnapshotReceiver::borrow_latest_and_closed` is the explicit benign
+    exception: the downstream façade needs this lower-crate bridge, its
+    signature contains only supported observation data, and it grants no
+    construction or installation capability. It therefore remains callable
+    on the façade-public receiver but is hidden from generated documentation;
+    the JSON walk deliberately does not gain a second hidden-item graph for
+    it. `MailboxCell::new` is likewise a hidden cross-crate constructor, but
+    the façade exports neither `MailboxCell` nor the `MailboxRuntime`
+    capability required to call it, so direct lower-crate construction remains
+    outside the supported boundary. The driver event lane's public adapter
+    types are opaque wrappers rather than Tokio aliases, and the lifecycle
+    ring capacity is an internal implementation choice rather than façade API.
 14. **Event-woken observers see consistent-or-newer snapshots.** Subscribe
    to lifecycle events; *synchronously inside the event arm*, read the
    snapshot and assert it already reflects the event — at both ends of the
@@ -3960,6 +3972,12 @@ pre-release, which does make the payload values themselves constructible by
 an application; that is deliberate and costs nothing, because authentication
 lives in the provenance structure rather than in the payload's privacy.
 Adding a cause or field must update every façade match.
+Construction is one named constructor per kind: `completed`, `failed`,
+`panicked`, `readiness_timed_out`, and `aborted` take the kind payload plus
+the orthogonal cancellation observation; `never_started` fixes cancellation
+to `NotObserved`. There is no public constructor that accepts an arbitrary
+`ExitKind`, so applications cannot construct the semantically impossible
+`NeverStarted`/`Observed` pair. The external-consumer probe pins that absence.
 Scope-level shutdown-timeout errors carry the affected children as
 structured data: child-id paths plus membership tokens (§7) — never
 bare ids, which sibling scopes may reuse (§2).

@@ -129,7 +129,7 @@ async fn latched_removal_suppresses_a_queued_start_effect() {
         "a latch that wins before effect execution suppresses user construction"
     );
     assert!(matches!(
-        crate::runtime::unbounded_mpsc_try_recv(&mut dynamic_events),
+        dynamic_events.try_recv(),
         Some(DriverEvent::Removal(RemovalRequest { key: queued })) if queued == key
     ));
 }
@@ -964,7 +964,7 @@ async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
     );
     assert!(fused_cancel.is_fired());
     assert!(
-        crate::runtime::unbounded_mpsc_try_recv(&mut dynamic_event_receiver).is_none(),
+        dynamic_event_receiver.try_recv().is_none(),
         "a reserved membership cannot emit a key-addressed Removal"
     );
 
@@ -1072,7 +1072,7 @@ async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_rech
         "the under-lock rejection admits no resident"
     );
     assert!(
-        crate::runtime::unbounded_mpsc_try_recv(&mut dynamic_event_receiver).is_none(),
+        dynamic_event_receiver.try_recv().is_none(),
         "a reservation-time cancellation emits no key-addressed Removal"
     );
     assert!(
@@ -1172,7 +1172,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
     assert_eq!(removal.key, key);
     if source == RemovalSource::FusedAndExplicit {
         assert!(
-            crate::runtime::unbounded_mpsc_try_recv(&mut dynamic_event_receiver).is_none(),
+            dynamic_event_receiver.try_recv().is_none(),
             "the state transition coalesces fused and explicit removal sources"
         );
     }
@@ -1342,13 +1342,12 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     .await;
     let key = exit.child;
     assert!(
-        crate::runtime::unbounded_mpsc_send(
-            &scope.events,
-            DriverEvent::Removal(RemovalRequest {
+        scope
+            .events
+            .send(DriverEvent::Removal(RemovalRequest {
                 key: ChildKey::fixture(u64::MAX - 1),
-            }),
-        )
-        .is_ok(),
+            }))
+            .is_ok(),
         "the open lane queues a predecessor edge ahead of the fused removal"
     );
     drop(admission);

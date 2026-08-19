@@ -40,14 +40,14 @@ pub fn stop_reason_into_nested_result(reason: StopReason) -> ExitResult {
 
 pub fn stop_reason_root_exit(reason: &StopReason) -> Exit {
     match reason {
-        StopReason::Finished => Exit::new(ExitKind::Completed, Cancellation::NotObserved),
-        StopReason::ShutdownRequested => Exit::new(ExitKind::Completed, Cancellation::Observed),
-        StopReason::IntensityTripped(trip) => Exit::new(
-            ExitKind::Failed(structured_intensity_trip_error(trip.clone())),
+        StopReason::Finished => Exit::completed(Cancellation::NotObserved),
+        StopReason::ShutdownRequested => Exit::completed(Cancellation::Observed),
+        StopReason::IntensityTripped(trip) => Exit::failed(
+            structured_intensity_trip_error(trip.clone()),
             Cancellation::NotObserved,
         ),
-        StopReason::StartupFailed(failure) => Exit::new(
-            ExitKind::Failed(structured_startup_failure_error(failure.clone())),
+        StopReason::StartupFailed(failure) => Exit::failed(
+            structured_startup_failure_error(failure.clone()),
             Cancellation::NotObserved,
         ),
         StopReason::NeverStarted => Exit::never_started(),
@@ -416,10 +416,38 @@ pub struct Exit {
 }
 
 impl Exit {
-    /// Creates an exit from its kind and cancellation observation.
-    #[must_use]
-    pub const fn new(kind: ExitKind, cancellation: Cancellation) -> Self {
+    const fn from_kind(kind: ExitKind, cancellation: Cancellation) -> Self {
         Self { kind, cancellation }
+    }
+
+    /// Constructs a successfully completed incarnation exit.
+    #[must_use]
+    pub const fn completed(cancellation: Cancellation) -> Self {
+        Self::from_kind(ExitKind::Completed, cancellation)
+    }
+
+    /// Constructs an application-failure exit.
+    #[must_use]
+    pub const fn failed(error: ExitError, cancellation: Cancellation) -> Self {
+        Self::from_kind(ExitKind::Failed(error), cancellation)
+    }
+
+    /// Constructs an exit for a panic in user code or destruction.
+    #[must_use]
+    pub const fn panicked(message: Option<String>, cancellation: Cancellation) -> Self {
+        Self::from_kind(ExitKind::Panicked { message }, cancellation)
+    }
+
+    /// Constructs an exit for an expired readiness deadline.
+    #[must_use]
+    pub const fn readiness_timed_out(deadline: Instant, cancellation: Cancellation) -> Self {
+        Self::from_kind(ExitKind::ReadinessTimedOut { deadline }, cancellation)
+    }
+
+    /// Constructs an exit for an incarnation future destroyed by the framework.
+    #[must_use]
+    pub const fn aborted(phase: GracePhase, cancellation: Cancellation) -> Self {
+        Self::from_kind(ExitKind::Aborted { phase }, cancellation)
     }
 
     /// Returns the exit kind.
@@ -441,9 +469,13 @@ impl Exit {
     }
 
     /// Constructs the membership-level never-started exit.
+    ///
+    /// A membership with no incarnation cannot have observed an incarnation's
+    /// cancellation token, so this constructor fixes cancellation to
+    /// [`Cancellation::NotObserved`].
     #[must_use]
     pub const fn never_started() -> Self {
-        Self::new(ExitKind::NeverStarted, Cancellation::NotObserved)
+        Self::from_kind(ExitKind::NeverStarted, Cancellation::NotObserved)
     }
 }
 
@@ -602,7 +634,7 @@ pub fn classify_exit(
             phase: GracePhase::WithinGrace,
         },
     };
-    Exit::new(kind, cancellation)
+    Exit::from_kind(kind, cancellation)
 }
 
 /// Adds a destructor panic to an already-classified exit without erasing an
@@ -610,7 +642,7 @@ pub fn classify_exit(
 pub fn classify_disposal_panic(exit: Exit, message: Option<String>) -> Exit {
     let Exit { kind, cancellation } = exit;
     let kind = prefer_earlier(kind, ExitKind::Panicked { message });
-    Exit::new(kind, cancellation)
+    Exit::from_kind(kind, cancellation)
 }
 
 /// Diagnostic precedence shared by provisional and final exit evidence.
@@ -677,6 +709,22 @@ mod tests {
         structured_intensity_trip_error, structured_startup_failure_error,
     };
 
+    fn exit(kind: ExitKind, cancellation: Cancellation) -> Exit {
+        match kind {
+            ExitKind::Completed => Exit::completed(cancellation),
+            ExitKind::Failed(error) => Exit::failed(error, cancellation),
+            ExitKind::Panicked { message } => Exit::panicked(message, cancellation),
+            ExitKind::ReadinessTimedOut { deadline } => {
+                Exit::readiness_timed_out(deadline, cancellation)
+            }
+            ExitKind::Aborted { phase } => Exit::aborted(phase, cancellation),
+            ExitKind::NeverStarted => {
+                assert_eq!(cancellation, Cancellation::NotObserved);
+                Exit::never_started()
+            }
+        }
+    }
+
     #[test]
     fn child_startup_failure_display_summarizes_every_exit_kind() {
         let mut identity = ScopeIdentity::new();
@@ -734,7 +782,7 @@ mod tests {
                 cause: StartupFailureCause::Child {
                     id: id.clone(),
                     membership,
-                    exit: Exit::new(kind, Cancellation::NotObserved),
+                    exit: exit(kind, Cancellation::NotObserved),
                 },
             };
 
@@ -844,7 +892,7 @@ mod tests {
                 JoinOutcome::Ok { value: () },
                 None,
                 Cancellation::NotObserved,
-                Exit::new(ExitKind::Completed, Cancellation::NotObserved),
+                Exit::completed(Cancellation::NotObserved),
             ),
             (
                 "cancellation overrides recorded completion",
@@ -852,7 +900,7 @@ mod tests {
                 JoinOutcome::Cancelled,
                 Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
-                Exit::new(
+                exit(
                     ExitKind::Aborted {
                         phase: GracePhase::AfterGrace,
                     },
@@ -865,7 +913,7 @@ mod tests {
                 JoinOutcome::Ok { value: () },
                 None,
                 Cancellation::NotObserved,
-                Exit::new(ExitKind::Failed(failure.clone()), Cancellation::NotObserved),
+                Exit::failed(failure.clone(), Cancellation::NotObserved),
             ),
             (
                 "late cancellation preserves recorded failure",
@@ -873,7 +921,7 @@ mod tests {
                 JoinOutcome::Cancelled,
                 Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
-                Exit::new(ExitKind::Failed(failure.clone()), Cancellation::Observed),
+                Exit::failed(failure.clone(), Cancellation::Observed),
             ),
             (
                 "join panic overrides recorded failure",
@@ -883,7 +931,7 @@ mod tests {
                 },
                 None,
                 Cancellation::NotObserved,
-                Exit::new(
+                exit(
                     ExitKind::Panicked {
                         message: Some("drop panic".to_owned()),
                     },
@@ -896,7 +944,7 @@ mod tests {
                 JoinOutcome::Cancelled,
                 Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
-                Exit::new(
+                exit(
                     ExitKind::ReadinessTimedOut { deadline },
                     Cancellation::Observed,
                 ),
@@ -909,7 +957,7 @@ mod tests {
                 },
                 None,
                 Cancellation::NotObserved,
-                Exit::new(
+                exit(
                     ExitKind::Panicked {
                         message: Some("drop panic".to_owned()),
                     },
@@ -926,7 +974,7 @@ mod tests {
                 },
                 None,
                 Cancellation::Observed,
-                Exit::new(
+                exit(
                     ExitKind::Panicked {
                         message: Some("callback panic".to_owned()),
                     },
@@ -939,7 +987,7 @@ mod tests {
                 JoinOutcome::Cancelled,
                 Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
-                Exit::new(
+                exit(
                     ExitKind::Aborted {
                         phase: GracePhase::WithinGrace,
                     },
@@ -952,7 +1000,7 @@ mod tests {
                 JoinOutcome::Cancelled,
                 None,
                 Cancellation::Observed,
-                Exit::new(
+                exit(
                     ExitKind::Aborted {
                         phase: GracePhase::WithinGrace,
                     },
@@ -965,7 +1013,7 @@ mod tests {
                 JoinOutcome::Ok { value: () },
                 Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
-                Exit::new(ExitKind::Completed, Cancellation::Observed),
+                Exit::completed(Cancellation::Observed),
             ),
             (
                 "join cancellation supplies a missing outcome",
@@ -973,7 +1021,7 @@ mod tests {
                 JoinOutcome::Cancelled,
                 Some(GracePhase::AfterGrace),
                 Cancellation::Observed,
-                Exit::new(
+                exit(
                     ExitKind::Aborted {
                         phase: GracePhase::AfterGrace,
                     },
@@ -986,7 +1034,7 @@ mod tests {
                 JoinOutcome::Ok { value: () },
                 None,
                 Cancellation::NotObserved,
-                Exit::new(
+                exit(
                     ExitKind::Aborted {
                         phase: GracePhase::WithinGrace,
                     },
@@ -1007,12 +1055,12 @@ mod tests {
     #[test]
     fn disposal_panic_uses_exit_precedence_and_preserves_cancellation() {
         let classified = classify_disposal_panic(
-            Exit::new(ExitKind::Completed, Cancellation::Observed),
+            Exit::completed(Cancellation::Observed),
             Some("destructor".to_owned()),
         );
         assert_eq!(
             classified,
-            Exit::new(
+            exit(
                 ExitKind::Panicked {
                     message: Some("destructor".to_owned())
                 },
@@ -1027,10 +1075,10 @@ mod tests {
         ] {
             assert_eq!(
                 classify_disposal_panic(
-                    Exit::new(weaker, Cancellation::NotObserved),
+                    exit(weaker, Cancellation::NotObserved),
                     Some("destructor".to_owned()),
                 ),
-                Exit::new(
+                exit(
                     ExitKind::Panicked {
                         message: Some("destructor".to_owned())
                     },
@@ -1039,7 +1087,7 @@ mod tests {
             );
         }
 
-        let earlier = Exit::new(
+        let earlier = exit(
             ExitKind::Panicked {
                 message: Some("task".to_owned()),
             },
@@ -1057,7 +1105,7 @@ mod tests {
         assert!(stop_reason_into_nested_result(StopReason::ShutdownRequested).is_ok());
         assert_eq!(
             stop_reason_root_exit(&StopReason::ShutdownRequested),
-            Exit::new(ExitKind::Completed, Cancellation::Observed)
+            Exit::completed(Cancellation::Observed)
         );
         assert_eq!(
             stop_reason_root_exit(&StopReason::NeverStarted),
@@ -1103,30 +1151,21 @@ mod tests {
     #[test]
     fn failed_exit_equality_is_shared_provenance_not_content() {
         let error = ExitError::message("boom");
-        let exit = Exit::new(ExitKind::Failed(error.clone()), Cancellation::NotObserved);
+        let exit = Exit::failed(error.clone(), Cancellation::NotObserved);
 
         // Clones of one error — including framework-published copies —
         // compare equal.
         assert_eq!(exit, exit.clone());
-        assert_eq!(
-            exit,
-            Exit::new(ExitKind::Failed(error.clone()), Cancellation::NotObserved)
-        );
+        assert_eq!(exit, Exit::failed(error.clone(), Cancellation::NotObserved));
 
         // Independently created errors with identical content do not.
         assert_ne!(
             exit,
-            Exit::new(
-                ExitKind::Failed(ExitError::message("boom")),
-                Cancellation::NotObserved
-            )
+            Exit::failed(ExitError::message("boom"), Cancellation::NotObserved)
         );
 
         // Cancellation remains structural even with shared provenance.
-        assert_ne!(
-            exit,
-            Exit::new(ExitKind::Failed(error), Cancellation::Observed)
-        );
+        assert_ne!(exit, Exit::failed(error, Cancellation::Observed));
     }
 
     #[test]
@@ -1142,13 +1181,13 @@ mod tests {
                 "application failure survives forced abort",
                 Some(RecordedOutcome::returned(Err(failure.clone()))),
                 Some(RecordedOutcome::aborted(GracePhase::AfterGrace)),
-                Exit::new(ExitKind::Failed(failure), Cancellation::Observed),
+                Exit::failed(failure, Cancellation::Observed),
             ),
             (
                 "forced readiness timeout overrides completion",
                 Some(RecordedOutcome::returned(Ok(()))),
                 Some(RecordedOutcome::readiness_timed_out(deadline)),
-                Exit::new(
+                exit(
                     ExitKind::ReadinessTimedOut { deadline },
                     Cancellation::Observed,
                 ),
@@ -1157,7 +1196,7 @@ mod tests {
                 "earlier abort evidence wins a tie",
                 Some(RecordedOutcome::aborted(GracePhase::WithinGrace)),
                 Some(RecordedOutcome::aborted(GracePhase::AfterGrace)),
-                Exit::new(
+                exit(
                     ExitKind::Aborted {
                         phase: GracePhase::WithinGrace,
                     },

@@ -38,15 +38,21 @@ async fn blocking_primary_wake_recollects_control_removal_before_arbitration() {
     );
     let publisher = crate::runtime::spawn(async move {
         crate::runtime::yield_now().await;
-        control
-            .send(DriverEvent::Removal(RemovalRequest { key }))
-            .expect("the control lane remains open");
-        primary
-            .send(DriverEvent::Child(ChildEvent::Ready {
-                child: key,
-                incarnation,
-            }))
-            .expect("the primary lane remains open");
+        assert!(
+            control
+                .send(DriverEvent::Removal(RemovalRequest { key }))
+                .is_ok(),
+            "the control lane remains open"
+        );
+        assert!(
+            primary
+                .send(DriverEvent::Child(ChildEvent::Ready {
+                    child: key,
+                    incarnation,
+                }))
+                .is_ok(),
+            "the primary lane remains open"
+        );
     });
     let wake = wait.await;
     assert!(matches!(
@@ -93,16 +99,19 @@ fn every_event_lane_is_capped_and_a_saturated_lane_forces_a_yield() {
     let (primary, mut primary_receiver) = crate::runtime::unbounded_mpsc();
     let (control, mut control_receiver) = crate::runtime::unbounded_mpsc();
     let (disposal, mut disposal_receiver) = crate::runtime::unbounded_mpsc();
-    primary
-        .send(disposed(primary_key))
-        .expect("the primary lane remains open");
-    control
-        .send(disposed(control_key))
-        .expect("the control lane remains open");
+    assert!(
+        primary.send(disposed(primary_key)).is_ok(),
+        "the primary lane remains open"
+    );
+    assert!(
+        control.send(disposed(control_key)).is_ok(),
+        "the control lane remains open"
+    );
     for _ in 0..limit * 2 {
-        disposal
-            .send(disposed(disposal_key))
-            .expect("the disposal lane remains open");
+        assert!(
+            disposal.send(disposed(disposal_key)).is_ok(),
+            "the disposal lane remains open"
+        );
     }
 
     let mut pending = Vec::new();
@@ -142,7 +151,7 @@ fn every_event_lane_is_capped_and_a_saturated_lane_forces_a_yield() {
         "disposal completions trail both lifecycle lanes so they stay batch-tail events"
     );
     assert!(
-        crate::runtime::unbounded_mpsc_try_recv(&mut disposal_receiver).is_some(),
+        disposal_receiver.try_recv().is_some(),
         "the disposal suffix remains for a later scheduler turn"
     );
 }

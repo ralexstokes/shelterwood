@@ -532,6 +532,12 @@ struct TimerEntry<M> {
     period: Option<Duration>,
 }
 
+enum IntervalRearm<M> {
+    Missing,
+    OneShot,
+    Interval(M),
+}
+
 /// Type-aware keyed timer lookup paired with an independently ordered
 /// deadline index.
 ///
@@ -749,10 +755,14 @@ impl<M> TimerStore<M> {
         }
     }
 
-    fn rearm_interval(&mut self, arming_order: ArmingOrder, now: Instant) -> Option<M> {
+    fn rearm_interval(&mut self, arming_order: ArmingOrder, now: Instant) -> IntervalRearm<M> {
         let (message, deadline) = {
-            let entry = self.entry_mut(arming_order)?;
-            let period = entry.period?;
+            let Some(entry) = self.entry_mut(arming_order) else {
+                return IntervalRearm::Missing;
+            };
+            let Some(period) = entry.period else {
+                return IntervalRearm::OneShot;
+            };
             let deadline = crate::deadline::Deadline::after(now, period).instant();
             let TimerMessage::Interval(message, clone_message) = &entry.message else {
                 unreachable!("an interval timer must own a message factory")
@@ -765,7 +775,7 @@ impl<M> TimerStore<M> {
             (message, deadline)
         };
         self.arm_deadline(arming_order, deadline);
-        Some(message)
+        IntervalRearm::Interval(message)
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -1808,8 +1818,10 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     fn deliver_timer(&mut self, arming: ArmingOrder) -> Option<M> {
-        if let Some(message) = self.resources.timers.rearm_interval(arming, runtime::now()) {
-            return Some(message);
+        match self.resources.timers.rearm_interval(arming, runtime::now()) {
+            IntervalRearm::Missing => return None,
+            IntervalRearm::OneShot => {}
+            IntervalRearm::Interval(message) => return Some(message),
         }
 
         let entry = self
@@ -2776,6 +2788,37 @@ mod tests {
     }
 
     #[test]
+    fn clearing_an_elapsed_undelivered_timer_skips_its_captured_arming() {
+        let mut context = bound_raw_context_for::<u8>().0;
+        let now = crate::runtime::now();
+        context.resources.timers.replace(
+            "first",
+            Some(now),
+            ArmingOrder(1),
+            TimerMessage::Once(1),
+            None,
+        );
+        context.resources.timers.replace(
+            "second",
+            Some(now),
+            ArmingOrder(2),
+            TimerMessage::Once(2),
+            None,
+        );
+
+        assert_eq!(context.try_recv(), Some(1));
+        assert!(
+            context.clear_timer(&"second"),
+            "an elapsed timer remains clearable before delivery"
+        );
+        assert_eq!(
+            context.try_recv(),
+            None,
+            "the fired batch skips an arming removed after its cut was captured"
+        );
+    }
+
+    #[test]
     fn resident_raw_collections_do_not_clone_disposal_per_element() {
         let mut resources = RawResources::<()>::default();
         let baseline = Arc::strong_count(&resources.disposal.panic);
@@ -2923,7 +2966,7 @@ mod timer_store_tests {
         time::{Duration, Instant},
     };
 
-    use super::{ArmingOrder, TimerMessage, TimerStore};
+    use super::{ArmingOrder, IntervalRearm, TimerMessage, TimerStore};
 
     fn order(value: u64) -> ArmingOrder {
         ArmingOrder(value)
@@ -3078,7 +3121,10 @@ mod timer_store_tests {
         );
         assert_eq!(timers.take_due(now), [arming]);
 
-        assert_eq!(timers.rearm_interval(arming, now), Some("tick"));
+        assert!(matches!(
+            timers.rearm_interval(arming, now),
+            IntervalRearm::Interval("tick")
+        ));
         assert_eq!(
             timers
                 .entry_mut(arming)

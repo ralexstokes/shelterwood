@@ -788,20 +788,23 @@ impl MemberCell {
         // winning exit. Notification-driven readers still see
         // discharge-before-pulse; tree-scoped publication defers both until
         // the complete observation transaction has released its gate.
+        let mut nonterminal_mailbox = false;
         let teardown = match &mut *self.mailbox.lock().expect("member mailbox mutex poisoned") {
             MemberMailbox::Terminal { teardown, .. } => teardown.take(),
             MemberMailbox::Unattached | MemberMailbox::Attached(_) => {
                 // Panicking here would poison the member mailbox and can
-                // retire a retained user exit during unwind. Diagnose the
-                // internal invariant in debug builds and keep release builds
-                // in the already-published terminal state.
-                debug_assert!(
-                    false,
-                    "terminal publication requires terminal mailbox state"
-                );
+                // retire a retained user exit during unwind. Compute the
+                // verdict under the lock and raise it below, once the guard
+                // has been released; release builds keep the already-published
+                // terminal state.
+                nonterminal_mailbox = true;
                 None
             }
         };
+        debug_assert!(
+            !nonterminal_mailbox,
+            "terminal publication requires terminal mailbox state"
+        );
         if let Some(teardown) = teardown {
             txn.defer(move || {
                 if let Some(payload) = teardown.finish() {
@@ -2011,6 +2014,11 @@ impl ScopeCell {
             child_id = ancestor.member.id().clone();
             ancestor.observation.lifecycle.publish(wakes, event.clone());
         }
+        // The producer's own copy still owns a retained exit. Retiring it here
+        // would submit a disposal job — and can start a native thread — with
+        // the observation gate held. This caller owns an effects sink, so it
+        // takes the preferred path and retires after unlock.
+        wakes.defer(move || drop(event));
     }
 
     fn close_observation_locked(&self, wakes: &mut ObservationTxn<'_>) {
@@ -3056,8 +3064,7 @@ mod tests {
             state: ScopeState::Running,
         });
         let (dropped, observed) = mpsc::sync_channel(1);
-
-        scope.emit(LifecycleEventKind::Exited {
+        let exhausted = LifecycleEventKind::Exited {
             id,
             membership,
             incarnation: incarnations.mint().expect("incarnation available"),
@@ -3065,7 +3072,23 @@ mod tests {
                 ExitKind::Failed(ExitError::from(GateDropError { gate, dropped })),
                 Cancellation::NotObserved,
             ),
+        };
+
+        // Retiring a `RetainedExit` never destroys the user error inline: it
+        // always submits the value to isolated disposal, so the destructor
+        // runs on a worker thread in either arrangement and its own view of
+        // the gate is a race. What the deferral changes is *when the
+        // submission happens*. Hold the gate open across the emit: nothing
+        // can arrive on this channel unless the submission already happened
+        // under the gate.
+        let retired_under_gate = scope.with_observation_gate(|wakes| {
+            scope.emit_locked(wakes, exhausted);
+            observed.recv_timeout(Duration::from_millis(500)).is_ok()
         });
+        assert!(
+            !retired_under_gate,
+            "an unsequenced exit must not be submitted for disposal under the observation gate"
+        );
 
         assert!(
             observed

@@ -39,8 +39,10 @@ and `incarnation()` / `membership()` are not `ActorRef` map keys.
 
 If teardown needs this actor as a registry key, capture `context.myself()` in
 `init` or `handle` and keep it in actor state. Unregister that must also cover
-init failure, handler error or panic, or hard abort belongs in `Drop` or on a
-`Removed` lifecycle event — `on_stop` does not run on those paths.
+init failure, handler error or panic, or hard abort belongs in the `Drop` of
+whatever owns the registration, or on a `Removed` lifecycle event — `on_stop`
+does not run on those paths. A failed `init` constructs no actor to drop, so a
+registration made there belongs to a guard among `init`'s own locals.
 
 ## Teardown communication uses `try_send`
 

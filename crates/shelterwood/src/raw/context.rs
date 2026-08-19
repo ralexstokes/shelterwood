@@ -837,8 +837,10 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Returns a membership-addressed handle to this actor.
     ///
-    /// The high-level [`crate::StopContext`] has no equivalent: capture this
-    /// handle before stop if teardown needs the slot identity.
+    /// Available for the whole raw incarnation, teardown included. The
+    /// high-level [`crate::StopContext`] withholds its equivalent, so
+    /// callback-actor authors capture [`crate::Context::myself`] while live
+    /// instead.
     #[must_use]
     pub fn myself(&self) -> ActorRef<M> {
         self.myself.clone()

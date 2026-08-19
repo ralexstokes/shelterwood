@@ -662,9 +662,7 @@ impl MemberCell {
         );
         if let Some(teardown) = teardown {
             txn.defer(move || {
-                if let Some(payload) = teardown.finish() {
-                    runtime::dispose_detached(payload);
-                }
+                runtime::dispose_detached(teardown.finish());
             });
         }
         // First terminalizer wins. A losing edge neither reclassifies startup

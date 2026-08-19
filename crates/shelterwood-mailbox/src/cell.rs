@@ -162,6 +162,10 @@ mod waker_slot {
     }
 
     impl WakerEffects {
+        pub(super) fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+
         fn push(&mut self, waker: Waker, action: WakerAction) {
             self.0.push(match action {
                 WakerAction::Wake => WakerEffect::Wake(waker),
@@ -294,31 +298,39 @@ impl<M> SendOperation<M> {
         let result = {
             let mut state = self.state.lock().expect("send operation mutex poisoned");
             match &mut state.outcome {
-                OperationOutcome::Accepted(incarnation) => OperationPoll::Accepted(*incarnation),
+                OperationOutcome::Accepted(incarnation) => {
+                    Ok(OperationPoll::Accepted(*incarnation))
+                }
                 OperationOutcome::Terminated {
                     message,
                     final_incarnation,
-                } => OperationPoll::Terminated {
-                    message: message
-                        .take()
-                        .expect("a terminal operation retains its message until observed"),
-                    final_incarnation: *final_incarnation,
-                },
+                } => message.take().map_or_else(
+                    || Err("a terminal operation retains its message until observed"),
+                    |message| {
+                        Ok(OperationPoll::Terminated {
+                            message,
+                            final_incarnation: *final_incarnation,
+                        })
+                    },
+                ),
                 OperationOutcome::Waiting { .. } => {
                     if let Some(replacement) = replacement {
                         state.waker.replace(replacement, &mut effects);
-                        OperationPoll::Pending
+                        Ok(OperationPoll::Pending)
                     } else if state.waker.will_wake(current) {
-                        OperationPoll::Pending
+                        Ok(OperationPoll::Pending)
                     } else {
-                        OperationPoll::NeedsWakerClone
+                        Ok(OperationPoll::NeedsWakerClone)
                     }
                 }
-                OperationOutcome::Withdrawn => panic!("a withdrawn send future was polled"),
+                OperationOutcome::Withdrawn => Err("a withdrawn send future was polled"),
             }
         };
         drop(effects);
-        result
+        match result {
+            Ok(result) => result,
+            Err(message) => panic!("{message}"),
+        }
     }
 
     #[cfg(test)]
@@ -350,6 +362,14 @@ impl<M> MailboxState<M> {
         }
     }
 
+    fn current_observation(&self) -> Option<Incarnation> {
+        match &self.binding {
+            MailboxBinding::Bound(bound) => Some(bound.incarnation()),
+            MailboxBinding::Frozen { incarnation, .. } => Some(*incarnation),
+            MailboxBinding::Unbound(_) | MailboxBinding::Terminal(_) => None,
+        }
+    }
+
     /// Replaces one binding only after its waiter identity domain is empty.
     ///
     /// The check is not an `assert!` because every caller holds the mailbox
@@ -359,7 +379,10 @@ impl<M> MailboxState<M> {
     /// `WaiterQueue` here. That drop would release the queue's
     /// `Arc<SendOperation<M>>`s under the mutex, so wherever one is the last
     /// owner a user message destructor would run in the critical section.
-    /// Declining costs a stalled transition, which is the lesser of the two.
+    /// At waiter-carrying call sites, declining also strands every parked
+    /// sender in the old binding. That fail-safe is still preferable to
+    /// destroying their operations and user messages under this mutex; every
+    /// production caller proves emptiness locally before reaching this seam.
     fn replace_binding(&mut self, replacement: MailboxBinding<M>) {
         let replaceable = match &self.binding {
             MailboxBinding::Unbound(waiters)
@@ -597,22 +620,20 @@ struct MailboxEffects<'a, 's, M: Send + 'static> {
 
 impl<'a, 's, M: Send + 'static> MailboxEffects<'a, 's, M> {
     fn new(cell: &'a MailboxCell<M>) -> Self {
-        Self {
-            cell,
-            external: None,
-            pulse: false,
-            displaced: Vec::new(),
-            isolate_displaced: false,
-            wakers: WakerEffects::default(),
-            returned: None,
-            accepted_sequence_exhausted: false,
-        }
+        Self::with_external(cell, None)
     }
 
     fn deferred(cell: &'a MailboxCell<M>, external: &'s mut dyn MailboxEffectSink) -> Self {
+        Self::with_external(cell, Some(external))
+    }
+
+    fn with_external(
+        cell: &'a MailboxCell<M>,
+        external: Option<&'s mut dyn MailboxEffectSink>,
+    ) -> Self {
         Self {
             cell,
-            external: Some(external),
+            external,
             pulse: false,
             displaced: Vec::new(),
             isolate_displaced: false,
@@ -633,6 +654,14 @@ impl<'a, 's, M: Send + 'static> MailboxEffects<'a, 's, M> {
 
 impl<M: Send + 'static> Drop for MailboxEffects<'_, '_, M> {
     fn drop(&mut self) {
+        if !self.pulse
+            && self.displaced.is_empty()
+            && self.wakers.is_empty()
+            && self.returned.is_none()
+            && !self.accepted_sequence_exhausted
+        {
+            return;
+        }
         let batch = MailboxEffectBatch {
             changed: Arc::clone(&self.cell.changed),
             runtime: Arc::clone(&self.cell.runtime),
@@ -881,16 +910,15 @@ impl<M: Send + 'static> MailboxTeardown<M> {
 }
 
 impl<M: Send + 'static> MailboxTermination for MailboxTeardown<M> {
-    fn finish(mut self: Box<Self>) -> Option<MailboxDisposal> {
+    fn finish(mut self: Box<Self>) -> MailboxDisposal {
         let panic = self.finish_framework();
         let payload = self
             .payload
             .take()
-            .map(|payload| Box::new(payload) as MailboxDisposal);
+            .map(|payload| Box::new(payload) as MailboxDisposal)
+            .expect("mailbox teardown retains its payload until finish");
         if let Some(panic) = panic {
-            if let Some(payload) = payload {
-                dispose(&self.runtime, payload);
-            }
+            self.runtime.dispose(payload);
             resume_panic(panic);
         }
         payload
@@ -987,17 +1015,11 @@ impl<M: Send + 'static> MailboxCell<M> {
                     }
                 }
             }
-            BindingStatus::Frozen(incarnation) => {
+            status @ (BindingStatus::Frozen(_) | BindingStatus::Unbound) => {
                 let operation = SendOperation::new(message);
-                operation.observe(incarnation);
-                if transaction.park(&operation) {
-                    SubmitTransition::Complete(Submission::Parked(operation))
-                } else {
-                    SubmitTransition::WaiterIdentityExhausted(operation)
+                if let BindingStatus::Frozen(incarnation) = status {
+                    operation.observe(incarnation);
                 }
-            }
-            BindingStatus::Unbound => {
-                let operation = SendOperation::new(message);
                 if transaction.park(&operation) {
                     SubmitTransition::Complete(Submission::Parked(operation))
                 } else {
@@ -1112,12 +1134,10 @@ impl<M: Send + 'static> MailboxCell<M> {
     }
 
     pub(super) fn current_observation(&self) -> Option<Incarnation> {
-        match self.state.lock().expect("mailbox mutex poisoned").status() {
-            BindingStatus::Bound(incarnation) | BindingStatus::Frozen(incarnation) => {
-                Some(incarnation)
-            }
-            BindingStatus::Unbound | BindingStatus::Terminal(_) => None,
-        }
+        self.state
+            .lock()
+            .expect("mailbox mutex poisoned")
+            .current_observation()
     }
 
     fn watcher(&self) -> Box<dyn MailboxSignalWatcher> {
@@ -1159,13 +1179,8 @@ impl<M: Send + 'static> MailboxCell<M> {
         // its guard, and only then can these effects run.
         let mut waker_effects = WakerEffects::default();
         let mut transaction = MailboxTxn::new(self);
-        let current_observation = match transaction.status() {
-            BindingStatus::Bound(incarnation) | BindingStatus::Frozen(incarnation) => {
-                Some(incarnation)
-            }
-            BindingStatus::Unbound | BindingStatus::Terminal(_) => None,
-        };
-        let (outcome, registration) = {
+        let current_observation = transaction.current_observation();
+        let transition = {
             let mut state = operation
                 .state
                 .lock()
@@ -1174,66 +1189,71 @@ impl<M: Send + 'static> MailboxCell<M> {
                 OperationOutcome::Waiting {
                     message,
                     newest_observed,
-                } => {
-                    // Mailbox terminality linearizes in the binding, while a
-                    // parked operation linearizes when its own outcome leaves
-                    // `Waiting`. A terminal teardown may therefore have
-                    // detached this waiter without discharging it yet; an
-                    // already-expired withdrawal legitimately wins that
-                    // operation-local race.
-                    let message = message
-                        .take()
-                        .expect("a waiting operation must retain its message");
-                    // The mailbox lock makes this one evidence snapshot: a
-                    // binding either precedes withdrawal and contributes its
-                    // incarnation, or follows the completed withdrawal. This
-                    // also covers an operation first submitted by an elapsed
-                    // (including zero-duration) deadline poll.
-                    let observed = (*newest_observed).or(current_observation);
-                    state.outcome = OperationOutcome::Withdrawn;
-                    state.waker.take(
-                        match disposition {
-                            WithdrawalDisposition::Inline => WakerAction::DropInline,
-                            WithdrawalDisposition::Isolated => {
-                                WakerAction::Dispose(Arc::clone(&self.runtime))
-                            }
-                        },
-                        &mut waker_effects,
-                    );
-                    (
-                        WithdrawalOutcome::Withdrawn { message, observed },
-                        state.registration.take(),
-                    )
-                }
+                } => match message.take() {
+                    Some(message) => {
+                        // Mailbox terminality linearizes in the binding, while a
+                        // parked operation linearizes when its own outcome leaves
+                        // `Waiting`. A terminal teardown may therefore have
+                        // detached this waiter without discharging it yet; an
+                        // already-expired withdrawal legitimately wins that
+                        // operation-local race.
+                        // The mailbox lock makes this one evidence snapshot: a
+                        // binding either precedes withdrawal and contributes its
+                        // incarnation, or follows the completed withdrawal. This
+                        // also covers an operation first submitted by an elapsed
+                        // (including zero-duration) deadline poll.
+                        let observed = (*newest_observed).or(current_observation);
+                        state.outcome = OperationOutcome::Withdrawn;
+                        state.waker.take(
+                            match disposition {
+                                WithdrawalDisposition::Inline => WakerAction::DropInline,
+                                WithdrawalDisposition::Isolated => {
+                                    WakerAction::Dispose(Arc::clone(&self.runtime))
+                                }
+                            },
+                            &mut waker_effects,
+                        );
+                        Ok((
+                            WithdrawalOutcome::Withdrawn { message, observed },
+                            state.registration.take(),
+                        ))
+                    }
+                    None => Err("a waiting operation must retain its message"),
+                },
                 OperationOutcome::Accepted(incarnation) => {
                     let incarnation = *incarnation;
                     // Acceptance took the waker in the same critical section
                     // that published this outcome, so no registration survives
                     // it for withdrawal to release.
                     debug_assert!(state.waker.is_empty());
-                    (
+                    Ok((
                         WithdrawalOutcome::Accepted(incarnation),
                         state.registration.take(),
-                    )
+                    ))
                 }
                 OperationOutcome::Terminated {
                     message,
                     final_incarnation,
-                } => {
-                    let message = message
-                        .take()
-                        .expect("a terminal operation must retain its message");
-                    let observed = *final_incarnation;
-                    // Termination likewise took the waker before publishing.
-                    debug_assert!(state.waker.is_empty());
-                    (
-                        WithdrawalOutcome::Terminated { message, observed },
-                        state.registration.take(),
-                    )
-                }
-                OperationOutcome::Withdrawn => {
-                    panic!("a send operation was withdrawn more than once")
-                }
+                } => match message.take() {
+                    Some(message) => {
+                        let observed = *final_incarnation;
+                        // Termination likewise took the waker before publishing.
+                        debug_assert!(state.waker.is_empty());
+                        Ok((
+                            WithdrawalOutcome::Terminated { message, observed },
+                            state.registration.take(),
+                        ))
+                    }
+                    None => Err("a terminal operation must retain its message"),
+                },
+                OperationOutcome::Withdrawn => Err("a send operation was withdrawn more than once"),
+            }
+        };
+        let (outcome, registration) = match transition {
+            Ok(transition) => transition,
+            Err(message) => {
+                transaction.finish(());
+                panic!("{message}");
             }
         };
         if let Some(registration) = registration {
@@ -1717,6 +1737,29 @@ pub(super) mod tests {
                 .upgrade()
                 .is_none_or(|mailbox| mailbox.state.try_lock().is_ok());
             let _ = dropped.send(unlocked);
+        }
+    }
+
+    struct LatestDisplacementMessage {
+        value: u8,
+        mailbox: Weak<MailboxCell<LatestDisplacementMessage>>,
+        displaced: Option<mpsc::Sender<(bool, Option<u8>)>>,
+    }
+
+    impl Drop for LatestDisplacementMessage {
+        fn drop(&mut self) {
+            let Some(displaced) = self.displaced.take() else {
+                return;
+            };
+            let observation = self.mailbox.upgrade().and_then(|mailbox| {
+                mailbox.state.try_lock().ok().map(|state| {
+                    (
+                        true,
+                        state.latest.as_ref().map(|latest| latest.message.value),
+                    )
+                })
+            });
+            let _ = displaced.send(observation.unwrap_or((false, None)));
         }
     }
 
@@ -2343,6 +2386,178 @@ pub(super) mod tests {
         );
         assert_eq!(receiver.try_recv(), Some(2));
         assert_eq!(receiver.try_recv(), None);
+    }
+
+    #[test]
+    fn stale_receivers_cannot_drain_a_rebound_or_frozen_mailbox() {
+        let (mailbox, actor) = actor();
+        let (first, second) = two_incarnations();
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ),
+        );
+        bind(&mailbox, token, first);
+        let stale = MailboxReceiver::new(Arc::clone(&mailbox), first);
+
+        let closed = close(&mailbox, first).expect("the first incarnation closes");
+        let (token, payload) = closed.into_parts();
+        drop(payload);
+        bind(&mailbox, token, second);
+        actor.try_send(7).expect("the rebound mailbox accepts");
+        let through = stale.accepted_sequence();
+
+        assert_eq!(stale.try_recv(), None);
+        assert_eq!(stale.try_recv_live_through(through), None);
+        freeze(&mailbox, second);
+        assert_eq!(stale.try_recv(), None);
+        assert_eq!(stale.try_recv_live_through(through), None);
+
+        let current = MailboxReceiver::new(mailbox, second);
+        assert_eq!(
+            current.try_recv(),
+            Some(7),
+            "stale reads leave the payload intact"
+        );
+    }
+
+    #[test]
+    fn live_latest_displacement_drops_after_unlock_and_replacement_visibility() {
+        let (mailbox, actor): (
+            Arc<MailboxCell<LatestDisplacementMessage>>,
+            ActorRef<LatestDisplacementMessage>,
+        ) = actor_for();
+        let token = configure(&mailbox, ResolvedMailbox::Latest);
+        let incarnation = mint_actor_incarnation();
+        bind(&mailbox, token, incarnation);
+        let weak = Arc::downgrade(&mailbox);
+        let (displaced, observed) = mpsc::channel();
+
+        actor
+            .try_send(LatestDisplacementMessage {
+                value: 1,
+                mailbox: Weak::clone(&weak),
+                displaced: Some(displaced),
+            })
+            .expect("the first latest value accepts");
+        actor
+            .try_send(LatestDisplacementMessage {
+                value: 2,
+                mailbox: weak,
+                displaced: None,
+            })
+            .expect("the replacement latest value accepts");
+
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the displaced value reports its drop context"),
+            (true, Some(2)),
+            "displacement drops after unlock and after publishing the replacement"
+        );
+    }
+
+    #[test]
+    fn bind_observes_waiters_that_remain_parked_beyond_capacity() {
+        let (mailbox, _) = actor();
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ),
+        );
+        let first = match mailbox.submit(1) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("an unbound mailbox parks the first send")
+            }
+        };
+        let second = match mailbox.submit(2) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("an unbound mailbox parks overflow sends")
+            }
+        };
+        let incarnation = mint_actor_incarnation();
+        bind(&mailbox, token, incarnation);
+        assert!(matches!(
+            first.poll(None, Waker::noop()),
+            super::OperationPoll::Accepted(bound) if bound == incarnation
+        ));
+
+        let mut withdrawal = mailbox.withdraw(&second, super::WithdrawalDisposition::Inline);
+        assert!(matches!(
+            withdrawal.take_outcome(),
+            super::WithdrawalOutcome::Withdrawn {
+                message: 2,
+                observed: Some(bound),
+            } if bound == incarnation
+        ));
+        withdrawal.finish();
+    }
+
+    #[test]
+    fn operation_invariant_panics_release_the_operation_guard() {
+        let withdrawn = super::SendOperation::new(1_u8);
+        withdrawn.state.lock().expect("operation state").outcome =
+            super::OperationOutcome::Withdrawn;
+        assert!(catch_unwind(AssertUnwindSafe(|| withdrawn.poll(None, Waker::noop()))).is_err());
+        drop(
+            withdrawn
+                .state
+                .lock()
+                .expect("withdrawn poll panic occurs after unlock"),
+        );
+
+        let missing = super::SendOperation::new(2_u8);
+        missing.state.lock().expect("operation state").outcome =
+            super::OperationOutcome::Terminated {
+                message: None,
+                final_incarnation: None,
+            };
+        assert!(catch_unwind(AssertUnwindSafe(|| missing.poll(None, Waker::noop()))).is_err());
+        drop(
+            missing
+                .state
+                .lock()
+                .expect("terminal verdict panic occurs after unlock"),
+        );
+    }
+
+    #[test]
+    fn repeated_withdrawal_panics_after_releasing_both_guards() {
+        let (mailbox, _) = actor();
+        let operation = match mailbox.submit(1) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("an unbound mailbox parks the send")
+            }
+        };
+        mailbox
+            .withdraw(&operation, super::WithdrawalDisposition::Inline)
+            .finish();
+
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                mailbox
+                    .withdraw(&operation, super::WithdrawalDisposition::Inline)
+                    .finish();
+            }))
+            .is_err()
+        );
+        drop(
+            operation
+                .state
+                .lock()
+                .expect("repeated withdrawal panic releases the operation guard"),
+        );
+        drop(
+            mailbox
+                .state
+                .lock()
+                .expect("repeated withdrawal panic releases the mailbox guard"),
+        );
     }
 
     #[test]

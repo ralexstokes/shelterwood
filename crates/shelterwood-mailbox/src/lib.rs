@@ -178,7 +178,7 @@ impl Drop for MailboxEffectQueue {
 /// It is public solely because sibling implementation crates retain it through
 /// type erasure; it is not a user extension point.
 pub trait MailboxTermination: private::SealedMailboxTermination + Send {
-    fn finish(self: Box<Self>) -> Option<MailboxDisposal>;
+    fn finish(self: Box<Self>) -> MailboxDisposal;
 }
 
 /// Type-erased mailbox lifecycle surface owned by a member cell.

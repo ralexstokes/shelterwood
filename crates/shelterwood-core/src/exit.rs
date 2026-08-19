@@ -705,8 +705,8 @@ mod tests {
         Cancellation, ChildId, Exit, ExitError, ExitKind, GracePhase, IntensityTrip, JoinOutcome,
         RecordedOutcome, StartupError, StartupFailure, StartupFailureCause, StopReason,
         classify_disposal_panic, classify_exit, exit_kind_eq, prefer_earlier,
-        reconcile_recorded_outcomes, stop_reason_into_nested_result, stop_reason_root_exit,
-        structured_intensity_trip_error, structured_startup_failure_error,
+        reconcile_recorded_outcomes, stop_reason_into_nested_result, stop_reason_precedence,
+        stop_reason_root_exit, structured_intensity_trip_error, structured_startup_failure_error,
     };
 
     fn exit(kind: ExitKind, cancellation: Cancellation) -> Exit {
@@ -1146,6 +1146,43 @@ mod tests {
             never_started.as_error().to_string(),
             "nested scope never started"
         );
+    }
+
+    #[test]
+    fn stop_reason_precedence_is_an_explicit_exhaustive_table() {
+        let trip = IntensityTrip {
+            max_restarts: 1,
+            observed_restarts: 2,
+            within: Duration::from_secs(10),
+        };
+        let startup = StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: ChildId::from("nested"),
+            },
+        };
+        let cases = [
+            (StopReason::Finished, super::StopPrecedence::Finished),
+            (
+                StopReason::IntensityTripped(trip),
+                super::StopPrecedence::IntensityTripped,
+            ),
+            (
+                StopReason::StartupFailed(startup),
+                super::StopPrecedence::StartupFailed,
+            ),
+            (
+                StopReason::ShutdownRequested,
+                super::StopPrecedence::ShutdownRequested,
+            ),
+            (
+                StopReason::NeverStarted,
+                super::StopPrecedence::NeverStarted,
+            ),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(stop_reason_precedence(&reason), expected as u8);
+        }
     }
 
     #[test]

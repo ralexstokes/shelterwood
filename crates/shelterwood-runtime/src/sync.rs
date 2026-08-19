@@ -402,6 +402,54 @@ pub fn oneshot<T>() -> (OneShotSender<T>, OneShotReceiver<T>) {
     )
 }
 
+/// Test-only publication half for staging the `ONESHOT_SENDING` window.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub struct OneShotSending<T> {
+    channel: Option<oneshot::Sender<T>>,
+    state: Arc<AtomicU8>,
+}
+
+/// Builds a one-shot whose send transition has won but whose value has not
+/// been published yet.
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub fn oneshot_sending_for_test<T>() -> (OneShotSending<T>, OneShotReceiver<T>) {
+    let (channel, receiver) = oneshot::channel();
+    let state = Arc::new(AtomicU8::new(ONESHOT_SENDING));
+    (
+        OneShotSending {
+            channel: Some(channel),
+            state: Arc::clone(&state),
+        },
+        OneShotReceiver {
+            channel: receiver,
+            state,
+        },
+    )
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl<T> OneShotSending<T> {
+    /// Publishes the value and completes the staged send transition.
+    pub fn publish(mut self, value: T) -> Result<(), T> {
+        let channel = self
+            .channel
+            .take()
+            .expect("a staged one-shot send publishes at most once");
+        match channel.send(value) {
+            Ok(()) => {
+                self.state.store(ONESHOT_SENT, Ordering::Release);
+                Ok(())
+            }
+            Err(value) => {
+                self.state.store(ONESHOT_RECEIVER_CLOSED, Ordering::Release);
+                Err(value)
+            }
+        }
+    }
+}
+
 impl<T> OneShotSender<T> {
     pub fn send(mut self, value: T) -> Result<(), T> {
         if self
@@ -971,8 +1019,8 @@ mod tests {
     };
 
     use crate::{
-        CompletionGatedLatch, JoinOutcome, Latch, OneShotClose, Signal, Timeout, join, oneshot,
-        spawn, timeout, yield_now,
+        BroadcastReceive, CompletionGatedLatch, JoinOutcome, Latch, OneShotClose, Signal, Timeout,
+        broadcast, join, oneshot, oneshot_sending_for_test, spawn, timeout, yield_now,
     };
 
     struct CountWake(Arc<AtomicUsize>);
@@ -1039,6 +1087,87 @@ mod tests {
             OneShotClose::Empty
         ));
         assert_eq!(sender.send(1), Err(1));
+    }
+
+    #[test]
+    fn closing_oneshot_waits_for_a_send_that_won_before_publication() {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+        let mut context = Context::from_waker(&waker);
+        let (sending, mut receiver) = oneshot_sending_for_test();
+
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::Pending
+        ));
+        sending.publish(7_u8).expect("the staged receiver is live");
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::Value(7)
+        ));
+    }
+
+    #[test]
+    fn broadcast_wrapper_maps_items_empty_close_and_exact_lag() {
+        let (sender, mut receiver) = broadcast(2);
+        assert!(matches!(receiver.try_receive(), BroadcastReceive::Empty));
+        assert_eq!(sender.send(0_u8), Ok(1));
+        assert!(matches!(receiver.try_receive(), BroadcastReceive::Item(0)));
+
+        for value in 1_u8..=5 {
+            assert_eq!(sender.send(value), Ok(1));
+        }
+        assert!(matches!(
+            receiver.try_receive(),
+            BroadcastReceive::Lagged(3)
+        ));
+        assert!(matches!(receiver.try_receive(), BroadcastReceive::Item(4)));
+        assert!(matches!(receiver.try_receive(), BroadcastReceive::Item(5)));
+        assert!(matches!(receiver.try_receive(), BroadcastReceive::Empty));
+        drop(sender);
+        assert!(matches!(receiver.try_receive(), BroadcastReceive::Closed));
+    }
+
+    #[test]
+    fn signal_pulse_wakes_a_parked_watcher_and_advances_generations() {
+        let signal = Signal::default();
+        let mut watcher = signal.watcher();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+
+        let mut first = Box::pin(watcher.changed());
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        signal.pulse();
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+        drop(first);
+
+        let mut second = Box::pin(watcher.changed());
+        assert!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        signal.pulse();
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+        assert!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
     }
 
     #[test]

@@ -152,7 +152,112 @@ impl<T: Send + 'static> DeadlineOperation for ReplyOperation<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::cell::tests::actor;
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, Wake, Waker},
+        time::{Duration, Instant},
+    };
+
+    use crate::{
+        BoxedSleep, ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
+        MailboxRuntime, MailboxSignal,
+    };
+
+    use super::super::cell::tests::{actor, actor_for_with_runtime};
+
+    struct RejectingSender;
+
+    impl ErasedOneShotSender for RejectingSender {
+        fn send(self: Box<Self>, value: ErasedValue) -> Result<(), ErasedValue> {
+            Err(value)
+        }
+    }
+
+    struct StagedReceiver(crate::runtime::OneShotReceiver<ErasedValue>);
+
+    impl ErasedOneShotReceiver for StagedReceiver {
+        fn poll_receive(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Option<ErasedValue>> {
+            self.0.poll_receive(context)
+        }
+
+        fn close_and_poll_receive(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> ErasedOneShotClose {
+            match self.0.close_and_poll_receive(context) {
+                crate::runtime::OneShotClose::Value(value) => ErasedOneShotClose::Value(value),
+                crate::runtime::OneShotClose::SenderClosed => ErasedOneShotClose::SenderClosed,
+                crate::runtime::OneShotClose::Empty => ErasedOneShotClose::Empty,
+                crate::runtime::OneShotClose::Pending => ErasedOneShotClose::Pending,
+            }
+        }
+
+        fn close(mut self: Pin<&mut Self>) {
+            self.0.close();
+        }
+
+        fn close_and_take(mut self: Pin<&mut Self>) -> Option<ErasedValue> {
+            self.0.close_and_take()
+        }
+    }
+
+    struct StagedReplyRuntime {
+        inner: Arc<dyn MailboxRuntime>,
+        publisher: Mutex<Option<crate::runtime::OneShotSending<ErasedValue>>>,
+    }
+
+    impl MailboxRuntime for StagedReplyRuntime {
+        fn oneshot(
+            &self,
+        ) -> (
+            Box<dyn ErasedOneShotSender>,
+            Pin<Box<dyn ErasedOneShotReceiver>>,
+        ) {
+            let (publisher, receiver) = crate::runtime::oneshot_sending_for_test();
+            let displaced = self
+                .publisher
+                .lock()
+                .expect("staged reply publisher mutex")
+                .replace(publisher);
+            assert!(displaced.is_none(), "the test creates one reply channel");
+            (
+                Box::new(RejectingSender),
+                Box::pin(StagedReceiver(receiver)),
+            )
+        }
+
+        fn signal(&self) -> Arc<dyn MailboxSignal> {
+            self.inner.signal()
+        }
+
+        fn dispose(&self, value: Box<dyn Send + 'static>) {
+            self.inner.dispose(value);
+        }
+
+        fn now(&self) -> Instant {
+            self.inner.now()
+        }
+
+        fn sleep_until(&self, deadline: Option<Instant>) -> BoxedSleep {
+            self.inner.sleep_until(deadline)
+        }
+    }
+
+    struct CountWake(Arc<AtomicUsize>);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn reply_debug_still_reports_the_derived_unanswered_state() {
@@ -193,5 +298,49 @@ mod tests {
         let (reply, receiver) = actor.reply_channel::<u8>();
         drop(receiver);
         reply.send(9);
+    }
+
+    #[crate::runtime::test(start_paused = true)]
+    async fn timeout_arbitration_waits_for_a_winning_send_to_publish() {
+        let runtime = Arc::new(StagedReplyRuntime {
+            inner: crate::capability::tests::runtime(),
+            publisher: Mutex::new(None),
+        });
+        let (_, actor) = actor_for_with_runtime::<()>(runtime.clone());
+        let (reply, receiver) = actor.reply_channel::<u8>();
+        let width = Duration::from_secs(1);
+        let mut receive = Box::pin(receiver.recv(width));
+        assert!(
+            receive
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+
+        crate::runtime::advance(width * 2).await;
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+        assert!(
+            receive
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending(),
+            "OneShotClose::Pending defers the timeout verdict"
+        );
+        let publisher = runtime
+            .publisher
+            .lock()
+            .expect("staged reply publisher mutex")
+            .take()
+            .expect("reply channel installed its publisher");
+        publisher
+            .publish(Box::new(7_u8))
+            .unwrap_or_else(|_| panic!("the staged receiver remains live"));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            receive.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Ok(7))
+        ));
+        drop(reply);
     }
 }

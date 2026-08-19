@@ -696,6 +696,7 @@ mod tests {
     use std::{
         future::Future,
         mem::ManuallyDrop,
+        pin::Pin,
         sync::{
             Arc, Mutex, Weak,
             atomic::{AtomicUsize, Ordering},
@@ -703,18 +704,314 @@ mod tests {
         },
         task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
         thread::ThreadId,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
-    use crate::{MailboxControl, MailboxEffectQueue, test_support::mint_actor_incarnation};
+    use shelterwood_core::DeadlineBudget;
+
+    use crate::{
+        BoxedSleep, CallErrorKind, ErasedOneShotReceiver, ErasedOneShotSender, Incarnation,
+        MailboxControl, MailboxEffectQueue, MailboxReceiver, MailboxRuntime, MailboxSignal, Reply,
+        policy::ResolvedMailbox, test_support::mint_actor_incarnation,
+    };
 
     use super::{
-        super::cell::tests::{actor, actor_for},
+        super::cell::tests::{
+            actor, actor_for, actor_for_with_runtime, bind, close, configure, prepare_termination,
+        },
         ActorRef, DeadlineOperation, DeadlinePhase, MailboxCell, SendFuture, SendFutureState,
         SendOperation,
     };
 
     const DISPOSAL_WAIT: Duration = Duration::from_secs(5);
+
+    struct CallRequest {
+        reply: Option<Reply<u8>>,
+    }
+
+    fn bound_call_actor(
+        capacity: usize,
+    ) -> (
+        Arc<MailboxCell<CallRequest>>,
+        ActorRef<CallRequest>,
+        Incarnation,
+        MailboxReceiver<CallRequest>,
+    ) {
+        let (mailbox, actor) = actor_for();
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(capacity).expect("non-zero queue capacity"),
+            ),
+        );
+        let incarnation = mint_actor_incarnation();
+        bind(&mailbox, token, incarnation);
+        let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+        (mailbox, actor, incarnation, receiver)
+    }
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[test]
+    fn zero_budget_call_never_constructs_or_submits_a_message() {
+        let (mailbox, actor): (Arc<MailboxCell<CallRequest>>, ActorRef<CallRequest>) = actor_for();
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ),
+        );
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let constructed = Arc::clone(&constructions);
+        let mut call = Box::pin(actor.call(
+            move |reply| {
+                constructed.fetch_add(1, Ordering::SeqCst);
+                CallRequest { reply: Some(reply) }
+            },
+            DeadlineBudget::ZERO,
+        ));
+
+        let Poll::Ready(Err(error)) = poll_once(call.as_mut()) else {
+            panic!("a zero-width call budget resolves on its first poll")
+        };
+        assert_eq!(error.kind, CallErrorKind::AcceptanceTimedOut);
+        assert_eq!(error.incarnation_observed, None);
+        assert_eq!(constructions.load(Ordering::SeqCst), 0);
+
+        let incarnation = mint_actor_incarnation();
+        bind(&mailbox, token, incarnation);
+        let receiver = MailboxReceiver::new(mailbox, incarnation);
+        assert!(receiver.try_recv().is_none(), "no request was submitted");
+    }
+
+    #[crate::runtime::test(start_paused = true)]
+    async fn call_acceptance_timeout_covers_unbound_and_full_mailboxes() {
+        let width = Duration::from_secs(1);
+
+        let (unbound_mailbox, unbound_actor): (
+            Arc<MailboxCell<CallRequest>>,
+            ActorRef<CallRequest>,
+        ) = actor_for();
+        let _token = configure(
+            &unbound_mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ),
+        );
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let constructed = Arc::clone(&constructions);
+        let mut unbound = Box::pin(unbound_actor.call(
+            move |reply| {
+                constructed.fetch_add(1, Ordering::SeqCst);
+                CallRequest { reply: Some(reply) }
+            },
+            width,
+        ));
+        assert!(poll_once(unbound.as_mut()).is_pending());
+        assert_eq!(constructions.load(Ordering::SeqCst), 1);
+        crate::runtime::advance(width * 2).await;
+        let error = unbound
+            .await
+            .expect_err("an unbound call withdraws before acceptance");
+        assert_eq!(error.kind, CallErrorKind::AcceptanceTimedOut);
+        assert_eq!(error.incarnation_observed, None);
+
+        let (_mailbox, full_actor, incarnation, receiver) = bound_call_actor(1);
+        assert!(matches!(
+            full_actor.try_send(CallRequest { reply: None }),
+            Ok(bound) if bound == incarnation
+        ));
+        let mut full = Box::pin(full_actor.call(|reply| CallRequest { reply: Some(reply) }, width));
+        assert!(poll_once(full.as_mut()).is_pending());
+        crate::runtime::advance(width * 2).await;
+        let error = full
+            .await
+            .expect_err("a call parked behind a full queue withdraws");
+        assert_eq!(error.kind, CallErrorKind::AcceptanceTimedOut);
+        assert_eq!(error.incarnation_observed, Some(incarnation));
+        let filler = receiver.try_recv().expect("the filler remains queued");
+        assert!(filler.reply.is_none());
+        assert!(
+            receiver.try_recv().is_none(),
+            "the timed-out call was withdrawn"
+        );
+
+        let (_mailbox, frozen_actor, incarnation, receiver) = bound_call_actor(1);
+        receiver.freeze();
+        let mut frozen =
+            Box::pin(frozen_actor.call(|reply| CallRequest { reply: Some(reply) }, width));
+        assert!(poll_once(frozen.as_mut()).is_pending());
+        crate::runtime::advance(width * 2).await;
+        let error = frozen
+            .await
+            .expect_err("a call parks while its accepting incarnation is frozen");
+        assert_eq!(error.kind, CallErrorKind::AcceptanceTimedOut);
+        assert_eq!(error.incarnation_observed, Some(incarnation));
+        assert!(
+            receiver.try_recv().is_none(),
+            "the frozen call was withdrawn"
+        );
+    }
+
+    #[crate::runtime::test(start_paused = true)]
+    async fn accepted_call_reports_reply_drop_response_timeout_and_success() {
+        let width = Duration::from_secs(1);
+
+        let (_mailbox, actor, incarnation, receiver) = bound_call_actor(1);
+        let mut success = Box::pin(actor.call(|reply| CallRequest { reply: Some(reply) }, width));
+        assert!(poll_once(success.as_mut()).is_pending());
+        receiver
+            .try_recv()
+            .expect("the successful request was accepted")
+            .reply
+            .expect("a call message carries its reply")
+            .send(7);
+        let replied = success.await.expect("the reply is delivered");
+        assert_eq!(replied.value, 7);
+        assert_eq!(replied.incarnation, incarnation);
+
+        let (_mailbox, actor, incarnation, receiver) = bound_call_actor(1);
+        let mut dropped = Box::pin(actor.call(|reply| CallRequest { reply: Some(reply) }, width));
+        assert!(poll_once(dropped.as_mut()).is_pending());
+        drop(
+            receiver
+                .try_recv()
+                .expect("the dropped-reply request was accepted")
+                .reply,
+        );
+        let error = dropped.await.expect_err("the accepted reply was dropped");
+        assert_eq!(error.kind, CallErrorKind::ReplyDropped);
+        assert_eq!(error.incarnation_observed, Some(incarnation));
+
+        let (_mailbox, actor, incarnation, receiver) = bound_call_actor(1);
+        let mut timed_out = Box::pin(actor.call(|reply| CallRequest { reply: Some(reply) }, width));
+        assert!(poll_once(timed_out.as_mut()).is_pending());
+        let held_reply = receiver
+            .try_recv()
+            .expect("the response-timeout request was accepted")
+            .reply
+            .expect("a call message carries its reply");
+        crate::runtime::advance(width * 2).await;
+        let error = timed_out
+            .await
+            .expect_err("an accepted request can outlive its response budget");
+        assert_eq!(error.kind, CallErrorKind::ResponseTimedOut);
+        assert_eq!(error.incarnation_observed, Some(incarnation));
+        drop(held_reply);
+    }
+
+    #[test]
+    fn terminal_call_reports_the_last_incarnation_without_acceptance() {
+        let (mailbox, actor, incarnation, _receiver) = bound_call_actor(1);
+        drop(close(&mailbox, incarnation));
+        let teardown = prepare_termination(&mailbox).expect("the closed mailbox can terminalize");
+        drop(teardown.finish());
+
+        let mut call = Box::pin(actor.call(
+            |reply| CallRequest { reply: Some(reply) },
+            Duration::from_secs(1),
+        ));
+        let Poll::Ready(Err(error)) = poll_once(call.as_mut()) else {
+            panic!("a terminal mailbox rejects the constructed request immediately")
+        };
+        assert_eq!(error.kind, CallErrorKind::Terminated);
+        assert_eq!(error.incarnation_observed, Some(incarnation));
+    }
+
+    struct ControlledClockRuntime {
+        inner: Arc<dyn MailboxRuntime>,
+        now: Arc<Mutex<Instant>>,
+    }
+
+    impl MailboxRuntime for ControlledClockRuntime {
+        fn oneshot(
+            &self,
+        ) -> (
+            Box<dyn ErasedOneShotSender>,
+            Pin<Box<dyn ErasedOneShotReceiver>>,
+        ) {
+            self.inner.oneshot()
+        }
+
+        fn signal(&self) -> Arc<dyn MailboxSignal> {
+            self.inner.signal()
+        }
+
+        fn dispose(&self, value: Box<dyn Send + 'static>) {
+            self.inner.dispose(value);
+        }
+
+        fn now(&self) -> Instant {
+            *self.now.lock().expect("controlled clock mutex")
+        }
+
+        fn sleep_until(&self, deadline: Option<Instant>) -> BoxedSleep {
+            self.inner.sleep_until(deadline)
+        }
+    }
+
+    struct ConstructionOverdueMessage {
+        _reply: Reply<u8>,
+        disposed: mpsc::Sender<ThreadId>,
+    }
+
+    impl Drop for ConstructionOverdueMessage {
+        fn drop(&mut self) {
+            let _ = self.disposed.send(std::thread::current().id());
+        }
+    }
+
+    #[test]
+    fn construction_that_consumes_the_budget_is_disposed_without_submission() {
+        let start = crate::capability::tests::runtime().now();
+        let clock = Arc::new(Mutex::new(start));
+        let runtime = Arc::new(ControlledClockRuntime {
+            inner: crate::capability::tests::runtime(),
+            now: Arc::clone(&clock),
+        });
+        let (mailbox, actor) = actor_for_with_runtime(runtime);
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ),
+        );
+        let (disposed, disposal) = mpsc::channel();
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let constructed = Arc::clone(&constructions);
+        let mut call = Box::pin(actor.call(
+            move |reply| {
+                constructed.fetch_add(1, Ordering::SeqCst);
+                *clock.lock().expect("controlled clock mutex") = start + Duration::from_secs(2);
+                ConstructionOverdueMessage {
+                    _reply: reply,
+                    disposed,
+                }
+            },
+            Duration::from_secs(1),
+        ));
+
+        let Poll::Ready(Err(error)) = poll_once(call.as_mut()) else {
+            panic!("construction that overruns the captured budget times out immediately")
+        };
+        assert_eq!(error.kind, CallErrorKind::AcceptanceTimedOut);
+        assert_eq!(error.incarnation_observed, None);
+        assert_eq!(constructions.load(Ordering::SeqCst), 1);
+        let disposal_thread = disposal
+            .recv_timeout(DISPOSAL_WAIT)
+            .expect("the overdue constructed message reaches isolated disposal");
+        assert_ne!(disposal_thread, std::thread::current().id());
+
+        let incarnation = mint_actor_incarnation();
+        bind(&mailbox, token, incarnation);
+        let receiver = MailboxReceiver::new(mailbox, incarnation);
+        assert!(
+            receiver.try_recv().is_none(),
+            "the overdue request was never submitted"
+        );
+    }
 
     #[derive(Default)]
     struct WakerVtableCalls {

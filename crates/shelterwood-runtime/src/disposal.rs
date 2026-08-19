@@ -370,12 +370,12 @@ pub fn dispose_all<T: Send + 'static>(values: Vec<T>) -> Latch {
 mod tests {
     use std::{
         sync::{
-            Arc, Mutex,
+            Arc, Condvar, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
         thread::{self, ThreadId},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use super::{
@@ -530,6 +530,104 @@ mod tests {
         let rejected = DisposalJob::new((), |_| {});
         let completed = DisposalJob::new((), |_| {});
         assert_blocking_pool_outcomes(accepted, rejected, completed);
+    }
+
+    struct AggregateDrop {
+        id: u8,
+        dropped: mpsc::Sender<u8>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        panic: bool,
+    }
+
+    impl Drop for AggregateDrop {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(self.id);
+            if let Some(gate) = &self.gate {
+                let (released, wake) = &**gate;
+                let mut released = released.lock().expect("aggregate gate remains healthy");
+                let deadline = Instant::now() + DESTRUCTOR_ESCAPE;
+                while !*released {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    released = wake
+                        .wait_timeout(released, remaining)
+                        .expect("aggregate gate remains healthy")
+                        .0;
+                }
+            }
+            assert!(!self.panic, "injected aggregate destructor panic");
+        }
+    }
+
+    #[test]
+    fn dispose_all_empty_fires_synchronously() {
+        let completion = super::dispose_all::<u8>(Vec::new());
+        assert!(completion.is_fired());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispose_all_fires_only_after_every_value_finishes() {
+        let (dropped, dropped_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let values = (0_u8..3)
+            .map(|id| AggregateDrop {
+                id,
+                dropped: dropped.clone(),
+                gate: (id == 2).then(|| Arc::clone(&gate)),
+                panic: false,
+            })
+            .collect();
+        let completion = super::dispose_all(values);
+
+        let mut observed = Vec::new();
+        for _ in 0..3 {
+            observed.push(
+                dropped_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("every destructor starts"),
+            );
+        }
+        observed.sort_unstable();
+        assert_eq!(observed, [0, 1, 2]);
+        assert!(matches!(
+            crate::timeout(Duration::from_millis(100), completion.fired()).await,
+            crate::Timeout::Elapsed
+        ));
+        release(&gate);
+        assert!(matches!(
+            crate::timeout(Duration::from_secs(1), completion.fired()).await,
+            crate::Timeout::Completed(())
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispose_all_contains_one_panic_and_completes_the_rest() {
+        let (dropped, dropped_rx) = mpsc::channel();
+        let values = (0_u8..3)
+            .map(|id| AggregateDrop {
+                id,
+                dropped: dropped.clone(),
+                gate: None,
+                panic: id == 1,
+            })
+            .collect();
+        let completion = super::dispose_all(values);
+
+        assert!(matches!(
+            crate::timeout(Duration::from_secs(1), completion.fired()).await,
+            crate::Timeout::Completed(())
+        ));
+        let mut observed = Vec::new();
+        for _ in 0..3 {
+            observed.push(
+                dropped_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("one panicking destructor cannot suppress another"),
+            );
+        }
+        observed.sort_unstable();
+        assert_eq!(observed, [0, 1, 2]);
     }
 
     struct DisposeOnDrop {

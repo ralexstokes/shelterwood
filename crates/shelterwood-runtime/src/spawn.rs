@@ -667,6 +667,75 @@ mod tests {
         assert_eq!(control_receiver.try_recv(), Some(0));
     }
 
+    #[tokio::test]
+    async fn scope_wait_reports_parent_shutdown_directly() {
+        let (_sender, mut receiver) = super::unbounded_mpsc::<()>();
+        let wake = super::wait_scope(
+            super::ScopeWait {
+                signal: std::future::pending(),
+                parent_shutdown: std::future::ready(()),
+            },
+            &mut receiver,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(matches!(wake, super::ScopeWake::ParentShutdown));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scope_wait_reports_deadline_and_keeps_an_absent_deadline_pending() {
+        let (_sender, mut receiver) = super::unbounded_mpsc::<()>();
+        let deadline = crate::now() + Duration::from_secs(10);
+        let wake = super::wait_scope(
+            super::ScopeWait {
+                signal: std::future::pending(),
+                parent_shutdown: std::future::pending(),
+            },
+            &mut receiver,
+            None,
+            Some(deadline),
+        )
+        .await;
+        assert!(matches!(wake, super::ScopeWake::Deadline));
+
+        let (sender, mut receiver) = super::unbounded_mpsc();
+        let mut waiting = Box::pin(super::wait_scope(
+            super::ScopeWait {
+                signal: std::future::pending(),
+                parent_shutdown: std::future::pending(),
+            },
+            &mut receiver,
+            None,
+            None,
+        ));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(sender.send(7_u8).is_ok());
+        assert!(matches!(waiting.await, super::ScopeWake::Message(Some(7))));
+    }
+
+    #[tokio::test]
+    async fn select_two_covers_both_sides_and_biases_ready_ties_left() {
+        assert!(matches!(
+            super::select_two(std::future::ready(1_u8), std::future::pending::<u8>()).await,
+            super::Either::Left(1)
+        ));
+        assert!(matches!(
+            super::select_two(std::future::pending::<u8>(), std::future::ready(2_u8)).await,
+            super::Either::Right(2)
+        ));
+        assert!(matches!(
+            super::select_two(std::future::ready(3_u8), std::future::ready(4_u8)).await,
+            super::Either::Left(3)
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocking_work_preserves_values_and_panics() {
         assert_eq!(super::spawn_blocking_work(|| 42_u8).await, 42);

@@ -1676,7 +1676,7 @@ pub(super) mod tests {
         pin::Pin,
         sync::{
             Arc, Mutex, Weak,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
         task::{Context, Poll, Wake, Waker},
@@ -1776,7 +1776,8 @@ pub(super) mod tests {
     /// flush can be made to unwind on demand.
     struct PanickingPulseRuntime {
         inner: Arc<dyn crate::MailboxRuntime>,
-        armed: Arc<std::sync::atomic::AtomicBool>,
+        armed: Arc<AtomicBool>,
+        disposals: Arc<AtomicUsize>,
     }
 
     impl crate::MailboxRuntime for PanickingPulseRuntime {
@@ -1797,6 +1798,7 @@ pub(super) mod tests {
         }
 
         fn dispose(&self, value: Box<dyn Send + 'static>) {
+            self.disposals.fetch_add(1, Ordering::SeqCst);
             self.inner.dispose(value);
         }
 
@@ -1811,7 +1813,7 @@ pub(super) mod tests {
 
     struct PanickingPulseSignal {
         inner: Arc<dyn crate::MailboxSignal>,
-        armed: Arc<std::sync::atomic::AtomicBool>,
+        armed: Arc<AtomicBool>,
     }
 
     impl crate::MailboxSignal for PanickingPulseSignal {
@@ -1930,25 +1932,31 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn actor_for<M: Send + 'static>() -> (Arc<MailboxCell<M>>, ActorRef<M>) {
+    pub(crate) fn actor_for_with_runtime<M: Send + 'static>(
+        runtime: Arc<dyn crate::MailboxRuntime>,
+    ) -> (Arc<MailboxCell<M>>, ActorRef<M>) {
         let id = ChildId::from("actor");
         let (membership, _) = mint_actor_membership();
         let member = Arc::new(TestIdentity {
             id: id.clone(),
             membership,
         });
-        let mailbox = MailboxCell::new(id, crate::capability::tests::runtime());
+        let mailbox = MailboxCell::new(id, runtime);
         (
             Arc::clone(&mailbox),
             crate::actor_ref_from_parts(member, mailbox),
         )
     }
 
+    pub(crate) fn actor_for<M: Send + 'static>() -> (Arc<MailboxCell<M>>, ActorRef<M>) {
+        actor_for_with_runtime(crate::capability::tests::runtime())
+    }
+
     pub(crate) fn actor() -> (Arc<MailboxCell<u8>>, ActorRef<u8>) {
         actor_for()
     }
 
-    fn configure<M: Send + 'static>(
+    pub(crate) fn configure<M: Send + 'static>(
         mailbox: &MailboxCell<M>,
         policy: ResolvedMailbox,
     ) -> crate::MailboxBindToken {
@@ -1956,7 +1964,7 @@ pub(super) mod tests {
         MailboxControl::configure(mailbox, policy, &mut effects)
     }
 
-    fn bind<M: Send + 'static>(
+    pub(crate) fn bind<M: Send + 'static>(
         mailbox: &MailboxCell<M>,
         token: crate::MailboxBindToken,
         incarnation: Incarnation,
@@ -1965,7 +1973,7 @@ pub(super) mod tests {
         MailboxControl::bind(mailbox, token, incarnation, &mut effects);
     }
 
-    fn prepare_termination<M: Send + 'static>(
+    pub(crate) fn prepare_termination<M: Send + 'static>(
         mailbox: &MailboxCell<M>,
     ) -> Option<Box<dyn crate::MailboxTermination>> {
         let mut effects = crate::MailboxEffectQueue::default();
@@ -1975,6 +1983,307 @@ pub(super) mod tests {
     fn park_with(future: &mut std::pin::Pin<Box<crate::SendFuture<u8>>>, waker: &Waker) {
         let mut context = Context::from_waker(waker);
         assert!(future.as_mut().poll(&mut context).is_pending());
+    }
+
+    pub(crate) fn freeze<M: Send + 'static>(mailbox: &MailboxCell<M>, incarnation: Incarnation) {
+        let mut effects = crate::MailboxEffectQueue::default();
+        MailboxControl::freeze(mailbox, incarnation, &mut effects);
+    }
+
+    /// Closes in the driver's shape: the result stays live across the effect
+    /// flush, so a panicking waker cannot strand the unread payload.
+    pub(crate) fn close<M: Send + 'static>(
+        mailbox: &MailboxCell<M>,
+        incarnation: Incarnation,
+    ) -> Option<crate::MailboxClose> {
+        let mut effects = crate::MailboxEffectQueue::default();
+        MailboxControl::close(mailbox, incarnation, &mut effects)
+    }
+
+    fn two_incarnations() -> (Incarnation, Incarnation) {
+        let (_, mut incarnations) = mint_actor_membership();
+        (
+            incarnations.mint().expect("first incarnation available"),
+            incarnations.mint().expect("second incarnation available"),
+        )
+    }
+
+    struct TrackedMessage {
+        value: u8,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TrackedMessage {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn freeze_and_close_preserve_waiters_payloads_and_incarnation_boundaries() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (first, second) = two_incarnations();
+        let mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ),
+        );
+
+        freeze(&mailbox, first);
+        assert!(close(&mailbox, first).is_none());
+        bind(&mailbox, token, first);
+        assert!(matches!(
+            mailbox.submit(TrackedMessage {
+                value: 1,
+                drops: Arc::clone(&drops),
+            }),
+            super::Submission::Accepted(bound) if bound == first
+        ));
+        let second_message = match mailbox.submit(TrackedMessage {
+            value: 2,
+            drops: Arc::clone(&drops),
+        }) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("the second message parks behind the full queue")
+            }
+        };
+
+        freeze(&mailbox, second);
+        assert!(close(&mailbox, second).is_none());
+        assert!(matches!(
+            &mailbox.state.lock().expect("mailbox mutex poisoned").binding,
+            super::MailboxBinding::Bound(super::BoundState::Full { incarnation, waiters })
+                if *incarnation == first && waiters.len() == 1
+        ));
+
+        freeze(&mailbox, first);
+        let third_message = match mailbox.submit(TrackedMessage {
+            value: 3,
+            drops: Arc::clone(&drops),
+        }) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("frozen intake parks new messages")
+            }
+        };
+        assert!(matches!(
+            &mailbox.state.lock().expect("mailbox mutex poisoned").binding,
+            super::MailboxBinding::Frozen { incarnation, waiters }
+                if *incarnation == first && waiters.len() == 2
+        ));
+
+        let closed =
+            close(&mailbox, first).expect("the matching close returns the unread queue payload");
+        assert!(matches!(
+            &mailbox.state.lock().expect("mailbox mutex poisoned").binding,
+            super::MailboxBinding::Unbound(waiters) if waiters.len() == 2
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let (token, payload) = closed.into_parts();
+        drop(payload);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "close transfers the unread payload instead of dropping it inline"
+        );
+
+        bind(&mailbox, token, second);
+        assert!(matches!(
+            second_message.poll(None, Waker::noop()),
+            super::OperationPoll::Accepted(bound) if bound == second
+        ));
+        assert!(matches!(
+            third_message.poll(None, Waker::noop()),
+            super::OperationPoll::NeedsWakerClone
+        ));
+        let receiver = MailboxReceiver::new(Arc::clone(&mailbox), second);
+        let message = receiver.try_recv().expect("the oldest waiter was promoted");
+        assert_eq!(message.value, 2);
+        drop(message);
+        assert!(matches!(
+            third_message.poll(None, Waker::noop()),
+            super::OperationPoll::Accepted(bound) if bound == second
+        ));
+        let message = receiver
+            .try_recv()
+            .expect("the remaining waiter was promoted");
+        assert_eq!(message.value, 3);
+        drop(message);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+
+        freeze(&mailbox, first);
+        assert!(close(&mailbox, first).is_none());
+        drop(close(&mailbox, second));
+        let teardown = prepare_termination(&mailbox).expect("an unbound mailbox can terminalize");
+        drop(teardown.finish());
+        freeze(&mailbox, second);
+        assert!(close(&mailbox, second).is_none());
+
+        let latest_drops = Arc::new(AtomicUsize::new(0));
+        let latest = MailboxCell::new(ChildId::from("latest"), crate::capability::tests::runtime());
+        let latest_token = configure(&latest, ResolvedMailbox::Latest);
+        bind(&latest, latest_token, first);
+        assert!(matches!(
+            latest.submit(TrackedMessage {
+                value: 4,
+                drops: Arc::clone(&latest_drops),
+            }),
+            super::Submission::Accepted(bound) if bound == first
+        ));
+        freeze(&latest, first);
+        let closed = close(&latest, first).expect("close returns the frozen latest payload");
+        assert_eq!(latest_drops.load(Ordering::SeqCst), 0);
+        let (_token, payload) = closed.into_parts();
+        drop(payload);
+        assert_eq!(latest_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn accepted_sequence_boundary_is_inclusive_and_live_only_refuses_frozen_input() {
+        let (mailbox, actor_ref) = actor();
+        let (incarnation, _) = two_incarnations();
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(4).expect("non-zero queue capacity"),
+            ),
+        );
+        bind(&mailbox, token, incarnation);
+        let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+
+        assert!(matches!(actor_ref.try_send(1), Ok(bound) if bound == incarnation));
+        assert!(matches!(actor_ref.try_send(2), Ok(bound) if bound == incarnation));
+        let through = receiver.accepted_sequence();
+        assert!(matches!(actor_ref.try_send(3), Ok(bound) if bound == incarnation));
+        assert_eq!(receiver.try_recv_live_through(through), Some(1));
+        assert_eq!(
+            receiver.try_recv_live_through(through),
+            Some(2),
+            "the accepted-sequence boundary itself is included"
+        );
+        assert_eq!(receiver.try_recv_live_through(through), None);
+
+        receiver.freeze();
+        let frozen_through = receiver.accepted_sequence();
+        assert_eq!(receiver.try_recv_live_through(frozen_through), None);
+        assert_eq!(
+            receiver.try_recv(),
+            Some(3),
+            "IncludeFrozen drains the same payload LiveOnly refuses"
+        );
+
+        let (latest_mailbox, latest_actor) = actor();
+        let latest_token = configure(&latest_mailbox, ResolvedMailbox::Latest);
+        bind(&latest_mailbox, latest_token, incarnation);
+        let latest_receiver = MailboxReceiver::new(latest_mailbox, incarnation);
+        assert!(matches!(
+            latest_actor.try_send(4),
+            Ok(bound) if bound == incarnation
+        ));
+        let latest_through = latest_receiver.accepted_sequence();
+        assert_eq!(
+            latest_receiver.try_recv_live_through(latest_through),
+            Some(4),
+            "latest mailboxes also include the exact accepted-sequence boundary"
+        );
+        assert!(matches!(
+            latest_actor.try_send(5),
+            Ok(bound) if bound == incarnation
+        ));
+        assert_eq!(latest_receiver.try_recv_live_through(latest_through), None);
+        assert_eq!(latest_receiver.try_recv(), Some(5));
+    }
+
+    #[test]
+    fn termination_that_wins_before_withdrawal_reports_the_terminal_outcome() {
+        let (mailbox, _) = actor();
+        let (incarnation, _) = two_incarnations();
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ),
+        );
+        bind(&mailbox, token, incarnation);
+        assert!(matches!(
+            mailbox.submit(1),
+            super::Submission::Accepted(bound) if bound == incarnation
+        ));
+        let operation = match mailbox.submit(2) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("the second message parks")
+            }
+        };
+
+        let teardown = prepare_termination(&mailbox).expect("the mailbox prepares termination");
+        let payload = teardown.finish();
+        let mut withdrawal = mailbox.withdraw(&operation, super::WithdrawalDisposition::Inline);
+        assert!(matches!(
+            withdrawal.take_outcome(),
+            super::WithdrawalOutcome::Terminated {
+                message: 2,
+                observed: Some(final_incarnation),
+            } if final_incarnation == incarnation
+        ));
+        withdrawal.finish();
+        drop(payload);
+    }
+
+    #[test]
+    fn termination_finish_completes_waiters_and_isolates_payload_after_signal_panic() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let disposals = Arc::new(AtomicUsize::new(0));
+        let runtime = Arc::new(PanickingPulseRuntime {
+            inner: crate::capability::tests::runtime(),
+            armed: Arc::clone(&armed),
+            disposals: Arc::clone(&disposals),
+        });
+        let (mailbox, actor) = actor_for_with_runtime(runtime);
+        let (incarnation, _) = two_incarnations();
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(
+                std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
+            ),
+        );
+        bind(&mailbox, token, incarnation);
+        assert!(matches!(actor.try_send(1), Ok(bound) if bound == incarnation));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+        let mut second = Box::pin(actor.send(2));
+        let mut third = Box::pin(actor.send(3));
+        park_with(&mut second, &waker);
+        park_with(&mut third, &waker);
+
+        let teardown = prepare_termination(&mailbox).expect("the mailbox prepares termination");
+        armed.store(true, Ordering::SeqCst);
+        let panic = catch_unwind(AssertUnwindSafe(move || {
+            let _ = teardown.finish();
+        }))
+        .expect_err("the primary signal panic resumes after teardown");
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("injected mailbox pulse panic")
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            disposals.load(Ordering::SeqCst),
+            1,
+            "a panicking finish submits the unread payload for isolated disposal"
+        );
+        for send in [&mut second, &mut third] {
+            let Poll::Ready(Err(error)) =
+                send.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("every waiter is terminal before the primary panic resumes")
+            };
+            assert_eq!(error.kind, SendErrorKind::Terminated);
+            assert_eq!(error.incarnation_observed, Some(incarnation));
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -2632,10 +2941,11 @@ pub(super) mod tests {
 
     #[test]
     fn a_panicking_close_flush_isolates_the_unread_payload() {
-        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armed = Arc::new(AtomicBool::new(false));
         let runtime = Arc::new(PanickingPulseRuntime {
             inner: crate::capability::tests::runtime(),
             armed: Arc::clone(&armed),
+            disposals: Arc::new(AtomicUsize::new(0)),
         });
         let mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
         let token = configure(&mailbox, ResolvedMailbox::Latest);

@@ -1216,6 +1216,24 @@ mod tests {
     }
 
     #[test]
+    fn force_in_idle_arms_immediate_escalation_on_the_first_advance() {
+        let forced_at = Instant::now();
+        let mut ladder = StopLadder::new(
+            Shutdown::graceful(Duration::from_secs(30)).expect("test grace is non-zero"),
+        );
+
+        ladder.force(forced_at);
+        assert_eq!(ladder.deadline(), None, "an idle ladder is not armed yet");
+        assert_eq!(ladder.advance(forced_at), Some(StopAction::Cancel));
+        assert_eq!(ladder.deadline(), Some(forced_at));
+        assert_eq!(
+            ladder.advance(forced_at),
+            Some(StopAction::Escalate),
+            "force before the first advance skips the cooperative grace"
+        );
+    }
+
+    #[test]
     fn force_preserves_an_already_due_deadline() {
         let start = Instant::now();
         let grace = Duration::from_secs(30);
@@ -1284,6 +1302,33 @@ mod tests {
             Some(StopAction::HardAbort {
                 phase: GracePhase::WithinGrace
             })
+        );
+    }
+
+    #[test]
+    fn framework_abort_acknowledgement_is_ignored_before_the_abort_phase() {
+        let start = Instant::now();
+        let mut ladder = StopLadder::for_framework_driver(Shutdown::Abort);
+
+        ladder.acknowledge_framework_abort();
+        assert_eq!(ladder.advance(start), Some(StopAction::Cancel));
+        ladder.acknowledge_framework_abort();
+        assert_eq!(ladder.advance(start), Some(StopAction::Escalate));
+        ladder.acknowledge_framework_abort();
+        let tidy = ladder.deadline().expect("abort policy keeps a tidy beat");
+        assert_eq!(
+            ladder.advance(tidy),
+            Some(StopAction::AbortFramework {
+                phase: GracePhase::WithinGrace
+            })
+        );
+        let framework_tidy = ladder.deadline().expect("framework abort has a tidy beat");
+        assert_eq!(
+            ladder.advance(framework_tidy),
+            Some(StopAction::HardAbort {
+                phase: GracePhase::WithinGrace
+            }),
+            "acknowledgements before AbortingFramework must not suppress the hard-abort fallback"
         );
     }
 
@@ -1610,6 +1655,37 @@ mod tests {
             Some(ReadinessEffect::TimedOut { deadline })
         );
         assert!(!timed_out.needs_signal_watch());
+
+        let configured_deadline = deadline + Duration::from_secs(2);
+        let mut premature = ReadinessGate::new();
+        assert_eq!(
+            premature.step(ReadinessEvent::Configure {
+                readiness: crate::Readiness::Manual,
+                deadline: Some(configured_deadline),
+            }),
+            Some(ReadinessEffect::ArmDeadline {
+                deadline: configured_deadline
+            })
+        );
+        assert_eq!(
+            premature.step(ReadinessEvent::Deadline {
+                now: deadline,
+                signal_seen: false,
+            }),
+            None,
+            "a deadline event before the configured instant cannot time readiness out"
+        );
+        assert!(premature.needs_signal_watch());
+        assert_eq!(
+            premature.step(ReadinessEvent::Deadline {
+                now: configured_deadline,
+                signal_seen: false,
+            }),
+            Some(ReadinessEffect::TimedOut {
+                deadline: configured_deadline
+            }),
+            "the original deadline remains armed after a premature event"
+        );
 
         let mut immediate = ReadinessGate::new();
         assert_eq!(

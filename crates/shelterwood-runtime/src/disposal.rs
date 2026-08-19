@@ -69,6 +69,12 @@ where
     T: Send + 'static,
     C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, Option<(T, C)>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn new(value: T, completion: C) -> Arc<Self> {
         Self::with_criticality(value, completion, false)
     }
@@ -91,10 +97,7 @@ where
     /// is taking the payload out, and the critical drop path below must stay
     /// panic-free because it can run inside an unwind.
     fn take_pending(&self) -> Option<(T, C)> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        self.lock_state().take()
     }
 
     fn finish(&self) {
@@ -149,10 +152,7 @@ where
     }
 
     fn is_pending(&self) -> bool {
-        self.state
-            .lock()
-            .expect("disposal job mutex poisoned")
-            .is_some()
+        self.lock_state().is_some()
     }
 }
 
@@ -213,7 +213,9 @@ fn enqueue_fallback_disposal_with(
     // The push and this pop share one guard, so the reclaimed entry is exactly
     // the job just appended even when older critical jobs are still queued.
     let rejected = state.queue.pop_back();
+    drop(state);
     debug_assert!(rejected.is_some());
+    drop(rejected);
     false
 }
 
@@ -369,7 +371,7 @@ mod tests {
     use std::{
         sync::{
             Arc, Condvar, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
         thread::{self, ThreadId},
@@ -378,7 +380,7 @@ mod tests {
 
     use super::{
         DisposalJob, DisposalPanic, FallbackDisposals, Isolated, dispose_detached,
-        retain_fallback_disposal_with,
+        enqueue_fallback_disposal_with, retain_fallback_disposal_with,
     };
     use crate::spawn::{BlockingPoolJob, blocking_pool_accepted};
 
@@ -401,6 +403,26 @@ mod tests {
     }
 
     struct PanickingDrop(Arc<AtomicUsize>);
+
+    struct LockCheckingJob {
+        disposals: Arc<Mutex<FallbackDisposals>>,
+        dropped_after_unlock: Arc<AtomicBool>,
+    }
+
+    impl Drop for LockCheckingJob {
+        fn drop(&mut self) {
+            self.dropped_after_unlock
+                .store(self.disposals.try_lock().is_ok(), Ordering::SeqCst);
+        }
+    }
+
+    impl BlockingPoolJob for LockCheckingJob {
+        fn run(&self) {}
+
+        fn is_pending(&self) -> bool {
+            true
+        }
+    }
 
     impl Drop for PanickingDrop {
         fn drop(&mut self) {
@@ -458,6 +480,32 @@ mod tests {
             .expect("failed spawn keeps critical disposal queued");
         queued.run();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn rejected_fallback_job_is_released_after_unlock() {
+        let disposals = Arc::new(Mutex::new(FallbackDisposals::default()));
+        let dropped_after_unlock = Arc::new(AtomicBool::new(false));
+        let job = Arc::new(LockCheckingJob {
+            disposals: Arc::clone(&disposals),
+            dropped_after_unlock: Arc::clone(&dropped_after_unlock),
+        });
+
+        assert!(!enqueue_fallback_disposal_with(&disposals, job, || Err(
+            std::io::Error::other("injected thread exhaustion")
+        ),));
+        assert!(dropped_after_unlock.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn pending_query_tolerates_a_poisoned_disposal_job() {
+        let job = DisposalJob::new((), |_| {});
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = job.state.lock().expect("state starts healthy");
+            panic!("inject disposal state poison");
+        }));
+
+        assert!(job.is_pending());
     }
 
     struct ReportingDrop(mpsc::Sender<DestructorThread>);

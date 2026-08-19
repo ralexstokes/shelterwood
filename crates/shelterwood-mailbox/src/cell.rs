@@ -3,12 +3,16 @@ use std::{
     fmt,
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
-    sync::{Arc, Mutex, MutexGuard, atomic::Ordering},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::{
-    ChildId, Incarnation, MailboxControl, MailboxDisposal, MailboxRuntime, MailboxSignal,
-    MailboxSignalWatcher, MailboxTermination,
+    ChildId, Incarnation, MailboxBindToken, MailboxClose, MailboxControl, MailboxDisposal,
+    MailboxEffectQueue, MailboxEffectSink, MailboxRuntime, MailboxSignal, MailboxSignalWatcher,
+    MailboxTermination,
     capability::{dispose, dispose_value},
     identity::{AtomicPoisonedCounter, PoisonedCounter},
     panic::{PanicAccumulator, PanicPayload, resume_panic},
@@ -319,6 +323,7 @@ impl<M> SendOperation<M> {
 
 pub(super) struct MailboxState<M> {
     kind: Option<MailboxKind>,
+    bind_permit: Arc<AtomicBool>,
     binding: MailboxBinding<M>,
     last_bound: Option<Incarnation>,
     pub(super) queue: VecDeque<Envelope<M>>,
@@ -335,12 +340,12 @@ impl<M> MailboxState<M> {
         }
     }
 
-    fn park(&mut self, operation: &Arc<SendOperation<M>>) {
+    fn park(&mut self, operation: &Arc<SendOperation<M>>) -> bool {
         match &mut self.binding {
             MailboxBinding::Unbound(waiters)
             | MailboxBinding::Frozen { waiters, .. }
             | MailboxBinding::Bound(BoundState::Full { waiters, .. }) => {
-                waiters.park(operation);
+                return waiters.park(operation);
             }
             MailboxBinding::Bound(BoundState::Available(incarnation)) => {
                 let Some(MailboxKind::Queue(capacity)) = self.kind else {
@@ -349,7 +354,9 @@ impl<M> MailboxState<M> {
                 debug_assert_eq!(self.queue.len(), capacity.get());
                 let incarnation = *incarnation;
                 let mut waiters = WaiterQueue::default();
-                waiters.park(operation);
+                if !waiters.park(operation) {
+                    return false;
+                }
                 self.binding = MailboxBinding::Bound(BoundState::Full {
                     incarnation,
                     waiters,
@@ -359,6 +366,7 @@ impl<M> MailboxState<M> {
                 unreachable!("terminal submissions return their payload directly")
             }
         }
+        true
     }
 
     /// Detaches every waiter from a non-terminal binding before a transition.
@@ -426,6 +434,23 @@ pub(super) enum Submission<M> {
     },
 }
 
+enum SubmitTransition<M> {
+    Complete(Submission<M>),
+    WaiterIdentityExhausted(Arc<SendOperation<M>>),
+    AcceptedSequenceExhausted(M),
+}
+
+enum AcceptTransition<M> {
+    Accepted(Incarnation),
+    Full(M),
+    Exhausted(M),
+}
+
+enum TrySendTransition<M> {
+    Complete(Result<Incarnation, SendError<M>>),
+    AcceptedSequenceExhausted(M),
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct WaiterId(u64);
 
@@ -470,20 +495,19 @@ impl<M> WaiterQueue<M> {
         self.entries.len()
     }
 
-    fn push_back(&mut self, operation: Arc<SendOperation<M>>) -> WaiterId {
-        let next = WaiterId(
-            self.ids
-                .mint()
-                .expect("mailbox waiter identity space exhausted"),
-        );
+    fn push_back(&mut self, operation: Arc<SendOperation<M>>) -> Option<WaiterId> {
+        let next = WaiterId(self.ids.mint()?);
         let replaced = self.entries.insert(next, operation);
         debug_assert!(replaced.is_none());
-        next
+        Some(next)
     }
 
-    fn park(&mut self, operation: &Arc<SendOperation<M>>) {
-        let registration = self.push_back(Arc::clone(operation));
+    fn park(&mut self, operation: &Arc<SendOperation<M>>) -> bool {
+        let Some(registration) = self.push_back(Arc::clone(operation)) else {
+            return false;
+        };
         operation.register(registration);
+        true
     }
 
     fn observe_all(&self, incarnation: Incarnation) {
@@ -520,24 +544,41 @@ impl<M> WaiterQueue<M> {
 /// of it: it never outlives the `MailboxTxn` that owns it, and every mailbox
 /// transition — including the per-message receive path — would otherwise pay
 /// two atomic refcount pairs to restate what the transaction already holds.
-struct MailboxEffects<'a, M: Send + 'static> {
+struct MailboxEffects<'a, 's, M: Send + 'static> {
     cell: &'a MailboxCell<M>,
+    external: Option<&'s mut dyn MailboxEffectSink>,
     pulse: bool,
     displaced: Vec<Envelope<M>>,
     isolate_displaced: bool,
     wakers: WakerEffects,
     returned: Option<M>,
+    accepted_sequence_exhausted: bool,
 }
 
-impl<'a, M: Send + 'static> MailboxEffects<'a, M> {
+impl<'a, 's, M: Send + 'static> MailboxEffects<'a, 's, M> {
     fn new(cell: &'a MailboxCell<M>) -> Self {
         Self {
             cell,
+            external: None,
             pulse: false,
             displaced: Vec::new(),
             isolate_displaced: false,
             wakers: WakerEffects::default(),
             returned: None,
+            accepted_sequence_exhausted: false,
+        }
+    }
+
+    fn deferred(cell: &'a MailboxCell<M>, external: &'s mut dyn MailboxEffectSink) -> Self {
+        Self {
+            cell,
+            external: Some(external),
+            pulse: false,
+            displaced: Vec::new(),
+            isolate_displaced: false,
+            wakers: WakerEffects::default(),
+            returned: None,
+            accepted_sequence_exhausted: false,
         }
     }
 
@@ -550,23 +591,56 @@ impl<'a, M: Send + 'static> MailboxEffects<'a, M> {
     }
 }
 
-impl<M: Send + 'static> Drop for MailboxEffects<'_, M> {
+impl<M: Send + 'static> Drop for MailboxEffects<'_, '_, M> {
     fn drop(&mut self) {
+        let batch = MailboxEffectBatch {
+            changed: Arc::clone(&self.cell.changed),
+            runtime: Arc::clone(&self.cell.runtime),
+            pulse: self.pulse,
+            displaced: std::mem::take(&mut self.displaced),
+            isolate_displaced: self.isolate_displaced,
+            wakers: std::mem::take(&mut self.wakers),
+            returned: self.returned.take(),
+            accepted_sequence_exhausted: self.accepted_sequence_exhausted,
+        };
+        if let Some(external) = self.external.take() {
+            external.defer_mailbox_effect(Box::new(move || {
+                batch.flush();
+            }));
+            return;
+        }
+        batch.flush();
+    }
+}
+
+struct MailboxEffectBatch<M> {
+    changed: Arc<dyn MailboxSignal>,
+    runtime: Arc<dyn MailboxRuntime>,
+    pulse: bool,
+    displaced: Vec<Envelope<M>>,
+    isolate_displaced: bool,
+    wakers: WakerEffects,
+    returned: Option<M>,
+    accepted_sequence_exhausted: bool,
+}
+
+impl<M: Send + 'static> MailboxEffectBatch<M> {
+    fn flush(mut self) {
         let mut panics = PanicAccumulator::default();
         if self.pulse {
-            panics.run(|| self.cell.changed.pulse());
+            panics.run(|| self.changed.pulse());
         }
         // Binding a latest-value mailbox historically handed displaced
         // payloads to isolated disposal before accepted senders were woken.
         // Preserve that observable ownership edge: a woken sender may run
         // immediately and must not race ahead of disposal submission.
         if self.isolate_displaced && !self.displaced.is_empty() {
-            let displaced = std::mem::take(&mut self.displaced);
+            let isolated = std::mem::take(&mut self.displaced);
             panics.run(|| {
                 dispose_value(
-                    self.cell.runtime.as_ref(),
+                    self.runtime.as_ref(),
                     MailboxPayload {
-                        queue: Some(displaced.into()),
+                        queue: Some(isolated.into()),
                         latest: None,
                         retired: Vec::new(),
                     },
@@ -575,23 +649,26 @@ impl<M: Send + 'static> Drop for MailboxEffects<'_, M> {
         }
         self.wakers.flush(&mut panics);
         if !self.isolate_displaced {
-            for displaced in self.displaced.drain(..) {
-                panics.run(|| drop(displaced));
+            for envelope in self.displaced.drain(..) {
+                panics.run(|| drop(envelope));
             }
         }
         if let Some(returned) = self.returned.take() {
             panics.run(|| drop(returned));
         }
+        if self.accepted_sequence_exhausted {
+            panics.run(|| panic!("mailbox accepted-sequence space exhausted"));
+        }
     }
 }
 
 /// A mailbox transition guard paired with its mandatory post-unlock effects.
-struct MailboxTxn<'a, M: Send + 'static> {
+struct MailboxTxn<'a, 's, M: Send + 'static> {
     state: Option<MutexGuard<'a, MailboxState<M>>>,
-    effects: MailboxEffects<'a, M>,
+    effects: MailboxEffects<'a, 's, M>,
 }
 
-impl<'a, M: Send + 'static> MailboxTxn<'a, M> {
+impl<'a, M: Send + 'static> MailboxTxn<'a, 'static, M> {
     fn new(cell: &'a MailboxCell<M>) -> Self {
         let effects = MailboxEffects::new(cell);
         let state = cell.state.lock().expect("mailbox mutex poisoned");
@@ -600,8 +677,19 @@ impl<'a, M: Send + 'static> MailboxTxn<'a, M> {
             effects,
         }
     }
+}
 
-    fn parts(&mut self) -> (&mut MailboxState<M>, &mut MailboxEffects<'a, M>) {
+impl<'a, 's, M: Send + 'static> MailboxTxn<'a, 's, M> {
+    fn deferred(cell: &'a MailboxCell<M>, effects: &'s mut dyn MailboxEffectSink) -> Self {
+        let effects = MailboxEffects::deferred(cell, effects);
+        let state = cell.state.lock().expect("mailbox mutex poisoned");
+        Self {
+            state: Some(state),
+            effects,
+        }
+    }
+
+    fn parts(&mut self) -> (&mut MailboxState<M>, &mut MailboxEffects<'a, 's, M>) {
         (
             self.state
                 .as_deref_mut()
@@ -624,7 +712,7 @@ impl<'a, M: Send + 'static> MailboxTxn<'a, M> {
     }
 }
 
-impl<M: Send + 'static> Deref for MailboxTxn<'_, M> {
+impl<M: Send + 'static> Deref for MailboxTxn<'_, '_, M> {
     type Target = MailboxState<M>;
 
     fn deref(&self) -> &Self::Target {
@@ -634,7 +722,7 @@ impl<M: Send + 'static> Deref for MailboxTxn<'_, M> {
     }
 }
 
-impl<M: Send + 'static> DerefMut for MailboxTxn<'_, M> {
+impl<M: Send + 'static> DerefMut for MailboxTxn<'_, '_, M> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.state
             .as_deref_mut()
@@ -642,7 +730,7 @@ impl<M: Send + 'static> DerefMut for MailboxTxn<'_, M> {
     }
 }
 
-impl<M: Send + 'static> Drop for MailboxTxn<'_, M> {
+impl<M: Send + 'static> Drop for MailboxTxn<'_, '_, M> {
     fn drop(&mut self) {
         // Rust drops fields after this body. Empty the guard field here so the
         // effects field necessarily flushes with no mailbox mutex held.
@@ -752,6 +840,11 @@ impl<M: Send + 'static> Drop for MailboxTeardown<M> {
     }
 }
 
+/// Restart-stable mailbox state for one actor membership.
+///
+/// Dropping the last handle can destroy unread user payloads. Framework owners
+/// must therefore close or terminalize the cell and transfer its payload to
+/// isolated disposal before releasing their final handle.
 pub struct MailboxCell<M> {
     pub(super) actor_id: ChildId,
     pub(super) state: Mutex<MailboxState<M>>,
@@ -776,6 +869,7 @@ impl<M: Send + 'static> MailboxCell<M> {
             actor_id,
             state: Mutex::new(MailboxState {
                 kind: None,
+                bind_permit: Arc::new(AtomicBool::new(false)),
                 binding: MailboxBinding::Unbound(WaiterQueue::default()),
                 last_bound: None,
                 queue: VecDeque::new(),
@@ -789,79 +883,120 @@ impl<M: Send + 'static> MailboxCell<M> {
 
     pub(super) fn submit(&self, message: M) -> Submission<M> {
         let mut transaction = MailboxTxn::new(self);
-        let submission = match transaction.status() {
-            BindingStatus::Terminal(final_incarnation) => Submission::Terminated {
-                message,
-                final_incarnation,
-            },
+        let transition = match transaction.status() {
+            BindingStatus::Terminal(final_incarnation) => {
+                SubmitTransition::Complete(Submission::Terminated {
+                    message,
+                    final_incarnation,
+                })
+            }
             BindingStatus::Bound(incarnation) => {
                 let accepted = {
                     let (state, effects) = transaction.parts();
                     accept_locked(state, incarnation, message, &self.accepted, effects)
                 };
                 match accepted {
-                    Ok(incarnation) => Submission::Accepted(incarnation),
-                    Err(message) => {
+                    AcceptTransition::Accepted(incarnation) => {
+                        SubmitTransition::Complete(Submission::Accepted(incarnation))
+                    }
+                    AcceptTransition::Full(message) => {
                         let operation = SendOperation::new(message);
                         operation.observe(incarnation);
-                        transaction.park(&operation);
-                        Submission::Parked(operation)
+                        if transaction.park(&operation) {
+                            SubmitTransition::Complete(Submission::Parked(operation))
+                        } else {
+                            SubmitTransition::WaiterIdentityExhausted(operation)
+                        }
+                    }
+                    AcceptTransition::Exhausted(message) => {
+                        SubmitTransition::AcceptedSequenceExhausted(message)
                     }
                 }
             }
             BindingStatus::Frozen(incarnation) => {
                 let operation = SendOperation::new(message);
                 operation.observe(incarnation);
-                transaction.park(&operation);
-                Submission::Parked(operation)
+                if transaction.park(&operation) {
+                    SubmitTransition::Complete(Submission::Parked(operation))
+                } else {
+                    SubmitTransition::WaiterIdentityExhausted(operation)
+                }
             }
             BindingStatus::Unbound => {
                 let operation = SendOperation::new(message);
-                transaction.park(&operation);
-                Submission::Parked(operation)
+                if transaction.park(&operation) {
+                    SubmitTransition::Complete(Submission::Parked(operation))
+                } else {
+                    SubmitTransition::WaiterIdentityExhausted(operation)
+                }
             }
         };
-        transaction.finish(submission)
+        match transaction.finish(transition) {
+            SubmitTransition::Complete(submission) => submission,
+            SubmitTransition::WaiterIdentityExhausted(operation) => {
+                dispose(&self.runtime, operation);
+                panic!("mailbox waiter identity space exhausted");
+            }
+            SubmitTransition::AcceptedSequenceExhausted(message) => {
+                dispose(&self.runtime, message);
+                panic!("mailbox accepted-sequence space exhausted");
+            }
+        }
     }
 
     pub(super) fn try_send(&self, message: M) -> Result<Incarnation, SendError<M>> {
         let mut transaction = MailboxTxn::new(self);
-        let result = match transaction.status() {
-            BindingStatus::Terminal(final_incarnation) => Err(SendError {
-                actor_id: self.actor_id.clone(),
-                incarnation_observed: final_incarnation,
-                message,
-                kind: SendErrorKind::Terminated,
-            }),
-            BindingStatus::Unbound => Err(SendError {
+        let transition = match transaction.status() {
+            BindingStatus::Terminal(final_incarnation) => {
+                TrySendTransition::Complete(Err(SendError {
+                    actor_id: self.actor_id.clone(),
+                    incarnation_observed: final_incarnation,
+                    message,
+                    kind: SendErrorKind::Terminated,
+                }))
+            }
+            BindingStatus::Unbound => TrySendTransition::Complete(Err(SendError {
                 actor_id: self.actor_id.clone(),
                 incarnation_observed: None,
                 message,
                 kind: SendErrorKind::NotRunning,
-            }),
-            BindingStatus::Frozen(incarnation) => Err(SendError {
+            })),
+            BindingStatus::Frozen(incarnation) => TrySendTransition::Complete(Err(SendError {
                 actor_id: self.actor_id.clone(),
                 incarnation_observed: Some(incarnation),
                 message,
                 kind: SendErrorKind::NotRunning,
-            }),
+            })),
             BindingStatus::Bound(incarnation) => {
                 let accepted = {
                     let (state, effects) = transaction.parts();
                     accept_locked(state, incarnation, message, &self.accepted, effects)
                 };
                 match accepted {
-                    Ok(incarnation) => Ok(incarnation),
-                    Err(message) => Err(SendError {
-                        actor_id: self.actor_id.clone(),
-                        incarnation_observed: Some(incarnation),
-                        message,
-                        kind: SendErrorKind::Full,
-                    }),
+                    AcceptTransition::Accepted(incarnation) => {
+                        TrySendTransition::Complete(Ok(incarnation))
+                    }
+                    AcceptTransition::Full(message) => {
+                        TrySendTransition::Complete(Err(SendError {
+                            actor_id: self.actor_id.clone(),
+                            incarnation_observed: Some(incarnation),
+                            message,
+                            kind: SendErrorKind::Full,
+                        }))
+                    }
+                    AcceptTransition::Exhausted(message) => {
+                        TrySendTransition::AcceptedSequenceExhausted(message)
+                    }
                 }
             }
         };
-        transaction.finish(result)
+        match transaction.finish(transition) {
+            TrySendTransition::Complete(result) => result,
+            TrySendTransition::AcceptedSequenceExhausted(message) => {
+                dispose(&self.runtime, message);
+                panic!("mailbox accepted-sequence space exhausted");
+            }
+        }
     }
 
     fn receive(
@@ -1039,12 +1174,16 @@ impl<M: Send + 'static> MailboxCell<M> {
 }
 
 impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
-    fn configure(&self, mailbox: ResolvedMailbox) {
+    fn configure(
+        &self,
+        mailbox: ResolvedMailbox,
+        effects: &mut dyn MailboxEffectSink,
+    ) -> MailboxBindToken {
         let kind = match mailbox {
             ResolvedMailbox::Queue(capacity) => MailboxKind::Queue(capacity),
             ResolvedMailbox::Latest => MailboxKind::Latest,
         };
-        let mut transaction = MailboxTxn::new(self);
+        let mut transaction = MailboxTxn::deferred(self, effects);
         let mismatch = match transaction.kind {
             Some(existing) => (existing != kind).then_some(existing),
             None => {
@@ -1052,16 +1191,23 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
                 None
             }
         };
+        let token = MailboxBindToken::new(Arc::clone(&transaction.bind_permit));
         transaction.finish(());
         if let Some(existing) = mismatch {
             panic!(
                 "mailbox configuration changed from {existing:?} to {kind:?} after initialization"
             );
         }
+        token
     }
 
-    fn bind(&self, incarnation: Incarnation) {
-        let mut transaction = MailboxTxn::new(self);
+    fn bind(
+        &self,
+        token: MailboxBindToken,
+        incarnation: Incarnation,
+        effects: &mut dyn MailboxEffectSink,
+    ) {
+        let mut transaction = MailboxTxn::deferred(self, effects);
         if matches!(transaction.status(), BindingStatus::Terminal(_)) {
             return transaction.finish(());
         }
@@ -1072,6 +1218,10 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         if !matches!(transaction.status(), BindingStatus::Unbound) {
             transaction.finish(());
             panic!("mailbox must close the prior incarnation before rebinding")
+        }
+        if !token.claim(&transaction.bind_permit) {
+            transaction.finish(());
+            panic!("mailbox bind token is foreign or was already consumed")
         }
         let mut waiters = transaction.take_waiters();
         transaction.last_bound = Some(incarnation);
@@ -1111,8 +1261,8 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         transaction.finish(())
     }
 
-    fn freeze(&self, incarnation: Incarnation) {
-        let mut transaction = MailboxTxn::new(self);
+    fn freeze(&self, incarnation: Incarnation, effects: &mut dyn MailboxEffectSink) {
+        let mut transaction = MailboxTxn::deferred(self, effects);
         if transaction.status() != BindingStatus::Bound(incarnation) {
             return transaction.finish(());
         }
@@ -1125,8 +1275,12 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         transaction.finish(())
     }
 
-    fn close(&self, incarnation: Incarnation) -> Option<MailboxDisposal> {
-        let mut transaction = MailboxTxn::new(self);
+    fn close(
+        &self,
+        incarnation: Incarnation,
+        effects: &mut dyn MailboxEffectSink,
+    ) -> Option<MailboxClose> {
+        let mut transaction = MailboxTxn::deferred(self, effects);
         if !matches!(
             transaction.status(),
             BindingStatus::Bound(current) | BindingStatus::Frozen(current)
@@ -1136,19 +1290,24 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }
         let waiters = transaction.take_waiters();
         transaction.binding = MailboxBinding::Unbound(waiters);
+        transaction.bind_permit = Arc::new(AtomicBool::new(false));
         let queue = std::mem::take(&mut transaction.queue);
         let latest = transaction.latest.take();
         transaction.effects.pulse();
-        let disposal = Some(Box::new(MailboxPayload {
+        let disposal = Box::new(MailboxPayload {
             queue: Some(queue),
             latest,
             retired: Vec::new(),
-        }) as MailboxDisposal);
-        transaction.finish(disposal)
+        }) as MailboxDisposal;
+        let token = MailboxBindToken::new(Arc::clone(&transaction.bind_permit));
+        transaction.finish(Some(MailboxClose::new(token, disposal)))
     }
 
-    fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>> {
-        let mut transaction = MailboxTxn::new(self);
+    fn prepare_termination(
+        &self,
+        effects: &mut dyn MailboxEffectSink,
+    ) -> Option<Box<dyn MailboxTermination>> {
+        let mut transaction = MailboxTxn::deferred(self, effects);
         if matches!(transaction.status(), BindingStatus::Terminal(_)) {
             return transaction.finish(None);
         }
@@ -1177,26 +1336,14 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         }) as Box<dyn MailboxTermination>);
         transaction.finish(teardown)
     }
-
-    #[cfg(debug_assertions)]
-    fn bind_order_valid(&self) -> bool {
-        let state = self.state.lock().expect("mailbox mutex poisoned");
-        state.kind.is_some()
-            && matches!(
-                state.status(),
-                BindingStatus::Unbound | BindingStatus::Terminal(_)
-            )
-    }
 }
 
 impl<M: Send + 'static> crate::private::SealedMailboxControl for MailboxCell<M> {}
 
-fn mint_accepted_sequence(accepted: &AtomicPoisonedCounter) -> AcceptedSequence {
-    AcceptedSequence(
-        accepted
-            .mint(Ordering::Release, Ordering::Relaxed)
-            .expect("mailbox accepted-sequence space exhausted"),
-    )
+fn mint_accepted_sequence(accepted: &AtomicPoisonedCounter) -> Option<AcceptedSequence> {
+    accepted
+        .mint(Ordering::Release, Ordering::Relaxed)
+        .map(AcceptedSequence)
 }
 
 fn accept_locked<M>(
@@ -1204,8 +1351,8 @@ fn accept_locked<M>(
     incarnation: Incarnation,
     message: M,
     accepted: &AtomicPoisonedCounter,
-    effects: &mut MailboxEffects<'_, M>,
-) -> Result<Incarnation, M>
+    effects: &mut MailboxEffects<'_, '_, M>,
+) -> AcceptTransition<M>
 where
     M: Send + 'static,
 {
@@ -1218,7 +1365,7 @@ where
             ..
         }) => {
             debug_assert_eq!(*current, incarnation);
-            return Err(message);
+            return AcceptTransition::Full(message);
         }
         MailboxBinding::Unbound(_)
         | MailboxBinding::Frozen { .. }
@@ -1231,10 +1378,12 @@ where
             MailboxKind::Queue(capacity)
         }
         Some(MailboxKind::Latest) => MailboxKind::Latest,
-        Some(MailboxKind::Queue(_)) => return Err(message),
+        Some(MailboxKind::Queue(_)) => return AcceptTransition::Full(message),
         None => unreachable!("a bound mailbox is always configured"),
     };
-    let accepted_sequence = mint_accepted_sequence(accepted);
+    let Some(accepted_sequence) = mint_accepted_sequence(accepted) else {
+        return AcceptTransition::Exhausted(message);
+    };
     match kind {
         MailboxKind::Queue(_) => {
             state.queue.push_back(Envelope {
@@ -1253,13 +1402,13 @@ where
         }
     }
     effects.pulse();
-    Ok(incarnation)
+    AcceptTransition::Accepted(incarnation)
 }
 
 fn promote_waiters<M: Send + 'static>(
     state: &mut MailboxState<M>,
     accepted_sequence: &AtomicPoisonedCounter,
-    effects: &mut MailboxEffects<'_, M>,
+    effects: &mut MailboxEffects<'_, '_, M>,
 ) {
     let Some(kind) = state.kind else {
         return;
@@ -1293,7 +1442,7 @@ fn promote_waiter_queue<M: Send + 'static>(
     queue: &mut VecDeque<Envelope<M>>,
     latest: &mut Option<Envelope<M>>,
     accepted_sequence: &AtomicPoisonedCounter,
-    effects: &mut MailboxEffects<'_, M>,
+    effects: &mut MailboxEffects<'_, '_, M>,
 ) {
     let available = match kind {
         MailboxKind::Queue(capacity) => capacity.get().saturating_sub(queue.len()),
@@ -1301,6 +1450,13 @@ fn promote_waiter_queue<M: Send + 'static>(
     };
     let mut accepted = 0usize;
     while accepted < available {
+        if waiters.is_empty() {
+            break;
+        }
+        let Some(accepted_sequence) = mint_accepted_sequence(accepted_sequence) else {
+            effects.accepted_sequence_exhausted = true;
+            break;
+        };
         let Some((registration, operation)) = waiters.pop_front() else {
             break;
         };
@@ -1309,7 +1465,6 @@ fn promote_waiter_queue<M: Send + 'static>(
         let Some(message) = operation.accept(incarnation, &mut effects.wakers) else {
             continue;
         };
-        let accepted_sequence = mint_accepted_sequence(accepted_sequence);
         match kind {
             MailboxKind::Queue(_) => queue.push_back(Envelope {
                 message,
@@ -1401,7 +1556,8 @@ impl<M: Send + 'static> MailboxReceiver<M> {
     }
 
     pub fn freeze(&self) {
-        self.mailbox.freeze(self.incarnation);
+        let mut effects = MailboxEffectQueue::default();
+        self.mailbox.freeze(self.incarnation, &mut effects);
     }
 
     pub async fn changed(&mut self) {
@@ -1418,13 +1574,15 @@ pub(super) mod tests {
         sync::{
             Arc, Mutex, Weak,
             atomic::{AtomicUsize, Ordering},
+            mpsc,
         },
         task::{Context, Poll, Wake, Waker},
         time::{Duration, Instant},
     };
 
     use crate::{
-        ActorIdentity, ActorRef, ChildId, MailboxControl, MailboxReceiver, SendErrorKind,
+        ActorIdentity, ActorRef, ChildId, Incarnation, MailboxControl, MailboxReceiver,
+        SendErrorKind,
         identity::ScopeIdentity,
         policy::{ResolvedDefaults, ResolvedMailbox},
     };
@@ -1440,6 +1598,24 @@ pub(super) mod tests {
     }
 
     struct CountWake(Arc<AtomicUsize>);
+
+    struct LockCheckingMessage {
+        mailbox: Weak<MailboxCell<LockCheckingMessage>>,
+        dropped: Option<mpsc::Sender<bool>>,
+    }
+
+    impl Drop for LockCheckingMessage {
+        fn drop(&mut self) {
+            let Some(dropped) = self.dropped.take() else {
+                return;
+            };
+            let unlocked = self
+                .mailbox
+                .upgrade()
+                .is_none_or(|mailbox| mailbox.state.try_lock().is_ok());
+            let _ = dropped.send(unlocked);
+        }
+    }
 
     impl Wake for CountWake {
         fn wake(self: Arc<Self>) {
@@ -1606,23 +1782,33 @@ pub(super) mod tests {
         actor_for()
     }
 
+    fn configure<M: Send + 'static>(
+        mailbox: &MailboxCell<M>,
+        policy: ResolvedMailbox,
+    ) -> crate::MailboxBindToken {
+        let mut effects = crate::MailboxEffectQueue::default();
+        MailboxControl::configure(mailbox, policy, &mut effects)
+    }
+
+    fn bind<M: Send + 'static>(
+        mailbox: &MailboxCell<M>,
+        token: crate::MailboxBindToken,
+        incarnation: Incarnation,
+    ) {
+        let mut effects = crate::MailboxEffectQueue::default();
+        MailboxControl::bind(mailbox, token, incarnation, &mut effects);
+    }
+
+    fn prepare_termination<M: Send + 'static>(
+        mailbox: &MailboxCell<M>,
+    ) -> Option<Box<dyn crate::MailboxTermination>> {
+        let mut effects = crate::MailboxEffectQueue::default();
+        MailboxControl::prepare_termination(mailbox, &mut effects)
+    }
+
     fn park_with(future: &mut std::pin::Pin<Box<crate::SendFuture<u8>>>, waker: &Waker) {
         let mut context = Context::from_waker(waker);
         assert!(future.as_mut().poll(&mut context).is_pending());
-    }
-
-    #[test]
-    #[should_panic(expected = "mailbox must be configured before its first bind")]
-    fn binding_before_configuration_trips_the_driver_contract() {
-        let (mailbox, _) = actor();
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        let incarnation = incarnations.mint().expect("incarnation available");
-
-        MailboxControl::bind(&*mailbox, incarnation);
     }
 
     #[test]
@@ -1631,11 +1817,11 @@ pub(super) mod tests {
         let queue = ResolvedMailbox::Queue(
             std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
         );
-        MailboxControl::configure(&*mailbox, queue);
-        MailboxControl::configure(&*mailbox, queue);
+        let _ = configure(&mailbox, queue);
+        let _ = configure(&mailbox, queue);
 
         let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
-            MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest);
+            let _ = configure(&mailbox, ResolvedMailbox::Latest);
         })) else {
             panic!("changing mailbox kind must trip the driver contract")
         };
@@ -1657,27 +1843,10 @@ pub(super) mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "mailbox must close the prior incarnation before rebinding")]
-    fn rebinding_before_close_trips_the_driver_contract() {
-        let (mailbox, _) = actor();
-        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox);
-        let mut identity = ScopeIdentity::new();
-        let (_, mut incarnations) = identity
-            .mint_membership(&ChildId::from("actor"))
-            .expect("membership available")
-            .into_pair();
-        let first = incarnations.mint().expect("first incarnation available");
-        let second = incarnations.mint().expect("second incarnation available");
-
-        MailboxControl::bind(&*mailbox, first);
-        MailboxControl::bind(&*mailbox, second);
-    }
-
-    #[test]
     fn bound_waiters_exist_only_in_the_full_state() {
         let (mailbox, _) = actor();
-        MailboxControl::configure(
-            &*mailbox,
+        let token = configure(
+            &mailbox,
             ResolvedMailbox::Queue(
                 std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
             ),
@@ -1688,7 +1857,7 @@ pub(super) mod tests {
             .expect("membership available")
             .into_pair();
         let incarnation = incarnations.mint().expect("incarnation available");
-        MailboxControl::bind(&*mailbox, incarnation);
+        bind(&mailbox, token, incarnation);
 
         assert!(matches!(
             mailbox.submit(1),
@@ -1722,8 +1891,8 @@ pub(super) mod tests {
     #[test]
     fn receive_promotes_multiple_parked_senders_in_fifo_order() {
         let (mailbox, actor) = actor();
-        MailboxControl::configure(
-            &*mailbox,
+        let token = configure(
+            &mailbox,
             ResolvedMailbox::Queue(
                 std::num::NonZeroUsize::new(1).expect("non-zero queue capacity"),
             ),
@@ -1734,7 +1903,7 @@ pub(super) mod tests {
             .expect("membership available")
             .into_pair();
         let incarnation = incarnations.mint().expect("incarnation available");
-        MailboxControl::bind(&*mailbox, incarnation);
+        bind(&mailbox, token, incarnation);
         let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
 
         assert!(matches!(actor.try_send(0), Ok(bound) if bound == incarnation));
@@ -1885,7 +2054,7 @@ pub(super) mod tests {
         park_with(&mut first, &first_panicking);
         park_with(&mut second, &second_panicking);
         park_with(&mut third, &counting);
-        MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox);
+        let token = configure(&mailbox, ResolvedDefaults::default().mailbox);
         let mut generations = {
             let mut identity = ScopeIdentity::new();
             let (_, generations) = identity
@@ -1898,7 +2067,7 @@ pub(super) mod tests {
 
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
-                MailboxControl::bind(&*mailbox, incarnation);
+                bind(&mailbox, token, incarnation);
             }))
             .is_err()
         );
@@ -1927,7 +2096,7 @@ pub(super) mod tests {
             events: Arc::clone(&events),
         });
         let mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
-        MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest);
+        let token = configure(&mailbox, ResolvedMailbox::Latest);
 
         let first = match mailbox.submit(1) {
             super::Submission::Parked(operation) => operation,
@@ -1949,8 +2118,9 @@ pub(super) mod tests {
             .mint_membership(&ChildId::from("actor"))
             .expect("membership available")
             .into_pair();
-        MailboxControl::bind(
-            &*mailbox,
+        bind(
+            &mailbox,
+            token,
             incarnations.mint().expect("incarnation available"),
         );
 
@@ -1982,7 +2152,7 @@ pub(super) mod tests {
 
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
-                drop(MailboxControl::prepare_termination(&*mailbox));
+                drop(prepare_termination(&mailbox));
             }))
             .is_err()
         );
@@ -2004,8 +2174,8 @@ pub(super) mod tests {
         let mut send = Box::pin(actor.send(1));
         park_with(&mut send, Waker::noop());
 
-        let teardown = MailboxControl::prepare_termination(&*mailbox)
-            .expect("live mailbox prepares terminal teardown");
+        let teardown =
+            prepare_termination(&mailbox).expect("live mailbox prepares terminal teardown");
         // Teardown is deliberately retained: cancellation sees terminal state
         // after the waiter queue was detached but before it was discharged.
         drop(send);
@@ -2033,8 +2203,8 @@ pub(super) mod tests {
         );
         crate::runtime::advance(width * 2).await;
 
-        let teardown = MailboxControl::prepare_termination(&*mailbox)
-            .expect("live mailbox prepares terminal teardown");
+        let teardown =
+            prepare_termination(&mailbox).expect("live mailbox prepares terminal teardown");
         // Teardown remains retained: timeout sees terminal binding after the
         // waiter queue was detached but before its waiter was discharged.
         let Poll::Ready(Err(error)) = send.as_mut().poll(&mut Context::from_waker(Waker::noop()))
@@ -2056,13 +2226,17 @@ pub(super) mod tests {
     fn stale_waiter_id_cannot_unlink_a_later_registration() {
         let mut waiters = super::WaiterQueue::default();
         let first = super::SendOperation::new(1_u8);
-        let first_id = waiters.push_back(Arc::clone(&first));
+        let first_id = waiters
+            .push_back(Arc::clone(&first))
+            .expect("first waiter id available");
         first.register(first_id);
         let removed = waiters.remove(first_id).expect("first waiter is live");
         removed.clear_registration(first_id);
 
         let second = super::SendOperation::new(2_u8);
-        let second_id = waiters.push_back(Arc::clone(&second));
+        let second_id = waiters
+            .push_back(Arc::clone(&second))
+            .expect("second waiter id available");
         second.register(second_id);
         assert_ne!(first_id, second_id, "waiter identities are never reused");
         assert!(
@@ -2083,9 +2257,9 @@ pub(super) mod tests {
         let first = super::SendOperation::new(1_u8);
         let second = super::SendOperation::new(2_u8);
         let third = super::SendOperation::new(3_u8);
-        let first_id = waiters.push_back(Arc::clone(&first));
-        let second_id = waiters.push_back(Arc::clone(&second));
-        let third_id = waiters.push_back(Arc::clone(&third));
+        let first_id = waiters.push_back(Arc::clone(&first)).expect("first id");
+        let second_id = waiters.push_back(Arc::clone(&second)).expect("second id");
+        let third_id = waiters.push_back(Arc::clone(&third)).expect("third id");
 
         assert!(Arc::ptr_eq(
             &waiters.remove(second_id).expect("middle waiter is live"),
@@ -2107,24 +2281,12 @@ pub(super) mod tests {
             ..super::WaiterQueue::default()
         };
         let last = waiters.push_back(super::SendOperation::new(1_u8));
-        assert_eq!(last, super::WaiterId(u64::MAX - 1));
+        assert_eq!(last, Some(super::WaiterId(u64::MAX - 1)));
 
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                waiters.push_back(super::SendOperation::new(2_u8));
-            }))
-            .is_err(),
-            "the poison key is never minted"
-        );
+        assert_eq!(waiters.push_back(super::SendOperation::new(2_u8)), None);
         assert!(waiters.ids.is_poisoned());
         assert!(!waiters.entries.contains_key(&super::WaiterId::POISON));
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                waiters.push_back(super::SendOperation::new(3_u8));
-            }))
-            .is_err(),
-            "the exhausted domain stays poisoned"
-        );
+        assert_eq!(waiters.push_back(super::SendOperation::new(3_u8)), None);
     }
 
     #[test]
@@ -2132,20 +2294,130 @@ pub(super) mod tests {
         let accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
         assert_eq!(
             super::mint_accepted_sequence(&accepted),
-            super::AcceptedSequence(u64::MAX - 1)
+            Some(super::AcceptedSequence(u64::MAX - 1))
         );
+        assert_eq!(super::mint_accepted_sequence(&accepted), None);
+        assert_eq!(super::mint_accepted_sequence(&accepted), None);
+    }
+
+    #[test]
+    fn waiter_identity_exhaustion_drops_the_message_after_unlock() {
+        let mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+        mailbox.state.lock().expect("mailbox state").binding =
+            super::MailboxBinding::Unbound(super::WaiterQueue {
+                ids: crate::identity::PoisonedCounter::near_exhaustion(),
+                ..super::WaiterQueue::default()
+            });
+        let weak = Arc::downgrade(&mailbox);
+        assert!(matches!(
+            mailbox.submit(LockCheckingMessage {
+                mailbox: Weak::clone(&weak),
+                dropped: None,
+            }),
+            super::Submission::Parked(_)
+        ));
+        let (dropped, observed) = mpsc::channel();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = mailbox.submit(LockCheckingMessage {
+                mailbox: weak,
+                dropped: Some(dropped),
+            });
+        }));
+        assert!(panic.is_err(), "exhaustion is reported to the caller");
         assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                super::mint_accepted_sequence(&accepted);
-            }))
-            .is_err()
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("isolated message destructor reports"),
+            "the exhausted message is destroyed outside the mailbox mutex"
         );
+    }
+
+    #[test]
+    fn accepted_sequence_exhaustion_drops_the_message_after_unlock() {
+        let mut mailbox =
+            MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+        Arc::get_mut(&mut mailbox)
+            .expect("mailbox is uniquely owned")
+            .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
+        let token = configure(&mailbox, ResolvedMailbox::Latest);
+        let mut identity = ScopeIdentity::new();
+        let (_, mut incarnations) = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available")
+            .into_pair();
+        bind(
+            &mailbox,
+            token,
+            incarnations.mint().expect("incarnation available"),
+        );
+        let weak = Arc::downgrade(&mailbox);
+        assert!(matches!(
+            mailbox.submit(LockCheckingMessage {
+                mailbox: Weak::clone(&weak),
+                dropped: None,
+            }),
+            super::Submission::Accepted(_)
+        ));
+        let (dropped, observed) = mpsc::channel();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = mailbox.submit(LockCheckingMessage {
+                mailbox: weak,
+                dropped: Some(dropped),
+            });
+        }));
+        assert!(panic.is_err(), "exhaustion is reported to the caller");
         assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                super::mint_accepted_sequence(&accepted);
-            }))
-            .is_err(),
-            "the accepted-sequence domain stays poisoned"
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("isolated message destructor reports"),
+            "the exhausted message is destroyed outside the mailbox mutex"
         );
+    }
+
+    #[test]
+    fn promotion_sequence_exhaustion_panics_after_unlock_without_poisoning() {
+        let mut mailbox =
+            MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+        Arc::get_mut(&mut mailbox)
+            .expect("mailbox is uniquely owned")
+            .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
+        let token = configure(
+            &mailbox,
+            ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero capacity")),
+        );
+        let mut identity = ScopeIdentity::new();
+        let (_, mut incarnations) = identity
+            .mint_membership(&ChildId::from("actor"))
+            .expect("membership available")
+            .into_pair();
+        let incarnation = incarnations.mint().expect("incarnation available");
+        bind(&mailbox, token, incarnation);
+        assert!(matches!(
+            mailbox.submit(1_u8),
+            super::Submission::Accepted(_)
+        ));
+        let operation = match mailbox.submit(2_u8) {
+            super::Submission::Parked(operation) => operation,
+            super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+                panic!("the full queue parks the second message")
+            }
+        };
+        let receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+
+        assert!(catch_unwind(AssertUnwindSafe(|| receiver.try_recv())).is_err());
+        drop(
+            mailbox
+                .state
+                .lock()
+                .expect("the exhaustion panic occurs after mailbox unlock"),
+        );
+        let mut withdrawal = mailbox.withdraw(&operation, super::WithdrawalDisposition::Inline);
+        assert!(matches!(
+            withdrawal.take_outcome(),
+            super::WithdrawalOutcome::Withdrawn { message: 2, .. }
+        ));
+        withdrawal.finish();
     }
 }

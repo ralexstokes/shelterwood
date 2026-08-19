@@ -50,7 +50,7 @@ use crate::{
         structured_startup_failure_error,
     },
     identity::IncarnationCounter,
-    mailbox::MailboxControl,
+    mailbox::{MailboxBindToken, MailboxControl, MailboxEffectQueue},
     observe::LifecycleEventKind,
     plan::{
         BuilderCore, ChildConstruction, ChildPlan, LowerError, ScopeFactory, ScopePlan, SlotCell,
@@ -384,8 +384,12 @@ impl Drop for ScopeRuntime {
             };
             if let Some(active) = child.active.take() {
                 if let Some(mailbox) = &child.mailbox {
-                    mailbox.freeze(active.incarnation);
-                    if let Some(teardown) = mailbox.close(active.incarnation) {
+                    let mut effects = MailboxEffectQueue::default();
+                    mailbox.freeze(active.incarnation, &mut effects);
+                    let closed = mailbox.close(active.incarnation, &mut effects);
+                    drop(effects);
+                    if let Some(closed) = closed {
+                        let (_token, teardown) = closed.into_parts();
                         runtime::dispose_detached(teardown);
                     }
                 }

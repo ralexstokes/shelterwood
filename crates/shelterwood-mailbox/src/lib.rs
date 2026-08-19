@@ -15,7 +15,13 @@
 //! foreign implementations may be called from framework critical sections and
 //! therefore invalidate the framework's lock-rule guarantees.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use shelterwood_core::policy::ResolvedMailbox;
 pub use shelterwood_core::{ChildId, Incarnation, Membership};
@@ -58,6 +64,77 @@ mod policy {
 /// published all waiter outcomes.
 pub type MailboxDisposal = Box<dyn Send>;
 
+/// Linear permission to bind one mailbox incarnation.
+///
+/// Configuration mints the initial permission and a successful close returns
+/// the next one. The token is intentionally neither `Clone` nor constructible
+/// outside the mailbox crate.
+#[must_use = "binding permission must be consumed by the next mailbox bind"]
+pub struct MailboxBindToken {
+    permit: Arc<AtomicBool>,
+}
+
+impl MailboxBindToken {
+    pub(crate) fn new(permit: Arc<AtomicBool>) -> Self {
+        Self { permit }
+    }
+
+    pub(crate) fn claim(&self, expected: &Arc<AtomicBool>) -> bool {
+        Arc::ptr_eq(&self.permit, expected)
+            && self
+                .permit
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+}
+
+/// Result of successfully closing one incarnation.
+#[must_use = "closing returns both the next bind permission and unread payload disposal"]
+pub struct MailboxClose {
+    bind: MailboxBindToken,
+    disposal: MailboxDisposal,
+}
+
+impl MailboxClose {
+    pub(crate) fn new(bind: MailboxBindToken, disposal: MailboxDisposal) -> Self {
+        Self { bind, disposal }
+    }
+
+    pub fn into_parts(self) -> (MailboxBindToken, MailboxDisposal) {
+        (self.bind, self.disposal)
+    }
+}
+
+/// Post-unlock destination for effects produced by mailbox control changes.
+///
+/// Control callers that hold a wider framework lock implement this trait on
+/// that lock's transaction. Callers without a wider lock use
+/// [`MailboxEffectQueue`], whose drop flushes every effect after the mailbox
+/// operation has returned.
+pub trait MailboxEffectSink {
+    fn defer_mailbox_effect(&mut self, effect: Box<dyn FnOnce()>);
+}
+
+/// Immediate-scope mailbox effect sink for callers holding no wider lock.
+#[must_use = "mailbox effects flush when the queue is dropped"]
+#[derive(Default)]
+pub struct MailboxEffectQueue(Vec<Box<dyn FnOnce()>>);
+
+impl MailboxEffectSink for MailboxEffectQueue {
+    fn defer_mailbox_effect(&mut self, effect: Box<dyn FnOnce()>) {
+        self.0.push(effect);
+    }
+}
+
+impl Drop for MailboxEffectQueue {
+    fn drop(&mut self) {
+        let mut panics = crate::panic::PanicAccumulator::default();
+        for effect in self.0.drain(..) {
+            panics.run(effect);
+        }
+    }
+}
+
 /// Prepared terminal mailbox transition. Finishing it wakes terminal waiters
 /// before returning unread payload ownership for detached disposal.
 ///
@@ -87,24 +164,36 @@ pub trait MailboxControl: private::SealedMailboxControl + fmt::Debug + Send + Sy
     /// Installs the declaration-time mailbox policy before the first bind.
     /// Reconfiguration may only repeat the same resolved policy; a mismatch
     /// panics after the mailbox lock has been released.
-    fn configure(&self, mailbox: ResolvedMailbox);
+    fn configure(
+        &self,
+        mailbox: ResolvedMailbox,
+        effects: &mut dyn MailboxEffectSink,
+    ) -> MailboxBindToken;
     /// Makes one incarnation live after configuration and prior-close cleanup.
     /// A bind after terminal preparation is deliberately ignored because
     /// terminality wins that race permanently.
-    fn bind(&self, incarnation: Incarnation);
+    fn bind(
+        &self,
+        token: MailboxBindToken,
+        incarnation: Incarnation,
+        effects: &mut dyn MailboxEffectSink,
+    );
     /// Stops new acceptance for the matching live incarnation.
-    fn freeze(&self, incarnation: Incarnation);
+    fn freeze(&self, incarnation: Incarnation, effects: &mut dyn MailboxEffectSink);
     /// Unbinds the matching incarnation and returns its unread payload.
     /// Every successful bind must be followed by this close before a rebind;
     /// skipping it would deliver the old incarnation's messages to the new.
-    fn close(&self, incarnation: Incarnation) -> Option<MailboxDisposal>;
+    fn close(
+        &self,
+        incarnation: Incarnation,
+        effects: &mut dyn MailboxEffectSink,
+    ) -> Option<MailboxClose>;
     /// Irreversibly terminalizes the membership and prepares synchronous
     /// waiter completion followed by isolated unread-payload disposal.
-    fn prepare_termination(&self) -> Option<Box<dyn MailboxTermination>>;
-
-    /// Debug-only check for the driver's configure/close-before-bind contract.
-    #[cfg(debug_assertions)]
-    fn bind_order_valid(&self) -> bool;
+    fn prepare_termination(
+        &self,
+        effects: &mut dyn MailboxEffectSink,
+    ) -> Option<Box<dyn MailboxTermination>>;
 }
 
 /// Restart-stable identity capability retained by an actor handle.

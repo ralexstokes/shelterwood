@@ -29,11 +29,11 @@ use crate::{
         stop_reason_precedence,
     },
     identity::{AtomicPoisonedCounter, IncarnationCounter, MintedMembership, ScopeIdentity},
-    mailbox::{ActorIdentity, MailboxControl, MailboxTermination},
+    mailbox::{ActorIdentity, MailboxControl, MailboxEffectSink, MailboxTermination},
     observe::{
-        ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-        LifecycleHub, LifecycleSeq, RetainedScopeSnapshot, ScopeKind, ScopeSnapshot, SnapshotHub,
-        SnapshotPublication, SnapshotReceiver,
+        ChildSnapshot, ChildState, LifecycleEventKind, LifecycleEvents, LifecycleHub, LifecycleSeq,
+        RetainedLifecycleEvent, RetainedLifecycleEventKind, RetainedScopeSnapshot, ScopeKind,
+        ScopeSnapshot, SnapshotHub, SnapshotPublication, SnapshotReceiver,
     },
     policy::{ResolvedCommonOptions, ScopeFlavor},
     runtime::{self, Latch},
@@ -679,7 +679,7 @@ impl MemberCell {
                         teardown,
                     } => {
                         debug_assert!(teardown.is_none());
-                        *teardown = mailbox.prepare_termination();
+                        *teardown = mailbox.prepare_termination(txn);
                         *control = Some(mailbox);
                         Some(exit.as_exit().clone())
                     }
@@ -748,7 +748,7 @@ impl MemberCell {
                 }
                 MemberMailbox::Attached(control) => {
                     let control = Arc::clone(control);
-                    let teardown = control.prepare_termination();
+                    let teardown = control.prepare_termination(txn);
                     *state = MemberMailbox::Terminal {
                         control: Some(control),
                         exit: RetainedExit::new(exit.clone()),
@@ -791,7 +791,15 @@ impl MemberCell {
         let teardown = match &mut *self.mailbox.lock().expect("member mailbox mutex poisoned") {
             MemberMailbox::Terminal { teardown, .. } => teardown.take(),
             MemberMailbox::Unattached | MemberMailbox::Attached(_) => {
-                unreachable!("terminal publication requires terminal mailbox state")
+                // Panicking here would poison the member mailbox and can
+                // retire a retained user exit during unwind. Diagnose the
+                // internal invariant in debug builds and keep release builds
+                // in the already-published terminal state.
+                debug_assert!(
+                    false,
+                    "terminal publication requires terminal mailbox state"
+                );
+                None
             }
         };
         if let Some(teardown) = teardown {
@@ -1040,6 +1048,12 @@ impl Drop for ObservationTxn<'_> {
     }
 }
 
+impl MailboxEffectSink for ObservationTxn<'_> {
+    fn defer_mailbox_effect(&mut self, effect: Box<dyn FnOnce()>) {
+        self.effects.push(effect);
+    }
+}
+
 /// Driver-independent view of one declaration slot while its membership is
 /// resident in a running scope.
 #[derive(Clone)]
@@ -1092,11 +1106,15 @@ impl ResidentChild {
                 },
             );
         }
+        // The projection can carry the last member/mailbox owner. Retire it
+        // only after the resident-tree observation gate is released.
+        txn.defer(move || drop(completion));
     }
 
     fn complete_removal(mut self, txn: &mut ObservationTxn<'_>) {
         let completion = self.disarm_removal();
         Self::publish_removal(completion, txn);
+        txn.defer(move || drop(self));
     }
 }
 
@@ -1956,6 +1974,10 @@ impl ScopeCell {
     }
 
     fn emit_locked(&self, wakes: &mut ObservationTxn<'_>, kind: LifecycleEventKind) {
+        // Convert every user-error-bearing edge to retained form before any
+        // fallible framework bookkeeping. A sequence-exhaustion path can now
+        // defer the retained value instead of unwinding with a raw `Exit`.
+        let kind = RetainedLifecycleEventKind::new(kind);
         // Parent links cannot change under the resident-tree observation gate.
         // Resolve them once for snapshot and lifecycle propagation so one leaf
         // edge does not repeatedly lock every ancestor's parent mutex.
@@ -1970,6 +1992,7 @@ impl ScopeCell {
             .lifecycle_seq
             .mint(Ordering::Release, Ordering::Relaxed);
         let Some(seq) = seq.map(LifecycleSeq::new) else {
+            wakes.defer(move || drop(kind));
             self.publish_snapshot_chain_through_locked(wakes, &ancestors);
             self.observation.lifecycle.publish_lagged(wakes, 1);
             for ancestor in &ancestors {
@@ -1980,23 +2003,18 @@ impl ScopeCell {
         self.publish_snapshot_chain_through_locked(wakes, &ancestors);
 
         let scope = self.member.membership();
-        let mut event = LifecycleEvent {
-            scope_path: Vec::new(),
-            scope,
-            seq,
-            kind,
-        };
+        let mut event = RetainedLifecycleEvent::from_retained_kind(scope, seq, kind);
         self.observation.lifecycle.publish(wakes, event.clone());
         let mut child_id = self.member.id().clone();
         for ancestor in ancestors {
-            event.scope_path.insert(0, child_id);
+            event.prepend_scope(child_id);
             child_id = ancestor.member.id().clone();
             ancestor.observation.lifecycle.publish(wakes, event.clone());
         }
     }
 
     fn close_observation_locked(&self, wakes: &mut ObservationTxn<'_>) {
-        if self.observation.closed.swap(true, Ordering::AcqRel) {
+        if self.observation.closed.load(Ordering::Acquire) {
             return;
         }
         // Closure follows the final state/snapshot/event publication performed
@@ -2006,6 +2024,9 @@ impl ScopeCell {
             .snapshots
             .close(wakes, move || scope.snapshot_locked());
         self.observation.lifecycle.close(wakes);
+        // Both hub closures are idempotent. Set the aggregate marker last so
+        // an unexpected panic leaves the operation retryable.
+        self.observation.closed.store(true, Ordering::Release);
     }
 
     #[cfg(any(test, feature = "test-util"))]
@@ -2427,7 +2448,7 @@ impl ScopeCell {
             .iter_mut()
             .map(ResidentChild::disarm_removal)
             .collect::<Vec<_>>();
-        drop(residents);
+        wakes.defer(move || drop(residents));
         for completion in completions {
             ResidentChild::publish_removal(completion, wakes);
         }
@@ -2598,12 +2619,14 @@ impl ScopeCell {
 mod tests {
     use std::{
         fmt,
+        future::Future,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
             mpsc,
         },
+        task::{Context, Poll, Wake, Waker},
         time::Duration,
     };
 
@@ -2613,11 +2636,64 @@ mod tests {
     };
 
     use crate::{
-        ChildId, MemberCell, RetainedExit, RetainedStopReason, ScopeCell, StartupDisposition,
-        identity::ScopeIdentity, policy::ScopeFlavor,
+        ChildId, LifecycleEventKind, MemberCell, ResidentProjection, RetainedExit,
+        RetainedStopReason, ScopeCell, StartupDisposition,
+        identity::ScopeIdentity,
+        mailbox::{
+            MailboxCell, MailboxControl, MailboxEffectQueue, MailboxReceiver, actor_ref_from_parts,
+        },
+        policy::{ResolvedMailbox, ScopeFlavor},
     };
 
     struct ThreadProbe(mpsc::SyncSender<std::thread::ThreadId>);
+
+    struct GateCheckingWake {
+        gate: super::ObservationGate,
+        woke_after_unlock: Arc<AtomicBool>,
+    }
+
+    impl Wake for GateCheckingWake {
+        fn wake(self: Arc<Self>) {
+            self.woke_after_unlock
+                .store(!self.gate.is_held(), Ordering::SeqCst);
+        }
+    }
+
+    struct GateDropError {
+        gate: super::ObservationGate,
+        dropped: mpsc::SyncSender<bool>,
+    }
+
+    impl fmt::Debug for GateDropError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("GateDropError")
+        }
+    }
+
+    impl fmt::Display for GateDropError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("gate drop probe")
+        }
+    }
+
+    impl std::error::Error for GateDropError {}
+
+    impl Drop for GateDropError {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(!self.gate.is_held());
+        }
+    }
+
+    struct GateDropMessage {
+        gate: super::ObservationGate,
+        dropped: mpsc::SyncSender<bool>,
+    }
+
+    impl Drop for GateDropMessage {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(!self.gate.is_held());
+        }
+    }
 
     impl fmt::Debug for ThreadProbe {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2921,5 +2997,130 @@ mod tests {
         );
 
         assert!(scope.request_shutdown_ignoring_poison().is_some());
+    }
+
+    #[test]
+    fn mailbox_control_wakes_are_deferred_past_the_observation_gate() {
+        let id = ChildId::from("root");
+        let mut identity = ScopeIdentity::new();
+        let member = MemberCell::new(
+            id.clone(),
+            identity
+                .mint_membership(&id)
+                .expect("root membership is available"),
+        );
+        let mut incarnations = member.take_incarnation_counter();
+        let incarnation = incarnations.mint().expect("incarnation available");
+        let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
+        let gate = scope.observation_gate();
+        let mailbox = MailboxCell::<u8>::new(id, crate::runtime::mailbox_runtime());
+        let mut effects = MailboxEffectQueue::default();
+        let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
+        MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
+        drop(effects);
+        let mut receiver = MailboxReceiver::new(Arc::clone(&mailbox), incarnation);
+        let woke_after_unlock = Arc::new(AtomicBool::new(false));
+        let waker = Waker::from(Arc::new(GateCheckingWake {
+            gate: gate.clone(),
+            woke_after_unlock: Arc::clone(&woke_after_unlock),
+        }));
+        let mut changed = Box::pin(receiver.changed());
+        assert!(matches!(
+            changed.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+
+        scope.with_observation_gate(|txn| {
+            MailboxControl::freeze(&*mailbox, incarnation, txn);
+        });
+
+        assert!(woke_after_unlock.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lifecycle_sequence_exhaustion_retires_the_exit_after_unlock() {
+        let id = ChildId::from("root");
+        let mut identity = ScopeIdentity::new();
+        let member = MemberCell::new(
+            id.clone(),
+            identity
+                .mint_membership(&id)
+                .expect("root membership is available"),
+        );
+        let membership = member.membership();
+        let mut incarnations = member.take_incarnation_counter();
+        let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
+        let gate = scope.observation_gate();
+        scope.set_lifecycle_sequence(u64::MAX - 2);
+        scope.emit(LifecycleEventKind::ScopeState {
+            state: ScopeState::Running,
+        });
+        let (dropped, observed) = mpsc::sync_channel(1);
+
+        scope.emit(LifecycleEventKind::Exited {
+            id,
+            membership,
+            incarnation: incarnations.mint().expect("incarnation available"),
+            exit: Exit::new(
+                ExitKind::Failed(ExitError::from(GateDropError { gate, dropped })),
+                Cancellation::NotObserved,
+            ),
+        });
+
+        assert!(
+            observed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("retained exit destructor reports"),
+            "an unsequenced exit is retired after the observation gate unlocks"
+        );
+    }
+
+    #[test]
+    fn clearing_residents_releases_the_last_mailbox_owner_after_unlock() {
+        let root_id = ChildId::from("root");
+        let mut root_identity = ScopeIdentity::new();
+        let root_member = MemberCell::new(
+            root_id.clone(),
+            root_identity
+                .mint_membership(&root_id)
+                .expect("root membership is available"),
+        );
+        let scope = ScopeCell::new(root_member, ScopeFlavor::Dynamic, ScopeIdentity::new());
+        let gate = scope.observation_gate();
+
+        let child_id = ChildId::from("child");
+        let mut child_identity = ScopeIdentity::new();
+        let child = MemberCell::new(
+            child_id.clone(),
+            child_identity
+                .mint_membership(&child_id)
+                .expect("child membership is available"),
+        );
+        let mut incarnations = child.take_incarnation_counter();
+        let incarnation = incarnations.mint().expect("incarnation available");
+        let mailbox = MailboxCell::new(child_id, crate::runtime::mailbox_runtime());
+        child.attach_mailbox(mailbox.clone());
+        let actor = actor_ref_from_parts(Arc::clone(&child), Arc::clone(&mailbox));
+        let mut effects = MailboxEffectQueue::default();
+        let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
+        MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
+        drop(effects);
+        let (dropped, observed) = mpsc::sync_channel(1);
+        actor
+            .try_send(GateDropMessage { gate, dropped })
+            .expect("bound mailbox accepts the probe");
+        scope.admit_child(ResidentProjection::new(Arc::clone(&child), None));
+        drop(actor);
+        drop(mailbox);
+        drop(child);
+
+        scope.clear_residents();
+
+        assert!(
+            observed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("resident mailbox payload destructor reports"),
+            "the displaced resident owner is released after the gate unlocks"
+        );
     }
 }

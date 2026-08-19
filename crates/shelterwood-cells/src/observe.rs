@@ -72,7 +72,7 @@ pub struct LifecycleEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RetainedLifecycleEvent {
+pub(crate) struct RetainedLifecycleEvent {
     scope_path: Vec<ChildId>,
     scope: Membership,
     seq: LifecycleSeq,
@@ -97,10 +97,33 @@ impl RetainedLifecycleEvent {
             kind: self.kind.into_public(),
         }
     }
+
+    pub(crate) fn from_retained_kind(
+        scope: Membership,
+        seq: LifecycleSeq,
+        kind: RetainedLifecycleEventKind,
+    ) -> Self {
+        Self {
+            scope_path: Vec::new(),
+            scope,
+            seq,
+            kind,
+        }
+    }
+
+    pub(crate) fn prepend_scope(&mut self, id: ChildId) {
+        self.scope_path.insert(0, id);
+    }
+}
+
+impl From<LifecycleEvent> for RetainedLifecycleEvent {
+    fn from(event: LifecycleEvent) -> Self {
+        Self::new(event)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum RetainedLifecycleEventKind {
+pub(crate) enum RetainedLifecycleEventKind {
     Added {
         id: ChildId,
         membership: Membership,
@@ -139,7 +162,7 @@ enum RetainedLifecycleEventKind {
 }
 
 impl RetainedLifecycleEventKind {
-    fn new(kind: LifecycleEventKind) -> Self {
+    pub(crate) fn new(kind: LifecycleEventKind) -> Self {
         match kind {
             LifecycleEventKind::Added { id, membership } => Self::Added { id, membership },
             LifecycleEventKind::Started {
@@ -1035,9 +1058,9 @@ impl LifecycleHub {
     pub(crate) fn publish(
         &self,
         txn: &mut crate::cells::ObservationTxn<'_>,
-        event: LifecycleEvent,
+        event: impl Into<RetainedLifecycleEvent>,
     ) {
-        let event = RetainedLifecycleEvent::new(event);
+        let event = event.into();
         let mut published = false;
         let mut undelivered = None;
         self.channels.signal.modify_silently(|signal| {

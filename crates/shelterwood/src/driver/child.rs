@@ -156,6 +156,7 @@ pub(super) fn discharge_child_terminality(completion: ChildTerminality) {
 pub(super) struct ChildRuntime {
     pub(super) slot: Arc<SlotCell>,
     pub(super) mailbox: Option<Arc<dyn MailboxControl>>,
+    pub(super) mailbox_bind: Option<MailboxBindToken>,
     pub(super) terminality: Obligation<ChildTerminality>,
     pub(super) construction: runtime::Isolated<ChildConstruction>,
     pub(super) pending_terminal: Option<PendingTerminal>,
@@ -192,13 +193,17 @@ impl ChildRuntime {
         );
         let incarnations = slot.member.take_incarnation_counter();
         let mailbox = slot.member.mailbox();
-        if let Some(mailbox) = &mailbox {
-            mailbox.configure(options.mailbox);
-        }
+        let mailbox_bind = if let Some(mailbox) = &mailbox {
+            let mut effects = MailboxEffectQueue::default();
+            Some(mailbox.configure(options.mailbox, &mut effects))
+        } else {
+            None
+        };
         Self {
             terminality,
             slot,
             mailbox,
+            mailbox_bind,
             construction,
             pending_terminal: None,
             options,
@@ -635,12 +640,12 @@ impl ScopeRuntime {
         } = dispatch_child_construction(child, &self.root, &self.defaults, incarnation, &latches);
         let now = runtime::now();
         if let Some(mailbox) = &child.mailbox {
-            #[cfg(debug_assertions)]
-            debug_assert!(
-                mailbox.bind_order_valid(),
-                "driver must configure before bind and close before rebind"
-            );
-            mailbox.bind(incarnation);
+            let mut effects = MailboxEffectQueue::default();
+            let token = child
+                .mailbox_bind
+                .take()
+                .expect("configuration or close supplies each bind token");
+            mailbox.bind(token, incarnation, &mut effects);
         }
         self.root.transition_child_stage(
             &child.slot.member,
@@ -742,7 +747,8 @@ impl ScopeRuntime {
             self.root
                 .transition_child_stage(&child.slot.member, MemberTransition::Stopping, None);
             if let Some(mailbox) = &child.mailbox {
-                mailbox.freeze(active.incarnation);
+                let mut effects = MailboxEffectQueue::default();
+                mailbox.freeze(active.incarnation, &mut effects);
             }
             active.forced_outcome = forced;
             if let Some(deadline) = active.readiness_deadline.take() {
@@ -904,10 +910,15 @@ impl ScopeRuntime {
         if let Some(deadline) = active.stop_deadline.take() {
             self.deadlines.cancel(deadline);
         }
-        if let Some(mailbox) = &child.mailbox
-            && let Some(teardown) = mailbox.close(incarnation)
-        {
-            runtime::dispose_detached(teardown);
+        if let Some(mailbox) = &child.mailbox {
+            let mut effects = MailboxEffectQueue::default();
+            let closed = mailbox.close(incarnation, &mut effects);
+            drop(effects);
+            if let Some(closed) = closed {
+                let (token, teardown) = closed.into_parts();
+                child.mailbox_bind = Some(token);
+                runtime::dispose_detached(teardown);
+            }
         }
         let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
         let exit = classify_exit(recorded, join, active.hard_abort_phase, cancellation);
@@ -994,7 +1005,7 @@ impl ScopeRuntime {
                         delay: decision.delay(),
                     },
                 );
-                let trip = decision.intensity_trip(self.intensity_policy);
+                let trip = decision.intensity_trip();
                 if trip.is_none()
                     && let Some(restart_at) = decision.restart_at()
                 {

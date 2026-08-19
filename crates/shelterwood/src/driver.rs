@@ -317,16 +317,19 @@ struct ScopeCompletion {
 
 impl Drop for ScopeRuntime {
     fn drop(&mut self) {
-        let dynamic_entries = if let Some(dynamic) = &self.dynamic {
-            let entries = self.root.with_observation_gate(|txn| {
-                let entries = dynamic.close(&self.root, txn);
-                self.root.set_dynamic_route_locked(None, txn);
-                entries
+        let mut panics = runtime::PanicAccumulator::default();
+        let mut dynamic_entries = None;
+        if let Some(dynamic) = &self.dynamic {
+            panics.run(|| {
+                self.root.with_observation_gate(|txn| {
+                    // Retain the entries before the transaction flushes its
+                    // wakes. If one is hostile, removal completion must still
+                    // remain ordered after terminality and residency cleanup.
+                    dynamic_entries = Some(dynamic.close(&self.root, txn));
+                    self.root.set_dynamic_route_locked(None, txn);
+                });
             });
-            Some(entries)
-        } else {
-            None
-        };
+        }
         // An exited child can be waiting only for retained user construction
         // to finish disposal. Its exit is already classified, so driver death
         // must publish that verdict before the terminality fallback gets a
@@ -336,7 +339,7 @@ impl Drop for ScopeRuntime {
         // publication. A completion that has already been reported is
         // available without waiting, however, so fold everything reported
         // before falling back to the stored verdict.
-        self.drain_arrived_disposal_events();
+        self.drain_arrived_disposal_events(&mut panics);
         let child_keys: Vec<_> = self.children.iter().map(|(key, _)| key).collect();
         for key in child_keys {
             if self
@@ -344,7 +347,7 @@ impl Drop for ScopeRuntime {
                 .get(key)
                 .is_some_and(|child| child.pending_terminal.is_some())
             {
-                self.handle_construction_disposed(key, None);
+                panics.run(|| self.handle_construction_disposed(key, None));
             }
             let Some(child) = self.children.get_mut(key) else {
                 // Terminal publication can reclaim a remove-retained dynamic
@@ -354,27 +357,33 @@ impl Drop for ScopeRuntime {
             };
             if let Some(active) = child.active.take() {
                 if let Some(mailbox) = &child.mailbox {
-                    mailbox.freeze(active.incarnation);
-                    if let Some(teardown) = mailbox.close(active.incarnation) {
+                    panics.run(|| mailbox.freeze(active.incarnation));
+                    let mut teardown = None;
+                    panics.run(|| teardown = mailbox.close(active.incarnation));
+                    if let Some(teardown) = teardown {
                         runtime::dispose_detached(teardown);
                     }
                 }
-                active.shutdown.fire();
-                active.abort.fire();
-                active.abort_handle.abort();
+                panics.run(|| {
+                    active.shutdown.fire();
+                });
+                panics.run(|| {
+                    active.abort.fire();
+                });
+                panics.run(|| active.abort_handle.abort());
             }
             // Driver destruction consumes the same owned terminality
             // completion as the orderly path. Its fallback publishes the
             // coarse kill verdict synchronously.
-            child.terminality.discharge();
+            panics.run(|| child.terminality.discharge());
         }
         // Residency owns the matching Removed edges. Clearing the set after
         // terminality discharges them all before the scope's final event.
-        self.root.clear_residents();
+        panics.run(|| self.root.clear_residents());
         // Dynamic entries own removal completions. Keep them armed until the
         // corresponding members are terminal and no longer resident.
-        drop(dynamic_entries);
-        self.children.clear();
+        panics.run(|| drop(dynamic_entries.take()));
+        panics.run(|| self.children.clear());
         // Unconditional: the publisher is the idempotence point, joining this
         // verdict into the stopped-reason lattice, but epoch retirement is not
         // idempotent and has no other owner. Skipping the call on an
@@ -385,12 +394,14 @@ impl Drop for ScopeRuntime {
             .map(|completion| completion.reason.as_reason().clone())
             .or_else(|| self.supervisor.lifecycle().draining_reason().cloned())
             .unwrap_or(StopReason::ShutdownRequested);
-        if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
-            self.root
-                .finish_root_incarnation(self.epoch, reason, exit.into_exit());
-        } else {
-            self.root.finish_incarnation(self.epoch, reason);
-        }
+        panics.run(|| {
+            if let Some(exit) = completion.and_then(|completion| completion.root_exit) {
+                self.root
+                    .finish_root_incarnation(self.epoch, reason, exit.into_exit());
+            } else {
+                self.root.finish_incarnation(self.epoch, reason);
+            }
+        });
     }
 }
 
@@ -432,7 +443,7 @@ impl ScopeRuntime {
     /// Non-blocking by construction, so a disposal still running on the
     /// blocking pool stays detached and its unknowable result cannot delay
     /// the kill path.
-    fn drain_arrived_disposal_events(&mut self) {
+    fn drain_arrived_disposal_events(&mut self, panics: &mut runtime::PanicAccumulator) {
         while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut self.disposal_event_receiver)
         {
             // The lane has one producer, which sends exactly one variant.
@@ -456,7 +467,7 @@ impl ScopeRuntime {
         // `pending_terminal`.
         while let Some(child) = self.arrived_disposal_panics.keys().next().copied() {
             let panic = self.take_arrived_disposal_panic(child);
-            self.handle_construction_disposed(child, panic);
+            panics.run(|| self.handle_construction_disposed(child, panic));
         }
     }
 

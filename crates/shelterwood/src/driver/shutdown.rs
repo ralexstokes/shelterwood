@@ -228,13 +228,14 @@ impl ScopeRuntime {
         // though its disposal event has not reached ordinary dispatch. Fold
         // every arrived completion before the hard-force fallback; the drain
         // is non-blocking, so still-running disposal remains detached.
-        self.drain_arrived_disposal_events();
+        let mut panics = runtime::PanicAccumulator::default();
+        self.drain_arrived_disposal_events(&mut panics);
         if self.supervisor.is_disposing(key) {
             // The incarnation has already exited; only its retained factory
             // remains, and the fold above found no completion reported for
             // it. Hard escalation detaches that cleanup and keeps the
             // recorded verdict.
-            self.handle_construction_disposed(key, None);
+            panics.run(|| self.handle_construction_disposed(key, None));
         }
     }
 

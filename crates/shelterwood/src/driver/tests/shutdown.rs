@@ -8,6 +8,91 @@ impl Drop for BlockingFactoryDrop {
     }
 }
 
+const ARRIVED_FACTORY_DISPOSAL_PANIC: &str = "arrived factory disposal panic";
+
+struct PanickingFactoryDrop;
+
+impl Drop for PanickingFactoryDrop {
+    fn drop(&mut self) {
+        panic!("{ARRIVED_FACTORY_DISPOSAL_PANIC}");
+    }
+}
+
+async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey, Arc<MemberCell>) {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "worker",
+        TaskDef::new({
+            let capture = PanickingFactoryDrop;
+            move |_| {
+                let _ = &capture;
+                future::pending::<crate::ExitResult>()
+            }
+        })
+        .restart(RestartPolicy::new(
+            RestartCondition::Never,
+            Backoff::Immediate,
+        ))
+        .retention(Retention::Retain),
+    )
+    .expect("valid task");
+    let mut plan = tree.lower_for_test();
+    let root = Arc::clone(&plan.root);
+    let epoch = root
+        .begin_incarnation(ScopeState::Starting)
+        .expect("test scope epoch is available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state_and_startup(ScopeState::Running, Ok(()));
+    root.set_admitted_children(
+        plan.children
+            .iter()
+            .map(|child| resident_projection(&child.slot))
+            .collect(),
+    );
+    let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
+    let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
+    let member = Arc::clone(&child.slot.member);
+    let mut children = ChildArena::default();
+    let key = children
+        .insert(child)
+        .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
+    let mut scope = ScopeRuntimeBuilder::new(root, epoch, events)
+        .with_defaults(plan.defaults.clone())
+        .with_children(children)
+        .with_lifecycle(ScopeLifecycle::running())
+        .build();
+    plan.finish_transfer();
+
+    scope.spawn_child(key);
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("worker is active");
+    let incarnation = active.incarnation;
+    active.abort_handle.abort();
+    scope.handle_exit(
+        key,
+        incarnation,
+        Some(RecordedOutcome::returned(Err(ExitError::message(
+            "application failure",
+        )))),
+        crate::runtime::JoinOutcome::Ok { value: () },
+        Cancellation::NotObserved,
+        false,
+    );
+    assert!(scope.children[key].pending_terminal.is_some());
+
+    let arrived = crate::runtime::timeout(DRIVER_PROGRESS_WAIT, async {
+        while crate::runtime::unbounded_mpsc_is_empty(&scope.disposal_event_receiver) {
+            crate::runtime::yield_now().await;
+        }
+    })
+    .await;
+    assert!(matches!(arrived, crate::runtime::Timeout::Completed(())));
+    (scope, key, member)
+}
+
 #[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_teardown_finishes_the_cancelled_root_driver() {
     let plan = DynamicTree::new().lower_for_test();
@@ -143,6 +228,69 @@ async fn runtime_teardown_publishes_the_exit_awaiting_factory_disposal() {
     assert_eq!(record.last_exit, Some(terminal));
 }
 
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_teardown_folds_an_arrived_factory_disposal_panic() {
+    let (scope, _key, member) = scope_with_arrived_factory_disposal_panic().await;
+
+    drop(scope);
+
+    assert_arrived_disposal_panic_published(&member);
+}
+
+fn assert_arrived_disposal_panic_published(member: &Arc<MemberCell>) {
+    assert!(matches!(
+        member.record().stage,
+        MemberStage::Terminal(ref exit)
+            if matches!(
+                exit.kind(),
+                ExitKind::Panicked { message }
+                    if message.as_deref() == Some(ARRIVED_FACTORY_DISPOSAL_PANIC)
+            )
+    ));
+}
+
+/// The lane is empty by the time a forced batch dispatches: collection
+/// already moved the completion into the batch, where `Pending::Force`
+/// (`ScopeShutdown`) outranks it (`ChildExit`). Staging is what keeps it
+/// reachable from the hard-force fallback.
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_force_folds_a_batch_collected_factory_disposal_panic() {
+    let (mut scope, key, member) = scope_with_arrived_factory_disposal_panic().await;
+
+    let mut pending = vec![Pending::Force.classified()];
+    collect_driver_events(&mut scope.disposal_event_receiver, 8, &mut pending);
+    scope.stage_batch_disposal_panics(&mut pending);
+    arbitrate(&mut pending);
+    let mut batch = pending.into_iter().map(|(_, event)| event);
+    assert!(matches!(batch.next(), Some(Pending::Force)));
+
+    scope.force_all();
+
+    assert!(!scope.supervisor.is_disposing(key));
+    assert_arrived_disposal_panic_published(&member);
+
+    // The batch's own entry still dispatches, against an already-taken
+    // `pending_terminal`, and must not disturb the published verdict.
+    let Some(Pending::Child(ChildEvent::ConstructionDisposed { child, panic })) = batch.next()
+    else {
+        panic!("the batch collected the construction-disposal completion")
+    };
+    assert_eq!(child, key);
+    let panic = panic.or_else(|| scope.take_arrived_disposal_panic(child));
+    scope.handle_construction_disposed(child, panic);
+    assert_arrived_disposal_panic_published(&member);
+}
+
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hard_force_folds_an_arrived_factory_disposal_panic() {
+    let (mut scope, key, member) = scope_with_arrived_factory_disposal_panic().await;
+
+    scope.force_all();
+
+    assert!(!scope.supervisor.is_disposing(key));
+    assert_arrived_disposal_panic_published(&member);
+}
+
 #[crate::runtime::test]
 async fn latched_shutdown_upgrades_an_intensity_drain() {
     let mut tree = Tree::new();
@@ -166,13 +314,12 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
     root.set_state(ScopeState::Running);
     root.set_startup(Ok(()));
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
     let key = children
         .insert(child)
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
@@ -239,13 +386,12 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
     root.set_state(ScopeState::Running);
     root.set_startup(Ok(()));
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
     let key = children
         .insert(child)
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
@@ -311,7 +457,6 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
@@ -320,7 +465,7 @@ async fn force_uses_the_stop_funnel_for_every_ordered_child() {
             .unwrap_or_else(|_| panic!("the fixture fits in the child-key domain"));
     }
     let keys = children.keys().collect::<Vec<_>>();
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
@@ -421,7 +566,6 @@ fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let mut children = ChildArena::default();
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
@@ -435,7 +579,7 @@ fn forced_ordered_drain_advances_an_inactive_suffix_iteratively() {
     for child in children.values_mut() {
         drop(child.construction.take());
     }
-    let mut scope = ScopeRuntimeBuilder::new(root, epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(root, epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)

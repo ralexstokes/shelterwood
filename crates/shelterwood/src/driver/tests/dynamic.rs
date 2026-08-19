@@ -79,8 +79,7 @@ async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
 /// left queued here, so arbitration cannot be what suppresses the start.
 #[crate::runtime::test]
 async fn latched_removal_suppresses_a_queued_start_effect() {
-    let (mut scope, _events, mut dynamic_events, _disposal_events, control) =
-        running_dynamic_fixture();
+    let (mut scope, _events, mut dynamic_events, control) = running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
     let starts = Arc::new(AtomicUsize::new(0));
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
@@ -366,8 +365,7 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
 
 #[crate::runtime::test]
 async fn final_removal_holds_the_id_until_removed_publication_commits() {
-    let (mut scope, _events, _dynamic_events, _disposal_events, control) =
-        running_dynamic_fixture();
+    let (mut scope, _events, _dynamic_events, control) = running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
@@ -454,8 +452,7 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
 
 #[crate::runtime::test]
 async fn removal_tolerates_synchronous_reclaim_from_the_stop_funnel() {
-    let (mut scope, _events, _dynamic_events, _disposal_events, control) =
-        running_dynamic_fixture();
+    let (mut scope, _events, _dynamic_events, control) = running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
         .expect("running dynamic scope reserves the child");
@@ -633,11 +630,10 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
     root.set_startup(Ok(()));
 
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, _disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
     root.set_dynamic_route(Some(control.clone()));
     root.set_admitted_children(Vec::new());
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_lifecycle(ScopeLifecycle::running())
         .with_dynamic(Some(control.clone()))
         .build();
@@ -696,7 +692,7 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
 
 #[crate::runtime::test]
 async fn annulment_before_admission_owns_never_started_terminality() {
-    let (mut scope, _event_receiver, mut dynamic_event_receiver, _disposal_event_receiver, control) =
+    let (mut scope, _event_receiver, mut dynamic_event_receiver, control) =
         running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
     let mut lifecycle = root.subscribe_lifecycle();
@@ -759,13 +755,8 @@ async fn annulment_before_admission_owns_never_started_terminality() {
 
 #[crate::runtime::test]
 async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
-    let (
-        mut scope,
-        mut event_receiver,
-        mut dynamic_event_receiver,
-        mut disposal_event_receiver,
-        control,
-    ) = running_dynamic_fixture();
+    let (mut scope, mut event_receiver, mut dynamic_event_receiver, control) =
+        running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
     let mut lifecycle = root.subscribe_lifecycle();
     let started = Latch::default();
@@ -838,7 +829,8 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
     .await
     .dispatch(&mut scope);
     let disposal =
-        match crate::runtime::timeout(Duration::from_secs(2), disposal_event_receiver.recv()).await
+        match crate::runtime::timeout(Duration::from_secs(2), scope.disposal_event_receiver.recv())
+            .await
         {
             crate::runtime::Timeout::Completed(Some(event)) => event,
             crate::runtime::Timeout::Completed(None) => panic!("the disposal lane remains open"),
@@ -878,13 +870,8 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
 #[crate::runtime::test]
 async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
     for _ in 0..64 {
-        let (
-            mut scope,
-            _event_receiver,
-            mut dynamic_event_receiver,
-            _disposal_event_receiver,
-            control,
-        ) = running_dynamic_fixture();
+        let (mut scope, _event_receiver, mut dynamic_event_receiver, control) =
+            running_dynamic_fixture();
         let root = Arc::clone(&scope.root);
         let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
             .expect("running dynamic scope reserves the child");
@@ -982,7 +969,7 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
 
 #[crate::runtime::test]
 async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
-    let (mut scope, _event_receiver, mut dynamic_event_receiver, _disposal_event_receiver, control) =
+    let (mut scope, _event_receiver, mut dynamic_event_receiver, control) =
         running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
@@ -1049,7 +1036,7 @@ async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
 
 #[crate::runtime::test]
 async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_recheck() {
-    let (mut scope, _event_receiver, mut dynamic_event_receiver, _disposal_event_receiver, control) =
+    let (mut scope, _event_receiver, mut dynamic_event_receiver, control) =
         running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
     let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
@@ -1141,13 +1128,8 @@ enum RemovalSource {
 }
 
 async fn exercise_coalesced_removal(source: RemovalSource) {
-    let (
-        mut scope,
-        mut event_receiver,
-        mut dynamic_event_receiver,
-        mut disposal_event_receiver,
-        control,
-    ) = running_dynamic_fixture();
+    let (mut scope, mut event_receiver, mut dynamic_event_receiver, control) =
+        running_dynamic_fixture();
     let root = Arc::clone(&scope.root);
     let mut lifecycle = root.subscribe_lifecycle();
     let started = Latch::default();
@@ -1284,7 +1266,8 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
     }
 
     let disposal =
-        match crate::runtime::timeout(Duration::from_secs(2), disposal_event_receiver.recv()).await
+        match crate::runtime::timeout(Duration::from_secs(2), scope.disposal_event_receiver.recv())
+            .await
         {
             crate::runtime::Timeout::Completed(Some(event)) => event,
             crate::runtime::Timeout::Completed(None) => {
@@ -1350,11 +1333,10 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     root.set_startup(Ok(()));
 
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events.clone());
     root.set_dynamic_route(Some(control.clone()));
     root.set_admitted_children(Vec::new());
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_lifecycle(ScopeLifecycle::running())
         .with_dynamic(Some(control.clone()))
         .build();
@@ -1477,7 +1459,7 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
     assert_eq!(removal.key, key);
     scope.handle_removal(removal);
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        disposal_event_receiver.recv().await
+        scope.disposal_event_receiver.recv().await
     else {
         panic!("removal joins retained construction disposal")
     };

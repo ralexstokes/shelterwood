@@ -220,6 +220,13 @@ struct ScopeRuntime {
     restart_shutdown_retries: Vec<(ChildKey, Epoch)>,
     events: runtime::UnboundedMpscSender<DriverEvent>,
     disposal_events: runtime::UnboundedMpscSender<DriverEvent>,
+    disposal_event_receiver: runtime::UnboundedMpscReceiver<DriverEvent>,
+    /// Construction-disposal payloads lifted off the lane but not yet
+    /// folded. Collection empties the lane into the arbitrated batch, so
+    /// this is the only place a teardown transition sorted ahead of that
+    /// batch can still find them. Plain framework data — the completion
+    /// carries a message, never a user value.
+    arrived_disposal_panics: BTreeMap<ChildKey, Option<runtime::DisposalPanic>>,
     deadlines: DeadlineQueue<DeadlineKind>,
     jitter: runtime::JitterRng,
     role: ScopeRole,
@@ -355,11 +362,11 @@ impl Drop for ScopeRuntime {
         // must publish that verdict before the terminality fallback gets a
         // chance to synthesize a coarse cancellation. The disposal job stays
         // detached; as on hard escalation, teardown does not wait for it and
-        // does not incorporate a destructor panic that has not been
-        // dispatched at publication — including a completion already queued
-        // on the disposal lane but not yet dispatched. Consuming that arrived
-        // half is issue #291, which covers this site and the matching discard
-        // in `force_child`.
+        // cannot incorporate a destructor panic that has not completed at
+        // publication. A completion that has already been reported is
+        // available without waiting, however, so fold everything reported
+        // before falling back to the stored verdict.
+        self.drain_arrived_disposal_events();
         let child_keys: Vec<_> = self.children.iter().map(|(key, _)| key).collect();
         for key in child_keys {
             if self
@@ -418,6 +425,71 @@ impl Drop for ScopeRuntime {
 }
 
 impl ScopeRuntime {
+    /// Moves the payload of every construction-disposal completion in a
+    /// collected batch onto the scope.
+    ///
+    /// Arbitration dispatches a scope-shutdown transition ahead of the
+    /// `ChildExit` class this completion belongs to, so the fallback in
+    /// `force_child` runs while the completion is still undispatched. Once
+    /// staged here it is reachable from that fallback; the batch entry keeps
+    /// its position and dispatches the staged payload in arbitration order
+    /// when no teardown claimed it first.
+    fn stage_batch_disposal_panics(&mut self, pending: &mut [(ArbitrationClass, Pending)]) {
+        for (_, event) in pending {
+            if let Pending::Child(ChildEvent::ConstructionDisposed { child, panic }) = event {
+                let panic = panic.take();
+                self.stage_disposal_panic(*child, panic);
+            }
+        }
+    }
+
+    fn stage_disposal_panic(&mut self, child: ChildKey, panic: Option<runtime::DisposalPanic>) {
+        let replaced = self.arrived_disposal_panics.insert(child, panic);
+        debug_assert!(
+            replaced.is_none(),
+            "a terminal disposes its retained construction once, under a never-reused key"
+        );
+    }
+
+    fn take_arrived_disposal_panic(&mut self, child: ChildKey) -> Option<runtime::DisposalPanic> {
+        self.arrived_disposal_panics.remove(&child).flatten()
+    }
+
+    /// Folds every construction-disposal completion already reported,
+    /// whether it is still on the lane or was staged out of the current
+    /// batch.
+    ///
+    /// Non-blocking by construction, so a disposal still running on the
+    /// blocking pool stays detached and its unknowable result cannot delay
+    /// the kill path.
+    fn drain_arrived_disposal_events(&mut self) {
+        while let Some(event) = runtime::unbounded_mpsc_try_recv(&mut self.disposal_event_receiver)
+        {
+            // The lane has one producer, which sends exactly one variant.
+            // Assert rather than let a pattern-matching loop condition drop
+            // an unexpected event and silently abandon the rest of the
+            // drain; teardown runs this during an unwind, where a panic
+            // would abort.
+            debug_assert!(
+                matches!(
+                    event,
+                    DriverEvent::Child(ChildEvent::ConstructionDisposed { .. })
+                ),
+                "the disposal lane carries only construction-disposal completions"
+            );
+            if let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = event {
+                self.stage_disposal_panic(child, panic);
+            }
+        }
+        // Folding empties the staging map, so the batch entries these
+        // completions came from dispatch as no-ops against an already-taken
+        // `pending_terminal`.
+        while let Some(child) = self.arrived_disposal_panics.keys().next().copied() {
+            let panic = self.take_arrived_disposal_panic(child);
+            self.handle_construction_disposed(child, panic);
+        }
+    }
+
     fn reduce(&mut self, event: SupervisorEvent) {
         supervisor_step(&mut self.supervisor, event, &mut self.supervisor_effects);
     }
@@ -852,7 +924,7 @@ async fn run_scope_incarnation(
         .saturating_mul(3)
         .max(MIN_EVENT_BATCH_LIMIT);
     let (events, mut event_receiver) = runtime::unbounded_mpsc();
-    let (disposal_events, mut disposal_event_receiver) = runtime::unbounded_mpsc();
+    let (disposal_events, disposal_event_receiver) = runtime::unbounded_mpsc();
     let (dynamic, mut dynamic_event_receiver) = if plan.root.flavor == ScopeFlavor::Dynamic {
         let (dynamic_events, receiver) = runtime::unbounded_mpsc();
         (Some(DynamicControl::new(dynamic_events)), Some(receiver))
@@ -901,6 +973,8 @@ async fn run_scope_incarnation(
         restart_shutdown_retries: Vec::new(),
         events,
         disposal_events,
+        disposal_event_receiver,
+        arrived_disposal_panics: BTreeMap::new(),
         deadlines: DeadlineQueue::default(),
         jitter: runtime::JitterRng::new(),
         role,
@@ -982,7 +1056,7 @@ async fn run_scope_incarnation(
             EventLanes {
                 primary: &mut event_receiver,
                 control: dynamic_event_receiver.as_mut(),
-                disposal: &mut disposal_event_receiver,
+                disposal: &mut scope.disposal_event_receiver,
             },
             event_batch_limit,
             &mut pending,
@@ -1052,6 +1126,10 @@ async fn run_scope_incarnation(
             continue;
         }
 
+        // Collection emptied the disposal lane into this batch. Stage the
+        // completion payloads on the scope before arbitration hands a
+        // teardown transition the chance to publish first.
+        scope.stage_batch_disposal_panics(&mut pending);
         arbitrate(&mut pending);
         for (_, event) in pending.drain(..) {
             match event {
@@ -1107,6 +1185,9 @@ async fn run_scope_incarnation(
                     readiness_signal_seen,
                 ),
                 Pending::Child(ChildEvent::ConstructionDisposed { child, panic }) => {
+                    // Staging emptied the event; a teardown that folded this
+                    // completion first leaves nothing to take.
+                    let panic = panic.or_else(|| scope.take_arrived_disposal_panic(child));
                     scope.handle_construction_disposed(child, panic);
                 }
                 Pending::Deadline(deadline) => scope.handle_deadline(deadline),

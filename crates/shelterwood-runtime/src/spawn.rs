@@ -462,6 +462,10 @@ pub fn unbounded_mpsc_try_recv<T>(receiver: &mut UnboundedMpscReceiver<T>) -> Op
     receiver.try_recv().ok()
 }
 
+pub fn unbounded_mpsc_is_empty<T>(receiver: &UnboundedMpscReceiver<T>) -> bool {
+    receiver.is_empty()
+}
+
 pub enum ScopeWake<T> {
     Signal,
     ParentShutdown,

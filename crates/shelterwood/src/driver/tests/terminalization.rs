@@ -158,11 +158,10 @@ async fn root_driver_panic_mid_drain_upgrades_to_the_join_monitor_verdict() {
     let mut events = handle.subscribe_lifecycle();
 
     let (events_tx, _events_rx) = crate::runtime::unbounded_mpsc();
-    let (disposal_events_tx, _disposal_events_rx) = crate::runtime::unbounded_mpsc();
     let driver = crate::runtime::spawn({
         let scope = Arc::clone(&scope);
         async move {
-            let _runtime = ScopeRuntimeBuilder::new(scope, epoch, events_tx, disposal_events_tx)
+            let _runtime = ScopeRuntimeBuilder::new(scope, epoch, events_tx)
                 .with_lifecycle(lifecycle)
                 .build();
             panic!("root driver panicked mid-drain");

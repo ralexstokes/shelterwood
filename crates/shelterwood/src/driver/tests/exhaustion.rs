@@ -108,13 +108,12 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
             .collect(),
     );
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
     let key = children
         .insert(child)
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
@@ -164,11 +163,11 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
     ));
     assert_eq!(root.snapshot().children.len(), 1);
 
-    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
-        disposal_event_receiver
-            .recv()
-            .await
-            .expect("disposal reports completion")
+    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = scope
+        .disposal_event_receiver
+        .recv()
+        .await
+        .expect("disposal reports completion")
     else {
         panic!("only construction disposal was armed")
     };
@@ -214,13 +213,12 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
     let key = children
         .insert(child)
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
@@ -244,11 +242,11 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
     scope.spawn_child(key);
     assert!(scope.children[key].is_disposing());
 
-    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
-        disposal_event_receiver
-            .recv()
-            .await
-            .expect("disposal reports completion")
+    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = scope
+        .disposal_event_receiver
+        .recv()
+        .await
+        .expect("disposal reports completion")
     else {
         panic!("only construction disposal was armed")
     };
@@ -312,13 +310,12 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
             .collect(),
     );
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
     let key = children
         .insert(child)
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
@@ -372,7 +369,7 @@ async fn latched_shutdown_keeps_the_startup_verdict_for_its_follow_up_event() {
     assert!(scope.children[key].restart_deadline.is_none());
 
     let Some(DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic })) =
-        disposal_event_receiver.recv().await
+        scope.disposal_event_receiver.recv().await
     else {
         panic!("only construction disposal was armed")
     };
@@ -705,13 +702,12 @@ async fn settlement_terminates_when_the_first_spawn_exhausts_incarnations() {
             .collect(),
     );
     let (events, _event_receiver) = crate::runtime::unbounded_mpsc();
-    let (disposal_events, mut disposal_event_receiver) = crate::runtime::unbounded_mpsc();
     let child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);
     let mut children = ChildArena::default();
     let key = children
         .insert(child)
         .unwrap_or_else(|_| panic!("the test fixture fits in the child-key domain"));
-    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events, disposal_events)
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
         .with_defaults(plan.defaults.clone())
         .with_intensity_policy(plan.intensity_policy())
         .with_children(children)
@@ -736,11 +732,11 @@ async fn settlement_terminates_when_the_first_spawn_exhausts_incarnations() {
     // membership gates ordered startup, but can no longer be constructed.
     scope.settle_supervisor();
 
-    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) =
-        disposal_event_receiver
-            .recv()
-            .await
-            .expect("disposal reports completion")
+    let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = scope
+        .disposal_event_receiver
+        .recv()
+        .await
+        .expect("disposal reports completion")
     else {
         panic!("only construction disposal was armed")
     };

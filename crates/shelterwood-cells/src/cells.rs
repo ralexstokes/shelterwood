@@ -3,8 +3,8 @@
 //! These cells are the neutral synchronization and observation projection
 //! layer shared by public handles, mailboxes, actor/task contexts, and the
 //! mutable supervision driver. In particular, this module does not depend on
-//! mutable driver state. Its dynamic-route interface names declaration slots
-//! only as opaque capability payloads; their state remains owned elsewhere.
+//! mutable driver state. Its dynamic-route interface retains only the one
+//! close-admission hook needed by restart-stable scope transitions.
 
 use std::{
     any::Any,
@@ -31,15 +31,12 @@ use shelterwood_core::{
     policy::{ResolvedCommonOptions, ScopeFlavor},
 };
 use shelterwood_mailbox::{ActorIdentity, MailboxControl, MailboxTermination};
-use shelterwood_runtime::{self as runtime, Latch};
+use shelterwood_runtime as runtime;
 
-use crate::{
-    admission::{RemoveOutcome, ReserveError},
-    observe::{
-        ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents,
-        LifecycleHub, LifecycleSeq, RetainedScopeSnapshot, ScopeSnapshot, SnapshotHub,
-        SnapshotPublication, SnapshotReceiver,
-    },
+use crate::observe::{
+    ChildSnapshot, ChildState, LifecycleEvent, LifecycleEventKind, LifecycleEvents, LifecycleHub,
+    LifecycleSeq, RetainedScopeSnapshot, ScopeSnapshot, SnapshotHub, SnapshotPublication,
+    SnapshotReceiver,
 };
 
 /// An exit copy retained by framework state.
@@ -842,66 +839,17 @@ impl ScopeRecord {
     }
 }
 
-/// Type-erased declaration slot carried by the restart-stable cell layer.
-///
-/// The route implementation chooses the concrete slot allocation. Erasing it
-/// here lets [`ScopeCell`] retain the route without depending on the plan
-/// layer that owns declaration state.
-pub type ErasedDynamicSlot = dyn Any + Send + Sync;
-
-/// Object-safe dynamic route retained by a restart-stable scope cell.
-pub type ErasedDynamicRoute = dyn DynamicRoute<Slot = ErasedDynamicSlot>;
-
-/// Cross-crate implementation seam for the façade's dynamic declaration
-/// route.
+/// Cross-crate close-admission hook retained by a restart-stable scope cell.
 ///
 /// # Implementation boundary
 ///
 /// This is not a user extension point. Only Shelterwood's façade implements
-/// and installs this trait. Its methods may run while the restart-stable tree
+/// and installs this trait. The callback runs while the restart-stable tree
 /// owns its observation gate, so a foreign implementation invalidates the
-/// framework's lock-rule guarantees.
-pub trait DynamicRoute: Send + Sync {
-    type Slot: ?Sized + Send + Sync;
-
-    fn reserve(
-        &self,
-        scope: &Arc<ScopeCell>,
-        id: ChildId,
-        child_scope: Option<ScopeFlavor>,
-        txn: &mut ObservationTxn<'_>,
-    ) -> Result<Arc<Self::Slot>, ReserveError>;
-
+/// framework's lock-rule guarantees. Requiring the transaction capability in
+/// the signature keeps that critical-section boundary explicit.
+pub trait DynamicRoute: Any + Send + Sync {
     fn close_admission(&self, txn: &mut ObservationTxn<'_>);
-
-    fn start_admission(
-        self: Arc<Self>,
-        slot: Arc<Self::Slot>,
-        fused_cancel: Option<Latch>,
-    ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError>;
-
-    fn cancel_reservation(
-        &self,
-        scope: &Arc<ScopeCell>,
-        slot: &Self::Slot,
-        txn: &mut ObservationTxn<'_>,
-    );
-
-    fn signal_fused_cancel(
-        &self,
-        scope: &Arc<ScopeCell>,
-        slot: &Self::Slot,
-        latch: &Latch,
-        txn: &mut ObservationTxn<'_>,
-    );
-
-    fn remove(
-        &self,
-        scope: &Arc<ScopeCell>,
-        id: &ChildId,
-        exact: Option<Membership>,
-        txn: &mut ObservationTxn<'_>,
-    ) -> runtime::OneShotReceiver<RemoveOutcome>;
 }
 
 /// Shared critical section for one resident tree's observation projection.
@@ -1184,7 +1132,7 @@ pub struct ScopeCell {
     me: Weak<ScopeCell>,
     child_identity: Mutex<ScopeIdentity>,
     control: Mutex<ScopeControl>,
-    dynamic_route: Mutex<Option<Arc<ErasedDynamicRoute>>>,
+    dynamic_route: Mutex<Option<Arc<dyn DynamicRoute>>>,
     observation: ScopeObservation,
     #[cfg(any(test, feature = "test-util"))]
     ancestor_parent_reads: AtomicUsize,
@@ -2427,7 +2375,7 @@ impl ScopeCell {
         }
     }
 
-    pub fn set_dynamic_route(&self, route: Option<Arc<ErasedDynamicRoute>>) {
+    pub fn set_dynamic_route(&self, route: Option<Arc<dyn DynamicRoute>>) {
         self.with_observation_gate(|txn| {
             self.set_dynamic_route_locked(route, txn);
         });
@@ -2435,7 +2383,7 @@ impl ScopeCell {
 
     pub fn set_dynamic_route_locked(
         &self,
-        route: Option<Arc<ErasedDynamicRoute>>,
+        route: Option<Arc<dyn DynamicRoute>>,
         txn: &mut ObservationTxn<'_>,
     ) {
         let previous = std::mem::replace(
@@ -2449,7 +2397,7 @@ impl ScopeCell {
         txn.pulse(&self.member.record);
     }
 
-    pub fn dynamic_route_in(&self, _txn: &ObservationTxn<'_>) -> Option<Arc<ErasedDynamicRoute>> {
+    pub fn dynamic_route_in(&self, _txn: &ObservationTxn<'_>) -> Option<Arc<dyn DynamicRoute>> {
         self.dynamic_route
             .lock()
             .expect("scope dynamic-route mutex poisoned")
@@ -2457,7 +2405,7 @@ impl ScopeCell {
     }
 
     #[cfg(any(test, feature = "test-util"))]
-    pub fn dynamic_route(&self) -> Option<Arc<ErasedDynamicRoute>> {
+    pub fn dynamic_route(&self) -> Option<Arc<dyn DynamicRoute>> {
         self.with_observation_gate(|txn| self.dynamic_route_in(txn))
     }
 

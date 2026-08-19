@@ -29,9 +29,9 @@ pub use admission::*;
 pub use cancellation::*;
 #[doc(hidden)]
 pub use cells::{
-    DynamicRoute, ErasedDynamicRoute, ErasedDynamicSlot, MemberCell, MemberStage, MemberTransition,
-    ObservationGate, ObservationTxn, ResidentProjection, RetainedExit, RetainedStopReason,
-    ScopeCell, ScopeControlEvent, StartupDisposition,
+    DynamicRoute, MemberCell, MemberStage, MemberTransition, ObservationGate, ObservationTxn,
+    ResidentProjection, RetainedExit, RetainedStopReason, ScopeCell, ScopeControlEvent,
+    StartupDisposition,
 };
 #[cfg(any(test, feature = "test-util"))]
 #[doc(hidden)]

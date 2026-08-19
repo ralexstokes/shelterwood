@@ -218,10 +218,9 @@ impl ScopeRuntime {
         self.supervisor.lifecycle().is_draining()
             || self.supervisor.hard_forced()
             || self.root.has_stop_request(self.epoch)
-            || self
-                .role
-                .ancestor()
-                .is_some_and(|latches| latches.shutdown.is_fired() || latches.abort.is_fired())
+            || self.role.ancestor().is_some_and(|latches| {
+                latches.framework_shutdown.is_fired() || latches.abort.is_fired()
+            })
             || self.removal_latched(key)
     }
 

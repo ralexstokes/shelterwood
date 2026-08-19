@@ -455,6 +455,32 @@ impl Actor for OffloadThenFailActor {
     }
 }
 
+struct OffloadThenFailInitActor;
+
+impl Actor for OffloadThenFailInitActor {
+    type Msg = ();
+    type Args = Arc<Mutex<Vec<&'static str>>>;
+
+    async fn init(log: Self::Args, context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        let guard = TeardownDropLog { log };
+        context
+            .offload(
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                },
+                |_| (),
+                Duration::MAX,
+            )
+            .expect("live init offload accepted");
+        Err(ExitError::message("injected init failure"))
+    }
+
+    async fn handle(&mut self, (): Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+        unreachable!("failed initialization never enters the handler loop")
+    }
+}
+
 /// `Handler` is the advertised raw-decorator composition point, so the raw
 /// incarnation boundary is not necessarily its immediate caller: a callback
 /// error must freeze and join incarnation-owned work inside `Handler::run`,
@@ -488,6 +514,38 @@ async fn handler_error_joins_offloads_before_returning_to_a_raw_decorator() {
         .shutdown(Duration::from_secs(1))
         .await
         .expect("tree shuts down");
+}
+
+/// The init-error call site must use the same teardown funnel as handler
+/// errors: outstanding work is destroyed before a raw decorator resumes and
+/// before startup exposes the exit.
+#[tokio::test]
+async fn init_error_joins_live_offloads_before_the_exit_is_observed() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "init-error",
+        RawOnceDef::new(ResumeProbeDecorator {
+            inner: Handler::<OffloadThenFailInitActor>::new(Arc::clone(&log)),
+            log: Arc::clone(&log),
+        }),
+    )
+    .expect("valid decorated actor");
+    let system = tree.spawn().expect("runtime is available");
+
+    system
+        .wait_started()
+        .await
+        .expect_err("the init error prevents startup");
+    assert_eq!(
+        *log.lock().expect("teardown log mutex poisoned"),
+        ["offload-destroyed", "decorator-resumed"],
+        "startup cannot expose the init error before its offload is destroyed"
+    );
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed-startup tree shuts down");
 }
 
 #[tokio::test(start_paused = true)]

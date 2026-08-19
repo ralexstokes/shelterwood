@@ -14,7 +14,7 @@ use crate::{
     cancellation::{CancellationToken, ParentCancellationToken},
     cells::MemberCell,
     definition::DefinitionSource,
-    policy::{ChildMode, CommonOptions},
+    policy::CommonOptions,
     runtime::{self, CompletionGatedLatch, Latch},
 };
 
@@ -196,21 +196,13 @@ impl<T: Send + 'static> TaskOnceDef<T> {
 type OnceTaskFactory = Box<dyn FnOnce(TaskContext) -> TaskFuture + Send + 'static>;
 
 pub(crate) struct TaskConstruction {
-    source: DefinitionSource<TaskFactory, OnceTaskFactory>,
+    pub(crate) source: DefinitionSource<TaskFactory, OnceTaskFactory>,
     options: CommonOptions,
 }
 
 impl TaskConstruction {
     pub(crate) fn options(&self) -> &CommonOptions {
         &self.options
-    }
-
-    pub(crate) fn mode(&self) -> ChildMode {
-        if self.source.is_one_shot() {
-            ChildMode::OneShot
-        } else {
-            ChildMode::Restartable
-        }
     }
 
     pub(crate) fn restartable(&self) -> Option<&TaskFactory> {

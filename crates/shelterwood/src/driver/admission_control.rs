@@ -271,9 +271,22 @@ impl DynamicControl {
         scope: &Arc<ScopeCell>,
         id: ChildId,
         child_scope: Option<ScopeFlavor>,
-        txn: &mut ObservationTxn<'_>,
+        _txn: &mut ObservationTxn<'_>,
     ) -> Result<Arc<SlotCell>, ReserveError> {
-        reserve_dynamic_slot(self, scope, id, child_scope, txn)
+        let mut state = self.state.lock().expect("dynamic-state mutex poisoned");
+        if !state.accepting {
+            return Err(ReserveError::NotAdmitting(NotAdmittingCause::Draining));
+        }
+        if let Some(existing) = state.entry(&id) {
+            if existing.removal_latched() {
+                return Err(ReserveError::RemovalInProgress(id));
+            }
+            return Err(ReserveError::DuplicateId(id));
+        }
+        let slot = mint_reserved_slot(scope, &id, child_scope)?;
+        scope.adopt_child_observation_gate(&slot.member, slot.scope.as_deref(), _txn);
+        state.insert(id, DynamicEntry::reserved(Arc::clone(&slot)), _txn);
+        Ok(slot)
     }
 
     pub(super) fn start_admission(
@@ -281,7 +294,22 @@ impl DynamicControl {
         slot: Arc<SlotCell>,
         fused_cancel: Option<Latch>,
     ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
-        start_dynamic_admission(self, slot, fused_cancel)
+        if !runtime::is_available() {
+            return Err(ReserveError::NoRuntime);
+        }
+        let (sender, response) = runtime::oneshot();
+        let request = AdmissionRequest {
+            control: Arc::downgrade(&self),
+            slot,
+            fused_cancel,
+            response: Obligation::new(sender, |sender| {
+                let _ = sender.send(Err(LOST_ADMISSION_RESPONSE_ERROR));
+            }),
+        };
+        // Queue synchronously so dropping a split-admission future immediately
+        // after its first poll cannot cancel the admitted request.
+        queue_driver_event(&self, DriverEvent::Admission(request));
+        Ok(response)
     }
 
     pub(super) fn cancel_reservation(
@@ -290,7 +318,10 @@ impl DynamicControl {
         slot: &SlotCell,
         txn: &mut ObservationTxn<'_>,
     ) {
-        cancel_dynamic_reservation_impl(scope, self, slot, txn);
+        let (definition, removed) = cancel_dynamic_reservation_parts(scope, self, slot, txn);
+        // The entry's drop completes its removal response; it must follow the
+        // member's terminal publication and isolated definition disposal.
+        txn.defer(move || dispose_definition_then(definition, move || drop(removed)));
     }
 
     pub(super) fn signal_fused_cancel(
@@ -300,7 +331,27 @@ impl DynamicControl {
         latch: &Latch,
         txn: &mut ObservationTxn<'_>,
     ) {
-        signal_fused_cancel_impl(self, scope, slot, latch, txn);
+        // The fire linearizes inside the transaction so a racing `remove` sees a
+        // decided latch, but the waker-visible wake must not run under the gate.
+        if !latch.fire_silently() {
+            return;
+        }
+        let latch = latch.clone();
+        txn.defer(move || latch.notify());
+        // The authoritative state transition owns request publication, so a
+        // racing explicit removal cannot queue the same membership again.
+        let removal = {
+            let mut state = self.state.lock().expect("dynamic-state mutex poisoned");
+            state
+                .entry_mut(slot.member.id())
+                .filter(|entry| entry.slot.member.membership() == slot.member.membership())
+                .and_then(|entry| entry.mark_removing(txn))
+                .map(|key| RemovalRequest { key })
+        };
+        if let Some(removal) = removal {
+            scope.set_child_removing_locked(&slot.member, txn);
+            defer_driver_event(txn, self, DriverEvent::Removal(removal));
+        }
     }
 
     pub(super) fn remove(
@@ -310,7 +361,34 @@ impl DynamicControl {
         exact: Option<Membership>,
         txn: &mut ObservationTxn<'_>,
     ) -> RemovalResponse {
-        remove_dynamic_impl(self, scope, id, exact, txn)
+        let mut state = self.state.lock().expect("dynamic-state mutex poisoned");
+        let Some(entry) = state.entry_mut(id) else {
+            return completed_removal(RemoveOutcome::AlreadyAbsent);
+        };
+        if exact.is_some_and(|membership| membership != entry.slot.member.membership()) {
+            return completed_removal(RemoveOutcome::AlreadyAbsent);
+        }
+        let response = entry.removal.payload_mut().subscribe();
+        if entry.is_reserved() {
+            let entry = state.remove(id, txn).expect("entry was just resolved");
+            drop(state);
+            let definition = take_terminal_reservation(scope, &entry.slot, txn);
+            txn.defer(move || dispose_definition_then(definition, move || drop(entry)));
+            return response;
+        }
+        // Terminal residents still have a driver registration. Route them
+        // through the normal removal path, like live residents, so that
+        // registration is reclaimed before the removal response completes.
+        let member = Arc::clone(&entry.slot.member);
+        let removal = entry.mark_removing(txn).map(|key| RemovalRequest { key });
+        drop(state);
+        if let Some(removal) = removal {
+            // Projection first, then the deferred request: the same order the
+            // fused source commits in.
+            scope.set_child_removing_locked(&member, txn);
+            defer_driver_event(txn, self, DriverEvent::Removal(removal));
+        }
+        response
     }
 
     fn close_admission_in(&self, _txn: &mut ObservationTxn<'_>) {
@@ -405,58 +483,12 @@ pub(super) fn reserve_dynamic_in(
     })
 }
 
-fn reserve_dynamic_slot(
-    control: &DynamicControl,
-    scope: &Arc<ScopeCell>,
-    id: ChildId,
-    child_scope: Option<ScopeFlavor>,
-    _txn: &mut ObservationTxn<'_>,
-) -> Result<Arc<SlotCell>, ReserveError> {
-    let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-    if !state.accepting {
-        return Err(ReserveError::NotAdmitting(NotAdmittingCause::Draining));
-    }
-    if let Some(existing) = state.entry(&id) {
-        if existing.removal_latched() {
-            return Err(ReserveError::RemovalInProgress(id));
-        }
-        return Err(ReserveError::DuplicateId(id));
-    }
-    let slot = mint_reserved_slot(scope, &id, child_scope)?;
-    scope.adopt_child_observation_gate(&slot.member, slot.scope.as_deref(), _txn);
-    state.insert(id, DynamicEntry::reserved(Arc::clone(&slot)), _txn);
-    Ok(slot)
-}
-
 pub(crate) fn start_admission(
     control: Arc<DynamicControl>,
     slot: Arc<SlotCell>,
     fused_cancel: Option<Latch>,
 ) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
     control.start_admission(slot, fused_cancel)
-}
-
-fn start_dynamic_admission(
-    control: Arc<DynamicControl>,
-    slot: Arc<SlotCell>,
-    fused_cancel: Option<Latch>,
-) -> Result<runtime::OneShotReceiver<Result<(), ReserveError>>, ReserveError> {
-    if !runtime::is_available() {
-        return Err(ReserveError::NoRuntime);
-    }
-    let (sender, response) = runtime::oneshot();
-    let request = AdmissionRequest {
-        control: Arc::downgrade(&control),
-        slot,
-        fused_cancel,
-        response: Obligation::new(sender, |sender| {
-            let _ = sender.send(Err(LOST_ADMISSION_RESPONSE_ERROR));
-        }),
-    };
-    // Queue synchronously so dropping a split-admission future immediately
-    // after its first poll cannot cancel the admitted request.
-    queue_driver_event(&control, DriverEvent::Admission(request));
-    Ok(response)
 }
 
 pub(super) fn cancel_dynamic_reservation_parts(
@@ -489,18 +521,6 @@ pub(crate) fn cancel_dynamic_reservation(
     scope.with_observation_gate(|txn| control.cancel_reservation(scope, slot.as_ref(), txn));
 }
 
-fn cancel_dynamic_reservation_impl(
-    scope: &ScopeCell,
-    control: &DynamicControl,
-    slot: &SlotCell,
-    txn: &mut ObservationTxn<'_>,
-) {
-    let (definition, removed) = cancel_dynamic_reservation_parts(scope, control, slot, txn);
-    // The entry's drop completes its removal response; it must follow the
-    // member's terminal publication and isolated definition disposal.
-    txn.defer(move || dispose_definition_then(definition, move || drop(removed)));
-}
-
 pub(crate) fn signal_fused_cancel(
     scope: &Arc<ScopeCell>,
     control: &DynamicControl,
@@ -510,36 +530,6 @@ pub(crate) fn signal_fused_cancel(
     scope.with_observation_gate(|txn| {
         control.signal_fused_cancel(scope, slot.as_ref(), latch, txn);
     });
-}
-
-fn signal_fused_cancel_impl(
-    control: &DynamicControl,
-    scope: &Arc<ScopeCell>,
-    slot: &SlotCell,
-    latch: &Latch,
-    txn: &mut ObservationTxn<'_>,
-) {
-    // The fire linearizes inside the transaction so a racing `remove` sees a
-    // decided latch, but the waker-visible wake must not run under the gate.
-    if !latch.fire_silently() {
-        return;
-    }
-    let latch = latch.clone();
-    txn.defer(move || latch.notify());
-    // The authoritative state transition owns request publication, so a
-    // racing explicit removal cannot queue the same membership again.
-    let removal = {
-        let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-        state
-            .entry_mut(slot.member.id())
-            .filter(|entry| entry.slot.member.membership() == slot.member.membership())
-            .and_then(|entry| entry.mark_removing(txn))
-            .map(|key| RemovalRequest { key })
-    };
-    if let Some(removal) = removal {
-        scope.set_child_removing_locked(&slot.member, txn);
-        defer_driver_event(txn, control, DriverEvent::Removal(removal));
-    }
 }
 
 pub(crate) fn remove_dynamic(
@@ -559,43 +549,6 @@ pub(crate) fn remove_dynamic(
         };
         control.remove(scope, id, exact, txn)
     })
-}
-
-fn remove_dynamic_impl(
-    control: &DynamicControl,
-    scope: &Arc<ScopeCell>,
-    id: &ChildId,
-    exact: Option<Membership>,
-    txn: &mut ObservationTxn<'_>,
-) -> RemovalResponse {
-    let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
-    let Some(entry) = state.entry_mut(id) else {
-        return completed_removal(RemoveOutcome::AlreadyAbsent);
-    };
-    if exact.is_some_and(|membership| membership != entry.slot.member.membership()) {
-        return completed_removal(RemoveOutcome::AlreadyAbsent);
-    }
-    let response = entry.removal.payload_mut().subscribe();
-    if entry.is_reserved() {
-        let entry = state.remove(id, txn).expect("entry was just resolved");
-        drop(state);
-        let definition = take_terminal_reservation(scope, &entry.slot, txn);
-        txn.defer(move || dispose_definition_then(definition, move || drop(entry)));
-        return response;
-    }
-    // Terminal residents still have a driver registration. Route them
-    // through the normal removal path, like live residents, so that
-    // registration is reclaimed before the removal response completes.
-    let member = Arc::clone(&entry.slot.member);
-    let removal = entry.mark_removing(txn).map(|key| RemovalRequest { key });
-    drop(state);
-    if let Some(removal) = removal {
-        // Projection first, then the deferred request: the same order the
-        // fused source commits in.
-        scope.set_child_removing_locked(&member, txn);
-        defer_driver_event(txn, control, DriverEvent::Removal(removal));
-    }
-    response
 }
 
 impl DynamicRoute for DynamicControl {

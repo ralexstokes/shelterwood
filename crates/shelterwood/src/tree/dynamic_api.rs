@@ -1,9 +1,8 @@
-use std::sync::Arc;
-
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId,
     admission::ReserveError,
     raw::{RawDef, RawOnceDef},
+    runtime,
     scope::{DynamicScopeRef, ScopeRef},
     task::{OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
@@ -19,43 +18,21 @@ use super::{
     system::sealed,
 };
 
-impl ScopeRef {
-    /// Requests shutdown and waits for this scope's incarnation to finish its
-    /// scope epilogue.
-    ///
-    /// `timeout` bounds cooperative teardown, not this call's return: it arms
-    /// when the targeted incarnation enters its drain and, once expired,
-    /// escalates and reports stragglers while the wait continues to
-    /// completion. Membership terminality published by an ancestor's teardown
-    /// does not resolve the call while that incarnation is still running its
-    /// epilogue.
-    ///
-    /// A scheduled scope driver joins its children before completing. If an
-    /// ancestor hard-aborts a framework driver at the tidy-abort backstop, its
-    /// synchronous drop epilogue can only *request* abort for active children,
-    /// so cancellation and user-future destruction below that boundary may
-    /// finish after this call returns.
-    /// A zero budget still requests cooperative cancellation, then skips its
-    /// wait and enters the ordinary escalation tail immediately.
-    pub async fn shutdown_and_wait(
-        &self,
-        timeout: impl Into<crate::DeadlineBudget>,
-    ) -> Result<(), crate::ShutdownTimeout> {
-        crate::driver::shutdown_scope(Arc::clone(&self.cell), timeout.into()).await
-    }
-}
-
 impl DynamicScopeRef {
     fn define_or_reject<D, S, H>(
         definition: D,
-        slot: Result<S, ReserveError>,
+        reserve: impl FnOnce() -> Result<S, ReserveError>,
         define: impl FnOnce(S, D) -> Admission<H>,
     ) -> Admission<H>
     where
         D: Send + 'static,
     {
-        match slot {
-            Ok(slot) => define(slot, definition),
+        let mut definition = runtime::Isolated::new(definition);
+        match reserve() {
+            Ok(slot) => define(
+                slot,
+                definition.take().expect("isolated definition is available"),
+            ),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
     }
@@ -114,7 +91,7 @@ impl DynamicScopeRef {
     ) -> Admission<ActorRef<A::Msg>> {
         Self::define_or_reject(
             definition,
-            self.reserve_actor_with(id, AdmissionOwnership::Fused),
+            || self.reserve_actor_with(id, AdmissionOwnership::Fused),
             |slot, definition| slot.core.define_raw(definition.into_raw()),
         )
     }
@@ -127,7 +104,7 @@ impl DynamicScopeRef {
     ) -> Admission<ActorRef<A::Msg>> {
         Self::define_or_reject(
             definition,
-            self.reserve_actor_with(id, AdmissionOwnership::Fused),
+            || self.reserve_actor_with(id, AdmissionOwnership::Fused),
             |slot, definition| slot.core.define_once_raw(definition.into_raw()),
         )
     }
@@ -140,7 +117,7 @@ impl DynamicScopeRef {
     ) -> Admission<ActorRef<R::Msg>> {
         Self::define_or_reject(
             definition,
-            self.reserve_actor_with(id, AdmissionOwnership::Fused),
+            || self.reserve_actor_with(id, AdmissionOwnership::Fused),
             |slot, definition| slot.core.define_raw(definition),
         )
     }
@@ -153,7 +130,7 @@ impl DynamicScopeRef {
     ) -> Admission<ActorRef<R::Msg>> {
         Self::define_or_reject(
             definition,
-            self.reserve_actor_with(id, AdmissionOwnership::Fused),
+            || self.reserve_actor_with(id, AdmissionOwnership::Fused),
             |slot, definition| slot.core.define_once_raw(definition),
         )
     }
@@ -169,7 +146,7 @@ impl DynamicScopeRef {
     pub fn add_task(&self, id: impl Into<ChildId>, definition: TaskDef) -> Admission<TaskRef> {
         Self::define_or_reject(
             definition,
-            self.reserve_task_with(id, AdmissionOwnership::Fused),
+            || self.reserve_task_with(id, AdmissionOwnership::Fused),
             |slot, definition| slot.core.define(definition),
         )
     }
@@ -182,7 +159,7 @@ impl DynamicScopeRef {
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
         Self::define_or_reject(
             definition,
-            self.reserve_task_with(id, AdmissionOwnership::Fused),
+            || self.reserve_task_with(id, AdmissionOwnership::Fused),
             |slot, definition| slot.core.define_once(definition),
         )
     }
@@ -205,7 +182,7 @@ impl DynamicScopeRef {
     ) -> Admission<T::Ref> {
         Self::define_or_reject(
             definition,
-            self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused),
+            || self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused),
             |slot, definition| slot.core.define(definition),
         )
     }
@@ -218,7 +195,7 @@ impl DynamicScopeRef {
     ) -> Admission<T::Ref> {
         Self::define_or_reject(
             definition,
-            self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused),
+            || self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused),
             |slot, definition| slot.core.define_once(definition),
         )
     }

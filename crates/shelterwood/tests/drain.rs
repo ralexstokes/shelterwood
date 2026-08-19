@@ -24,6 +24,21 @@ enum Message {
     Offload,
 }
 
+const CONTINUATION_RECOVERED: usize = 1 << 0;
+const TIMEOUT_RECOVERED: usize = 1 << 1;
+const INTERVAL_RECOVERED: usize = 1 << 2;
+const CLEAR_REJECTED: usize = 1 << 3;
+const OFFLOAD_RECOVERED: usize = 1 << 4;
+const SCOPED_OFFLOAD_RECOVERED: usize = 1 << 5;
+const SILENT_DRAIN_CONTROL_RETURNED: usize = 1 << 6;
+const ALL_DRAIN_REJECTIONS_OBSERVED: usize = CONTINUATION_RECOVERED
+    | TIMEOUT_RECOVERED
+    | INTERVAL_RECOVERED
+    | CLEAR_REJECTED
+    | OFFLOAD_RECOVERED
+    | SCOPED_OFFLOAD_RECOVERED
+    | SILENT_DRAIN_CONTROL_RETURNED;
+
 /// Publishes a handler's `is_draining()` observations for judgement in the
 /// test body.
 ///
@@ -64,6 +79,7 @@ struct Args {
     drain_entered: Arc<AtomicBool>,
     allow_drain: ReleaseGate,
     deferred_ran: Arc<AtomicBool>,
+    rejections: Arc<AtomicUsize>,
     log: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -90,29 +106,37 @@ impl Actor for DrainActor {
                 self.0.value_draining.record(context.is_draining());
                 self.0.log.lock().expect("log mutex poisoned").push(value);
                 if !self.0.drain_entered.swap(true, Ordering::SeqCst) {
-                    let continuation = context
+                    let mut observed = 0;
+                    if context
                         .continue_with(Message::Deferred)
-                        .expect_err("drain rejects continuations");
-                    assert!(matches!(continuation.into_inner(), Message::Deferred));
+                        .is_err_and(|rejected| matches!(rejected.into_inner(), Message::Deferred))
+                    {
+                        observed |= CONTINUATION_RECOVERED;
+                    }
 
-                    let timer = context
+                    if context
                         .set_timeout("timer", Message::Timer, Duration::ZERO)
-                        .expect_err("drain rejects timers");
-                    assert!(matches!(timer.into_inner().1, Message::Timer));
+                        .is_err_and(|rejected| matches!(rejected.into_inner().1, Message::Timer))
+                    {
+                        observed |= TIMEOUT_RECOVERED;
+                    }
 
-                    let interval = context
+                    if context
                         .set_interval("interval", Message::Timer, Duration::from_secs(1))
-                        .expect_err("drain rejects intervals");
-                    let (interval_key, interval_message) = interval.into_inner();
-                    assert_eq!(interval_key, "interval");
-                    assert!(matches!(interval_message, Message::Timer));
+                        .is_err_and(|rejected| {
+                            let (key, message) = rejected.into_inner();
+                            key == "interval" && matches!(message, Message::Timer)
+                        })
+                    {
+                        observed |= INTERVAL_RECOVERED;
+                    }
 
-                    context
-                        .clear_timer(&"timer")
-                        .expect_err("drain rejects timer retraction");
+                    if context.clear_timer(&"timer").is_err() {
+                        observed |= CLEAR_REJECTED;
+                    }
 
                     let ran = Arc::clone(&self.0.deferred_ran);
-                    let offload = context
+                    if context
                         .offload(
                             async move {
                                 ran.store(true, Ordering::SeqCst);
@@ -120,11 +144,17 @@ impl Actor for DrainActor {
                             |_| Message::Offload,
                             Duration::from_secs(1),
                         )
-                        .expect_err("drain rejects offloads");
-                    drop(offload);
+                        .is_err_and(|rejected| {
+                            let (work, continuation) = rejected.into_inner();
+                            drop(work);
+                            matches!(continuation(Ok(())), Message::Offload)
+                        })
+                    {
+                        observed |= OFFLOAD_RECOVERED;
+                    }
 
                     let scoped_ran = Arc::clone(&self.0.deferred_ran);
-                    let scoped = context
+                    if context
                         .offload_scoped(
                             async move {
                                 scoped_ran.store(true, Ordering::SeqCst);
@@ -132,13 +162,26 @@ impl Actor for DrainActor {
                             |_| Message::Offload,
                             Duration::from_secs(1),
                         )
-                        .expect_err("drain rejects scoped offloads");
-                    // The rejected payload is recovered whole: the work
-                    // future is discarded without running and the
-                    // continuation still produces its message.
-                    let (scoped_work, scoped_continuation) = scoped.into_inner();
-                    drop(scoped_work);
-                    assert!(matches!(scoped_continuation(Ok(())), Message::Offload));
+                        .is_err_and(|rejected| {
+                            // The rejected payload is recovered whole: the
+                            // work future is discarded without running and the
+                            // continuation still produces its message.
+                            let (work, continuation) = rejected.into_inner();
+                            drop(work);
+                            matches!(continuation(Ok(())), Message::Offload)
+                        })
+                    {
+                        observed |= SCOPED_OFFLOAD_RECOVERED;
+                    }
+
+                    // These unit-returning controls deliberately stay silent
+                    // during frozen-prefix drain. Calling them here and then
+                    // completing the exact prefix pins that they neither
+                    // reject by panicking nor perturb drain progression.
+                    context.mark_ready();
+                    context.stop();
+                    observed |= SILENT_DRAIN_CONTROL_RETURNED;
+                    self.0.rejections.store(observed, Ordering::SeqCst);
 
                     self.0.allow_drain.wait().await;
                 }
@@ -159,6 +202,7 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
     let drain_entered = Arc::new(AtomicBool::new(false));
     let allow_drain = ReleaseGate::default();
     let deferred_ran = Arc::new(AtomicBool::new(false));
+    let rejections = Arc::new(AtomicUsize::new(0));
     let log = Arc::new(Mutex::new(Vec::new()));
 
     let mut tree = Tree::new();
@@ -173,6 +217,7 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
                 drain_entered: Arc::clone(&drain_entered),
                 allow_drain: allow_drain.clone(),
                 deferred_ran: Arc::clone(&deferred_ran),
+                rejections: Arc::clone(&rejections),
                 log: Arc::clone(&log),
             })
             .mailbox(mailbox),
@@ -235,6 +280,11 @@ async fn assert_drain_fixture(mailbox: Mailbox, expected: &[u8]) {
         "every drained delivery observes the draining phase",
     );
     assert!(!deferred_ran.load(Ordering::SeqCst));
+    assert_eq!(
+        rejections.load(Ordering::SeqCst),
+        ALL_DRAIN_REJECTIONS_OBSERVED,
+        "every rejected operation returns its original payload for body-side judgement"
+    );
 }
 
 #[tokio::test(start_paused = true)]

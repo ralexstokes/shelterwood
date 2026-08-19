@@ -38,13 +38,10 @@ use crate::{
     },
     deadline::Deadline,
     engine::{
-        ArbitrationClass, ChildKey, DeadlineHandle, DeadlineQueue, Effect as SupervisorEffect,
-        Epoch, Event as SupervisorEvent, ExitDispatch, IncarnationRun, IntensityState,
-        MembershipStatus, ReadinessEffect, ReadinessEvent, ReadinessGate, RestartState,
-        ScopeLifecycle, ScopeMode, StopAction, StopLadder, SupervisorState,
-        admit as supervisor_admit, arbitrate, begin_drain as supervisor_begin_drain, dispatch_exit,
-        fail_startup as supervisor_fail_startup, force as supervisor_force, schedule_restart,
-        step as supervisor_step,
+        ArbitrationClass, DeadlineHandle, DeadlineQueue, Epoch, ExitDispatch, IncarnationRun,
+        IntensityState, MembershipStatus, ReadinessEffect, ReadinessEvent, ReadinessGate,
+        RestartState, ScopeLifecycle, ScopeMode, StopAction, StopLadder, arbitrate, dispatch_exit,
+        schedule_restart,
     },
     exit::{
         RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
@@ -61,6 +58,11 @@ use crate::{
     raw::{CatchUnwindFuture, RawRunContext, RawSpawn},
     runtime::{self, CompletionGatedLatch, Latch},
     task::{TaskContext, TaskContextLatches, TaskFactory},
+};
+use shelterwood_core::supervisor::{
+    ChildKey, Effect as SupervisorEffect, Event as SupervisorEvent, SupervisorState,
+    admit as supervisor_admit, begin_drain as supervisor_begin_drain,
+    fail_startup as supervisor_fail_startup, force as supervisor_force, step as supervisor_step,
 };
 
 use admission_control::{
@@ -345,6 +347,11 @@ struct ScopeCompletion {
     root_exit: Option<RetainedExit>,
 }
 
+/// Runs the synchronous fail-closed scope epilogue.
+///
+/// `pending_startup_removals` can reach this path only when a resumed
+/// user-code panic unwinds the driver: no await point exists between retaining
+/// one of those completions and the orderly batch epilogue that publishes it.
 impl Drop for ScopeRuntime {
     fn drop(&mut self) {
         let mut panics = runtime::PanicAccumulator::default();
@@ -416,6 +423,7 @@ impl Drop for ScopeRuntime {
         // Residency owns the matching Removed edges. Clearing the set after
         // terminality discharges them all before the scope's final event.
         panics.run(|| self.root.clear_residents());
+        panics.run(|| self.publish_startup_removals());
         // Dynamic entries own removal completions. Keep them armed until the
         // corresponding members are terminal and no longer resident.
         panics.run(|| drop(dynamic_entries.take()));

@@ -9,10 +9,11 @@ use crate::{
     cells::MemberCell,
     definition::DefinitionSource,
     mailbox::{MailboxCell, MailboxControl, MailboxEffectQueue, actor_ref_from_parts},
-    policy::{ChildMode, CommonOptions},
+    policy::CommonOptions,
     runtime::{
-        CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, UnwindPanics, catch_panic,
-        keep_first_panic, resume_preferred_panic, resume_preferred_panic_outside_unwind,
+        CompletionGatedLatch, Isolated, Latch, PanicAccumulator, PanicPayload, UnwindPanics,
+        catch_panic, keep_first_panic, resume_preferred_panic,
+        resume_preferred_panic_outside_unwind,
     },
     scope::ScopeRef,
 };
@@ -86,9 +87,18 @@ impl<R: RawActor> RawDef<R> {
         retention,
     );
 
-    pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
-        let factory = self.factory;
-        let readiness = self.options.readiness.unwrap_or_else(R::readiness);
+    pub(crate) fn erase(
+        mut definition: Isolated<Self>,
+        mailbox: Arc<MailboxCell<R::Msg>>,
+    ) -> RawConstruction {
+        let readiness = definition
+            .get()
+            .options
+            .readiness
+            .unwrap_or_else(R::readiness);
+        let Self { factory, options } = definition
+            .take()
+            .expect("isolated raw definition is available");
         RawConstruction {
             source: DefinitionSource::Restartable(Arc::new(move || {
                 let actor = factory();
@@ -97,7 +107,7 @@ impl<R: RawActor> RawDef<R> {
                     mailbox: Arc::clone(&mailbox),
                 })
             })),
-            options: self.options,
+            options,
             readiness,
         }
     }
@@ -137,14 +147,21 @@ impl<R: RawActor> RawOnceDef<R> {
         retention,
     );
 
-    pub(crate) fn erase(self, mailbox: Arc<MailboxCell<R::Msg>>) -> RawConstruction {
-        let readiness = self.options.readiness.unwrap_or_else(R::readiness);
+    pub(crate) fn erase(
+        mut definition: Isolated<Self>,
+        mailbox: Arc<MailboxCell<R::Msg>>,
+    ) -> RawConstruction {
+        let readiness = definition
+            .get()
+            .options
+            .readiness
+            .unwrap_or_else(R::readiness);
+        let Self { actor, options } = definition
+            .take()
+            .expect("isolated raw definition is available");
         RawConstruction {
-            source: DefinitionSource::OneShot(Box::new(RawInstance {
-                actor: self.actor,
-                mailbox,
-            })),
-            options: self.options,
+            source: DefinitionSource::OneShot(Box::new(RawInstance { actor, mailbox })),
+            options,
             readiness,
         }
     }
@@ -153,7 +170,7 @@ impl<R: RawActor> RawOnceDef<R> {
 type RawFuture = Pin<Box<dyn Future<Output = ExitResult> + Send + 'static>>;
 type RawFactory = Arc<dyn Fn() -> Box<dyn ErasedRawInstance> + Send + Sync + 'static>;
 
-trait ErasedRawInstance: Send {
+pub(crate) trait ErasedRawInstance: Send {
     fn run(self: Box<Self>, context: RawRunContext, readiness: Readiness) -> RawFuture;
 }
 
@@ -280,7 +297,7 @@ impl<R: RawActor> ErasedRawInstance for RawInstance<R> {
 }
 
 pub(crate) struct RawConstruction {
-    source: DefinitionSource<RawFactory, Box<dyn ErasedRawInstance>>,
+    pub(crate) source: DefinitionSource<RawFactory, Box<dyn ErasedRawInstance>>,
     options: CommonOptions,
     readiness: Readiness,
 }
@@ -292,14 +309,6 @@ impl RawConstruction {
 
     pub(crate) fn readiness(&self) -> Readiness {
         self.readiness
-    }
-
-    pub(crate) fn mode(&self) -> ChildMode {
-        if self.source.is_one_shot() {
-            ChildMode::OneShot
-        } else {
-            ChildMode::Restartable
-        }
     }
 
     pub(crate) fn one_shot(&self) -> bool {

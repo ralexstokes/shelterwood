@@ -110,7 +110,13 @@ macro_rules! impl_actor_core_definition {
         {
             let actor = self.actor_ref();
             let Self { endpoint, mailbox } = self;
-            endpoint.define(actor, ChildConstruction::Raw(definition.erase(mailbox)))
+            endpoint.define(
+                actor,
+                ChildConstruction::Raw($definition::erase(
+                    runtime::Isolated::new(definition),
+                    mailbox,
+                )),
+            )
         }
     };
 }

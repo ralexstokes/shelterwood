@@ -1667,6 +1667,15 @@ terminates the process by contract.
   `Drop` — is a genuine double panic and aborts the process; that is
   Rust's contract, documented alongside §11's `panic = "unwind"`
   precondition, not something the runner can contain.
+- **Declaration-hook isolation.** The static and dynamic `add_*` entry points
+  isolate the supplied definition before invoking the caller's
+  `Into<ChildId>` conversion, and raw-definition erasure keeps the definition
+  isolated while invoking `RawActor::readiness`. A panic from either eager
+  hook therefore cannot unwind through and destroy that definition on the
+  caller's thread. This is a narrow ownership guarantee, not an extension of
+  the runner boundary: other locals in the user's synchronous declaration
+  call remain subject to Rust's ordinary unwinding and double-panic contract,
+  as do user values that the framework never accepted or wrapped.
 
 ## 8. Child specification and options [#368]
 

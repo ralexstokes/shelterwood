@@ -824,32 +824,23 @@ pub struct CommonOptions {
 pub struct ResolvedDefaults {
     pub child_restart: RestartPolicy,
     pub child_shutdown: Shutdown,
-    pub mailbox: ResolvedMailbox,
+    mailbox_kind: ResolvedMailboxKind,
     /// Nearest resolved queue capacity, retained across defaults of other kinds.
-    pub queue_capacity: NonZeroUsize,
+    queue_capacity: NonZeroUsize,
     pub mailbox_shutdown: MailboxShutdown,
     readiness_deadline: ResolvedReadinessDeadline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedMailboxKind {
+    Queue,
+    Latest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolvedMailbox {
     Queue(NonZeroUsize),
     Latest,
-}
-
-impl ResolvedMailbox {
-    fn resolve(
-        value: Option<Mailbox>,
-        inherited: Self,
-        inherited_queue_capacity: NonZeroUsize,
-    ) -> Self {
-        match value {
-            None => inherited,
-            Some(Mailbox::Queue(None)) => Self::Queue(inherited_queue_capacity),
-            Some(Mailbox::Queue(Some(capacity))) => Self::Queue(capacity),
-            Some(Mailbox::Latest) => Self::Latest,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -890,7 +881,7 @@ impl Default for ResolvedDefaults {
         Self {
             child_restart: RestartPolicy::default(),
             child_shutdown: Shutdown::default(),
-            mailbox: ResolvedMailbox::Queue(queue_capacity),
+            mailbox_kind: ResolvedMailboxKind::Queue,
             queue_capacity,
             mailbox_shutdown: MailboxShutdown::default(),
             readiness_deadline: ResolvedReadinessDeadline::Bounded(readiness_deadline),
@@ -899,15 +890,40 @@ impl Default for ResolvedDefaults {
 }
 
 impl ResolvedDefaults {
+    pub fn mailbox(&self) -> ResolvedMailbox {
+        match self.mailbox_kind {
+            ResolvedMailboxKind::Queue => ResolvedMailbox::Queue(self.queue_capacity),
+            ResolvedMailboxKind::Latest => ResolvedMailbox::Latest,
+        }
+    }
+
+    /// Resolves a child's mailbox override against these defaults.
+    ///
+    /// Kept on `ResolvedDefaults` for the same reason `overlay` resolves the
+    /// kind and the capacity together: an inherited `Queue` and the capacity
+    /// it inherits come from one value, so the contradictory pairing of
+    /// `Queue(a)` with a capacity `b != a` has no way to be written.
+    pub fn resolve_child_mailbox(&self, value: Option<Mailbox>) -> ResolvedMailbox {
+        match value {
+            None => self.mailbox(),
+            Some(Mailbox::Queue(None)) => ResolvedMailbox::Queue(self.queue_capacity),
+            Some(Mailbox::Queue(Some(capacity))) => ResolvedMailbox::Queue(capacity),
+            Some(Mailbox::Latest) => ResolvedMailbox::Latest,
+        }
+    }
+
     pub fn overlay(&self, values: &ScopeDefaults) -> Self {
+        let (mailbox_kind, queue_capacity) = match values.mailbox {
+            None => (self.mailbox_kind, self.queue_capacity),
+            Some(Mailbox::Queue(None)) => (ResolvedMailboxKind::Queue, self.queue_capacity),
+            Some(Mailbox::Queue(Some(capacity))) => (ResolvedMailboxKind::Queue, capacity),
+            Some(Mailbox::Latest) => (ResolvedMailboxKind::Latest, self.queue_capacity),
+        };
         Self {
             child_restart: resolve(values.child_restart, self.child_restart),
             child_shutdown: resolve(values.child_shutdown, self.child_shutdown),
-            mailbox: ResolvedMailbox::resolve(values.mailbox, self.mailbox, self.queue_capacity),
-            queue_capacity: match values.mailbox {
-                Some(Mailbox::Queue(Some(capacity))) => capacity,
-                None | Some(Mailbox::Queue(None) | Mailbox::Latest) => self.queue_capacity,
-            },
+            mailbox_kind,
+            queue_capacity,
             mailbox_shutdown: resolve(values.mailbox_shutdown, self.mailbox_shutdown),
             readiness_deadline: ResolvedReadinessDeadline::resolve(
                 values.readiness_deadline,
@@ -954,11 +970,7 @@ pub fn resolve_common(
             resolve(options.restart, defaults.child_restart)
         },
         shutdown: resolve(options.shutdown, defaults.child_shutdown),
-        mailbox: ResolvedMailbox::resolve(
-            options.mailbox,
-            defaults.mailbox,
-            defaults.queue_capacity,
-        ),
+        mailbox: defaults.resolve_child_mailbox(options.mailbox),
         mailbox_shutdown: resolve(options.mailbox_shutdown, defaults.mailbox_shutdown),
         readiness: resolve(options.readiness, default_readiness),
         readiness_deadline: ResolvedReadinessDeadline::resolve(
@@ -1373,7 +1385,7 @@ mod tests {
             ..ScopeDefaults::default()
         });
         assert_eq!(
-            library_queue.mailbox,
+            library_queue.mailbox(),
             ResolvedMailbox::Queue(NonZeroUsize::new(64).expect("capacity is non-zero"))
         );
 
@@ -1385,14 +1397,14 @@ mod tests {
             mailbox: Some(Mailbox::latest()),
             ..ScopeDefaults::default()
         });
-        assert_eq!(latest.mailbox, ResolvedMailbox::Latest);
+        assert_eq!(latest.mailbox(), ResolvedMailbox::Latest);
 
         let deferred_queue = latest.overlay(&ScopeDefaults {
             mailbox: Some(Mailbox::queue_inherit()),
             ..ScopeDefaults::default()
         });
         assert_eq!(
-            deferred_queue.mailbox,
+            deferred_queue.mailbox(),
             ResolvedMailbox::Queue(NonZeroUsize::new(10).expect("capacity is non-zero"))
         );
         assert_eq!(deferred_queue.child_restart, latest.child_restart);
@@ -1403,7 +1415,7 @@ mod tests {
             ..ScopeDefaults::default()
         });
         assert_eq!(
-            reset_queue.mailbox,
+            reset_queue.mailbox(),
             ResolvedMailbox::Queue(NonZeroUsize::new(64).expect("capacity is non-zero"))
         );
     }
@@ -1438,7 +1450,7 @@ mod tests {
         );
         assert_eq!(child.restart, inherited.child_restart);
         assert_eq!(child.shutdown, inherited.child_shutdown);
-        assert_eq!(child.mailbox, inherited.mailbox);
+        assert_eq!(child.mailbox, inherited.mailbox());
         assert_eq!(child.mailbox_shutdown, inherited.mailbox_shutdown);
         assert_eq!(child.readiness, Readiness::Manual);
         assert_eq!(child.readiness_deadline, inherited.readiness_deadline);
@@ -1461,7 +1473,7 @@ mod tests {
         );
         assert_eq!(overridden.restart, RestartPolicy::default());
         assert_eq!(overridden.shutdown, Shutdown::default());
-        assert_eq!(overridden.mailbox, inherited.mailbox);
+        assert_eq!(overridden.mailbox, inherited.mailbox());
         assert_eq!(overridden.mailbox_shutdown, MailboxShutdown::Drain);
         assert_eq!(overridden.readiness, Readiness::Immediate);
         assert_eq!(

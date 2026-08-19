@@ -793,7 +793,7 @@ mod tests {
         let mut effects = MailboxEffectQueue::default();
         let token = MailboxControl::configure(
             &*mailbox,
-            crate::policy::ResolvedDefaults::default().mailbox,
+            crate::policy::ResolvedDefaults::default().mailbox(),
             &mut effects,
         );
         let incarnation = mint_actor_incarnation();

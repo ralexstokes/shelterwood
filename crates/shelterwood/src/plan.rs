@@ -10,7 +10,7 @@ use crate::{
     admission::ReserveError,
     cells::{MemberCell, ObservationTxn, ScopeCell},
     definition::DefinitionSource,
-    identity::ScopeIdentity,
+    identity::{MembershipReconciliation, ScopeIdentity},
     policy::{
         ChildMode, CommonOptions, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor,
         resolve_common,
@@ -376,15 +376,16 @@ impl BuilderCore {
             // not this builder's throwaway root.
             self.adopting_root = Some(Arc::clone(&root));
             for slot in &self.slots {
-                let Some(rebased) =
-                    root.adopt_or_mint_membership(slot.member.id(), slot.member.membership())
-                else {
-                    let id = slot.member.id().clone();
-                    let disposal = self.begin_failed_disposal();
-                    return Err(LowerError::IdentityExhausted { id, disposal });
-                };
-                if let Some(identity) = rebased {
-                    slot.member.rebase_membership(identity);
+                match root.adopt_or_mint_membership(slot.member.id(), slot.member.membership()) {
+                    MembershipReconciliation::Adopted => {}
+                    MembershipReconciliation::Minted(identity) => {
+                        slot.member.rebase_membership(identity);
+                    }
+                    MembershipReconciliation::Exhausted => {
+                        let id = slot.member.id().clone();
+                        let disposal = self.begin_failed_disposal();
+                        return Err(LowerError::IdentityExhausted { id, disposal });
+                    }
                 }
             }
         }

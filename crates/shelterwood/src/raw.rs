@@ -2267,8 +2267,11 @@ mod tests {
         let mailbox = MailboxCell::new(id.clone(), crate::runtime::mailbox_runtime());
         member.attach_mailbox(mailbox.clone());
         let mut effects = MailboxEffectQueue::default();
-        let token =
-            MailboxControl::configure(&*mailbox, ResolvedDefaults::default().mailbox, &mut effects);
+        let token = MailboxControl::configure(
+            &*mailbox,
+            ResolvedDefaults::default().mailbox(),
+            &mut effects,
+        );
         let incarnation = member
             .take_incarnation_counter()
             .mint()

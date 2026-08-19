@@ -2172,7 +2172,7 @@ pub(super) mod tests {
         park_with(&mut first, &first_panicking);
         park_with(&mut second, &second_panicking);
         park_with(&mut third, &counting);
-        let token = configure(&mailbox, ResolvedDefaults::default().mailbox);
+        let token = configure(&mailbox, ResolvedDefaults::default().mailbox());
         let incarnation = mint_actor_incarnation();
 
         assert!(

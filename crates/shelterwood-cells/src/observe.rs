@@ -76,200 +76,37 @@ pub struct LifecycleEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RetainedLifecycleEvent {
-    scope_path: Vec<ChildId>,
-    scope: Membership,
-    seq: LifecycleSeq,
-    kind: RetainedLifecycleEventKind,
+    // Keep the public event before its guards. Ring eviction therefore drops
+    // every raw exit projection while a retained copy still protects its user
+    // error, and only the guards' later drop submits destruction to isolated
+    // disposal. This is the same field-order argument as
+    // `RetainedScopeSnapshot` and `RetainedStopReason`.
+    event: LifecycleEvent,
+    guards: Arc<Vec<RetainedExit>>,
 }
 
 impl RetainedLifecycleEvent {
     fn new(event: LifecycleEvent) -> Self {
+        let mut guards = Vec::new();
+        if let LifecycleEventKind::Exited { exit, .. } = &event.kind {
+            RetainedExit::retain_exit(&mut guards, exit);
+        }
+        if let LifecycleEventKind::ScopeState { state } = &event.kind {
+            RetainedExit::retain_scope_state(&mut guards, state);
+        }
         Self {
-            scope_path: event.scope_path,
-            scope: event.scope,
-            seq: event.seq,
-            kind: RetainedLifecycleEventKind::new(event.kind),
+            event,
+            guards: Arc::new(guards),
         }
     }
 
     fn into_public(self) -> LifecycleEvent {
-        LifecycleEvent {
-            scope_path: self.scope_path,
-            scope: self.scope,
-            seq: self.seq,
-            kind: self.kind.into_public(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RetainedLifecycleEventKind {
-    Added {
-        id: ChildId,
-        membership: Membership,
-    },
-    Started {
-        id: ChildId,
-        membership: Membership,
-        incarnation: Incarnation,
-    },
-    Ready {
-        id: ChildId,
-        membership: Membership,
-        incarnation: Incarnation,
-    },
-    Exited {
-        id: ChildId,
-        membership: Membership,
-        incarnation: Incarnation,
-        exit: RetainedExit,
-    },
-    RestartScheduled {
-        id: ChildId,
-        membership: Membership,
-        attempt: RestartAttempt,
-        delay: Duration,
-    },
-    Removed {
-        id: ChildId,
-        membership: Membership,
-        last_incarnation: Option<Incarnation>,
-    },
-    ScopeState {
-        state: ScopeState,
-        retained_exits: Vec<RetainedExit>,
-    },
-}
-
-impl RetainedLifecycleEventKind {
-    fn new(kind: LifecycleEventKind) -> Self {
-        match kind {
-            LifecycleEventKind::Added { id, membership } => Self::Added { id, membership },
-            LifecycleEventKind::Started {
-                id,
-                membership,
-                incarnation,
-            } => Self::Started {
-                id,
-                membership,
-                incarnation,
-            },
-            LifecycleEventKind::Ready {
-                id,
-                membership,
-                incarnation,
-            } => Self::Ready {
-                id,
-                membership,
-                incarnation,
-            },
-            LifecycleEventKind::Exited {
-                id,
-                membership,
-                incarnation,
-                exit,
-            } => Self::Exited {
-                id,
-                membership,
-                incarnation,
-                exit: RetainedExit::new(exit),
-            },
-            LifecycleEventKind::RestartScheduled {
-                id,
-                membership,
-                attempt,
-                delay,
-            } => Self::RestartScheduled {
-                id,
-                membership,
-                attempt,
-                delay,
-            },
-            LifecycleEventKind::Removed {
-                id,
-                membership,
-                last_incarnation,
-            } => Self::Removed {
-                id,
-                membership,
-                last_incarnation,
-            },
-            LifecycleEventKind::ScopeState { state } => {
-                let mut retained_exits = Vec::new();
-                RetainedExit::retain_scope_state(&mut retained_exits, &state);
-                Self::ScopeState {
-                    state,
-                    retained_exits,
-                }
-            }
-        }
-    }
-
-    fn into_public(self) -> LifecycleEventKind {
-        match self {
-            Self::Added { id, membership } => LifecycleEventKind::Added { id, membership },
-            Self::Started {
-                id,
-                membership,
-                incarnation,
-            } => LifecycleEventKind::Started {
-                id,
-                membership,
-                incarnation,
-            },
-            Self::Ready {
-                id,
-                membership,
-                incarnation,
-            } => LifecycleEventKind::Ready {
-                id,
-                membership,
-                incarnation,
-            },
-            Self::Exited {
-                id,
-                membership,
-                incarnation,
-                exit,
-            } => LifecycleEventKind::Exited {
-                id,
-                membership,
-                incarnation,
-                exit: exit.into_exit(),
-            },
-            Self::RestartScheduled {
-                id,
-                membership,
-                attempt,
-                delay,
-            } => LifecycleEventKind::RestartScheduled {
-                id,
-                membership,
-                attempt,
-                delay,
-            },
-            Self::Removed {
-                id,
-                membership,
-                last_incarnation,
-            } => LifecycleEventKind::Removed {
-                id,
-                membership,
-                last_incarnation,
-            },
-            Self::ScopeState {
-                state,
-                retained_exits,
-            } => {
-                // The public state now owns the raw copies. Converting the
-                // guards back to ordinary exits preserves caller-controlled
-                // last-drop timing at this read boundary.
-                for exit in retained_exits {
-                    drop(exit.into_exit());
-                }
-                LifecycleEventKind::ScopeState { state }
-            }
-        }
+        let Self { event, guards } = self;
+        // A broadcast receive owns a clone of the retained wrapper. Moving the
+        // public event out first leaves its raw exits protected while this
+        // cloned guard allocation is released as refcount traffic.
+        drop(guards);
+        event
     }
 }
 

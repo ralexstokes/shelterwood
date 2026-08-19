@@ -699,6 +699,7 @@ mod tests {
         sync::{
             Arc, Mutex, Weak,
             atomic::{AtomicUsize, Ordering},
+            mpsc,
         },
         task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
         thread::ThreadId,
@@ -712,6 +713,8 @@ mod tests {
         ActorRef, DeadlineOperation, DeadlinePhase, MailboxCell, SendFuture, SendFutureState,
         SendOperation,
     };
+
+    const DISPOSAL_WAIT: Duration = Duration::from_secs(5);
 
     #[derive(Default)]
     struct WakerVtableCalls {
@@ -851,11 +854,15 @@ mod tests {
         );
     }
 
-    struct CountedDrop(Arc<AtomicUsize>);
+    struct CountedDrop {
+        drops: Arc<AtomicUsize>,
+        disposed: mpsc::Sender<()>,
+    }
 
     impl Drop for CountedDrop {
         fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            let _ = self.disposed.send(());
         }
     }
 
@@ -863,17 +870,18 @@ mod tests {
     fn dropping_a_never_polled_send_disposes_the_message_exactly_once() {
         let (mailbox, actor): (Arc<MailboxCell<CountedDrop>>, ActorRef<CountedDrop>) = actor_for();
         let drops = Arc::new(AtomicUsize::new(0));
+        let (disposed, disposal) = mpsc::channel();
 
-        drop(actor.send(CountedDrop(Arc::clone(&drops))));
+        drop(actor.send(CountedDrop {
+            drops: Arc::clone(&drops),
+            disposed,
+        }));
 
         // The never-submitted message routes through detached isolated
         // disposal on another thread, so acknowledge it with a bounded wait.
-        for _ in 0..1_000 {
-            if drops.load(Ordering::SeqCst) == 1 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        disposal
+            .recv_timeout(DISPOSAL_WAIT)
+            .expect("isolated disposal destroys the never-submitted message");
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let state = mailbox.state.lock().expect("mailbox mutex poisoned");
         assert!(state.queue.is_empty());
@@ -882,20 +890,38 @@ mod tests {
 
     /// Records the thread a destructor ran on, so a test can tell an inline
     /// destructor apart from one that reached isolated disposal.
-    type DisposalThread = Arc<Mutex<Option<ThreadId>>>;
+    #[derive(Clone)]
+    struct DisposalThread {
+        recorded: Arc<Mutex<Option<ThreadId>>>,
+        notification: mpsc::Sender<ThreadId>,
+        receiver: Arc<Mutex<mpsc::Receiver<ThreadId>>>,
+    }
 
     fn disposal_thread() -> DisposalThread {
-        Arc::new(Mutex::new(None))
+        let (notification, receiver) = mpsc::channel();
+        DisposalThread {
+            recorded: Arc::new(Mutex::new(None)),
+            notification,
+            receiver: Arc::new(Mutex::new(receiver)),
+        }
     }
 
     fn await_disposal(recorder: &DisposalThread) -> ThreadId {
-        for _ in 0..1_000 {
-            if let Some(thread) = *recorder.lock().expect("disposal recorder mutex") {
-                return thread;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        if let Some(thread) = *recorder.recorded.lock().expect("disposal recorder mutex") {
+            return thread;
         }
-        panic!("isolated disposal never destroyed the value")
+        recorder
+            .receiver
+            .lock()
+            .expect("disposal notification receiver mutex")
+            .recv_timeout(DISPOSAL_WAIT)
+            .expect("isolated disposal destroys the value")
+    }
+
+    fn record_disposal(recorder: &DisposalThread) {
+        let thread = std::thread::current().id();
+        *recorder.recorded.lock().expect("disposal recorder mutex") = Some(thread);
+        let _ = recorder.notification.send(thread);
     }
 
     /// A caller waker whose destructor records itself and then panics.
@@ -909,7 +935,7 @@ mod tests {
 
     impl Drop for HostileWakerDrop {
         fn drop(&mut self) {
-            *self.0.lock().expect("disposal recorder mutex") = Some(std::thread::current().id());
+            record_disposal(&self.0);
             panic!("injected waker drop panic");
         }
     }
@@ -918,7 +944,7 @@ mod tests {
 
     impl Drop for ThreadRecordingDrop {
         fn drop(&mut self) {
-            *self.0.lock().expect("disposal recorder mutex") = Some(std::thread::current().id());
+            record_disposal(&self.0);
         }
     }
 
@@ -978,7 +1004,7 @@ mod tests {
         send: &mut std::pin::Pin<Box<SendFuture<M>>>,
         recorder: &DisposalThread,
     ) {
-        let hostile = Waker::from(Arc::new(HostileWakerDrop(Arc::clone(recorder))));
+        let hostile = Waker::from(Arc::new(HostileWakerDrop(recorder.clone())));
         assert!(
             send.as_mut()
                 .poll(&mut Context::from_waker(&hostile))
@@ -1035,7 +1061,7 @@ mod tests {
 
         let message_thread = disposal_thread();
         let waker_thread = disposal_thread();
-        let mut send = Box::pin(actor.send(ThreadRecordingDrop(Arc::clone(&message_thread))));
+        let mut send = Box::pin(actor.send(ThreadRecordingDrop(message_thread.clone())));
         park_behind_hostile_waker(&mut send, &waker_thread);
 
         drop(send);

@@ -623,6 +623,41 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
 // them, so a competing terminalizer can never publish an exit that diverges
 // from the one the lifecycle stream carries.
 
+/// The reachable half of the fail-closed admission contract.
+///
+/// `Admission`'s documented behaviour when the driver's completion route is
+/// lost is produced by the request obligation's drop fallback, not by the
+/// receiver-side `unwrap_or_else` that `lost_admission_response_policy_fails_closed`
+/// pins: that branch is unreachable precisely because this one always
+/// publishes. Observe the value a caller actually gets.
+#[crate::runtime::test]
+async fn a_dropped_admission_request_publishes_the_fail_closed_response() {
+    let (scope, _event_receiver, mut dynamic_event_receiver, _control) = running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    reservation
+        .slot
+        .define(ChildConstruction::Task(TaskDef::new(|_| future::pending())));
+    let (mut response, request) =
+        begin_admission(&reservation, &mut dynamic_event_receiver, None).await;
+
+    // Destroying the request without completing it is the only path that
+    // reaches the obligation's fallback.
+    drop(request);
+
+    assert_eq!(
+        response.try_receive(),
+        Some(Err(crate::driver::LOST_ADMISSION_RESPONSE_ERROR)),
+        "a lost admission completion route fails closed on the documented error"
+    );
+    assert_eq!(
+        crate::driver::LOST_ADMISSION_RESPONSE_ERROR,
+        ReserveError::NotAdmitting(crate::NotAdmittingCause::Terminal),
+        "the `Admission` doc comment names this error"
+    );
+}
+
 #[crate::runtime::test]
 async fn annulment_before_admission_owns_never_started_terminality() {
     let (mut scope, _event_receiver, mut dynamic_event_receiver, control) =

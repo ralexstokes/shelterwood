@@ -745,11 +745,29 @@ async fn owning_shutdown_joins_recursively_aborted_scope_drivers() {
 
 #[tokio::test]
 async fn subtree_shutdown_and_wait_zero_escalates_and_joins_its_target_incarnation() {
+    let live = Arc::new(AtomicBool::new(true));
+    struct Clears(Arc<AtomicBool>);
+    impl Drop for Clears {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
     let mut nested = Tree::new();
     let leaf = nested
         .add_task(
             "leaf",
-            TaskDef::new(|_| future::pending()).shutdown(Shutdown::Abort),
+            TaskDef::new({
+                let live = Arc::clone(&live);
+                move |_| {
+                    let guard = Clears(Arc::clone(&live));
+                    async move {
+                        let _guard = guard;
+                        future::pending().await
+                    }
+                }
+            })
+            .shutdown(Shutdown::Abort),
         )
         .expect("valid leaf");
     let mut root = Tree::new();
@@ -763,6 +781,13 @@ async fn subtree_shutdown_and_wait_zero_escalates_and_joins_its_target_incarnati
         .shutdown_and_wait(Duration::ZERO)
         .await
         .expect_err("zero budget immediately escalates the live leaf");
+    // Immediately, before any further await: the zero-width path still runs
+    // the ordinary abort tail, so the straggler is already joined when the
+    // call returns rather than merely eventually terminalized.
+    assert!(
+        !live.load(Ordering::SeqCst),
+        "shutdown_and_wait returns only after joining its escalated straggler"
+    );
     assert_eq!(timeout.stragglers.len(), 1);
     assert_eq!(
         timeout.stragglers[0]

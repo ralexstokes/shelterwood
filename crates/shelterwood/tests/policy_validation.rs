@@ -17,6 +17,11 @@ fn jitter_sample_facade_clamps_and_drives_equal_jitter() {
         JitterSample::new(1.0 - f64::EPSILON),
         "the public sample clamps to the documented half-open range"
     );
+    assert_ne!(
+        JitterSample::new(1.0),
+        JitterSample::new(0.5),
+        "the clamp ceiling is the top of the range, not an arbitrary interior point"
+    );
 
     let backoff =
         Backoff::fixed(Duration::from_nanos(100), Jitter::Equal).expect("the delay is non-zero");
@@ -28,6 +33,11 @@ fn jitter_sample_facade_clamps_and_drives_equal_jitter() {
         backoff.next_delay(RestartAttempt::ZERO.bump(), JitterSample::new(0.5)),
         Duration::from_nanos(75),
         "the supplied sample, rather than hidden randomness, selects the delay"
+    );
+    assert_eq!(
+        backoff.next_delay(RestartAttempt::ZERO.bump(), JitterSample::new(1.0)),
+        Duration::from_nanos(100),
+        "the clamped ceiling is observable through the delay it produces: an          over-range sample spans the whole equal-jitter band, one nanosecond          rounding included"
     );
 }
 

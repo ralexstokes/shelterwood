@@ -67,7 +67,7 @@ impl ScopeRuntime {
     /// precedes it can shrink the declared initial set — the completion is
     /// retained until the batch epilogue recomputes the aggregate. That
     /// ordering is what makes a returned `RemoveOutcome::Removed` imply
-    /// startup already saw the shrunken set (SPEC §6).
+    /// startup already saw the shrunken set (SPEC §7).
     fn release_removed_entry(&mut self, entry: DynamicEntry) {
         if self.supervisor.lifecycle().is_starting() {
             self.pending_startup_removals.push(entry);

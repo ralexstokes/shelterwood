@@ -8,7 +8,7 @@
 //! to be reachable at all.
 //!
 //! What the walk checks is the reducer-expressible subset of SPEC's invariant
-//! list: R1–R6 (§6.1), E4 (§7.1), and S3–S5 (§10.1). The rest of the list —
+//! list: R1–R6, E4, and S3–S5 (§15.3). The rest of the list —
 //! the stop ladder (S1/S2), the sampled latches (S6), driver death (S7), the
 //! exit funnel (E1–E3/E5/E6), and tree lowering (T1–T7) — is not stated over
 //! `SupervisorState`, so it is not claimable here and is left to the engine
@@ -728,7 +728,7 @@ fn check_s5_derived_level_triggered_completion(transition: &Transition<'_>) {
 }
 
 /// Walks every reachable reducer state of every configuration, asserting the
-/// reducer-expressible half of SPEC's invariant list at every transition.
+/// reducer-expressible half of SPEC §15.3's invariant list at every transition.
 ///
 /// This replaces an enumeration of event *schedules* (8!/9! permutations over
 /// a four-event alphabet). Exploring states rather than orderings visits each

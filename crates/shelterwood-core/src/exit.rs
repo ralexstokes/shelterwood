@@ -80,7 +80,7 @@ pub fn stop_reason_precedence(reason: &StopReason) -> u8 {
 /// itself ended. `ShutdownRequested` outranks the structured failures because
 /// a requested stop supersedes whatever the incarnation would otherwise have
 /// reported. `NeverStarted` is the top element because it is not a live
-/// incarnation's verdict at all but the membership-terminal twin of §7's
+/// incarnation's verdict at all but the membership-terminal twin of §8's
 /// `Exit::never_started()` (SPEC B.6): whenever a membership terminalizes
 /// without ever spawning, the scope-state projection must agree with the
 /// membership exit, in either arrival order.

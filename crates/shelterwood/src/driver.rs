@@ -947,7 +947,7 @@ async fn run_nested_tree_with_epoch(
                 // Mirror the loop's `Pending::Shutdown` arm: firing the
                 // child-facing shutdown latch is what makes this scope's exit read
                 // `Cancellation::Observed` at its parent, as a requested stop
-                // must (§11). An ancestor-driven stop already fired that latch
+                // must (§12). An ancestor-driven stop already fired that latch
                 // independently; do not couple its framework observer back to
                 // user-installable cancellation waiters.
                 if self_shutdown {
@@ -1272,7 +1272,7 @@ async fn run_scope_incarnation(
         // batch. Any transition that changes the startup aggregate therefore
         // gets the same recomputation point as terminal completion.
         scope.settle_supervisor();
-        // A removal response is also an observation edge: SPEC §6 promises
+        // A removal response is also an observation edge: SPEC §7 promises
         // that a returned `Removed` has already been incorporated into the
         // startup aggregate. Finalization retains starting-phase obligations
         // until the recomputation above establishes that order.

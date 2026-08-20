@@ -573,7 +573,7 @@ impl Drop for DoublePanicActor {
     }
 }
 
-/// §7's containment boundary at the raw layer: a `run` panic is caught
+/// §8's containment boundary at the raw layer: a `run` panic is caught
 /// before the actor value is destroyed, so a destructor that also panics is
 /// a second contained panic — the process survives and exactly one
 /// `Panicked` report publishes, carrying the run panic's payload.
@@ -690,7 +690,7 @@ impl RawActor for ScopeQuitterRaw {
 }
 
 /// `RawContext::request_scope_shutdown` targets the supervising scope
-/// (§7): the nested scope drains as `ShutdownRequested` while the parent
+/// (§12): the nested scope drains as `ShutdownRequested` while the parent
 /// and its other children keep running.
 #[tokio::test]
 async fn raw_context_scope_shutdown_request_stops_only_the_supervising_scope() {

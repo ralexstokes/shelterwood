@@ -389,7 +389,7 @@ async fn timed_send_withdraws_while_replacement_is_in_backoff() {
 
 /// Dropping a parked send while the mailbox is unbound (the rebind window)
 /// withdraws it: the replacement incarnation never sees the message even
-/// though promotion runs at the next bind (§5.1's withdrawal rule).
+/// though promotion runs at the next bind (§5.2's withdrawal rule).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropping_a_parked_send_in_the_rebind_window_withdraws_it() {
     let factories = Arc::new(AtomicUsize::new(0));

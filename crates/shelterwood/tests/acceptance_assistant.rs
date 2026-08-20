@@ -749,7 +749,7 @@ impl Actor for IdleSessionActor {
         match message {
             IdleMessage::Activity => {
                 // Re-keying replaces the pending deadline: activity pushes
-                // idleness out instead of stacking timers (§5.3).
+                // idleness out instead of stacking timers (§6.3).
                 context
                     .set_timeout("idle", IdleMessage::IdleExpired, IDLE_AFTER)
                     .expect("live session re-arms its idle timer");

@@ -1666,7 +1666,7 @@ async fn removal_of_a_polled_split_definition_keeps_the_scope_admitting() {
         }
     })));
     // The first poll queues the admission with the driver; the removal then
-    // lands before the driver dequeues it — §13.12's mandated race, which
+    // lands before the driver dequeues it — §16.12's mandated race, which
     // must resolve `ReservationEnded` while the scope keeps admitting.
     assert!(poll_once(admission.as_mut()).is_pending());
     assert_eq!(scope.remove("worker").await, RemoveOutcome::Removed);
@@ -1841,7 +1841,7 @@ async fn admissions_return_kind_specific_handles_directly() {
 }
 
 /// A root whose initial child fails before its readiness edge publishes
-/// `StartupFailed` and keeps the started prefix supervised (§6); reservation
+/// `StartupFailed` and keeps the started prefix supervised (§7); reservation
 /// and admission on that scope both surface the dedicated cause.
 #[tokio::test]
 async fn startup_failed_roots_reject_reservation_and_admission_with_startup_failed() {

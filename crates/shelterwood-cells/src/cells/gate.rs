@@ -121,7 +121,7 @@ impl<'a> ObservationTxn<'a> {
         // released first, two transactions on one gate could interleave as
         // "T1 unlocks, T2 stages and installs a newer cut, T1 installs its
         // stale one", leaving every ungated borrow behind the tree until some
-        // later publication corrected it. SPEC §12 promises this ordering.
+        // later publication corrected it. SPEC §14 promises this ordering.
         // This install segment must remain panic-free apart from unreachable
         // invariant assertions. A panic raised here runs from `Drop`, escapes
         // before the post-unlock accumulator, and would strand later snapshot

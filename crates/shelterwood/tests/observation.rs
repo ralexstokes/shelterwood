@@ -926,7 +926,7 @@ async fn unspawned_scope_publishes_terminal_values_before_both_observers_close()
 /// terminal edges: the active child's `Exited` and `Removed` are published
 /// before the scope's final event, no snapshot row of a stopped scope keeps
 /// a live incarnation, and the member's handles resolve terminal (§3.2's
-/// exact pairing; §13.7 on the abort path).
+/// exact pairing; §16.7 on the abort path).
 #[tokio::test]
 async fn hard_aborted_scope_pairs_added_with_exited_and_removed() {
     let mut nested = Tree::new();
@@ -994,7 +994,7 @@ async fn hard_aborted_scope_pairs_added_with_exited_and_removed() {
 }
 
 /// A member that never spawned is the plain `Stopped { NeverStarted }`
-/// terminal (B.6) — `StartupAborted` is reserved for the §6 case: a
+/// terminal (B.6) — `StartupAborted` is reserved for the §7 case: a
 /// membership that ran and failed before its initial readiness edge.
 #[tokio::test]
 async fn never_ran_members_stop_rather_than_report_startup_abort() {

@@ -1648,7 +1648,7 @@ impl RawActor for NeverConstructed {
 #[tokio::test]
 async fn immediate_raw_construction_panic_classifies_post_ready() {
     // Resolved-`Immediate` readiness publishes at spawn, before the raw
-    // factory runs (SPEC §6): a construction panic is a post-ready failure,
+    // factory runs (SPEC §7): a construction panic is a post-ready failure,
     // so ordered startup has already advanced past the child and later
     // siblings still start.
     let sibling_started = Arc::new(AtomicBool::new(false));

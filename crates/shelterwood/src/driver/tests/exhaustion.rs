@@ -223,7 +223,7 @@ async fn incarnation_exhaustion_uses_post_disposal_retention_routing() {
 }
 
 /// Exhaustion terminalizes a membership that never spawned. B.6 makes
-/// that the plain `Stopped { NeverStarted }` verdict; §6's
+/// that the plain `Stopped { NeverStarted }` verdict; §7's
 /// `StartupAborted` stays reserved for a membership that ran and failed
 /// before its initial readiness edge. The pre-readiness position still
 /// has to route the scope's startup failure.
@@ -282,7 +282,7 @@ async fn first_spawn_exhaustion_stops_without_reporting_a_startup_abort() {
     );
     assert!(
         !scope.children[key].slot.member.record().startup_aborted,
-        "§6's startup-abort flag belongs to a membership that ran"
+        "§7's startup-abort flag belongs to a membership that ran"
     );
     assert!(
         matches!(

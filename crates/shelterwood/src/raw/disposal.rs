@@ -43,7 +43,10 @@ impl<F: Future> Future for CatchUnwindFuture<F> {
                 let future = this.future.take();
                 match catch_panic(|| drop(future)) {
                     Ok(()) => Poll::Ready(Ok(value)),
-                    Err(payload) => Poll::Ready(Err(payload)),
+                    Err(payload) => {
+                        discard_panic(catch_panic(|| drop(value)).err());
+                        Poll::Ready(Err(payload))
+                    }
                 }
             }
             Ok(Poll::Pending) => Poll::Pending,
@@ -179,5 +182,193 @@ impl<T> Drop for Contained<T> {
         if let Some(value) = self.value.take() {
             self.disposal.dispose(value);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future::Future,
+        panic::panic_any,
+        pin::Pin,
+        process::Command,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, Waker},
+    };
+
+    use super::{CatchUnwindFuture, PanicPayload, discard_panic};
+
+    struct PanickingOutput {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for PanickingOutput {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            panic!("injected output destructor panic");
+        }
+    }
+
+    struct RecursivelyPanickingPayload;
+
+    impl Drop for RecursivelyPanickingPayload {
+        fn drop(&mut self) {
+            panic_any(RecursivelyPanickingPayload);
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum FutureDropPayload {
+        Message,
+        Recursive,
+    }
+
+    struct ReadyThenDropPanics {
+        output: Option<PanickingOutput>,
+        drops: Arc<AtomicUsize>,
+        payload: FutureDropPayload,
+    }
+
+    impl Future for ReadyThenDropPanics {
+        type Output = PanickingOutput;
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(self.output.take().expect("the test future is polled once"))
+        }
+    }
+
+    impl Drop for ReadyThenDropPanics {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            match self.payload {
+                FutureDropPayload::Message => panic!("injected future destructor panic"),
+                FutureDropPayload::Recursive => panic_any(RecursivelyPanickingPayload),
+            }
+        }
+    }
+
+    struct PollThenDropPanics {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for PollThenDropPanics {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            panic!("injected poll panic");
+        }
+    }
+
+    impl Drop for PollThenDropPanics {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            panic!("injected future destructor panic");
+        }
+    }
+
+    fn ready_error<T>(polled: Poll<Result<T, PanicPayload>>) -> PanicPayload {
+        match polled {
+            Poll::Ready(Err(payload)) => payload,
+            Poll::Ready(Ok(_)) => panic!("the hostile future unexpectedly succeeded"),
+            Poll::Pending => panic!("the hostile future unexpectedly remained pending"),
+        }
+    }
+
+    fn panic_message(payload: &PanicPayload) -> Option<&str> {
+        payload
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+    }
+
+    #[test]
+    fn completed_future_drop_panic_wins_and_output_drop_is_contained() {
+        let future_drops = Arc::new(AtomicUsize::new(0));
+        let output_drops = Arc::new(AtomicUsize::new(0));
+        let mut boundary = Box::pin(CatchUnwindFuture::new(ReadyThenDropPanics {
+            output: Some(PanickingOutput {
+                drops: Arc::clone(&output_drops),
+            }),
+            drops: Arc::clone(&future_drops),
+            payload: FutureDropPayload::Message,
+        }));
+
+        let payload = ready_error(
+            boundary
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+        );
+        assert_eq!(
+            panic_message(&payload),
+            Some("injected future destructor panic")
+        );
+        discard_panic(Some(payload));
+        assert_eq!(future_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(output_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn poll_panic_wins_and_future_drop_panic_is_contained() {
+        let future_drops = Arc::new(AtomicUsize::new(0));
+        let mut boundary = Box::pin(CatchUnwindFuture::new(PollThenDropPanics {
+            drops: Arc::clone(&future_drops),
+        }));
+
+        let payload = ready_error(
+            boundary
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+        );
+        assert_eq!(panic_message(&payload), Some("injected poll panic"));
+        discard_panic(Some(payload));
+        assert_eq!(future_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn hostile_output_cannot_abort_while_a_hostile_future_panic_is_retained() {
+        const CHILD_ENV: &str = "SHELTERWOOD_CATCH_UNWIND_OUTPUT_CHILD";
+        const TEST_NAME: &str = "raw::disposal::tests::hostile_output_cannot_abort_while_a_hostile_future_panic_is_retained";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let future_drops = Arc::new(AtomicUsize::new(0));
+            let output_drops = Arc::new(AtomicUsize::new(0));
+            let mut boundary = Box::pin(CatchUnwindFuture::new(ReadyThenDropPanics {
+                output: Some(PanickingOutput {
+                    drops: Arc::clone(&output_drops),
+                }),
+                drops: Arc::clone(&future_drops),
+                payload: FutureDropPayload::Recursive,
+            }));
+
+            let payload = ready_error(
+                boundary
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+            );
+            discard_panic(Some(payload));
+            assert_eq!(future_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(output_drops.load(Ordering::SeqCst), 1);
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().expect("unit-test executable"))
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("hostile-output subprocess starts");
+
+        assert!(
+            output.status.success(),
+            "hostile-output subprocess must return the retained panic instead of aborting\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }

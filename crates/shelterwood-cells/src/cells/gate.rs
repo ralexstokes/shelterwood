@@ -122,6 +122,11 @@ impl<'a> ObservationTxn<'a> {
         // "T1 unlocks, T2 stages and installs a newer cut, T1 installs its
         // stale one", leaving every ungated borrow behind the tree until some
         // later publication corrected it. SPEC §12 promises this ordering.
+        // This install segment must remain panic-free apart from unreachable
+        // invariant assertions. A panic raised here runs from `Drop`, escapes
+        // before the post-unlock accumulator, and would strand later snapshot
+        // installations plus every queued effect; the current path invokes no
+        // user code and defers generation exhaustion into `effects`.
         for publication in self.snapshots.drain(..) {
             publication.install(&mut self.effects);
         }

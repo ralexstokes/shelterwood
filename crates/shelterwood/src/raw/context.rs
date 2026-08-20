@@ -696,12 +696,11 @@ impl<M> Default for RawResources<M> {
 }
 
 impl<M> RawResources<M> {
-    fn freeze(&mut self) -> usize {
+    fn freeze(&mut self) {
         if !self.accepting {
-            return 0;
+            return;
         }
         self.accepting = false;
-        let dropped_continuations = self.continuations.len();
         // Treat the whole freeze as one cleanup transaction. Cancellation
         // contains each latch wake, future disposal and task abort
         // independently, while this outer accumulator keeps one failure from
@@ -728,7 +727,6 @@ impl<M> RawResources<M> {
             // synchronous cleanup has completed without losing the diagnostic.
             self.disposal.panic.restore_first(payload);
         }
-        dropped_continuations
     }
 
     /// Drops ledger entries for offloads that already finished, keeping a
@@ -765,7 +763,6 @@ impl<M> RawResources<M> {
                             "library-owned offload task panicked without a string payload"
                                 .to_owned()
                         });
-                        tracing::error!(%message, "library-owned offload task panicked");
                         self.disposal.panic.record(Box::new(message));
                     }
                 }
@@ -778,10 +775,7 @@ impl<M> RawResources<M> {
 
 impl<M> Drop for RawResources<M> {
     fn drop(&mut self) {
-        let freeze_panic = catch_panic(|| {
-            let _ = self.freeze();
-        })
-        .err();
+        let freeze_panic = catch_panic(|| self.freeze()).err();
         let mut panics = PanicAccumulator::default();
         // `freeze` can transfer a destructor panic into the shared slot. Take
         // that retained application diagnostic after cleanup and preserve it
@@ -933,7 +927,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// from the epilogue.
     pub fn stop(&mut self) {
         self.receiver.freeze();
-        self.freeze_and_report();
+        self.freeze_resources();
         self.local_stop.fire();
     }
 
@@ -949,7 +943,7 @@ impl<M: Send + 'static> RawContext<M> {
         // publishes it through the initializer context's Drop fallback.
         self.deferred_init_stop = true;
         self.receiver.freeze();
-        self.freeze_and_report();
+        self.freeze_resources();
     }
 
     /// Closes the callback initializer boundary. Consuming the pending bit
@@ -1135,7 +1129,7 @@ impl<M: Send + 'static> RawContext<M> {
         loop {
             if self.local_stop.is_fired() {
                 self.receiver.freeze();
-                self.freeze_and_report();
+                self.freeze_resources();
                 // `stop()` originates on this task, but the configured
                 // shutdown ladder is owned by the driver. The driver's helper
                 // only observes the local-stop latch and forwards
@@ -1152,7 +1146,7 @@ impl<M: Send + 'static> RawContext<M> {
                 // also freezes before cancellation, but correctness of this
                 // receive boundary does not depend on that remote ordering.
                 self.receiver.freeze();
-                self.freeze_and_report();
+                self.freeze_resources();
                 self.resources.resume_pending_panic();
                 return None;
             }
@@ -1194,7 +1188,7 @@ impl<M: Send + 'static> RawContext<M> {
             // not rely on the driver's mailbox-freeze ordering relative to
             // the shutdown latch this call observes.
             self.receiver.freeze();
-            self.freeze_and_report();
+            self.freeze_resources();
             self.resources.resume_pending_panic();
             self.receiver.try_recv()
         } else {
@@ -1565,22 +1559,10 @@ impl<M: Send + 'static> RawContext<M> {
         .await;
     }
 
+    /// Freezes incarnation resources on the exit path, discarding §6.2's
+    /// queued continuations.
     pub(crate) fn freeze_resources(&mut self) {
-        self.freeze_and_report();
-    }
-
-    /// Freezes incarnation resources, reporting §6.2's discarded
-    /// continuations on the exit path.
-    fn freeze_and_report(&mut self) {
-        let dropped = self.resources.freeze();
-        if dropped > 0 {
-            tracing::debug!(
-                id = %self.id,
-                incarnation = ?self.incarnation,
-                dropped_continuations = dropped,
-                "queued continuations discarded at the stop freeze"
-            );
-        }
+        self.resources.freeze();
     }
 
     pub(crate) async fn join_resources(&mut self) {
@@ -2437,7 +2419,7 @@ mod tests {
             task: None,
         });
 
-        assert_eq!(resources.freeze(), 1);
+        resources.freeze();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let payload = resources
             .disposal
@@ -2477,7 +2459,7 @@ mod tests {
             task: None,
         });
 
-        assert_eq!(resources.freeze(), 0);
+        resources.freeze();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let payload = resources
             .disposal
@@ -2498,9 +2480,13 @@ mod tests {
             .continuations
             .push_back(PanickingDrop(Arc::clone(&drops)));
 
-        assert_eq!(resources.freeze(), 1);
-        assert_eq!(resources.freeze(), 0, "the freeze transition is one-shot");
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        resources.freeze();
+        resources.freeze();
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the freeze transition is one-shot"
+        );
 
         let payload = catch_unwind(AssertUnwindSafe(|| drop(resources)))
             .expect_err("drop resumes the failure retained by the first freeze");
@@ -2540,7 +2526,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(resources.freeze(), 2);
+        resources.freeze();
         assert_eq!(
             drops.load(Ordering::SeqCst),
             4,

@@ -428,8 +428,9 @@ trait Actor: Sized + Send + 'static {
   classifies `Failed`; §8). Infallible handlers write `Ok(())`; there is
   no `IntoExitResult` conversion trait. There is deliberately no
   stop-outcome return type: clean self-stop is `ctx.stop()` alone (B.1 —
-  effective after the current callback, `Err` outcome wins, idempotent),
-  so the return channel carries errors only and stop has one mechanism
+  intake and incarnation-owned resources freeze at the call, terminal
+  publication follows the callback, `Err` outcome wins, idempotent), so
+  the return channel carries errors only and stop has one mechanism
   (§1 principle 2). Constraints that MUST hold:
   - The blanket loop applies its own `?` only after awaiting the
     callback's exact `ExitResult`.
@@ -2095,17 +2096,20 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   accepted while the membership has *no live incarnation* (a restart
   window — B.9's `shutdown_and_wait` landing between incarnations) is
   held on the membership and armed onto the next incarnation at its
-  start, which then starts and immediately begins teardown. A stop latched
-  before the driver's first settlement likewise still constructs the first
-  incarnation and then immediately tears it down. The two rules partition by
-  target and never conflict: fresh-restart-starts-
-  clear says a latch *consumed by* incarnation N never carries to N+1;
-  the pending latch holds a request that arrived with no incarnation to
-  consume it — it was never any incarnation's spent latch, and it waits
-  for its first. What cannot exist is a stop request silently dropped in
-  the window. Cancelling an awaited membership operation never rides the
-  channel either: it is a per-operation level latch on the operation's
-  cell (§9's linearization rule).
+  start, which then starts and immediately begins teardown. The
+  scope-level latch has its own version of that window: a stop latched
+  before the driver's first settlement is read only at the top of the
+  driver's first loop pass, after the initial incarnations are already
+  published, so it too constructs and then immediately tears down. The
+  two carry rules partition by target and never conflict:
+  fresh-restart-starts-clear says a latch *consumed by* incarnation N
+  never carries to N+1; the pending latch holds a request that arrived
+  with no incarnation to consume it — it was never any incarnation's
+  spent latch, and it waits for its first. What cannot exist is a stop
+  request silently dropped in the window. Cancelling an awaited
+  membership operation never rides the channel either: it is a
+  per-operation level latch on the operation's cell (§9's linearization
+  rule).
 - Rebinding-transparent `send` during teardown can park against an
   unbound sibling; teardown-window notifications use `try_send`. This
   tradeoff is prominent shutdown guidance, alongside the

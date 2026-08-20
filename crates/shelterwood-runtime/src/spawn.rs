@@ -443,9 +443,10 @@ pub(super) fn contain_panic_payload(payload: PanicPayload) -> Option<String> {
             None
         }
     };
-    // A custom panic payload is user-owned too. Its destructor may panic, so
-    // discard it under a fresh unwind boundary before publishing completion.
-    discard_panic(Some(payload));
+    // A custom panic payload is user-owned too. Its destructor may panic or
+    // block, so retire it on the detached disposal lane before publishing
+    // completion.
+    dispose_detached(payload);
     message
 }
 

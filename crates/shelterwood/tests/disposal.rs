@@ -7,6 +7,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     task::{Context, Poll, Wake, Waker},
     thread::{self, ThreadId},
@@ -60,6 +61,26 @@ impl Drop for DropProbe {
 struct BlockingDropProbe {
     dropped: tokio::sync::mpsc::UnboundedSender<ThreadId>,
     _blocker: DestructorBlocker,
+}
+
+struct BlockingPanicPayload {
+    started: mpsc::Sender<ThreadId>,
+    _blocker: DestructorBlocker,
+}
+
+impl BlockingPanicPayload {
+    fn new(gate: &DestructorGate, started: mpsc::Sender<ThreadId>) -> Self {
+        Self {
+            started,
+            _blocker: gate.blocker(),
+        }
+    }
+}
+
+impl Drop for BlockingPanicPayload {
+    fn drop(&mut self) {
+        let _ = self.started.send(thread::current().id());
+    }
 }
 
 impl BlockingDropProbe {
@@ -473,6 +494,58 @@ fn final_factory_capture_is_destroyed_outside_the_current_thread_driver() {
         drops.recv().await.expect("factory capture was destroyed")
     });
     assert_ne!(dropped, driver_thread);
+}
+
+#[test]
+fn blocking_panic_payload_does_not_stall_current_thread_exit_publication() {
+    let driver_thread = thread::current().id();
+    let gate = DestructorGate::default();
+    let (started, started_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let release_gate = gate.clone();
+    let helper = thread::spawn(move || {
+        let destructor_thread = started_rx
+            .recv_timeout(POLL_TIMEOUT)
+            .expect("panic payload destruction starts");
+        let released_after_publication = release_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        release_gate.release();
+        (destructor_thread, released_after_publication)
+    });
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let exit = runtime.block_on(async {
+        let mut tree = Tree::new();
+        let payload = BlockingPanicPayload::new(&gate, started);
+        let (task, _completion) = tree
+            .add_task_once(
+                "panic",
+                TaskOnceDef::new(move |_| async move {
+                    std::panic::panic_any(payload);
+                    #[allow(unreachable_code)]
+                    Ok::<(), ExitError>(())
+                }),
+            )
+            .expect("valid task");
+        let system = tree.spawn().expect("runtime is available");
+        let exit = task.wait().await;
+        release
+            .send(())
+            .expect("payload remains blocked until exit publication");
+        assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+        exit
+    });
+
+    let (destructor_thread, released_after_publication) =
+        helper.join().expect("destructor helper joins");
+    assert!(
+        released_after_publication,
+        "a blocking panic-payload destructor stalled exit publication"
+    );
+    assert_ne!(destructor_thread, driver_thread);
+    assert!(matches!(exit.kind(), ExitKind::Panicked { message: None }));
 }
 
 #[test]

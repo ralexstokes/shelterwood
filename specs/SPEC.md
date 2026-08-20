@@ -750,10 +750,12 @@ surfaces on that task even though the replacement remains accepted.
 Framework-initiated disposal of externally submitted mailbox or
 reply-bearing payloads — including mailbox teardown, timeout/withdrawal
 cleanup, and accepted-prefix batch disposal — runs detached from the
-initiating task with per-element panic containment. Incarnation-owned
-continuations, timer messages, and offload state instead follow §6.5 and
-§8's incarnation teardown and verdict rules. No single disposal-thread
-identity is promised.
+initiating task with per-element panic containment. After extracting any
+string diagnostic, the framework likewise destroys an opaque user panic
+payload on the detached disposal lane rather than on the executor publishing
+the exit. Incarnation-owned continuations, timer messages, and offload state
+instead follow §6.5 and §8's incarnation teardown and verdict rules. No single
+disposal-thread identity is promised.
 
 (The synchronization discipline behind every mailbox transition — the
 effects sink paired with the state guard, and the structural waker slot —

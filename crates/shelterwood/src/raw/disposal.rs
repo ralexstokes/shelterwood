@@ -193,7 +193,6 @@ mod tests {
         future::Future,
         panic::panic_any,
         pin::Pin,
-        process::Command,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -329,55 +328,38 @@ mod tests {
         assert_eq!(future_drops.load(Ordering::SeqCst), 1);
     }
 
+    /// Both destructors here are hostile: the output panics, and the retained
+    /// future-destructor payload panics again when it is dropped. Combining
+    /// them uncontained is an abort, which needs no subprocess harness to
+    /// observe — nextest gives every test its own process, so the abort is
+    /// this test's own failure signal rather than a poisoned run.
     #[test]
     fn hostile_output_destructor_cannot_escape_while_a_hostile_future_panic_is_retained() {
-        const CHILD_ENV: &str = "SHELTERWOOD_CATCH_UNWIND_OUTPUT_CHILD";
-        const TEST_NAME: &str = "raw::disposal::tests::hostile_output_destructor_cannot_escape_while_a_hostile_future_panic_is_retained";
+        let future_drops = Arc::new(AtomicUsize::new(0));
+        let output_drops = Arc::new(AtomicUsize::new(0));
+        let mut boundary = Box::pin(CatchUnwindFuture::new(ReadyThenDropPanics {
+            output: Some(PanickingOutput {
+                drops: Arc::clone(&output_drops),
+            }),
+            drops: Arc::clone(&future_drops),
+            payload: FutureDropPayload::Recursive,
+        }));
 
-        if std::env::var_os(CHILD_ENV).is_some() {
-            let future_drops = Arc::new(AtomicUsize::new(0));
-            let output_drops = Arc::new(AtomicUsize::new(0));
-            let mut boundary = Box::pin(CatchUnwindFuture::new(ReadyThenDropPanics {
-                output: Some(PanickingOutput {
-                    drops: Arc::clone(&output_drops),
-                }),
-                drops: Arc::clone(&future_drops),
-                payload: FutureDropPayload::Recursive,
-            }));
-
-            let payload = ready_error(
-                boundary
-                    .as_mut()
-                    .poll(&mut Context::from_waker(Waker::noop())),
-            );
-            discard_panic(Some(payload));
-            assert_eq!(future_drops.load(Ordering::SeqCst), 1);
-            assert_eq!(output_drops.load(Ordering::SeqCst), 1);
-            return;
-        }
-
-        let output = Command::new(std::env::current_exe().expect("unit-test executable"))
-            .arg("--exact")
-            .arg(TEST_NAME)
-            .arg("--nocapture")
-            .arg("--test-threads=1")
-            .env(CHILD_ENV, "1")
-            .output()
-            .expect("hostile-output subprocess starts");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success(),
-            "hostile-output subprocess must return the retained panic instead of escaping the boundary\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr),
+        let payload = ready_error(
+            boundary
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
         );
-        // A filter matching nothing is a passing libtest run, so the status
-        // check alone goes vacuous the moment this test is renamed or moved.
+        // Establish the verdict before disposing of the payload: this one
+        // cannot be dropped by an assertion's own unwind.
+        let future_payload_survived = payload.is::<RecursivelyPanickingPayload>();
+        discard_panic(Some(payload));
         assert!(
-            stdout.contains("1 passed"),
-            "the subprocess must actually run {TEST_NAME}\nstdout:\n{stdout}",
+            future_payload_survived,
+            "the retained future-destructor payload must survive the hostile output destructor"
         );
+        assert_eq!(future_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(output_drops.load(Ordering::SeqCst), 1);
     }
 
     struct LoggedDrop {

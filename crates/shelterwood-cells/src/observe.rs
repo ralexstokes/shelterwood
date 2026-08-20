@@ -470,9 +470,8 @@ impl SnapshotReceiver {
     /// Waits for and returns a newer snapshot.
     pub async fn changed(&mut self) -> Result<Arc<ScopeSnapshot>, SnapshotClosed> {
         loop {
-            let state = self.inner.borrow_cloned();
+            let state = self.inner.borrow_and_update_cloned();
             if state.generation.current() != self.seen_generation {
-                let state = self.inner.borrow_and_update_cloned();
                 self.seen_generation = state.generation.current();
                 return Ok(state.snapshot.public());
             }
@@ -888,10 +887,6 @@ impl fmt::Debug for LifecycleEvents {
 }
 
 pub(crate) struct LifecycleHub {
-    channels: LifecycleChannels,
-}
-
-struct LifecycleChannels {
     events: runtime::BroadcastSender<RetainedLifecycleEvent>,
     signal: runtime::WatchSender<LifecycleSignal>,
 }
@@ -909,25 +904,27 @@ impl Default for LifecycleHub {
     fn default() -> Self {
         let (events, _) = runtime::broadcast(LIFECYCLE_EVENT_CAPACITY);
         let (signal, _) = runtime::watch(LifecycleSignal::default());
-        Self {
-            channels: LifecycleChannels { events, signal },
-        }
+        Self { events, signal }
     }
 }
 
 impl LifecycleHub {
-    pub(crate) fn subscribe(&self) -> LifecycleEvents {
-        let signal = self.channels.signal.watcher();
+    /// Subscribes while the containing scope's observation gate is held.
+    ///
+    /// Requiring the transaction makes the signal snapshot and broadcast
+    /// subscription atomic with publication by construction.
+    pub(crate) fn subscribe(&self, _txn: &mut crate::cells::ObservationTxn<'_>) -> LifecycleEvents {
+        let signal = self.signal.watcher();
         let seen_explicit_lag = signal.borrow_cloned().explicit_lag;
         LifecycleEvents {
-            events: self.channels.events.subscribe(),
+            events: self.events.subscribe(),
             signal,
             seen_explicit_lag,
         }
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.channels.signal.read_with(|signal| signal.closed)
+        self.signal.read_with(|signal| signal.closed)
     }
 
     /// Publishes while the containing scope's observation gate is held.
@@ -939,26 +936,36 @@ impl LifecycleHub {
         let event = event.into();
         let mut published = false;
         let mut undelivered = None;
-        self.channels.signal.modify_silently(|signal| {
+        self.signal.modify_silently(|signal| {
             if signal.closed {
                 undelivered = Some(event);
                 return;
             }
-            undelivered = self.channels.events.send(event).err();
+            // Keep insertion under the gate. Deferring `send` would let two
+            // transactions flush out of `seq` order, invert a child's `Added`
+            // edge against events from inside it, and expose closure before
+            // the final event from the closing transaction. Tokio's send does
+            // not invoke a user callback here: Shelterwood never awaits the
+            // broadcast receiver, so its waiter list is empty. A full ring can
+            // evict a retained event in this call, whose last guard may submit
+            // critical disposal under both locks. That submission is
+            // refcount/framework work only and is the accepted trade because
+            // drop glue inside the send has no transaction sink to reach.
+            undelivered = self.events.send(event).err();
             published = true;
         });
         if let Some(undelivered) = undelivered {
-            drop(undelivered);
+            txn.defer(move || drop(undelivered));
         }
         if published {
-            txn.pulse(&self.channels.signal);
+            txn.pulse(&self.signal);
         }
     }
 
     /// Publishes an explicit lag marker under the observation gate.
     pub(crate) fn publish_lagged(&self, txn: &mut crate::cells::ObservationTxn<'_>, dropped: u64) {
         let mut published = false;
-        self.channels.signal.modify_silently(|signal| {
+        self.signal.modify_silently(|signal| {
             if signal.closed {
                 return;
             }
@@ -966,21 +973,21 @@ impl LifecycleHub {
             published = true;
         });
         if published {
-            txn.pulse(&self.channels.signal);
+            txn.pulse(&self.signal);
         }
     }
 
     /// Closes while the containing scope's observation gate is held.
     pub(crate) fn close(&self, txn: &mut crate::cells::ObservationTxn<'_>) {
         let mut modified = false;
-        self.channels.signal.modify_silently(|signal| {
+        self.signal.modify_silently(|signal| {
             if !signal.closed {
                 signal.closed = true;
                 modified = true;
             }
         });
         if modified {
-            txn.pulse(&self.channels.signal);
+            txn.pulse(&self.signal);
         }
     }
 }
@@ -989,11 +996,8 @@ impl fmt::Debug for LifecycleHub {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LifecycleHub")
-            .field("receivers", &self.channels.events.receiver_count())
-            .field(
-                "closed",
-                &self.channels.signal.read_with(|signal| signal.closed),
-            )
+            .field("receivers", &self.events.receiver_count())
+            .field("closed", &self.signal.read_with(|signal| signal.closed))
             .finish()
     }
 }
@@ -1363,7 +1367,9 @@ mod tests {
     #[shelterwood_runtime::test]
     async fn lifecycle_close_wakes_parked_receivers() {
         let hub = Arc::new(LifecycleHub::default());
-        let mut events = hub.subscribe();
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let mut events = hub.subscribe(&mut txn);
+        drop(txn);
         let waiter = runtime::spawn(async move { events.recv().await });
         runtime::yield_now().await;
 
@@ -1382,8 +1388,8 @@ mod tests {
             .expect("membership available")
             .membership();
         let hub = LifecycleHub::default();
-        let mut events = hub.subscribe();
         let mut txn = crate::cells::ObservationTxn::detached();
+        let mut events = hub.subscribe(&mut txn);
         hub.close(&mut txn);
 
         hub.publish(
@@ -1421,9 +1427,8 @@ mod tests {
             },
         };
         let hub = LifecycleHub::default();
-        let mut events = hub.subscribe();
-
         let mut txn = crate::cells::ObservationTxn::detached();
+        let mut events = hub.subscribe(&mut txn);
         hub.publish_lagged(&mut txn, 1);
         hub.publish(&mut txn, event(1));
         drop(txn);
@@ -1463,9 +1468,8 @@ mod tests {
             },
         };
         let hub = LifecycleHub::default();
-        let mut events = hub.subscribe();
-
         let mut txn = crate::cells::ObservationTxn::detached();
+        let mut events = hub.subscribe(&mut txn);
         hub.publish_lagged(&mut txn, 2);
         hub.publish(&mut txn, event(1));
         hub.close(&mut txn);
@@ -1476,8 +1480,11 @@ mod tests {
         assert_eq!(events.try_recv(), Ok(LifecycleItem::Lagged { dropped: 2 }));
         assert_eq!(events.try_recv(), Ok(LifecycleItem::Event(event(1))));
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Closed));
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let mut after_close = hub.subscribe(&mut txn);
+        drop(txn);
         assert_eq!(
-            hub.subscribe().try_recv(),
+            after_close.try_recv(),
             Err(LifecycleTryRecvError::Closed),
             "post-close subscribers start at the drained terminal edge"
         );

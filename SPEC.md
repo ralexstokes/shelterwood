@@ -2252,7 +2252,8 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
 5. **S5 — completion is derived and level-triggered.** `all_children_joined`
    is derived from child states. `Settle` emits `Finished` once iff the
    lifecycle’s flavor-specific finish predicate accepts that derived value.
-   (`supervisor::derived_completion_property_matches_the_child_states`,
+   (`engine::scope_lifecycle_owns_first_failure_drain_status_and_finish_policy`,
+   `supervisor::derived_completion_property_matches_the_child_states`,
    `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`.)
 6. **S6 — shutdown requests are sampled latches.** Scope shutdown and removal
    are synchronous, idempotent latches sampled into reducer events at step
@@ -2655,13 +2656,13 @@ or lifetime paragraph is unmapped.
   was requested concurrently elsewhere);
   `wait_started()` resolves once at startup and cannot observe a
   later trip, so `wait()` is the post-startup observation point. Natural
-  completion is pinned exactly: an **ordered** scope *finishes* when it
-  has at least one membership and every membership is terminal (a
-  retained terminal child counts — §8's retention is observability, not
-  liveness); a root parked in `StartupFailed` is exempt — it never
-  finishes (the park rule above). The finishing test runs **at each membership's
-  terminalization, strictly before retention-based pruning** removes it
-  (§8's remove-on-terminal default), and its result is latched — so
+  completion is pinned exactly: once aggregate startup has completed, an
+  **ordered** scope *finishes* when it has at least one membership and every
+  membership is terminal (a retained terminal child counts — §8's retention
+  is observability, not liveness); a root parked in `StartupFailed` is exempt —
+  it never finishes (the park rule above). The finishing test runs **at each
+  membership's terminalization, strictly before retention-based pruning**
+  removes it (§8's remove-on-terminal default), and its result is latched — so
   pruning the final one-shot membership can never turn a finished
   workload into an idling empty scope, and pruning order is otherwise
   unobservable. The scope then publishes `Stopped { reason: Finished }` and, when

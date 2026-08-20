@@ -707,8 +707,9 @@ fn check_s5_derived_level_triggered_completion(transition: &Transition<'_>) {
         assert!(
             transition.after.lifecycle().is_draining()
                 || (transition.after.flavor() == ScopeFlavor::Ordered
+                    && transition.after.lifecycle().startup_complete()
                     && !transition.after.is_empty()),
-            "only a draining scope, or a non-empty ordered one, finishes"
+            "only a draining scope, or a running non-empty ordered one, finishes"
         );
     }
     // And its liveness half: settlement is level-triggered, so a drained scope

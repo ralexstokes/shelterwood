@@ -174,13 +174,6 @@ static FALLBACK_DISPOSALS: Mutex<FallbackDisposals> = Mutex::new(FallbackDisposa
     worker_live: false,
 });
 
-/// Queues a disposal job for the shared fallback thread, lazily starting it.
-/// Returns `false` when no worker exists and none could be started; the
-/// caller must then finish the job itself.
-fn enqueue_fallback_disposal(job: Arc<dyn BlockingPoolJob>) -> bool {
-    enqueue_fallback_disposal_with(&FALLBACK_DISPOSALS, job, spawn_fallback_worker)
-}
-
 /// Queues a disposal that must never fall back to the submitting thread.
 ///
 /// The `()` return is the contract: every path transfers ownership. If native
@@ -279,6 +272,17 @@ where
     T: Send + 'static,
     C: FnOnce(Option<DisposalPanic>) + Send + 'static,
 {
+    dispatch_disposal_with(job, &FALLBACK_DISPOSALS, spawn_fallback_worker);
+}
+
+fn dispatch_disposal_with<T, C>(
+    job: Arc<DisposalJob<T, C>>,
+    disposals: &Mutex<FallbackDisposals>,
+    spawn: impl FnOnce() -> std::io::Result<std::thread::JoinHandle<()>>,
+) where
+    T: Send + 'static,
+    C: FnOnce(Option<DisposalPanic>) + Send + 'static,
+{
     // A rejected submission falls through so the fallback thread, rather than
     // this runtime-teardown thread, owns user destruction.
     if submit_blocking_job(&job) {
@@ -293,7 +297,11 @@ where
     // user destructors, exactly what isolation must prevent. Serialization is
     // the accepted trade: one blocking destructor delays later fallback
     // disposals instead of consuming another native thread.
-    if enqueue_fallback_disposal(Arc::clone(&job) as Arc<dyn BlockingPoolJob>) {
+    if enqueue_fallback_disposal_with(
+        disposals,
+        Arc::clone(&job) as Arc<dyn BlockingPoolJob>,
+        spawn,
+    ) {
         return;
     }
 
@@ -379,8 +387,8 @@ mod tests {
     };
 
     use super::{
-        DisposalJob, DisposalPanic, FallbackDisposals, Isolated, dispose_detached,
-        enqueue_fallback_disposal_with, retain_fallback_disposal_with,
+        DisposalJob, DisposalPanic, FallbackDisposals, Isolated, dispatch_disposal_with,
+        dispose_detached, enqueue_fallback_disposal_with, retain_fallback_disposal_with,
     };
     use crate::{
         spawn::BlockingPoolJob,
@@ -484,6 +492,43 @@ mod tests {
             std::io::Error::other("injected thread exhaustion")
         ),));
         assert!(dropped_after_unlock.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn exhausted_runtime_and_thread_creation_finishes_disposal_inline() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let diagnostic = Arc::new(Mutex::new(None));
+        let completion_diagnostic = Arc::clone(&diagnostic);
+        let disposals = Mutex::new(FallbackDisposals::default());
+        let job = DisposalJob::new(PanickingDrop(Arc::clone(&drops)), move |panic| {
+            *completion_diagnostic
+                .lock()
+                .expect("diagnostic mutex poisoned") = Some(panic);
+        });
+
+        // A plain test has no Tokio context, so blocking-pool submission is
+        // rejected. The injected spawner then reaches the final synchronous
+        // degradation path without depending on actual resource exhaustion.
+        dispatch_disposal_with(job, &disposals, || {
+            Err(std::io::Error::other("injected thread exhaustion"))
+        });
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(
+            disposals
+                .lock()
+                .expect("local disposal queue remains healthy")
+                .queue
+                .is_empty(),
+            "a non-critical job rejected by the spawner returns to its submitter"
+        );
+        let diagnostic = diagnostic.lock().expect("diagnostic mutex poisoned");
+        assert!(matches!(
+            diagnostic.as_ref(),
+            Some(Some(DisposalPanic {
+                message: Some(message)
+            })) if message == "cancelled disposal job payload"
+        ));
     }
 
     #[test]

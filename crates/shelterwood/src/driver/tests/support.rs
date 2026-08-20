@@ -20,7 +20,7 @@ pub(super) use crate::{
     SendErrorKind, StartupError, StartupFailure, StartupFailureCause, StopReason, SubtreeDef,
     SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
     cells::LIFECYCLE_EVENT_CAPACITY,
-    engine::{ChildKey, Epoch, Event as SupervisorEvent, ScopeLifecycle, StopLadder, arbitrate},
+    engine::{Epoch, ScopeLifecycle, StopLadder, arbitrate},
     exit::RecordedOutcome,
     identity::{IncarnationCounter, ScopeIdentity},
     mailbox::{MailboxCell, actor_ref_from_parts},
@@ -28,6 +28,7 @@ pub(super) use crate::{
     policy::ResolvedDefaults,
     runtime::{CompletionGatedLatch, DedicatedRuntime, Latch},
 };
+pub(super) use shelterwood_core::supervisor::{ChildKey, Event as SupervisorEvent};
 
 pub(super) struct ObservedExit {
     pub(super) child: ChildKey,

@@ -11,10 +11,7 @@ use crate::{
     cells::{MemberCell, ObservationTxn, ScopeCell},
     definition::DefinitionSource,
     identity::{MembershipReconciliation, ScopeIdentity},
-    policy::{
-        ChildMode, CommonOptions, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor,
-        resolve_common,
-    },
+    policy::{CommonOptions, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor, resolve_common},
     raw::RawConstruction,
     runtime::{self, Isolated, Latch},
     task::TaskConstruction,
@@ -55,7 +52,7 @@ pub(crate) fn resolve_fixture_options(member: &MemberCell) {
     let options = resolve_common(
         &CommonOptions::default(),
         &ResolvedDefaults::default(),
-        ChildMode::Restartable,
+        crate::policy::ChildMode::Restartable,
         Readiness::Immediate,
     );
     member.set_options(options);
@@ -109,13 +106,6 @@ impl SlotCell {
             rejected.is_none(),
             "a child slot was defined more than once"
         );
-    }
-
-    pub(crate) fn is_undefined(&self) -> bool {
-        matches!(
-            *self.definition.lock().expect("definition mutex poisoned"),
-            DefinitionState::Undefined
-        )
     }
 
     fn take_definition(
@@ -192,6 +182,7 @@ impl SlotCell {
         definition
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_policy(
         &self,
         defaults: &ResolvedDefaults,
@@ -201,6 +192,20 @@ impl SlotCell {
             return None;
         };
         Some(self.resolve_defined_policy(definition, defaults))
+    }
+
+    fn resolve_policy_for_lowering(
+        &self,
+        defaults: &ResolvedDefaults,
+    ) -> Result<Option<ResolvedCommonOptions>, DefinitionAlreadyLowered> {
+        let state = self.definition.lock().expect("definition mutex poisoned");
+        match &*state {
+            DefinitionState::Undefined => Ok(None),
+            DefinitionState::Defined(definition) => {
+                Ok(Some(self.resolve_defined_policy(definition, defaults)))
+            }
+            DefinitionState::Lowered => Err(DefinitionAlreadyLowered),
+        }
     }
 
     /// Resolves policy and claims the matching construction under one
@@ -253,12 +258,12 @@ impl SlotCell {
             // nameable, so it arrives here as the kind default.
             ChildConstruction::Raw(definition) => (
                 definition.options(),
-                definition.mode(),
+                definition.source.mode(),
                 definition.readiness(),
             ),
             ChildConstruction::Task(definition) => (
                 definition.options(),
-                definition.mode(),
+                definition.source.mode(),
                 Readiness::Immediate,
             ),
             ChildConstruction::Scope(definition) => {
@@ -266,7 +271,12 @@ impl SlotCell {
                     readiness: None,
                     ..definition.options.clone()
                 };
-                return resolve_common(&options, defaults, definition.mode(), Readiness::Manual);
+                return resolve_common(
+                    &options,
+                    defaults,
+                    definition.source.mode(),
+                    Readiness::Manual,
+                );
             }
         };
         resolve_common(options, defaults, mode, default_readiness)
@@ -350,11 +360,24 @@ impl BuilderCore {
         root_override: Option<Arc<ScopeCell>>,
     ) -> Result<ScopePlan, LowerError> {
         let root = root_override.unwrap_or_else(|| Arc::clone(&self.root));
-        let undefined: Vec<_> = self
+        let defaults = inherited.overlay(&self.config.defaults);
+        // Resolve and classify each definition under one definition-lock pass.
+        // Resolution is pure, so evaluating defined siblings before reporting
+        // an undefined slot cannot publish or consume anything.
+        let resolved: Vec<Result<ResolvedCommonOptions, ChildId>> = self
             .slots
             .iter()
-            .filter(|slot| slot.is_undefined())
-            .map(|slot| slot.member.id().clone())
+            .map(|slot| match slot.resolve_policy_for_lowering(&defaults) {
+                Ok(Some(options)) => Ok(options),
+                Ok(None) => Err(slot.member.id().clone()),
+                Err(DefinitionAlreadyLowered) => {
+                    panic!("a tree must be lowered at most once")
+                }
+            })
+            .collect();
+        let undefined: Vec<_> = resolved
+            .iter()
+            .filter_map(|result| result.as_ref().err().cloned())
             .collect();
         if !undefined.is_empty() {
             let disposal = self.begin_failed_disposal();
@@ -363,7 +386,6 @@ impl BuilderCore {
                 disposal,
             });
         }
-        let (defaults, resolved) = self.resolve_policies(&inherited);
         if !Arc::ptr_eq(&root, &self.root) {
             // From the first adoption on, a failed or unwound lowering must
             // evict the terminalized slots from the override's identity map,
@@ -385,13 +407,11 @@ impl BuilderCore {
         }
         root.set_observation_config(self.config.intensity);
         let mut children = Vec::with_capacity(self.slots.len());
-        debug_assert_eq!(
-            self.slots.len(),
-            resolved.len(),
-            "policy resolution is one entry per slot, in slot order"
-        );
-        for (slot, resolved) in self.slots.iter().zip(resolved) {
-            let resolved = resolved.expect("defined slot must have resolved options");
+        for (slot, resolved) in self
+            .slots
+            .iter()
+            .zip(resolved.into_iter().filter_map(Result::ok))
+        {
             let definition = slot
                 .take_definition()
                 .expect("a tree must be lowered at most once")
@@ -410,21 +430,6 @@ impl BuilderCore {
             children,
             terminality: Some(ScopePlanTerminality),
         })
-    }
-
-    fn resolve_policies(
-        &self,
-        inherited: &ResolvedDefaults,
-    ) -> (ResolvedDefaults, Vec<Option<ResolvedCommonOptions>>) {
-        let defaults = inherited.overlay(&self.config.defaults);
-        // One entry per slot, in slot order. An undefined slot resolves to
-        // `None` rather than being skipped, so this vector can never shift a
-        // later child onto another child's options.
-        let mut resolved = Vec::with_capacity(self.slots.len());
-        for slot in &self.slots {
-            resolved.push(slot.resolve_policy(&defaults));
-        }
-        (defaults, resolved)
     }
 
     fn terminalize(&self) {
@@ -553,14 +558,6 @@ pub(crate) struct ScopeConstruction {
 pub(crate) type ScopeFactory = Arc<dyn Fn() -> BuilderCore + Send + Sync + 'static>;
 
 impl ScopeConstruction {
-    pub(crate) fn mode(&self) -> ChildMode {
-        if self.source.is_one_shot() {
-            ChildMode::OneShot
-        } else {
-            ChildMode::Restartable
-        }
-    }
-
     pub(crate) fn restartable(&self) -> Option<&ScopeFactory> {
         self.source.restartable()
     }
@@ -642,6 +639,22 @@ mod tests {
             slots.push(slot);
         }
         (builder, slots)
+    }
+
+    #[test]
+    #[should_panic(expected = "a tree must be lowered at most once")]
+    fn fused_lowering_keeps_lowered_distinct_from_undefined() {
+        let mut builder = BuilderCore::new(ScopeFlavor::Ordered);
+        let slot = builder
+            .reserve("claimed", None)
+            .expect("reservation succeeds");
+        slot.define(ChildConstruction::Task(configured_task()));
+        let _claimed = slot
+            .take_definition()
+            .expect("slot has not been lowered")
+            .expect("slot is defined");
+
+        let _ = builder.lower(ResolvedDefaults::default(), None);
     }
 
     #[test]

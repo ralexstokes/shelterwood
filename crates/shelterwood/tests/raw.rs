@@ -18,7 +18,8 @@ use shelterwood::{
 };
 
 struct FactoryTaskActor {
-    factory_task: String,
+    factory_task: tokio::task::Id,
+    observations: Arc<Mutex<Vec<(tokio::task::Id, tokio::task::Id)>>>,
 }
 
 struct InertRaw;
@@ -35,23 +36,39 @@ impl RawActor for FactoryTaskActor {
     type Msg = ();
 
     async fn run(&mut self, _context: &mut RawContext<Self::Msg>) -> ExitResult {
-        assert_eq!(self.factory_task, format!("{:?}", tokio::task::id()));
+        self.observations
+            .lock()
+            .expect("task observation mutex poisoned")
+            .push((self.factory_task, tokio::task::id()));
         Ok(())
     }
 }
 
 #[tokio::test]
 async fn restartable_raw_factory_runs_inside_the_incarnation_task() {
+    let observations = Arc::new(Mutex::new(Vec::new()));
     let mut tree = Tree::new();
     tree.add_raw(
         "factory-task",
-        RawDef::factory(|| FactoryTaskActor {
-            factory_task: format!("{:?}", tokio::task::id()),
+        RawDef::factory({
+            let observations = Arc::clone(&observations);
+            move || FactoryTaskActor {
+                factory_task: tokio::task::id(),
+                observations: Arc::clone(&observations),
+            }
         }),
     )
     .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    let observed = observations
+        .lock()
+        .expect("task observation mutex poisoned");
+    assert_eq!(observed.len(), 1, "the one incarnation publishes one pair");
+    assert_eq!(
+        observed[0].0, observed[0].1,
+        "the factory and raw run execute in the same Tokio task"
+    );
 }
 
 #[test]

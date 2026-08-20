@@ -34,15 +34,18 @@ pub enum BuildError {
 }
 /// Routes a definition rejected before admission through isolated disposal.
 ///
-/// A failed reservation returns before framework state owns the supplied
-/// definition, so dropping it inline would run a possibly blocking or
-/// panicking user destructor on the caller instead of producing an ordinary
-/// [`ReserveError`].
+/// Builder and dynamic-add entry points wrap the definition before evaluating
+/// the caller's `Into<ChildId>` hook or raw readiness metadata. A failed
+/// reservation therefore arrives here already isolated, and dropping the
+/// wrapper cannot run a possibly blocking or panicking user destructor on the
+/// caller instead of producing an ordinary [`ReserveError`]. This guarantee
+/// covers the supplied definition only; Rust's ordinary unwind rules still
+/// govern every other caller-owned local.
 pub(super) fn dispose_rejected<D: Send + 'static>(
-    definition: D,
+    definition: runtime::Isolated<D>,
     error: ReserveError,
 ) -> ReserveError {
-    runtime::dispose_detached(definition);
+    drop(definition);
     error
 }
 
@@ -90,8 +93,11 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: ActorDef<A>,
         ) -> Result<ActorRef<A::Msg>, ReserveError> {
+            let mut definition = runtime::Isolated::new(definition);
             match self.reserve_actor(id) {
-                Ok(slot) => Ok(slot.define(definition)),
+                Ok(slot) => Ok(slot.define(
+                    definition.take().expect("isolated definition is available"),
+                )),
                 Err(error) => Err(dispose_rejected(definition, error)),
             }
         }
@@ -103,8 +109,11 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: ActorOnceDef<A>,
         ) -> Result<ActorRef<A::Msg>, ReserveError> {
+            let mut definition = runtime::Isolated::new(definition);
             match self.reserve_actor(id) {
-                Ok(slot) => Ok(slot.define_once(definition)),
+                Ok(slot) => Ok(slot.define_once(
+                    definition.take().expect("isolated definition is available"),
+                )),
                 Err(error) => Err(dispose_rejected(definition, error)),
             }
         }
@@ -116,8 +125,11 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: RawDef<R>,
         ) -> Result<ActorRef<R::Msg>, ReserveError> {
+            let mut definition = runtime::Isolated::new(definition);
             match self.reserve_actor(id) {
-                Ok(slot) => Ok(slot.define_raw(definition)),
+                Ok(slot) => Ok(slot.define_raw(
+                    definition.take().expect("isolated definition is available"),
+                )),
                 Err(error) => Err(dispose_rejected(definition, error)),
             }
         }
@@ -129,8 +141,11 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: RawOnceDef<R>,
         ) -> Result<ActorRef<R::Msg>, ReserveError> {
+            let mut definition = runtime::Isolated::new(definition);
             match self.reserve_actor(id) {
-                Ok(slot) => Ok(slot.define_once_raw(definition)),
+                Ok(slot) => Ok(slot.define_once_raw(
+                    definition.take().expect("isolated definition is available"),
+                )),
                 Err(error) => Err(dispose_rejected(definition, error)),
             }
         }
@@ -150,8 +165,11 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: TaskDef,
         ) -> Result<TaskRef, ReserveError> {
+            let mut definition = runtime::Isolated::new(definition);
             match self.reserve_task(id) {
-                Ok(slot) => Ok(slot.define(definition)),
+                Ok(slot) => Ok(slot.define(
+                    definition.take().expect("isolated definition is available"),
+                )),
                 Err(error) => Err(dispose_rejected(definition, error)),
             }
         }
@@ -163,8 +181,11 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: TaskOnceDef<T>,
         ) -> Result<(TaskRef, OneShotTaskRef<T>), ReserveError> {
+            let mut definition = runtime::Isolated::new(definition);
             match self.reserve_task(id) {
-                Ok(slot) => Ok(slot.define_once(definition)),
+                Ok(slot) => Ok(slot.define_once(
+                    definition.take().expect("isolated definition is available"),
+                )),
                 Err(error) => Err(dispose_rejected(definition, error)),
             }
         }
@@ -189,8 +210,11 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: SubtreeDef<T>,
         ) -> Result<T::Ref, ReserveError> {
+            let mut definition = runtime::Isolated::new(definition);
             match self.reserve_subtree::<T>(id) {
-                Ok(slot) => Ok(slot.define(definition)),
+                Ok(slot) => Ok(slot.define(
+                    definition.take().expect("isolated definition is available"),
+                )),
                 Err(error) => Err(dispose_rejected(definition, error)),
             }
         }
@@ -202,8 +226,11 @@ macro_rules! impl_common_builder_surface {
             id: impl Into<ChildId>,
             definition: SubtreeOnceDef<T>,
         ) -> Result<T::Ref, ReserveError> {
+            let mut definition = runtime::Isolated::new(definition);
             match self.reserve_subtree::<T>(id) {
-                Ok(slot) => Ok(slot.define_once(definition)),
+                Ok(slot) => Ok(slot.define_once(
+                    definition.take().expect("isolated definition is available"),
+                )),
                 Err(error) => Err(dispose_rejected(definition, error)),
             }
         }

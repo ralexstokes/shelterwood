@@ -785,10 +785,11 @@ async fn ordered_startup_advances_past_a_reclaimed_cursor() {
 }
 
 /// A removal response is an observation boundary, not merely a wake. Keep it
-/// pending after membership commit until the batch epilogue has recomputed
-/// startup over the shrunken declared set.
+/// pending after membership commit until startup has been recomputed over the
+/// shrunken declared set, and make the synchronous driver epilogue explicitly
+/// discharge the retained completion if unwind bypasses the batch epilogue.
 #[crate::runtime::test]
-async fn startup_removal_response_follows_aggregate_recomputation() {
+async fn startup_removal_response_follows_recomputation_and_drop_discharges_it() {
     let mut tree = DynamicTree::new();
     tree.add_task(
         "gate",
@@ -837,7 +838,12 @@ async fn startup_removal_response_follows_aggregate_recomputation() {
     scope.progress_startup();
     assert!(scope.supervisor.lifecycle().startup_complete());
     assert_eq!(root.record().startup, Some(Ok(())));
-    scope.publish_startup_removals();
+    assert_eq!(
+        removal.try_receive(),
+        None,
+        "the fixture retains the completion until the explicit drop epilogue"
+    );
+    drop(scope);
     assert_eq!(removal.try_receive(), Some(RemoveOutcome::Removed));
 }
 

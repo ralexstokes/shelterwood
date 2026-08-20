@@ -78,8 +78,8 @@ async fn one_shot_raw_resource_drops_once_on_normal_exit() {
     count.assert_once();
 }
 
-#[test]
-fn one_shot_raw_resource_drops_once_on_readiness_definition_panic() {
+#[tokio::test(flavor = "current_thread")]
+async fn one_shot_raw_resource_drops_once_on_readiness_definition_panic() {
     let count = ConsumeCount::default();
     let mut tree = Tree::new();
     let result = catch_unwind(AssertUnwindSafe(|| {
@@ -91,6 +91,7 @@ fn one_shot_raw_resource_drops_once_on_readiness_definition_panic() {
         );
     }));
     assert!(result.is_err());
+    assert_eventually!(|| count.get() == 1).await;
     count.assert_once();
 }
 
@@ -111,6 +112,7 @@ async fn dynamic_one_shot_raw_resource_drops_once_on_readiness_definition_panic(
     }));
 
     assert!(result.is_err());
+    assert_eventually!(|| count.get() == 1).await;
     count.assert_once();
     drop(
         scope

@@ -72,6 +72,30 @@ impl ScopeRef {
     pub fn request_shutdown(&self) {
         let _ = self.cell.request_shutdown();
     }
+
+    /// Requests shutdown and waits for this scope's incarnation to finish its
+    /// scope epilogue.
+    ///
+    /// `timeout` bounds cooperative teardown, not this call's return: it arms
+    /// when the targeted incarnation enters its drain and, once expired,
+    /// escalates and reports stragglers while the wait continues to
+    /// completion. Membership terminality published by an ancestor's teardown
+    /// does not resolve the call while that incarnation is still running its
+    /// epilogue.
+    ///
+    /// A scheduled scope driver joins its children before completing. If an
+    /// ancestor hard-aborts a framework driver at the tidy-abort backstop, its
+    /// synchronous drop epilogue can only *request* abort for active children,
+    /// so cancellation and user-future destruction below that boundary may
+    /// finish after this call returns.
+    /// A zero budget still requests cooperative cancellation, then skips its
+    /// wait and enters the ordinary escalation tail immediately.
+    pub async fn shutdown_and_wait(
+        &self,
+        timeout: impl Into<DeadlineBudget>,
+    ) -> Result<(), crate::ShutdownTimeout> {
+        crate::driver::shutdown_scope(Arc::clone(&self.cell), timeout.into()).await
+    }
 }
 
 impl ScopeRef {

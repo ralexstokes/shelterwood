@@ -690,6 +690,7 @@ impl ScopeRuntime {
         {
             return;
         }
+        let startup = self.terminal_startup_disposition(key);
         let child = self
             .children
             .get_mut(key)
@@ -704,14 +705,6 @@ impl ScopeRuntime {
                 .record()
                 .last_exit
                 .unwrap_or_else(Exit::never_started);
-            let startup = if self.supervisor.is_initial(key)
-                && !self.supervisor.lifecycle().startup_complete()
-                && !self.supervisor.initial_ready(key)
-            {
-                StartupDisposition::Aborted
-            } else {
-                StartupDisposition::NotAborted
-            };
             // Exhaustion is a terminal outcome, not an exceptional cleanup
             // path. Join retained-definition disposal before terminality,
             // retention, removal completion, or ordered-scope progression.
@@ -1049,6 +1042,7 @@ impl ScopeRuntime {
         // `construction_is_suppressed` still gates the restart deadline arm,
         // where every suppression source has a guaranteed follow-up event.
         let membership_status = self.dispatch_membership_status(key);
+        let startup = self.terminal_startup_disposition(key);
         let child = self
             .children
             .get_mut(key)
@@ -1061,18 +1055,6 @@ impl ScopeRuntime {
         };
         match dispatch_exit(&exit, child.options.restart, mode, membership_status) {
             ExitDispatch::Terminal => {
-                // §6's startup abort is a startup-sequence property: the
-                // membership failed before its *initial* readiness edge. A
-                // later incarnation stopped pre-ready (e.g. during drain)
-                // does not rewind it.
-                let startup = if self.supervisor.is_initial(key)
-                    && !self.supervisor.lifecycle().startup_complete()
-                    && !self.supervisor.initial_ready(key)
-                {
-                    StartupDisposition::Aborted
-                } else {
-                    StartupDisposition::NotAborted
-                };
                 self.begin_terminal_disposal(key, exit, Some(incarnation), startup);
             }
             ExitDispatch::ScheduleRestart => {
@@ -1150,6 +1132,20 @@ impl ScopeRuntime {
             // intensity or fail startup, and the execution-time suppression
             // re-check then observes that drain.
             self.restart_shutdown_retries.push((key, target));
+        }
+    }
+
+    fn terminal_startup_disposition(&self, key: ChildKey) -> StartupDisposition {
+        // §6's startup abort is a startup-sequence property: the membership
+        // failed before its *initial* readiness edge. A later incarnation
+        // stopped pre-ready (for example during drain) does not rewind it.
+        if self.supervisor.is_initial(key)
+            && !self.supervisor.lifecycle().startup_complete()
+            && !self.supervisor.initial_ready(key)
+        {
+            StartupDisposition::Aborted
+        } else {
+            StartupDisposition::NotAborted
         }
     }
 

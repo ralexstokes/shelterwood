@@ -157,6 +157,10 @@ impl<'a, A: Actor> Context<'a, A> {
     actor_context_forwarders!(A);
 
     /// Releases this incarnation's readiness gate while live.
+    ///
+    /// During frozen-prefix drain the incarnation is already stopping, so
+    /// readiness can no longer change the startup outcome and this call is a
+    /// deliberate no-op.
     pub fn mark_ready(&self) {
         if self.stage == DeliveryStage::Live {
             self.raw.mark_ready();
@@ -164,6 +168,10 @@ impl<'a, A: Actor> Context<'a, A> {
     }
 
     /// Requests a clean local stop after the current callback.
+    ///
+    /// During frozen-prefix drain the incarnation is already stopping, so
+    /// this call deliberately does not inject a second local-stop edge and
+    /// returns silently.
     pub fn stop(&mut self) {
         if self.stage == DeliveryStage::Live {
             self.raw.stop();

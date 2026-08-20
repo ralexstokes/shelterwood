@@ -1216,7 +1216,7 @@ and `supervisor::…` names the pure reducer suite.
    before the removal response resolves. (`supervisor::sampled_removal_suppresses_start_effects_until_commit`,
    `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`,
    `integration::queued_removal_suppresses_replayed_self_stop_readiness`,
-   `integration::startup_removal_response_follows_aggregate_recomputation`.)
+   `integration::startup_removal_response_follows_recomputation_and_drop_discharges_it`.)
 4. **R4 — ordered start is one accepted edge at a time.** `Settle` emits
    `StartChild` only for the current initial cursor, and advances the cursor
    only past a spawned-and-ready member or a reclaimed key, reaching every
@@ -1458,7 +1458,7 @@ One classification, produced at one point, used by every consumer.
 3. **E3 — cancellation is orthogonal sampled state.** The exit records
    `Observed` iff the incarnation cancellation latch had fired when the
    outcome was recorded. Restart eligibility never inspects this field.
-   (`engine::funnel_dispatch_depends_on_mode_and_membership_state`,
+   (`engine::funnel_dispatch_covers_every_policy_exit_and_suppression_combination`,
    `integration::locally_requested_subtree_shutdown_reads_cancelled`.)
 4. **E4 — one authoritative membership/incarnation state.** Incarnation
    phases advance only through `Unstarted → Active → Stopping? → Complete →
@@ -1470,7 +1470,7 @@ One classification, produced at one point, used by every consumer.
 5. **E5 — restart suppression is state-derived.** Exits schedule restart only
    while the scope is running and the membership is resident. Draining or
    `Removing` records schedule nothing and charge no intensity.
-   (`engine::funnel_dispatch_depends_on_mode_and_membership_state`,
+   (`engine::funnel_dispatch_covers_every_policy_exit_and_suppression_combination`,
    `integration::same_batch_removal_suppresses_pending_restart_shutdown`.)
 6. **E6 — publication fences replacement.** A replacement spawn follows the
    predecessor’s terminal publication; stale incarnation evidence cannot
@@ -1667,6 +1667,15 @@ terminates the process by contract.
   `Drop` — is a genuine double panic and aborts the process; that is
   Rust's contract, documented alongside §11's `panic = "unwind"`
   precondition, not something the runner can contain.
+- **Declaration-hook isolation.** The static and dynamic `add_*` entry points
+  isolate the supplied definition before invoking the caller's
+  `Into<ChildId>` conversion, and raw-definition erasure keeps the definition
+  isolated while invoking `RawActor::readiness`. A panic from either eager
+  hook therefore cannot unwind through and destroy that definition on the
+  caller's thread. This is a narrow ownership guarantee, not an extension of
+  the runner boundary: other locals in the user's synchronous declaration
+  call remain subject to Rust's ordinary unwinding and double-panic contract,
+  as do user values that the framework never accepted or wrapped.
 
 ## 8. Child specification and options [#368]
 

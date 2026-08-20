@@ -2036,6 +2036,60 @@ mod tests {
         assert!(!resources.offloads[0].finished.is_fired());
     }
 
+    #[crate::runtime::test]
+    async fn ordinary_offload_completion_retains_a_finished_waiter_wake_panic() {
+        let mut resources = RawResources::<()>::default();
+        let mut panic_signal = resources.disposal.signal.watcher();
+        let finished = Latch::default();
+        let mut waiter = Box::pin(finished.fired());
+        let hostile = Waker::from(Arc::new(PanickingWake("ordinary finished wake panic")));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+
+        let state = SharedOffloadState::new(
+            Box::pin(async {}),
+            resources.disposal.clone(),
+            finished.clone(),
+        );
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished: finished.clone(),
+            state: Some(Arc::clone(&state)),
+            task: None,
+        });
+        let mut work = SharedOffloadFuture(state);
+        assert!(
+            Pin::new(&mut work)
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready(),
+            "a caller wake panic does not escape through the offload task"
+        );
+
+        assert!(finished.is_fired(), "all completion waiters were released");
+        resources.reclaim_finished();
+        assert!(
+            resources.offloads.is_empty(),
+            "ledger reclamation cannot discard the retained diagnostic"
+        );
+        assert!(matches!(
+            crate::runtime::timeout(Duration::from_secs(1), panic_signal.changed()).await,
+            crate::runtime::Timeout::Completed(())
+        ));
+        let payload = resources
+            .disposal
+            .panic
+            .take()
+            .expect("the caller wake panic survives ledger reclamation");
+        assert_eq!(
+            panic_message(&payload),
+            Some("ordinary finished wake panic")
+        );
+    }
+
     /// `freeze` is the drain that normally empties the continuation queue, but
     /// it is not a guaranteed one: `Drop for RawResources` skips it once the
     /// incarnation is already frozen, and runs it under `catch_panic` so an

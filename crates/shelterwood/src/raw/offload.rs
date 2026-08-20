@@ -196,6 +196,15 @@ impl SharedOffloadState {
         self.disposal.record(payload);
     }
 
+    fn fire_finished(&self) {
+        if let Err(payload) = catch_panic(|| self.finished.fire()) {
+            // Completion waiters are caller-owned. Keep their wake panics in
+            // the incarnation slot instead of letting them escape through the
+            // framework-owned offload task's join result.
+            self.record(payload);
+        }
+    }
+
     pub(super) fn dispose(&self, future: Option<OffloadFuture>) {
         if let Some(future) = future {
             self.disposal.dispose(future);
@@ -232,7 +241,7 @@ impl Future for SharedOffloadFuture {
                 let dispose = self.0.finish_poll(future, OffloadPoll::Pending);
                 if dispose.is_some() {
                     self.0.dispose(dispose);
-                    self.0.finished.fire();
+                    self.0.fire_finished();
                     Poll::Ready(())
                 } else {
                     Poll::Pending
@@ -241,14 +250,14 @@ impl Future for SharedOffloadFuture {
             Ok(Poll::Ready(())) => {
                 let dispose = self.0.finish_poll(future, OffloadPoll::Finished);
                 self.0.dispose(dispose);
-                self.0.finished.fire();
+                self.0.fire_finished();
                 Poll::Ready(())
             }
             Err(payload) => {
                 let dispose = self.0.finish_poll(future, OffloadPoll::Finished);
                 self.0.record(payload);
                 self.0.dispose(dispose);
-                self.0.finished.fire();
+                self.0.fire_finished();
                 Poll::Ready(())
             }
         }

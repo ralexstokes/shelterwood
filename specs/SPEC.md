@@ -772,7 +772,6 @@ fairness:
    message), with one fairness exception: immediately after a continuation
    runs, one ready mailbox/offload delivery gets a turn before the next
    continuation, so a continuation chain cannot starve external input;
-   dropped-continuation reporting on exit is preserved;
 3. mailbox and offload deliveries;
 4. keyed timers.
 
@@ -781,8 +780,8 @@ applied to the loop). Continuations form a FIFO queue: multiple
 `continue_with` calls from one callback are all retained, in call order —
 no last-wins replacement and no single-pending cap (the queue is unbounded
 and consumes no mailbox capacity, B.1; discard happens only at the stop
-freeze, reported on exit) — each running as a "next message" ahead of
-queued mail, with the fairness interleave above applying between
+freeze) — each running as a "next message" ahead of queued mail, with
+the fairness interleave above applying between
 successive continuations. Timers whose deadlines fire at the same instant
 deliver in **arming order** — the order their *current* armings were
 established; re-arming a key (§6.3's replacement) takes the new position —
@@ -851,8 +850,8 @@ at the freeze, in acceptance order; under `latest()`, the surviving slot
 *replaced* per §5.4's replacement ordering, and is never handled). At the
 freeze, outstanding offloads are cancelled (incarnation-owned work of a
 stopping incarnation — continuations suppressed per §6.5), queued
-continuations are discarded and reported on exit (priority item 2 above),
-and armed timers are dropped (§6.3) — so for a cooperative `Drain` that
+continuations are discarded (priority item 2 above), and armed timers
+are dropped (§6.3) — so for a cooperative `Drain` that
 runs to completion, "the handled log equals the accepted prefix" (§16.15)
 has no asterisks beyond the one conflation already states: under `queue`
 the two are identical; under `latest()` the handled log is the accepted
@@ -2526,8 +2525,10 @@ final cut, never a partial batch. Watch conflation remains permitted only
 *between committed transaction cuts*; it is not permission to expose the
 transaction's internal publications.
 
-`tracing` spans emit from one choke point (the optional `metrics` surface
-is Part II §22). Everything else observational — peer monitoring, actor
+Diagnostic instrumentation is not one of these contracts and core
+requires none; where a conforming library adds it, §15.7 constrains how
+(the optional `metrics` surface is Part II §22, a second emitter over the
+same seam). Everything else observational — peer monitoring, actor
 statistics, the self-recovering child-observation reducer, the packaged
 restart-counter view — is Part II (§20, §22): all are adapters over these
 two streams and the §3 identity types, which is what makes them safely
@@ -2850,14 +2851,58 @@ publication skipped when no subscriber exists — a subscriber-channel
 optimization only: pull-side `snapshot()` is an on-demand projection and
 can never go stale from the skip, and a fresh subscription's initial
 value is computed at subscribe time (§14) — (the conflating watch already
-makes cost O(observations), not O(events)); per-message `tracing` built
-lazily and near-zero with no active subscriber. What stays unsanctioned
-even under measured pressure: clock reads or randomness inside decision
-modules (pass `now` and samples in — it costs nothing), dispatch paths
-that bypass the exit funnel, and per-call-site staleness shortcuts —
+makes cost O(observations), not O(events)); per-message diagnostic
+instrumentation, if §15.7 ever adds any, built lazily so that it costs
+approximately nothing with no active subscriber — the cached-interest
+check of a conventional instrumentation library already supplies this, so
+the requirement is the property, not a bespoke mechanism for it. What
+stays unsanctioned even under measured pressure: clock reads or
+randomness inside decision modules (pass `now` and samples in — it costs
+nothing), dispatch paths that bypass the exit funnel, and per-call-site
+staleness shortcuts —
 each of these is a known failure mode of impure supervision engines in a
 performance costume, and no supervision engine has been observed hot
 enough to justify one. Measure before relaxing anything else.
+
+### 15.7 Instrumentation
+
+Diagnostic instrumentation — trace events, spans, and the Part II
+`metrics` feature (§22) — is **not** part of the observable contract:
+nothing in §§1–14 may be stated in terms of what a trace prints, and a
+conforming library MAY ship none at all. What is normative is the shape
+instrumentation MUST take *when* it is added, because the alternative —
+emission written wherever it seemed useful — retracts the guarantees
+§15.4 makes structural, one call site at a time.
+
+- **One layer emits.** Emission is confined to the top (façade) layer and
+  the confinement is a dependency pin, checkable at the manifest: the
+  instrumentation library is nameable only there, the same shape as the
+  runtime adapter being the only layer allowed to name a concrete
+  executor. Layers below surface facts as *data*, on the effects and
+  event values they already carry, and let the façade decide whether that
+  data becomes an event. A pin is enforceable; a convention about where
+  macros get written is not.
+- **A typed vocabulary, not free-form call sites.** Events are built
+  through named constructors whose signatures admit only framework-owned
+  data — discriminants, the §3 identity types, sequence numbers, counts,
+  durations. A user `Debug`/`Display` appears in no signature, which
+  states §15.4's field constraint once, structurally, instead of
+  re-deciding it at each call site. An operator who wants a failed
+  incarnation's error reads it from the `Exit` (§8) and formats it on
+  their own thread.
+- **Emission rides the effects flush.** An event arising inside a
+  critical section is recorded in that transaction's deferred-effect list
+  and emitted after the guard is released. A subscriber is arbitrary user
+  code — it may panic, block, or re-enter the library — so it is exactly
+  what §15.4 forbids under a framework lock, and the flush is where such
+  work already belongs.
+- **Spans attach at one site.** Spans, when added, attach per
+  incarnation, at the single site that already owns the incarnation
+  boundary, rather than being opened per operation across the loop.
+
+The `metrics` feature is a second emitter over this same vocabulary, not
+a shared runtime funnel that both must be routed through: it consumes the
+same typed events and inherits all four rules above.
 
 ## 16. Conformance obligations
 

@@ -122,15 +122,16 @@ pub(super) fn discharge_child_terminality(completion: ChildTerminality) {
     let (exit, exited_incarnation) = if never_started {
         (Exit::never_started(), None)
     } else {
-        (
-            classify_exit(
+        {
+            let (exit, discarded) = classify_exit(
                 None,
                 runtime::JoinOutcome::Cancelled,
                 None,
                 Cancellation::Observed,
-            ),
-            record.incarnation,
-        )
+            );
+            drop(discarded.map(RetainedExit::new));
+            (exit, record.incarnation)
+        }
     };
     // Initial-child conversion precedes residency publication. If a later
     // conversion unwinds, use the slot-owned gate for the converted prefix;
@@ -596,7 +597,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         let _ = exit_sender.send(DriverEvent::Child(ChildEvent::Exited {
             child: key,
             incarnation,
-            recorded: report.outcome,
+            recorded: report.outcome.map(RetainedRecordedOutcome::new),
             join,
             cancellation: report.cancellation,
             readiness_signal_seen: report.readiness_signal_seen,
@@ -968,7 +969,7 @@ impl ScopeRuntime {
         &mut self,
         key: ChildKey,
         incarnation: Incarnation,
-        recorded: Option<RecordedOutcome>,
+        recorded: Option<RetainedRecordedOutcome>,
         join: runtime::JoinOutcome<()>,
         cancellation: Cancellation,
         readiness_signal_seen: bool,
@@ -1019,8 +1020,13 @@ impl ScopeRuntime {
                 runtime::dispose_detached(teardown);
             }
         }
-        let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
-        let exit = classify_exit(recorded, join, active.hard_abort_phase, cancellation);
+        let recorded = recorded.map(RetainedRecordedOutcome::into_outcome);
+        let (recorded, discarded_recorded) =
+            reconcile_recorded_outcomes(recorded, active.forced_outcome);
+        drop(discarded_recorded.map(RetainedRecordedOutcome::new));
+        let (exit, discarded_exit) =
+            classify_exit(recorded, join, active.hard_abort_phase, cancellation);
+        drop(discarded_exit.map(RetainedExit::new));
         child.restarts.settle_if_stable(
             IncarnationRun {
                 started_at: active.started_at,
@@ -1226,7 +1232,7 @@ impl ScopeRuntime {
             return;
         };
         let member = Arc::clone(&child.slot.member);
-        let mut exit = terminal.exit.into_exit();
+        let mut exit = terminal.exit;
         if terminal.exited_incarnation.is_some()
             && let Some(runtime::DisposalPanic { message }) = panic
         {
@@ -1234,7 +1240,9 @@ impl ScopeRuntime {
             // never-started child or a child between restart incarnations
             // keeps its already-authoritative verdict while disposal remains
             // ordered ahead of terminal routing.
-            exit = classify_disposal_panic(exit, message);
+            let (selected, discarded) = classify_disposal_panic(exit.into_exit(), message);
+            exit = RetainedExit::new(selected);
+            drop(RetainedExit::new(discarded));
         }
         // §7's `StartupAborted` is a startup-sequence property of a
         // membership that *ran* and failed before its initial readiness
@@ -1248,6 +1256,7 @@ impl ScopeRuntime {
         } else {
             StartupDisposition::NotAborted
         };
+        let exit = exit.into_exit();
         self.terminalize_child(key, exit.clone(), terminal.exited_incarnation, startup);
         // Keep the marker installed until terminal publication has committed.
         // A concurrent shutdown sampler then sees either pending cleanup or a

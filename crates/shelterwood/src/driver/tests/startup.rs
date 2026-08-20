@@ -113,9 +113,9 @@ async fn pre_admission_restart_shutdown_does_not_expedite_the_following_incarnat
     scope.handle_exit(
         key,
         first,
-        Some(RecordedOutcome::returned(Err(ExitError::message(
-            "restart the nested scope",
-        )))),
+        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+            Err(ExitError::message("restart the nested scope")),
+        ))),
         crate::runtime::JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
@@ -306,9 +306,9 @@ async fn restart_shutdown_arriving_before_exit_is_retried_after_the_child_become
     scope.handle_exit(
         key,
         first,
-        Some(RecordedOutcome::returned(Err(ExitError::message(
-            "restart the nested scope",
-        )))),
+        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+            Err(ExitError::message("restart the nested scope")),
+        ))),
         crate::runtime::JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
@@ -415,9 +415,9 @@ async fn same_batch_intensity_exit_suppresses_real_expedited_factory() {
     let exit = DriverEvent::Child(ChildEvent::Exited {
         child: trip,
         incarnation,
-        recorded: Some(RecordedOutcome::returned(Err(ExitError::message(
-            "trip intensity",
-        )))),
+        recorded: Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+            Err(ExitError::message("trip intensity")),
+        ))),
         join: crate::runtime::JoinOutcome::Ok { value: () },
         cancellation: Cancellation::NotObserved,
         readiness_signal_seen: false,
@@ -551,9 +551,9 @@ async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
     let nested_exit = DriverEvent::Child(ChildEvent::Exited {
         child: nested,
         incarnation: nested_first,
-        recorded: Some(RecordedOutcome::returned(Err(ExitError::message(
-            "restart the nested scope",
-        )))),
+        recorded: Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+            Err(ExitError::message("restart the nested scope")),
+        ))),
         join: crate::runtime::JoinOutcome::Ok { value: () },
         cancellation: Cancellation::NotObserved,
         readiness_signal_seen: false,
@@ -561,9 +561,9 @@ async fn same_batch_intensity_exit_suppresses_retained_expedite_retry() {
     let trip_exit = DriverEvent::Child(ChildEvent::Exited {
         child: trip,
         incarnation: trip_incarnation,
-        recorded: Some(RecordedOutcome::returned(Err(ExitError::message(
-            "trip intensity",
-        )))),
+        recorded: Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+            Err(ExitError::message("trip intensity")),
+        ))),
         join: crate::runtime::JoinOutcome::Ok { value: () },
         cancellation: Cancellation::NotObserved,
         readiness_signal_seen: false,
@@ -653,7 +653,9 @@ async fn same_batch_self_stop_preserves_fired_readiness_for_startup() {
         Pending::Child(ChildEvent::Exited {
             child: key,
             incarnation,
-            recorded: Some(RecordedOutcome::returned(Ok(()))),
+            recorded: Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(Ok(
+                (),
+            )))),
             join: crate::runtime::JoinOutcome::Ok { value: () },
             cancellation: Cancellation::NotObserved,
             readiness_signal_seen: true,

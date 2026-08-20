@@ -1,10 +1,13 @@
 mod common;
 
 use std::{
+    fmt,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
     },
+    thread::{self, ThreadId},
     time::Duration,
 };
 
@@ -23,6 +26,28 @@ use shelterwood::{
     ReadinessDeadline, RestartCondition, RestartPolicy, Retention, ScopeState, Shutdown,
     StartupError, StartupFailureCause, SubtreeOnceDef, TaskDef, Tree,
 };
+
+struct ThreadProbe(mpsc::SyncSender<ThreadId>);
+
+impl fmt::Debug for ThreadProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ThreadProbe")
+    }
+}
+
+impl fmt::Display for ThreadProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("thread probe")
+    }
+}
+
+impl std::error::Error for ThreadProbe {}
+
+impl Drop for ThreadProbe {
+    fn drop(&mut self) {
+        let _ = self.0.send(thread::current().id());
+    }
+}
 
 struct ReadyThenStop;
 
@@ -743,6 +768,62 @@ async fn readiness_deadline_is_typed_and_absolute() {
         StartupError::StartupFailed(ref failure)
             if matches!(failure.cause, StartupFailureCause::Child { ref id, .. } if id.as_str() == "gated")
     ));
+    system
+        .shutdown(Duration::ZERO)
+        .await
+        .expect("terminal child leaves no straggler");
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_timeout_disposes_a_losing_application_error_off_the_driver() {
+    let driver_thread = thread::current().id();
+    let (dropped, observed) = mpsc::sync_channel(1);
+    let deadline_width = Duration::from_secs(10);
+    let started = ReleaseGate::default();
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "losing-error",
+            TaskDef::new({
+                let started = started.clone();
+                move |context| {
+                    let dropped = dropped.clone();
+                    let started = started.clone();
+                    async move {
+                        started.release();
+                        context.shutdown_token().cancelled().await;
+                        Err(ExitError::from(ThreadProbe(dropped)))
+                    }
+                }
+            })
+            .restart(never())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .readiness_deadline(
+                ReadinessDeadline::bounded(deadline_width).expect("non-zero deadline"),
+            ),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+
+    started.wait().await;
+    advance_time(deadline_width).await;
+    system
+        .wait_started()
+        .await
+        .expect_err("readiness timeout aborts startup");
+    assert!(matches!(
+        task.wait().await.kind(),
+        ExitKind::ReadinessTimedOut { .. }
+    ));
+    let disposal_thread = tokio::task::spawn_blocking(move || {
+        observed
+            .recv_timeout(POLL_TIMEOUT)
+            .expect("the losing application error is disposed")
+    })
+    .await
+    .expect("disposal waiter joins");
+    assert_ne!(disposal_thread, driver_thread);
     system
         .shutdown(Duration::ZERO)
         .await

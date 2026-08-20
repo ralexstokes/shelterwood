@@ -702,15 +702,32 @@ impl<M> RawResources<M> {
         }
         self.accepting = false;
         let dropped_continuations = self.continuations.len();
-        // Cancellation catches each future's destructor independently, so a
-        // failure cannot prevent later offloads from being cancelled/signalled.
+        // Treat the whole freeze as one cleanup transaction. Cancellation
+        // contains each latch wake, future disposal and task abort
+        // independently, while this outer accumulator keeps one failure from
+        // skipping later offloads or any of the collection drains.
+        let mut panics = PanicAccumulator::default();
+        // An already-retained offload failure happened before this freeze and
+        // therefore precedes every synchronous cleanup failure below.
+        panics.record(self.disposal.panic.take());
         for offload in &mut self.offloads {
-            offload.cancel();
+            panics.record(offload.cancel(&self.disposal.panic));
+            panics.record(self.disposal.panic.take());
         }
-        self.continuations.clear();
-        self.timers.clear();
-        self.ready_batch = None;
-        self.events.clear();
+        panics.run(|| self.continuations.clear());
+        panics.record(self.disposal.panic.take());
+        panics.run(|| self.timers.clear());
+        panics.record(self.disposal.panic.take());
+        panics.run(|| self.ready_batch = None);
+        panics.record(self.disposal.panic.take());
+        panics.run(|| self.events.clear());
+        panics.record(self.disposal.panic.take());
+        if let Some(payload) = panics.take() {
+            // The owned raw-incarnation epilogue drains this slot after the
+            // freeze and before joining, so publication is delayed until all
+            // synchronous cleanup has completed without losing the diagnostic.
+            self.disposal.panic.restore_first(payload);
+        }
         dropped_continuations
     }
 
@@ -905,6 +922,13 @@ impl<M: Send + 'static> RawContext<M> {
     /// frozen mailbox. Idempotent. This is the primitive the blanket handler
     /// loop's `Context::stop` is built on (§1 principle 5); the child's
     /// configured §10 ladder bounds the stop.
+    ///
+    /// A cleanup failure raised while freezing — a hostile waker woken by
+    /// offload cancellation, or a released destructor — is retained as this
+    /// incarnation's exit rather than raised here, so this call returns
+    /// normally and the caller's loop keeps running. The payload surfaces
+    /// from the next [`recv`](Self::recv)/[`try_recv`](Self::try_recv) or
+    /// from the epilogue.
     pub fn stop(&mut self) {
         self.receiver.freeze();
         self.freeze_and_report();
@@ -1056,9 +1080,12 @@ impl<M: Send + 'static> RawContext<M> {
     /// reported: an offload-work panic, and — because the stop branches
     /// freeze first — a destructor panic from the queued continuations,
     /// armed timers, queued offload completions and offload futures that the
-    /// freeze releases. Retention is the guarantee, not a join: a payload
-    /// recorded after this check is still the incarnation's exit, but is
-    /// classified by the epilogue and cannot suppress `on_stop`.
+    /// freeze releases, a waker panic from the `Guard::finished()` waiters
+    /// and cancellation latches that cancelling those offloads wakes, and a
+    /// panic raised by aborting an offload task. Retention is the guarantee,
+    /// not a join: a payload recorded after this check is still the
+    /// incarnation's exit, but is classified by the epilogue and cannot
+    /// suppress `on_stop`.
     ///
     /// A panic in an offload's continuation closure — the `FnOnce` that
     /// builds the message from the offload result, not a
@@ -1113,9 +1140,12 @@ impl<M: Send + 'static> RawContext<M> {
     /// [`continue_with`](Self::continue_with) continuation, which is a plain
     /// stored message) surfaces directly from this call. During drain it
     /// freezes first, then resumes any incarnation-owned disposal panic
-    /// retained by that point — an offload-work panic, or a destructor panic
+    /// retained by that point — an offload-work panic, a destructor panic
     /// from the continuations, timers, queued completions and offload futures
-    /// the freeze releases — before reading the frozen accepted mailbox
+    /// the freeze releases, a waker panic from the `Guard::finished()`
+    /// waiters and cancellation latches that cancelling those offloads wakes,
+    /// or a panic raised by aborting an offload task — before reading the
+    /// frozen accepted mailbox
     /// prefix. Retention is the guarantee, not a join: a payload recorded
     /// after the check is still the incarnation's exit, but is classified by
     /// the epilogue and cannot suppress `on_stop`.
@@ -1129,6 +1159,10 @@ impl<M: Send + 'static> RawContext<M> {
     /// resuming the loop.
     pub fn try_recv(&mut self) -> Option<M> {
         if self.is_stopping() {
+            // Establish the receive boundary locally just as `recv` does. Do
+            // not rely on the driver's mailbox-freeze ordering relative to
+            // the shutdown latch this call observes.
+            self.receiver.freeze();
             self.freeze_and_report();
             self.resources.resume_pending_panic();
             self.receiver.try_recv()
@@ -1537,7 +1571,7 @@ mod tests {
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Poll, Waker},
+        task::{Context, Poll, Wake, Waker},
         thread,
         time::Duration,
     };
@@ -1686,6 +1720,18 @@ mod tests {
     }
 
     struct PanickingDrop(Arc<AtomicUsize>);
+
+    struct PanickingWake(&'static str);
+
+    impl Wake for PanickingWake {
+        fn wake(self: Arc<Self>) {
+            panic!("{}", self.0);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            panic!("{}", self.0);
+        }
+    }
 
     impl Drop for PanickingDrop {
         fn drop(&mut self) {
@@ -2071,6 +2117,73 @@ mod tests {
     }
 
     #[test]
+    fn try_recv_freezes_its_mailbox_when_it_observes_shutdown() {
+        let (mut context, actor, shutdown) = bound_raw_context_for::<u8>();
+        actor
+            .try_send(1)
+            .expect("the live mailbox accepts before shutdown");
+        shutdown.fire();
+
+        assert_eq!(
+            context.try_recv(),
+            Some(1),
+            "drain mode still reads the prefix accepted before the local freeze"
+        );
+        assert_eq!(
+            actor
+                .try_send(2)
+                .expect_err("try_recv's local freeze closes the acceptance boundary")
+                .kind,
+            crate::SendErrorKind::NotRunning
+        );
+    }
+
+    #[test]
+    fn cancelled_queued_event_is_disposed_without_materializing_its_message() {
+        let (mut context, _actor, _shutdown) = bound_raw_context_for::<u8>();
+        let cancellation = Latch::default();
+        cancellation.fire();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let event_payload = PanickingDrop(Arc::clone(&drops));
+        let invoked_by_event = Arc::clone(&invoked);
+        context.resources.events.push(QueuedEvent {
+            cancellation,
+            make_message: Box::new(move || {
+                invoked_by_event.fetch_add(1, Ordering::SeqCst);
+                drop(event_payload);
+                7
+            }),
+        });
+
+        assert_eq!(
+            context.try_recv(),
+            None,
+            "a completion cancelled after queueing does not deliver a message"
+        );
+        assert_eq!(
+            invoked.load(Ordering::SeqCst),
+            0,
+            "the cancelled completion never runs its message builder"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the queued completion is disposed at materialization time"
+        );
+        let payload = context
+            .resources
+            .disposal
+            .panic
+            .take()
+            .expect("the hostile event destructor is retained by raw disposal");
+        assert_eq!(
+            panic_message(&payload),
+            Some("contained raw payload destructor panic")
+        );
+    }
+
+    #[test]
     fn a_caught_interval_clone_panic_preserves_the_fired_batch_for_retry() {
         let clones = Arc::new(AtomicUsize::new(0));
         let mut context = bound_raw_context_for::<PanicOnceClone>().0;
@@ -2266,6 +2379,108 @@ mod tests {
             drops.load(Ordering::SeqCst),
             2,
             "repeat cancellation is inert"
+        );
+    }
+
+    #[test]
+    fn freeze_preserves_an_offload_wake_panic_ahead_of_later_collection_disposal() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut resources = RawResources::<PanickingDrop>::default();
+        resources
+            .continuations
+            .push_back(PanickingDrop(Arc::clone(&drops)));
+
+        let finished = Latch::default();
+        let mut waiter = Box::pin(finished.fired());
+        let hostile = Waker::from(Arc::new(PanickingWake("first finished wake panic")));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished: finished.clone(),
+            state: None,
+            task: None,
+        });
+
+        assert_eq!(resources.freeze(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let payload = resources
+            .disposal
+            .panic
+            .take()
+            .expect("the first cleanup failure is retained");
+        assert_eq!(panic_message(&payload), Some("first finished wake panic"));
+    }
+
+    #[test]
+    fn freeze_preserves_future_disposal_ahead_of_its_later_finished_wake() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut resources = RawResources::<()>::default();
+        let finished = Latch::default();
+        let mut waiter = Box::pin(finished.fired());
+        let hostile = Waker::from(Arc::new(PanickingWake("later finished wake panic")));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        let state = SharedOffloadState::new(
+            Box::pin(BlockingPollDrop {
+                entered: Arc::new(Barrier::new(1)),
+                release: Arc::new(Barrier::new(1)),
+                drops: Arc::clone(&drops),
+                panic_on_drop: true,
+            }),
+            resources.disposal.clone(),
+            finished.clone(),
+        );
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished: finished.clone(),
+            state: Some(state),
+            task: None,
+        });
+
+        assert_eq!(resources.freeze(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let payload = resources
+            .disposal
+            .panic
+            .take()
+            .expect("the first cleanup failure is retained");
+        assert_eq!(
+            panic_message(&payload),
+            Some("unit offload destructor panic")
+        );
+    }
+
+    #[test]
+    fn repeated_freeze_preserves_the_first_failure_without_repeating_disposal() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut resources = RawResources::<PanickingDrop>::default();
+        resources
+            .continuations
+            .push_back(PanickingDrop(Arc::clone(&drops)));
+
+        assert_eq!(resources.freeze(), 1);
+        assert_eq!(resources.freeze(), 0, "the freeze transition is one-shot");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let payload = catch_unwind(AssertUnwindSafe(|| drop(resources)))
+            .expect_err("drop resumes the failure retained by the first freeze");
+        assert_eq!(
+            panic_message(&payload),
+            Some("contained raw payload destructor panic")
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "drop does not re-run already completed disposal"
         );
     }
 

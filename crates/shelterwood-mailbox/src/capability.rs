@@ -227,15 +227,57 @@ pub(crate) mod tests {
         MailboxRuntime, MailboxSignal, MailboxSignalWatcher,
     };
 
-    struct AdapterRuntime;
+    type ErasedOneShot = (
+        Box<dyn ErasedOneShotSender>,
+        Pin<Box<dyn ErasedOneShotReceiver>>,
+    );
 
-    impl MailboxRuntime for AdapterRuntime {
+    type OneShotHook = dyn Fn() -> ErasedOneShot + Send + Sync;
+    type NowHook = dyn Fn() -> Instant + Send + Sync;
+
+    /// The one mailbox runtime used by this crate's tests. Optional hooks let
+    /// a focused test control one capability while every other method keeps
+    /// using the real runtime adapter primitives below.
+    pub(crate) struct TestRuntime {
+        oneshot: Option<Box<OneShotHook>>,
+        now: Option<Box<NowHook>>,
+    }
+
+    impl TestRuntime {
+        pub(crate) fn new() -> Self {
+            Self {
+                oneshot: None,
+                now: None,
+            }
+        }
+
+        pub(crate) fn with_oneshot(
+            mut self,
+            oneshot: impl Fn() -> ErasedOneShot + Send + Sync + 'static,
+        ) -> Self {
+            self.oneshot = Some(Box::new(oneshot));
+            self
+        }
+
+        pub(crate) fn with_now(
+            mut self,
+            now: impl Fn() -> Instant + Send + Sync + 'static,
+        ) -> Self {
+            self.now = Some(Box::new(now));
+            self
+        }
+    }
+
+    impl MailboxRuntime for TestRuntime {
         fn oneshot(
             &self,
         ) -> (
             Box<dyn ErasedOneShotSender>,
             Pin<Box<dyn ErasedOneShotReceiver>>,
         ) {
+            if let Some(oneshot) = &self.oneshot {
+                return oneshot();
+            }
             let (sender, receiver) = oneshot();
             (
                 Box::new(AdapterOneShotSender(sender)),
@@ -252,7 +294,7 @@ pub(crate) mod tests {
         }
 
         fn now(&self) -> Instant {
-            now()
+            self.now.as_ref().map_or_else(now, |now| now())
         }
 
         fn sleep_until(&self, deadline: Option<Instant>) -> BoxedSleep {
@@ -271,7 +313,13 @@ pub(crate) mod tests {
         }
     }
 
-    struct AdapterOneShotReceiver(OneShotReceiver<ErasedValue>);
+    pub(crate) struct AdapterOneShotReceiver(OneShotReceiver<ErasedValue>);
+
+    impl AdapterOneShotReceiver {
+        pub(crate) fn new(receiver: OneShotReceiver<ErasedValue>) -> Self {
+            Self(receiver)
+        }
+    }
 
     impl ErasedOneShotReceiver for AdapterOneShotReceiver {
         fn poll_receive(
@@ -323,6 +371,6 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn runtime() -> Arc<dyn MailboxRuntime> {
-        Arc::new(AdapterRuntime)
+        Arc::new(TestRuntime::new())
     }
 }

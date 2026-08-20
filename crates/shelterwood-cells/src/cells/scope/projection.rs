@@ -97,8 +97,8 @@ impl ScopeCell {
     }
 
     pub fn subscribe_lifecycle(&self) -> LifecycleEvents {
-        self.with_observation_gate(|_txn| {
-            let events = self.observation.lifecycle.subscribe();
+        self.with_observation_gate(|txn| {
+            let events = self.observation.lifecycle.subscribe(txn);
             debug_assert!(
                 !self.observation.closed.load(Ordering::Acquire)
                     || self.observation.lifecycle.is_closed(),

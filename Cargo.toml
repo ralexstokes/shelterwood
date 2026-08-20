@@ -41,4 +41,3 @@ thiserror = "2.0.19"
 # Blocking-pool rejection ownership is verified against this exact Tokio
 # release. Any upgrade must re-audit and re-run the adapter regressions.
 tokio = { version = "=1.53.1", features = ["macros", "rt", "sync", "time"] }
-tracing = "0.1.44"

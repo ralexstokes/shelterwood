@@ -266,14 +266,18 @@ All adapters over core's two streams and identity types:
 - **Packaged restart-counter view** — subscription plus cumulative total
   that survives `Lagged`, deduplicated, making breaker patterns turnkey
   without hand-carried totals.
-- **`metrics` feature** — optional metric emission from the same single
-  choke point as `tracing`; the debugging surface exposes structured
-  snapshots rather than name-filtered tuples.
+- **`metrics` feature** — optional metric emission built over the same
+  typed event vocabulary as diagnostic tracing (Part I §15.7), as a
+  second emitter rather than a funnel both are routed through; the
+  debugging surface exposes structured snapshots rather than
+  name-filtered tuples.
 
 **Placement.** Split. The statistics fields, counters, and message-size
 measurement are an internal seam (counted inside the mailbox and loop,
-B.6), and the `metrics` feature shares `tracing`'s internal choke point;
-every packaged view above the two streams is a public-surface adapter
+B.6), and the `metrics` feature emits from the instrumentation seam Part
+I §15.7 requires — the same typed events, the same effects-flush timing,
+the same confinement to the façade layer. Every packaged view above the
+two streams is a public-surface adapter
 and MAY ship in the utility tier (§27).
 
 ## 23. Outline (`serde` feature)

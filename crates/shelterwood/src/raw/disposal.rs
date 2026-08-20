@@ -329,10 +329,15 @@ mod tests {
     }
 
     /// Both destructors here are hostile: the output panics, and the retained
-    /// future-destructor payload panics again when it is dropped. Combining
-    /// them uncontained is an abort, which needs no subprocess harness to
-    /// observe — nextest gives every test its own process, so the abort is
-    /// this test's own failure signal rather than a poisoned run.
+    /// future-destructor payload panics again when it is dropped. Uncontained,
+    /// that pair does not abort — the output destructor's panic escapes `poll`,
+    /// inverting the documented precedence, and the retained payload leaks
+    /// rather than double-panicking, because an unwinding function never drops
+    /// its return place. An escaping panic is an ordinary caught failure, so
+    /// the assertions below are the signal and no subprocess is needed. Should
+    /// a future regression turn this pair into a genuine double panic, nextest
+    /// gives every test its own process, so the abort would still be this
+    /// test's own failure rather than a poisoned run.
     #[test]
     fn hostile_output_destructor_cannot_escape_while_a_hostile_future_panic_is_retained() {
         let future_drops = Arc::new(AtomicUsize::new(0));
@@ -450,6 +455,11 @@ mod tests {
         assert_eq!(future_drops.load(Ordering::SeqCst), 1);
     }
 
+    /// The one genuine abort in this module: uncontained, the inner
+    /// destructor's panic lands inside the primary unwind, which is a
+    /// non-unwinding double panic rather than a catchable failure. Nextest's
+    /// process-per-test isolation is what makes that abort this test's own
+    /// signal, so no subprocess harness is needed here either.
     #[test]
     fn a_boundary_dropped_during_an_unwind_contains_its_future_destructor_panic() {
         let future_drops = Arc::new(AtomicUsize::new(0));

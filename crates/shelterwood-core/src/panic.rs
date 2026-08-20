@@ -136,7 +136,15 @@ mod tests {
 
     use super::{
         PanicAccumulator, PanicPayload, UnwindPanics, discard_panic, resume_preferred_panic,
+        resume_preferred_panic_outside_unwind,
     };
+
+    fn panic_message(payload: &PanicPayload) -> Option<&str> {
+        payload
+            .downcast_ref::<&'static str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+    }
 
     struct RecursivelyPanickingPayload;
 
@@ -193,6 +201,44 @@ mod tests {
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"outer panic"));
         assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
         assert_eq!(cleanup_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn primary_panic_takes_precedence_over_cleanup_outside_an_unwind() {
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            resume_preferred_panic(UnwindPanics {
+                primary: Some(Box::new("primary panic")),
+                cleanup: Some(Box::new("cleanup panic")),
+            });
+        }))
+        .expect_err("the primary panic is resumed");
+        assert_eq!(panic_message(&payload), Some("primary panic"));
+    }
+
+    #[test]
+    fn outside_unwind_resumption_preserves_primary_and_cleanup_precedence() {
+        let primary = catch_unwind(AssertUnwindSafe(|| {
+            resume_preferred_panic_outside_unwind(UnwindPanics {
+                primary: Some(Box::new("primary panic")),
+                cleanup: Some(Box::new("cleanup panic")),
+            });
+        }))
+        .expect_err("the primary panic is resumed");
+        assert_eq!(panic_message(&primary), Some("primary panic"));
+
+        let cleanup = catch_unwind(AssertUnwindSafe(|| {
+            resume_preferred_panic_outside_unwind(UnwindPanics {
+                primary: None,
+                cleanup: Some(Box::new("cleanup panic")),
+            });
+        }))
+        .expect_err("cleanup stands in when there is no primary panic");
+        assert_eq!(panic_message(&cleanup), Some("cleanup panic"));
+
+        resume_preferred_panic_outside_unwind(UnwindPanics {
+            primary: None,
+            cleanup: None,
+        });
     }
 
     struct TaggedPanic {

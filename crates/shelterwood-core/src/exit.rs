@@ -569,6 +569,12 @@ impl RecordedOutcome {
         self.0
     }
 
+    /// Reports whether this outcome owns an application error.
+    #[must_use]
+    pub fn is_failed(&self) -> bool {
+        matches!(self.0, ExitKind::Failed(_))
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub fn kind(&self) -> &ExitKind {
         &self.0
@@ -582,19 +588,23 @@ impl RecordedOutcome {
 /// recorded first. This prevents a forced abort from erasing a structured
 /// application failure while still allowing a readiness timeout to supersede
 /// ordinary completion; the final join uses the same rule when it contributes
-/// panic evidence.
+/// panic evidence. The second tuple field returns the discarded outcome so the
+/// runtime-owning caller can choose its destruction venue.
 pub fn reconcile_recorded_outcomes(
     recorded: Option<RecordedOutcome>,
     forced: Option<RecordedOutcome>,
-) -> Option<RecordedOutcome> {
+) -> (Option<RecordedOutcome>, Option<RecordedOutcome>) {
     match (recorded, forced) {
-        (Some(recorded), Some(forced)) => Some(RecordedOutcome(prefer_earlier(
-            recorded.into_kind(),
-            forced.into_kind(),
-        ))),
-        (Some(recorded), None) => Some(recorded),
-        (None, Some(forced)) => Some(forced),
-        (None, None) => None,
+        (Some(recorded), Some(forced)) => {
+            let (selected, discarded) = prefer_earlier(recorded.into_kind(), forced.into_kind());
+            (
+                Some(RecordedOutcome(selected)),
+                Some(RecordedOutcome(discarded)),
+            )
+        }
+        (Some(recorded), None) => (Some(recorded), None),
+        (None, Some(forced)) => (Some(forced), None),
+        (None, None) => (None, None),
     }
 }
 
@@ -608,13 +618,14 @@ pub fn reconcile_recorded_outcomes(
 /// Equal-ranked outcomes keep the earlier recorded evidence, including its
 /// panic payload or abort provenance. A cancelled join uses the supervisor's
 /// hard-abort phase when one was recorded and otherwise fails closed to
-/// [`GracePhase::WithinGrace`].
+/// [`GracePhase::WithinGrace`]. The discarded exit is returned separately so
+/// framework callers never destroy a losing application error accidentally.
 pub fn classify_exit(
     recorded: Option<RecordedOutcome>,
     join: JoinOutcome<()>,
     hard_abort_phase: Option<GracePhase>,
     cancellation: Cancellation,
-) -> Exit {
+) -> (Exit, Option<Exit>) {
     let recorded_kind = recorded.map(RecordedOutcome::into_kind);
     let join_kind = match join {
         JoinOutcome::Ok { .. } => None,
@@ -624,23 +635,36 @@ pub fn classify_exit(
         }),
     };
 
-    let kind = match (recorded_kind, join_kind) {
-        (Some(recorded), Some(join)) => prefer_earlier(recorded, join),
-        (Some(recorded), None) => recorded,
-        (None, Some(join)) => join,
-        (None, None) => ExitKind::Aborted {
-            phase: GracePhase::WithinGrace,
-        },
+    let (kind, discarded) = match (recorded_kind, join_kind) {
+        (Some(recorded), Some(join)) => {
+            let (selected, discarded) = prefer_earlier(recorded, join);
+            (selected, Some(discarded))
+        }
+        (Some(recorded), None) => (recorded, None),
+        (None, Some(join)) => (join, None),
+        (None, None) => (
+            ExitKind::Aborted {
+                phase: GracePhase::WithinGrace,
+            },
+            None,
+        ),
     };
-    Exit::from_kind(kind, cancellation)
+    (
+        Exit::from_kind(kind, cancellation),
+        discarded.map(|kind| Exit::from_kind(kind, cancellation)),
+    )
 }
 
 /// Adds a destructor panic to an already-classified exit without erasing an
 /// earlier panic, which has equal diagnostic precedence and happened first.
-pub fn classify_disposal_panic(exit: Exit, message: Option<String>) -> Exit {
+/// The discarded exit remains owned by the caller for venue-safe retirement.
+pub fn classify_disposal_panic(exit: Exit, message: Option<String>) -> (Exit, Exit) {
     let Exit { kind, cancellation } = exit;
-    let kind = prefer_earlier(kind, ExitKind::Panicked { message });
-    Exit::from_kind(kind, cancellation)
+    let (selected, discarded) = prefer_earlier(kind, ExitKind::Panicked { message });
+    (
+        Exit::from_kind(selected, cancellation),
+        Exit::from_kind(discarded, cancellation),
+    )
 }
 
 /// Diagnostic precedence shared by provisional and final exit evidence.
@@ -657,11 +681,11 @@ enum OutcomeRank {
     Panicked,
 }
 
-fn prefer_earlier(earlier: ExitKind, later: ExitKind) -> ExitKind {
+fn prefer_earlier(earlier: ExitKind, later: ExitKind) -> (ExitKind, ExitKind) {
     if rank(&earlier) >= rank(&later) {
-        earlier
+        (earlier, later)
     } else {
-        later
+        (later, earlier)
     }
 }
 
@@ -854,15 +878,19 @@ mod tests {
 
         for (earlier_index, (earlier_name, earlier)) in ordered.iter().enumerate() {
             for (later_index, (later_name, later)) in ordered.iter().enumerate() {
-                let selected = prefer_earlier(earlier.clone(), later.clone());
-                let expected = if earlier_index >= later_index {
-                    earlier
+                let (selected, discarded) = prefer_earlier(earlier.clone(), later.clone());
+                let (expected, expected_discarded) = if earlier_index >= later_index {
+                    (earlier, later)
                 } else {
-                    later
+                    (later, earlier)
                 };
                 assert!(
                     exit_kind_eq(&selected, expected),
                     "earlier {earlier_name}, later {later_name}: selected {selected:?}, expected {expected:?}"
+                );
+                assert!(
+                    exit_kind_eq(&discarded, expected_discarded),
+                    "earlier {earlier_name}, later {later_name}: discarded {discarded:?}, expected {expected_discarded:?}"
                 );
             }
         }
@@ -873,10 +901,9 @@ mod tests {
         let later = ExitKind::Panicked {
             message: Some("later".to_owned()),
         };
-        assert!(exit_kind_eq(
-            &prefer_earlier(earlier.clone(), later),
-            &earlier
-        ));
+        let (selected, discarded) = prefer_earlier(earlier.clone(), later.clone());
+        assert!(exit_kind_eq(&selected, &earlier));
+        assert!(exit_kind_eq(&discarded, &later));
     }
 
     #[test]
@@ -1042,17 +1069,15 @@ mod tests {
         ];
 
         for (case, recorded, join, hard_abort_phase, cancellation, expected) in cases {
-            assert_eq!(
-                classify_exit(recorded, join, hard_abort_phase, cancellation),
-                expected,
-                "{case}"
-            );
+            let (classified, _discarded) =
+                classify_exit(recorded, join, hard_abort_phase, cancellation);
+            assert_eq!(classified, expected, "{case}");
         }
     }
 
     #[test]
     fn disposal_panic_uses_exit_precedence_and_preserves_cancellation() {
-        let classified = classify_disposal_panic(
+        let (classified, discarded) = classify_disposal_panic(
             Exit::completed(Cancellation::Observed),
             Some("destructor".to_owned()),
         );
@@ -1065,17 +1090,18 @@ mod tests {
                 Cancellation::Observed
             )
         );
+        assert_eq!(discarded, Exit::completed(Cancellation::Observed));
 
         let deadline = Instant::now() + Duration::from_secs(1);
         for weaker in [
             ExitKind::Failed(ExitError::message("failed")),
             ExitKind::ReadinessTimedOut { deadline },
         ] {
+            let weaker = exit(weaker, Cancellation::NotObserved);
+            let (classified, discarded) =
+                classify_disposal_panic(weaker.clone(), Some("destructor".to_owned()));
             assert_eq!(
-                classify_disposal_panic(
-                    exit(weaker, Cancellation::NotObserved),
-                    Some("destructor".to_owned()),
-                ),
+                classified,
                 exit(
                     ExitKind::Panicked {
                         message: Some("destructor".to_owned())
@@ -1083,6 +1109,7 @@ mod tests {
                     Cancellation::NotObserved
                 )
             );
+            assert_eq!(discarded, weaker);
         }
 
         let earlier = exit(
@@ -1091,9 +1118,12 @@ mod tests {
             },
             Cancellation::NotObserved,
         );
+        let (classified, discarded) =
+            classify_disposal_panic(earlier.clone(), Some("destructor".to_owned()));
+        assert_eq!(classified, earlier);
         assert_eq!(
-            classify_disposal_panic(earlier.clone(), Some("destructor".to_owned())),
-            earlier
+            discarded,
+            Exit::panicked(Some("destructor".to_owned()), Cancellation::NotObserved)
         );
     }
 
@@ -1261,17 +1291,14 @@ mod tests {
         ];
 
         for (case, recorded, forced, expected) in cases {
-            let reconciled = reconcile_recorded_outcomes(recorded, forced);
-            assert_eq!(
-                classify_exit(
-                    reconciled,
-                    JoinOutcome::Cancelled,
-                    Some(GracePhase::AfterGrace),
-                    Cancellation::Observed
-                ),
-                expected,
-                "{case}"
+            let (reconciled, _discarded_recorded) = reconcile_recorded_outcomes(recorded, forced);
+            let (classified, _discarded_exit) = classify_exit(
+                reconciled,
+                JoinOutcome::Cancelled,
+                Some(GracePhase::AfterGrace),
+                Cancellation::Observed,
             );
+            assert_eq!(classified, expected, "{case}");
         }
     }
 

@@ -65,9 +65,9 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
     scope.handle_exit(
         key,
         incarnation,
-        Some(RecordedOutcome::returned(Err(ExitError::message(
-            "application failure",
-        )))),
+        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+            Err(ExitError::message("application failure")),
+        ))),
         crate::runtime::JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
@@ -458,9 +458,9 @@ async fn latched_shutdown_upgrades_an_intensity_drain() {
     scope.handle_exit(
         key,
         incarnation,
-        Some(RecordedOutcome::returned(Err(ExitError::message(
-            "trip intensity",
-        )))),
+        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+            Err(ExitError::message("trip intensity")),
+        ))),
         crate::runtime::JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,
@@ -506,9 +506,9 @@ async fn force_upgrades_an_intensity_drain_to_shutdown_requested() {
     scope.handle_exit(
         key,
         incarnation,
-        Some(RecordedOutcome::returned(Err(ExitError::message(
-            "trip intensity",
-        )))),
+        Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+            Err(ExitError::message("trip intensity")),
+        ))),
         crate::runtime::JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
         false,

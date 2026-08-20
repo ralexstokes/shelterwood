@@ -34,7 +34,8 @@ use crate::{
     admission::{NotAdmittingCause, ReserveError},
     cells::{
         MemberCell, MemberStage, MemberTransition, ResidentProjection, RetainedExit,
-        RetainedStopReason, ScopeCell, ScopeControlEvent, StartupDisposition,
+        RetainedRecordedOutcome, RetainedStopReason, ScopeCell, ScopeControlEvent,
+        StartupDisposition,
     },
     deadline::Deadline,
     engine::{
@@ -129,7 +130,9 @@ fn classify_retained_root_driver_join(
             (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
         }
     };
-    Err(classify_exit(None, join, None, cancellation))
+    let (exit, discarded) = classify_exit(None, join, None, cancellation);
+    drop(discarded.map(RetainedExit::new));
+    Err(exit)
 }
 
 impl Drop for SystemRun {

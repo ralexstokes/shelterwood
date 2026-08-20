@@ -3,7 +3,9 @@ use std::{fmt, sync::Arc};
 use shelterwood_core::{
     Exit,
     engine::ScopeState,
-    exit::{ExitKind, StartupError, StartupFailure, StartupFailureCause, StopReason},
+    exit::{
+        ExitKind, RecordedOutcome, StartupError, StartupFailure, StartupFailureCause, StopReason,
+    },
 };
 use shelterwood_runtime as runtime;
 
@@ -125,6 +127,48 @@ impl Drop for RetainedExit {
         };
         if matches!(exit.kind(), ExitKind::Failed(_)) {
             runtime::dispose_critical(exit);
+        }
+    }
+}
+
+/// A provisional outcome retained by framework event and driver state.
+///
+/// The failed variant owns a type-erased application error just like a failed
+/// [`Exit`]. If framework control flow retires the carrier without selecting
+/// that outcome, its user value is transferred to critical disposal.
+pub struct RetainedRecordedOutcome(Option<RecordedOutcome>);
+
+impl RetainedRecordedOutcome {
+    pub fn new(outcome: RecordedOutcome) -> Self {
+        Self(Some(outcome))
+    }
+
+    pub fn as_outcome(&self) -> &RecordedOutcome {
+        self.0
+            .as_ref()
+            .expect("retained recorded outcome was already taken")
+    }
+
+    pub fn into_outcome(mut self) -> RecordedOutcome {
+        self.0
+            .take()
+            .expect("retained recorded outcome was already taken")
+    }
+}
+
+impl fmt::Debug for RetainedRecordedOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_outcome().fmt(formatter)
+    }
+}
+
+impl Drop for RetainedRecordedOutcome {
+    fn drop(&mut self) {
+        let Some(outcome) = self.0.take() else {
+            return;
+        };
+        if outcome.is_failed() {
+            runtime::dispose_critical(outcome);
         }
     }
 }
@@ -281,6 +325,42 @@ mod tests {
                 .expect("converted exit destruction completes"),
             caller,
             "a converted public exit keeps ordinary caller-owned drop timing"
+        );
+    }
+
+    #[test]
+    fn retained_failed_recorded_outcome_disposes_off_the_retiring_thread() {
+        let retiring_thread = std::thread::current().id();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retained = RetainedRecordedOutcome::new(RecordedOutcome::returned(Err(
+            ExitError::from(ThreadProbe(dropped)),
+        )));
+
+        drop(retained);
+
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("recorded failure disposal completes"),
+            retiring_thread
+        );
+    }
+
+    #[test]
+    fn selected_recorded_outcome_preserves_the_callers_drop_thread() {
+        let caller = std::thread::current().id();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retained = RetainedRecordedOutcome::new(RecordedOutcome::returned(Err(
+            ExitError::from(ThreadProbe(dropped)),
+        )));
+
+        drop(retained.into_outcome());
+
+        assert_eq!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("selected recorded outcome destruction completes"),
+            caller
         );
     }
 

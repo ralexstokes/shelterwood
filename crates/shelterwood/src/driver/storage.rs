@@ -1,10 +1,22 @@
 //! Fail-closed completion storage used by the runtime shell.
 
+use crate::runtime;
+
 /// An exactly-once synchronous completion.
 ///
 /// The orderly path consumes the payload with [`Self::complete`]. If that
 /// path is destroyed before doing so, dropping the obligation executes the
 /// fail-closed fallback instead. Fallbacks must never await or join.
+///
+/// Every fallback reaches code the framework did not schedule — a one-shot
+/// send wakes the caller's waker inline, and terminality publication runs
+/// through the resident tree — so destruction contains it. A fallback panic
+/// resumes from an ordinary drop, keeping the diagnostic authoritative. A
+/// fallback panic raised while the obligation is destroyed during an existing
+/// unwind is discarded instead: losing that diagnostic is the lesser outcome
+/// against the double panic that would abort the process. Discharging the
+/// obligation explicitly ([`Self::discharge`]) contains nothing, so a caller
+/// on a destruction path supplies its own accumulator.
 #[must_use = "dropping an obligation executes its fallback completion"]
 pub(super) struct Obligation<T> {
     payload: Option<T>,
@@ -40,7 +52,7 @@ impl<T> Obligation<T> {
 
 impl<T> Drop for Obligation<T> {
     fn drop(&mut self) {
-        let mut panics = crate::runtime::PanicAccumulator::default();
+        let mut panics = runtime::PanicAccumulator::default();
         panics.run(|| self.discharge());
     }
 }
@@ -125,12 +137,19 @@ mod tests {
             .output()
             .expect("nested-unwind subprocess starts");
 
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),
-            "nested-unwind subprocess must preserve the original panic instead of aborting\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            "nested-unwind subprocess must preserve the original panic instead of aborting\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
             output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+        );
+        // The child filter is a hardcoded name, and libtest exits zero when
+        // `--exact` matches nothing. Without this the whole regression goes
+        // vacuous the moment the test moves or is renamed.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must actually run this test, not filter it away\nstdout:\n{stdout}\nstderr:\n{stderr}",
         );
     }
 }

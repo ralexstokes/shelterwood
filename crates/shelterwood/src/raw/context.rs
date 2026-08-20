@@ -922,6 +922,13 @@ impl<M: Send + 'static> RawContext<M> {
     /// frozen mailbox. Idempotent. This is the primitive the blanket handler
     /// loop's `Context::stop` is built on (§1 principle 5); the child's
     /// configured §10 ladder bounds the stop.
+    ///
+    /// A cleanup failure raised while freezing — a hostile waker woken by
+    /// offload cancellation, or a released destructor — is retained as this
+    /// incarnation's exit rather than raised here, so this call returns
+    /// normally and the caller's loop keeps running. The payload surfaces
+    /// from the next [`recv`](Self::recv)/[`try_recv`](Self::try_recv) or
+    /// from the epilogue.
     pub fn stop(&mut self) {
         self.receiver.freeze();
         self.freeze_and_report();
@@ -1073,9 +1080,12 @@ impl<M: Send + 'static> RawContext<M> {
     /// reported: an offload-work panic, and — because the stop branches
     /// freeze first — a destructor panic from the queued continuations,
     /// armed timers, queued offload completions and offload futures that the
-    /// freeze releases. Retention is the guarantee, not a join: a payload
-    /// recorded after this check is still the incarnation's exit, but is
-    /// classified by the epilogue and cannot suppress `on_stop`.
+    /// freeze releases, a waker panic from the `Guard::finished()` waiters
+    /// and cancellation latches that cancelling those offloads wakes, and a
+    /// panic raised by aborting an offload task. Retention is the guarantee,
+    /// not a join: a payload recorded after this check is still the
+    /// incarnation's exit, but is classified by the epilogue and cannot
+    /// suppress `on_stop`.
     ///
     /// A panic in an offload's continuation closure — the `FnOnce` that
     /// builds the message from the offload result, not a
@@ -1130,9 +1140,12 @@ impl<M: Send + 'static> RawContext<M> {
     /// [`continue_with`](Self::continue_with) continuation, which is a plain
     /// stored message) surfaces directly from this call. During drain it
     /// freezes first, then resumes any incarnation-owned disposal panic
-    /// retained by that point — an offload-work panic, or a destructor panic
+    /// retained by that point — an offload-work panic, a destructor panic
     /// from the continuations, timers, queued completions and offload futures
-    /// the freeze releases — before reading the frozen accepted mailbox
+    /// the freeze releases, a waker panic from the `Guard::finished()`
+    /// waiters and cancellation latches that cancelling those offloads wakes,
+    /// or a panic raised by aborting an offload task — before reading the
+    /// frozen accepted mailbox
     /// prefix. Retention is the guarantee, not a join: a payload recorded
     /// after the check is still the incarnation's exit, but is classified by
     /// the epilogue and cannot suppress `on_stop`.

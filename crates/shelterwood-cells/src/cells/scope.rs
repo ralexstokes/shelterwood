@@ -1263,6 +1263,19 @@ impl ScopeCell {
         self.with_observation_gate(|txn| self.terminalize_never_started_locked(txn));
     }
 
+    /// Publishes and closes a nested scope body that was spawned but never
+    /// began its own incarnation. The parent driver remains responsible for
+    /// the shared membership's terminal exit.
+    pub fn close_never_started_body(&self) {
+        self.with_observation_gate(|txn| {
+            if self.observation.closed.load(Ordering::Acquire) {
+                return;
+            }
+            self.publish_stopped_locked(txn, StopReason::NeverStarted, None, None);
+            self.close_observation_locked(txn);
+        });
+    }
+
     pub fn terminalize_never_started_locked(&self, txn: &mut ObservationTxn<'_>) {
         if self.observation.closed.load(Ordering::Acquire) {
             return;
@@ -1304,6 +1317,31 @@ mod tests {
     struct GateCheckingWake {
         gate: super::ObservationGate,
         woke_after_unlock: Arc<AtomicBool>,
+    }
+
+    #[test]
+    fn never_started_restart_body_replaces_the_stale_prior_reason_and_closes() {
+        let scope = isolated_scope("nested", ScopeFlavor::Ordered);
+        let epoch = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("first incarnation begins");
+        scope.finish_incarnation(epoch, StopReason::Finished);
+        let snapshots = scope.subscribe_snapshots();
+
+        scope.close_never_started_body();
+
+        let (snapshot, closed) = snapshots.borrow_latest_and_closed();
+        assert!(closed);
+        assert!(matches!(
+            snapshot.state,
+            ScopeState::Stopped {
+                reason: StopReason::NeverStarted
+            }
+        ));
+        assert!(
+            !matches!(scope.member.record().stage, MemberStage::Terminal(_)),
+            "the parent driver still owns membership terminality"
+        );
     }
 
     impl Wake for GateCheckingWake {

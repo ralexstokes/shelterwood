@@ -418,6 +418,7 @@ async fn nested_membership_exhaustion_is_structured_and_fail_closed() {
                 abort_ack: Latch::default(),
             },
         },
+        nested_scope_start(&scope),
     )
     .await
     .expect_err("the stable child-id domain is exhausted");

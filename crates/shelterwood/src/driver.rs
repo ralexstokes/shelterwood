@@ -829,6 +829,17 @@ struct ScopeEpochGuard {
     retained_exits: Vec<RetainedExit>,
 }
 
+type NestedScopeStart = Obligation<Arc<ScopeCell>>;
+
+fn nested_scope_start(scope: &Arc<ScopeCell>) -> NestedScopeStart {
+    Obligation::new(Arc::clone(scope), close_never_started_scope_body)
+}
+
+fn close_never_started_scope_body(scope: Arc<ScopeCell>) {
+    let mut panics = runtime::PanicAccumulator::default();
+    panics.run(|| scope.close_never_started_body());
+}
+
 impl ScopeEpochGuard {
     fn begin(scope: &Arc<ScopeCell>) -> Option<Self> {
         let lifecycle = ScopeLifecycle::starting();
@@ -879,8 +890,10 @@ async fn run_nested_tree(
     scope: Arc<ScopeCell>,
     inherited: ResolvedDefaults,
     latches: NestedScopeLatches,
+    mut start: NestedScopeStart,
 ) -> crate::ExitResult {
     let epoch = begin_nested_incarnation(&scope)?;
+    start.complete(drop);
     run_nested_tree_with_epoch(tree, scope, inherited, latches, epoch).await
 }
 
@@ -893,8 +906,10 @@ async fn run_nested_factory(
     scope: Arc<ScopeCell>,
     inherited: ResolvedDefaults,
     latches: NestedScopeLatches,
+    mut start: NestedScopeStart,
 ) -> crate::ExitResult {
     let epoch = begin_nested_incarnation(&scope)?;
+    start.complete(drop);
     let tree = factory();
     run_nested_tree_with_epoch(tree, scope, inherited, latches, epoch).await
 }

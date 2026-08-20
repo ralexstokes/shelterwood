@@ -270,12 +270,14 @@ enum SpawnBody {
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
         latches: NestedScopeLatches,
+        start: NestedScopeStart,
     },
     ScopeOnce {
         tree: Box<BuilderCore>,
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
         latches: NestedScopeLatches,
+        start: NestedScopeStart,
     },
 }
 
@@ -486,6 +488,7 @@ fn dispatch_child_construction(
                 (
                     SpawnBody::ScopeRestartable {
                         factory: Arc::clone(factory),
+                        start: nested_scope_start(&scope),
                         scope,
                         inherited,
                         latches: latches.nested_scope(),
@@ -498,6 +501,7 @@ fn dispatch_child_construction(
                         tree: definition
                             .take_one_shot()
                             .expect("one-shot subtree construction invoked more than once"),
+                        start: nested_scope_start(&scope),
                         scope,
                         inherited,
                         latches: latches.nested_scope(),
@@ -568,13 +572,15 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                     scope,
                     inherited,
                     latches,
-                } => run_nested_factory(factory, scope, inherited, latches).await,
+                    start,
+                } => run_nested_factory(factory, scope, inherited, latches, start).await,
                 SpawnBody::ScopeOnce {
                     tree,
                     scope,
                     inherited,
                     latches,
-                } => run_nested_tree(*tree, scope, inherited, latches).await,
+                    start,
+                } => run_nested_tree(*tree, scope, inherited, latches, start).await,
             }
         };
         let outcome = CatchUnwindFuture::new(body).await;

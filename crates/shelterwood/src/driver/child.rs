@@ -675,7 +675,7 @@ impl ScopeRuntime {
         // construction funnel so initial and freshly admitted children obey
         // the same execution-time suppression rule as restart deadlines.
         // Scope-stop sources remain owned by their ordered control event; this
-        // gate is the membership-local rule from SPEC §7.
+        // gate is the membership-local rule from SPEC §8.
         if self.removal_latched(key) {
             self.reduce(SupervisorEvent::RemovalSampled { child: key });
             return;
@@ -951,7 +951,7 @@ impl ScopeRuntime {
             // An inverted `stop(); mark_ready()` sequence may also count as
             // ready here when its latch fires before the driver observes the
             // stop — licensed by the spec's "fired before ... a clean
-            // self-stop is observed" wording (§6).
+            // self-stop is observed" wording (§7).
             self.handle_ready(key, incarnation);
         }
         if self
@@ -1136,7 +1136,7 @@ impl ScopeRuntime {
     }
 
     fn terminal_startup_disposition(&self, key: ChildKey) -> StartupDisposition {
-        // §6's startup abort is a startup-sequence property: the membership
+        // §7's startup abort is a startup-sequence property: the membership
         // failed before its *initial* readiness edge. A later incarnation
         // stopped pre-ready (for example during drain) does not rewind it.
         if self.supervisor.is_initial(key)
@@ -1236,7 +1236,7 @@ impl ScopeRuntime {
             // ordered ahead of terminal routing.
             exit = classify_disposal_panic(exit, message);
         }
-        // §6's `StartupAborted` is a startup-sequence property of a
+        // §7's `StartupAborted` is a startup-sequence property of a
         // membership that *ran* and failed before its initial readiness
         // edge. A terminal without an exited incarnation never ran, so it
         // publishes the plain `Stopped { NeverStarted }` verdict (B.6) even

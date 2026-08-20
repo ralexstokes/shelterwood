@@ -475,7 +475,7 @@ impl<A: Actor> RawActor for Handler<A> {
     /// Runs one incarnation, leaning on the raw incarnation boundary for the
     /// panic machinery: a callback panic unwinds straight through this frame,
     /// and the raw runner freezes the mailbox and incarnation resources,
-    /// joins them, and only then drops this handler (§5.5's
+    /// joins them, and only then drops this handler (§6.5's
     /// resource-before-actor order), preserving the panic as the
     /// authoritative exit. Storing the actor in `self` rather than a frame
     /// local is what keeps its drop after that join on the `Err` and panic
@@ -542,7 +542,7 @@ impl<A: Actor> RawActor for Handler<A> {
     }
 }
 
-/// Propagates a callback error after §5.5's orderly teardown: incarnation-owned
+/// Propagates a callback error after §6.5's orderly teardown: incarnation-owned
 /// work is frozen, cancelled, and joined before control returns to the caller,
 /// which at the advertised composition point may be a raw decorator rather
 /// than the raw incarnation boundary itself.

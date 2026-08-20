@@ -1764,7 +1764,7 @@ enum DiscardedContinuationMessage {
 
 /// Queues a continuation whose destructor panics, then stops. The stop's
 /// freeze discards the continuation into the incarnation's shared disposal
-/// slot, which the following receive boundary resumes: SPEC §5.2's exclusion
+/// slot, which the following receive boundary resumes: SPEC §6.2's exclusion
 /// covers any incarnation-owned disposal panic, not offload work alone.
 struct DiscardedContinuationPanicActor {
     observations: Arc<StopPathPanicObservations>,
@@ -2037,7 +2037,7 @@ impl Actor for CrashTeardownActor {
     }
 }
 
-/// §5.5's teardown order holds on the crash path too: a `handle` panic joins
+/// §6.5's teardown order holds on the crash path too: a `handle` panic joins
 /// and destroys in-flight offload work before actor state is dropped.
 #[tokio::test]
 async fn incarnation_offloads_are_destroyed_before_actor_state_on_panic() {
@@ -2413,7 +2413,7 @@ async fn saturated_mailbox_does_not_grow_the_completion_backlog() {
     );
 }
 
-/// §5.5's teardown order holds on the error path too: a handler `Err` joins
+/// §6.5's teardown order holds on the error path too: a handler `Err` joins
 /// and destroys in-flight offload work before actor state is dropped.
 #[tokio::test]
 async fn incarnation_offloads_are_destroyed_before_actor_state_on_error() {

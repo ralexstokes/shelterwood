@@ -737,7 +737,7 @@ async fn shard_store_retire_waits_for_accepted_requests() {
         .expect("shard actor is alive");
 
     // Retirement starts while the accepted write is mid-handling;
-    // `membership_status` flips synchronously at the call (§13.12).
+    // `membership_status` flips synchronously at the call (§16.12).
     let removal = tokio::spawn({
         let ranges = ranges.clone();
         let scope = scope.clone();

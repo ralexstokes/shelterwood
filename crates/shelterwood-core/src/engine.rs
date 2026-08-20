@@ -179,7 +179,7 @@ impl StopLadder {
                 };
                 self.phase = StopPhase::Escalated;
                 // A forced ladder is the `Abort` policy's zero-grace point on
-                // this same ladder (§10), so it takes the zero-grace tidy beat
+                // this same ladder (§11), so it takes the zero-grace tidy beat
                 // rather than one scaled to the grace force just skipped. The
                 // Grace-phase provenance above is unaffected: whether grace
                 // actually expired is a separate fact from how long the beat

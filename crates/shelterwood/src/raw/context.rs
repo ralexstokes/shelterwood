@@ -73,7 +73,7 @@ struct QueuedEvent<M> {
 /// captured completion prefix, with continuation fairness interleaved, so the
 /// population stays bounded by the actor's own in-flight offload count plus
 /// the completions arriving within one such window. Bounded-mailbox policy
-/// governs external input only (SPEC §5.5: offload completions do not consume
+/// governs external input only (SPEC §6.5: offload completions do not consume
 /// mailbox capacity), and imposing a bound here would either block the offload
 /// task or drop a completion the total-continuation contract promises to
 /// deliver. Freezing at stop clears the queue, and dropped `RawResources`
@@ -900,7 +900,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// Returns the engine-resolved effective readiness mode for this
     /// incarnation: the definition-level override when one was given,
     /// otherwise the actor's declared mode. This is the single source the
-    /// gate is driven by (§6) — decorators and the blanket handler loop
+    /// gate is driven by (§7) — decorators and the blanket handler loop
     /// consult it rather than re-deriving their own.
     #[must_use]
     pub fn readiness(&self) -> Readiness {
@@ -917,13 +917,13 @@ impl<M: Send + 'static> RawContext<M> {
     /// Requests a clean self-stop of this incarnation.
     ///
     /// External intake freezes at this call — the drained set is exactly the
-    /// already-accepted prefix (§5.1's close point) — queued continuations
+    /// already-accepted prefix (§5.4's close point) — queued continuations
     /// and timers are discarded, and [`recv`](Self::recv) returns `None`.
     /// A raw loop honoring [`MailboxShutdown::Drain`] must then consume the
     /// frozen prefix with [`try_recv`](Self::try_recv); `recv` never drains a
     /// frozen mailbox. Idempotent. This is the primitive the blanket handler
     /// loop's `Context::stop` is built on (§1 principle 5); the child's
-    /// configured §10 ladder bounds the stop.
+    /// configured §11 ladder bounds the stop.
     ///
     /// A cleanup failure raised while freezing — a hostile waker woken by
     /// offload cancellation, or a released destructor — is retained as this
@@ -1034,7 +1034,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// Starts incarnation-owned async work with one total deadline budget.
     ///
     /// Completions re-enter the loop through incarnation-internal storage
-    /// that does not consume mailbox capacity (SPEC §5.5). That storage is
+    /// that does not consume mailbox capacity (SPEC §6.5). That storage is
     /// unbounded but cannot accumulate a backlog: it holds at most one entry
     /// per offload the actor itself started, and each bounded arbitration turn
     /// admits at most one mailbox delivery before its captured completion
@@ -1348,7 +1348,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// a self-feeding offload chain from starving the mailbox. One steady-batch
     /// consequence: a mailbox message arriving mid-drain waits behind the
     /// batch's captured completion prefix (bounded by the in-flight offload
-    /// count) — a cross-source ordering the spec leaves unspecified (SPEC §5.2:
+    /// count) — a cross-source ordering the spec leaves unspecified (SPEC §6.1:
     /// no global linearization point across source cutoffs), so tests must not
     /// pin any particular interleaving.
     ///
@@ -1404,7 +1404,7 @@ impl<M: Send + 'static> RawContext<M> {
             // A steady batch may have exhausted its captured external turn
             // while a continuation handler made later external work ready.
             // Start a fresh bounded turn before allowing another continuation
-            // so that work receives §5.2's mandatory fairness opportunity.
+            // so that work receives §6.1's mandatory fairness opportunity.
             // Fired batches deliberately retain their immutable cutoffs:
             // post-fire arrivals must not jump the already-fired timers.
             if !batch.is_fired()
@@ -1569,7 +1569,7 @@ impl<M: Send + 'static> RawContext<M> {
         self.freeze_and_report();
     }
 
-    /// Freezes incarnation resources, reporting §5.2's discarded
+    /// Freezes incarnation resources, reporting §6.2's discarded
     /// continuations on the exit path.
     fn freeze_and_report(&mut self) {
         let dropped = self.resources.freeze();

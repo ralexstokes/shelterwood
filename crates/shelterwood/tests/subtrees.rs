@@ -878,7 +878,7 @@ async fn shutdown_and_wait_wakes_when_a_parent_drain_terminalizes_a_restarting_s
 
 /// A subtree that shuts itself down records a cancelled exit: the stop
 /// request was observed before the outcome, whether it came from an
-/// ancestor's latch or the scope's own `request_scope_shutdown` (§7's
+/// ancestor's latch or the scope's own `request_scope_shutdown` (§8's
 /// `cancelled` definition is observation, not provenance).
 #[tokio::test]
 async fn locally_requested_subtree_shutdown_reads_cancelled() {

@@ -1291,7 +1291,7 @@ mod tests {
 
     #[test]
     fn large_exponent_backoff_is_monotone_and_saturates_at_the_maximum() {
-        // Pins the §9.2 amendment (SPEC §4.6): in the large-exponent regime
+        // Pins SPEC §10.2's large-exponent contract: in the large-exponent regime
         // the derived delay is monotone nondecreasing in the attempt and
         // plateaus exactly at the configured maximum, including across the
         // `i32::MAX` exponent clamp and out to `RestartAttempt(u64::MAX)`.

@@ -2641,38 +2641,38 @@ observable rules in §7, §8, §11, and §12.
 
 *Readiness and startup:*
 
-- Only initial memberships gate scope startup; a runtime admission never
+- **R1.** Only initial memberships gate scope startup; a runtime admission never
   enters the readiness aggregate.
-- Readiness is incarnation-local and monotone until restart: an accepted
+- **R2.** Readiness is incarnation-local and monotone until restart: an accepted
   readiness transition flips an initial member's bit `false → true`;
   duplicate readiness is a no-op; a restart-pending transition resets the
   bit only while startup is incomplete; once the aggregate has fired it
   never rewinds.
-- Removal is sampled at the publication transition: the readiness event
+- **R3.** Removal is sampled at the publication transition: the readiness event
   carries the synchronous removal-latch sample; a true sample first marks
   the membership `Removing` and the readiness edge is then rejected. A
   committed removal shrinks the initial set only at the reclaim step that
   follows `Removed` publication and precedes the removal response's
   resolution.
-- Ordered start is one accepted edge at a time: the settlement step emits
+- **R4.** Ordered start is one accepted edge at a time: the settlement step emits
   a start effect only for the current initial cursor, and advances the
   cursor only past a spawned-and-ready member or a reclaimed slot,
   reaching every initial member in declaration order. Dynamic startup may
   emit one accepted start per unspawned initial member.
-- Settlement effects are acknowledgeable: every emitted start effect
+- **R5.** Settlement effects are acknowledgeable: every emitted start effect
   names a resident child in an unstarted or restart-pending state —
   exactly the set the spawn acknowledgment accepts — and a settlement
   pass that emits no acknowledgeable work is already at a fixed point:
   re-entering settlement on an unchanged state reproduces its start
   effects and nothing else, so a level-triggered settle loop cannot spin.
-- Aggregate completion is derived, emitted at most once, and never while
+- **R6.** Aggregate completion is derived, emitted at most once, and never while
   any initial record remains unready — including one already latched for
   removal, which leaves the initial set only at reclaim. The empty
   initial set satisfies the predicate. For a dynamic scope that predicate
   is also sufficient; ordered startup adds its cursor, so a member
   latched for removal at or ahead of the cursor withholds completion
   until the removal commits even when every initial member is ready.
-- Terminal pre-ready failure is flavor-independent, rollback
+- **R7.** Terminal pre-ready failure is flavor-independent, rollback
   position-dependent: the exit funnel applies restart policy first; a
   terminal pre-ready failure emits the startup-failure transition; an
   ordered suffix becomes `NeverStarted`, while a dynamic scope has no
@@ -2681,52 +2681,52 @@ observable rules in §7, §8, §11, and §12.
 
 *Exits:*
 
-- Record, destroy, join, publish: one owned report token records the run
+- **E1.** Record, destroy, join, publish: one owned report token records the run
   outcome; dropping it records the fallback; no consumer sees an exit
   until the incarnation is destroyed and joined, and exactly one report
   is then published (§8's two-phase rule).
-- Verdict precedence is total and table-driven (§8), with the one
+- **E2.** Verdict precedence is total and table-driven (§8), with the one
   deliberate asymmetry: a recorded `Failed` survives a later abort; a
   recorded `Completed` does not.
-- Cancellation is orthogonal sampled state: the exit records `Observed`
+- **E3.** Cancellation is orthogonal sampled state: the exit records `Observed`
   iff the incarnation cancellation latch had fired when the outcome was
   recorded; restart eligibility never inspects this field.
-- One authoritative membership/incarnation state: incarnation phases
+- **E4.** One authoritative membership/incarnation state: incarnation phases
   advance only through
   `Unstarted → Active → Stopping? → Complete → RestartPending | Disposing
   → Joined`; stale or out-of-order events are total no-ops. Removal
   changes the enclosing membership state monotonically to `Removing`,
   never a parallel flag.
-- Restart suppression is state-derived: exits schedule restart only while
+- **E5.** Restart suppression is state-derived: exits schedule restart only while
   the scope is running and the membership is resident; draining or
   `Removing` records schedule nothing and charge no intensity.
-- Publication fences replacement: a replacement spawn follows the
+- **E6.** Publication fences replacement: a replacement spawn follows the
   predecessor's terminal publication; stale incarnation evidence cannot
   affect the replacement.
 
 *Shutdown:*
 
-- One ladder per stop, with the accepted transitions of §11 and
+- **S1.** One ladder per stop, with the accepted transitions of §11 and
   `force(now)` only ever moving the current deadline earlier, never
   skipping the tidy beat.
-- The stop policy has no zero-grace branch (§11); `Abort` records
+- **S2.** The stop policy has no zero-grace branch (§11); `Abort` records
   `WithinGrace`, graceful expiry records `AfterGrace`.
-- Flavor owns sequencing, not mechanism: drain entry initializes a
+- **S3.** Flavor owns sequencing, not mechanism: drain entry initializes a
   reverse cursor for ordered scopes and emits one stop per incomplete
   child of a dynamic scope; the ordered settlement exposes at most one
   incomplete child and does not advance until it joins.
-- The drain reason is the monotone lattice of §11; forced shutdown also
+- **S4.** The drain reason is the monotone lattice of §11; forced shutdown also
   sets the hard-force fact and emits one force effect per incomplete
   child.
-- Completion is derived and level-triggered: "all children joined" is
+- **S5.** Completion is derived and level-triggered: "all children joined" is
   derived from child states, and the finish effect is emitted once iff
   the flavor-specific finish predicate accepts that derived value.
-- Shutdown requests are sampled latches (§11): synchronous, idempotent,
+- **S6.** Shutdown requests are sampled latches (§11): synchronous, idempotent,
   sampled into decision events at step entry; a request consumed by
   incarnation N does not reach N+1; a request accepted with no live
   incarnation is owned by the membership until the next incarnation
   begins.
-- Driver death discharges owned obligations: destroying a driver
+- **S7.** Driver death discharges owned obligations: destroying a driver
   terminalizes active memberships, resolves admission/removal/shutdown
   completions, and closes observation only after terminal publication;
   the synchronous fallback may sacrifice post-join precision but may not
@@ -2734,27 +2734,27 @@ observable rules in §7, §8, §11, and §12.
 
 *Trees and lifetime:*
 
-- Declaration consumes into one typed root (§12's dispatch rule);
+- **T1.** Declaration consumes into one typed root (§12's dispatch rule);
   `System` is the sole non-cloneable owner and its drop latches shutdown.
-- Root and nested startup failure diverge only after the same decision
+- **T2.** Root and nested startup failure diverge only after the same decision
   transition (§7, §12).
-- Natural completion is flavor-policy derived (§12): ordered scopes may
+- **T3.** Natural completion is flavor-policy derived (§12): ordered scopes may
   finish after every membership joins; dynamic scopes, and ordered scopes
   holding a perpetually restartable member, do not finish merely because
   their current resident set is empty or terminal.
-- Dynamic admission has one linearization path (§9): reservation owns id
+- **T4.** Dynamic admission has one linearization path (§9): reservation owns id
   uniqueness and payload; an admission event inserts one authoritative
   child record and resolves independently of child readiness;
   cancellation chooses withdrawal or removal by whether admission won.
-- Removal is exact, idempotent, and monotone (§12): exact-handle removal
+- **T5.** Removal is exact, idempotent, and monotone (§12): exact-handle removal
   compares membership; id-only removal names the current resident; once
   sampled, the state stays `Removing` through stop, terminalization,
   finalization, and reclaim.
-- Non-owning scope shutdown targets an incarnation (B.9): a live request
+- **T6.** Non-owning scope shutdown targets an incarnation (B.9): a live request
   resolves after that incarnation's scope epilogue; a restart-window
   request arms the next incarnation; a membership that never spawns
   resolves at terminality.
-- Dynamic capability is explicit: `DynamicScopeRef` exposes only dynamic
+- **T7.** Dynamic capability is explicit: `DynamicScopeRef` exposes only dynamic
   operations inherently; shared observation/control is reached via
   `as_scope() -> &ScopeRef`; there is no mirrored forwarding block and no
   `Deref` conversion.

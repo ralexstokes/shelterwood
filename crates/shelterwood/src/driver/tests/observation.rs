@@ -1340,7 +1340,7 @@ fn gate_handoff_rejects_a_scope_with_an_unadmitted_dynamic_reservation() {
     root.set_admitted_children(vec![resident_projection(&slot)]);
 }
 
-/// SPEC §1's lock rule: nothing user-owned is destroyed inside a framework
+/// SPEC §15.4's lock rule: nothing user-owned is destroyed inside a framework
 /// critical section. `Exit`'s type-erased application error is the cell
 /// layer's only user-owned value, and the tests below cover the paths that
 /// retire one under the resident-tree observation gate: a losing

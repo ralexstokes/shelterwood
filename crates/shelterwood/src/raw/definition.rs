@@ -225,7 +225,7 @@ impl<R: RawActor> RawIncarnationOwner<R> {
 impl<R: RawActor> Drop for RawIncarnationOwner<R> {
     fn drop(&mut self) {
         // A hard abort destroys the incarnation future instead of polling its
-        // teardown epilogue. Preserve §5.5's resource-before-actor order, but
+        // teardown epilogue. Preserve §6.5's resource-before-actor order, but
         // put a boundary around each destructor so two panics cannot abort the
         // process. The resource panic is primary: it may be an owned offload
         // panic that completed before cancellation was requested.

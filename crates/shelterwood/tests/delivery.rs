@@ -438,7 +438,7 @@ impl RawActor for PoisonedCallActor {
 
 /// An accepted-but-undelivered call whose envelope is destroyed at
 /// incarnation close still surfaces `ReplyDropped` with the accepting
-/// incarnation (§5.1, B.3) — the close path, not a handler-side drop.
+/// incarnation (§5.4, B.3) — the close path, not a handler-side drop.
 #[tokio::test]
 async fn undelivered_call_killed_at_incarnation_close_reports_reply_dropped() {
     let gate = ReleaseGate::default();
@@ -479,7 +479,7 @@ impl RawActor for StubbornActor {
 
 /// After a forced teardown hard-aborts a nested scope, its members are
 /// terminal: `try_send` fails `Terminated` (not the transient `NotRunning`)
-/// and a parked `send` resolves instead of parking forever (§13.2, §3.4).
+/// and a parked `send` resolves instead of parking forever (§16.2, §3.4).
 #[tokio::test]
 async fn forced_teardown_terminalizes_nested_mailboxes() {
     let mut nested = Tree::new();

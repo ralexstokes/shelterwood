@@ -61,7 +61,6 @@ impl<T> Drop for Obligation<T> {
 mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
-        process::Command,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -113,43 +112,21 @@ mod tests {
         );
     }
 
+    /// Runs in process because every runner that reaches this test isolates
+    /// it in one: `just test` and the authoritative Nix check both invoke
+    /// `cargo nextest run` for `--lib --bins --tests --examples`, and nextest
+    /// executes each test as its own process. A regressed containment
+    /// therefore aborts that process, which the runner reports as this test
+    /// failing on SIGABRT. No in-process assertion can observe an abort, so
+    /// the assertions below pin the other half instead: that the *original*
+    /// panic, not the fallback's, is what reaches the boundary.
     #[test]
     fn obligation_fallback_panic_is_contained_during_an_existing_unwind() {
-        const CHILD_ENV: &str = "SHELTERWOOD_OBLIGATION_UNWIND_CHILD";
-        const TEST_NAME: &str = "driver::storage::tests::obligation_fallback_panic_is_contained_during_an_existing_unwind";
-
-        if std::env::var_os(CHILD_ENV).is_some() {
-            let panic = catch_unwind(|| {
-                let _obligation = Obligation::new((), panic_fallback);
-                panic!("outer panic");
-            })
-            .expect_err("the original unwind reaches its boundary");
-            assert_eq!(panic.downcast_ref::<&str>(), Some(&"outer panic"));
-            return;
-        }
-
-        let output = Command::new(std::env::current_exe().expect("unit-test executable"))
-            .arg("--exact")
-            .arg(TEST_NAME)
-            .arg("--nocapture")
-            .arg("--test-threads=1")
-            .env(CHILD_ENV, "1")
-            .output()
-            .expect("nested-unwind subprocess starts");
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            output.status.success(),
-            "nested-unwind subprocess must preserve the original panic instead of aborting\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            output.status,
-        );
-        // The child filter is a hardcoded name, and libtest exits zero when
-        // `--exact` matches nothing. Without this the whole regression goes
-        // vacuous the moment the test moves or is renamed.
-        assert!(
-            stdout.contains("1 passed"),
-            "the child must actually run this test, not filter it away\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        );
+        let panic = catch_unwind(|| {
+            let _obligation = Obligation::new((), panic_fallback);
+            panic!("outer panic");
+        })
+        .expect_err("the original unwind reaches its boundary");
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"outer panic"));
     }
 }

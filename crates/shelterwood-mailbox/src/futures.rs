@@ -119,13 +119,7 @@ impl<M: Send + 'static> ActorRef<M> {
     pub fn send_timeout(&self, message: M, deadline: impl Into<DeadlineBudget>) -> SendTimeout<M> {
         let runtime = self.mailbox.runtime();
         SendTimeout {
-            deadlined: Deadlined::no_attempt(
-                TimedSend {
-                    send: self.send(message),
-                },
-                deadline,
-                runtime,
-            ),
+            deadlined: Deadlined::no_attempt(self.send(message), deadline, runtime),
         }
     }
 
@@ -401,11 +395,7 @@ impl<M: Send + 'static> Drop for SendFuture<M> {
 /// Cancellation-safe future returned by [`ActorRef::send_timeout`].
 #[must_use]
 pub struct SendTimeout<M: Send + 'static> {
-    deadlined: Deadlined<TimedSend<M>>,
-}
-
-struct TimedSend<M: Send + 'static> {
-    send: SendFuture<M>,
+    deadlined: Deadlined<SendFuture<M>>,
 }
 
 impl<M: Send + 'static> fmt::Debug for SendTimeout<M> {
@@ -449,15 +439,7 @@ fn withdraw_send_with<M: Send + 'static>(
     result
 }
 
-fn withdraw_send<M: Send + 'static>(send: &mut SendFuture<M>) -> Result<Incarnation, SendError<M>> {
-    // Unlike the cancellation path this is a normal return on the caller's own
-    // task, and the recovered message goes back to that same caller. No core
-    // lock is held, so the caller's waker destructor stays inline and its
-    // panic stays visible.
-    withdraw_send_with(send, WithdrawalDisposition::Inline)
-}
-
-impl<M: Send + 'static> DeadlineOperation for TimedSend<M> {
+impl<M: Send + 'static> DeadlineOperation for SendFuture<M> {
     type Output = Result<Incarnation, SendError<M>>;
 
     fn poll_deadlined(
@@ -466,13 +448,17 @@ impl<M: Send + 'static> DeadlineOperation for TimedSend<M> {
         _budget: crate::deadline::Deadline,
         phase: DeadlinePhase,
     ) -> Poll<Self::Output> {
-        if let Poll::Ready(result) = Pin::new(&mut self.send).poll(context) {
+        if let Poll::Ready(result) = Pin::new(&mut *self).poll(context) {
             return Poll::Ready(result);
         }
         if phase == DeadlinePhase::InitialAttempt {
             Poll::Pending
         } else {
-            Poll::Ready(withdraw_send(&mut self.send))
+            // Unlike cancellation this is a normal return on the caller's
+            // task. The recovered message goes back to that caller and the
+            // registered waker destructor stays inline, so its panic remains
+            // visible.
+            Poll::Ready(withdraw_send_with(self, WithdrawalDisposition::Inline))
         }
     }
 
@@ -480,7 +466,7 @@ impl<M: Send + 'static> DeadlineOperation for TimedSend<M> {
         // The send was never polled, so it was never submitted: withdrawal
         // recovers the message and reports the mailbox's current binding as
         // the newest incarnation observed during the attempt.
-        withdraw_send(&mut self.send)
+        withdraw_send_with(self, WithdrawalDisposition::Inline)
     }
 }
 
@@ -562,6 +548,22 @@ impl<M: Send + 'static, T: Send + 'static> CallOperation<M, T> {
             reply.close();
         }
     }
+
+    fn fail_send(
+        &mut self,
+        error: SendError<M>,
+        kind: CallErrorKind,
+    ) -> Poll<Result<Replied<T>, CallError>> {
+        self.close_reply();
+        // The call surface has no way to hand the recovered message back;
+        // route the discard through isolated disposal.
+        self.actor.mailbox.dispose(error.message);
+        Poll::Ready(Err(CallError {
+            actor_id: error.actor_id,
+            incarnation_observed: error.incarnation_observed,
+            kind,
+        }))
+    }
 }
 
 impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M, T> {
@@ -608,16 +610,7 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
                     self.send = None;
                 }
                 Poll::Ready(Err(error)) => {
-                    self.close_reply();
-                    // The call surface has no way to hand the recovered
-                    // message back; route the discard through isolated
-                    // disposal.
-                    self.actor.mailbox.dispose(error.message);
-                    return Poll::Ready(Err(CallError {
-                        actor_id: error.actor_id,
-                        incarnation_observed: error.incarnation_observed,
-                        kind: CallErrorKind::Terminated,
-                    }));
+                    return self.fail_send(error, CallErrorKind::Terminated);
                 }
                 Poll::Pending => {}
             }
@@ -652,21 +645,14 @@ impl<M: Send + 'static, T: Send + 'static> DeadlineOperation for CallOperation<M
                 self.poll_reply(context, incarnation, DeadlinePhase::TimeoutArbitration)
             }
             Err(error) => {
-                self.close_reply();
-                // The call surface has no way to hand the recovered message
-                // back; route the discard through isolated disposal.
-                self.actor.mailbox.dispose(error.message);
-                Poll::Ready(Err(CallError {
-                    actor_id: error.actor_id,
-                    incarnation_observed: error.incarnation_observed,
-                    kind: match error.kind {
-                        SendErrorKind::TimedOut => CallErrorKind::AcceptanceTimedOut,
-                        SendErrorKind::Terminated => CallErrorKind::Terminated,
-                        SendErrorKind::NotRunning | SendErrorKind::Full => {
-                            unreachable!("withdrawal returns only timed-out or terminal errors")
-                        }
-                    },
-                }))
+                let kind = match error.kind {
+                    SendErrorKind::TimedOut => CallErrorKind::AcceptanceTimedOut,
+                    SendErrorKind::Terminated => CallErrorKind::Terminated,
+                    SendErrorKind::NotRunning | SendErrorKind::Full => {
+                        unreachable!("withdrawal returns only timed-out or terminal errors")
+                    }
+                };
+                self.fail_send(error, kind)
             }
         }
     }
@@ -704,14 +690,13 @@ mod tests {
         },
         task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
         thread::ThreadId,
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     use shelterwood_core::DeadlineBudget;
 
     use crate::{
-        BoxedSleep, CallErrorKind, ErasedOneShotReceiver, ErasedOneShotSender, Incarnation,
-        MailboxControl, MailboxEffectQueue, MailboxReceiver, MailboxRuntime, MailboxSignal, Reply,
+        CallErrorKind, Incarnation, MailboxControl, MailboxEffectQueue, MailboxReceiver, Reply,
         policy::ResolvedMailbox, test_support::mint_actor_incarnation,
     };
 
@@ -939,38 +924,6 @@ mod tests {
         assert_eq!(error.incarnation_observed, Some(incarnation));
     }
 
-    struct ControlledClockRuntime {
-        inner: Arc<dyn MailboxRuntime>,
-        now: Arc<Mutex<Instant>>,
-    }
-
-    impl MailboxRuntime for ControlledClockRuntime {
-        fn oneshot(
-            &self,
-        ) -> (
-            Box<dyn ErasedOneShotSender>,
-            Pin<Box<dyn ErasedOneShotReceiver>>,
-        ) {
-            self.inner.oneshot()
-        }
-
-        fn signal(&self) -> Arc<dyn MailboxSignal> {
-            self.inner.signal()
-        }
-
-        fn dispose(&self, value: Box<dyn Send + 'static>) {
-            self.inner.dispose(value);
-        }
-
-        fn now(&self) -> Instant {
-            *self.now.lock().expect("controlled clock mutex")
-        }
-
-        fn sleep_until(&self, deadline: Option<Instant>) -> BoxedSleep {
-            self.inner.sleep_until(deadline)
-        }
-    }
-
     struct ConstructionOverdueMessage {
         _reply: Reply<u8>,
         disposed: mpsc::Sender<ThreadId>,
@@ -986,10 +939,11 @@ mod tests {
     fn construction_that_consumes_the_budget_is_disposed_without_submission() {
         let start = crate::capability::tests::runtime().now();
         let clock = Arc::new(Mutex::new(start));
-        let runtime = Arc::new(ControlledClockRuntime {
-            inner: crate::capability::tests::runtime(),
-            now: Arc::clone(&clock),
-        });
+        let runtime_clock = Arc::clone(&clock);
+        let runtime = Arc::new(
+            crate::capability::tests::TestRuntime::new()
+                .with_now(move || *runtime_clock.lock().expect("controlled clock mutex")),
+        );
         let (mailbox, actor) = actor_for_with_runtime(runtime);
         let token = configure(
             &mailbox,
@@ -1386,6 +1340,54 @@ mod tests {
             "a hostile waker destructor cannot divert the message from isolated disposal"
         );
         assert_ne!(await_disposal(&waker_thread), here);
+    }
+
+    #[crate::runtime::test(start_paused = true)]
+    async fn send_timeout_releases_its_waker_inline_after_recovering_the_message() {
+        let (_, actor): (
+            Arc<MailboxCell<ThreadRecordingDrop>>,
+            ActorRef<ThreadRecordingDrop>,
+        ) = actor_for();
+        let width = Duration::from_secs(1);
+        let message_thread = disposal_thread();
+        let waker_thread = disposal_thread();
+        let mut send =
+            Box::pin(actor.send_timeout(ThreadRecordingDrop(message_thread.clone()), width));
+        // Keep the caller-owned raw waker permanently inert: if an assertion
+        // below fails, dropping it during that unwind would create a second
+        // panic and abort the test process. Only its registered clone is the
+        // subject of this regression.
+        let hostile = ManuallyDrop::new(panicking_drop_waker(waker_thread.clone()));
+        let mut context = Context::from_waker(&hostile);
+        let deadline =
+            crate::deadline::Deadline::after(crate::capability::tests::runtime().now(), width);
+
+        assert!(
+            send.deadlined
+                .operation
+                .poll_deadlined(&mut context, deadline, DeadlinePhase::InitialAttempt)
+                .is_pending()
+        );
+        crate::runtime::advance(width * 2).await;
+        let polling_thread = std::thread::current().id();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            send.deadlined.operation.poll_deadlined(
+                &mut context,
+                deadline,
+                DeadlinePhase::TimeoutArbitration,
+            )
+        }))
+        .expect_err("inline waker destruction surfaces its panic from the timeout poll");
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("injected call waker drop panic")
+        );
+        assert_eq!(await_disposal(&waker_thread), polling_thread);
+        assert_eq!(
+            await_disposal(&message_thread),
+            polling_thread,
+            "the recovered message remains caller-owned when the waker drop unwinds"
+        );
     }
 
     #[test]

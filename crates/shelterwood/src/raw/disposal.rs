@@ -13,7 +13,9 @@ use crate::runtime::{PanicAccumulator, PanicPayload, Signal, catch_panic, discar
 ///
 /// Once the inner future returns `Ready`, it is destroyed before the output is
 /// released. If that destruction panics, the already-produced output is
-/// discarded and the destructor panic becomes this future's error.
+/// discarded and the destructor panic becomes this future's error. Discarding
+/// is itself contained: a hostile output destructor's own panic is swallowed
+/// rather than replacing the retained destructor panic or escaping the poll.
 pub(crate) struct CatchUnwindFuture<F> {
     future: Option<Pin<Box<F>>>,
 }
@@ -193,13 +195,13 @@ mod tests {
         pin::Pin,
         process::Command,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::{Context, Poll, Waker},
     };
 
-    use super::{CatchUnwindFuture, PanicPayload, discard_panic};
+    use super::{CatchUnwindFuture, PanicPayload, catch_panic, discard_panic};
 
     struct PanickingOutput {
         drops: Arc<AtomicUsize>,
@@ -328,9 +330,9 @@ mod tests {
     }
 
     #[test]
-    fn hostile_output_cannot_abort_while_a_hostile_future_panic_is_retained() {
+    fn hostile_output_destructor_cannot_escape_while_a_hostile_future_panic_is_retained() {
         const CHILD_ENV: &str = "SHELTERWOOD_CATCH_UNWIND_OUTPUT_CHILD";
-        const TEST_NAME: &str = "raw::disposal::tests::hostile_output_cannot_abort_while_a_hostile_future_panic_is_retained";
+        const TEST_NAME: &str = "raw::disposal::tests::hostile_output_destructor_cannot_escape_while_a_hostile_future_panic_is_retained";
 
         if std::env::var_os(CHILD_ENV).is_some() {
             let future_drops = Arc::new(AtomicUsize::new(0));
@@ -363,12 +365,125 @@ mod tests {
             .output()
             .expect("hostile-output subprocess starts");
 
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success(),
-            "hostile-output subprocess must return the retained panic instead of aborting\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            "hostile-output subprocess must return the retained panic instead of escaping the boundary\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{}",
             output.status,
-            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+        // A filter matching nothing is a passing libtest run, so the status
+        // check alone goes vacuous the moment this test is renamed or moved.
+        assert!(
+            stdout.contains("1 passed"),
+            "the subprocess must actually run {TEST_NAME}\nstdout:\n{stdout}",
+        );
+    }
+
+    struct LoggedDrop {
+        label: &'static str,
+        log: DropLog,
+    }
+
+    impl Drop for LoggedDrop {
+        fn drop(&mut self) {
+            self.log
+                .lock()
+                .expect("drop log mutex poisoned")
+                .push(self.label);
+        }
+    }
+
+    type DropLog = Arc<Mutex<Vec<&'static str>>>;
+
+    fn drop_log_entries(log: &DropLog) -> Vec<&'static str> {
+        log.lock().expect("drop log mutex poisoned").clone()
+    }
+
+    struct ReadyThenLogsDrop {
+        output: Option<LoggedDrop>,
+        log: DropLog,
+    }
+
+    impl Future for ReadyThenLogsDrop {
+        type Output = LoggedDrop;
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(self.output.take().expect("the test future is polled once"))
+        }
+    }
+
+    impl Drop for ReadyThenLogsDrop {
+        fn drop(&mut self) {
+            self.log
+                .lock()
+                .expect("drop log mutex poisoned")
+                .push("future");
+        }
+    }
+
+    #[test]
+    fn a_completed_future_is_destroyed_once_before_its_output_is_released() {
+        let log: DropLog = Arc::new(Mutex::new(Vec::new()));
+        let mut boundary = Box::pin(CatchUnwindFuture::new(ReadyThenLogsDrop {
+            output: Some(LoggedDrop {
+                label: "output",
+                log: Arc::clone(&log),
+            }),
+            log: Arc::clone(&log),
+        }));
+
+        let output = match boundary
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(Ok(output)) => output,
+            Poll::Ready(Err(_)) => panic!("the clean future must not report a panic"),
+            Poll::Pending => panic!("the clean future completes on its first poll"),
+        };
+        assert_eq!(
+            drop_log_entries(&log),
+            vec!["future"],
+            "the inner future is destroyed exactly once, before the output is released"
+        );
+
+        drop(output);
+        assert_eq!(drop_log_entries(&log), vec!["future", "output"]);
+    }
+
+    #[test]
+    fn an_unpolled_boundary_resumes_its_future_destructor_panic_from_drop_glue() {
+        let future_drops = Arc::new(AtomicUsize::new(0));
+        let boundary = CatchUnwindFuture::new(PollThenDropPanics {
+            drops: Arc::clone(&future_drops),
+        });
+
+        let payload = catch_panic(|| drop(boundary))
+            .expect_err("drop glue resumes the inner destructor panic outside an unwind");
+        assert_eq!(
+            panic_message(&payload),
+            Some("injected future destructor panic")
+        );
+        discard_panic(Some(payload));
+        assert_eq!(future_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_boundary_dropped_during_an_unwind_contains_its_future_destructor_panic() {
+        let future_drops = Arc::new(AtomicUsize::new(0));
+        let payload = catch_panic({
+            let future_drops = Arc::clone(&future_drops);
+            move || {
+                let _boundary = CatchUnwindFuture::new(PollThenDropPanics {
+                    drops: future_drops,
+                });
+                panic!("injected primary panic");
+            }
+        })
+        .expect_err("the primary panic reaches the boundary");
+
+        assert_eq!(panic_message(&payload), Some("injected primary panic"));
+        discard_panic(Some(payload));
+        assert_eq!(future_drops.load(Ordering::SeqCst), 1);
     }
 }

@@ -6,7 +6,7 @@ the tree owns startup order, readiness, restart policy, bounded mailboxes,
 shutdown, and observation. Stable membership and incarnation identities make
 failure recovery explicit without a global registry.
 
-The current `0.1` surface is the core described by [SPEC.md](../../../specs/SPEC.md): ordered
+The current `0.1` surface is the core described by [SPEC.md](specs/SPEC.md): ordered
 and dynamic scopes, `OneForOne` supervision, handler and raw actors, supervised
 tasks, queue and latest-value mailboxes, lifecycle events, and recursive
 snapshots. Part II features in the specification are intentionally not part of

@@ -1263,16 +1263,28 @@ impl ScopeCell {
         self.with_observation_gate(|txn| self.terminalize_never_started_locked(txn));
     }
 
-    /// Publishes and closes a nested scope body that was spawned but never
-    /// began its own incarnation. The parent driver remains responsible for
-    /// the shared membership's terminal exit.
+    /// Publishes a nested scope body that was spawned but never began its own
+    /// incarnation. The parent driver remains responsible for the shared
+    /// membership's terminal exit and, unless it already published that exit,
+    /// closes observation after the terminal parent projection.
     pub fn close_never_started_body(&self) {
         self.with_observation_gate(|txn| {
             if self.observation.closed.load(Ordering::Acquire) {
                 return;
             }
+            // A never-polled restart never reaches `begin_incarnation`, so
+            // perform that boundary's projection reset before publishing the
+            // replacement terminal state. Otherwise the prior incarnation's
+            // startup result and restart total leak into this one.
+            self.observation.record.modify_silently(|record| {
+                record.total_restarts = TotalRestarts::ZERO;
+                record.startup = None;
+                record.refresh_retained_exits();
+            });
             self.publish_stopped_locked(txn, StopReason::NeverStarted, None, None);
-            self.close_observation_locked(txn);
+            if self.membership_terminal() {
+                self.close_observation_locked(txn);
+            }
         });
     }
 
@@ -1320,28 +1332,41 @@ mod tests {
     }
 
     #[test]
-    fn never_started_restart_body_replaces_the_stale_prior_reason_and_closes() {
+    fn never_started_restart_body_resets_before_membership_closes_observation() {
         let scope = isolated_scope("nested", ScopeFlavor::Ordered);
         let epoch = scope
             .begin_incarnation(ScopeState::Starting)
             .expect("first incarnation begins");
         scope.finish_incarnation(epoch, StopReason::Finished);
+        scope.observation.record.modify_silently(|record| {
+            record.total_restarts = TotalRestarts::ZERO.bump();
+            record.startup = Some(Ok(()));
+        });
         let snapshots = scope.subscribe_snapshots();
 
         scope.close_never_started_body();
 
         let (snapshot, closed) = snapshots.borrow_latest_and_closed();
-        assert!(closed);
+        assert!(!closed, "membership terminality owns observation closure");
         assert!(matches!(
             snapshot.state,
             ScopeState::Stopped {
                 reason: StopReason::NeverStarted
             }
         ));
+        assert_eq!(snapshot.total_restarts, TotalRestarts::ZERO);
+        assert!(matches!(
+            scope.record().startup,
+            Some(Err(StartupError::ShutdownRequested))
+        ));
         assert!(
             !matches!(scope.member.record().stage, MemberStage::Terminal(_)),
             "the parent driver still owns membership terminality"
         );
+
+        scope.terminalize_never_started();
+        let (_, closed) = snapshots.borrow_latest_and_closed();
+        assert!(closed, "terminal membership closes observation");
     }
 
     impl Wake for GateCheckingWake {

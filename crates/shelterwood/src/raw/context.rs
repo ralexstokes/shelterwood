@@ -801,6 +801,7 @@ pub struct RawContext<M> {
     abort: CancellationToken,
     ready: CompletionGatedLatch,
     local_stop: Latch,
+    deferred_init_stop: bool,
     readiness: Readiness,
     mailbox_shutdown: MailboxShutdown,
     receiver: MailboxReceiver<M>,
@@ -833,6 +834,7 @@ impl<M: Send + 'static> RawContext<M> {
             abort: ParentCancellationToken::from_latch(run.abort).token(),
             ready: run.ready,
             local_stop: run.local_stop,
+            deferred_init_stop: false,
             readiness,
             mailbox_shutdown: run.mailbox_shutdown,
             receiver: MailboxReceiver::new(mailbox, run.incarnation),
@@ -935,8 +937,37 @@ impl<M: Send + 'static> RawContext<M> {
         self.local_stop.fire();
     }
 
+    /// Freezes a callback actor at an `AfterInit` initializer's stop request,
+    /// but holds supervisor publication until the initializer returns. The
+    /// blanket handler then fires automatic readiness and this stop in one
+    /// fixed order; projected decorator contexts share the same pending bit.
+    pub(crate) fn defer_stop_until_after_init(&mut self) {
+        if self.deferred_init_stop {
+            return;
+        }
+        // Record the request before cleanup so an unwind from cleanup still
+        // publishes it through the initializer context's Drop fallback.
+        self.deferred_init_stop = true;
+        self.receiver.freeze();
+        self.freeze_and_report();
+    }
+
+    /// Closes the callback initializer boundary. Consuming the pending bit
+    /// lets a successful effective `AfterInit` initializer use the ordinary
+    /// `mark_ready` path before its own stop is published. Parent shutdown
+    /// keeps the existing no-readiness rule.
+    pub(crate) fn finish_callback_init(&mut self, successful: bool) {
+        let deferred_stop = std::mem::take(&mut self.deferred_init_stop);
+        if successful && self.readiness == Readiness::AfterInit {
+            self.mark_ready();
+        }
+        if deferred_stop {
+            self.local_stop.fire();
+        }
+    }
+
     pub(crate) fn is_stopping(&self) -> bool {
-        self.local_stop.is_fired() || self.shutdown.is_cancelled()
+        self.deferred_init_stop || self.local_stop.is_fired() || self.shutdown.is_cancelled()
     }
 
     /// Queues an actor-local continuation ahead of external input.

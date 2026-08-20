@@ -1249,10 +1249,16 @@ and `supervisor::…` names the pure reducer suite.
    position-dependent.** The exit funnel applies restart policy first. A
    terminal pre-ready failure emits `FailStartup`; an ordered suffix becomes
    `NeverStarted`, while a dynamic scope has no unstarted suffix. Root failure
-   parks in `StartupFailed`; nested failure begins ordinary rollback.
+   parks in `StartupFailed`; nested failure begins ordinary rollback. For an
+   effective `AfterInit` callback actor, a `stop()` requested during an
+   initializer that returns `Ok` becomes observable only after the automatic
+   readiness edge, so its clean exit is post-ready. An effective `Manual`
+   override receives no such edge and the same pre-ready stop remains R7.
    (`integration::ordered_terminal_pre_ready_exit_parks_the_root_and_marks_suffix_never_started`,
    `integration::dynamic_startup_failure_keeps_other_initial_members_supervised`,
-   `integration::nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause`.)
+   `integration::nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause`,
+   `integration::after_init_stop_waits_for_success_then_advances_the_ordered_suffix`,
+   `integration::manual_stop_in_init_remains_a_terminal_pre_ready_failure`.)
 
 No rule above is flagged unverified: each has direct checked evidence. The
 remaining prose in this section specifies declaration defaults, user-facing
@@ -1275,7 +1281,12 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
 ```
 
 - `Actor` (blanket) children default to `AfterInit`: ready when `init`
-  returns `Ok`.
+  returns `Ok`. If that successful initializer requested `Context::stop()`,
+  intake freezes at the request but the blanket loop publishes the automatic
+  readiness edge before publishing the self-stop. This fixed latch order
+  preserves `AfterInit` under arbitrary scheduling of the readiness and
+  self-stop watcher tasks; it does not change an effective `Manual`
+  initializer's pre-ready stop.
 - Raw actor types declare via `RawActor::readiness()`; decorators propagate
   with a visible `R::readiness()`. The trait default is `Immediate`, so
   a decorator that omits propagation reports immediate readiness — an
@@ -1308,8 +1319,9 @@ enum Readiness { Immediate, AfterInit, Manual }   // mode only — the deadline 
   exactly **two** states: immediate, or gated with a resolved deadline.
   `AfterInit` is declaration-level sugar — the blanket loop reports
   readiness through the same public `mark_ready` mechanism after `init`
-  returns `Ok`; there is no third engine state and no framework-private
-  readiness path (§1 principles 2 and 5). Deadline expiry is a distinct
+  returns `Ok`, then publishes any self-stop deferred from that initializer;
+  there is no third engine state and no framework-private readiness path (§1
+  principles 2 and 5). Deadline expiry is a distinct
   startup-failure exit cause (§7) — one type, for tasks and actors alike,
   produced by one engine-side timeout (not re-implemented per child kind
   and reunited by downcast).
@@ -2404,7 +2416,14 @@ framework contract**. No other normative shutdown paragraph is unmapped.
   bound on its drain-plus-`on_stop` window (§5.2), so a wedged self-stop
   escalates — grace expiry, tidy beat, hard abort — exactly like a
   supervisor-initiated one. Self-stop changes who started the clock,
-  never which ladder runs.
+  never which ladder runs. One case defers the clock rather than
+  changing it: an effective `AfterInit` initializer publishes its
+  `stop()` only when it returns (R7, §6), so an initializer that
+  requests a stop and then never returns has not yet armed the ladder.
+  Intake is already frozen and the readiness deadline still bounds it,
+  but a `ReadinessDeadline::Unbounded` declaration leaves that wedge
+  bounded only by parent or scope shutdown. Declaring an unbounded
+  readiness deadline is what accepts that.
 - Shutdown requests are **level-triggered, not queued**: owner drop,
   `request_shutdown()` / `request_scope_shutdown()`, and parent
   escalation each set an idempotent per-scope latch (a token edge, like
@@ -3719,7 +3738,7 @@ the same series during shutdown drain; **Stop** = `StopContext<'_, A>` in
 | `recv()` / `try_recv()` (the merged event source: mailbox, offload completions, fired timers, queued continuations, §5.2 priority; `recv` yields `None` on stop request, biased; `try_recv` ignores the stop token — the drain primitive for raw loops: under `Drain`, exhaust the frozen prefix via `try_recv` after `recv` yields `None`, §10's raw-loop obligation) | ✓ | — | — | — |
 | `mailbox_shutdown()` (the resolved §10 policy for this actor's mailbox — what a raw loop consults to honor `Drain` vs `Discard`) | ✓ | — | — | — |
 | `mark_ready()` (one-shot effect by construction; meaningful only under gated readiness, else a documented no-op — B.2's rule, uniformly; during drain always the no-op) | ✓ | ✓ | ✓ | — |
-| `stop()` (clean self-stop; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §10 ladder as the stop bound. Live/Drain: effective after the current callback. Raw: freezes intake at the call — drain the frozen prefix via `try_recv` after `recv` yields `None`; §1 principle 5's public primitive for the blanket loop's `stop()`) | ✓ | ✓ | ✓ | — |
+| `stop()` (clean self-stop; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §10 ladder as the stop bound. Live/Drain: effective after the current callback; in a successful effective-`AfterInit` initializer, after its automatic readiness edge. Raw: freezes intake at the call — drain the frozen prefix via `try_recv` after `recv` yields `None`; §1 principle 5's public primitive for the blanket loop's `stop()`) | ✓ | ✓ | ✓ | — |
 | `is_draining()` | — | ✓ | ✓ | — |
 | `continue_with(msg)` (next-message continuation; no mailbox capacity; anti-starvation per §5.2) | ✓ | ✓ | **R** | — |
 | Keyed timers: `set_timeout` / `set_interval` / `clear_timer` (§5.3) | ✓ | ✓ | **R** | — |

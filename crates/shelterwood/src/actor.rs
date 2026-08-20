@@ -123,6 +123,7 @@ macro_rules! actor_context_forwarders {
 /// Which mailbox delivery stage owns the current callback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeliveryStage {
+    Initializing,
     Live,
     DrainingFrozenPrefix,
 }
@@ -131,6 +132,7 @@ enum DeliveryStage {
 pub struct Context<'a, A: Actor> {
     raw: &'a mut RawContext<A::Msg>,
     stage: DeliveryStage,
+    owns_init_boundary: bool,
     actor: PhantomData<fn() -> A>,
 }
 
@@ -150,8 +152,23 @@ impl<'a, A: Actor> Context<'a, A> {
         Self {
             raw,
             stage,
+            owns_init_boundary: false,
             actor: PhantomData,
         }
+    }
+
+    fn new_initializing(raw: &'a mut RawContext<A::Msg>) -> Self {
+        Self {
+            raw,
+            stage: DeliveryStage::Initializing,
+            owns_init_boundary: true,
+            actor: PhantomData,
+        }
+    }
+
+    fn initialization_returned(&mut self) {
+        debug_assert_eq!(self.stage, DeliveryStage::Initializing);
+        self.owns_init_boundary = false;
     }
 
     actor_context_forwarders!(A);
@@ -162,19 +179,29 @@ impl<'a, A: Actor> Context<'a, A> {
     /// readiness can no longer change the startup outcome and this call is a
     /// deliberate no-op.
     pub fn mark_ready(&self) {
-        if self.stage == DeliveryStage::Live {
+        if self.stage != DeliveryStage::DrainingFrozenPrefix {
             self.raw.mark_ready();
         }
     }
 
     /// Requests a clean local stop after the current callback.
     ///
+    /// During a successful initializer with effective [`Readiness::AfterInit`],
+    /// the automatic readiness edge is published before this request becomes
+    /// observable to the supervisor. This preserves `AfterInit`'s promise
+    /// that returning `Ok` establishes readiness. An explicit
+    /// [`Readiness::Manual`] override keeps ordinary pre-ready stop semantics.
+    ///
     /// During frozen-prefix drain the incarnation is already stopping, so
     /// this call deliberately does not inject a second local-stop edge and
     /// returns silently.
     pub fn stop(&mut self) {
-        if self.stage == DeliveryStage::Live {
-            self.raw.stop();
+        match self.stage {
+            DeliveryStage::Initializing if self.raw.readiness() == Readiness::AfterInit => {
+                self.raw.defer_stop_until_after_init();
+            }
+            DeliveryStage::Initializing | DeliveryStage::Live => self.raw.stop(),
+            DeliveryStage::DrainingFrozenPrefix => {}
         }
     }
 
@@ -288,7 +315,22 @@ impl<'a, A: Actor> Context<'a, A> {
         Context {
             raw: &mut *self.raw,
             stage,
+            // The outermost handler context owns the initializer-return
+            // boundary. A decorator's projected context must not publish a
+            // deferred self-stop before the outer initializer also returns.
+            owns_init_boundary: false,
             actor: PhantomData,
+        }
+    }
+}
+
+impl<A: Actor> Drop for Context<'_, A> {
+    fn drop(&mut self) {
+        if self.owns_init_boundary {
+            // Cancellation and panic do not cross the successful-init
+            // ordering point. Preserve the requested stop for exit
+            // classification without manufacturing readiness.
+            self.raw.finish_callback_init(false);
         }
     }
 }
@@ -448,19 +490,22 @@ impl<A: Actor> RawActor for Handler<A> {
             panic!("handler actor initialization invoked more than once");
         };
         let initialized = {
-            let mut context = Context::<A>::new(raw, DeliveryStage::Live);
-            A::init(args, &mut context).await
+            let mut context = Context::<A>::new_initializing(raw);
+            let initialized = A::init(args, &mut context).await;
+            context.initialization_returned();
+            initialized
         };
         match initialized {
             Ok(actor) => self.state = HandlerState::Running(actor),
-            Err(error) => return fail_after_teardown(raw, error).await,
+            Err(error) => {
+                raw.finish_callback_init(false);
+                return fail_after_teardown(raw, error).await;
+            }
         }
         let HandlerState::Running(actor) = &mut self.state else {
             unreachable!("successful initialization installs the running actor")
         };
-        if raw.readiness() == Readiness::AfterInit {
-            raw.mark_ready();
-        }
+        raw.finish_callback_init(true);
 
         while let Some(message) = raw.recv().await {
             let handled = {

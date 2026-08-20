@@ -184,7 +184,12 @@ impl<'a, A: Actor> Context<'a, A> {
         }
     }
 
-    /// Requests a clean local stop after the current callback.
+    /// Requests a clean local stop.
+    ///
+    /// External intake and incarnation-owned continuations, timers, and
+    /// offloads freeze at this call. The current callback may finish, but any
+    /// later attempt from it to queue such work is rejected. Terminal
+    /// publication follows callback completion.
     ///
     /// During a successful initializer with effective [`Readiness::AfterInit`],
     /// the automatic readiness edge is published before this request becomes

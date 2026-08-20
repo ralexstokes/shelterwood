@@ -2095,8 +2095,10 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   accepted while the membership has *no live incarnation* (a restart
   window — B.9's `shutdown_and_wait` landing between incarnations) is
   held on the membership and armed onto the next incarnation at its
-  start, which then starts and immediately begins teardown. The two
-  rules partition by target and never conflict: fresh-restart-starts-
+  start, which then starts and immediately begins teardown. A stop latched
+  before the driver's first settlement likewise still constructs the first
+  incarnation and then immediately tears it down. The two rules partition by
+  target and never conflict: fresh-restart-starts-
   clear says a latch *consumed by* incarnation N never carries to N+1;
   the pending latch holds a request that arrived with no incarnation to
   consume it — it was never any incarnation's spent latch, and it waits
@@ -3280,7 +3282,7 @@ in `on_stop`. ✓ = available; **R** = MUST be `Rejected`-or-absent (§6.4);
 | `recv()` / `try_recv()` (the merged event source: mailbox, offload completions, fired timers, queued continuations, §6.1 priority; `recv` yields `None` on stop request, biased; `try_recv` ignores the stop token — the drain primitive for raw loops: under `Drain`, exhaust the frozen prefix via `try_recv` after `recv` yields `None`, §11's raw-loop obligation) | ✓ | — | — | — |
 | `mailbox_shutdown()` (the resolved §11 policy for this actor's mailbox — what a raw loop consults to honor `Drain` vs `Discard`) | ✓ | — | — | — |
 | `mark_ready()` (one-shot effect by construction; meaningful only under gated readiness, else a documented no-op — B.2's rule, uniformly; during drain always the no-op) | ✓ | ✓ | ✓ | — |
-| `stop()` (clean self-stop; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §11 ladder as the stop bound. Live/Drain: effective after the current callback; in a successful effective-`AfterInit` initializer, after its automatic readiness edge. Raw: freezes intake at the call — drain the frozen prefix via `try_recv` after `recv` yields `None`; §1 principle 5's public primitive for the blanket loop's `stop()`) | ✓ | ✓ | ✓ | — |
+| `stop()` (clean self-stop; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §11 ladder as the stop bound. Live: freezes intake and incarnation-owned resources at the call, so later same-callback work is rejected; the callback may finish before terminal publication. In a successful effective-`AfterInit` initializer, stop publication follows its automatic readiness edge, while the freeze remains immediate. Drain is already frozen. Raw: freezes intake at the call — drain the frozen prefix via `try_recv` after `recv` yields `None`; §1 principle 5's public primitive for the blanket loop's `stop()`) | ✓ | ✓ | ✓ | — |
 | `is_draining()` | — | ✓ | ✓ | — |
 | `continue_with(msg)` (next-message continuation; no mailbox capacity; anti-starvation per §6.1) | ✓ | ✓ | **R** | — |
 | Keyed timers: `set_timeout` / `set_interval` / `clear_timer` (§6.3) | ✓ | ✓ | **R** | — |

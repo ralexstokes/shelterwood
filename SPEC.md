@@ -1256,7 +1256,9 @@ and `supervisor::…` names the pure reducer suite.
    override receives no such edge and the same pre-ready stop remains R7.
    (`integration::ordered_terminal_pre_ready_exit_parks_the_root_and_marks_suffix_never_started`,
    `integration::dynamic_startup_failure_keeps_other_initial_members_supervised`,
-   `integration::nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause`.)
+   `integration::nested_dynamic_startup_failure_rolls_back_and_preserves_inner_cause`,
+   `integration::after_init_stop_waits_for_success_then_advances_the_ordered_suffix`,
+   `integration::manual_stop_in_init_remains_a_terminal_pre_ready_failure`.)
 
 No rule above is flagged unverified: each has direct checked evidence. The
 remaining prose in this section specifies declaration defaults, user-facing
@@ -2397,7 +2399,14 @@ framework contract**. No other normative shutdown paragraph is unmapped.
   bound on its drain-plus-`on_stop` window (§5.2), so a wedged self-stop
   escalates — grace expiry, tidy beat, hard abort — exactly like a
   supervisor-initiated one. Self-stop changes who started the clock,
-  never which ladder runs.
+  never which ladder runs. One case defers the clock rather than
+  changing it: an effective `AfterInit` initializer publishes its
+  `stop()` only when it returns (R7, §6), so an initializer that
+  requests a stop and then never returns has not yet armed the ladder.
+  Intake is already frozen and the readiness deadline still bounds it,
+  but a `ReadinessDeadline::Unbounded` declaration leaves that wedge
+  bounded only by parent or scope shutdown. Declaring an unbounded
+  readiness deadline is what accepts that.
 - Shutdown requests are **level-triggered, not queued**: owner drop,
   `request_shutdown()` / `request_scope_shutdown()`, and parent
   escalation each set an idempotent per-scope latch (a token edge, like

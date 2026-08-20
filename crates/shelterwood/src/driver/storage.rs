@@ -40,7 +40,8 @@ impl<T> Obligation<T> {
 
 impl<T> Drop for Obligation<T> {
     fn drop(&mut self) {
-        self.discharge();
+        let mut panics = crate::runtime::PanicAccumulator::default();
+        panics.run(|| self.discharge());
     }
 }
 
@@ -48,6 +49,7 @@ impl<T> Drop for Obligation<T> {
 mod tests {
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
+        process::Command,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -62,6 +64,10 @@ mod tests {
 
     fn panic_after_counting(fallbacks: Arc<AtomicUsize>) {
         fallbacks.fetch_add(1, Ordering::SeqCst);
+        panic!("injected fallback panic");
+    }
+
+    fn panic_fallback((): ()) {
         panic!("injected fallback panic");
     }
 
@@ -92,6 +98,39 @@ mod tests {
             fallbacks.load(Ordering::SeqCst),
             1,
             "drop cannot repeat a fallback that panicked"
+        );
+    }
+
+    #[test]
+    fn obligation_fallback_panic_is_contained_during_an_existing_unwind() {
+        const CHILD_ENV: &str = "SHELTERWOOD_OBLIGATION_UNWIND_CHILD";
+        const TEST_NAME: &str = "driver::storage::tests::obligation_fallback_panic_is_contained_during_an_existing_unwind";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let panic = catch_unwind(|| {
+                let _obligation = Obligation::new((), panic_fallback);
+                panic!("outer panic");
+            })
+            .expect_err("the original unwind reaches its boundary");
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&"outer panic"));
+            return;
+        }
+
+        let output = Command::new(std::env::current_exe().expect("unit-test executable"))
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("nested-unwind subprocess starts");
+
+        assert!(
+            output.status.success(),
+            "nested-unwind subprocess must preserve the original panic instead of aborting\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
         );
     }
 }

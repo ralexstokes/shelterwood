@@ -251,10 +251,9 @@ pub fn dispatch_exit(
     scope: ScopeMode,
     membership: MembershipStatus,
 ) -> ExitDispatch {
-    debug_assert!(
-        !matches!(exit.kind(), ExitKind::NeverStarted),
-        "NeverStarted is a membership outcome outside incarnation dispatch"
-    );
+    if matches!(exit.kind(), ExitKind::NeverStarted) {
+        return ExitDispatch::Terminal;
+    }
     if scope == ScopeMode::Draining || membership == MembershipStatus::Removing {
         return ExitDispatch::Terminal;
     }
@@ -1440,16 +1439,17 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "NeverStarted is a membership outcome outside incarnation dispatch")]
-    fn funnel_dispatch_rejects_the_membership_level_never_started_outcome() {
+    fn funnel_dispatch_treats_the_membership_level_never_started_outcome_as_terminal() {
         let exit = Exit::never_started();
-        let _ = dispatch_exit(
-            &exit,
-            RestartPolicy::default(),
-            ScopeMode::Running,
-            MembershipStatus::Active,
+        assert_eq!(
+            dispatch_exit(
+                &exit,
+                RestartPolicy::new(RestartCondition::Always, Backoff::Immediate),
+                ScopeMode::Running,
+                MembershipStatus::Active,
+            ),
+            ExitDispatch::Terminal,
         );
     }
 

@@ -404,6 +404,123 @@ impl<R: RawActor> RawActor for ResumeProbeDecorator<R> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ErrorReturnCapabilities {
+    continuation_rejected: bool,
+    timer_rejected: bool,
+    offload_rejected: bool,
+}
+
+struct ErrorReturnProbe<R> {
+    inner: R,
+    observed: Arc<Mutex<Option<ErrorReturnCapabilities>>>,
+}
+
+impl<R: RawActor<Msg = ()>> RawActor for ErrorReturnProbe<R> {
+    type Msg = ();
+
+    fn readiness() -> Readiness {
+        R::readiness()
+    }
+
+    async fn run(&mut self, context: &mut RawContext<Self::Msg>) -> ExitResult {
+        let result = self.inner.run(context).await;
+        assert!(result.is_err(), "the probe requires an inner error return");
+        let capabilities = ErrorReturnCapabilities {
+            continuation_rejected: context.continue_with(()).is_err(),
+            timer_rejected: context
+                .set_timeout("after-inner-error", (), Duration::from_secs(1))
+                .is_err(),
+            offload_rejected: context.offload(async {}, |_| (), Duration::MAX).is_err(),
+        };
+        *self
+            .observed
+            .lock()
+            .expect("error-return observation mutex poisoned") = Some(capabilities);
+        result
+    }
+}
+
+struct InitErrorActor;
+
+impl Actor for InitErrorActor {
+    type Msg = ();
+    type Args = ();
+
+    async fn init((): (), _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Err(ExitError::message("injected handler init error"))
+    }
+
+    async fn handle(&mut self, (): Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+        unreachable!("failed initialization never enters the handler loop")
+    }
+}
+
+struct PlainRawError;
+
+impl RawActor for PlainRawError {
+    type Msg = ();
+
+    fn readiness() -> Readiness {
+        Readiness::Manual
+    }
+
+    async fn run(&mut self, _: &mut RawContext<Self::Msg>) -> ExitResult {
+        Err(ExitError::message("injected raw error"))
+    }
+}
+
+async fn capabilities_after_inner_error<R: RawActor<Msg = ()>>(
+    inner: R,
+) -> ErrorReturnCapabilities {
+    let observed = Arc::new(Mutex::new(None));
+    let mut tree = Tree::new();
+    tree.add_raw_once(
+        "error-return",
+        RawOnceDef::new(ErrorReturnProbe {
+            inner,
+            observed: Arc::clone(&observed),
+        }),
+    )
+    .expect("valid decorated actor");
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect_err("the pre-readiness error aborts startup");
+    let capabilities = observed
+        .lock()
+        .expect("error-return observation mutex poisoned")
+        .expect("the decorator observed its returned context");
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed-startup tree shuts down");
+    capabilities
+}
+
+#[tokio::test]
+async fn handler_error_freezes_resources_while_plain_raw_error_leaves_them_live() {
+    assert_eq!(
+        capabilities_after_inner_error(Handler::<InitErrorActor>::new(())).await,
+        ErrorReturnCapabilities {
+            continuation_rejected: true,
+            timer_rejected: true,
+            offload_rejected: true,
+        },
+        "Handler errors return only after their resource half is frozen"
+    );
+    assert_eq!(
+        capabilities_after_inner_error(PlainRawError).await,
+        ErrorReturnCapabilities {
+            continuation_rejected: false,
+            timer_rejected: false,
+            offload_rejected: false,
+        },
+        "plain RawActor errors reach their decorator before raw-boundary teardown"
+    );
+}
+
 struct TeardownDropLog {
     log: Arc<Mutex<Vec<&'static str>>>,
 }

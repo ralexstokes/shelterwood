@@ -1049,6 +1049,14 @@ handlers non-blocking. Contracts:
   `StopContext::run_blocking` may therefore start work after the
   async-resource freeze. The mailbox binding outlives actor destruction
   on every path.
+- At the raw-decorator composition point, an inner `Handler` returning
+  `Err` has already frozen and joined its incarnation-owned resource half;
+  continuing that raw loop is unsupported. It deliberately has **not**
+  frozen the mailbox: an incarnation ending without a stop phase keeps the
+  §5.4 acceptance window open until the raw boundary publishes its exit. A
+  plain `RawActor` returning `Err` has not performed either teardown step;
+  its decorator still observes a live context until it returns to that
+  boundary.
 
 ## 7. Readiness
 

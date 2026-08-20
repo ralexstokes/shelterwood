@@ -483,7 +483,12 @@ impl<A: Actor> RawActor for Handler<A> {
     /// this wrapper is the advertised raw-decorator composition point, so a
     /// decorator — not the raw runner — may resume after this future
     /// returns, and it must not observe still-live incarnation resources;
-    /// every error exit therefore freezes and joins them here first.
+    /// every error exit therefore freezes and joins them here first. That
+    /// half-teardown deliberately does not freeze the mailbox: an incarnation
+    /// ending without a stop phase remains accepting until exit publication
+    /// (SPEC §5.4). A decorator may inspect the returned error and the now-
+    /// rejected resource capabilities, but resuming the raw loop past this
+    /// point is unsupported.
     async fn run(&mut self, raw: &mut RawContext<Self::Msg>) -> ExitResult {
         let HandlerState::Uninit(args) = std::mem::replace(&mut self.state, HandlerState::Spent)
         else {
@@ -545,7 +550,9 @@ impl<A: Actor> RawActor for Handler<A> {
 /// Propagates a callback error after §6.5's orderly teardown: incarnation-owned
 /// work is frozen, cancelled, and joined before control returns to the caller,
 /// which at the advertised composition point may be a raw decorator rather
-/// than the raw incarnation boundary itself.
+/// than the raw incarnation boundary itself. The mailbox stays bound until
+/// the raw incarnation boundary publishes the exit, as SPEC §5.4 requires;
+/// returning to the loop after this resource-only teardown is unsupported.
 async fn fail_after_teardown<M: Send + 'static>(
     raw: &mut RawContext<M>,
     error: ExitError,

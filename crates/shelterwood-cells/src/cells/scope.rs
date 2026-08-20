@@ -53,65 +53,13 @@ impl ResidentProjection {
     }
 }
 
-struct ResidencyCompletion {
-    parent: Weak<ScopeCell>,
-    projection: ResidentProjection,
-}
-
 struct ResidentChild {
     projection: ResidentProjection,
-    removal: Option<ResidencyCompletion>,
 }
 
 impl ResidentChild {
-    fn new(parent: &Arc<ScopeCell>, projection: ResidentProjection) -> Self {
-        Self {
-            removal: Some(ResidencyCompletion {
-                parent: Arc::downgrade(parent),
-                projection: projection.clone(),
-            }),
-            projection,
-        }
-    }
-
-    fn disarm_removal(&mut self) -> ResidencyCompletion {
-        self.removal
-            .take()
-            .expect("a resident completes removal exactly once")
-    }
-
-    fn publish_removal(completion: ResidencyCompletion, txn: &mut ObservationTxn<'_>) {
-        if let Some(parent) = completion.parent.upgrade() {
-            parent.emit_locked(
-                txn,
-                LifecycleEventKind::Removed {
-                    id: completion.projection.member.id().clone(),
-                    membership: completion.projection.member.membership(),
-                    last_incarnation: completion.projection.member.record().last_incarnation,
-                },
-            );
-        }
-        // The projection can carry the last member/mailbox owner. Retire it
-        // only after the resident-tree observation gate is released.
-        txn.defer(move || drop(completion));
-    }
-
-    fn complete_removal(mut self, txn: &mut ObservationTxn<'_>) {
-        let completion = self.disarm_removal();
-        Self::publish_removal(completion, txn);
-        txn.defer(move || drop(self));
-    }
-}
-
-impl Drop for ResidentChild {
-    fn drop(&mut self) {
-        let Some(completion) = self.removal.take() else {
-            return;
-        };
-        let Some(parent) = completion.parent.upgrade() else {
-            return;
-        };
-        parent.with_observation_gate(|txn| Self::publish_removal(completion, txn));
+    fn new(projection: ResidentProjection) -> Self {
+        Self { projection }
     }
 }
 
@@ -127,6 +75,28 @@ struct ScopeControl {
 struct ScopeRequest {
     epoch: Epoch,
     consumed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ScopeRequestSlot {
+    Shutdown,
+    Force,
+}
+
+impl ScopeRequestSlot {
+    fn get(self, control: &ScopeControl) -> Option<&ScopeRequest> {
+        match self {
+            Self::Shutdown => control.shutdown.as_ref(),
+            Self::Force => control.force.as_ref(),
+        }
+    }
+
+    fn get_mut(self, control: &mut ScopeControl) -> Option<&mut ScopeRequest> {
+        match self {
+            Self::Shutdown => control.shutdown.as_mut(),
+            Self::Force => control.force.as_mut(),
+        }
+    }
 }
 
 /// One fact published by a scope control-plane transaction for its driver.
@@ -158,11 +128,9 @@ pub enum ScopeControlEvent {
 struct ScopeObservation {
     config: Mutex<ObservationConfig>,
     record: runtime::WatchSender<ScopeRecord>,
-    // `ResidentChild::drop` emits `Removed` by taking the observation gate
-    // itself, so dropping a resident anywhere the gate is already held
-    // self-deadlocks. In-gate removal paths must consume the resident through
-    // `complete_removal(txn)`. Dropping a resident while holding this mutex
-    // likewise self-deadlocks, so removal moves it into outer storage first.
+    // Removal paths move residents into transaction effects before emitting
+    // their `Removed` edges. A projection can be the last member/mailbox
+    // owner, so neither this mutex nor the observation gate may retire one.
     current_children: Mutex<Vec<ResidentChild>>,
     parent: Mutex<Option<Weak<ScopeCell>>>,
     lifecycle_seq: AtomicPoisonedCounter,
@@ -495,13 +463,13 @@ impl ScopeCell {
     }
 
     pub fn set_state(&self, state: ScopeState) {
-        self.with_observation_gate(|txn| self.set_state_locked(state, txn));
+        self.with_observation_gate(|txn| self.set_state_locked(state, &[], txn));
     }
 
     pub fn set_state_and_startup(&self, state: ScopeState, startup: Result<(), StartupError>) {
         self.with_observation_gate(|txn| {
             self.set_startup_locked(startup, txn);
-            self.set_state_locked(state, txn);
+            self.set_state_locked(state, &[], txn);
         });
     }
 
@@ -520,34 +488,31 @@ impl ScopeCell {
     ) {
         debug_assert!(matches!(state, ScopeState::Draining));
         self.with_observation_gate(|txn| {
-            // Statement order is load-bearing: every marker must be stored
-            // *before* `set_state_locked` writes `Draining` into the scope
-            // record. A zero-budget sampler reads that record first, so the
-            // `Draining` read is the release edge that makes the markers
-            // visible to it. Publishing the state first reopens #270: the
-            // driver writes `Draining` with no marker yet stored, a sampler on
-            // another worker reads `Draining`, then reads `false` for a child
-            // this very step is disposing, then reads that child's still
-            // nonterminal record, and reports a spurious
-            // `Err(ShutdownTimeout)`. No test holds this order — moving the
-            // loop below `set_state_locked` leaves the suite green — so this
-            // comment is the only guard.
-            for member in terminal_disposals {
-                debug_assert!(
-                    self.current_observation_gate()
-                        .shares_gate(&member.current_observation_gate()),
-                    "a drain entry may mark only a resident member on its observation gate"
-                );
-                member.set_terminal_disposal_pending(true);
-            }
             if let Some(startup) = startup {
                 self.set_startup_locked(startup, txn);
             }
-            self.set_state_locked(state, txn);
+            self.set_state_locked(state, terminal_disposals, txn);
         });
     }
 
-    fn set_state_locked(&self, state: ScopeState, txn: &mut ObservationTxn<'_>) {
+    fn set_state_locked(
+        &self,
+        state: ScopeState,
+        terminal_disposals: &[Arc<MemberCell>],
+        txn: &mut ObservationTxn<'_>,
+    ) {
+        // The marker slice is part of the state-writer signature so the #270
+        // regression guard cannot be reordered at a caller. Every marker is
+        // stored before the `Draining` record write whose release edge makes
+        // it visible to zero-budget shutdown samplers on other workers.
+        for member in terminal_disposals {
+            debug_assert!(
+                self.current_observation_gate()
+                    .shares_gate(&member.current_observation_gate()),
+                "a drain entry may mark only a resident member on its observation gate"
+            );
+            member.set_terminal_disposal_pending(true);
+        }
         let mut transient_retained = Vec::new();
         RetainedExit::retain_scope_state(&mut transient_retained, &state);
         if matches!(state, ScopeState::Draining | ScopeState::StartupFailed)
@@ -729,7 +694,16 @@ impl ScopeCell {
             return false;
         };
         debug_assert_eq!(resident.projection.member.membership(), membership);
-        resident.complete_removal(txn);
+        let event = LifecycleEventKind::Removed {
+            id: resident.projection.member.id().clone(),
+            membership,
+            last_incarnation: resident.projection.member.record().last_incarnation,
+        };
+        // The projection can carry the last member/mailbox owner. Put it in
+        // the transaction before the fallible publication path so unwind also
+        // retires it only after the observation gate is released.
+        txn.defer(move || drop(resident));
+        self.emit_locked(txn, event);
         true
     }
 
@@ -770,7 +744,7 @@ impl ScopeCell {
         // Tuple field order is intentional: a rejected raw startup result is
         // released while its retained guards still exist, then those guards
         // transfer failed destruction to isolated disposal.
-        drop(incoming);
+        txn.defer(move || drop(incoming));
         if published {
             txn.pulse(&self.member.record);
             txn.pulse(&self.observation.record);
@@ -995,25 +969,7 @@ impl ScopeCell {
     }
 
     pub fn take_shutdown_request(&self, epoch: Epoch) -> bool {
-        let pending = self
-            .control
-            .lock()
-            .expect("scope control mutex poisoned")
-            .shutdown
-            .is_some_and(|request| request.epoch == epoch && !request.consumed);
-        if !pending {
-            return false;
-        }
-        self.with_observation_gate(|_txn| {
-            let mut control = self.control.lock().expect("scope control mutex poisoned");
-            match control.shutdown.as_mut() {
-                Some(request) if request.epoch == epoch && !request.consumed => {
-                    request.consumed = true;
-                    true
-                }
-                _ => false,
-            }
-        })
+        self.take_request(ScopeRequestSlot::Shutdown, epoch)
     }
 
     pub fn force_shutdown(&self, epoch: Epoch) {
@@ -1031,18 +987,19 @@ impl ScopeCell {
     }
 
     pub fn take_force_request(&self, epoch: Epoch) -> bool {
-        let pending = self
-            .control
-            .lock()
-            .expect("scope control mutex poisoned")
-            .force
+        self.take_request(ScopeRequestSlot::Force, epoch)
+    }
+
+    fn take_request(&self, slot: ScopeRequestSlot, epoch: Epoch) -> bool {
+        let pending = slot
+            .get(&self.control.lock().expect("scope control mutex poisoned"))
             .is_some_and(|request| request.epoch == epoch && !request.consumed);
         if !pending {
             return false;
         }
         self.with_observation_gate(|_txn| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
-            match control.force.as_mut() {
+            match slot.get_mut(&mut control) {
                 Some(request) if request.epoch == epoch && !request.consumed => {
                     request.consumed = true;
                     true
@@ -1124,8 +1081,7 @@ impl ScopeCell {
         child
             .member
             .transition_locked(txn, MemberTransition::Admitted);
-        self.current_children()
-            .push(ResidentChild::new(self, child));
+        self.current_children().push(ResidentChild::new(child));
         self.emit_locked(txn, LifecycleEventKind::Added { id, membership });
     }
 
@@ -1134,20 +1090,24 @@ impl ScopeCell {
     }
 
     pub fn clear_residents_locked(&self, wakes: &mut ObservationTxn<'_>) {
-        let mut residents = {
+        let residents = {
             let mut children = self.current_children();
             std::mem::take(&mut *children)
         };
-        // Disarm every drop fallback before publishing any edge. If an emit
-        // unwinds, the untouched suffix no longer re-enters the non-reentrant
-        // observation gate from ResidentChild::drop.
-        let completions = residents
-            .iter_mut()
-            .map(ResidentChild::disarm_removal)
+        let removals = residents
+            .iter()
+            .map(|resident| LifecycleEventKind::Removed {
+                id: resident.projection.member.id().clone(),
+                membership: resident.projection.member.membership(),
+                last_incarnation: resident.projection.member.record().last_incarnation,
+            })
             .collect::<Vec<_>>();
+        // Schedule the whole displaced set before emitting any edge. This
+        // both preserves last-owner disposal and makes an unwind retire the
+        // untouched suffix after unlock.
         wakes.defer(move || drop(residents));
-        for completion in completions {
-            ResidentChild::publish_removal(completion, wakes);
+        for removal in removals {
+            self.emit_locked(wakes, removal);
         }
     }
 
@@ -1292,8 +1252,10 @@ impl ScopeCell {
         } else {
             // Release the rejected raw projection before its guards. This is
             // the same field order used by retained framework state.
-            drop(state);
-            drop(transient_retained);
+            wakes.defer(move || {
+                drop(state);
+                drop(transient_retained);
+            });
         }
     }
 
@@ -1450,6 +1412,18 @@ mod tests {
             &leaf_scope.parent().expect("leaf parent is installed"),
             &nested
         ));
+    }
+
+    #[test]
+    fn drain_publication_installs_terminal_disposal_intent_with_the_state() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let child = child_member(&root, "child");
+        root.set_admitted_children(vec![ResidentProjection::new(Arc::clone(&child), None)]);
+
+        root.publish_drain(ScopeState::Draining, None, &[Arc::clone(&child)]);
+
+        assert!(matches!(root.record().state, ScopeState::Draining));
+        assert!(child.terminal_or_disposal_pending());
     }
 
     #[test]

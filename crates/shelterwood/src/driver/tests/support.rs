@@ -134,8 +134,8 @@ pub(super) use super::super::{
     ResidentProjection, RetainedRecordedOutcome, RuntimeStorage, ScopeCell, ScopeControlEvent,
     ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring,
     StartupDisposition, cancel_dynamic_reservation, child::dispatch_child_construction_for_test,
-    discharge_child_terminality, events::collect_driver_events, monitor_root_driver, report_slot,
-    nested_scope_start, reserve_dynamic, resident_projection, restart_shutdown_work,
+    discharge_child_terminality, events::collect_driver_events, monitor_root_driver,
+    nested_scope_start, report_slot, reserve_dynamic, resident_projection, restart_shutdown_work,
     run_nested_factory, run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
 };
 

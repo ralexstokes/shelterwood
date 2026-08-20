@@ -263,6 +263,17 @@ async fn nested_body_aborted_before_first_poll_publishes_never_started_and_close
         "the never-polled nested task to join",
     )
     .await;
+    let (pre_terminal, closed) = snapshots.borrow_latest_and_closed();
+    assert!(matches!(
+        pre_terminal.state,
+        ScopeState::Stopped {
+            reason: StopReason::NeverStarted
+        }
+    ));
+    assert!(
+        !closed,
+        "the body cannot close observation ahead of its parent terminal projection"
+    );
     drop(scope);
     assert_eq!(nested.wait_stopped().await, StopReason::NeverStarted);
     let (latest, closed) = snapshots.borrow_latest_and_closed();

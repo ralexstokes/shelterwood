@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    Exit, GracePhase, Intensity, IntensityTrip, JitterSample, Readiness, RestartAttempt,
+    Exit, ExitKind, GracePhase, Intensity, IntensityTrip, JitterSample, Readiness, RestartAttempt,
     RestartCount, RestartPolicy, Shutdown, TotalRestarts,
     deadline::Deadline,
     exit::{StopReason, stop_reason_precedence},
@@ -251,6 +251,10 @@ pub fn dispatch_exit(
     scope: ScopeMode,
     membership: MembershipStatus,
 ) -> ExitDispatch {
+    debug_assert!(
+        !matches!(exit.kind(), ExitKind::NeverStarted),
+        "NeverStarted is a membership outcome outside incarnation dispatch"
+    );
     if scope == ScopeMode::Draining || membership == MembershipStatus::Removing {
         return ExitDispatch::Terminal;
     }
@@ -285,7 +289,8 @@ struct IntensityCharge {
 }
 
 impl IntensityTrip {
-    fn new(policy: Intensity, charge: IntensityCharge) -> Self {
+    fn new(charge: IntensityCharge) -> Self {
+        let policy = charge.policy;
         debug_assert_eq!(charge.tripped, charge.in_window > policy.max_restarts());
         Self {
             max_restarts: policy.max_restarts(),
@@ -401,9 +406,7 @@ impl RestartDecision {
     }
 
     pub fn intensity_trip(&self) -> Option<IntensityTrip> {
-        self.charge
-            .tripped
-            .then(|| IntensityTrip::new(self.charge.policy, self.charge))
+        self.charge.tripped.then(|| IntensityTrip::new(self.charge))
     }
 }
 
@@ -910,7 +913,7 @@ impl ScopeLifecycle {
         if let Some(reason) = self.draining_reason() {
             return children.all_terminal.then(|| reason.clone());
         }
-        (!self.startup_failed()
+        (self.startup_complete()
             && flavor == ScopeFlavor::Ordered
             && children.has_children
             && children.all_terminal)
@@ -1378,7 +1381,6 @@ mod tests {
                 },
                 true,
             ),
-            (ExitKind::NeverStarted, true),
         ];
         let policies = [
             (RestartCondition::Never, false, false),
@@ -1389,10 +1391,8 @@ mod tests {
         for cancellation in [Cancellation::NotObserved, Cancellation::Observed] {
             for (kind, failure) in &cases {
                 // Built through the per-kind constructors rather than a generic
-                // `Exit::new`, which no longer exists. `NeverStarted` pairs only
-                // with `NotObserved`: SPEC declares that pair the sole
-                // unconstructible combination, so the matrix covers the eleven
-                // reachable ones.
+                // `Exit::new`, which no longer exists. `NeverStarted` is a
+                // membership fact outside dispatch's incarnation-exit domain.
                 let exit = match kind {
                     ExitKind::Completed => Exit::completed(cancellation),
                     ExitKind::Failed(error) => Exit::failed(error.clone(), cancellation),
@@ -1401,10 +1401,7 @@ mod tests {
                         Exit::readiness_timed_out(*deadline, cancellation)
                     }
                     ExitKind::Aborted { phase } => Exit::aborted(*phase, cancellation),
-                    ExitKind::NeverStarted => match cancellation {
-                        Cancellation::NotObserved => Exit::never_started(),
-                        Cancellation::Observed => continue,
-                    },
+                    ExitKind::NeverStarted => unreachable!("the cases exclude membership exits"),
                 };
                 assert_eq!(exit.is_failure(), *failure);
                 for (condition, restart_completed, restart_failure) in policies {
@@ -1443,6 +1440,19 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "NeverStarted is a membership outcome outside incarnation dispatch")]
+    fn funnel_dispatch_rejects_the_membership_level_never_started_outcome() {
+        let exit = Exit::never_started();
+        let _ = dispatch_exit(
+            &exit,
+            RestartPolicy::default(),
+            ScopeMode::Running,
+            MembershipStatus::Active,
+        );
+    }
+
     #[test]
     fn intensity_window_is_strict_and_tripping_charge_is_counted() {
         let start = Instant::now();
@@ -1453,7 +1463,7 @@ mod tests {
         assert!(trip.tripped);
         assert_eq!(trip.in_window, 2);
         assert_eq!(trip.total_restarts, TotalRestarts::ZERO.bump().bump());
-        let trip_payload = crate::IntensityTrip::new(policy, trip);
+        let trip_payload = crate::IntensityTrip::new(trip);
         assert_eq!(trip_payload.max_restarts, policy.max_restarts());
         assert_eq!(trip_payload.observed_restarts, trip.in_window);
         assert_eq!(trip_payload.within, policy.within());
@@ -1519,7 +1529,7 @@ mod tests {
         assert!(decision.charge.tripped);
         assert_eq!(
             decision.intensity_trip(),
-            Some(crate::IntensityTrip::new(intensity_policy, decision.charge))
+            Some(crate::IntensityTrip::new(decision.charge))
         );
     }
 
@@ -1714,6 +1724,19 @@ mod tests {
 
     #[test]
     fn scope_lifecycle_owns_first_failure_drain_status_and_finish_policy() {
+        let starting = ScopeLifecycle::starting();
+        assert_eq!(
+            starting.finish_if_ready(
+                ScopeFlavor::Ordered,
+                ChildCompletionState {
+                    has_children: true,
+                    all_terminal: true,
+                },
+            ),
+            None,
+            "natural completion waits for aggregate startup to complete"
+        );
+
         let mut lifecycle = ScopeLifecycle::starting();
         assert_eq!(lifecycle.fail_startup(), Some(ScopeState::StartupFailed));
         assert_eq!(

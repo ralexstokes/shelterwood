@@ -87,6 +87,35 @@ impl WaiterRegistry {
         }
     }
 
+    /// Polls one register/recheck waiter protocol around `ready`.
+    ///
+    /// Caller waker cloning happens before the registry lock is acquired. A
+    /// displaced registration and the registration removed after a successful
+    /// recheck are both destroyed only after that recheck completes, so a
+    /// hostile waker destructor cannot strand an already-published outcome.
+    fn poll_registered<T>(
+        &self,
+        identity: &Arc<()>,
+        context: &Context<'_>,
+        mut ready: impl FnMut() -> Option<T>,
+    ) -> Poll<T> {
+        if let Some(output) = ready() {
+            let registered = self.remove(identity);
+            Self::drop_registered([registered]);
+            return Poll::Ready(output);
+        }
+
+        // Caller code runs before the registry lock is acquired.
+        let waker = context.waker().clone();
+        let displaced = self.register(identity, waker);
+        let output = ready();
+        let registered = output.is_some().then(|| self.remove(identity)).flatten();
+        // Complete the publication recheck before a hostile displaced waker
+        // destructor is allowed to resume its panic.
+        Self::drop_registered([displaced, registered]);
+        output.map_or(Poll::Pending, Poll::Ready)
+    }
+
     fn len(&self) -> usize {
         self.waiters
             .lock()
@@ -233,27 +262,12 @@ impl Future for LatchWait<'_> {
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        if this.latch.is_fired() {
-            let registered = this.latch.state.waiters.remove(&this.identity);
-            WaiterRegistry::drop_registered([registered]);
-            return Poll::Ready(());
-        }
-
-        // Caller code runs before the registry lock is acquired.
-        let waker = context.waker().clone();
-        let displaced = this.latch.state.waiters.register(&this.identity, waker);
-        let fired = this.latch.is_fired();
-        let registered = fired
-            .then(|| this.latch.state.waiters.remove(&this.identity))
-            .flatten();
-        // Finish the register/recheck protocol before a hostile displaced
-        // waker destructor is allowed to resume its panic.
-        WaiterRegistry::drop_registered([displaced, registered]);
-        if fired {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
+        this.latch
+            .state
+            .waiters
+            .poll_registered(&this.identity, context, || {
+                this.latch.is_fired().then_some(())
+            })
     }
 }
 
@@ -506,6 +520,13 @@ impl<T> Drop for OneShotSender<T> {
                 Ordering::Acquire,
             );
         }
+        // Tokio closes the channel synchronously and may invoke a receiver's
+        // caller-supplied waker from the sender's drop glue. Surface that panic
+        // to an ordinary dropper, but contain it during an existing unwind so
+        // an unanswered reply cannot abort the process with a double panic.
+        let channel = self.channel.take();
+        let mut panics = PanicAccumulator::default();
+        panics.run(|| drop(channel));
     }
 }
 
@@ -591,10 +612,12 @@ impl<T> OneShotReceiver<T> {
 ///
 /// The erasure is load-bearing API design, not incidental: `Drop` must repeat
 /// whatever bounds the struct declares, so bounding this type would push
-/// `T: Send + 'static` onto the *definitions* of the public wrappers that hold
-/// it (`ReplyReceiver`, `ReplyReceive`, `CallFuture`, `OneShotTaskRef`) and
-/// force downstream generic declarations to carry a bound they never asked
-/// for. Execution bounds belong on constructors and operational impls here.
+/// `T: Send + 'static` onto the definition of the public `OneShotTaskRef`
+/// wrapper that holds it and force downstream generic declarations to carry a
+/// bound they never asked for. Reply and call wrappers hold the separate
+/// erased `DisposingReceiver` in `shelterwood-mailbox::capability`; the two
+/// boundary types preserve the same constructor-only bound. Execution bounds
+/// belong on constructors and operational impls here.
 pub struct DisposingReceiver<T> {
     inner: OneShotReceiver<T>,
     dispose: fn(T),
@@ -800,39 +823,19 @@ struct WatchWait<'a, T> {
 
 impl<T> WatchWait<'_, T> {
     fn poll(&mut self, context: &mut Context<'_>) -> Poll<WatchWaitOutcome> {
-        let version = self.receiver.shared.version.load(Ordering::Acquire);
-        if version != self.receiver.seen {
-            self.receiver.seen = version;
-            let registered = self.receiver.shared.waiters.remove(&self.identity);
-            WaiterRegistry::drop_registered([registered]);
-            return Poll::Ready(WatchWaitOutcome::Changed);
-        }
-        if self.receiver.shared.senders.load(Ordering::Acquire) == 0 {
-            let registered = self.receiver.shared.waiters.remove(&self.identity);
-            WaiterRegistry::drop_registered([registered]);
-            return Poll::Ready(WatchWaitOutcome::Closed);
-        }
-
-        // Caller code runs before the registry lock is acquired.
-        let waker = context.waker().clone();
-        let displaced = self.receiver.shared.waiters.register(&self.identity, waker);
-        let version = self.receiver.shared.version.load(Ordering::Acquire);
-        let outcome = if version != self.receiver.seen {
-            self.receiver.seen = version;
-            Some(WatchWaitOutcome::Changed)
-        } else if self.receiver.shared.senders.load(Ordering::Acquire) == 0 {
-            Some(WatchWaitOutcome::Closed)
-        } else {
-            None
-        };
-        let registered = outcome
-            .is_some()
-            .then(|| self.receiver.shared.waiters.remove(&self.identity))
-            .flatten();
-        // Complete the publication recheck before a hostile displaced waker
-        // destructor is allowed to resume its panic.
-        WaiterRegistry::drop_registered([displaced, registered]);
-        outcome.map_or(Poll::Pending, Poll::Ready)
+        let shared = &self.receiver.shared;
+        let seen = &mut self.receiver.seen;
+        shared.waiters.poll_registered(&self.identity, context, || {
+            let version = shared.version.load(Ordering::Acquire);
+            if version != *seen {
+                *seen = version;
+                Some(WatchWaitOutcome::Changed)
+            } else if shared.senders.load(Ordering::Acquire) == 0 {
+                Some(WatchWaitOutcome::Closed)
+            } else {
+                None
+            }
+        })
     }
 }
 
@@ -1011,12 +1014,13 @@ impl<T> fmt::Debug for BroadcastReceiver<T> {
 mod tests {
     use std::{
         future::Future,
+        mem::ManuallyDrop,
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
         time::Duration,
     };
 
@@ -1057,6 +1061,101 @@ mod tests {
             self.wakes.fetch_add(1, Ordering::SeqCst);
             std::panic::panic_any(self.message);
         }
+    }
+
+    struct LastWakerDropPanics;
+
+    unsafe fn clone_last_drop_panics(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the reference represented by
+        // `data`; the returned raw waker owns only the new clone.
+        let probe = ManuallyDrop::new(unsafe { Arc::<LastWakerDropPanics>::from_raw(data.cast()) });
+        RawWaker::new(
+            Arc::into_raw(Arc::clone(&probe)).cast(),
+            &LAST_DROP_PANICS_VTABLE,
+        )
+    }
+
+    unsafe fn wake_last_drop_panics(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<LastWakerDropPanics>::from_raw(data.cast()) });
+    }
+
+    unsafe fn wake_by_ref_last_drop_panics(_data: *const ()) {}
+
+    unsafe fn drop_last_drop_panics(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        let probe = unsafe { Arc::<LastWakerDropPanics>::from_raw(data.cast()) };
+        let last = Arc::strong_count(&probe) == 1;
+        drop(probe);
+        if last {
+            panic!("injected registered waker drop panic");
+        }
+    }
+
+    static LAST_DROP_PANICS_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_last_drop_panics,
+        wake_last_drop_panics,
+        wake_by_ref_last_drop_panics,
+        drop_last_drop_panics,
+    );
+
+    fn last_drop_panics_waker() -> Waker {
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::new(LastWakerDropPanics)).cast(),
+            &LAST_DROP_PANICS_VTABLE,
+        );
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    struct TransitionOnClone {
+        transition: Box<dyn Fn() + Send + Sync>,
+    }
+
+    unsafe fn clone_transition_on_clone(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the reference represented by
+        // `data`; the returned raw waker owns only the new clone.
+        let probe = ManuallyDrop::new(unsafe { Arc::<TransitionOnClone>::from_raw(data.cast()) });
+        (probe.transition)();
+        RawWaker::new(
+            Arc::into_raw(Arc::clone(&probe)).cast(),
+            &TRANSITION_ON_CLONE_VTABLE,
+        )
+    }
+
+    unsafe fn wake_transition_on_clone(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<TransitionOnClone>::from_raw(data.cast()) });
+    }
+
+    unsafe fn wake_by_ref_transition_on_clone(_data: *const ()) {}
+
+    unsafe fn drop_transition_on_clone(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<TransitionOnClone>::from_raw(data.cast()) });
+    }
+
+    static TRANSITION_ON_CLONE_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_transition_on_clone,
+        wake_transition_on_clone,
+        wake_by_ref_transition_on_clone,
+        drop_transition_on_clone,
+    );
+
+    fn transition_on_clone_waker(transition: impl Fn() + Send + Sync + 'static) -> Waker {
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::new(TransitionOnClone {
+                transition: Box::new(transition),
+            }))
+            .cast(),
+            &TRANSITION_ON_CLONE_VTABLE,
+        );
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
     }
 
     fn assert_panic_message(payload: &(dyn std::any::Any + Send), expected: &'static str) {
@@ -1107,6 +1206,52 @@ mod tests {
         assert!(matches!(
             receiver.close_and_poll_receive(&mut context),
             OneShotClose::Value(7)
+        ));
+    }
+
+    #[test]
+    fn closing_oneshot_during_sending_bounces_the_value_to_the_publisher() {
+        let (sending, mut receiver) = oneshot_sending_for_test();
+
+        receiver.close();
+
+        assert_eq!(sending.publish(7_u8), Err(7));
+        assert_eq!(receiver.try_receive(), None);
+    }
+
+    #[test]
+    fn close_and_take_during_sending_leaves_the_value_with_the_publisher() {
+        let (sending, mut receiver) = oneshot_sending_for_test();
+
+        assert_eq!(receiver.close_and_take(), None);
+
+        assert_eq!(sending.publish(7_u8), Err(7));
+        assert_eq!(receiver.try_receive(), None);
+    }
+
+    #[test]
+    fn dropping_oneshot_sender_surfaces_a_hostile_receiver_waker_once() {
+        const PANIC: &str = "injected one-shot receiver waker panic";
+
+        let (sender, mut receiver) = oneshot::<u8>();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountPanicWake {
+            wakes: Arc::clone(&wakes),
+            message: PANIC,
+        }));
+        assert!(matches!(
+            receiver.poll_receive(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+
+        let payload = catch_unwind(AssertUnwindSafe(|| drop(sender)))
+            .expect_err("an ordinary sender drop surfaces the hostile wake");
+
+        assert_panic_message(&*payload, PANIC);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            receiver.poll_receive(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(None)
         ));
     }
 
@@ -1287,6 +1432,78 @@ mod tests {
                 .as_mut()
                 .poll(&mut Context::from_waker(&waker))
                 .is_ready()
+        );
+    }
+
+    #[test]
+    fn latch_rechecks_fire_before_dropping_a_displaced_hostile_waker() {
+        const PANIC: &str = "injected registered waker drop panic";
+
+        let latch = Latch::default();
+        let hostile = last_drop_panics_waker();
+        let mut waiting = Box::pin(latch.fired());
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        // The registered clone remains live, so releasing the caller's raw
+        // waker reference does not run its last-reference panic yet.
+        drop(hostile);
+
+        let racing_latch = latch.clone();
+        let racing = transition_on_clone_waker(move || {
+            assert!(racing_latch.fire_silently());
+        });
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = waiting.as_mut().poll(&mut Context::from_waker(&racing));
+        }))
+        .expect_err("destroying the displaced waker still surfaces its panic");
+
+        assert_panic_message(&*payload, PANIC);
+        assert!(latch.is_fired());
+        assert_eq!(
+            latch.state.waiters.len(),
+            0,
+            "the fire recheck removes the replacement before the displaced destructor resumes"
+        );
+    }
+
+    #[test]
+    fn watch_rechecks_pulse_before_dropping_a_displaced_hostile_waker() {
+        const PANIC: &str = "injected registered waker drop panic";
+
+        let (sender, mut receiver) = super::watch(());
+        let hostile = last_drop_panics_waker();
+        let mut waiting = Box::pin(receiver.changed());
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+        drop(hostile);
+
+        // Advance the same atomic publication edge as `pulse` during the
+        // replacement waker's clone. Leaving the registry intact is the
+        // deterministic race shape that exercises displaced-waker teardown.
+        let shared = Arc::clone(&sender.shared);
+        let racing = transition_on_clone_waker(move || {
+            shared.version.fetch_add(1, Ordering::AcqRel);
+        });
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = waiting.as_mut().poll(&mut Context::from_waker(&racing));
+        }))
+        .expect_err("destroying the displaced waker still surfaces its panic");
+
+        assert_panic_message(&*payload, PANIC);
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "the pulse version is consumed before the displaced destructor resumes"
         );
     }
 

@@ -8,7 +8,7 @@ use std::{
 };
 
 use shelterwood_core::{
-    ChildId, Exit, Incarnation, Membership, RestartCount,
+    ChildId, Exit, ExitKind, Incarnation, Membership, RestartCount,
     engine::MembershipStatus,
     identity::{IncarnationCounter, MintedMembership},
     policy::ResolvedCommonOptions,
@@ -27,6 +27,20 @@ pub enum MemberStage {
     Restarting,
     Stopping,
     Terminal(Exit),
+}
+
+impl MemberStage {
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Reserved => "Reserved",
+            Self::Admitted => "Admitted",
+            Self::Starting => "Starting",
+            Self::Running => "Running",
+            Self::Restarting => "Restarting",
+            Self::Stopping => "Stopping",
+            Self::Terminal(_) => "Terminal",
+        }
+    }
 }
 
 /// One non-terminal member-record transition owned by the cell layer.
@@ -105,16 +119,16 @@ impl MemberRecord {
             MemberTransition::Admitted => {
                 debug_assert!(
                     matches!(self.stage, MemberStage::Reserved),
-                    "admission must consume a fresh reservation, not {:?}",
-                    self.stage
+                    "admission must consume a fresh reservation, not {}",
+                    self.stage.tag()
                 );
                 self.stage = MemberStage::Admitted;
             }
             MemberTransition::Starting { incarnation } => {
                 debug_assert!(
                     matches!(self.stage, MemberStage::Admitted | MemberStage::Restarting),
-                    "a spawn must start an admitted or restarting member, not {:?}",
-                    self.stage
+                    "a spawn must start an admitted or restarting member, not {}",
+                    self.stage.tag()
                 );
                 self.stage = MemberStage::Starting;
                 self.incarnation = Some(incarnation);
@@ -125,16 +139,16 @@ impl MemberRecord {
                 debug_assert!(
                     matches!(self.stage, MemberStage::Starting | MemberStage::Reserved),
                     "readiness must promote a starting member (or the root scope's own \
-                     never-admitted reservation), not {:?}",
-                    self.stage
+                     never-admitted reservation), not {}",
+                    self.stage.tag()
                 );
                 self.stage = MemberStage::Running;
             }
             MemberTransition::Stopping => {
                 debug_assert!(
                     matches!(self.stage, MemberStage::Starting | MemberStage::Running),
-                    "a stop ladder must begin on a starting or running member, not {:?}",
-                    self.stage
+                    "a stop ladder must begin on a starting or running member, not {}",
+                    self.stage.tag()
                 );
                 self.stage = MemberStage::Stopping;
             }
@@ -148,8 +162,8 @@ impl MemberRecord {
                         self.stage,
                         MemberStage::Starting | MemberStage::Running | MemberStage::Stopping
                     ),
-                    "a restart must be scheduled from an active incarnation's exit, not {:?}",
-                    self.stage
+                    "a restart must be scheduled from an active incarnation's exit, not {}",
+                    self.stage.tag()
                 );
                 self.stage = MemberStage::Restarting;
                 self.incarnation = None;
@@ -216,12 +230,26 @@ impl fmt::Debug for MemberMailbox {
                 control,
                 exit,
                 teardown,
-            } => formatter
-                .debug_struct("Terminal")
-                .field("control", control)
-                .field("exit", exit)
-                .field("teardown_pending", &teardown.is_some())
-                .finish(),
+            } => {
+                // Formatting `ExitKind::Failed` would invoke the user's error
+                // formatter while `MemberCell::mailbox` is held by the
+                // derived `MemberCell` Debug implementation. A static tag is
+                // the only mailbox diagnostic needed here.
+                let exit = match exit.as_exit().kind() {
+                    ExitKind::Completed => "Completed",
+                    ExitKind::Failed(_) => "Failed",
+                    ExitKind::Panicked { .. } => "Panicked",
+                    ExitKind::ReadinessTimedOut { .. } => "ReadinessTimedOut",
+                    ExitKind::Aborted { .. } => "Aborted",
+                    ExitKind::NeverStarted => "NeverStarted",
+                };
+                formatter
+                    .debug_struct("Terminal")
+                    .field("control", control)
+                    .field("exit", &exit)
+                    .field("teardown_pending", &teardown.is_some())
+                    .finish()
+            }
         }
     }
 }
@@ -319,7 +347,7 @@ impl MemberCell {
         };
     }
 
-    /// Reads the drain-entry terminal-disposal marker.
+    /// Reports terminality or drain-entry terminal-disposal intent.
     ///
     /// `Acquire` pairs with the `Release` store in
     /// [`Self::set_terminal_disposal_pending`]. Two separate edges make a
@@ -329,7 +357,11 @@ impl MemberCell {
     /// [`ScopeCell::resident_projections`] takes `observation.current_children`
     /// — a different mutex from the gate `publish_drain` holds.
     ///
-    /// * A load that observes the *clear* synchronizes with the store the
+    /// This method owns the marker-before-record order so a caller cannot
+    /// accidentally recreate the trailing gap by reversing two independent
+    /// reads.
+    ///
+    /// * A marker load that observes the *clear* synchronizes with the store the
     ///   driver issues after `terminalize_child` published
     ///   `MemberStage::Terminal`, so the sampler's following record read is
     ///   ordered after that publication. It cannot pair a stale nonterminal
@@ -342,8 +374,9 @@ impl MemberCell {
     ///   write/read pair supplies happens-before, and coherence then forbids
     ///   this load from returning a value preceding `true` in the marker's
     ///   modification order.
-    pub fn terminal_disposal_pending(&self) -> bool {
+    pub fn terminal_or_disposal_pending(&self) -> bool {
         self.terminal_disposal_pending.load(Ordering::Acquire)
+            || matches!(self.record().stage, MemberStage::Terminal(_))
     }
 
     /// Installs or clears the drain-entry terminal-disposal marker.
@@ -353,7 +386,7 @@ impl MemberCell {
     /// `MemberStage::Terminal` to any sampler whose `Acquire` load reads it;
     /// the setting store is made visible by the `Draining` record write that
     /// `publish_drain` performs afterwards. See
-    /// [`Self::terminal_disposal_pending`] for the full argument.
+    /// [`Self::terminal_or_disposal_pending`] for the full argument.
     pub fn set_terminal_disposal_pending(&self, pending: bool) {
         self.terminal_disposal_pending
             .store(pending, Ordering::Release);
@@ -761,6 +794,24 @@ mod tests {
                 .is_pending(),
             "a losing terminalizer publishes no second record edge"
         );
+    }
+
+    #[test]
+    fn terminal_sample_accepts_pending_disposal_or_a_terminal_record() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let member = &scope.member;
+        assert!(!member.terminal_or_disposal_pending());
+
+        member.set_terminal_disposal_pending(true);
+        assert!(member.terminal_or_disposal_pending());
+
+        member.set_terminal_disposal_pending(false);
+        assert!(!member.terminal_or_disposal_pending());
+        member.terminalize(
+            Exit::completed(Cancellation::NotObserved),
+            StartupDisposition::Unchanged,
+        );
+        assert!(member.terminal_or_disposal_pending());
     }
 
     #[test]

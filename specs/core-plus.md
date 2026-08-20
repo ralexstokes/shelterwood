@@ -6,7 +6,7 @@ appendices (which span all parts), and the conventions — normative
 language among them — that govern this document unchanged.
 [non-core.md](non-core.md) holds Part III. Section numbering is global
 across the three documents: references below §17 resolve in SPEC.md, and
-§26 resolves in non-core.md.
+§26–§27 resolve in non-core.md.
 
 Every section here is an optional extension of core: individually
 adoptable, in any order except where a section states a dependency, and
@@ -14,6 +14,15 @@ each names the hook Part I already carries for it. A library that ships
 none of them is still complete (Part I's conformance statement); a
 library that ships one MUST meet that section in full, including the
 Part-II-tagged rows of the appendices and the activated clauses of §16.
+
+Each section (or, where it splits, each part) carries a **placement**
+note recording why it sits in Part II rather than Part III. *Internal
+seam* means the feature reaches machinery no public surface exposes and
+can only live in the library. *Public-surface composition* means the
+hook is public API: the section is in Part II as a packaging decision,
+its packaged form MAY ship in the utility tier (§27) rather than as a
+library feature, and its contract and conformance clauses bind unchanged
+wherever it ships.
 
 ## Table of contents
 
@@ -82,6 +91,13 @@ adds the convenience surface:
 
 Activates the pinning clause of obligation §16.2.
 
+**Placement.** Split. `pinned` is an internal seam: fencing a send to
+one incarnation must be checked on the mailbox admission path — a
+check-then-send outside it races with rebind and delivers to the
+successor. The incarnation-after awaitable and `call_idempotent` are
+public-surface compositions over §3.3's tokens, B.3's errors, and the
+lifecycle stream (§27).
+
 ## 18. Keyed conflation: `latest_by_key`
 
 `latest_by_key(capacity, key_fn)` — conflation per key with a bounded key
@@ -109,6 +125,11 @@ urgent-control-under-flood composes from `try_send` plus adequate key
 capacity; per-view conflation machinery is rejected (§19); and the
 state-plane/control-plane split is real — a barrier cannot safely share
 a keyed conflating mailbox with replaceable state.
+
+**Placement.** Internal seam — conflation, eviction, capacity behavior,
+the §5.3 `call` contract, and the counters all live on the mailbox
+admission path; a front-actor emulation adds a hop and changes
+backpressure semantics.
 
 ## 19. Message mapping: `contramap` and `project`
 
@@ -165,7 +186,16 @@ impl<'a, A: Actor + ?Sized> Context<'a, A> {
   which breaks replay-correct durability — a replayed effect message
   both replays and regenerates, running the effect twice. A design that
   works origin-blind has no need of `project`; implementing `project`
-  without such a consumer is unjustified surface.
+  without such a consumer is unjustified surface. Durable actors are
+  the anticipated consumer (§27's durability adapter): a
+  provenance-explicit wrapper — one that journals decided events or
+  provenance-tagged arms, never the raw inbound stream — is not
+  origin-blind, and is the shape of design that could clear the wall.
+
+**Placement.** Internal seam — a mapped ref shares the outer ref's
+identity, mailbox, and stats attribution, which no wrapper actor can
+provide (the forwarding-actor emulation is exactly what this section
+rejects), and `project` operates on `Context` by definition.
 
 ## 20. Peer monitoring
 
@@ -185,6 +215,12 @@ query, transition evidence is available from events without keeping
 application-side history. In core, sibling-failure reaction routes
 through the supervisor (fate-sharing) or lifecycle-stream subscription;
 watch is the in-mailbox refinement.
+
+**Placement.** Public-surface composition — the lifecycle stream, the
+§3.1 primitive, and ordinary sends can implement this contract (the
+immediate-`Started` dedup rides on incarnation tokens), at the cost of a
+per-watch or multiplexed forwarding task; library placement removes the
+hop, no seam requires it. MAY ship in the utility tier (§27).
 
 ## 21. Group strategies: `OneForAll`, `RestForOne`
 
@@ -209,6 +245,10 @@ charge nothing (mode dispatch, §11) — they are part of the drain.
 Respawn is declared-order and readiness-gated, exactly like ordered
 startup (§7). Activates the group clause of obligation §16.9.
 
+**Placement.** Internal seam — atomic intensity charging and drain-mode
+dispatch live in §11's exit funnel; a lifecycle-driven emulation is racy
+and cannot charge the budget atomically.
+
 ## 22. Observation extensions
 
 All adapters over core's two streams and identity types:
@@ -230,6 +270,12 @@ All adapters over core's two streams and identity types:
   choke point as `tracing`; the debugging surface exposes structured
   snapshots rather than name-filtered tuples.
 
+**Placement.** Split. The statistics fields, counters, and message-size
+measurement are an internal seam (counted inside the mailbox and loop,
+B.6), and the `metrics` feature shares `tracing`'s internal choke point;
+every packaged view above the two streams is a public-surface adapter
+and MAY ship in the utility tier (§27).
+
 ## 23. Outline (`serde` feature)
 
 **Purpose.** The outline is a policy-drift fingerprint: a serializable,
@@ -249,9 +295,14 @@ machine, and distribution (§26) will not build on it — a distribution
 layer needs code identity, args transport, and state handoff, and will
 define its own wire format.
 
-**Placement.** If this exists at all it must be a library feature: the
-orphan rule bars downstream crates from implementing `Serialize` for
-library-owned policy types. Feature-gated `serde` derives cost non-users
+**Placement.** Internal seam — if this exists at all it must be a
+library feature, and the binding reason is access, not the orphan rule:
+the outline captures the *resolved* declaration, everything §10.3's
+inheritance machinery decides silently, and no public surface exposes
+that resolution for traversal. (The orphan rule alone would not decide
+it — a downstream crate could mirror the policy types rather than
+implement `Serialize` on library-owned ones, but it would have nothing
+to fill the mirrors with.) Feature-gated `serde` derives cost non-users
 nothing; core's only obligation is the "serializable where §23 needs it"
 clause on the §9 options record (§15.2).
 
@@ -281,6 +332,10 @@ ordering. It is the seam for embedding and for a future
 `!Send`/thread-per-core mode. Activates the hosted-parity clause of
 obligation §16.7.
 
+**Placement.** Internal seam — the feature *is* the incarnation runner,
+exposed; the downstream substitute is hand-written `catch_unwind` and
+teardown, which is exactly what it exists to eliminate.
+
 ## 25. Lifetime and timing conveniences
 
 - **Cross-actor delayed delivery** (`send_after_to` / `interval_to`): a
@@ -294,3 +349,9 @@ obligation §16.7.
 - **Sibling-readiness barrier**: first-class support for a child
   awaiting a *named sibling's* readiness (a scope-relative readiness
   barrier), replacing offload-the-wait plumbing.
+
+**Placement.** Public-surface composition — respectively: an
+incarnation-owned task that sleeps and sends (subject to the target's
+mailbox semantics by construction), `OneShotTaskRef` awaitables composed
+with `shutdown()`, and packaged offload-the-wait. MAY ship in the
+utility tier (§27).

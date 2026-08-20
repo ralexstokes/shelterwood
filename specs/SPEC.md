@@ -17,8 +17,10 @@ until it is deliberately amended.
   optional features. Each is individually adoptable, and each names the
   hook Part I already carries so that adopting it later requires no
   redesign of core.
-- **Part III — Exclusions** (§26, [non-core.md](non-core.md)): capabilities
-  that are deliberately never part of the core library.
+- **Part III — Outside the library** (§26–§27,
+  [non-core.md](non-core.md)): capabilities that are deliberately never
+  part of the library, and the utility tier — first-party crates above
+  the library that compose strictly from the public surface.
 
 Section numbering is global across the three documents: a `§N` reference
 resolves to whichever document carries that section, and the conventions
@@ -60,7 +62,7 @@ scenarios.
   - [15. Construction requirements](#15-construction-requirements)
   - [16. Conformance obligations](#16-conformance-obligations)
 - [Part II — Extensions](core-plus.md) (§17–§25, own document)
-- [Part III — Exclusions](non-core.md) (§26, own document)
+- [Part III — Outside the library](non-core.md) (§26–§27, own document)
 - [Appendix A. Normative defaults and bounds](#appendix-a-normative-defaults-and-bounds)
 - [Appendix B. Surface reference](#appendix-b-surface-reference)
 - [Appendix C. Acceptance scenarios](#appendix-c-acceptance-scenarios-informative-in-prose-normative-in-obligation)
@@ -366,7 +368,8 @@ it still retains the same live lineage; a temporary builder never defines
 the ordering domain. Different ids and different owning scope memberships
 remain incomparable. A small routing/registry adapter for planned handoff
 (a `ServiceRef`/route-cell that the application repoints at cutover) is out
-of core (§26) — it must not weaken exact membership identity.
+of core, packaged in the utility tier (§27) — it must not weaken exact
+membership identity.
 
 ## 4. Construction and restart
 

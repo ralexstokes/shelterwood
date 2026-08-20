@@ -29,20 +29,6 @@ pub enum MemberStage {
     Terminal(Exit),
 }
 
-impl MemberStage {
-    fn tag(&self) -> &'static str {
-        match self {
-            Self::Reserved => "Reserved",
-            Self::Admitted => "Admitted",
-            Self::Starting => "Starting",
-            Self::Running => "Running",
-            Self::Restarting => "Restarting",
-            Self::Stopping => "Stopping",
-            Self::Terminal(_) => "Terminal",
-        }
-    }
-}
-
 /// One non-terminal member-record transition owned by the cell layer.
 pub enum MemberTransition {
     Admitted,
@@ -108,48 +94,52 @@ impl MemberRecord {
     /// Applies one driver-requested transition.
     ///
     /// Every watch-channel writer routes stage changes through here (see
-    /// [`MemberCell::transition`] for the wake-bus contract), so each arm
-    /// asserts the source stages its driver call sites can actually present.
+    /// [`MemberCell::transition`] for the wake-bus contract). The reducer
+    /// rejects an event whose source stage is not one its driver call sites
+    /// can present, including in release builds.
     ///
     /// Exits are safe to retire inside the watch mutation: the record's guard
     /// set still covers the displaced value, and [`Self::refresh_retained_exits`]
     /// re-establishes that cover before the mutation returns.
-    fn apply_transition(&mut self, transition: MemberTransition) {
+    fn apply_transition(&mut self, transition: MemberTransition) -> Result<(), MemberTransition> {
+        let legal = matches!(
+            (&self.stage, &transition),
+            (MemberStage::Reserved, MemberTransition::Admitted)
+                | (
+                    MemberStage::Admitted | MemberStage::Restarting,
+                    MemberTransition::Starting { .. }
+                )
+                | (
+                    MemberStage::Starting | MemberStage::Reserved,
+                    MemberTransition::Running
+                )
+                | (
+                    MemberStage::Starting | MemberStage::Running,
+                    MemberTransition::Stopping
+                )
+                | (
+                    MemberStage::Starting | MemberStage::Running | MemberStage::Stopping,
+                    MemberTransition::RestartScheduled { .. }
+                )
+        );
+        if !legal {
+            return Err(transition);
+        }
+
         match transition {
             MemberTransition::Admitted => {
-                debug_assert!(
-                    matches!(self.stage, MemberStage::Reserved),
-                    "admission must consume a fresh reservation, not {}",
-                    self.stage.tag()
-                );
                 self.stage = MemberStage::Admitted;
             }
             MemberTransition::Starting { incarnation } => {
-                debug_assert!(
-                    matches!(self.stage, MemberStage::Admitted | MemberStage::Restarting),
-                    "a spawn must start an admitted or restarting member, not {}",
-                    self.stage.tag()
-                );
                 self.stage = MemberStage::Starting;
                 self.incarnation = Some(incarnation);
                 self.last_incarnation = Some(incarnation);
                 self.restart_at = None;
             }
             MemberTransition::Running => {
-                debug_assert!(
-                    matches!(self.stage, MemberStage::Starting | MemberStage::Reserved),
-                    "readiness must promote a starting member (or the root scope's own \
-                     never-admitted reservation), not {}",
-                    self.stage.tag()
-                );
                 self.stage = MemberStage::Running;
             }
             MemberTransition::Stopping => {
-                debug_assert!(
-                    matches!(self.stage, MemberStage::Starting | MemberStage::Running),
-                    "a stop ladder must begin on a starting or running member, not {}",
-                    self.stage.tag()
-                );
                 self.stage = MemberStage::Stopping;
             }
             MemberTransition::RestartScheduled {
@@ -157,14 +147,6 @@ impl MemberRecord {
                 restart_count,
                 restart_at,
             } => {
-                debug_assert!(
-                    matches!(
-                        self.stage,
-                        MemberStage::Starting | MemberStage::Running | MemberStage::Stopping
-                    ),
-                    "a restart must be scheduled from an active incarnation's exit, not {}",
-                    self.stage.tag()
-                );
                 self.stage = MemberStage::Restarting;
                 self.incarnation = None;
                 self.last_exit = Some(exit);
@@ -172,6 +154,7 @@ impl MemberRecord {
                 self.restart_at = restart_at;
             }
         }
+        Ok(())
     }
 }
 
@@ -407,8 +390,8 @@ impl MemberCell {
     /// field read by a loop precondition must be changed through a pulsing path
     /// like this one, never by a silent write outside an observation gate.
     #[cfg(any(test, feature = "test-util"))]
-    pub fn transition(&self, transition: MemberTransition) {
-        self.with_observation_txn(|txn| self.transition_locked(txn, transition));
+    pub fn transition(&self, transition: MemberTransition) -> bool {
+        self.with_observation_txn(|txn| self.transition_locked(txn, transition))
     }
 
     fn with_observation_txn<R>(&self, operation: impl FnOnce(&mut ObservationTxn<'_>) -> R) -> R {
@@ -527,9 +510,13 @@ impl MemberCell {
         txn.pulse(&self.record);
     }
 
-    pub fn transition_locked(&self, txn: &mut ObservationTxn<'_>, transition: MemberTransition) {
+    pub fn transition_locked(
+        &self,
+        txn: &mut ObservationTxn<'_>,
+        transition: MemberTransition,
+    ) -> bool {
         // `RestartScheduled` carries a user error by value. Retain it before
-        // the watch lock and reducer assertions so an invariant panic can
+        // the watch lock and reducer validation so an unrelated panic can
         // unwind the raw transition as refcount traffic only.
         let retained_exit = match &transition {
             MemberTransition::RestartScheduled { exit, .. } => {
@@ -540,11 +527,29 @@ impl MemberCell {
             | MemberTransition::Running
             | MemberTransition::Stopping => None,
         };
-        self.update_locked(txn, |record| record.apply_transition(transition));
+        let mut rejected = None;
+        self.record
+            .modify_silently(|record| match record.apply_transition(transition) {
+                Ok(()) => record.refresh_retained_exits(),
+                Err(transition) => rejected = Some(transition),
+            });
+        if let Some(rejected) = rejected {
+            // Rejection is a total no-op. The rejected event may own a failed
+            // exit, so retire it with the transaction rather than under the
+            // observation gate or watch lock.
+            txn.defer(move || runtime::dispose_detached(rejected));
+            if let Some(retained_exit) = retained_exit {
+                // The deferred transition proves this clone cannot be last.
+                drop(retained_exit.into_exit());
+            }
+            return false;
+        }
+        txn.pulse(&self.record);
         if let Some(retained_exit) = retained_exit {
             // The record now owns an equivalent retained copy.
             drop(retained_exit.into_exit());
         }
+        true
     }
 
     pub fn set_options(&self, options: ResolvedCommonOptions) {
@@ -757,8 +762,9 @@ mod tests {
     // is gated on the profile it can hold in rather than left to fail there.
     #[cfg(debug_assertions)]
     #[test]
-    fn illegal_restart_transition_retires_its_user_error_off_thread() {
+    fn illegal_restart_transition_is_rejected_in_every_build() {
         let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let mut watcher = scope.member.record_watcher();
         let (dropped, observed) = mpsc::sync_channel(1);
         let retiring_thread = std::thread::current().id();
         let exit = Exit::failed(
@@ -766,21 +772,30 @@ mod tests {
             Cancellation::NotObserved,
         );
 
-        catch_unwind(AssertUnwindSafe(|| {
-            scope.member.transition(MemberTransition::RestartScheduled {
+        assert!(
+            !scope.member.transition(MemberTransition::RestartScheduled {
                 exit,
                 restart_count: RestartCount::ZERO.bump(),
                 restart_at: None,
-            });
-        }))
-        .expect_err("a reserved member cannot schedule a restart");
+            }),
+            "a reserved member cannot schedule a restart"
+        );
+        assert!(matches!(scope.member.record().stage, MemberStage::Reserved));
+        let mut changed = Box::pin(watcher.changed());
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "a rejected transition publishes no record edge"
+        );
 
         assert_ne!(
             observed
                 .recv_timeout(Duration::from_secs(10))
                 .expect("failed exit disposal reports"),
             retiring_thread,
-            "the incoming user error cannot unwind under the record and observation locks"
+            "a rejected user error retires on the detached lane"
         );
     }
 

@@ -647,18 +647,24 @@ impl ScopeCell {
         member: &MemberCell,
         transition: MemberTransition,
         event: Option<LifecycleEventKind>,
-    ) {
+    ) -> bool {
         // Routed through `transition_locked` rather than a record-only update
         // so a restart schedule's displaced exit leaves the gate on this path
         // too.
         self.with_observation_gate(|wakes| {
-            member.transition_locked(wakes, transition);
+            if !member.transition_locked(wakes, transition) {
+                if let Some(event) = event {
+                    wakes.defer(move || runtime::dispose_detached(event));
+                }
+                return false;
+            }
             if let Some(event) = event {
                 self.emit_locked(wakes, event);
             } else {
                 self.publish_snapshot_chain_locked(wakes);
             }
-        });
+            true
+        })
     }
 
     pub fn publish_child_restart(
@@ -668,16 +674,20 @@ impl ScopeCell {
         transition: MemberTransition,
         exited: LifecycleEventKind,
         scheduled: LifecycleEventKind,
-    ) {
+    ) -> bool {
         self.with_observation_gate(|wakes| {
+            if !member.transition_locked(wakes, transition) {
+                wakes.defer(move || runtime::dispose_detached((exited, scheduled)));
+                return false;
+            }
             self.observation.record.modify_silently(|scope| {
                 scope.total_restarts = total_restarts;
             });
             wakes.pulse(&self.observation.record);
-            member.transition_locked(wakes, transition);
             self.emit_locked(wakes, exited);
             self.emit_locked(wakes, scheduled);
-        });
+            true
+        })
     }
 
     pub fn terminalize_child(
@@ -1174,17 +1184,17 @@ impl ScopeCell {
     }
 
     #[cfg(any(test, feature = "test-util"))]
-    pub fn admit_child(self: &Arc<Self>, child: ResidentProjection) {
-        self.with_observation_gate(|wakes| self.admit_child_locked(child, wakes));
+    pub fn admit_child(self: &Arc<Self>, child: ResidentProjection) -> bool {
+        self.with_observation_gate(|wakes| self.admit_child_locked(child, wakes))
     }
 
     pub fn admit_child_locked(
         self: &Arc<Self>,
         child: ResidentProjection,
         txn: &mut ObservationTxn<'_>,
-    ) {
+    ) -> bool {
         // Take protected ownership before gate adoption, parent wiring, and
-        // reducer assertions. Until the final push succeeds this projection
+        // reducer validation. Until the final push succeeds this projection
         // may be the last owner of a mailbox-bearing member.
         let child = ResidentAdmission::new(child, txn);
         let projection = child.projection();
@@ -1197,13 +1207,17 @@ impl ScopeCell {
         }
         let id = projection.member.id().clone();
         let membership = projection.member.membership();
-        projection
+        if !projection
             .member
-            .transition_locked(txn, MemberTransition::Admitted);
+            .transition_locked(txn, MemberTransition::Admitted)
+        {
+            return false;
+        }
         drop(projection);
         self.current_children()
             .push(ResidentChild::new(child.install()));
         self.emit_locked(txn, LifecycleEventKind::Added { id, membership });
+        true
     }
 
     pub fn clear_residents(&self) {
@@ -1463,7 +1477,7 @@ mod tests {
     use super::*;
     use crate::{
         cells::test_support::{TEST_WAIT, ThreadProbe, child_member, child_scope, isolated_scope},
-        observe::LifecycleItem,
+        observe::{LifecycleItem, LifecycleTryRecvError},
     };
 
     struct GateCheckingWake {
@@ -1703,7 +1717,7 @@ mod tests {
         drop(effects);
         // Admission below is intentionally illegal, but the projection is
         // still the final owner of this mailbox-bearing member when it fails.
-        member.transition(MemberTransition::Admitted);
+        assert!(member.transition(MemberTransition::Admitted));
         let (dropped, observed) = mpsc::sync_channel(1);
         actor
             .try_send(ThreadProbe(dropped))
@@ -1713,8 +1727,14 @@ mod tests {
         drop(mailbox);
         let retiring_thread = std::thread::current().id();
 
-        catch_unwind(AssertUnwindSafe(|| root.admit_child(projection)))
-            .expect_err("an admitted member cannot be admitted twice");
+        assert!(
+            !root.admit_child(projection),
+            "an admitted member cannot be admitted twice"
+        );
+        assert!(
+            root.resident_projections().is_empty(),
+            "a rejected admission publishes no residency"
+        );
 
         assert_ne!(
             observed
@@ -1723,6 +1743,36 @@ mod tests {
             retiring_thread,
             "the by-value projection cannot unwind its mailbox through the observation gate"
         );
+    }
+
+    #[test]
+    fn rejected_stage_transition_suppresses_its_lifecycle_publication() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let member = child_member(&root, "invalid");
+        let mut events = root.subscribe_lifecycle();
+
+        assert!(
+            !root.transition_child_stage(
+                &member,
+                MemberTransition::RestartScheduled {
+                    exit: Exit::completed(Cancellation::NotObserved),
+                    restart_count: RestartCount::ZERO.bump(),
+                    restart_at: None,
+                },
+                Some(LifecycleEventKind::Exited {
+                    id: member.id().clone(),
+                    membership: member.membership(),
+                    incarnation: member
+                        .take_incarnation_counter()
+                        .mint()
+                        .expect("incarnation available"),
+                    exit: Exit::completed(Cancellation::NotObserved),
+                }),
+            ),
+            "the Reserved-to-Restarting projection transition is illegal"
+        );
+        assert!(matches!(member.record().stage, MemberStage::Reserved));
+        assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
     }
 
     #[test]

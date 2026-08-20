@@ -484,11 +484,12 @@ impl<A: Actor> RawActor for Handler<A> {
     /// decorator — not the raw runner — may resume after this future
     /// returns, and it must not observe still-live incarnation resources;
     /// every error exit therefore freezes and joins them here first. That
-    /// half-teardown deliberately does not freeze the mailbox: an incarnation
-    /// ending without a stop phase remains accepting until exit publication
-    /// (SPEC §5.4). A decorator may inspect the returned error and the now-
-    /// rejected resource capabilities, but resuming the raw loop past this
-    /// point is unsupported.
+    /// half-teardown deliberately does not freeze the mailbox, so a decorator
+    /// may inspect the returned error with the mailbox still live and the
+    /// resource capabilities now rejected. Resuming the raw loop past this
+    /// point is unsupported; once the decorated raw stack returns, the raw
+    /// incarnation boundary freezes the mailbox before destroying the context
+    /// and actor.
     async fn run(&mut self, raw: &mut RawContext<Self::Msg>) -> ExitResult {
         let HandlerState::Uninit(args) = std::mem::replace(&mut self.state, HandlerState::Spent)
         else {
@@ -550,9 +551,10 @@ impl<A: Actor> RawActor for Handler<A> {
 /// Propagates a callback error after §6.5's orderly teardown: incarnation-owned
 /// work is frozen, cancelled, and joined before control returns to the caller,
 /// which at the advertised composition point may be a raw decorator rather
-/// than the raw incarnation boundary itself. The mailbox stays bound until
-/// the raw incarnation boundary publishes the exit, as SPEC §5.4 requires;
-/// returning to the loop after this resource-only teardown is unsupported.
+/// than the raw incarnation boundary itself. This helper leaves the mailbox
+/// live for that decorator; the outer raw incarnation boundary freezes it when
+/// the decorated stack returns. Returning to the loop after this resource-only
+/// teardown is unsupported.
 async fn fail_after_teardown<M: Send + 'static>(
     raw: &mut RawContext<M>,
     error: ExitError,

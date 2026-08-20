@@ -205,10 +205,23 @@ impl<T> Drop for DisposingReceiver<T> {
             .expect("a live disposing receiver retains its channel");
         let mut value = None;
         let mut panics = crate::panic::PanicAccumulator::default();
+        // Recovery runs first so an unclaimed value reaches isolated disposal
+        // before the receiver -- and therefore before the waker clone it
+        // registered -- is retired; a hostile waker destructor can neither
+        // divert nor destroy it. If recovery itself unwinds, the value stays
+        // in the channel and `inner`'s own drop glue destroys it inline
+        // rather than through the isolated lane: accepted, because reaching
+        // it requires a destructor that has already panicked, and the
+        // alternative is retrying a step that just failed.
         panics.run(|| value = inner.close_and_take_erased());
-        if let Some(value) = value {
-            self.runtime.dispose(value);
-        }
+        // `dispose` can fall back to destroying the value on this thread when
+        // task and native-thread creation are exhausted, so submission belongs
+        // inside the boundary too.
+        panics.run(|| {
+            if let Some(value) = value {
+                self.runtime.dispose(value);
+            }
+        });
         panics.run(|| drop(inner));
     }
 }

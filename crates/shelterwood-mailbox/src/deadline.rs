@@ -111,7 +111,24 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             this.operation
                 .poll_deadlined(context, budget, DeadlinePhase::InitialAttempt)
         {
-            this.timer = None;
+            // Completion retires the wheel entry here, and only here: a
+            // future held past its result would otherwise keep a timer armed
+            // with a clone of the caller's waker and deliver that expiry to a
+            // caller who already has its answer. Retirement must therefore be
+            // synchronous -- handing the timer to isolated disposal leaves the
+            // entry armed until a worker thread reaches it, which is the
+            // spurious wake this exists to prevent.
+            //
+            // A `RawWaker` vtable is caller code, and `result` -- which may
+            // own a user value -- is a live local across that destructor. A
+            // resuming boundary would destroy the completed output instead of
+            // returning it, and a hostile output destructor would turn that
+            // into a double panic and a process abort, so the panic is
+            // contained rather than resumed: a delivered result outranks a
+            // waker-cleanup diagnostic. This is the precedence
+            // `CatchUnwindFuture`'s completed-output arm already applies.
+            let timer = this.timer.take();
+            crate::panic::discard_panic(crate::panic::catch_panic(|| drop(timer)).err());
             return Poll::Ready(result);
         }
         if this.phase == DeadlinePhase::InitialAttempt {
@@ -137,6 +154,14 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
 }
 
 impl<F> Drop for Deadlined<F> {
+    /// Retires an unelapsed timer inside a boundary.
+    ///
+    /// Cancelling an armed timer destroys the clone of the caller's waker it
+    /// registered, and a `RawWaker` vtable is caller code. There is no caller
+    /// left to surface a panic to here, and during an existing unwind a bare
+    /// destructor panic is a double panic and a process abort, so the
+    /// retirement runs through an accumulator: it resumes on an ordinary drop
+    /// and is contained while another unwind is already in progress.
     fn drop(&mut self) {
         let timer = self.timer.take();
         let mut panics = crate::panic::PanicAccumulator::default();
@@ -148,7 +173,11 @@ impl<F> Drop for Deadlined<F> {
 mod tests {
     use std::{
         future::Future,
-        task::{Context, Poll, Waker},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, Wake, Waker},
     };
 
     /// Stays pending on its first elapsed poll, modelling an atomic
@@ -158,9 +187,15 @@ mod tests {
         elapsed_polls: usize,
     }
 
-    struct ReadyImmediately;
+    /// Parks once, then completes strictly before its deadline -- the only
+    /// arrangement in which a retained future can still hold an armed wheel
+    /// entry carrying a clone of the caller's waker.
+    #[derive(Default)]
+    struct ReadyAfterParking {
+        polls: usize,
+    }
 
-    impl super::DeadlineOperation for ReadyImmediately {
+    impl super::DeadlineOperation for ReadyAfterParking {
         type Output = ();
 
         fn poll_deadlined(
@@ -169,10 +204,30 @@ mod tests {
             _budget: crate::deadline::Deadline,
             _phase: super::DeadlinePhase,
         ) -> Poll<()> {
-            Poll::Ready(())
+            self.polls += 1;
+            if self.polls < 2 {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
         }
 
         fn short_circuit(&mut self) {}
+    }
+
+    /// Records wakes so an armed wheel entry is observable as the spurious
+    /// wake it would deliver rather than as a cleared field.
+    #[derive(Default)]
+    struct WakeRecorder(AtomicUsize);
+
+    impl Wake for WakeRecorder {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     impl super::DeadlineOperation for PendingOnFirstExpiry {
@@ -220,22 +275,35 @@ mod tests {
         assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(2)));
     }
 
-    #[crate::runtime::test]
-    async fn a_completed_operation_retires_its_timer_immediately() {
+    #[crate::runtime::test(start_paused = true)]
+    async fn a_completed_operation_leaves_no_timer_to_wake_its_caller() {
+        let width = std::time::Duration::from_secs(1);
         let mut future = Box::pin(super::Deadlined::no_attempt(
-            ReadyImmediately,
-            std::time::Duration::from_secs(30),
+            ReadyAfterParking::default(),
+            width,
             crate::capability::tests::runtime(),
         ));
-        let mut context = Context::from_waker(Waker::noop());
+        let recorder = Arc::new(WakeRecorder::default());
+        let waker = Waker::from(Arc::clone(&recorder));
+        let mut context = Context::from_waker(&waker);
 
+        // Parking arms the timer with a clone of this waker; the operation
+        // then completes while that deadline is still in the future.
+        assert!(future.as_mut().poll(&mut context).is_pending());
         assert!(matches!(
             future.as_mut().poll(&mut context),
             Poll::Ready(())
         ));
-        assert!(
-            future.timer.is_none(),
-            "a completed but retained deadline future leaves no armed timer"
+        let woken_before = recorder.0.load(Ordering::SeqCst);
+
+        crate::runtime::advance(width * 2).await;
+
+        // The future is still held, so a timer left armed by completion would
+        // deliver its expiry to the caller that already has its result.
+        assert_eq!(
+            recorder.0.load(Ordering::SeqCst),
+            woken_before,
+            "a completed but retained deadline future must not wake its caller when the deadline elapses"
         );
     }
 

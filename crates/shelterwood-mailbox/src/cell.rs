@@ -379,10 +379,17 @@ impl<M> MailboxState<M> {
     /// `WaiterQueue` here. That drop would release the queue's
     /// `Arc<SendOperation<M>>`s under the mutex, so wherever one is the last
     /// owner a user message destructor would run in the critical section.
-    /// At waiter-carrying call sites, declining also strands every parked
-    /// sender in the old binding. That fail-safe is still preferable to
-    /// destroying their operations and user messages under this mutex; every
-    /// production caller proves emptiness locally before reaching this seam.
+    ///
+    /// The guard covers the *old* binding only. `replacement` is taken by
+    /// value, so declining destroys it — and any operation it carries —
+    /// right here, still under the mutex. The decline is therefore a
+    /// last-resort diagnostic, not a safe fallback. At every waiter-carrying
+    /// call site it is unreachable by construction: `take_waiters` moves the
+    /// parked senders out of the old binding into the replacement first, so
+    /// the domain this check reads is already empty. The remaining callers
+    /// pass an `Available` or empty binding. Reaching the decline would mean
+    /// a terminal misuse in which either outcome destroys user values in the
+    /// critical section.
     fn replace_binding(&mut self, replacement: MailboxBinding<M>) {
         let replaceable = match &self.binding {
             MailboxBinding::Unbound(waiters)

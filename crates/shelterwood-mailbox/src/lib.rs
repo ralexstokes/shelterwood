@@ -178,6 +178,7 @@ impl Drop for MailboxEffectQueue {
 /// It is public solely because sibling implementation crates retain it through
 /// type erasure; it is not a user extension point.
 pub trait MailboxTermination: private::SealedMailboxTermination + Send {
+    #[must_use = "finishing hands back the unread payload for detached disposal"]
     fn finish(self: Box<Self>) -> MailboxDisposal;
 }
 

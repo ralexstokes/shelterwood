@@ -495,6 +495,44 @@ impl MemberCell {
         }
     }
 
+    /// Runs an admission attempt under this member's current observation gate.
+    ///
+    /// The caller already holds the destination gate. When the gates differ,
+    /// this takes the current child gate in the one permitted parent-to-child
+    /// direction and keeps it held through `attempt`, allowing validation,
+    /// transition, and handoff to form one cut. The attempt installs the new
+    /// gate itself only after it has accepted the transition.
+    pub(super) fn try_adopt_observation_gate_with(
+        &self,
+        gate: &ObservationGate,
+        mut report_capture: impl FnMut(),
+        attempt: impl FnOnce(&ObservationGate) -> bool,
+    ) -> bool {
+        let mut attempt = Some(attempt);
+        loop {
+            let current = self.current_observation_gate();
+            if current.shares_gate(gate) {
+                return attempt
+                    .take()
+                    .expect("observation gate admission runs exactly once")(
+                    &current
+                );
+            }
+            report_capture();
+            let current_guard = current.lock();
+            if current.shares_gate(&self.current_observation_gate()) {
+                let admitted = attempt
+                    .take()
+                    .expect("observation gate admission runs exactly once")(
+                    &current
+                );
+                drop(current_guard);
+                return admitted;
+            }
+            drop(current_guard);
+        }
+    }
+
     pub(super) fn update_locked(
         &self,
         txn: &mut ObservationTxn<'_>,

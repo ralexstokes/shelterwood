@@ -485,6 +485,46 @@ impl ScopeCell {
         );
     }
 
+    fn admit_observation_gate(
+        &self,
+        parent: &ScopeCell,
+        gate: &ObservationGate,
+        txn: &mut ObservationTxn<'_>,
+    ) -> bool {
+        debug_assert!(
+            !std::ptr::eq(self, parent),
+            "a scope cannot be admitted into itself"
+        );
+        debug_assert!(
+            gate.shares_gate(&parent.current_observation_gate()),
+            "observation gates are admitted only in the parent-to-child direction"
+        );
+        self.member.try_adopt_observation_gate_with(
+            gate,
+            || {
+                #[cfg(any(test, feature = "test-util"))]
+                self.report_gate_capture(GateCapture::Adoption);
+            },
+            |current| {
+                if !self
+                    .member
+                    .transition_locked(txn, MemberTransition::Admitted)
+                {
+                    return false;
+                }
+                if !current.shares_gate(gate) {
+                    debug_assert!(
+                        self.dynamic_route_in(txn).is_none(),
+                        "a scope with a live dynamic route is never re-homed"
+                    );
+                    self.member.install_observation_gate_locked(current, gate);
+                    self.adopt_descendant_observation_gates_locked(current, gate, txn);
+                }
+                true
+            },
+        )
+    }
+
     pub fn adopt_child_observation_gate(
         self: &Arc<Self>,
         member: &MemberCell,
@@ -1199,20 +1239,37 @@ impl ScopeCell {
         let child = ResidentAdmission::new(child, txn);
         let projection = child.projection();
         let gate = self.current_observation_gate();
-        if let Some(scope) = &projection.scope {
-            scope.adopt_observation_gate(self, &gate, txn);
-            scope.set_parent(self, txn);
+        let admitted = if let Some(scope) = &projection.scope {
+            let admitted = scope.admit_observation_gate(self, &gate, txn);
+            if admitted {
+                scope.set_parent(self, txn);
+            }
+            admitted
         } else {
-            projection.member.adopt_observation_gate(&gate, txn);
+            projection.member.try_adopt_observation_gate_with(
+                &gate,
+                || {},
+                |current| {
+                    if !projection
+                        .member
+                        .transition_locked(txn, MemberTransition::Admitted)
+                    {
+                        return false;
+                    }
+                    if !current.shares_gate(&gate) {
+                        projection
+                            .member
+                            .install_observation_gate_locked(current, &gate);
+                    }
+                    true
+                },
+            )
+        };
+        if !admitted {
+            return false;
         }
         let id = projection.member.id().clone();
         let membership = projection.member.membership();
-        if !projection
-            .member
-            .transition_locked(txn, MemberTransition::Admitted)
-        {
-            return false;
-        }
         drop(projection);
         self.current_children()
             .push(ResidentChild::new(child.install()));
@@ -1742,6 +1799,47 @@ mod tests {
                 .expect("mailbox payload disposal reports"),
             retiring_thread,
             "the by-value projection cannot unwind its mailbox through the observation gate"
+        );
+    }
+
+    #[test]
+    fn rejected_nested_admission_preserves_original_parent_and_gate() {
+        let original = isolated_scope("original", ScopeFlavor::Ordered);
+        let destination = isolated_scope("destination", ScopeFlavor::Ordered);
+        let nested = child_scope(&original, "nested", ScopeFlavor::Dynamic);
+        let descendant = child_member(&nested, "descendant");
+        nested.set_admitted_children(vec![ResidentProjection::new(Arc::clone(&descendant), None)]);
+        original.set_admitted_children(vec![ResidentProjection::new(
+            Arc::clone(&nested.member),
+            Some(Arc::clone(&nested)),
+        )]);
+        let original_gate = original.observation_gate();
+        assert!(original_gate.same_gate(&nested.observation_gate()));
+        assert!(original_gate.same_gate(&descendant.observation_gate()));
+
+        assert!(
+            !destination.admit_child(ResidentProjection::new(
+                Arc::clone(&nested.member),
+                Some(Arc::clone(&nested)),
+            )),
+            "an already-admitted subtree cannot move to a second parent"
+        );
+
+        assert!(original.has_resident_child(&nested.member));
+        assert!(destination.resident_projections().is_empty());
+        assert!(Arc::ptr_eq(
+            &nested
+                .parent()
+                .expect("the original parent remains installed"),
+            &original
+        ));
+        assert!(original_gate.same_gate(&nested.observation_gate()));
+        assert!(original_gate.same_gate(&descendant.observation_gate()));
+        assert!(
+            !destination
+                .observation_gate()
+                .same_gate(&nested.observation_gate()),
+            "rejection leaves the subtree on its original observation gate"
         );
     }
 

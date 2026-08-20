@@ -1312,12 +1312,11 @@ fn gate_handoff_waits_for_an_in_flight_observation_edge() {
     );
 }
 
-#[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "a scope with a live dynamic route is never re-homed")]
-fn gate_handoff_rejects_a_scope_with_an_unadmitted_dynamic_reservation() {
+fn gate_handoff_rejects_a_scope_with_an_unadmitted_dynamic_reservation_without_rehoming() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+    let original_gate = nested.observation_gate();
     nested
         .member
         .update(|record| record.stage = MemberStage::Running);
@@ -1340,6 +1339,14 @@ fn gate_handoff_rejects_a_scope_with_an_unadmitted_dynamic_reservation() {
     // Public layering cannot reach this adoption: a reservation requires a
     // started driver, while a scope is parented before its driver starts.
     root.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(
+        root.resident_projections().is_empty(),
+        "the illegal running-to-admitted transition publishes no residency"
+    );
+    assert!(
+        original_gate.same_gate(&nested.observation_gate()),
+        "a rejected admission leaves the live subtree on its original gate"
+    );
 }
 
 /// SPEC §15.4's lock rule: nothing user-owned is destroyed inside a framework

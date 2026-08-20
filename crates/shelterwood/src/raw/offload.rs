@@ -4,7 +4,10 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
     task::{Context as TaskPollContext, Poll},
 };
 
@@ -14,6 +17,10 @@ use super::disposal::{PanicSlot, RawDisposal};
 
 type OffloadFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type SharedWork = Arc<SharedOffloadState>;
+
+const FINISHED_PENDING: u8 = 0;
+const FINISHED_PUBLISHING: u8 = 1;
+const FINISHED_PUBLISHED: u8 = 2;
 
 /// Marker returned to an offload continuation when its one deadline expires.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -147,6 +154,7 @@ pub(super) struct SharedOffloadState {
     pub(super) state: Mutex<OffloadFutureState>,
     disposal: RawDisposal,
     finished: Latch,
+    finished_publication: AtomicU8,
 }
 
 impl SharedOffloadState {
@@ -159,6 +167,7 @@ impl SharedOffloadState {
             }),
             disposal,
             finished,
+            finished_publication: AtomicU8::new(FINISHED_PENDING),
         })
     }
 
@@ -197,12 +206,37 @@ impl SharedOffloadState {
     }
 
     fn fire_finished(&self) {
+        // The latch exposes its fired bit before invoking caller wakers. Claim
+        // that notification once so a concurrent cancellation cannot call a
+        // no-op second `fire` and mark publication complete while the winning
+        // caller is still inside a hostile wake.
+        if self
+            .finished_publication
+            .compare_exchange(
+                FINISHED_PENDING,
+                FINISHED_PUBLISHING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
         if let Err(payload) = catch_panic(|| self.finished.fire()) {
             // Completion waiters are caller-owned. Keep their wake panics in
             // the incarnation slot instead of letting them escape through the
             // framework-owned offload task's join result.
             self.record(payload);
         }
+        // Release-publish only after a hostile wake has either returned or
+        // had its panic installed in the incarnation slot. Ledger reclamation
+        // uses this edge instead of the latch's earlier fired bit.
+        self.finished_publication
+            .store(FINISHED_PUBLISHED, Ordering::Release);
+    }
+
+    pub(super) fn finished_published(&self) -> bool {
+        self.finished_publication.load(Ordering::Acquire) == FINISHED_PUBLISHED
     }
 
     pub(super) fn dispose(&self, future: Option<OffloadFuture>) {
@@ -222,7 +256,7 @@ impl SharedOffloadState {
             }
         };
         self.dispose(future);
-        self.finished.fire();
+        self.fire_finished();
     }
 }
 

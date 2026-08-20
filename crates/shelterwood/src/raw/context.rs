@@ -740,7 +740,13 @@ impl<M> RawResources<M> {
     /// count, so a per-turn walk of it is proportional to work the actor
     /// itself has outstanding.
     fn reclaim_finished(&mut self) {
-        self.offloads.retain(|offload| !offload.finished.is_fired());
+        self.offloads.retain(|offload| {
+            if let Some(state) = &offload.state {
+                !state.finished_published()
+            } else {
+                !offload.finished.is_fired()
+            }
+        });
     }
 
     fn resume_pending_panic(&self) {
@@ -1736,6 +1742,12 @@ mod tests {
 
     struct PanickingWake(&'static str);
 
+    struct BlockingPanickingWake {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        message: &'static str,
+    }
+
     impl Wake for PanickingWake {
         fn wake(self: Arc<Self>) {
             panic!("{}", self.0);
@@ -1743,6 +1755,24 @@ mod tests {
 
         fn wake_by_ref(self: &Arc<Self>) {
             panic!("{}", self.0);
+        }
+    }
+
+    impl BlockingPanickingWake {
+        fn block_then_panic(&self) {
+            self.entered.wait();
+            self.release.wait();
+            panic!("{}", self.message);
+        }
+    }
+
+    impl Wake for BlockingPanickingWake {
+        fn wake(self: Arc<Self>) {
+            self.block_then_panic();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.block_then_panic();
         }
     }
 
@@ -2036,13 +2066,19 @@ mod tests {
         assert!(!resources.offloads[0].finished.is_fired());
     }
 
-    #[crate::runtime::test]
-    async fn ordinary_offload_completion_retains_a_finished_waiter_wake_panic() {
+    #[test]
+    fn ordinary_offload_completion_retains_a_finished_waiter_wake_panic() {
         let mut resources = RawResources::<()>::default();
-        let mut panic_signal = resources.disposal.signal.watcher();
+        let panic = Arc::clone(&resources.disposal.panic);
         let finished = Latch::default();
         let mut waiter = Box::pin(finished.fired());
-        let hostile = Waker::from(Arc::new(PanickingWake("ordinary finished wake panic")));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let hostile = Waker::from(Arc::new(BlockingPanickingWake {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            message: "ordinary finished wake panic",
+        }));
         assert!(
             waiter
                 .as_mut()
@@ -2061,27 +2097,36 @@ mod tests {
             state: Some(Arc::clone(&state)),
             task: None,
         });
-        let mut work = SharedOffloadFuture(state);
-        assert!(
-            Pin::new(&mut work)
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_ready(),
-            "a caller wake panic does not escape through the offload task"
-        );
+        let poller = thread::spawn(move || {
+            let mut work = SharedOffloadFuture(state);
+            assert!(
+                Pin::new(&mut work)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready(),
+                "a caller wake panic does not escape through the offload task"
+            );
+        });
+        entered.wait();
 
         assert!(finished.is_fired(), "all completion waiters were released");
         resources.reclaim_finished();
         assert!(
-            resources.offloads.is_empty(),
-            "ledger reclamation cannot discard the retained diagnostic"
+            !resources.offloads.is_empty(),
+            "the fired bit cannot retire work before its hostile wake is contained"
         );
-        assert!(matches!(
-            crate::runtime::timeout(Duration::from_secs(1), panic_signal.changed()).await,
-            crate::runtime::Timeout::Completed(())
-        ));
-        let payload = resources
-            .disposal
-            .panic
+        assert!(
+            panic.take().is_none(),
+            "an actor turn can precede the blocked wake's panic"
+        );
+
+        release.wait();
+        poller.join().expect("the caller wake panic is contained");
+        resources.reclaim_finished();
+        assert!(
+            resources.offloads.is_empty(),
+            "the ledger retires work after notification publication"
+        );
+        let payload = panic
             .take()
             .expect("the caller wake panic survives ledger reclamation");
         assert_eq!(

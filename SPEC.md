@@ -1216,7 +1216,7 @@ and `supervisor::…` names the pure reducer suite.
    before the removal response resolves. (`supervisor::sampled_removal_suppresses_start_effects_until_commit`,
    `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`,
    `integration::queued_removal_suppresses_replayed_self_stop_readiness`,
-   `integration::startup_removal_response_follows_aggregate_recomputation`.)
+   `integration::startup_removal_response_follows_recomputation_and_drop_discharges_it`.)
 4. **R4 — ordered start is one accepted edge at a time.** `Settle` emits
    `StartChild` only for the current initial cursor, and advances the cursor
    only past a spawned-and-ready member or a reclaimed key, reaching every
@@ -1470,7 +1470,7 @@ One classification, produced at one point, used by every consumer.
 3. **E3 — cancellation is orthogonal sampled state.** The exit records
    `Observed` iff the incarnation cancellation latch had fired when the
    outcome was recorded. Restart eligibility never inspects this field.
-   (`engine::funnel_dispatch_depends_on_mode_and_membership_state`,
+   (`engine::funnel_dispatch_covers_every_policy_exit_and_suppression_combination`,
    `integration::locally_requested_subtree_shutdown_reads_cancelled`.)
 4. **E4 — one authoritative membership/incarnation state.** Incarnation
    phases advance only through `Unstarted → Active → Stopping? → Complete →
@@ -1482,7 +1482,7 @@ One classification, produced at one point, used by every consumer.
 5. **E5 — restart suppression is state-derived.** Exits schedule restart only
    while the scope is running and the membership is resident. Draining or
    `Removing` records schedule nothing and charge no intensity.
-   (`engine::funnel_dispatch_depends_on_mode_and_membership_state`,
+   (`engine::funnel_dispatch_covers_every_policy_exit_and_suppression_combination`,
    `integration::same_batch_removal_suppresses_pending_restart_shutdown`.)
 6. **E6 — publication fences replacement.** A replacement spawn follows the
    predecessor’s terminal publication; stale incarnation evidence cannot
@@ -1679,6 +1679,15 @@ terminates the process by contract.
   `Drop` — is a genuine double panic and aborts the process; that is
   Rust's contract, documented alongside §11's `panic = "unwind"`
   precondition, not something the runner can contain.
+- **Declaration-hook isolation.** The static and dynamic `add_*` entry points
+  isolate the supplied definition before invoking the caller's
+  `Into<ChildId>` conversion, and raw-definition erasure keeps the definition
+  isolated while invoking `RawActor::readiness`. A panic from either eager
+  hook therefore cannot unwind through and destroy that definition on the
+  caller's thread. This is a narrow ownership guarantee, not an extension of
+  the runner boundary: other locals in the user's synchronous declaration
+  call remain subject to Rust's ordinary unwinding and double-panic contract,
+  as do user values that the framework never accepted or wrapped.
 
 ## 8. Child specification and options [#368]
 
@@ -1783,8 +1792,15 @@ API-shape rules:
 - The spec surface for one kind names operations identically across kinds —
   the one-shot operation is the `_once` twin, never a differently-named
   `spawn_once`.
-- Adding a new child kind or mode extends the shared record, not a
-  hand-maintained matrix.
+- Adding a new child kind or mode extends the shared record and the private
+  declaration dispatch, not duplicated reserve/add/define choreography. The
+  dispatch is deliberately sealed inside the façade: its associated handle
+  set and slot kind let the implementation share that choreography, but the
+  eight public add entry points and the nominal slot methods above it remain
+  concrete. Making the dispatch public would admit an oversized extension
+  surface and turn per-kind parameter errors into generic trait-bound errors;
+  collapsing the reserve methods would also be false because actor mailbox
+  type and subtree flavor are fixed before a definition exists.
 
 **Slots — the reserve-before-define surface.** §3.2's cell machinery has
 one public face, uniform across the three kinds and both scope flavors.
@@ -2255,7 +2271,8 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
 5. **S5 — completion is derived and level-triggered.** `all_children_joined`
    is derived from child states. `Settle` emits `Finished` once iff the
    lifecycle’s flavor-specific finish predicate accepts that derived value.
-   (`supervisor::derived_completion_property_matches_the_child_states`,
+   (`engine::scope_lifecycle_owns_first_failure_drain_status_and_finish_policy`,
+   `supervisor::derived_completion_property_matches_the_child_states`,
    `supervisor::exhaustive_reachable_states_preserve_the_reducer_invariants`.)
 6. **S6 — shutdown requests are sampled latches.** Scope shutdown and removal
    are synchronous, idempotent latches sampled into reducer events at step
@@ -2665,13 +2682,13 @@ or lifetime paragraph is unmapped.
   was requested concurrently elsewhere);
   `wait_started()` resolves once at startup and cannot observe a
   later trip, so `wait()` is the post-startup observation point. Natural
-  completion is pinned exactly: an **ordered** scope *finishes* when it
-  has at least one membership and every membership is terminal (a
-  retained terminal child counts — §8's retention is observability, not
-  liveness); a root parked in `StartupFailed` is exempt — it never
-  finishes (the park rule above). The finishing test runs **at each membership's
-  terminalization, strictly before retention-based pruning** removes it
-  (§8's remove-on-terminal default), and its result is latched — so
+  completion is pinned exactly: once aggregate startup has completed, an
+  **ordered** scope *finishes* when it has at least one membership and every
+  membership is terminal (a retained terminal child counts — §8's retention
+  is observability, not liveness); a root parked in `StartupFailed` is exempt —
+  it never finishes (the park rule above). The finishing test runs **at each
+  membership's terminalization, strictly before retention-based pruning**
+  removes it (§8's remove-on-terminal default), and its result is latched — so
   pruning the final one-shot membership can never turn a finished
   workload into an idling empty scope, and pruning order is otherwise
   unobservable. The scope then publishes `Stopped { reason: Finished }` and, when

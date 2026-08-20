@@ -174,6 +174,10 @@ impl<'a, A: Actor> Context<'a, A> {
     actor_context_forwarders!(A);
 
     /// Releases this incarnation's readiness gate while live.
+    ///
+    /// During frozen-prefix drain the incarnation is already stopping, so
+    /// readiness can no longer change the startup outcome and this call is a
+    /// deliberate no-op.
     pub fn mark_ready(&self) {
         if self.stage != DeliveryStage::DrainingFrozenPrefix {
             self.raw.mark_ready();
@@ -187,6 +191,10 @@ impl<'a, A: Actor> Context<'a, A> {
     /// observable to the supervisor. This preserves `AfterInit`'s promise
     /// that returning `Ok` establishes readiness. An explicit
     /// [`Readiness::Manual`] override keeps ordinary pre-ready stop semantics.
+    ///
+    /// During frozen-prefix drain the incarnation is already stopping, so
+    /// this call deliberately does not inject a second local-stop edge and
+    /// returns silently.
     pub fn stop(&mut self) {
         match self.stage {
             DeliveryStage::Initializing if self.raw.readiness() == Readiness::AfterInit => {

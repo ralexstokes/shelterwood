@@ -214,6 +214,37 @@ mod tests {
     }
 
     #[test]
+    fn retained_exit_install_replaces_and_isolates_a_changed_last_owned_set() {
+        let retiring_thread = std::thread::current().id();
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let mut guards = Arc::new(vec![RetainedExit::new(Exit::failed(
+            ExitError::from(ThreadProbe(dropped)),
+            Cancellation::NotObserved,
+        ))]);
+        let original = Arc::downgrade(&guards);
+
+        RetainedExit::install(
+            &mut guards,
+            vec![RetainedExit::new(Exit::completed(
+                Cancellation::NotObserved,
+            ))],
+        );
+
+        assert!(
+            original.upgrade().is_none(),
+            "a changed guard set replaces the shared allocation"
+        );
+        assert!(matches!(guards[0].as_exit().kind(), ExitKind::Completed));
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("the displaced last-owned failure is disposed"),
+            retiring_thread,
+            "replacement must isolate the displaced failed payload"
+        );
+    }
+
+    #[test]
     fn retained_failed_exit_disposes_off_the_retiring_thread() {
         let retiring_thread = std::thread::current().id();
         let (dropped, observed) = mpsc::sync_channel(1);

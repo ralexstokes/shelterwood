@@ -1421,6 +1421,76 @@ mod tests {
     }
 
     #[test]
+    fn child_mailbox_overrides_cover_every_kind_and_capacity_source() {
+        let queue_capacity = NonZeroUsize::new(10).expect("capacity is non-zero");
+        let explicit_capacity = NonZeroUsize::new(3).expect("capacity is non-zero");
+        let defaults = ResolvedDefaults::default()
+            .overlay(&ScopeDefaults {
+                mailbox: Some(Mailbox::Queue(Some(queue_capacity))),
+                ..ScopeDefaults::default()
+            })
+            .overlay(&ScopeDefaults {
+                mailbox: Some(Mailbox::Latest),
+                ..ScopeDefaults::default()
+            });
+
+        assert_eq!(
+            defaults.resolve_child_mailbox(None),
+            ResolvedMailbox::Latest
+        );
+        assert_eq!(
+            defaults.resolve_child_mailbox(Some(Mailbox::Queue(None))),
+            ResolvedMailbox::Queue(queue_capacity),
+            "queue inheritance retains the last queue capacity across a Latest default"
+        );
+        assert_eq!(
+            defaults.resolve_child_mailbox(Some(Mailbox::Queue(Some(explicit_capacity)))),
+            ResolvedMailbox::Queue(explicit_capacity)
+        );
+        assert_eq!(
+            defaults.resolve_child_mailbox(Some(Mailbox::Latest)),
+            ResolvedMailbox::Latest
+        );
+    }
+
+    #[test]
+    fn one_shot_resolution_forces_never_restart_and_defaults_to_removal() {
+        let explicit_restart = RestartPolicy::new(RestartCondition::Always, Backoff::Immediate);
+        let defaults = ResolvedDefaults::default();
+        let resolved = resolve_common(
+            &CommonOptions {
+                restart: Some(explicit_restart),
+                ..CommonOptions::default()
+            },
+            &defaults,
+            ChildMode::OneShot,
+            Readiness::Immediate,
+        );
+        assert_eq!(
+            resolved.restart,
+            RestartPolicy::new(RestartCondition::Never, Backoff::Immediate),
+            "one-shot mode overrides even an explicit restart policy"
+        );
+        assert_eq!(resolved.retention, Retention::Remove);
+
+        let retained = resolve_common(
+            &CommonOptions {
+                restart: Some(explicit_restart),
+                retention: Some(Retention::Retain),
+                ..CommonOptions::default()
+            },
+            &defaults,
+            ChildMode::OneShot,
+            Readiness::Immediate,
+        );
+        assert_eq!(
+            retained.restart,
+            RestartPolicy::new(RestartCondition::Never, Backoff::Immediate)
+        );
+        assert_eq!(retained.retention, Retention::Retain);
+    }
+
+    #[test]
     fn default_overlay_and_child_resolution_share_inheritance_rules() {
         let inherited = ResolvedDefaults::default().overlay(&ScopeDefaults {
             child_restart: Some(RestartPolicy::new(

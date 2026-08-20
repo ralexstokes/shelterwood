@@ -1,13 +1,15 @@
 use std::{fmt, marker::PhantomData, sync::Arc};
 
 use crate::{
-    ActorDef, ActorOnceDef, ActorRef,
+    ActorDef, ActorOnceDef, ActorRef, ChildId,
+    admission::ReserveError,
     driver::DynamicReservation,
     mailbox::{MailboxCell, actor_ref_from_parts},
-    plan::{ChildConstruction, SlotCell},
+    plan::{BuilderCore, ChildConstruction, SlotCell},
+    policy::ScopeFlavor,
     raw::{RawDef, RawOnceDef},
     runtime,
-    scope::ScopeRef,
+    scope::{DynamicScopeRef, ScopeRef},
     task::{OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
 
@@ -91,104 +93,203 @@ impl Drop for DynamicSlotEndpoint {
     }
 }
 
-pub(super) struct ActorSlotCore<E, M> {
-    pub(super) endpoint: E,
+/// Private declaration-kind dispatch shared by reservation and definition.
+///
+/// The public API stays nominal: callers never name this trait or its marker
+/// types. It exists so adding a definition mode supplies only its semantic
+/// lowering instead of copying the reserve/attach/admit choreography.
+pub(super) trait SlotKind: Sized {
+    const SCOPE_FLAVOR: Option<ScopeFlavor>;
+
+    fn attach(slot: &SlotCell) -> Self;
+}
+
+pub(super) struct ActorKind<M> {
     mailbox: Arc<MailboxCell<M>>,
 }
 
-pub(super) fn attach_actor_mailbox<M: Send + 'static>(slot: &SlotCell) -> Arc<MailboxCell<M>> {
-    let mailbox = MailboxCell::new(slot.member.id().clone(), crate::runtime::mailbox_runtime());
-    slot.member.attach_mailbox(mailbox.clone());
-    mailbox
+impl<M: Send + 'static> SlotKind for ActorKind<M> {
+    const SCOPE_FLAVOR: Option<ScopeFlavor> = None;
+
+    fn attach(slot: &SlotCell) -> Self {
+        let mailbox = MailboxCell::new(slot.member.id().clone(), crate::runtime::mailbox_runtime());
+        slot.member.attach_mailbox(mailbox.clone());
+        Self { mailbox }
+    }
 }
 
-macro_rules! impl_actor_core_definition {
-    ($method:ident, $definition:ident) => {
-        pub(super) fn $method<R>(self, definition: $definition<R>) -> E::Output<ActorRef<M>>
-        where
-            R: crate::RawActor<Msg = M>,
-        {
-            let actor = self.actor_ref();
-            let Self { endpoint, mailbox } = self;
-            endpoint.define(actor, ChildConstruction::Raw(definition.erase(mailbox)))
-        }
-    };
+pub(super) struct TaskKind;
+
+impl SlotKind for TaskKind {
+    const SCOPE_FLAVOR: Option<ScopeFlavor> = None;
+
+    fn attach(_slot: &SlotCell) -> Self {
+        Self
+    }
 }
 
-impl<E: SlotEndpoint, M: Send + 'static> ActorSlotCore<E, M> {
-    pub(super) fn new(endpoint: E, mailbox: Arc<MailboxCell<M>>) -> Self {
-        Self { endpoint, mailbox }
+pub(super) struct SubtreeKind<T: Subtree>(PhantomData<fn() -> T>);
+
+impl<T: Subtree> SlotKind for SubtreeKind<T> {
+    const SCOPE_FLAVOR: Option<ScopeFlavor> = Some(<T as sealed::Sealed>::FLAVOR);
+
+    fn attach(_slot: &SlotCell) -> Self {
+        Self(PhantomData)
+    }
+}
+
+pub(super) struct SlotCore<E, K> {
+    pub(super) endpoint: E,
+    kind: K,
+}
+
+impl<E: SlotEndpoint, K: SlotKind> SlotCore<E, K> {
+    fn new(endpoint: E) -> Self {
+        let kind = K::attach(endpoint.slot());
+        Self { endpoint, kind }
     }
 
+    pub(super) fn define<D>(self, definition: D) -> E::Output<D::Handles>
+    where
+        D: Definition<Kind = K>,
+    {
+        let (handles, construction) = definition.lower(&self);
+        self.endpoint.define(handles, construction)
+    }
+}
+
+pub(super) fn reserve_static<K: SlotKind>(
+    core: &mut BuilderCore,
+    id: impl Into<ChildId>,
+) -> Result<SlotCore<StaticSlotEndpoint, K>, ReserveError> {
+    core.reserve(id, K::SCOPE_FLAVOR)
+        .map(|slot| SlotCore::new(StaticSlotEndpoint(slot)))
+}
+
+pub(super) fn reserve_dynamic<K: SlotKind>(
+    scope: &DynamicScopeRef,
+    id: impl Into<ChildId>,
+    ownership: AdmissionOwnership,
+) -> Result<SlotCore<DynamicSlotEndpoint, K>, ReserveError> {
+    crate::driver::reserve_dynamic(&scope.0.cell, id.into(), K::SCOPE_FLAVOR)
+        .map(|reservation| SlotCore::new(DynamicSlotEndpoint::new(reservation, ownership)))
+}
+
+/// Sealed semantic lowering for each nominal public definition type.
+///
+/// `Kind` chooses the reservation shape; `Handles` pins the return type. The
+/// borrowed slot lets each implementation construct its typed handles without
+/// gaining authority to bind or admit the endpoint; [`SlotCore::define`] owns
+/// that single final transition. The eight public add methods remain concrete
+/// wrappers, so this trait cannot enlarge the accepted public surface or
+/// weaken inference.
+pub(super) trait Definition: Send + 'static + Sized {
+    type Kind: SlotKind;
+    type Handles;
+
+    fn lower<E: SlotEndpoint>(
+        self,
+        slot: &SlotCore<E, Self::Kind>,
+    ) -> (Self::Handles, ChildConstruction);
+}
+
+impl<E: SlotEndpoint, M: Send + 'static> SlotCore<E, ActorKind<M>> {
     fn actor_ref(&self) -> ActorRef<M> {
         actor_ref_from_parts(
             Arc::clone(&self.endpoint.slot().member),
-            Arc::clone(&self.mailbox),
-        )
-    }
-
-    impl_actor_core_definition!(define_raw, RawDef);
-    impl_actor_core_definition!(define_once_raw, RawOnceDef);
-}
-
-pub(super) struct TaskSlotCore<E> {
-    pub(super) endpoint: E,
-}
-
-impl<E: SlotEndpoint> TaskSlotCore<E> {
-    pub(super) fn new(endpoint: E) -> Self {
-        Self { endpoint }
-    }
-
-    fn task_ref(&self) -> TaskRef {
-        TaskRef::new(Arc::clone(&self.endpoint.slot().member))
-    }
-
-    pub(super) fn define(self, definition: TaskDef) -> E::Output<TaskRef> {
-        let task = self.task_ref();
-        self.endpoint
-            .define(task, ChildConstruction::Task(definition.erase()))
-    }
-
-    pub(super) fn define_once<T: Send + 'static>(
-        self,
-        definition: TaskOnceDef<T>,
-    ) -> E::Output<(TaskRef, OneShotTaskRef<T>)> {
-        let task = self.task_ref();
-        let (completion, receiver) = runtime::oneshot();
-        let claim = OneShotTaskRef::new(receiver, task.clone());
-        self.endpoint.define(
-            (task, claim),
-            ChildConstruction::Task(definition.erase(completion)),
+            Arc::clone(&self.kind.mailbox),
         )
     }
 }
 
-pub(super) struct SubtreeSlotCore<E, T: Subtree> {
-    pub(super) endpoint: E,
-    marker: PhantomData<fn() -> T>,
-}
+macro_rules! impl_raw_definition {
+    ($definition:ident) => {
+        impl<R: crate::RawActor> Definition for $definition<R> {
+            type Kind = ActorKind<R::Msg>;
+            type Handles = ActorRef<R::Msg>;
 
-macro_rules! impl_subtree_core_definition {
-    ($method:ident, $definition:ident) => {
-        pub(super) fn $method(self, definition: $definition<T>) -> E::Output<T::Ref> {
-            let scope = self.scope_ref();
-            self.endpoint.define(
-                scope,
-                ChildConstruction::Scope(Box::new(definition.erase())),
-            )
+            fn lower<E: SlotEndpoint>(
+                self,
+                slot: &SlotCore<E, Self::Kind>,
+            ) -> (Self::Handles, ChildConstruction) {
+                let actor = slot.actor_ref();
+                (
+                    actor,
+                    ChildConstruction::Raw($definition::erase(
+                        runtime::Isolated::new(self),
+                        Arc::clone(&slot.kind.mailbox),
+                    )),
+                )
+            }
         }
     };
 }
 
-impl<E: SlotEndpoint, T: Subtree> SubtreeSlotCore<E, T> {
-    pub(super) fn new(endpoint: E) -> Self {
-        Self {
-            endpoint,
-            marker: PhantomData,
-        }
-    }
+impl_raw_definition!(RawDef);
+impl_raw_definition!(RawOnceDef);
 
+impl<A: crate::Actor> Definition for ActorDef<A> {
+    type Kind = ActorKind<A::Msg>;
+    type Handles = ActorRef<A::Msg>;
+
+    fn lower<E: SlotEndpoint>(
+        self,
+        slot: &SlotCore<E, Self::Kind>,
+    ) -> (Self::Handles, ChildConstruction) {
+        self.into_raw().lower(slot)
+    }
+}
+
+impl<A: crate::Actor> Definition for ActorOnceDef<A> {
+    type Kind = ActorKind<A::Msg>;
+    type Handles = ActorRef<A::Msg>;
+
+    fn lower<E: SlotEndpoint>(
+        self,
+        slot: &SlotCore<E, Self::Kind>,
+    ) -> (Self::Handles, ChildConstruction) {
+        self.into_raw().lower(slot)
+    }
+}
+
+impl<E: SlotEndpoint> SlotCore<E, TaskKind> {
+    fn task_ref(&self) -> TaskRef {
+        TaskRef::new(Arc::clone(&self.endpoint.slot().member))
+    }
+}
+
+impl Definition for TaskDef {
+    type Kind = TaskKind;
+    type Handles = TaskRef;
+
+    fn lower<E: SlotEndpoint>(
+        self,
+        slot: &SlotCore<E, Self::Kind>,
+    ) -> (Self::Handles, ChildConstruction) {
+        let task = slot.task_ref();
+        (task, ChildConstruction::Task(self.erase()))
+    }
+}
+
+impl<T: Send + 'static> Definition for TaskOnceDef<T> {
+    type Kind = TaskKind;
+    type Handles = (TaskRef, OneShotTaskRef<T>);
+
+    fn lower<E: SlotEndpoint>(
+        self,
+        slot: &SlotCore<E, Self::Kind>,
+    ) -> (Self::Handles, ChildConstruction) {
+        let task = slot.task_ref();
+        let (completion, receiver) = runtime::oneshot();
+        let claim = OneShotTaskRef::new(receiver, task.clone());
+        (
+            (task, claim),
+            ChildConstruction::Task(self.erase(completion)),
+        )
+    }
+}
+
+impl<E: SlotEndpoint, T: Subtree> SlotCore<E, SubtreeKind<T>> {
     fn scope_ref(&self) -> T::Ref {
         <T as sealed::Sealed>::make_ref(ScopeRef {
             cell: Arc::clone(
@@ -200,10 +301,27 @@ impl<E: SlotEndpoint, T: Subtree> SubtreeSlotCore<E, T> {
             ),
         })
     }
-
-    impl_subtree_core_definition!(define, SubtreeDef);
-    impl_subtree_core_definition!(define_once, SubtreeOnceDef);
 }
+
+macro_rules! impl_subtree_definition {
+    ($definition:ident) => {
+        impl<T: Subtree> Definition for $definition<T> {
+            type Kind = SubtreeKind<T>;
+            type Handles = T::Ref;
+
+            fn lower<E: SlotEndpoint>(
+                self,
+                slot: &SlotCore<E, Self::Kind>,
+            ) -> (Self::Handles, ChildConstruction) {
+                let scope = slot.scope_ref();
+                (scope, ChildConstruction::Scope(Box::new(self.erase())))
+            }
+        }
+    };
+}
+
+impl_subtree_definition!(SubtreeDef);
+impl_subtree_definition!(SubtreeOnceDef);
 
 macro_rules! impl_slot_debug {
     ($slot:ident $(<$generic:ident $(: $bound:path)?>)?, $label:literal) => {
@@ -219,7 +337,7 @@ macro_rules! impl_slot_debug {
 }
 /// An owned pre-spawn actor slot with a stable mailbox binding.
 pub struct ActorSlot<M> {
-    pub(super) core: ActorSlotCore<StaticSlotEndpoint, M>,
+    pub(super) core: SlotCore<StaticSlotEndpoint, ActorKind<M>>,
 }
 
 impl_slot_debug!(ActorSlot<M>, "ActorSlot");
@@ -237,7 +355,7 @@ impl<M: Send + 'static> ActorSlot<M> {
     where
         A: crate::Actor<Msg = M>,
     {
-        self.define_raw(definition.into_raw())
+        self.core.define(definition)
     }
 
     /// Defines a consuming one-shot callback-oriented actor and consumes the slot.
@@ -246,7 +364,7 @@ impl<M: Send + 'static> ActorSlot<M> {
     where
         A: crate::Actor<Msg = M>,
     {
-        self.define_once_raw(definition.into_raw())
+        self.core.define(definition)
     }
 
     /// Defines a restartable raw actor and consumes the slot.
@@ -255,7 +373,7 @@ impl<M: Send + 'static> ActorSlot<M> {
     where
         R: crate::RawActor<Msg = M>,
     {
-        self.core.define_raw(definition)
+        self.core.define(definition)
     }
 
     /// Defines a consuming one-shot raw actor and consumes the slot.
@@ -264,13 +382,13 @@ impl<M: Send + 'static> ActorSlot<M> {
     where
         R: crate::RawActor<Msg = M>,
     {
-        self.core.define_once_raw(definition)
+        self.core.define(definition)
     }
 }
 
 /// An owned pre-spawn task slot.
 pub struct TaskSlot {
-    pub(super) core: TaskSlotCore<StaticSlotEndpoint>,
+    pub(super) core: SlotCore<StaticSlotEndpoint, TaskKind>,
 }
 
 impl_slot_debug!(TaskSlot, "TaskSlot");
@@ -294,12 +412,12 @@ impl TaskSlot {
         self,
         definition: TaskOnceDef<T>,
     ) -> (TaskRef, OneShotTaskRef<T>) {
-        self.core.define_once(definition)
+        self.core.define(definition)
     }
 }
 /// A split dynamic actor reservation with a stable mailbox binding.
 pub struct DynamicActorSlot<M> {
-    pub(super) core: ActorSlotCore<DynamicSlotEndpoint, M>,
+    pub(super) core: SlotCore<DynamicSlotEndpoint, ActorKind<M>>,
 }
 
 impl_slot_debug!(DynamicActorSlot<M>, "DynamicActorSlot");
@@ -316,7 +434,7 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     where
         A: crate::Actor<Msg = M>,
     {
-        self.define_raw(definition.into_raw())
+        self.core.define(definition)
     }
 
     /// Defines a one-shot callback-oriented actor; dropping after first poll detaches.
@@ -324,7 +442,7 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     where
         A: crate::Actor<Msg = M>,
     {
-        self.define_once_raw(definition.into_raw())
+        self.core.define(definition)
     }
 
     /// Defines a restartable raw actor; dropping after first poll detaches.
@@ -332,7 +450,7 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     where
         R: crate::RawActor<Msg = M>,
     {
-        self.core.define_raw(definition)
+        self.core.define(definition)
     }
 
     /// Defines a one-shot raw actor; dropping after first poll detaches.
@@ -340,13 +458,13 @@ impl<M: Send + 'static> DynamicActorSlot<M> {
     where
         R: crate::RawActor<Msg = M>,
     {
-        self.core.define_once_raw(definition)
+        self.core.define(definition)
     }
 }
 
 /// A split dynamic task reservation.
 pub struct DynamicTaskSlot {
-    pub(super) core: TaskSlotCore<DynamicSlotEndpoint>,
+    pub(super) core: SlotCore<DynamicSlotEndpoint, TaskKind>,
 }
 
 impl_slot_debug!(DynamicTaskSlot, "DynamicTaskSlot");
@@ -368,13 +486,13 @@ impl DynamicTaskSlot {
         self,
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
-        self.core.define_once(definition)
+        self.core.define(definition)
     }
 }
 
 /// A split dynamic subtree reservation.
 pub struct DynamicSubtreeSlot<T: Subtree> {
-    pub(super) core: SubtreeSlotCore<DynamicSlotEndpoint, T>,
+    pub(super) core: SlotCore<DynamicSlotEndpoint, SubtreeKind<T>>,
 }
 
 impl_slot_debug!(DynamicSubtreeSlot<T: Subtree>, "DynamicSubtreeSlot");
@@ -393,12 +511,12 @@ impl<T: Subtree> DynamicSubtreeSlot<T> {
 
     /// Defines a one-shot subtree; dropping after first poll detaches.
     pub fn define_once(self, definition: SubtreeOnceDef<T>) -> Admission<T::Ref> {
-        self.core.define_once(definition)
+        self.core.define(definition)
     }
 }
 /// A typed pre-spawn subtree slot.
 pub struct SubtreeSlot<T: Subtree> {
-    pub(super) core: SubtreeSlotCore<StaticSlotEndpoint, T>,
+    pub(super) core: SlotCore<StaticSlotEndpoint, SubtreeKind<T>>,
 }
 
 impl_slot_debug!(SubtreeSlot<T: Subtree>, "SubtreeSlot");
@@ -419,6 +537,6 @@ impl<T: Subtree> SubtreeSlot<T> {
     /// Defines a one-shot subtree and consumes the slot.
     #[must_use]
     pub fn define_once(self, definition: SubtreeOnceDef<T>) -> T::Ref {
-        self.core.define_once(definition)
+        self.core.define(definition)
     }
 }

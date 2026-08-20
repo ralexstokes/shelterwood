@@ -1,5 +1,7 @@
 //! Shared private machinery for declaration definitions.
 
+use crate::policy::ChildMode;
+
 /// Repeatable or consuming definition payload state.
 ///
 /// The explicit `Spent` state lets consumers move a one-shot payload without
@@ -14,6 +16,14 @@ pub(crate) enum DefinitionSource<R, O> {
 impl<R, O> DefinitionSource<R, O> {
     pub(crate) fn is_one_shot(&self) -> bool {
         matches!(self, Self::OneShot(_) | Self::Spent)
+    }
+
+    pub(crate) fn mode(&self) -> ChildMode {
+        if self.is_one_shot() {
+            ChildMode::OneShot
+        } else {
+            ChildMode::Restartable
+        }
     }
 
     pub(crate) fn restartable(&self) -> Option<&R> {
@@ -139,6 +149,8 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    use crate::policy::ChildMode;
+
     use super::DefinitionSource;
 
     #[test]
@@ -146,6 +158,7 @@ mod tests {
         let mut source = DefinitionSource::<_, ()>::Restartable(String::from("factory"));
 
         assert!(!source.is_one_shot());
+        assert_eq!(source.mode(), ChildMode::Restartable);
         assert_eq!(source.restartable().map(String::as_str), Some("factory"));
         assert_eq!(source.take_one_shot(), None);
         assert_eq!(source.restartable().map(String::as_str), Some("factory"));
@@ -156,10 +169,12 @@ mod tests {
         let mut source = DefinitionSource::<(), _>::OneShot(String::from("body"));
 
         assert!(source.is_one_shot());
+        assert_eq!(source.mode(), ChildMode::OneShot);
         assert_eq!(source.take_one_shot().as_deref(), Some("body"));
         assert!(source.is_one_shot());
         assert!(source.take_one_shot().is_none());
         assert!(matches!(source, DefinitionSource::Spent));
+        assert_eq!(source.mode(), ChildMode::OneShot);
     }
 
     #[test]

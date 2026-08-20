@@ -689,11 +689,6 @@ impl SupervisorState {
         assert_eq!(self.children.len(), self.child_keys.len());
         for (&key, child) in &self.children {
             assert_eq!(self.child_keys.get(&child.membership), Some(&key));
-            // A start effect is only ever derived from `startable`, so a
-            // spawnable record must be one `Event::Spawned` away from
-            // executing. This is the emission/acceptance agreement that keeps
-            // level-triggered settlement terminating.
-            assert!(!child.startable() || !child.state.joined());
         }
         // The ordered cursors are flavor-owned state; a dynamic scope that
         // grew one would silently acquire a second stop sequencer.

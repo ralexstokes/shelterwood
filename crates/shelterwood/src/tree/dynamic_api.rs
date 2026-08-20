@@ -1,9 +1,8 @@
-use std::sync::Arc;
-
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId,
     admission::ReserveError,
     raw::{RawDef, RawOnceDef},
+    runtime,
     scope::{DynamicScopeRef, ScopeRef},
     task::{OneShotTaskRef, TaskDef, TaskOnceDef, TaskRef},
 };
@@ -12,88 +11,20 @@ use super::{
     Admission, DynamicActorSlot, DynamicSubtreeSlot, DynamicTaskSlot, Removal, Subtree, SubtreeDef,
     SubtreeOnceDef,
     builders::dispose_rejected,
-    slots::{
-        ActorSlotCore, AdmissionOwnership, DynamicSlotEndpoint, SubtreeSlotCore, TaskSlotCore,
-        attach_actor_mailbox,
-    },
-    system::sealed,
+    slots::{ActorKind, AdmissionOwnership, Definition, SubtreeKind, TaskKind, reserve_dynamic},
 };
 
-impl ScopeRef {
-    /// Requests shutdown and waits for this scope's incarnation to finish its
-    /// scope epilogue.
-    ///
-    /// `timeout` bounds cooperative teardown, not this call's return: it arms
-    /// when the targeted incarnation enters its drain and, once expired,
-    /// escalates and reports stragglers while the wait continues to
-    /// completion. Membership terminality published by an ancestor's teardown
-    /// does not resolve the call while that incarnation is still running its
-    /// epilogue.
-    ///
-    /// A scheduled scope driver joins its children before completing. If an
-    /// ancestor hard-aborts a framework driver at the tidy-abort backstop, its
-    /// synchronous drop epilogue can only *request* abort for active children,
-    /// so cancellation and user-future destruction below that boundary may
-    /// finish after this call returns.
-    /// A zero budget still requests cooperative cancellation, then skips its
-    /// wait and enters the ordinary escalation tail immediately.
-    pub async fn shutdown_and_wait(
-        &self,
-        timeout: impl Into<crate::DeadlineBudget>,
-    ) -> Result<(), crate::ShutdownTimeout> {
-        crate::driver::shutdown_scope(Arc::clone(&self.cell), timeout.into()).await
-    }
-}
-
 impl DynamicScopeRef {
-    fn define_or_reject<D, S, H>(
+    fn add_definition<D: Definition>(
+        &self,
+        id: impl Into<ChildId>,
         definition: D,
-        slot: Result<S, ReserveError>,
-        define: impl FnOnce(S, D) -> Admission<H>,
-    ) -> Admission<H>
-    where
-        D: Send + 'static,
-    {
-        match slot {
-            Ok(slot) => define(slot, definition),
+    ) -> Admission<D::Handles> {
+        let mut definition = runtime::Isolated::new(definition);
+        match reserve_dynamic::<D::Kind>(self, id, AdmissionOwnership::Fused) {
+            Ok(slot) => slot.define(definition.take().expect("isolated definition is available")),
             Err(error) => Admission::error(dispose_rejected(definition, error)),
         }
-    }
-
-    fn reserve_actor_with<M: Send + 'static>(
-        &self,
-        id: impl Into<ChildId>,
-        ownership: AdmissionOwnership,
-    ) -> Result<DynamicActorSlot<M>, ReserveError> {
-        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
-            let mailbox = attach_actor_mailbox(&reservation.slot);
-            DynamicActorSlot {
-                core: ActorSlotCore::new(DynamicSlotEndpoint::new(reservation, ownership), mailbox),
-            }
-        })
-    }
-
-    fn reserve_task_with(
-        &self,
-        id: impl Into<ChildId>,
-        ownership: AdmissionOwnership,
-    ) -> Result<DynamicTaskSlot, ReserveError> {
-        crate::driver::reserve_dynamic(&self.0.cell, id.into(), None).map(|reservation| {
-            DynamicTaskSlot {
-                core: TaskSlotCore::new(DynamicSlotEndpoint::new(reservation, ownership)),
-            }
-        })
-    }
-
-    fn reserve_subtree_with<T: Subtree>(
-        &self,
-        id: impl Into<ChildId>,
-        ownership: AdmissionOwnership,
-    ) -> Result<DynamicSubtreeSlot<T>, ReserveError> {
-        crate::driver::reserve_dynamic(&self.0.cell, id.into(), Some(<T as sealed::Sealed>::FLAVOR))
-            .map(|reservation| DynamicSubtreeSlot {
-                core: SubtreeSlotCore::new(DynamicSlotEndpoint::new(reservation, ownership)),
-            })
     }
 
     /// Reserves an actor id synchronously and exposes its exact handle.
@@ -103,7 +34,8 @@ impl DynamicScopeRef {
         &self,
         id: impl Into<ChildId>,
     ) -> Result<DynamicActorSlot<M>, ReserveError> {
-        self.reserve_actor_with(id, AdmissionOwnership::Split)
+        reserve_dynamic::<ActorKind<M>>(self, id, AdmissionOwnership::Split)
+            .map(|core| DynamicActorSlot { core })
     }
 
     /// Adds a restartable callback-oriented actor, resolving at admission.
@@ -112,11 +44,7 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: ActorDef<A>,
     ) -> Admission<ActorRef<A::Msg>> {
-        Self::define_or_reject(
-            definition,
-            self.reserve_actor_with(id, AdmissionOwnership::Fused),
-            |slot, definition| slot.core.define_raw(definition.into_raw()),
-        )
+        self.add_definition(id, definition)
     }
 
     /// Adds a consuming one-shot callback-oriented actor, resolving at admission.
@@ -125,11 +53,7 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: ActorOnceDef<A>,
     ) -> Admission<ActorRef<A::Msg>> {
-        Self::define_or_reject(
-            definition,
-            self.reserve_actor_with(id, AdmissionOwnership::Fused),
-            |slot, definition| slot.core.define_once_raw(definition.into_raw()),
-        )
+        self.add_definition(id, definition)
     }
 
     /// Adds a restartable raw actor, resolving at admission.
@@ -138,11 +62,7 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: RawDef<R>,
     ) -> Admission<ActorRef<R::Msg>> {
-        Self::define_or_reject(
-            definition,
-            self.reserve_actor_with(id, AdmissionOwnership::Fused),
-            |slot, definition| slot.core.define_raw(definition),
-        )
+        self.add_definition(id, definition)
     }
 
     /// Adds a consuming one-shot raw actor, resolving at admission.
@@ -151,27 +71,20 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: RawOnceDef<R>,
     ) -> Admission<ActorRef<R::Msg>> {
-        Self::define_or_reject(
-            definition,
-            self.reserve_actor_with(id, AdmissionOwnership::Fused),
-            |slot, definition| slot.core.define_once_raw(definition),
-        )
+        self.add_definition(id, definition)
     }
 
     /// Reserves a task id synchronously and exposes its exact handle.
     ///
     /// Returns [`ReserveError::NoRuntime`] outside an ambient Tokio runtime.
     pub fn reserve_task(&self, id: impl Into<ChildId>) -> Result<DynamicTaskSlot, ReserveError> {
-        self.reserve_task_with(id, AdmissionOwnership::Split)
+        reserve_dynamic::<TaskKind>(self, id, AdmissionOwnership::Split)
+            .map(|core| DynamicTaskSlot { core })
     }
 
     /// Adds a restartable task, resolving at admission rather than startup.
     pub fn add_task(&self, id: impl Into<ChildId>, definition: TaskDef) -> Admission<TaskRef> {
-        Self::define_or_reject(
-            definition,
-            self.reserve_task_with(id, AdmissionOwnership::Fused),
-            |slot, definition| slot.core.define(definition),
-        )
+        self.add_definition(id, definition)
     }
 
     /// Adds a consuming one-shot task, resolving at admission.
@@ -180,11 +93,7 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: TaskOnceDef<T>,
     ) -> Admission<(TaskRef, OneShotTaskRef<T>)> {
-        Self::define_or_reject(
-            definition,
-            self.reserve_task_with(id, AdmissionOwnership::Fused),
-            |slot, definition| slot.core.define_once(definition),
-        )
+        self.add_definition(id, definition)
     }
 
     /// Reserves a typed subtree id synchronously.
@@ -194,7 +103,8 @@ impl DynamicScopeRef {
         &self,
         id: impl Into<ChildId>,
     ) -> Result<DynamicSubtreeSlot<T>, ReserveError> {
-        self.reserve_subtree_with(id, AdmissionOwnership::Split)
+        reserve_dynamic::<SubtreeKind<T>>(self, id, AdmissionOwnership::Split)
+            .map(|core| DynamicSubtreeSlot { core })
     }
 
     /// Adds a restartable subtree, resolving at admission.
@@ -203,11 +113,7 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: SubtreeDef<T>,
     ) -> Admission<T::Ref> {
-        Self::define_or_reject(
-            definition,
-            self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused),
-            |slot, definition| slot.core.define(definition),
-        )
+        self.add_definition(id, definition)
     }
 
     /// Adds a consuming one-shot subtree, resolving at admission.
@@ -216,11 +122,7 @@ impl DynamicScopeRef {
         id: impl Into<ChildId>,
         definition: SubtreeOnceDef<T>,
     ) -> Admission<T::Ref> {
-        Self::define_or_reject(
-            definition,
-            self.reserve_subtree_with::<T>(id, AdmissionOwnership::Fused),
-            |slot, definition| slot.core.define_once(definition),
-        )
+        self.add_definition(id, definition)
     }
 
     /// Latches id-based removal synchronously; the returned future only

@@ -3,19 +3,10 @@ use super::*;
 fn collect_stragglers(scope: &ScopeCell, prefix: &[ChildId], out: &mut Vec<ShutdownStraggler>) {
     let children = scope.resident_projections();
     for child in children {
-        // Read the release/acquire marker before the terminal projection. If
-        // terminal publication has already cleared it, that acquire orders
-        // the following record read after publication; if cleanup is still
-        // pending, the marker itself excludes the child. Reading the record
-        // first could pair a stale nonterminal projection with the later
-        // cleared marker and recreate a narrow trailing gap.
-        //
-        // Argued, not pinned: the window is too narrow to provoke
-        // deterministically, and reverting to record-first leaves the suite
-        // green.
-        if child.member.terminal_disposal_pending()
-            || matches!(child.member.record().stage, MemberStage::Terminal(_))
-        {
+        // The cell owns the load ordering: the release/acquire marker is read
+        // before the terminal projection, so a caller cannot pair a stale
+        // nonterminal record with a later cleared marker.
+        if child.member.terminal_or_disposal_pending() {
             continue;
         }
         let mut path = prefix.to_vec();

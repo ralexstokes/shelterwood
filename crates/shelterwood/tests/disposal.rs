@@ -3,6 +3,7 @@ mod common;
 use std::{
     future::{Future, poll_fn},
     marker::PhantomData,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -17,10 +18,10 @@ use crate::common::{
     next_event, policy::never, poll_once,
 };
 use shelterwood::{
-    Backoff, CallErrorKind, Cancellation, ChildState, DynamicTree, ExitError, ExitKind, ExitResult,
-    Jitter, LifecycleEventKind, Mailbox, RawActor, RawContext, RawDef, RawOnceDef, Readiness,
-    ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition, RestartPolicy,
-    ScopeState, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
+    Backoff, CallErrorKind, Cancellation, ChildId, ChildState, DynamicTree, ExitError, ExitKind,
+    ExitResult, Jitter, LifecycleEventKind, Mailbox, RawActor, RawContext, RawDef, RawOnceDef,
+    Readiness, ReadinessDeadline, RemoveOutcome, Reply, ReserveError, RestartCondition,
+    RestartPolicy, ScopeState, SubtreeOnceDef, TaskDef, TaskOnceDef, Tree,
 };
 
 struct DropProbe {
@@ -1177,6 +1178,108 @@ impl RawActor for HostileCapture {
     async fn run(&mut self, _context: &mut RawContext<Self::Msg>) -> ExitResult {
         Ok(())
     }
+}
+
+struct PanickingDefinitionId;
+
+impl From<PanickingDefinitionId> for ChildId {
+    fn from(_: PanickingDefinitionId) -> Self {
+        panic!("injected child-id conversion panic")
+    }
+}
+
+struct HostileReadinessCapture {
+    _probe: DropProbe,
+}
+
+impl RawActor for HostileReadinessCapture {
+    type Msg = ();
+
+    fn readiness() -> Readiness {
+        panic!("injected raw-readiness panic")
+    }
+
+    async fn run(&mut self, _context: &mut RawContext<Self::Msg>) -> ExitResult {
+        unreachable!("readiness metadata prevents admission")
+    }
+}
+
+fn hostile_task_definition(
+    dropped: tokio::sync::mpsc::UnboundedSender<ThreadId>,
+    panic: &'static str,
+) -> TaskDef {
+    TaskDef::new({
+        let capture = DropProbe::panicking(dropped, panic);
+        move |_| {
+            let _ = &capture;
+            async { Ok(()) }
+        }
+    })
+}
+
+#[tokio::test]
+async fn add_id_conversion_panics_keep_static_and_dynamic_definitions_isolated() {
+    let (static_dropped, mut static_drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let static_result = catch_unwind(AssertUnwindSafe(|| {
+        let _ = tree.add_task(
+            PanickingDefinitionId,
+            hostile_task_definition(static_dropped, "static id-hook definition destructor"),
+        );
+    }));
+    assert!(
+        static_result.is_err(),
+        "the id conversion panic still surfaces"
+    );
+    assert_disposed_off_current(
+        &mut static_drops,
+        "the static definition survives the id-hook unwind and is disposed off-thread",
+    )
+    .await;
+
+    let system = DynamicTree::new().spawn().expect("runtime is available");
+    system.wait_started().await.expect("dynamic root starts");
+    let scope = system.scope();
+    let (dynamic_dropped, mut dynamic_drops) = tokio::sync::mpsc::unbounded_channel();
+    let dynamic_result = catch_unwind(AssertUnwindSafe(|| {
+        drop(scope.add_task(
+            PanickingDefinitionId,
+            hostile_task_definition(dynamic_dropped, "dynamic id-hook definition destructor"),
+        ));
+    }));
+    assert!(
+        dynamic_result.is_err(),
+        "the dynamic id conversion panic still surfaces"
+    );
+    assert_disposed_off_current(
+        &mut dynamic_drops,
+        "the dynamic definition survives the id-hook unwind and is disposed off-thread",
+    )
+    .await;
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("dynamic root shuts down");
+}
+
+#[tokio::test]
+async fn raw_readiness_panic_keeps_the_definition_destructor_isolated() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let mut tree = Tree::new();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let _ = tree.add_raw_once(
+            "readiness-panic",
+            RawOnceDef::new(HostileReadinessCapture {
+                _probe: DropProbe::panicking(dropped, "readiness-hook definition destructor"),
+            }),
+        );
+    }));
+    assert!(result.is_err(), "the readiness panic still surfaces");
+    assert_disposed_off_current(
+        &mut drops,
+        "the raw definition survives the readiness-hook unwind and is disposed off-thread",
+    )
+    .await;
 }
 
 #[tokio::test]

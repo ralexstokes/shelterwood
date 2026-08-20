@@ -89,6 +89,21 @@ impl PanicSlot {
             .expect("offload panic mutex poisoned")
             .take()
     }
+
+    /// Restores a payload already established to precede anything that can
+    /// have reached this slot in the meantime.
+    ///
+    /// Raw-resource freeze temporarily folds slot-retained disposal failures
+    /// into its cleanup-wide accumulator. An offload task may publish another
+    /// failure before that transaction installs its winner, so ordinary
+    /// first-wins [`Self::record`] would invert the observed cleanup order.
+    pub(super) fn restore_first(&self, payload: PanicPayload) {
+        let displaced = {
+            let mut pending = self.payload.lock().expect("offload panic mutex poisoned");
+            pending.replace(payload)
+        };
+        discard_panic(displaced);
+    }
 }
 
 /// The one cleanup route for values owned by a raw incarnation.

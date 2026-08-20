@@ -111,6 +111,7 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             this.operation
                 .poll_deadlined(context, budget, DeadlinePhase::InitialAttempt)
         {
+            this.timer = None;
             return Poll::Ready(result);
         }
         if this.phase == DeadlinePhase::InitialAttempt {
@@ -135,6 +136,14 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
     }
 }
 
+impl<F> Drop for Deadlined<F> {
+    fn drop(&mut self) {
+        let timer = self.timer.take();
+        let mut panics = crate::panic::PanicAccumulator::default();
+        panics.run(|| drop(timer));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -147,6 +156,23 @@ mod tests {
     #[derive(Default)]
     struct PendingOnFirstExpiry {
         elapsed_polls: usize,
+    }
+
+    struct ReadyImmediately;
+
+    impl super::DeadlineOperation for ReadyImmediately {
+        type Output = ();
+
+        fn poll_deadlined(
+            &mut self,
+            _context: &mut Context<'_>,
+            _budget: crate::deadline::Deadline,
+            _phase: super::DeadlinePhase,
+        ) -> Poll<()> {
+            Poll::Ready(())
+        }
+
+        fn short_circuit(&mut self) {}
     }
 
     impl super::DeadlineOperation for PendingOnFirstExpiry {
@@ -192,6 +218,25 @@ mod tests {
         assert!(future.as_mut().poll(&mut context).is_pending());
 
         assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(2)));
+    }
+
+    #[crate::runtime::test]
+    async fn a_completed_operation_retires_its_timer_immediately() {
+        let mut future = Box::pin(super::Deadlined::no_attempt(
+            ReadyImmediately,
+            std::time::Duration::from_secs(30),
+            crate::capability::tests::runtime(),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            future.as_mut().poll(&mut context),
+            Poll::Ready(())
+        ));
+        assert!(
+            future.timer.is_none(),
+            "a completed but retained deadline future leaves no armed timer"
+        );
     }
 
     #[test]

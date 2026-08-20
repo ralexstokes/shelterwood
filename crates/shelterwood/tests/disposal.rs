@@ -16,7 +16,7 @@ use std::{
 
 use crate::common::{
     DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually,
-    next_event, policy::never, poll_once,
+    assert_quiet, next_event, policy::never, poll_once,
 };
 use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildId, ChildState, DynamicTree, ExitError, ExitKind,
@@ -158,6 +158,20 @@ struct PanickingPanicPayload;
 impl Drop for PanickingPanicPayload {
     fn drop(&mut self) {
         panic!("panic payload destructor");
+    }
+}
+
+/// A panic payload whose own destructor panics with a fresh copy of itself.
+///
+/// The counter records how many copies the framework destroys, which is the
+/// property under test: the terminal discard must stop the chain rather than
+/// let each replacement queue the next one.
+struct SelfRegeneratingPanicPayload(Arc<AtomicUsize>);
+
+impl Drop for SelfRegeneratingPanicPayload {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        std::panic::panic_any(SelfRegeneratingPanicPayload(Arc::clone(&self.0)));
     }
 }
 
@@ -507,7 +521,7 @@ fn blocking_panic_payload_does_not_stall_current_thread_exit_publication() {
         let destructor_thread = started_rx
             .recv_timeout(POLL_TIMEOUT)
             .expect("panic payload destruction starts");
-        let released_after_publication = release_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let released_after_publication = release_rx.recv_timeout(POLL_TIMEOUT).is_ok();
         release_gate.release();
         (destructor_thread, released_after_publication)
     });
@@ -546,6 +560,47 @@ fn blocking_panic_payload_does_not_stall_current_thread_exit_publication() {
     );
     assert_ne!(destructor_thread, driver_thread);
     assert!(matches!(exit.kind(), ExitKind::Panicked { message: None }));
+}
+
+/// Detaching the payload must not cost the chain's terminal step.
+///
+/// The disposal lane classifies a destructor panic by calling back into
+/// `contain_panic_payload`, so a payload submitted bare would queue its own
+/// replacement forever. `shelterwood_core::panic`'s
+/// `discarding_a_recursively_hostile_panic_payload_is_contained` pins the
+/// terminal discard in isolation; this pins it on the path a user reaches,
+/// where the payload leaves an actor through `panic_any`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_self_regenerating_panic_payload_is_destroyed_a_bounded_number_of_times() {
+    let destructions = Arc::new(AtomicUsize::new(0));
+    let payload = SelfRegeneratingPanicPayload(Arc::clone(&destructions));
+    let mut tree = Tree::new();
+    let (task, _completion) = tree
+        .add_task_once(
+            "regenerating",
+            TaskOnceDef::new(move |_| async move {
+                std::panic::panic_any(payload);
+                #[allow(unreachable_code)]
+                Ok::<(), ExitError>(())
+            }),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    assert!(matches!(
+        task.wait().await.kind(),
+        ExitKind::Panicked { message: None }
+    ));
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+
+    // Exactly one copy is destroyed: the replacement its destructor raises is
+    // the already-panicking diagnostic the terminal discard leaks on purpose.
+    // Without that step the count climbs by six figures per second, so the
+    // quiet window fails on its first sample instead of spinning.
+    assert_eventually!(|| destructions.load(Ordering::SeqCst) >= 1).await;
+    assert_quiet(Duration::from_millis(200), || {
+        destructions.load(Ordering::SeqCst) > 1
+    })
+    .await;
 }
 
 #[test]

@@ -117,21 +117,24 @@ impl<'a> ObservationTxn<'a> {
     }
 
     fn commit(&mut self) {
+        let mut panics = runtime::PanicAccumulator::default();
         // Installation precedes the unlock, and the order is load-bearing:
         // released first, two transactions on one gate could interleave as
         // "T1 unlocks, T2 stages and installs a newer cut, T1 installs its
         // stale one", leaving every ungated borrow behind the tree until some
         // later publication corrected it. SPEC §14 promises this ordering.
-        // This install segment must remain panic-free apart from unreachable
-        // invariant assertions. A panic raised here runs from `Drop`, escapes
-        // before the post-unlock accumulator, and would strand later snapshot
-        // installations plus every queued effect; the current path invokes no
-        // user code and defers generation exhaustion into `effects`.
-        for publication in self.snapshots.drain(..) {
-            publication.install(&mut self.effects);
+        // Installations invoke no user code, but keep even their unreachable
+        // invariant assertions inside the accumulator. A broken installation
+        // must not strand the remaining committed cuts or their queued effects,
+        // and its panic resumes only after the guard is gone.
+        for mut publication in self.snapshots.drain(..) {
+            panics.run(|| publication.install(&mut self.effects));
+            // The projection captures its publishing scope. Transfer the
+            // whole attempted publication to the post-unlock list whether
+            // installation succeeded or panicked.
+            self.effects.push(Box::new(move || drop(publication)));
         }
         drop(self.guard.take());
-        let mut panics = runtime::PanicAccumulator::default();
         for effect in self.effects.drain(..) {
             // One hostile waker must not prevent the remaining committed
             // observation edges from notifying their waiters.

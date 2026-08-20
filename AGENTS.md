@@ -60,10 +60,10 @@ rests on:
   traffic and only the last clone submits disposal. Scope state and startup
   results need that protection too: a structured startup failure recursively
   owns the triggering child's `Exit`.
-  `ScopeCell::clear_residents_locked` and `prune_child_locked` still defer
-  displaced `Arc<MemberCell>`s: the last member owner can also be the last
-  owner of a mailbox containing unread user messages, which `RetainedExit`
-  does not cover.
+  `ScopeCell::clear_residents_locked` and `prune_child_locked` route displaced
+  `Arc<MemberCell>`s through `runtime::dispose_detached` after unlock: the last
+  member owner can also be the last owner of a mailbox containing unread user
+  messages, which `RetainedExit` does not cover.
 - **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination`,
   `MailboxRuntime`, `MailboxEffectSink`, `ActorIdentity` and `DynamicRoute` are
   implementation seams

@@ -41,4 +41,12 @@ thiserror = "2.0.19"
 # Blocking-pool rejection ownership is verified against this exact Tokio
 # release. Any upgrade must re-audit and re-run the adapter regressions.
 tokio = { version = "=1.53.1", features = ["macros", "rt", "sync", "time"] }
-tracing = "0.1.44"
+# `tracing` is deliberately absent, and its absence is the pin: no workspace
+# crate may name it, so an emission written anywhere today fails to compile
+# rather than landing outside the instrumentation seam SPEC §15.7 requires.
+# The relaxation is planned, not forbidden: when instrumentation lands, this
+# entry returns and the pin narrows to "only the `shelterwood` façade crate
+# may depend on `tracing`" — the same shape as the tokio pin, where only
+# `shelterwood-runtime` names the adapter's runtime. Lower crates surface
+# facts as data through the existing effects and event machinery; the top
+# crate is the only emitter.

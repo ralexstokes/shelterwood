@@ -8,9 +8,9 @@ use std::{
     task::{Context as TaskPollContext, Poll},
 };
 
-use crate::runtime::{ActorWork, Latch, PanicPayload, catch_panic};
+use crate::runtime::{ActorWork, Latch, PanicAccumulator, PanicPayload, catch_panic};
 
-use super::disposal::RawDisposal;
+use super::disposal::{PanicSlot, RawDisposal};
 
 type OffloadFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type SharedWork = Arc<SharedOffloadState>;
@@ -263,10 +263,19 @@ pub(super) struct OffloadResource {
 }
 
 impl OffloadResource {
-    pub(super) fn cancel(&mut self) {
-        self.cancellation.fire();
+    pub(super) fn cancel(&mut self, retained: &PanicSlot) -> Option<PanicPayload> {
+        let mut panics = PanicAccumulator::default();
+        panics.run(|| {
+            self.cancellation.fire();
+        });
+        panics.record(retained.take());
         if let Some(state) = &self.state {
-            state.cancel();
+            // `state.cancel` disposes the future before firing `finished`.
+            // Pull that contained destructor failure into the accumulator
+            // before recording a later wake panic escaping the call.
+            let state_panic = catch_panic(|| state.cancel()).err();
+            panics.record(retained.take());
+            panics.record(state_panic);
         }
         if let Some(task) = &self.task {
             // These are complementary: `state.cancel()` synchronously
@@ -274,8 +283,13 @@ impl OffloadResource {
             // in-progress poll to dispose on return, while abort independently
             // requests cancellation of the runtime task driving that poll.
             // Neither substitutes for the other.
-            task.abort();
+            panics.run(|| task.abort());
+            panics.record(retained.take());
         }
-        self.finished.fire();
+        panics.run(|| {
+            self.finished.fire();
+        });
+        panics.record(retained.take());
+        panics.take()
     }
 }

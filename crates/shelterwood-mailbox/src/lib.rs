@@ -45,6 +45,8 @@ pub use cell::*;
 pub use errors::*;
 pub use futures::*;
 pub use reply::*;
+#[doc(hidden)]
+pub use waker_proxy::WakerProxy;
 
 mod identity {
     pub(crate) use shelterwood_core::identity::*;

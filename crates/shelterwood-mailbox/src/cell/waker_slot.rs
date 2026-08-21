@@ -59,7 +59,7 @@ impl WakerEffects {
         });
     }
 
-    pub(super) fn flush(&mut self, panics: &mut PanicAccumulator) {
+    pub(crate) fn flush(&mut self, panics: &mut PanicAccumulator) {
         for effect in self.0.drain(..) {
             match effect {
                 WakerEffect::Wake(waker) => panics.run(|| waker.wake()),

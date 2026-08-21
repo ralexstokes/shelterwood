@@ -137,7 +137,7 @@ fn blocking_timer_waker_retirement_does_not_stall_unrelated_timer_traffic() {
         .spawn(move || {
             let _runtime = cancel_handle.enter();
             drop(future);
-            let _ = cancelled_tx.send(());
+            let _ = cancelled_tx.send(thread::current().id());
         })
         .expect("cancellation thread starts");
 
@@ -159,22 +159,43 @@ fn blocking_timer_waker_retirement_does_not_stall_unrelated_timer_traffic() {
                     .is_pending()
             );
             drop(timer);
-            let _ = probe_tx.send(());
+            let _ = probe_tx.send(thread::current().id());
         })
         .expect("unrelated timer thread starts");
 
-    let probe_completed = probe_rx.recv_timeout(POLL_TIMEOUT).is_ok();
-    let cancel_completed = cancelled_rx.recv_timeout(POLL_TIMEOUT).is_ok();
+    let probe_thread = probe_rx.recv_timeout(POLL_TIMEOUT).ok();
+    let cancel_thread = cancelled_rx.recv_timeout(POLL_TIMEOUT).ok();
     gate.release();
     cancel.join().expect("cancellation thread does not panic");
     probe.join().expect("unrelated timer thread does not panic");
 
-    assert!(
-        probe_completed,
-        "a blocking caller-waker destructor on {destructor_thread:?} held Tokio's time-driver mutex"
+    // Unwrapped rather than compared as options, so the identity assertions
+    // below cannot pass merely because a thread never reported in.
+    let probe_thread = probe_thread.unwrap_or_else(|| {
+        panic!(
+            "a blocking caller-waker destructor on {destructor_thread:?} held Tokio's time-driver mutex"
+        )
+    });
+    let cancel_thread =
+        cancel_thread.expect("timer cancellation waited for disposal-lane waker destruction");
+
+    // The premise, stated rather than assumed: this test only means anything
+    // while `Deadlined::drop` keeps the disposal-lane venue that #398 ruling 3
+    // grants drop glue. Were the drop path to adopt the poll path's
+    // synchronous containment, the destructor would run on the cancelling
+    // thread -- naming the threads it must avoid says so directly instead of
+    // leaving it to be inferred from two liveness waits.
+    assert_ne!(
+        destructor_thread, cancel_thread,
+        "a blocking caller-waker destructor must not run on the thread cancelling the future"
     );
-    assert!(
-        cancel_completed,
-        "timer cancellation waited for disposal-lane waker destruction"
+    assert_ne!(
+        destructor_thread, probe_thread,
+        "a blocking caller-waker destructor must not run on an unrelated timer thread"
+    );
+    assert_ne!(
+        destructor_thread,
+        thread::current().id(),
+        "a blocking caller-waker destructor must not run on the polling thread"
     );
 }

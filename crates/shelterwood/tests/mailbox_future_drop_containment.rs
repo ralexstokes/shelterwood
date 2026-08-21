@@ -136,7 +136,10 @@ async fn send_timeout_drop_contains_timer_waker_during_unwind() {
 #[tokio::test]
 async fn call_acceptance_phase_drop_contains_timer_waker_during_unwind() {
     let (_tree, actor) = actor_ref();
-    assert_pending_then_unwind(Box::pin(actor.call(Message::Hold, Duration::MAX)));
+    // A bounded budget, deliberately: `Duration::MAX` overflows to an
+    // unbounded deadline, which registers no timer waker at all and would
+    // leave this test named after a clone it never mints.
+    assert_pending_then_unwind(Box::pin(actor.call(Message::Hold, Duration::from_secs(30))));
 }
 
 #[tokio::test]
@@ -210,10 +213,17 @@ impl Drop for HostileReply {
 }
 
 /// A deadline future that completes *after* parking still holds a caller-waker
-/// clone behind its timer proxy. Retiring that clone on the ready return must
-/// use contained disposal while the completed reply is a live local; an
-/// escaping cleanup panic would destroy that value and -- with a hostile value
-/// destructor -- abort the process.
+/// clone behind its timer proxy, and the completion path retires that clone
+/// **on this thread** -- the poll-path half of #398 ruling 3's venue split.
+/// The destructor injected below therefore runs synchronously inside
+/// `Deadlined::poll`, while the delivered reply is a live local in the same
+/// frame. An escaping cleanup panic would destroy that value mid-unwind and --
+/// with the hostile value destructor this test installs -- abort the process.
+///
+/// Judged by the ordinary return: the poll must hand back `Ready` with the
+/// delivered value. Wrapping the poll in `catch_unwind` would make the test
+/// vacuous -- it would pass on a framework that contains nothing, because the
+/// harness would be doing the containing.
 #[tokio::test]
 async fn recv_ready_after_parking_contains_the_retired_timer_waker() {
     let (_tree, actor) = actor_ref();

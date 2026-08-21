@@ -272,6 +272,49 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn zero_timeout_preserves_operation_first_arbitration() {
+        assert!(matches!(
+            timeout(Duration::ZERO, std::future::ready(7_u8)).await,
+            super::Timeout::Completed(7)
+        ));
+        assert!(matches!(
+            timeout(Duration::ZERO, std::future::pending::<()>()).await,
+            super::Timeout::Elapsed
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operation_ready_at_the_exact_deadline_wins() {
+        let deadline = super::now() + Duration::from_secs(1);
+        let operation = std::future::poll_fn(|_| {
+            if super::now() >= deadline {
+                Poll::Ready(7_u8)
+            } else {
+                Poll::Pending
+            }
+        });
+        let mut timed = std::pin::pin!(super::timeout_at(deadline, operation));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(timed.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            timed.as_mut().poll(&mut context),
+            Poll::Ready(super::Timeout::Completed(7))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maximum_timeout_stays_unbounded() {
+        let mut timed = std::pin::pin!(timeout(Duration::MAX, std::future::pending::<()>()));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(timed.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(MAX_TIMER_SLICE * 2).await;
+        assert!(timed.as_mut().poll(&mut context).is_pending());
+    }
+
     #[test]
     fn already_due_clock_limit_needs_no_timer_arm() {
         let edge = latest_representable(std::time::Instant::now());

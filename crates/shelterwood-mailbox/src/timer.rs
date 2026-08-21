@@ -255,6 +255,16 @@ mod tests {
             timer.timer_waker.is_none(),
             "the no-op probe allocates no proxy on the ready path"
         );
+
+        assert!(
+            timer.as_mut().poll(&mut context).is_ready(),
+            "a completed proxied timer is fused"
+        );
+        assert_eq!(
+            state.clones.load(Ordering::SeqCst),
+            0,
+            "repolling a completed timer never reaches the caller vtable"
+        );
     }
 
     #[test]

@@ -251,6 +251,25 @@ pub fn dispatch_exit(
     scope: ScopeMode,
     membership: MembershipStatus,
 ) -> ExitDispatch {
+    // SPEC §8: `NeverStarted` is a membership fact, not an incarnation
+    // verdict — it "is never input to restart or intensity accounting".
+    // Every supported producer terminalizes the membership directly and never
+    // reaches dispatch, so arriving here is a framework bug: the assert makes
+    // it loud in debug, and the return fails closed in release rather than
+    // charging a restart for an incarnation that never ran.
+    //
+    // Failing closed is the lesser of two wrong outcomes, not a correct one:
+    // the sole dispatch caller holds a real incarnation, so a `Terminal`
+    // verdict here would publish a `NeverStarted` terminal paired with
+    // `last_incarnation: Some(..)`, which SPEC §B.3 excludes. `ExitDispatch`
+    // carries no incarnation, so the pairing is the caller's to choose and
+    // cannot be repaired from inside this function; an inconsistent terminal
+    // projection is still strictly better than an illegal restart, and the
+    // debug abort fires before any such projection can be published.
+    debug_assert!(
+        !matches!(exit.kind(), ExitKind::NeverStarted),
+        "NeverStarted is a membership outcome outside incarnation dispatch"
+    );
     if matches!(exit.kind(), ExitKind::NeverStarted) {
         return ExitDispatch::Terminal;
     }
@@ -1439,6 +1458,25 @@ mod tests {
         }
     }
 
+    /// Debug half of the two-profile guard: the misuse aborts loudly.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "NeverStarted is a membership outcome outside incarnation dispatch")]
+    fn funnel_dispatch_rejects_the_membership_level_never_started_outcome() {
+        let exit = Exit::never_started();
+        let _ = dispatch_exit(
+            &exit,
+            RestartPolicy::new(RestartCondition::Always, Backoff::Immediate),
+            ScopeMode::Running,
+            MembershipStatus::Active,
+        );
+    }
+
+    /// Release half: with the assert compiled out the same input fails closed
+    /// on `Terminal` instead of charging a restart. `RestartCondition::Always`
+    /// is the one condition whose `should_restart` returns `true`
+    /// unconditionally, so removing the guard flips this assertion.
+    #[cfg(not(debug_assertions))]
     #[test]
     fn funnel_dispatch_treats_the_membership_level_never_started_outcome_as_terminal() {
         let exit = Exit::never_started();

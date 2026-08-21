@@ -10,6 +10,7 @@ mod recorder;
 mod startup;
 mod timing;
 pub(crate) mod waiting;
+mod waker;
 
 pub(crate) use gates::{DestructorBlocker, DestructorGate, ReleaseGate};
 pub(crate) use lifecycle::{last_panic_message, next_event, next_item};
@@ -18,7 +19,9 @@ pub(crate) use recorder::{GatedRecorder, MessageRecorder};
 pub(crate) use startup::startup_failed_child;
 pub(crate) use timing::{
     POLL_TIMEOUT, advance_time, assert_eventually_predicate, assert_quiet, poll_once, poll_until,
+    poll_until_ready,
 };
+pub(crate) use waker::{HostileWakerState, hostile_waker};
 
 macro_rules! assert_eventually {
     ($predicate:expr $(,)?) => {

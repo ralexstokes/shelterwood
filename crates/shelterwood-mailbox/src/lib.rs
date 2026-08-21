@@ -48,7 +48,7 @@ pub use futures::*;
 pub use reply::*;
 #[doc(hidden)]
 pub use timer::ProxiedSleep;
-pub use waker_proxy::WakerProxy;
+pub use waker_proxy::{ProxiedPoll, WakerProxy};
 
 mod identity {
     pub(crate) use shelterwood_core::identity::*;

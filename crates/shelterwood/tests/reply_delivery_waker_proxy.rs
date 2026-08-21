@@ -2,55 +2,12 @@ mod common;
 
 use std::{
     future::Future,
-    mem::ManuallyDrop,
-    sync::Arc,
-    task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 
-use common::{POLL_TIMEOUT, ReleaseGate};
+use common::{POLL_TIMEOUT, ReleaseGate, hostile_waker};
 use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Reply, Tree};
-
-unsafe fn clone_panicking_drop_waker(data: *const ()) -> RawWaker {
-    // SAFETY: every pointer using this vtable came from an Arc of the
-    // matching type. ManuallyDrop preserves the reference represented by
-    // `data`; the returned raw waker owns only the new clone.
-    let state = ManuallyDrop::new(unsafe { Arc::<()>::from_raw(data.cast()) });
-    RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &PANICKING_DROP_WAKER_VTABLE,
-    )
-}
-
-unsafe fn wake_panicking_drop_waker(data: *const ()) {
-    // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<()>::from_raw(data.cast()) });
-}
-
-unsafe fn wake_by_ref_panicking_drop_waker(_data: *const ()) {}
-
-unsafe fn drop_panicking_drop_waker(data: *const ()) {
-    // SAFETY: drop consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<()>::from_raw(data.cast()) });
-    panic!("injected reply caller-waker drop panic");
-}
-
-static PANICKING_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_panicking_drop_waker,
-    wake_panicking_drop_waker,
-    wake_by_ref_panicking_drop_waker,
-    drop_panicking_drop_waker,
-);
-
-fn panicking_drop_waker() -> Waker {
-    let raw = RawWaker::new(
-        Arc::into_raw(Arc::new(())).cast(),
-        &PANICKING_DROP_WAKER_VTABLE,
-    );
-    // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-    // ownership across clone, wake, and drop.
-    unsafe { Waker::from_raw(raw) }
-}
 
 enum Message {
     Ask(Reply<u8>),
@@ -100,7 +57,7 @@ async fn successful_call_contains_reply_caller_waker_retirement() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
 
-    let hostile = ManuallyDrop::new(panicking_drop_waker());
+    let (hostile, _state) = hostile_waker("injected reply caller-waker drop panic");
     let mut call = Box::pin(actor.call(Message::Ask, Duration::from_secs(30)));
     assert!(matches!(
         call.as_mut().poll(&mut TaskContext::from_waker(&hostile)),
@@ -167,7 +124,7 @@ async fn successful_recv_cannot_double_panic_with_hostile_waker_and_value_drops(
         .add_actor_once("reply-waker-recv", ActorOnceDef::<ChannelSource>::new(()))
         .expect("valid actor");
     let (reply, receiver) = actor.reply_channel::<HostileReply>();
-    let hostile = ManuallyDrop::new(panicking_drop_waker());
+    let (hostile, _state) = hostile_waker("injected reply caller-waker drop panic");
     let mut receive = Box::pin(receiver.recv(Duration::from_secs(30)));
     assert!(matches!(
         receive

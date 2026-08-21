@@ -10,55 +10,12 @@ mod common;
 
 use std::{
     future::Future,
-    mem::ManuallyDrop,
-    sync::Arc,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{Context, Poll},
     time::Duration,
 };
 
-use common::{assert_eventually, waiting::task as waiting_task};
+use common::{assert_eventually, hostile_waker, waiting::task as waiting_task};
 use shelterwood::{ChildState, DynamicTree, RemoveOutcome};
-
-unsafe fn clone_panicking_drop_waker(data: *const ()) -> RawWaker {
-    // SAFETY: every pointer using this vtable came from an Arc of the
-    // matching type. ManuallyDrop preserves the reference represented by
-    // `data`; the returned raw waker owns only the new clone.
-    let state = ManuallyDrop::new(unsafe { Arc::<()>::from_raw(data.cast()) });
-    RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &PANICKING_DROP_WAKER_VTABLE,
-    )
-}
-
-unsafe fn wake_panicking_drop_waker(data: *const ()) {
-    // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<()>::from_raw(data.cast()) });
-}
-
-unsafe fn wake_by_ref_panicking_drop_waker(_data: *const ()) {}
-
-unsafe fn drop_panicking_drop_waker(data: *const ()) {
-    // SAFETY: drop consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<()>::from_raw(data.cast()) });
-    panic!("injected admission/removal caller-waker drop panic");
-}
-
-static PANICKING_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_panicking_drop_waker,
-    wake_panicking_drop_waker,
-    wake_by_ref_panicking_drop_waker,
-    drop_panicking_drop_waker,
-);
-
-fn panicking_drop_waker() -> Waker {
-    let raw = RawWaker::new(
-        Arc::into_raw(Arc::new(())).cast(),
-        &PANICKING_DROP_WAKER_VTABLE,
-    );
-    // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-    // ownership across clone, wake, and drop.
-    unsafe { Waker::from_raw(raw) }
-}
 
 /// Admission does not enqueue its driver request until first poll. A
 /// current-thread runtime therefore makes the pending registration
@@ -72,7 +29,7 @@ async fn successful_admission_never_parks_its_caller_waker_and_returns_the_exact
     let slot = scope.reserve_task("proxied-admission").expect("id is free");
     let expected = slot.task_ref();
     let mut admission = Box::pin(slot.define(waiting_task()));
-    let hostile = ManuallyDrop::new(panicking_drop_waker());
+    let (hostile, _state) = hostile_waker("injected admission/removal caller-waker drop panic");
 
     assert!(matches!(
         admission.as_mut().poll(&mut Context::from_waker(&hostile)),
@@ -115,7 +72,7 @@ async fn exact_removal_never_parks_its_caller_waker_and_preserves_its_outcomes()
         .await
         .expect("task is admitted");
     let mut removal = Box::pin(scope.remove_task(&task));
-    let hostile = ManuallyDrop::new(panicking_drop_waker());
+    let (hostile, _state) = hostile_waker("injected admission/removal caller-waker drop panic");
 
     assert!(matches!(
         removal.as_mut().poll(&mut Context::from_waker(&hostile)),

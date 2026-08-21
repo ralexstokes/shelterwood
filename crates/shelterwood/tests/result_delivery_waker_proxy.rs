@@ -2,56 +2,12 @@ mod common;
 
 use std::{
     future::Future,
-    mem::ManuallyDrop,
-    pin::Pin,
-    sync::{Arc, mpsc},
-    task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker},
-    time::Instant,
+    sync::mpsc,
+    task::{Context as TaskContext, Poll},
 };
 
-use common::POLL_TIMEOUT;
+use common::{DestructorGate, POLL_TIMEOUT, hostile_waker, poll_until_ready};
 use shelterwood::{Actor, ActorOnceDef, Blocking, Context, ExitError, ExitResult, Tree};
-
-unsafe fn clone_panicking_drop_waker(data: *const ()) -> RawWaker {
-    // SAFETY: every pointer using this vtable came from an Arc of the
-    // matching type. ManuallyDrop preserves the reference represented by
-    // `data`; the returned raw waker owns only the new clone.
-    let state = ManuallyDrop::new(unsafe { Arc::<()>::from_raw(data.cast()) });
-    RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &PANICKING_DROP_WAKER_VTABLE,
-    )
-}
-
-unsafe fn wake_panicking_drop_waker(data: *const ()) {
-    // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<()>::from_raw(data.cast()) });
-}
-
-unsafe fn wake_by_ref_panicking_drop_waker(_data: *const ()) {}
-
-unsafe fn drop_panicking_drop_waker(data: *const ()) {
-    // SAFETY: drop consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<()>::from_raw(data.cast()) });
-    panic!("injected result caller-waker drop panic");
-}
-
-static PANICKING_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_panicking_drop_waker,
-    wake_panicking_drop_waker,
-    wake_by_ref_panicking_drop_waker,
-    drop_panicking_drop_waker,
-);
-
-fn panicking_drop_waker() -> Waker {
-    let raw = RawWaker::new(
-        Arc::into_raw(Arc::new(())).cast(),
-        &PANICKING_DROP_WAKER_VTABLE,
-    );
-    // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-    // ownership across clone, wake, and drop.
-    unsafe { Waker::from_raw(raw) }
-}
 
 struct DeliveredValue {
     panic_on_drop: bool,
@@ -65,24 +21,9 @@ impl Drop for DeliveredValue {
     }
 }
 
-fn poll_until_ready<F: Future>(mut future: Pin<&mut F>, waker: &Waker) -> F::Output {
-    let deadline = Instant::now() + POLL_TIMEOUT;
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut TaskContext::from_waker(waker)) {
-            return output;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "result future becomes ready before the test deadline"
-        );
-        std::thread::yield_now();
-    }
-}
-
 enum BlockingMessage {
     Start {
-        entered: mpsc::Sender<()>,
-        release: mpsc::Receiver<()>,
+        operation: DestructorGate,
         panic_on_drop: bool,
     },
 }
@@ -105,15 +46,12 @@ impl Actor for BlockingSource {
         context: &mut Context<'_, Self>,
     ) -> ExitResult {
         let BlockingMessage::Start {
-            entered,
-            release,
+            operation,
             panic_on_drop,
         } = message;
+        let blocker = operation.blocker();
         let work = context.run_blocking(move |_| {
-            let _ = entered.send(());
-            release
-                .recv_timeout(POLL_TIMEOUT)
-                .expect("the test releases the blocking operation");
+            drop(blocker);
             DeliveredValue { panic_on_drop }
         });
         self.work
@@ -125,8 +63,7 @@ impl Actor for BlockingSource {
 
 async fn drive_run_blocking_delivery(panic_on_drop: bool) {
     let (work_tx, work_rx) = mpsc::channel();
-    let (entered_tx, entered_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
+    let operation = DestructorGate::default();
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
@@ -138,8 +75,7 @@ async fn drive_run_blocking_delivery(panic_on_drop: bool) {
     system.wait_started().await.expect("actor starts");
     actor
         .send(BlockingMessage::Start {
-            entered: entered_tx,
-            release: release_rx,
+            operation: operation.clone(),
             panic_on_drop,
         })
         .await
@@ -150,18 +86,14 @@ async fn drive_run_blocking_delivery(panic_on_drop: bool) {
             .recv_timeout(POLL_TIMEOUT)
             .expect("the actor returns the public blocking future"),
     );
-    entered_rx
-        .recv_timeout(POLL_TIMEOUT)
-        .expect("the blocking operation starts");
-    let hostile = ManuallyDrop::new(panicking_drop_waker());
+    operation.wait_entered();
+    let (hostile, _state) = hostile_waker("injected result caller-waker drop panic");
     assert!(matches!(
         work.as_mut().poll(&mut TaskContext::from_waker(&hostile)),
         Poll::Pending
     ));
 
-    release_tx
-        .send(())
-        .expect("the blocking operation retains its release lane");
+    operation.release();
     let value = poll_until_ready(work.as_mut(), &hostile);
     assert_eq!(value.panic_on_drop, panic_on_drop);
     if panic_on_drop {

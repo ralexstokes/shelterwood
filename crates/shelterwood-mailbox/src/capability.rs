@@ -4,14 +4,14 @@ use std::{
     marker::PhantomData,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
     time::Instant,
 };
 
 use crate::{
     cell::waker_slot::{WakerAction, WakerEffects},
     panic::PanicAccumulator,
-    waker_proxy::WakerProxy,
+    waker_proxy::ProxiedPoll,
 };
 
 pub type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -166,7 +166,7 @@ pub(crate) fn dispose<T: Send + 'static>(runtime: &Arc<dyn MailboxRuntime>, valu
 pub(crate) struct DisposingReceiver<T> {
     inner: Option<OneShotReceiver<T>>,
     runtime: Arc<dyn MailboxRuntime>,
-    reply_waker: Option<WakerProxy>,
+    reply_poll: ProxiedPoll,
 }
 
 impl<T: Send + 'static> DisposingReceiver<T> {
@@ -174,33 +174,9 @@ impl<T: Send + 'static> DisposingReceiver<T> {
         Self {
             inner: Some(inner),
             runtime,
-            reply_waker: None,
+            reply_poll: ProxiedPoll::new(),
         }
     }
-}
-
-fn poll_one_shot_with_proxy<T: Send + 'static, R>(
-    inner: &mut OneShotReceiver<T>,
-    reply_waker: &mut Option<WakerProxy>,
-    context: &mut Context<'_>,
-    mut poll: impl FnMut(&mut OneShotReceiver<T>, &mut Context<'_>) -> R,
-    is_pending: impl Fn(&R) -> bool,
-) -> R {
-    if reply_waker.is_none() {
-        let mut probe = Context::from_waker(Waker::noop());
-        let result = poll(inner, &mut probe);
-        if !is_pending(&result) {
-            return result;
-        }
-        *reply_waker = Some(WakerProxy::new());
-    }
-
-    let reply_waker = reply_waker
-        .as_ref()
-        .expect("a parked reply receiver retains its waker proxy");
-    reply_waker.register(context.waker());
-    let mut proxy_context = Context::from_waker(reply_waker.waker());
-    poll(inner, &mut proxy_context)
 }
 
 impl<T> DisposingReceiver<T> {
@@ -246,13 +222,10 @@ impl<T> DisposingReceiver<T> {
     ///   `call` and `recv`, and a lane submission there is real cost on every
     ///   reply, where a contained drop of a benign waker is nearly free.
     fn retire_reply_waker(&mut self, panics: &mut PanicAccumulator) {
-        let reply_waker = self.reply_waker.take();
         let mut effects = WakerEffects::default();
-        if let Some(reply_waker) = &reply_waker {
-            reply_waker.retire(WakerAction::DropInline, &mut effects);
-        }
+        self.reply_poll
+            .retire(WakerAction::DropInline, &mut effects);
         effects.flush(panics);
-        panics.run(|| drop(reply_waker));
     }
 }
 
@@ -264,11 +237,10 @@ impl<T: Send + 'static> DisposingReceiver<T> {
         // Probe with a framework waker, then leave only the proxy registered
         // across a pending return so Tokio never destroys a caller waker at
         // that seam.
-        let result = poll_one_shot_with_proxy(
+        let result = self.reply_poll.poll(
             self.inner
                 .as_mut()
                 .expect("a live disposing receiver retains its channel"),
-            &mut self.reply_waker,
             context,
             OneShotReceiver::poll_receive,
             Poll::is_pending,
@@ -286,11 +258,10 @@ impl<T: Send + 'static> DisposingReceiver<T> {
     }
 
     pub(crate) fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T> {
-        let result = poll_one_shot_with_proxy(
+        let result = self.reply_poll.poll(
             self.inner
                 .as_mut()
                 .expect("a live disposing receiver retains its channel"),
-            &mut self.reply_waker,
             context,
             OneShotReceiver::close_and_poll_receive,
             |result| matches!(result, OneShotClose::Pending),

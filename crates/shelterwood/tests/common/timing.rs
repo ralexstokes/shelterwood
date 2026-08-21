@@ -3,7 +3,7 @@ use std::{
     panic::Location,
     pin::Pin,
     task::{Context, Poll, Waker},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Shared wall-clock budget for eventually-consistent test observations.
@@ -15,6 +15,21 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 pub(crate) fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     let mut context = Context::from_waker(Waker::noop());
     future.poll(&mut context)
+}
+
+/// Spin-polls a pinned future with a supplied test waker until it is ready.
+pub(crate) fn poll_until_ready<F: Future>(mut future: Pin<&mut F>, waker: &Waker) -> F::Output {
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut Context::from_waker(waker)) {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "future becomes ready before the test deadline"
+        );
+        std::thread::yield_now();
+    }
 }
 
 /// Advances Tokio's paused clock.

@@ -1,13 +1,81 @@
 use std::{
     mem,
     sync::{Arc, Mutex},
-    task::{Wake, Waker},
+    task::{Context, Wake, Waker},
 };
 
 use crate::{
     cell::waker_slot::{WakerAction, WakerEffects, WakerSlot},
     panic::PanicAccumulator,
 };
+
+/// Reusable probe, registration, and proxy-poll state machine.
+///
+/// The first poll uses a framework no-op waker, preserving the already-ready
+/// fast path without cloning a caller waker. A pending result installs the
+/// stable proxy, registers the real caller behind it, and immediately polls
+/// again so the external primitive never retains a raw caller waker.
+///
+/// Retirement remains venue-specific. Mailbox users call [`Self::retire`]
+/// with an effects sink; `shelterwood-runtime` calls [`Self::retire_with`]
+/// through its wrapper after selecting inline or detached destruction.
+#[doc(hidden)]
+pub struct ProxiedPoll {
+    proxy: Option<WakerProxy>,
+}
+
+impl ProxiedPoll {
+    #[doc(hidden)]
+    pub fn new() -> Self {
+        Self { proxy: None }
+    }
+
+    /// Polls `target` without ever parking the caller's raw waker in it.
+    #[doc(hidden)]
+    pub fn poll<T, R>(
+        &mut self,
+        target: &mut T,
+        context: &mut Context<'_>,
+        mut poll: impl FnMut(&mut T, &mut Context<'_>) -> R,
+        is_pending: impl Fn(&R) -> bool,
+    ) -> R {
+        if self.proxy.is_none() {
+            let mut probe = Context::from_waker(Waker::noop());
+            let result = poll(target, &mut probe);
+            if !is_pending(&result) {
+                return result;
+            }
+            self.proxy = Some(WakerProxy::new());
+        }
+
+        let proxy = self
+            .proxy
+            .as_ref()
+            .expect("a pending proxied poll retains its waker proxy");
+        proxy.register(context.waker());
+        let mut proxy_context = Context::from_waker(proxy.waker());
+        poll(target, &mut proxy_context)
+    }
+
+    /// Retires the current caller registration into a mailbox effects sink.
+    pub(crate) fn retire(&mut self, action: WakerAction, effects: &mut WakerEffects) {
+        let proxy = self.proxy.take();
+        if let Some(proxy) = &proxy {
+            proxy.retire(action, effects);
+        }
+        drop(proxy);
+    }
+
+    /// Retires the current caller registration through a cross-crate effect.
+    #[doc(hidden)]
+    pub fn retire_with(&mut self, effect: fn(Waker), panics: &mut PanicAccumulator) {
+        let proxy = self.proxy.take();
+        if let Some(proxy) = &proxy {
+            proxy.retire_with(effect, panics);
+        }
+        panics.run(|| drop(proxy));
+    }
+}
 
 /// Stable framework-owned waker registered with an external primitive.
 ///

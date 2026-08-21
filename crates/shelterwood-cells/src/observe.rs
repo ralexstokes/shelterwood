@@ -580,8 +580,12 @@ impl SnapshotPublication {
     }
 
     pub(crate) fn coalesce(&mut self, newer: Self) -> SnapshotProjection {
-        debug_assert!(self.same_hub(&newer));
-        debug_assert!(!self.closed, "a closed snapshot hub cannot publish again");
+        // `ObservationTxn::stage_snapshot` selects this publication with
+        // `same_hub`, so hub identity is structural. Closure is total: once
+        // staged, it wins over every later publication in the transaction.
+        if self.closed {
+            return newer.projection;
+        }
         self.published |= newer.published;
         self.closed = newer.closed;
         std::mem::replace(&mut self.projection, newer.projection)
@@ -604,10 +608,9 @@ impl SnapshotPublication {
         let mut generation_exhausted = false;
         if snapshot.is_some() {
             self.sender.modify_silently(|state| {
-                debug_assert!(
-                    !state.closed,
-                    "the gate serializes closure against installation"
-                );
+                if state.closed {
+                    return;
+                }
                 retired = Some(std::mem::replace(
                     &mut state.snapshot,
                     snapshot
@@ -620,6 +623,12 @@ impl SnapshotPublication {
                 state.closed = self.closed;
                 modified = true;
             });
+        }
+        if let Some(uninstalled) = snapshot.take() {
+            // A prior committed close remains authoritative. The cut was
+            // already built, so retire its user-bearing snapshot after both
+            // the watch mutex and observation gate are released.
+            effects.push(Box::new(move || drop(uninstalled)));
         }
         if let Some(retired) = retired {
             effects.push(Box::new(move || drop(retired)));
@@ -818,6 +827,11 @@ pub struct LifecycleEvents {
     events: runtime::BroadcastReceiver<RetainedLifecycleEvent>,
     signal: runtime::WatchReceiver<LifecycleSignal>,
     seen_explicit_lag: u64,
+    // Total fallback for a broadcast implementation that returns an item
+    // despite reporting a length beyond its effective capacity. The explicit
+    // marker remains first and the retained event is not destroyed on an
+    // invariant-panic stack.
+    pending: Option<RetainedLifecycleEvent>,
 }
 
 impl LifecycleEvents {
@@ -848,17 +862,21 @@ impl LifecycleEvents {
             // evict the oldest unread event. Tokio guarantees the next read
             // reports lag when `len` exceeds the effective capacity; 128 is
             // already a power of two, so the effective capacity is exact.
-            if self.events.len() > LIFECYCLE_EVENT_CAPACITY {
-                let overflow = self.events.try_receive();
-                debug_assert!(
-                    matches!(&overflow, runtime::BroadcastReceive::Lagged(_)),
-                    "a lagging broadcast receiver should report its dropped prefix"
-                );
-                if let runtime::BroadcastReceive::Lagged(overflow) = overflow {
-                    dropped = dropped.saturating_add(overflow);
+            if self.pending.is_none() && self.events.len() > LIFECYCLE_EVENT_CAPACITY {
+                match self.events.try_receive() {
+                    runtime::BroadcastReceive::Lagged(overflow) => {
+                        dropped = dropped.saturating_add(overflow);
+                    }
+                    runtime::BroadcastReceive::Item(event) => {
+                        self.pending = Some(event);
+                    }
+                    runtime::BroadcastReceive::Empty | runtime::BroadcastReceive::Closed => {}
                 }
             }
             return Ok(LifecycleItem::Lagged { dropped });
+        }
+        if let Some(event) = self.pending.take() {
+            return Ok(LifecycleItem::Event(event.into_public()));
         }
         match self.events.try_receive() {
             runtime::BroadcastReceive::Item(event) => Ok(LifecycleItem::Event(event.into_public())),
@@ -874,7 +892,10 @@ impl fmt::Debug for LifecycleEvents {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LifecycleEvents")
-            .field("queued", &self.events.len())
+            .field(
+                "queued",
+                &(self.events.len() + usize::from(self.pending.is_some())),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -913,6 +934,7 @@ impl LifecycleHub {
             events: self.events.subscribe(),
             signal,
             seen_explicit_lag,
+            pending: None,
         }
     }
 

@@ -71,10 +71,12 @@ use admission_control::{
     reject_admission_after_disposal,
 };
 pub(crate) use admission_control::{
-    DynamicReservation, LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR, RemovalResponse,
-    cancel_dynamic_reservation, remove_dynamic, reserve_dynamic, signal_fused_cancel,
-    start_admission,
+    DynamicReservation, RemovalResponse, cancel_dynamic_reservation, remove_dynamic,
+    reserve_dynamic, signal_fused_cancel, start_admission,
 };
+
+#[cfg(test)]
+pub(crate) use admission_control::{LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR};
 
 #[cfg(test)]
 use crate::cells::{GateCapture, RuntimeStorage};
@@ -315,6 +317,10 @@ impl<T> ChildResources<T> {
 
     fn values(&self) -> impl Iterator<Item = &T> {
         self.0.values()
+    }
+
+    fn into_values(self) -> impl Iterator<Item = T> {
+        self.0.into_values()
     }
 
     #[cfg(test)]
@@ -574,11 +580,10 @@ impl ScopeRuntime {
     }
 
     fn stage_disposal_panic(&mut self, child: ChildKey, panic: Option<runtime::DisposalPanic>) {
-        let replaced = self.arrived_disposal_panics.insert(child, panic);
-        debug_assert!(
-            replaced.is_none(),
-            "a terminal disposes its retained construction once, under a never-reused key"
-        );
+        // A terminal normally reports construction disposal exactly once.
+        // Preserve the first completion if that producer contract regresses:
+        // this also keeps driver teardown total when it is already unwinding.
+        self.arrived_disposal_panics.entry(child).or_insert(panic);
     }
 
     fn take_arrived_disposal_panic(&mut self, child: ChildKey) -> Option<runtime::DisposalPanic> {
@@ -595,19 +600,15 @@ impl ScopeRuntime {
     fn drain_arrived_disposal_events(&mut self, panics: &mut runtime::PanicAccumulator) {
         while let Some(event) = self.disposal_event_receiver.try_recv() {
             // The lane has one producer, which sends exactly one variant.
-            // Assert rather than let a pattern-matching loop condition drop
-            // an unexpected event and silently abandon the rest of the
-            // drain; teardown runs this during an unwind, where a panic
-            // would abort.
-            debug_assert!(
-                matches!(
-                    event,
-                    DriverEvent::Child(ChildEvent::ConstructionDisposed { .. })
-                ),
-                "the disposal lane carries only construction-disposal completions"
-            );
-            if let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = event {
-                self.stage_disposal_panic(child, panic);
+            // Keep the impossible foreign-event fallback total even during a
+            // driver unwind: an admission/removal request can retain user
+            // construction and response wakers, so contain its drop through
+            // the teardown accumulator instead of diagnosing on this stack.
+            match event {
+                DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) => {
+                    self.stage_disposal_panic(child, panic);
+                }
+                unexpected => panics.run(|| drop(unexpected)),
             }
         }
         // Folding empties the staging map, so the batch entries these
@@ -665,11 +666,14 @@ impl ScopeRuntime {
         let Some(key) = supervisor_admit(&mut self.supervisor, membership, initial) else {
             return Err(Box::new(child));
         };
-        let replaced = self.children.insert(key, child);
-        debug_assert!(
-            replaced.is_none(),
-            "the reducer's monotonic child key is new to runtime resources"
-        );
+        // This method can run under both the observation gate and dynamic-
+        // state mutex. Probe before insertion so even a future key-domain
+        // regression returns the incoming user construction intact instead
+        // of displacing and unwinding a resident child through those locks.
+        if self.children.get(key).is_some() {
+            return Err(Box::new(child));
+        }
+        let _ = self.children.insert(key, child);
         Ok(key)
     }
 
@@ -749,6 +753,7 @@ impl ScopeRuntime {
         enum AdmissionInstall {
             Admitted {
                 key: ChildKey,
+                entry_promoted: bool,
                 projection_admitted: bool,
             },
             Rejected {
@@ -795,7 +800,7 @@ impl ScopeRuntime {
             let entry = state
                 .entry_mut(id)
                 .expect("the matching reservation was just resolved");
-            entry.promote(key, request.fused_cancel.take(), txn);
+            let entry_promoted = entry.promote(key, request.fused_cancel.take(), txn);
             // The slot was minted `Reserved` by this reservation and nothing
             // can have started it, so the projection reducer accepts. A
             // refusal here would leave the entry promoted with no residency
@@ -803,18 +808,43 @@ impl ScopeRuntime {
             let admitted = root.admit_child_locked(resident_projection(&request.slot), txn);
             AdmissionInstall::Admitted {
                 key,
+                entry_promoted,
                 projection_admitted: admitted,
             }
         });
         let key = match installed {
             AdmissionInstall::Admitted {
                 key,
+                entry_promoted,
                 projection_admitted,
             } => {
-                assert!(
-                    projection_admitted,
-                    "a promoted reservation is admitted from `Reserved` exactly once"
-                );
+                let invariant = if !entry_promoted {
+                    Some("only a reservation can become resident")
+                } else if !projection_admitted {
+                    Some("a promoted reservation is admitted from `Reserved` exactly once")
+                } else {
+                    None
+                };
+                if let Some(invariant) = invariant {
+                    // The control-plane guards are gone, but `request` still
+                    // owns the caller's response waker. Publish and contain
+                    // that fail-closed completion only after recording the
+                    // framework diagnostic, so neither its wake nor its drop
+                    // runs as ordinary panic-stack destruction and neither
+                    // can replace the primary invariant.
+                    //
+                    // `PanicAccumulator` contains rather than resumes on an
+                    // already-unwinding stack, so record the diagnostic only
+                    // when there is a stack to raise it on. Assuming a resume
+                    // would turn a contained failure into a double panic.
+                    let mut panics = runtime::PanicAccumulator::default();
+                    if !std::thread::panicking() {
+                        panics.run(|| panic!("{invariant}"));
+                    }
+                    panics.run(|| request.complete_lost());
+                    drop(panics);
+                    return;
+                }
                 key
             }
             AdmissionInstall::Rejected {
@@ -1060,10 +1090,30 @@ async fn run_scope_incarnation(
             root.member
                 .transition_locked(txn, MemberTransition::Running)
         });
-        assert!(
-            running,
-            "a root incarnation promotes its own never-admitted reservation"
-        );
+        if !running {
+            // A refused root projection cannot support a driver. Establish
+            // the invariant first, then retire the still-owned plan and epoch
+            // through contained ordinary calls before resuming it. Definitions,
+            // response wakes, and resident projections therefore cannot run
+            // as ordinary framework-panic stack destruction.
+            //
+            // `PanicAccumulator` contains rather than resumes on an
+            // already-unwinding stack, so record the diagnostic only when
+            // there is a stack to raise it on and fall through to the drain
+            // verdict otherwise. `begin_incarnation` already published
+            // `Starting`, so the epoch finishes as a requested stop rather
+            // than claiming no incarnation ever began.
+            let mut panics = runtime::PanicAccumulator::default();
+            if !std::thread::panicking() {
+                panics.run(|| {
+                    panic!("a root incarnation promotes its own never-admitted reservation")
+                });
+            }
+            panics.run(|| drop(plan));
+            panics.run(|| epoch.finish(StopReason::ShutdownRequested));
+            drop(panics);
+            return StopReason::ShutdownRequested;
+        }
     }
     // Both lanes are unbounded so their producers can publish synchronously.
     // Keep child lifecycle events separate from externally generated dynamic
@@ -1095,15 +1145,35 @@ async fn run_scope_incarnation(
     // exactly one terminality owner for every child.
     let mut supervisor = SupervisorState::new(root.flavor, epoch.lifecycle());
     let mut children = ChildResources::default();
+    let mut rejected_child = None;
     plan.children.reverse();
     while let Some(child) = plan.children.pop() {
         let child = ChildRuntime::from_plan(child, &root);
         let membership = child.slot.member.membership();
         let Some(key) = supervisor_admit(&mut supervisor, membership, true) else {
-            unreachable!("a fresh child-key domain accommodates an in-memory child collection")
+            rejected_child = Some(child);
+            break;
         };
-        let replaced = children.insert(key, child);
-        debug_assert!(replaced.is_none());
+        if children.get(key).is_some() {
+            rejected_child = Some(child);
+            break;
+        }
+        let _ = children.insert(key, child);
+    }
+    if let Some(child) = rejected_child {
+        // A fresh domain cannot exhaust for an in-memory plan, but the total
+        // fallback still owns real user constructions. Join their terminality
+        // obligations on the ordinary path, let ScopePlan retire the suffix,
+        // and finish this epoch without a framework unwind. The verdict is
+        // `ShutdownRequested`, not `NeverStarted`: `begin_incarnation` already
+        // published `Starting`, and SPEC B.6's `NeverStarted` states that no
+        // scope incarnation ever began.
+        let mut rejected = children.into_values().collect::<Vec<_>>();
+        rejected.push(child);
+        runtime::dispose_all(rejected).fired().await;
+        drop(plan);
+        epoch.finish(StopReason::ShutdownRequested);
+        return StopReason::ShutdownRequested;
     }
     if let Some(control) = &dynamic {
         root.with_observation_gate(|txn| {
@@ -1228,12 +1298,20 @@ async fn run_scope_incarnation(
                     // Every lane sender is retained by the scope runtime or
                     // one of its registered children until this loop exits.
                     // A closed receiver would otherwise make this select arm
-                    // permanently ready and spin, so diagnose any future
-                    // ownership change where it is first observable.
-                    debug_assert!(
-                        false,
-                        "a driver event lane closed before its receive loop exited"
-                    );
+                    // permanently ready and spin. Fail closed by returning a
+                    // retained shutdown completion: a framework panic here
+                    // would unwind the other receiver and any queued admission
+                    // response wakers outside ScopeRuntime's contained epilogue.
+                    let reason = StopReason::ShutdownRequested;
+                    let root_exit = scope
+                        .role
+                        .is_root()
+                        .then(|| RetainedExit::new(stop_reason_root_exit(&reason)));
+                    scope.completion = Some(ScopeCompletion {
+                        reason: RetainedStopReason::new(reason.clone()),
+                        root_exit,
+                    });
+                    return reason;
                 }
                 runtime::ScopeWake::Deadline => {
                     // A producer becoming ready at the same instant owns the

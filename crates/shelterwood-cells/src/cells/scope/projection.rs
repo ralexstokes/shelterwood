@@ -82,30 +82,34 @@ impl ScopeCell {
     }
 
     pub fn subscribe_snapshots(&self) -> SnapshotReceiver {
-        self.with_observation_gate(|wakes| {
+        let (receiver, closed_consistent) = self.with_observation_gate(|wakes| {
             let receiver = self
                 .observation
                 .snapshots
                 .subscribe(self.snapshot_locked(), wakes);
-            debug_assert!(
-                !self.observation.closed.load(Ordering::Acquire)
-                    || receiver.borrow_latest_and_closed().1,
-                "closed snapshot state is installed before later subscriptions"
-            );
-            receiver
-        })
+            let closed_consistent = !self.observation.closed.load(Ordering::Acquire)
+                || receiver.borrow_latest_and_closed().1;
+            (receiver, closed_consistent)
+        });
+        assert!(
+            closed_consistent,
+            "closed snapshot state is installed before later subscriptions"
+        );
+        receiver
     }
 
     pub fn subscribe_lifecycle(&self) -> LifecycleEvents {
-        self.with_observation_gate(|txn| {
+        let (events, closed_consistent) = self.with_observation_gate(|txn| {
             let events = self.observation.lifecycle.subscribe(txn);
-            debug_assert!(
-                !self.observation.closed.load(Ordering::Acquire)
-                    || self.observation.lifecycle.is_closed(),
-                "closed lifecycle state is installed before later subscriptions"
-            );
-            events
-        })
+            let closed_consistent = !self.observation.closed.load(Ordering::Acquire)
+                || self.observation.lifecycle.is_closed();
+            (events, closed_consistent)
+        });
+        assert!(
+            closed_consistent,
+            "closed lifecycle state is installed before later subscriptions"
+        );
+        events
     }
 
     fn snapshot_locked(&self) -> RetainedScopeSnapshot {

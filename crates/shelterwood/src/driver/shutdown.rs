@@ -145,7 +145,7 @@ impl ScopeRuntime {
         else {
             return;
         };
-        debug_assert!(startup.is_some() || !startup_pending);
+        assert!(startup.is_some() || !startup_pending);
         // Ordered drain exposes its first stop only through `Settle`; derive
         // that command before publication so both scope flavors can commit an
         // inactive child's terminal-cleanup intent with the `Draining` edge.

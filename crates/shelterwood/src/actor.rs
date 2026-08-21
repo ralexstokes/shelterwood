@@ -167,7 +167,7 @@ impl<'a, A: Actor> Context<'a, A> {
     }
 
     fn initialization_returned(&mut self) {
-        debug_assert_eq!(self.stage, DeliveryStage::Initializing);
+        assert_eq!(self.stage, DeliveryStage::Initializing);
         self.owns_init_boundary = false;
     }
 

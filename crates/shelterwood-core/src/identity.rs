@@ -153,6 +153,10 @@ impl PoisonedCounter {
     }
 
     fn from_current(current: u64) -> Self {
+        // Diagnostic-only: every caller extracts a constructible Generation,
+        // which excludes poison. The cells path reaches this while its child-
+        // identity mutex is held, so reachable behavior must not rely on a
+        // panic here.
         debug_assert_ne!(current, u64::MAX);
         Self { current }
     }
@@ -437,6 +441,9 @@ impl ScopeIdentity {
                 MembershipReconciliation::Minted(MintedMembership::new(membership))
             }
             Entry::Vacant(entry) => {
+                // Diagnostic-only under the cells child-identity mutex. A
+                // public Membership cannot contain the private poison value;
+                // insertion behavior therefore does not rely on this check.
                 debug_assert_ne!(provisional.0.generation, Generation::POISON);
                 entry.insert(FenceCounter::from_fence(provisional.0));
                 MembershipReconciliation::Adopted

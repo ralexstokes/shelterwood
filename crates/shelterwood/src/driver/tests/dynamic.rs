@@ -10,17 +10,29 @@ async fn refused_dynamic_admission_panics_after_control_plane_unlock() {
     reservation.slot.define(ChildConstruction::Task(
         TaskDef::new(|_| future::pending()).erase(),
     ));
-    let (_response, request) = begin_admission(&reservation, &mut dynamic_events, None).await;
+    let (response, request) = begin_admission(&reservation, &mut dynamic_events, None).await;
+    let mut response = Box::pin(response.receive());
+    let hostile = Waker::from(Arc::new(PanicWake(
+        "injected admission response waker panic",
+    )));
+    assert!(
+        response
+            .as_mut()
+            .poll(&mut Context::from_waker(&hostile))
+            .is_pending(),
+        "the response waiter is parked before the invariant"
+    );
 
     // Corrupt only the projection source stage. Admission still commits its
     // arena insertion and dynamic-entry promotion before the cell reducer
     // refuses Running -> Admitted, reaching the driver invariant exactly.
     member.update(|record| record.stage = MemberStage::Running);
-    let refusal = catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request)));
-
-    assert!(
-        refusal.is_err(),
-        "a refused dynamic admission fails closed in every profile"
+    let refusal = catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request)))
+        .expect_err("a refused dynamic admission fails closed in every profile");
+    assert_eq!(
+        refusal.downcast_ref::<String>().map(String::as_str),
+        Some("a promoted reservation is admitted from `Reserved` exactly once"),
+        "the framework invariant stays primary over the hostile response wake"
     );
     assert!(
         !root.observation_gate().is_poisoned(),
@@ -44,6 +56,14 @@ async fn refused_dynamic_admission_panics_after_control_plane_unlock() {
             .is_some_and(|entry| !entry.is_reserved()),
         "the fixture reaches the committing admission site after entry promotion"
     );
+    assert!(matches!(
+        response
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Some(Err(ReserveError::NotAdmitting(
+            crate::NotAdmittingCause::Terminal
+        ))))
+    ));
 
     // Restore the source stage and missing residency so ScopeRuntime's normal
     // fail-closed epilogue can discharge this deliberately corrupted fixture.

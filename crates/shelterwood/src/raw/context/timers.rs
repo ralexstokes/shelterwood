@@ -124,16 +124,20 @@ impl<M> TimerStore<M> {
     where
         K: Hash + Eq + Send + 'static,
     {
-        let arming_order = ArmingOrder(
-            self.arming_orders
-                .mint()
-                .expect("timer arming-order space exhausted"),
-        );
-        // Hash and equality are user code. Keep incoming ownership behind the
-        // disposal boundary until those callbacks finish so a callback panic
-        // cannot unwind through a hostile key or message destructor.
+        // Every verdict below is framework-owned. Contain incoming ownership
+        // before even minting the arming id so exhaustion cannot unwind a
+        // hostile key or message destructor on the framework panic's stack.
+        // Hash and equality are user code and need the same boundary.
         let key = Contained::new(key, self.disposal.clone());
         let message = Contained::new(message, self.disposal.clone());
+        let Some(arming_order) = self.arming_orders.mint().map(ArmingOrder) else {
+            // Dispose both inputs before establishing the diagnostic. Their
+            // destructor panics are retained by RawDisposal and cannot replace
+            // the arming-space invariant.
+            drop(message);
+            drop(key);
+            panic!("timer arming-order space exhausted");
+        };
         let hash = self.hash_key(key.get());
         self.remove_hashed(hash, key.get());
         self.keyed.entry(hash).or_default().push(TimerEntry {
@@ -144,7 +148,7 @@ impl<M> TimerStore<M> {
             period,
         });
         let previous = self.armings.insert(arming_order, hash);
-        debug_assert!(previous.is_none());
+        assert!(previous.is_none());
         if let Some(deadline) = deadline {
             self.deadlines.insert((deadline, arming_order));
         }
@@ -241,14 +245,10 @@ impl<M> TimerStore<M> {
         // `replace` writes the key bucket and the arming index in one window
         // that cannot panic between them — the user `Hash`/`Eq` callbacks run
         // strictly before it — and an entry never migrates buckets except
-        // through this method. Their agreement is therefore structural, so
-        // check it where a broken invariant is cheap to see rather than
-        // paying two extra map lookups on every removal.
-        debug_assert_eq!(
-            self.armings.get(&entry.arming_order),
-            Some(&location.hash),
-            "a timer's key and arming indexes must agree"
-        );
+        // through this method. Their agreement is structural. Do not diagnose
+        // a future regression here: `entry` already owns the user's key and
+        // message, so an assertion would destroy both on a framework-panic
+        // stack. The cleanup below is total for either recorded hash.
         if empty {
             self.keyed.remove(&location.hash);
         }
@@ -370,7 +370,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{IntervalRearm, TimerMessage, TimerStore};
+    use super::{IntervalRearm, PoisonedCounter, TimerMessage, TimerStore};
 
     #[derive(Eq, PartialEq)]
     struct CollidingKey(u8);
@@ -699,6 +699,43 @@ mod tests {
     }
 
     #[test]
+    fn arming_exhaustion_disposes_inputs_before_the_framework_panic() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut timers = TimerStore::default();
+        timers.arming_orders = PoisonedCounter::near_exhaustion();
+        assert!(
+            timers.arming_orders.mint().is_some(),
+            "the fixture consumes the final arming id"
+        );
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            timers.replace(
+                PanickingDropKey(Arc::clone(&drops)),
+                None,
+                TimerMessage::Once(PanickingTimerMessage(Arc::clone(&drops))),
+                None,
+            );
+        }))
+        .expect_err("the exhausted arming domain remains a framework panic");
+
+        assert_eq!(
+            panic.downcast_ref::<&'static str>().copied(),
+            Some("timer arming-order space exhausted"),
+            "hostile input destructors cannot replace the invariant"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            2,
+            "both inputs are disposed before the framework panic begins"
+        );
+        assert!(
+            timers.disposal.panic.take().is_some(),
+            "the first hostile destructor panic remains cleanup evidence"
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
     fn zero_period_timer_cleanup_stays_contained_when_hash_panics() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut timers = TimerStore::default();
@@ -762,6 +799,26 @@ mod tests {
         assert_eq!(
             cleanup.downcast_ref::<&'static str>().copied(),
             Some("timer key destructor panic")
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn unlink_is_total_when_the_arming_hash_disagrees() {
+        let mut timers = TimerStore::default();
+        let arming = timers.replace(7_u8, None, TimerMessage::Once("message"), None);
+        let recorded = timers.armings[&arming];
+        timers
+            .armings
+            .insert(arming, super::KeyHash(recorded.0.wrapping_add(1)));
+
+        assert_eq!(
+            once(
+                timers
+                    .take(&7_u8)
+                    .expect("the keyed entry remains removable")
+            ),
+            "message"
         );
         assert!(timers.is_empty());
     }

@@ -654,6 +654,10 @@ impl ScopeRuntime {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
+        // Protect the raw user error before every resource lookup and reducer
+        // invariant. A malformed key may still be diagnosed, but it cannot
+        // unwind the Exit payload on the driver stack.
+        let mut exit = Some(RetainedExit::new(exit));
         // Production terminal publication follows joined construction
         // disposal.  A few structural test/fallback paths synthesize that
         // already-joined boundary directly, so normalize them through the
@@ -666,14 +670,21 @@ impl ScopeRuntime {
             .children
             .get_mut(key)
             .expect("terminalized child remains registered")
-            .terminalize(&self.root, exit, exited_incarnation, startup);
+            .terminalize(
+                &self.root,
+                exit.take()
+                    .expect("terminal publication consumes its retained exit once")
+                    .into_exit(),
+                exited_incarnation,
+                startup,
+            );
         self.reduce(SupervisorEvent::Terminalized { child: key });
         // The reducer drops an event whose predecessor never ran, which keeps
         // `step` total but leaves the shell no return channel. A child that
         // published terminality without reaching `Joined` would never count
         // toward completion, so the scope would simply never finish. Assert
         // the transition landed rather than discovering it as a stall.
-        debug_assert!(
+        assert!(
             self.supervisor.joined(key),
             "terminal publication must leave the reducer's membership joined"
         );
@@ -1196,6 +1207,10 @@ impl ScopeRuntime {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) {
+        // Retain before every refusal and invariant verdict. A failed Exit can
+        // own hostile user error drop glue, so no path may unwind or return it
+        // directly on the driver thread.
+        let mut exit = Some(RetainedExit::new(exit));
         if !self.supervisor.contains(key)
             || self.supervisor.is_disposing(key)
             || self.supervisor.joined(key)
@@ -1206,7 +1221,7 @@ impl ScopeRuntime {
         // Same reasoning as `terminalize_child`: a dropped `DisposalStarted`
         // would make the later `Terminalized` unreachable too, stranding the
         // membership short of `Joined` with no loud failure.
-        debug_assert!(
+        assert!(
             self.supervisor.is_disposing(key),
             "terminal disposal must leave the reducer's incarnation disposing"
         );
@@ -1218,7 +1233,9 @@ impl ScopeRuntime {
                 return;
             }
             child.pending_terminal = Some(PendingTerminal {
-                exit: RetainedExit::new(exit),
+                exit: exit
+                    .take()
+                    .expect("terminal disposal installs its retained exit once"),
                 exited_incarnation,
                 startup,
             });

@@ -207,7 +207,10 @@ fn enqueue_fallback_disposal_with(
     // the job just appended even when older critical jobs are still queued.
     let rejected = state.queue.pop_back();
     drop(state);
-    debug_assert!(rejected.is_some());
+    // Keep even a future queue regression total. The caller retains the
+    // original job Arc and will finish it on the ordinary fallback path; an
+    // assertion here could instead unwind that user payload through disposal
+    // infrastructure.
     drop(rejected);
     false
 }

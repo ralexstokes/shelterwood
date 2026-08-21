@@ -354,7 +354,14 @@ impl SupervisorState {
         }
         let raw = self.keys.mint()?;
         let child = ChildKey(raw);
-        let replaced = self.children.insert(
+        // Keep a future key-domain regression total. Admission callers can
+        // hold wider framework locks while they retain an incoming user
+        // construction, so this pure reducer must never diagnose a collision
+        // by unwinding through them or displace the existing record.
+        if self.children.contains_key(&child) {
+            return None;
+        }
+        let _ = self.children.insert(
             child,
             ChildRecord {
                 membership,
@@ -367,12 +374,11 @@ impl SupervisorState {
                 spawned_once: false,
             },
         );
-        debug_assert!(replaced.is_none(), "monotonic child keys are never reused");
-        let replaced = self.child_keys.insert(membership, child);
-        assert!(
-            replaced.is_none(),
-            "one live membership maps to exactly one child key"
-        );
+        // No "one live membership maps to exactly one child key" assertion is
+        // written here any more: the `child_keys.contains_key` guard at the
+        // top of this function makes a displacing insert unwritable rather
+        // than merely unfired, which is the stronger form of the same claim.
+        self.child_keys.insert(membership, child);
         if initial && self.flavor == ScopeFlavor::Ordered && self.next_ordered_start.is_none() {
             self.next_ordered_start = Some(child);
         }
@@ -629,8 +635,12 @@ impl SupervisorState {
                 }
                 let membership = record.membership;
                 self.children.remove(&child);
-                let removed = self.child_keys.remove(&membership);
-                debug_assert_eq!(removed, Some(child));
+                // The membership index is derived bookkeeping. A mismatch is
+                // fail-closed (the stale membership remains unavailable) and
+                // cannot justify unwinding a runtime resource owner.
+                if self.child_keys.get(&membership) == Some(&child) {
+                    let _ = self.child_keys.remove(&membership);
+                }
             }
             Event::FailStartup => {
                 let _ = self.fail_startup();
@@ -682,6 +692,11 @@ impl SupervisorState {
             self.keys.mint().is_none(),
             "the child-key domain reaches its permanent poison state"
         );
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn reuse_child_keys_for_test(&mut self) {
+        self.keys = PoisonedCounter::new();
     }
 
     #[cfg(test)]
@@ -1185,6 +1200,19 @@ mod tests {
             super::admit(&mut state, members[3], false).is_none(),
             "poisoned exhaustion remains fail closed"
         );
+        state.check_invariants();
+    }
+
+    #[test]
+    fn registration_key_collision_preserves_the_resident_record() {
+        let members = memberships(2);
+        let mut state = SupervisorState::new(ScopeFlavor::Dynamic, ScopeLifecycle::running());
+        let resident = admit(&mut state, members[0], false);
+        state.reuse_child_keys_for_test();
+
+        assert_eq!(super::admit(&mut state, members[1], false), None);
+        assert_eq!(state.key_for(members[0]), Some(resident));
+        assert_eq!(state.key_for(members[1]), None);
         state.check_invariants();
     }
 

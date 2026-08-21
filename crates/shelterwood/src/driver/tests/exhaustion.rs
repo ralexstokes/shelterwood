@@ -55,6 +55,56 @@ async fn reserve_error_identity_exhausted_maps_the_child_key_domain() {
     ));
 }
 
+#[crate::runtime::test]
+async fn reused_child_key_rejects_and_disposes_after_control_plane_unlock() {
+    let (mut scope, _events, mut dynamic_events, control) = running_dynamic_fixture();
+    let resident = reserve_dynamic(&scope.root, ChildId::from("resident"), None)
+        .expect("the resident reservation succeeds");
+    resident.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
+    let (resident_response, resident_request) =
+        begin_admission(&resident, &mut dynamic_events, None).await;
+    scope.handle_admission(resident_request);
+    assert!(matches!(resident_response.receive().await, Some(Ok(()))));
+
+    scope.supervisor.reuse_child_keys_for_test();
+    let rejected = reserve_dynamic(&scope.root, ChildId::from("rejected"), None)
+        .expect("the second membership domain still has capacity");
+    let (probe, disposed) = thread_reporting_error();
+    rejected.slot.define(ChildConstruction::Task(
+        TaskDef::new(move |_| {
+            let _ = &probe;
+            future::pending::<crate::ExitResult>()
+        })
+        .erase(),
+    ));
+    let (rejected_response, rejected_request) =
+        begin_admission(&rejected, &mut dynamic_events, None).await;
+    let driver_thread = std::thread::current().id();
+
+    scope.handle_admission(rejected_request);
+
+    assert!(matches!(
+        rejected_response.receive().await,
+        Some(Err(ReserveError::IdentityExhausted))
+    ));
+    assert_ne!(
+        disposed
+            .recv_timeout(DRIVER_PROGRESS_WAIT)
+            .expect("the rejected construction capture is disposed"),
+        driver_thread,
+        "a key collision cannot destroy the rejected construction on the driver"
+    );
+    assert!(!scope.root.observation_gate().is_poisoned());
+    assert!(!control.state.is_poisoned());
+    assert_eq!(
+        scope.children.len(),
+        1,
+        "the collision preserves the resident child resource"
+    );
+}
+
 #[test]
 fn member_transitions_own_their_complete_record_projection() {
     let mut identity = ScopeIdentity::new();

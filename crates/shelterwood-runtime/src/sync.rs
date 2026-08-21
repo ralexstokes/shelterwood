@@ -321,7 +321,7 @@ impl CompletionGatedLatch {
             return false;
         }
         let transitioned = self.fired.fire();
-        debug_assert!(transitioned);
+        assert!(transitioned);
         true
     }
 
@@ -360,7 +360,7 @@ impl CompletionGatedLatch {
                 .is_ok()
             {
                 let transitioned = self.completed.fire();
-                debug_assert!(transitioned);
+                assert!(transitioned);
                 return fired;
             }
         }
@@ -497,11 +497,13 @@ impl<T> OneShotSender<T> {
     }
 
     pub fn is_closed(&self) -> bool {
-        // Observed under the observation gate and the dynamic-state mutex
+        // Diagnostic-only: this is observed under the observation gate and
+        // the dynamic-state mutex
         // (`RemovalResponses::subscribe`), so the missing-channel verdict
         // cannot be raised as a panic without poisoning both for every later
-        // caller. The total form reports the taken channel as closed, which
-        // is what a sender past `send` is.
+        // caller. No correctness property depends on the diagnostic: the
+        // total form reports the taken channel as closed, which is what a
+        // sender past `send` is, and no test expects this assertion to fire.
         debug_assert!(
             self.channel.is_some(),
             "an observable one-shot sender retains its channel"
@@ -681,9 +683,9 @@ impl<T> WatchShared<T> {
     ///
     /// `modify_silently` and `read_with` run a caller closure under this
     /// guard, and those closures do real work: a lifecycle publication sends
-    /// on a broadcast channel here, and a snapshot installation evaluates a
-    /// `debug_assert!` and mints a generation. A panic in any of them would
-    /// otherwise wedge every later read, publication, subscription and
+    /// on a broadcast channel here, and a snapshot installation mints a
+    /// generation. A panic in any of them would otherwise wedge every later
+    /// read, publication, subscription and
     /// terminal wait on the channel. The guarded data is plain framework
     /// state with no invariant spanning the closure, so the surviving value
     /// stays usable; this matches `ObservationGate::lock`, which tolerates
@@ -724,6 +726,9 @@ impl<T> Clone for WatchSender<T> {
 impl<T> Drop for WatchSender<T> {
     fn drop(&mut self) {
         let previous = self.shared.senders.fetch_sub(1, Ordering::AcqRel);
+        // Diagnostic-only: safe ownership cannot drop one endpoint twice.
+        // The wake decision below remains total without this check, and no
+        // test depends on the diagnostic panic.
         debug_assert!(previous > 0, "a watch sender is released at most once");
         if previous == 1 {
             self.shared.waiters.wake_all();
@@ -810,6 +815,9 @@ impl<T> Clone for WatchReceiver<T> {
 impl<T> Drop for WatchReceiver<T> {
     fn drop(&mut self) {
         let previous = self.shared.receivers.fetch_sub(1, Ordering::AcqRel);
+        // Diagnostic-only: safe ownership cannot drop one endpoint twice.
+        // There is no downstream action whose correctness depends on this
+        // check, and no test depends on the diagnostic panic.
         debug_assert!(previous > 0, "a watch receiver is released at most once");
     }
 }

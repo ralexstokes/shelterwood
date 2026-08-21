@@ -180,10 +180,9 @@ impl SharedOffloadState {
 
     pub(super) fn take_for_poll(&self) -> Option<OffloadFuture> {
         let mut state = self.state.lock().expect("offload future mutex poisoned");
-        if state.cancelled {
+        if state.cancelled || state.polling {
             return None;
         }
-        debug_assert!(!state.polling, "offload work must have one poller");
         let future = state.future.take();
         state.polling = future.is_some();
         future
@@ -197,9 +196,15 @@ impl SharedOffloadState {
         let mut state = self.state.lock().expect("offload future mutex poisoned");
         state.polling = false;
         if outcome == OffloadPoll::Pending && !state.cancelled {
-            debug_assert!(state.future.is_none());
-            state.future = Some(future);
-            None
+            if state.future.is_none() {
+                state.future = Some(future);
+                None
+            } else {
+                // A duplicate poll completion cannot overwrite and destroy
+                // the already-retained user future under this mutex. Return
+                // the duplicate to the caller's disposal path instead.
+                Some(future)
+            }
         } else {
             Some(future)
         }

@@ -4,8 +4,14 @@ use std::{
     marker::PhantomData,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Instant,
+};
+
+use crate::{
+    cell::waker_slot::{WakerAction, WakerEffects},
+    panic::PanicAccumulator,
+    waker_proxy::WakerProxy,
 };
 
 pub type BoxedSleep = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -160,6 +166,7 @@ pub(crate) fn dispose<T: Send + 'static>(runtime: &Arc<dyn MailboxRuntime>, valu
 pub(crate) struct DisposingReceiver<T> {
     inner: Option<OneShotReceiver<T>>,
     runtime: Arc<dyn MailboxRuntime>,
+    reply_waker: Option<WakerProxy>,
 }
 
 impl<T: Send + 'static> DisposingReceiver<T> {
@@ -167,8 +174,33 @@ impl<T: Send + 'static> DisposingReceiver<T> {
         Self {
             inner: Some(inner),
             runtime,
+            reply_waker: None,
         }
     }
+}
+
+fn poll_one_shot_with_proxy<T: Send + 'static, R>(
+    inner: &mut OneShotReceiver<T>,
+    reply_waker: &mut Option<WakerProxy>,
+    context: &mut Context<'_>,
+    mut poll: impl FnMut(&mut OneShotReceiver<T>, &mut Context<'_>) -> R,
+    is_pending: impl Fn(&R) -> bool,
+) -> R {
+    if reply_waker.is_none() {
+        let mut probe = Context::from_waker(Waker::noop());
+        let result = poll(inner, &mut probe);
+        if !is_pending(&result) {
+            return result;
+        }
+        *reply_waker = Some(WakerProxy::new());
+    }
+
+    let reply_waker = reply_waker
+        .as_ref()
+        .expect("a parked reply receiver retains its waker proxy");
+    reply_waker.register(context.waker());
+    let mut proxy_context = Context::from_waker(reply_waker.waker());
+    poll(inner, &mut proxy_context)
 }
 
 impl<T> DisposingReceiver<T> {
@@ -184,16 +216,94 @@ impl<T> DisposingReceiver<T> {
 
     pub(crate) fn close(&mut self) {
         self.inner_mut().close();
+        // Contained rather than re-raised, for the same reason as the delivery
+        // seams: `close`'s callers can own a live user value while they call
+        // it. `CallOperation::fail_send` holds the recovered `SendError<M>`
+        // message in its frame, so letting a hostile caller-waker destructor
+        // unwind out of here would put that panic in flight while the message
+        // is still to be destroyed -- the double-panic abort this proxy exists
+        // to remove.
+        let mut panics = PanicAccumulator::default();
+        self.retire_reply_waker(&mut panics);
+        crate::panic::discard_panic(panics.take());
+    }
+
+    /// Takes the caller waker out of the proxy and queues its destructor into
+    /// an effects sink, so it runs with no proxy mutex held.
+    ///
+    /// The delivery seams then *discard* whatever that destructor raises. Two
+    /// costs ride on that, both accepted by #398 ruling 3:
+    ///
+    /// * The panic is swallowed with no diagnostic. A delivered user value has
+    ///   to be returned by value, so there is no point after the handoff at
+    ///   which a retained payload could be resumed -- resuming before it would
+    ///   destroy the value the caller is owed. `shelterwood-core`'s `panic`
+    ///   module holds that containment is false on a normal return path; this
+    ///   is the deliberate exception to that guidance, not an oversight.
+    /// * A caller-waker destructor that *blocks* stalls the delivering task
+    ///   synchronously. The same ruling weighed a per-delivery disposal-lane
+    ///   submission against it: delivery is the hot path of every successful
+    ///   `call` and `recv`, and a lane submission there is real cost on every
+    ///   reply, where a contained drop of a benign waker is nearly free.
+    fn retire_reply_waker(&mut self, panics: &mut PanicAccumulator) {
+        let reply_waker = self.reply_waker.take();
+        let mut effects = WakerEffects::default();
+        if let Some(reply_waker) = &reply_waker {
+            reply_waker.retire(WakerAction::DropInline, &mut effects);
+        }
+        effects.flush(panics);
+        panics.run(|| drop(reply_waker));
     }
 }
 
 impl<T: Send + 'static> DisposingReceiver<T> {
     pub(crate) fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
-        self.inner_mut().poll_receive(context)
+        // In pinned Tokio 1.53.1, `Receiver::poll` first obtains the result,
+        // then clears its `Inner`; the last `Inner::drop` calls
+        // `rx_task.drop_task` while that result can own the delivered value.
+        // Probe with a framework waker, then leave only the proxy registered
+        // across a pending return so Tokio never destroys a caller waker at
+        // that seam.
+        let result = poll_one_shot_with_proxy(
+            self.inner
+                .as_mut()
+                .expect("a live disposing receiver retains its channel"),
+            &mut self.reply_waker,
+            context,
+            OneShotReceiver::poll_receive,
+            Poll::is_pending,
+        );
+        if result.is_ready() {
+            // `result` may own a user value. The caller-waker diagnostic is
+            // subordinate to delivering it, so retire synchronously but
+            // contain any hostile destructor panic before returning. See
+            // `retire_reply_waker` for the two costs that ride on the discard.
+            let mut panics = PanicAccumulator::default();
+            self.retire_reply_waker(&mut panics);
+            crate::panic::discard_panic(panics.take());
+        }
+        result
     }
 
     pub(crate) fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T> {
-        self.inner_mut().close_and_poll_receive(context)
+        let result = poll_one_shot_with_proxy(
+            self.inner
+                .as_mut()
+                .expect("a live disposing receiver retains its channel"),
+            &mut self.reply_waker,
+            context,
+            OneShotReceiver::close_and_poll_receive,
+            |result| matches!(result, OneShotClose::Pending),
+        );
+        if !matches!(result, OneShotClose::Pending) {
+            // Timeout arbitration can return a concurrently delivered user
+            // value, so it uses the same synchronous contained precedence as
+            // the ordinary ready path, and accepts the same two costs.
+            let mut panics = PanicAccumulator::default();
+            self.retire_reply_waker(&mut panics);
+            crate::panic::discard_panic(panics.take());
+        }
+        result
     }
 }
 
@@ -204,14 +314,21 @@ impl<T> Drop for DisposingReceiver<T> {
             .take()
             .expect("a live disposing receiver retains its channel");
         let mut value = None;
-        let mut panics = crate::panic::PanicAccumulator::default();
-        // Tokio's one-shot close is atomics-only, so cancellation never
-        // required the timer path's blocking-disposal venue. The old ruling
-        // that this justified leaving the one-shot registration unproxied is
-        // nevertheless superseded by #398: reply polling registers a proxy
-        // uniformly because delivery, not cancellation, is the abort-class
-        // seam. Cancellation inherits that containment without retaining a
-        // special raw-waker path of its own.
+        let mut panics = PanicAccumulator::default();
+        // Cancellation never required the timer path's blocking-disposal
+        // venue, which is a claim about venue only: closing a one-shot runs on
+        // the receiver's own thread with no shared driver or wheel mutex held,
+        // so a slow caller-waker destructor there stalls this future alone
+        // rather than every timer registration in the process. It is not that
+        // close touches no wakers -- in the pinned 1.53.1, `Inner::close`
+        // wakes a set tx task and calls `rx_task.drop_task()` when the channel
+        // is not yet complete, so pre-proxy this path did destroy a caller
+        // waker inline. The old ruling that the venue argument justified
+        // leaving the one-shot registration unproxied is superseded by #398:
+        // reply polling registers a proxy uniformly because delivery, not
+        // cancellation, is the abort-class seam, so the waker Tokio drops here
+        // is now only ever a framework proxy clone. Cancellation inherits that
+        // containment without retaining a special raw-waker path of its own.
         // Recovery runs first so an unclaimed value reaches isolated disposal
         // before the receiver -- and therefore before the waker clone it
         // registered -- is retired; a hostile waker destructor can neither
@@ -230,6 +347,7 @@ impl<T> Drop for DisposingReceiver<T> {
             }
         });
         panics.run(|| drop(inner));
+        self.retire_reply_waker(&mut panics);
     }
 }
 

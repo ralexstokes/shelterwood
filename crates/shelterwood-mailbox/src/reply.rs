@@ -154,15 +154,20 @@ impl<T: Send + 'static> DeadlineOperation for ReplyOperation<T> {
 mod tests {
     use std::{
         future::Future,
+        mem::ManuallyDrop,
+        pin::Pin,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
         time::Duration,
     };
 
-    use crate::{ErasedOneShotSender, ErasedValue};
+    use crate::{
+        ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
+        capability::{DisposingReceiver, OneShotClose, oneshot},
+    };
 
     use super::super::cell::tests::{actor, actor_for_with_runtime};
 
@@ -172,6 +177,100 @@ mod tests {
         fn send(self: Box<Self>, value: ErasedValue) -> Result<(), ErasedValue> {
             Err(value)
         }
+    }
+
+    struct SeamReceiver {
+        pending_polls: usize,
+        value: Option<ErasedValue>,
+        value_on_close: bool,
+    }
+
+    impl ErasedOneShotReceiver for SeamReceiver {
+        fn poll_receive(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<ErasedValue>> {
+            if self.pending_polls > 0 {
+                self.pending_polls -= 1;
+                Poll::Pending
+            } else {
+                Poll::Ready(self.value.take())
+            }
+        }
+
+        fn close_and_poll_receive(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> ErasedOneShotClose {
+            if self.value_on_close {
+                self.value
+                    .take()
+                    .map_or(ErasedOneShotClose::SenderClosed, ErasedOneShotClose::Value)
+            } else {
+                ErasedOneShotClose::Pending
+            }
+        }
+
+        fn close(self: Pin<&mut Self>) {}
+
+        fn close_and_take(mut self: Pin<&mut Self>) -> Option<ErasedValue> {
+            self.value.take()
+        }
+    }
+
+    struct DropCounter {
+        drops: Arc<AtomicUsize>,
+        hostile: bool,
+    }
+
+    unsafe fn clone_counted_drop_waker(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the represented reference;
+        // the returned raw waker owns only the new clone.
+        let state = ManuallyDrop::new(unsafe { Arc::<DropCounter>::from_raw(data.cast()) });
+        RawWaker::new(
+            Arc::into_raw(Arc::clone(&state)).cast(),
+            &COUNTED_DROP_WAKER_VTABLE,
+        )
+    }
+
+    unsafe fn wake_counted_drop_waker(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<DropCounter>::from_raw(data.cast()) });
+    }
+
+    unsafe fn wake_by_ref_counted_drop_waker(_data: *const ()) {}
+
+    unsafe fn drop_counted_drop_waker(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        let state = unsafe { Arc::<DropCounter>::from_raw(data.cast()) };
+        state.drops.fetch_add(1, Ordering::SeqCst);
+        assert!(!state.hostile, "injected reply caller-waker drop panic");
+    }
+
+    static COUNTED_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_counted_drop_waker,
+        wake_counted_drop_waker,
+        wake_by_ref_counted_drop_waker,
+        drop_counted_drop_waker,
+    );
+
+    fn drop_waker(drops: Arc<AtomicUsize>, hostile: bool) -> Waker {
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::new(DropCounter { drops, hostile })).cast(),
+            &COUNTED_DROP_WAKER_VTABLE,
+        );
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    fn counted_drop_waker(drops: Arc<AtomicUsize>) -> Waker {
+        drop_waker(drops, false)
+    }
+
+    fn hostile_drop_waker(drops: Arc<AtomicUsize>) -> Waker {
+        drop_waker(drops, true)
     }
 
     struct CountWake(Arc<AtomicUsize>);
@@ -221,6 +320,107 @@ mod tests {
         let (reply, receiver) = actor.reply_channel::<u8>();
         drop(receiver);
         reply.send(9);
+    }
+
+    #[crate::runtime::test]
+    async fn ready_race_retires_the_reply_caller_waker_before_returning() {
+        let runtime = Arc::new(
+            crate::capability::tests::TestRuntime::new().with_oneshot(|| {
+                (
+                    Box::new(RejectingSender),
+                    Box::pin(SeamReceiver {
+                        pending_polls: 1,
+                        value: Some(Box::new(7_u8)),
+                        value_on_close: false,
+                    }),
+                )
+            }),
+        );
+        let (_, actor) = actor_for_with_runtime::<()>(runtime);
+        let (_reply, receiver) = actor.reply_channel::<u8>();
+        let mut receive = Box::pin(receiver.recv(Duration::from_secs(1)));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let caller = ManuallyDrop::new(counted_drop_waker(Arc::clone(&drops)));
+
+        assert!(matches!(
+            receive.as_mut().poll(&mut Context::from_waker(&caller)),
+            Poll::Ready(Ok(7))
+        ));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the proxy's caller clone retires synchronously at the ready seam"
+        );
+    }
+
+    #[test]
+    fn timeout_arbitration_value_retires_the_reply_caller_waker_before_returning() {
+        let runtime = Arc::new(
+            crate::capability::tests::TestRuntime::new().with_oneshot(|| {
+                (
+                    Box::new(RejectingSender),
+                    Box::pin(SeamReceiver {
+                        pending_polls: usize::MAX,
+                        value: Some(Box::new(9_u8)),
+                        value_on_close: true,
+                    }),
+                )
+            }),
+        );
+        let (_, inner) = oneshot::<u8>(&(runtime.clone() as Arc<dyn crate::MailboxRuntime>));
+        let mut receiver = DisposingReceiver::new(inner, runtime);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let caller = ManuallyDrop::new(counted_drop_waker(Arc::clone(&drops)));
+        let mut context = Context::from_waker(&caller);
+
+        assert!(receiver.poll_receive(&mut context).is_pending());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::Value(9)
+        ));
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "timeout arbitration retires the proxy's caller clone before returning the value"
+        );
+    }
+
+    #[test]
+    fn close_retires_the_reply_caller_waker_and_contains_a_hostile_destructor() {
+        let runtime = Arc::new(
+            crate::capability::tests::TestRuntime::new().with_oneshot(|| {
+                (
+                    Box::new(RejectingSender),
+                    Box::pin(SeamReceiver {
+                        pending_polls: usize::MAX,
+                        value: None,
+                        value_on_close: false,
+                    }),
+                )
+            }),
+        );
+        let (_, inner) = oneshot::<u8>(&(runtime.clone() as Arc<dyn crate::MailboxRuntime>));
+        let mut receiver = DisposingReceiver::new(inner, runtime);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let caller = ManuallyDrop::new(hostile_drop_waker(Arc::clone(&drops)));
+        let mut context = Context::from_waker(&caller);
+
+        assert!(receiver.poll_receive(&mut context).is_pending());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        // Returning normally is the assertion: `close` is reached from frames
+        // that own a live user value (`CallOperation::fail_send` holds the
+        // recovered message), so a hostile caller-waker destructor has to be
+        // contained here rather than re-raised. A `catch_unwind` around this
+        // call would pass even if containment were removed.
+        receiver.close();
+
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "close retires the proxy's caller clone"
+        );
     }
 
     #[crate::runtime::test(start_paused = true)]

@@ -1,6 +1,6 @@
 use std::{
     fmt,
-    future::Future,
+    future::{Future, poll_fn},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -53,15 +53,18 @@ impl<H> PendingAdmission<H> {
             Arc::clone(&self.reservation.slot),
             self.fused_cancel.clone(),
         )?;
+        let mut response = crate::runtime::DisposingReceiver::new(response);
         Ok(Box::pin(async move {
-            response.receive().await.unwrap_or_else(|| {
-                // The driver's admission `Obligation` publishes an outcome on
-                // every path, including its drop fallback. Treat a missing
-                // response as the scope having gone terminal so a caller is
-                // never stranded, but fail loudly: silence here would mask
-                // an obligation regression.
-                panic!("admission response obligation must complete");
-            })
+            poll_fn(|context| response.poll_receive(context))
+                .await
+                .unwrap_or_else(|| {
+                    // The driver's admission `Obligation` publishes an outcome on
+                    // every path, including its drop fallback. Treat a missing
+                    // response as the scope having gone terminal so a caller is
+                    // never stranded, but fail loudly: silence here would mask
+                    // an obligation regression.
+                    panic!("admission response obligation must complete");
+                })
         }))
     }
 
@@ -234,16 +237,19 @@ impl fmt::Debug for Removal {
 
 impl Removal {
     pub(super) fn new(response: crate::driver::RemovalResponse) -> Self {
+        let mut response = crate::runtime::DisposingReceiver::new(response);
         Self {
             inner: Box::pin(async move {
-                response.receive().await.unwrap_or_else(|| {
-                    // The driver's removal `Obligation` publishes `Removed`
-                    // on every destruction path. A missing response therefore
-                    // means the terminal route vanished after removal latched:
-                    // preserve the removal goal, but flag the invariant break
-                    // just as admission does above.
-                    panic!("removal response obligation must complete");
-                })
+                poll_fn(|context| response.poll_receive(context))
+                    .await
+                    .unwrap_or_else(|| {
+                        // The driver's removal `Obligation` publishes `Removed`
+                        // on every destruction path. A missing response therefore
+                        // means the terminal route vanished after removal latched:
+                        // preserve the removal goal, but flag the invariant break
+                        // just as admission does above.
+                        panic!("removal response obligation must complete");
+                    })
             }),
         }
     }

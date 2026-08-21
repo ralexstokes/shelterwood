@@ -13,6 +13,7 @@ use shelterwood_core::exit::JoinOutcome;
 use super::{
     DisposingReceiver, OneShotReceiver, OneShotSender, PanicPayload, catch_panic, discard_panic,
     dispose_detached, oneshot, sleep_until_std,
+    waker_proxy::{WakerProxy, WakerRetirement},
 };
 
 const BLOCKING_FALLBACK_THREAD: &str = "shelterwood-blocking";
@@ -410,7 +411,71 @@ where
 
 pub async fn join<T>(handle: JoinHandle<T>) -> JoinOutcome<T> {
     let JoinHandle { inner } = handle;
-    match inner.await {
+    classify_join_result(inner.await)
+}
+
+/// Joins a task from a future polled directly by a public API caller.
+///
+/// Tokio retains the polling task's raw waker in the join trailer. In pinned
+/// Tokio 1.53.1 that waker survives task completion until the `JoinHandle` is
+/// dropped, when the awaiting frame can already own a `JoinError::Panic` and
+/// its opaque panic payload. Park only a stable framework proxy in Tokio,
+/// retire the real caller waker synchronously and with containment before the
+/// ready result crosses this boundary, then let the handle destroy the proxy.
+///
+/// The ordinary [`join`] remains the lower-cost path for framework-task
+/// venues, whose executor wakers are not supplied by a public caller.
+pub async fn join_user_polled<T>(handle: JoinHandle<T>) -> JoinOutcome<T> {
+    let JoinHandle { inner } = handle;
+    classify_join_result(poll_join_user_waker(inner).await)
+}
+
+async fn poll_join_user_waker<T>(mut inner: task::JoinHandle<T>) -> Result<T, task::JoinError> {
+    let mut caller_waker = None;
+    let result = poll_fn(|context| {
+        if caller_waker.is_none() {
+            // Preserve the already-ready fast path: a framework no-op probe
+            // avoids cloning a caller waker that Tokio never needs to park.
+            let mut probe = std::task::Context::from_waker(std::task::Waker::noop());
+            let result = std::pin::Pin::new(&mut inner).poll(&mut probe);
+            if result.is_ready() {
+                return result;
+            }
+            caller_waker = Some(WakerProxy::new());
+        }
+
+        let proxy = caller_waker
+            .as_ref()
+            .expect("a pending public join retains its waker proxy");
+        proxy.register(context);
+        let mut proxy_context = std::task::Context::from_waker(proxy.waker());
+        let result = std::pin::Pin::new(&mut inner).poll(&mut proxy_context);
+        if result.is_ready() {
+            retire_join_caller_waker(&mut caller_waker);
+        }
+        result
+    })
+    .await;
+
+    // `result` can own Tokio's opaque panic payload. The real caller waker was
+    // already retired above, so dropping the completed handle dispatches only
+    // framework proxy vtables while that payload is live.
+    drop(inner);
+    result
+}
+
+fn retire_join_caller_waker(caller_waker: &mut Option<WakerProxy>) {
+    let caller_waker = caller_waker.take();
+    let mut panics = super::PanicAccumulator::default();
+    if let Some(caller_waker) = &caller_waker {
+        caller_waker.retire(WakerRetirement::Inline, &mut panics);
+    }
+    panics.run(|| drop(caller_waker));
+    discard_panic(panics.take());
+}
+
+fn classify_join_result<T>(result: Result<T, task::JoinError>) -> JoinOutcome<T> {
+    match result {
         Ok(value) => JoinOutcome::Ok { value },
         Err(error) if error.is_panic() => JoinOutcome::Panic {
             message: contain_panic_payload(error.into_panic()),
@@ -616,13 +681,14 @@ impl Default for JitterRng {
 #[cfg(test)]
 mod tests {
     use std::{
+        mem::ManuallyDrop,
         panic,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
         thread,
         time::Duration,
     };
@@ -653,6 +719,51 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             panic!("hostile blocking-result waker");
         }
+    }
+
+    #[derive(Default)]
+    struct JoinWakeState(AtomicBool);
+
+    unsafe fn clone_join_waker(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the reference represented by
+        // `data`; the returned raw waker owns only the new clone.
+        let state = ManuallyDrop::new(unsafe { Arc::<JoinWakeState>::from_raw(data.cast()) });
+        RawWaker::new(Arc::into_raw(Arc::clone(&state)).cast(), &JOIN_WAKER_VTABLE)
+    }
+
+    unsafe fn wake_join_waker(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        let state = unsafe { Arc::<JoinWakeState>::from_raw(data.cast()) };
+        state.0.store(true, Ordering::SeqCst);
+    }
+
+    unsafe fn wake_by_ref_join_waker(data: *const ()) {
+        // SAFETY: ManuallyDrop preserves the reference represented by `data`.
+        let state = ManuallyDrop::new(unsafe { Arc::<JoinWakeState>::from_raw(data.cast()) });
+        state.0.store(true, Ordering::SeqCst);
+    }
+
+    unsafe fn drop_join_waker(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<JoinWakeState>::from_raw(data.cast()) });
+        panic!("hostile public-join waker destructor");
+    }
+
+    static JOIN_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_join_waker,
+        wake_join_waker,
+        wake_by_ref_join_waker,
+        drop_join_waker,
+    );
+
+    fn panicking_drop_join_waker() -> (ManuallyDrop<Waker>, Arc<JoinWakeState>) {
+        let state = Arc::new(JoinWakeState::default());
+        let raw = RawWaker::new(Arc::into_raw(Arc::clone(&state)).cast(), &JOIN_WAKER_VTABLE);
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        let waker = unsafe { Waker::from_raw(raw) };
+        (ManuallyDrop::new(waker), state)
     }
 
     #[tokio::test]
@@ -852,6 +963,55 @@ mod tests {
                 message: Some(message)
             } if message == "blocking work panic"
         ));
+    }
+
+    /// Tokio's ready join result can own the task's opaque panic payload while
+    /// dropping the caller waker retained in the handle trailer. Combining a
+    /// panicking payload destructor with a panicking waker destructor used to
+    /// make that geometry abort the process. This test intentionally installs
+    /// both; nextest's process isolation turns a regression into this test's
+    /// failure rather than taking the whole suite with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_polled_join_separates_hostile_waker_and_panic_payload_destruction() {
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (payload_dropped, payload_dropped_rx) = mpsc::channel();
+        let handle = super::spawn(async move {
+            let _ = released.await;
+            panic::panic_any(PanickingDrop(payload_dropped));
+        });
+        let mut join = Box::pin(super::join_user_polled(handle));
+        let (hostile, state) = panicking_drop_join_waker();
+
+        assert!(matches!(
+            join.as_mut().poll(&mut Context::from_waker(&hostile)),
+            Poll::Pending
+        ));
+        release.send(()).expect("the panicking task is still live");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state.0.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completed task wakes its public join waiter");
+
+        assert!(matches!(
+            join.as_mut().poll(&mut Context::from_waker(&hostile)),
+            Poll::Ready(super::JoinOutcome::Panic { message: None })
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match payload_dropped_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        panic!("the hostile panic payload was not destroyed")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the hostile panic payload reaches detached disposal");
     }
 
     #[test]

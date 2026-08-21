@@ -184,7 +184,12 @@ impl<'a, A: Actor> Context<'a, A> {
         }
     }
 
-    /// Requests a clean local stop after the current callback.
+    /// Requests a clean local stop.
+    ///
+    /// External intake and incarnation-owned continuations, timers, and
+    /// offloads freeze at this call. The current callback may finish, but any
+    /// later attempt from it to queue such work is rejected. Terminal
+    /// publication follows callback completion.
     ///
     /// During a successful initializer with effective [`Readiness::AfterInit`],
     /// the automatic readiness edge is published before this request becomes
@@ -483,7 +488,23 @@ impl<A: Actor> RawActor for Handler<A> {
     /// this wrapper is the advertised raw-decorator composition point, so a
     /// decorator — not the raw runner — may resume after this future
     /// returns, and it must not observe still-live incarnation resources;
-    /// every error exit therefore freezes and joins them here first.
+    /// every error exit therefore freezes and joins them here first. That
+    /// half-teardown touches only the resource half: it leaves the mailbox
+    /// binding exactly as this loop left it — still accepting when the error
+    /// preceded any intake freeze, already frozen when it was raised during
+    /// frozen-prefix drain or after a `Context::stop` request, since
+    /// [`RawContext::stop`] and the [`recv`](RawContext::recv) /
+    /// [`try_recv`](RawContext::try_recv) shutdown boundary freeze intake
+    /// themselves. Either way the decorator finds the resource capabilities
+    /// already rejected. Resuming the raw loop past this point is
+    /// unsupported, and unenforced beyond a second call to this method
+    /// panicking: receives keep delivering whatever the mailbox state still
+    /// allows, while `continue_with`, `set_timeout`, `set_interval` and
+    /// `offload` silently return `Rejected` instead of diagnosing. Once the
+    /// decorated raw stack returns, the raw incarnation boundary freezes the
+    /// mailbox before joining resources and destroying the context and
+    /// actor, which is where acceptance closes for an incarnation that ends
+    /// without a stop phase (§5.4).
     async fn run(&mut self, raw: &mut RawContext<Self::Msg>) -> ExitResult {
         let HandlerState::Uninit(args) = std::mem::replace(&mut self.state, HandlerState::Spent)
         else {
@@ -545,7 +566,12 @@ impl<A: Actor> RawActor for Handler<A> {
 /// Propagates a callback error after §6.5's orderly teardown: incarnation-owned
 /// work is frozen, cancelled, and joined before control returns to the caller,
 /// which at the advertised composition point may be a raw decorator rather
-/// than the raw incarnation boundary itself.
+/// than the raw incarnation boundary itself. This helper touches only the
+/// resource half, leaving the mailbox binding as it found it: still accepting
+/// when the error preceded any intake freeze, already frozen when it was
+/// raised during frozen-prefix drain or after a stop request. The outer raw
+/// incarnation boundary freezes the mailbox when the decorated stack returns.
+/// Returning to the loop after this resource-only teardown is unsupported.
 async fn fail_after_teardown<M: Send + 'static>(
     raw: &mut RawContext<M>,
     error: ExitError,

@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) struct RecordedReport {
-    pub(super) outcome: Option<RecordedOutcome>,
+    pub(super) outcome: Option<RetainedRecordedOutcome>,
     pub(super) cancellation: Cancellation,
     pub(super) readiness_signal_seen: bool,
 }
@@ -55,6 +55,11 @@ pub(super) fn report_slot(
 
 impl ReportCompletion {
     fn fill(self, outcome: Option<RecordedOutcome>) {
+        // Retain here rather than at the send site. From `set` until the exit
+        // joiner's `receive`, the joiner's claim is the cell's sole owner; a
+        // joiner dropped un-polled at runtime teardown would otherwise run the
+        // application error's destructor inline on the teardown thread.
+        let outcome = outcome.map(RetainedRecordedOutcome::new);
         let cancellation =
             if self.shutdown.is_fired() || self.local_stop.as_ref().is_some_and(Latch::is_fired) {
                 Cancellation::Observed
@@ -123,7 +128,7 @@ pub(super) fn discharge_child_terminality(completion: ChildTerminality) {
         (Exit::never_started(), None)
     } else {
         (
-            classify_exit(
+            classify_exit_retaining(
                 None,
                 runtime::JoinOutcome::Cancelled,
                 None,
@@ -269,12 +274,14 @@ enum SpawnBody {
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
         latches: NestedScopeLatches,
+        start: NestedScopeStart,
     },
     ScopeOnce {
         tree: Box<BuilderCore>,
         scope: Arc<ScopeCell>,
         inherited: ResolvedDefaults,
         latches: NestedScopeLatches,
+        start: NestedScopeStart,
     },
 }
 
@@ -485,6 +492,7 @@ fn dispatch_child_construction(
                 (
                     SpawnBody::ScopeRestartable {
                         factory: Arc::clone(factory),
+                        start: nested_scope_start(&scope),
                         scope,
                         inherited,
                         latches: latches.nested_scope(),
@@ -497,6 +505,7 @@ fn dispatch_child_construction(
                         tree: definition
                             .take_one_shot()
                             .expect("one-shot subtree construction invoked more than once"),
+                        start: nested_scope_start(&scope),
                         scope,
                         inherited,
                         latches: latches.nested_scope(),
@@ -567,13 +576,15 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
                     scope,
                     inherited,
                     latches,
-                } => run_nested_factory(factory, scope, inherited, latches).await,
+                    start,
+                } => run_nested_factory(factory, scope, inherited, latches, start).await,
                 SpawnBody::ScopeOnce {
                     tree,
                     scope,
                     inherited,
                     latches,
-                } => run_nested_tree(*tree, scope, inherited, latches).await,
+                    start,
+                } => run_nested_tree(*tree, scope, inherited, latches, start).await,
             }
         };
         let outcome = CatchUnwindFuture::new(body).await;
@@ -968,7 +979,7 @@ impl ScopeRuntime {
         &mut self,
         key: ChildKey,
         incarnation: Incarnation,
-        recorded: Option<RecordedOutcome>,
+        recorded: Option<RetainedRecordedOutcome>,
         join: runtime::JoinOutcome<()>,
         cancellation: Cancellation,
         readiness_signal_seen: bool,
@@ -1019,8 +1030,8 @@ impl ScopeRuntime {
                 runtime::dispose_detached(teardown);
             }
         }
-        let recorded = reconcile_recorded_outcomes(recorded, active.forced_outcome);
-        let exit = classify_exit(recorded, join, active.hard_abort_phase, cancellation);
+        let recorded = reconcile_recorded_outcomes_retaining(recorded, active.forced_outcome);
+        let exit = classify_exit_retaining(recorded, join, active.hard_abort_phase, cancellation);
         child.restarts.settle_if_stable(
             IncarnationRun {
                 started_at: active.started_at,
@@ -1226,7 +1237,7 @@ impl ScopeRuntime {
             return;
         };
         let member = Arc::clone(&child.slot.member);
-        let mut exit = terminal.exit.into_exit();
+        let mut exit = terminal.exit;
         if terminal.exited_incarnation.is_some()
             && let Some(runtime::DisposalPanic { message }) = panic
         {
@@ -1234,7 +1245,7 @@ impl ScopeRuntime {
             // never-started child or a child between restart incarnations
             // keeps its already-authoritative verdict while disposal remains
             // ordered ahead of terminal routing.
-            exit = classify_disposal_panic(exit, message);
+            exit = classify_disposal_panic_retaining(exit, message);
         }
         // §7's `StartupAborted` is a startup-sequence property of a
         // membership that *ran* and failed before its initial readiness
@@ -1248,6 +1259,7 @@ impl ScopeRuntime {
         } else {
             StartupDisposition::NotAborted
         };
+        let exit = exit.into_exit();
         self.terminalize_child(key, exit.clone(), terminal.exited_incarnation, startup);
         // Keep the marker installed until terminal publication has committed.
         // A concurrent shutdown sampler then sees either pending cleanup or a

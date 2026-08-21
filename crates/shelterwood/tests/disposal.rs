@@ -1,12 +1,14 @@
 mod common;
 
 use std::{
+    fmt,
     future::{Future, poll_fn},
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc,
     },
     task::{Context, Poll, Wake, Waker},
     thread::{self, ThreadId},
@@ -14,8 +16,8 @@ use std::{
 };
 
 use crate::common::{
-    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually,
-    next_event, policy::never, poll_once,
+    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, advance_time,
+    assert_eventually, assert_quiet, next_event, policy::never, poll_once,
 };
 use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildId, ChildState, DynamicTree, ExitError, ExitKind,
@@ -48,6 +50,23 @@ impl DropProbe {
     }
 }
 
+impl fmt::Debug for DropProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DropProbe")
+    }
+}
+
+impl fmt::Display for DropProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("drop probe")
+    }
+}
+
+/// Lets the probe stand in for an application error, so a losing
+/// `ExitKind::Failed` payload reports its destruction thread the same way
+/// every other user value in this file does.
+impl std::error::Error for DropProbe {}
+
 impl Drop for DropProbe {
     fn drop(&mut self) {
         let _ = self.dropped.send(thread::current().id());
@@ -60,6 +79,26 @@ impl Drop for DropProbe {
 struct BlockingDropProbe {
     dropped: tokio::sync::mpsc::UnboundedSender<ThreadId>,
     _blocker: DestructorBlocker,
+}
+
+struct BlockingPanicPayload {
+    started: mpsc::Sender<ThreadId>,
+    _blocker: DestructorBlocker,
+}
+
+impl BlockingPanicPayload {
+    fn new(gate: &DestructorGate, started: mpsc::Sender<ThreadId>) -> Self {
+        Self {
+            started,
+            _blocker: gate.blocker(),
+        }
+    }
+}
+
+impl Drop for BlockingPanicPayload {
+    fn drop(&mut self) {
+        let _ = self.started.send(thread::current().id());
+    }
 }
 
 impl BlockingDropProbe {
@@ -137,6 +176,20 @@ struct PanickingPanicPayload;
 impl Drop for PanickingPanicPayload {
     fn drop(&mut self) {
         panic!("panic payload destructor");
+    }
+}
+
+/// A panic payload whose own destructor panics with a fresh copy of itself.
+///
+/// The counter records how many copies the framework destroys, which is the
+/// property under test: the terminal discard must stop the chain rather than
+/// let each replacement queue the next one.
+struct SelfRegeneratingPanicPayload(Arc<AtomicUsize>);
+
+impl Drop for SelfRegeneratingPanicPayload {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        std::panic::panic_any(SelfRegeneratingPanicPayload(Arc::clone(&self.0)));
     }
 }
 
@@ -473,6 +526,99 @@ fn final_factory_capture_is_destroyed_outside_the_current_thread_driver() {
         drops.recv().await.expect("factory capture was destroyed")
     });
     assert_ne!(dropped, driver_thread);
+}
+
+#[test]
+fn blocking_panic_payload_does_not_stall_current_thread_exit_publication() {
+    let driver_thread = thread::current().id();
+    let gate = DestructorGate::default();
+    let (started, started_rx) = mpsc::channel();
+    let (release, release_rx) = mpsc::channel();
+    let release_gate = gate.clone();
+    let helper = thread::spawn(move || {
+        let destructor_thread = started_rx
+            .recv_timeout(POLL_TIMEOUT)
+            .expect("panic payload destruction starts");
+        let released_after_publication = release_rx.recv_timeout(POLL_TIMEOUT).is_ok();
+        release_gate.release();
+        (destructor_thread, released_after_publication)
+    });
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let exit = runtime.block_on(async {
+        let mut tree = Tree::new();
+        let payload = BlockingPanicPayload::new(&gate, started);
+        let (task, _completion) = tree
+            .add_task_once(
+                "panic",
+                TaskOnceDef::new(move |_| async move {
+                    std::panic::panic_any(payload);
+                    #[allow(unreachable_code)]
+                    Ok::<(), ExitError>(())
+                }),
+            )
+            .expect("valid task");
+        let system = tree.spawn().expect("runtime is available");
+        let exit = task.wait().await;
+        release
+            .send(())
+            .expect("payload remains blocked until exit publication");
+        assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+        exit
+    });
+
+    let (destructor_thread, released_after_publication) =
+        helper.join().expect("destructor helper joins");
+    assert!(
+        released_after_publication,
+        "a blocking panic-payload destructor stalled exit publication"
+    );
+    assert_ne!(destructor_thread, driver_thread);
+    assert!(matches!(exit.kind(), ExitKind::Panicked { message: None }));
+}
+
+/// Detaching the payload must not cost the chain's terminal step.
+///
+/// The disposal lane classifies a destructor panic by calling back into
+/// `contain_panic_payload`, so a payload submitted bare would queue its own
+/// replacement forever. `shelterwood_core::panic`'s
+/// `discarding_a_recursively_hostile_panic_payload_is_contained` pins the
+/// terminal discard in isolation; this pins it on the path a user reaches,
+/// where the payload leaves an actor through `panic_any`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_self_regenerating_panic_payload_is_destroyed_a_bounded_number_of_times() {
+    let destructions = Arc::new(AtomicUsize::new(0));
+    let payload = SelfRegeneratingPanicPayload(Arc::clone(&destructions));
+    let mut tree = Tree::new();
+    let (task, _completion) = tree
+        .add_task_once(
+            "regenerating",
+            TaskOnceDef::new(move |_| async move {
+                std::panic::panic_any(payload);
+                #[allow(unreachable_code)]
+                Ok::<(), ExitError>(())
+            }),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+    assert!(matches!(
+        task.wait().await.kind(),
+        ExitKind::Panicked { message: None }
+    ));
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+
+    // Exactly one copy is destroyed: the replacement its destructor raises is
+    // the already-panicking diagnostic the terminal discard leaks on purpose.
+    // Without that step the count climbs by six figures per second, so the
+    // quiet window fails on its first sample instead of spinning.
+    assert_eventually!(|| destructions.load(Ordering::SeqCst) >= 1).await;
+    assert_quiet(Duration::from_millis(200), || {
+        destructions.load(Ordering::SeqCst) > 1
+    })
+    .await;
 }
 
 #[test]
@@ -1136,6 +1282,61 @@ async fn abandoned_one_shot_completion_keeps_completed_verdict_through_destructo
     );
     assert_disposed_off_current(&mut drops, "abandoned result reports its disposal thread").await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+/// A readiness timeout outranks the application failure the task then returns.
+/// The loser is a user value the framework never publishes, so its destruction
+/// venue is the only thing left to pin.
+#[tokio::test(start_paused = true)]
+async fn readiness_timeout_disposes_a_losing_application_error_off_the_driver() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let deadline_width = Duration::from_secs(10);
+    let started = ReleaseGate::default();
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "losing-error",
+            TaskDef::new({
+                let started = started.clone();
+                move |context| {
+                    let probe = DropProbe::reporting(dropped.clone());
+                    let started = started.clone();
+                    async move {
+                        started.release();
+                        context.shutdown_token().cancelled().await;
+                        Err(ExitError::from(probe))
+                    }
+                }
+            })
+            .restart(never())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .readiness_deadline(
+                ReadinessDeadline::bounded(deadline_width).expect("non-zero deadline"),
+            ),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+
+    started.wait().await;
+    advance_time(deadline_width).await;
+    system
+        .wait_started()
+        .await
+        .expect_err("readiness timeout aborts startup");
+    assert!(matches!(
+        task.wait().await.kind(),
+        ExitKind::ReadinessTimedOut { .. }
+    ));
+    assert_disposed_off_current(
+        &mut drops,
+        "the losing application error reports its disposal thread",
+    )
+    .await;
+    system
+        .shutdown(Duration::ZERO)
+        .await
+        .expect("terminal child leaves no straggler");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

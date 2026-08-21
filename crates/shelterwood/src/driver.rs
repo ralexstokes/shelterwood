@@ -34,7 +34,9 @@ use crate::{
     admission::{NotAdmittingCause, ReserveError},
     cells::{
         MemberCell, MemberStage, MemberTransition, ResidentProjection, RetainedExit,
-        RetainedStopReason, ScopeCell, ScopeControlEvent, StartupDisposition,
+        RetainedRecordedOutcome, RetainedStopReason, ScopeCell, ScopeControlEvent,
+        StartupDisposition, classify_disposal_panic_retaining, classify_exit_retaining,
+        reconcile_recorded_outcomes_retaining,
     },
     deadline::Deadline,
     engine::{
@@ -44,9 +46,8 @@ use crate::{
         schedule_restart,
     },
     exit::{
-        RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
-        reconcile_recorded_outcomes, stop_reason_into_nested_result, stop_reason_root_exit,
-        structured_startup_failure_error,
+        RecordedOutcome, StartupError, StopReason, stop_reason_into_nested_result,
+        stop_reason_root_exit, structured_startup_failure_error,
     },
     identity::IncarnationCounter,
     mailbox::{MailboxBindToken, MailboxControl, MailboxEffectQueue},
@@ -129,11 +130,14 @@ fn classify_retained_root_driver_join(
             (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
         }
     };
-    Err(classify_exit(None, join, None, cancellation))
+    Err(classify_exit_retaining(None, join, None, cancellation))
 }
 
 impl Drop for SystemRun {
     fn drop(&mut self) {
+        if self.driver.is_none() {
+            return;
+        }
         // After a clean shutdown the root epochs are `Idle`, not `Exhausted`,
         // so this writes a real `ScopeRequest` — targeting the pending next
         // incarnation — into dead control state and pulses the member record.
@@ -826,6 +830,18 @@ struct ScopeEpochGuard {
     retained_exits: Vec<RetainedExit>,
 }
 
+type NestedScopeStart = Obligation<Arc<ScopeCell>>;
+
+fn nested_scope_start(scope: &Arc<ScopeCell>) -> NestedScopeStart {
+    Obligation::new(Arc::clone(scope), close_never_started_scope_body)
+}
+
+fn close_never_started_scope_body(scope: Arc<ScopeCell>) {
+    // Bare like every sibling fallback: `Obligation::drop` is this
+    // obligation's only discharge path and contains the call itself.
+    scope.close_never_started_body();
+}
+
 impl ScopeEpochGuard {
     fn begin(scope: &Arc<ScopeCell>) -> Option<Self> {
         let lifecycle = ScopeLifecycle::starting();
@@ -876,8 +892,10 @@ async fn run_nested_tree(
     scope: Arc<ScopeCell>,
     inherited: ResolvedDefaults,
     latches: NestedScopeLatches,
+    mut start: NestedScopeStart,
 ) -> crate::ExitResult {
     let epoch = begin_nested_incarnation(&scope)?;
+    start.complete(drop);
     run_nested_tree_with_epoch(tree, scope, inherited, latches, epoch).await
 }
 
@@ -890,8 +908,10 @@ async fn run_nested_factory(
     scope: Arc<ScopeCell>,
     inherited: ResolvedDefaults,
     latches: NestedScopeLatches,
+    mut start: NestedScopeStart,
 ) -> crate::ExitResult {
     let epoch = begin_nested_incarnation(&scope)?;
+    start.complete(drop);
     let tree = factory();
     run_nested_tree_with_epoch(tree, scope, inherited, latches, epoch).await
 }

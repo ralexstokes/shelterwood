@@ -1388,6 +1388,46 @@ impl ScopeCell {
         self.with_observation_gate(|txn| self.terminalize_never_started_locked(txn));
     }
 
+    /// Publishes a nested scope body that was spawned but never began its own
+    /// incarnation. The parent driver remains responsible for the shared
+    /// membership's terminal exit and, unless it already published that exit,
+    /// closes observation after the terminal parent projection.
+    ///
+    /// `Unstarted` is precisely SPEC B.6's "no incarnation has ever spawned"
+    /// in the scope plane, and `Stopped { NeverStarted }` is its terminal
+    /// twin; publishing that pair is what makes the record agree with
+    /// `wait_stopped`'s own `Unstarted` answer. A body dropped before its
+    /// *restart* incarnation began is a different case: that scope already
+    /// published a real prior-incarnation reason, which is both its final
+    /// verdict and terminal, so the fallback must leave it alone. Publishing
+    /// `NeverStarted` over it would contradict the shared membership's exit
+    /// (`Aborted` with `last_incarnation: Some(..)`) and — because the parent
+    /// path can terminalize and close first — would only land in one of two
+    /// arrival orders. The fallback therefore supplies a missing terminal
+    /// projection and never replaces a published one; closure is the only
+    /// effect it owns unconditionally. `total_restarts` and `startup` need no
+    /// reset under this gate: an `Unstarted` scope never charged a restart,
+    /// and a startup result installed without an incarnation (identity
+    /// exhaustion) is the structured cause `wait_started` must keep.
+    pub fn close_never_started_body(&self) {
+        self.with_observation_gate(|txn| {
+            if self.observation.closed.load(Ordering::Acquire) {
+                return;
+            }
+            if matches!(self.record().state, ScopeState::Unstarted) {
+                self.publish_stopped_locked(txn, StopReason::NeverStarted, None, None);
+            }
+            // The same guard `terminalize_child` applies to its trailing
+            // close: a stream whose payload is still `Starting`/`Running`
+            // must not end on that projection.
+            if self.membership_terminal()
+                && matches!(self.record().state, ScopeState::Stopped { .. })
+            {
+                self.close_observation_locked(txn);
+            }
+        });
+    }
+
     pub fn terminalize_never_started_locked(&self, txn: &mut ObservationTxn<'_>) {
         if self.observation.closed.load(Ordering::Acquire) {
             return;
@@ -1412,9 +1452,9 @@ mod tests {
     };
 
     use shelterwood_core::{
-        Cancellation, ExitError, IntensityTrip, StartupFailure, StartupFailureCause,
+        Cancellation, ExitError, GracePhase, IntensityTrip, StartupFailure, StartupFailureCause,
         identity::ScopeIdentity,
-        policy::{ResolvedMailbox, ScopeFlavor},
+        policy::{ResolvedMailbox, RestartCount, ScopeFlavor},
     };
     use shelterwood_mailbox::{
         MailboxCell, MailboxControl, MailboxEffectQueue, MailboxReceiver, actor_ref_from_parts,
@@ -1429,6 +1469,152 @@ mod tests {
     struct GateCheckingWake {
         gate: super::ObservationGate,
         woke_after_unlock: Arc<AtomicBool>,
+    }
+
+    #[test]
+    fn never_started_body_publishes_before_membership_closes_observation() {
+        let scope = isolated_scope("nested", ScopeFlavor::Ordered);
+        let snapshots = scope.subscribe_snapshots();
+
+        scope.close_never_started_body();
+
+        let (snapshot, closed) = snapshots.borrow_latest_and_closed();
+        assert!(!closed, "membership terminality owns observation closure");
+        assert!(matches!(
+            snapshot.state,
+            ScopeState::Stopped {
+                reason: StopReason::NeverStarted
+            }
+        ));
+        assert_eq!(snapshot.total_restarts, TotalRestarts::ZERO);
+        assert!(matches!(
+            scope.record().startup,
+            Some(Err(StartupError::ShutdownRequested))
+        ));
+        assert!(
+            !matches!(scope.member.record().stage, MemberStage::Terminal(_)),
+            "the parent driver still owns membership terminality"
+        );
+
+        scope.terminalize_never_started();
+        let (_, closed) = snapshots.borrow_latest_and_closed();
+        assert!(closed, "terminal membership closes observation");
+    }
+
+    /// A body dropped before its *restart* incarnation began keeps the prior
+    /// incarnation's published reason, whichever of the two owners of that
+    /// scope's terminality runs first.
+    ///
+    /// The parent path (`terminalize_child`) and the body fallback race on a
+    /// current-thread runtime only by a few instructions, and on a
+    /// multi-thread runtime genuinely. Publishing `NeverStarted` here would
+    /// both depend on that order and contradict the membership exit, which
+    /// carries `last_incarnation: Some(..)` — SPEC B.6's stop-reason lattice
+    /// requires the projection and the exit to agree in either order.
+    #[test]
+    fn never_polled_restart_body_keeps_its_prior_reason_in_either_arrival_order() {
+        for parent_first in [true, false] {
+            let root = isolated_scope("root", ScopeFlavor::Ordered);
+            let nested = child_scope(&root, "nested", ScopeFlavor::Ordered);
+            root.admit_child(ResidentProjection::new(
+                Arc::clone(&nested.member),
+                Some(Arc::clone(&nested)),
+            ));
+            let mut incarnations = nested.member.take_incarnation_counter();
+            let first = incarnations.mint().expect("first incarnation available");
+            nested
+                .member
+                .transition(MemberTransition::Starting { incarnation: first });
+            let epoch = nested
+                .begin_incarnation(ScopeState::Starting)
+                .expect("first incarnation begins");
+            nested.finish_incarnation(epoch, StopReason::Finished);
+            nested
+                .member
+                .transition(MemberTransition::RestartScheduled {
+                    exit: Exit::completed(Cancellation::NotObserved),
+                    restart_count: RestartCount::ZERO.bump(),
+                    restart_at: None,
+                });
+            let restarted = incarnations.mint().expect("restart incarnation available");
+            nested.member.transition(MemberTransition::Starting {
+                incarnation: restarted,
+            });
+            let snapshots = nested.subscribe_snapshots();
+
+            // The restart body is dropped before its first poll, so it never
+            // reaches `begin_incarnation` and the parent aborts it.
+            let terminalize = || {
+                root.terminalize_child(
+                    &nested.member,
+                    Exit::aborted(GracePhase::WithinGrace, Cancellation::Observed),
+                    Some(restarted),
+                    StartupDisposition::NotAborted,
+                )
+            };
+            if parent_first {
+                terminalize();
+                nested.close_never_started_body();
+            } else {
+                nested.close_never_started_body();
+                terminalize();
+            }
+
+            let (snapshot, closed) = snapshots.borrow_latest_and_closed();
+            assert_eq!(
+                snapshot.state,
+                ScopeState::Stopped {
+                    reason: StopReason::Finished
+                },
+                "a never-polled restart keeps its prior incarnation's reason \
+                 (parent_first={parent_first})"
+            );
+            assert!(
+                closed,
+                "membership terminality closes observation (parent_first={parent_first})"
+            );
+            let record = nested.member.record();
+            assert!(
+                matches!(record.stage, MemberStage::Terminal(_)),
+                "the parent owns the shared membership's terminal exit"
+            );
+            assert!(
+                record.last_incarnation.is_some(),
+                "a restarted membership has spawned, so `NeverStarted` cannot describe it"
+            );
+        }
+    }
+
+    /// Identity exhaustion installs a structured startup failure and then
+    /// discharges the body obligation without an incarnation. The fallback
+    /// supplies the missing terminal projection without overwriting that
+    /// cause, so `wait_started` keeps reporting it.
+    #[test]
+    fn never_started_body_preserves_a_structured_startup_failure() {
+        let scope = isolated_scope("nested", ScopeFlavor::Ordered);
+        let failure = StartupFailure {
+            cause: StartupFailureCause::IdentityExhausted {
+                id: scope.member.id().clone(),
+            },
+        };
+        scope.set_startup(Err(StartupError::StartupFailed(failure)));
+
+        scope.close_never_started_body();
+
+        assert!(
+            matches!(
+                scope.record().startup,
+                Some(Err(StartupError::StartupFailed(_)))
+            ),
+            "a structured startup cause survives the never-started fallback: {:?}",
+            scope.record().startup
+        );
+        assert!(matches!(
+            scope.record().state,
+            ScopeState::Stopped {
+                reason: StopReason::NeverStarted
+            }
+        ));
     }
 
     impl Wake for GateCheckingWake {

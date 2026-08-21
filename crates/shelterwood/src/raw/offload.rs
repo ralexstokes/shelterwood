@@ -4,7 +4,10 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context as TaskPollContext, Poll},
 };
 
@@ -56,6 +59,17 @@ impl Guard {
     /// Waits for work completion or an incarnation-teardown cancellation request.
     ///
     /// This notification does not join work that is being hard-aborted.
+    ///
+    /// The waker driving this await is caller-owned, but the incarnation is
+    /// what runs it, so it belongs to SPEC §6.2's incarnation-owned disposal
+    /// funnel on the *ordinary* completion path and not only at teardown. A
+    /// waker that panics while being woken has its payload retained, which
+    /// fails the incarnation at its next receive boundary and suppresses
+    /// `on_stop` — a third party awaiting this can therefore kill the actor.
+    /// A waker that blocks instead holds the work in the incarnation's
+    /// resource ledger until it returns, so incarnation teardown joins that
+    /// completion rather than sailing past it. Await this from a task whose
+    /// waker does neither.
     pub async fn finished(&self) {
         self.finished.fired().await;
     }
@@ -147,6 +161,7 @@ pub(super) struct SharedOffloadState {
     pub(super) state: Mutex<OffloadFutureState>,
     disposal: RawDisposal,
     finished: Latch,
+    finished_published: AtomicBool,
 }
 
 impl SharedOffloadState {
@@ -159,6 +174,7 @@ impl SharedOffloadState {
             }),
             disposal,
             finished,
+            finished_published: AtomicBool::new(false),
         })
     }
 
@@ -196,6 +212,46 @@ impl SharedOffloadState {
         self.disposal.record(payload);
     }
 
+    /// Fires the completion notification once, and publishes it only after
+    /// this thread's wake has finished.
+    ///
+    /// [`Latch::fire`] sets its fired bit inside `fire_silently`, before it
+    /// wakes anything, so that bit cannot be the ledger's retirement
+    /// predicate: reclamation would be free to retire the entry — dropping the
+    /// task handle teardown still has to join — while a caller's completion
+    /// waker is mid-wake, after which a payload recorded by that wake lands in
+    /// a slot nobody reads again. Splitting the transition from the wake and
+    /// claiming the *latch's own* transition, rather than a second claim
+    /// beside it, keeps the wake-running thread and the publishing thread the
+    /// same thread by construction: two claims could disagree, letting a
+    /// concurrent canceller win the latch and run the wake while the publisher
+    /// marked completion around it.
+    fn fire_finished(&self) {
+        if !self.finished.fire_silently() {
+            return;
+        }
+        if let Err(payload) = catch_panic(|| self.finished.notify()) {
+            // Completion waiters are caller-owned. Keep their wake panics in
+            // the incarnation slot instead of letting them escape through the
+            // framework-owned offload task's join result.
+            self.record(payload);
+        }
+        // Release-publish only after the wake above returned or had its panic
+        // installed in the incarnation slot. Ledger reclamation consumes this
+        // edge with the matching `Acquire` in `finished_published`; weakening
+        // either side would let a reclaiming actor observe retirement without
+        // observing the recorded payload. No test pins that pairing — only
+        // this comment does.
+        self.finished_published.store(true, Ordering::Release);
+    }
+
+    /// Reports whether completion has been notified *and* its wake has
+    /// returned. See [`Self::fire_finished`] for why this, not
+    /// [`Latch::is_fired`], is what may retire ledger state.
+    pub(super) fn finished_published(&self) -> bool {
+        self.finished_published.load(Ordering::Acquire)
+    }
+
     pub(super) fn dispose(&self, future: Option<OffloadFuture>) {
         if let Some(future) = future {
             self.disposal.dispose(future);
@@ -213,7 +269,7 @@ impl SharedOffloadState {
             }
         };
         self.dispose(future);
-        self.finished.fire();
+        self.fire_finished();
     }
 }
 
@@ -232,7 +288,7 @@ impl Future for SharedOffloadFuture {
                 let dispose = self.0.finish_poll(future, OffloadPoll::Pending);
                 if dispose.is_some() {
                     self.0.dispose(dispose);
-                    self.0.finished.fire();
+                    self.0.fire_finished();
                     Poll::Ready(())
                 } else {
                     Poll::Pending
@@ -241,14 +297,14 @@ impl Future for SharedOffloadFuture {
             Ok(Poll::Ready(())) => {
                 let dispose = self.0.finish_poll(future, OffloadPoll::Finished);
                 self.0.dispose(dispose);
-                self.0.finished.fire();
+                self.0.fire_finished();
                 Poll::Ready(())
             }
             Err(payload) => {
                 let dispose = self.0.finish_poll(future, OffloadPoll::Finished);
                 self.0.record(payload);
                 self.0.dispose(dispose);
-                self.0.finished.fire();
+                self.0.fire_finished();
                 Poll::Ready(())
             }
         }
@@ -270,9 +326,11 @@ impl OffloadResource {
         });
         panics.record(retained.take());
         if let Some(state) = &self.state {
-            // `state.cancel` disposes the future before firing `finished`.
-            // Pull that contained destructor failure into the accumulator
-            // before recording a later wake panic escaping the call.
+            // `state.cancel` disposes the future and then contains its own
+            // completion wake, so neither a destructor panic nor a caller
+            // waker panic escapes the call: both arrive through the retained
+            // slot, where `PanicSlot`'s first-wins policy discards the loser.
+            // `state_panic` can therefore only be a poisoned-mutex `expect`.
             let state_panic = catch_panic(|| state.cancel()).err();
             panics.record(retained.take());
             panics.record(state_panic);
@@ -286,6 +344,12 @@ impl OffloadResource {
             panics.run(|| task.abort());
             panics.record(retained.take());
         }
+        // Unconditional on purpose. Once any contained fire has claimed the
+        // latch this is a no-op, which is what keeps a caller's completion
+        // wake off the actor thread while the offload task is running it. It
+        // is not redundant, though: a `state.cancel` that panicked before
+        // reaching its own fire — only a poisoned mutex can do that — would
+        // otherwise leave `Guard::finished()` waiters unwoken forever.
         panics.run(|| {
             self.finished.fire();
         });

@@ -239,6 +239,117 @@ async fn converted_nested_child_without_residency_closes_its_scope_on_drop() {
     assert!(snapshots.changed().await.is_err());
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn nested_body_aborted_before_first_poll_publishes_never_started_and_closes() {
+    let mut tree = Tree::new();
+    let nested = tree
+        .add_subtree_once("nested", SubtreeOnceDef::new(Tree::new()))
+        .expect("valid nested scope");
+    let mut snapshots = nested.subscribe_snapshots();
+    let fixture = OrderedScopeFixture::new(tree);
+    let key = fixture.children.keys().next().expect("nested child key");
+    let (mut scope, mut events) = fixture.build();
+
+    scope.spawn_child(key);
+    scope.children[key]
+        .active
+        .as_ref()
+        .expect("nested child is active")
+        .abort_handle
+        .abort();
+    let _exit = recv_child_exit(
+        &mut events,
+        DRIVER_PROGRESS_WAIT,
+        "the never-polled nested task to join",
+    )
+    .await;
+    let (pre_terminal, closed) = snapshots.borrow_latest_and_closed();
+    assert!(matches!(
+        pre_terminal.state,
+        ScopeState::Stopped {
+            reason: StopReason::NeverStarted
+        }
+    ));
+    assert!(
+        !closed,
+        "the body cannot close observation ahead of its parent terminal projection"
+    );
+    drop(scope);
+    assert_eq!(nested.wait_stopped().await, StopReason::NeverStarted);
+    let (latest, closed) = snapshots.borrow_latest_and_closed();
+    assert!(
+        closed,
+        "never-polled nested observation is closed: {latest:?}"
+    );
+    assert!(matches!(
+        latest.state,
+        ScopeState::Stopped {
+            reason: StopReason::NeverStarted
+        }
+    ));
+    let terminal = snapshots
+        .changed()
+        .await
+        .expect("the final nested snapshot is published");
+    assert!(matches!(
+        terminal.state,
+        ScopeState::Stopped {
+            reason: StopReason::NeverStarted
+        }
+    ));
+    assert!(snapshots.changed().await.is_err());
+}
+
+#[test]
+fn nested_body_spawned_after_runtime_shutdown_closes_its_observation() {
+    let mut tree = Tree::new();
+    let nested = tree
+        .add_subtree_once("nested", SubtreeOnceDef::new(Tree::new()))
+        .expect("valid nested scope");
+    let mut snapshots = nested.subscribe_snapshots();
+    let fixture = OrderedScopeFixture::new(tree);
+    let key = fixture.children.keys().next().expect("nested child key");
+    let (mut scope, _events) = fixture.build();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let dead_handle = runtime.handle().clone();
+    runtime.shutdown_background();
+    let entered = dead_handle.enter();
+    scope.spawn_child(key);
+    drop(entered);
+    drop(scope);
+
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("observer runtime");
+    observer.block_on(async {
+        assert!(matches!(
+            crate::runtime::timeout(DRIVER_PROGRESS_WAIT, nested.wait_stopped()).await,
+            crate::runtime::Timeout::Completed(StopReason::NeverStarted)
+        ));
+        let (latest, closed) = snapshots.borrow_latest_and_closed();
+        assert!(
+            closed,
+            "post-shutdown nested observation is closed: {latest:?}"
+        );
+        assert!(matches!(
+            latest.state,
+            ScopeState::Stopped {
+                reason: StopReason::NeverStarted
+            }
+        ));
+        snapshots
+            .changed()
+            .await
+            .expect("the final nested snapshot is published");
+        assert!(snapshots.changed().await.is_err());
+    });
+}
+
 #[crate::runtime::test]
 async fn scope_plan_conversion_panic_terminalizes_every_child() {
     let mut tree = Tree::new();

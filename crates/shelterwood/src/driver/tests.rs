@@ -5,6 +5,7 @@ mod exhaustion;
 mod observation;
 mod payload;
 mod reports;
+mod retained_outcomes;
 mod shutdown;
 mod startup;
 mod support;

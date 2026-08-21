@@ -820,6 +820,7 @@ async fn panicking_nested_factory_releases_its_pre_driver_epoch() {
     let scope = isolated_scope("nested", ScopeFlavor::Ordered);
     let driver_scope = Arc::clone(&scope);
     let driver = crate::runtime::spawn(async move {
+        let start = nested_scope_start(&driver_scope);
         let factory = Arc::new(|| -> crate::plan::BuilderCore {
             panic!("injected nested factory panic");
         });
@@ -836,6 +837,7 @@ async fn panicking_nested_factory_releases_its_pre_driver_epoch() {
                     abort_ack: Latch::default(),
                 },
             },
+            start,
         )
         .await
     });

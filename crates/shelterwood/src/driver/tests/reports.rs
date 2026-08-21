@@ -11,7 +11,7 @@ fn owned_report_token_consumes_or_falls_back_once() {
     let report = claim.receive();
     assert!(matches!(
         report.outcome,
-        Some(outcome) if matches!(outcome.kind(), ExitKind::Completed)
+        Some(outcome) if matches!(outcome.as_outcome().kind(), ExitKind::Completed)
     ));
     assert_eq!(report.cancellation, Cancellation::NotObserved);
     assert!(!report.readiness_signal_seen);
@@ -34,7 +34,7 @@ fn owned_report_token_records_prior_cancellation() {
     let report = claim.receive();
     assert!(matches!(
         report.outcome,
-        Some(outcome) if matches!(outcome.kind(), ExitKind::Completed)
+        Some(outcome) if matches!(outcome.as_outcome().kind(), ExitKind::Completed)
     ));
     assert_eq!(report.cancellation, Cancellation::Observed);
 }
@@ -102,4 +102,27 @@ fn owned_report_token_records_readiness_at_completion() {
     token.record(RecordedOutcome::returned(Ok(())));
     assert!(readiness.is_completed());
     assert!(claim.receive().readiness_signal_seen);
+}
+
+/// The claim is the cell's sole owner from the moment the child task fills it
+/// until the exit joiner calls `receive`. A joiner dropped un-polled in that
+/// window — runtime teardown drops un-polled tasks — must not run the
+/// application error's destructor inline, which is why the retaining carrier
+/// is applied in `fill` rather than at the event's send site.
+#[test]
+fn an_unclaimed_report_disposes_its_failed_outcome_off_the_dropping_thread() {
+    let (token, claim) = report_slot(Latch::default(), None, CompletionGatedLatch::default());
+    let (recorded, observed) = thread_reporting_error();
+    token.record(RecordedOutcome::returned(Err(recorded)));
+    let dropping_thread = std::thread::current().id();
+
+    drop(claim);
+
+    assert_ne!(
+        observed
+            .recv_timeout(DRIVER_PROGRESS_WAIT)
+            .expect("the unclaimed report's failed outcome is disposed"),
+        dropping_thread,
+        "an un-received report must not destroy its application error inline"
+    );
 }

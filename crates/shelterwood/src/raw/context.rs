@@ -1,11 +1,12 @@
 //! Per-incarnation raw actor context and owned resources.
 
+mod timers;
+
 use std::{
-    any::{Any, TypeId},
-    collections::{BTreeSet, HashMap, VecDeque, hash_map::RandomState},
+    collections::VecDeque,
     fmt,
     future::Future,
-    hash::{BuildHasher, Hash},
+    hash::Hash,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -13,7 +14,6 @@ use std::{
 use crate::{
     ActorRef, ChildId, DeadlineBudget, Incarnation, MailboxShutdown, Readiness,
     cancellation::{CancellationToken, ParentCancellationToken},
-    identity::PoisonedCounter,
     mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
     runtime::{
         self, CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher,
@@ -32,6 +32,8 @@ use super::{
 
 #[cfg(test)]
 use super::offload::OffloadPoll;
+
+use timers::{ArmingOrder, IntervalRearm, TimerMessage, TimerStore};
 
 type DeferredMessage<M> = Box<dyn FnOnce() -> M + Send + 'static>;
 /// An operation rejected because the actor incarnation is already stopping.
@@ -235,320 +237,6 @@ impl<M> Drop for ContinuationQueue<M> {
     }
 }
 
-enum TimerMessage<M> {
-    Once(M),
-    Interval(M, fn(&M) -> M),
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct ArmingOrder(u64);
-
-impl ArmingOrder {
-    const MAX: Self = Self(u64::MAX);
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct KeyHash(u64);
-
-struct TimerEntry<M> {
-    key: Box<dyn Any + Send>,
-    /// `None` when the requested delay overflows the clock: a deadline that
-    /// never arrives, mirroring the offload path — never "due now".
-    deadline: Option<Instant>,
-    arming_order: ArmingOrder,
-    message: TimerMessage<M>,
-    period: Option<Duration>,
-}
-
-enum IntervalRearm<M> {
-    Missing,
-    OneShot,
-    Interval(M),
-}
-
-#[derive(Clone, Copy)]
-struct TimerLocation {
-    hash: KeyHash,
-    index: usize,
-}
-
-/// Type-aware keyed timer lookup paired with an independently ordered
-/// deadline index.
-///
-/// Type identity participates in the key hash, so equal values of different
-/// key types remain distinct. A hash bucket still verifies erased equality to
-/// preserve `Eq` semantics in the unlikely event of a collision.
-struct TimerStore<M> {
-    key_hasher: RandomState,
-    keyed: HashMap<KeyHash, Vec<TimerEntry<M>>>,
-    armings: HashMap<ArmingOrder, KeyHash>,
-    deadlines: BTreeSet<(Instant, ArmingOrder)>,
-    disposal: RawDisposal,
-    #[cfg(test)]
-    lookup_probes: usize,
-}
-
-#[cfg(test)]
-impl<M> Default for TimerStore<M> {
-    fn default() -> Self {
-        Self::new(RawDisposal::default())
-    }
-}
-
-impl<M> TimerStore<M> {
-    fn new(disposal: RawDisposal) -> Self {
-        Self {
-            key_hasher: RandomState::new(),
-            keyed: HashMap::new(),
-            armings: HashMap::new(),
-            deadlines: BTreeSet::new(),
-            disposal,
-            #[cfg(test)]
-            lookup_probes: 0,
-        }
-    }
-    fn hash_key<K: Hash + 'static>(&self, key: &K) -> KeyHash {
-        KeyHash(self.key_hasher.hash_one((TypeId::of::<K>(), key)))
-    }
-
-    fn is_empty(&self) -> bool {
-        self.armings.is_empty()
-    }
-
-    fn clear(&mut self) {
-        let keyed = std::mem::take(&mut self.keyed);
-        self.armings.clear();
-        self.deadlines.clear();
-        for entry in keyed.into_values().flatten() {
-            self.dispose_entry(entry);
-        }
-    }
-
-    fn replace<K>(
-        &mut self,
-        key: K,
-        deadline: Option<Instant>,
-        arming_order: ArmingOrder,
-        message: TimerMessage<M>,
-        period: Option<Duration>,
-    ) where
-        K: Hash + Eq + Send + 'static,
-    {
-        // Hash and equality are user code. Keep incoming ownership behind the
-        // disposal boundary until those callbacks finish so a callback panic
-        // cannot unwind through a hostile key or message destructor.
-        let key = Contained::new(key, self.disposal.clone());
-        let message = Contained::new(message, self.disposal.clone());
-        let hash = self.hash_key(key.get());
-        self.remove_hashed(hash, key.get());
-        self.keyed.entry(hash).or_default().push(TimerEntry {
-            key: Box::new(key.into_inner()),
-            deadline,
-            arming_order,
-            message: message.into_inner(),
-            period,
-        });
-        let previous = self.armings.insert(arming_order, hash);
-        debug_assert!(previous.is_none());
-        if let Some(deadline) = deadline {
-            self.deadlines.insert((deadline, arming_order));
-        }
-    }
-
-    fn take<K>(&mut self, key: &K) -> Option<TimerEntry<M>>
-    where
-        K: Hash + Eq + 'static,
-    {
-        let hash = self.hash_key(key);
-        self.take_hashed(hash, key)
-    }
-
-    fn take_hashed<K>(&mut self, hash: KeyHash, key: &K) -> Option<TimerEntry<M>>
-    where
-        K: Eq + 'static,
-    {
-        #[cfg(test)]
-        let mut probes = 0;
-        let location = self.locate(hash, |entry| {
-            #[cfg(test)]
-            {
-                probes += 1;
-            }
-            entry.key.downcast_ref::<K>() == Some(key)
-        })?;
-        #[cfg(test)]
-        {
-            self.lookup_probes = self.lookup_probes.saturating_add(probes);
-        }
-        Some(self.unlink(location))
-    }
-
-    fn remove<K>(&mut self, key: &K) -> bool
-    where
-        K: Hash + Eq + 'static,
-    {
-        let Some(entry) = self.take(key) else {
-            return false;
-        };
-        self.dispose_entry(entry);
-        true
-    }
-
-    fn remove_hashed<K>(&mut self, hash: KeyHash, key: &K) -> bool
-    where
-        K: Eq + 'static,
-    {
-        let Some(entry) = self.take_hashed(hash, key) else {
-            return false;
-        };
-        self.dispose_entry(entry);
-        true
-    }
-
-    fn clear_and_dispose<K>(&mut self, key: K, message: M)
-    where
-        K: Hash + Eq + Send + 'static,
-    {
-        // A zero-period interval still invokes user Hash/Eq while it owns the
-        // rejected inputs. Keep both values contained through that lookup.
-        let key = Contained::new(key, self.disposal.clone());
-        let message = Contained::new(message, self.disposal.clone());
-        self.remove(key.get());
-        drop(key);
-        drop(message);
-    }
-
-    fn dispose_entry(&self, entry: TimerEntry<M>) {
-        let TimerEntry { key, message, .. } = entry;
-        self.disposal.dispose(key);
-        self.disposal.dispose(message);
-    }
-
-    fn locate(
-        &self,
-        hash: KeyHash,
-        mut predicate: impl FnMut(&TimerEntry<M>) -> bool,
-    ) -> Option<TimerLocation> {
-        let index = self.keyed.get(&hash)?.iter().position(&mut predicate)?;
-        Some(TimerLocation { hash, index })
-    }
-
-    fn unlink(&mut self, location: TimerLocation) -> TimerEntry<M> {
-        let (entry, empty) = {
-            let bucket = self
-                .keyed
-                .get_mut(&location.hash)
-                .expect("a timer location must reference a key bucket");
-            let entry = bucket.swap_remove(location.index);
-            (entry, bucket.is_empty())
-        };
-        // `replace` writes the key bucket and the arming index in one window
-        // that cannot panic between them — the user `Hash`/`Eq` callbacks run
-        // strictly before it — and an entry never migrates buckets except
-        // through this method. Their agreement is therefore structural, so
-        // check it where a broken invariant is cheap to see rather than
-        // paying two extra map lookups on every removal.
-        debug_assert_eq!(
-            self.armings.get(&entry.arming_order),
-            Some(&location.hash),
-            "a timer's key and arming indexes must agree"
-        );
-        if empty {
-            self.keyed.remove(&location.hash);
-        }
-        self.armings.remove(&entry.arming_order);
-        if let Some(deadline) = entry.deadline {
-            self.deadlines.remove(&(deadline, entry.arming_order));
-        }
-        entry
-    }
-
-    /// Resolves an arming index to its key-bucket location.
-    ///
-    /// `None` means the arming order is unknown, which is an ordinary miss.
-    /// A known arming order whose bucket or entry is absent is index
-    /// corruption; the two shapes panic distinctly so a failure names which
-    /// half of the pair went missing.
-    fn locate_arming(&self, arming_order: ArmingOrder) -> Option<TimerLocation> {
-        let hash = *self.armings.get(&arming_order)?;
-        let index = self
-            .keyed
-            .get(&hash)
-            .expect("an arming index must reference a key bucket")
-            .iter()
-            .position(|entry| entry.arming_order == arming_order)
-            .expect("an arming index must reference a timer");
-        Some(TimerLocation { hash, index })
-    }
-
-    fn remove_arming(&mut self, arming_order: ArmingOrder) -> Option<TimerEntry<M>> {
-        let location = self.locate_arming(arming_order)?;
-        Some(self.unlink(location))
-    }
-
-    fn entry_mut(&mut self, arming_order: ArmingOrder) -> Option<&mut TimerEntry<M>> {
-        let location = self.locate_arming(arming_order)?;
-        Some(
-            self.keyed
-                .get_mut(&location.hash)
-                .expect("a timer location must reference a key bucket")
-                .get_mut(location.index)
-                .expect("a timer location must reference a timer"),
-        )
-    }
-
-    fn take_due(&mut self, now: Instant) -> VecDeque<ArmingOrder> {
-        let due = self
-            .deadlines
-            .range(..=(now, ArmingOrder::MAX))
-            .copied()
-            .collect::<Vec<_>>();
-        for deadline in &due {
-            self.deadlines.remove(deadline);
-        }
-        due.into_iter().map(|(_, arming)| arming).collect()
-    }
-
-    fn arm_deadline(&mut self, arming_order: ArmingOrder, deadline: Option<Instant>) {
-        if let Some(deadline) = deadline {
-            self.deadlines.insert((deadline, arming_order));
-        }
-    }
-
-    fn rearm_interval(&mut self, arming_order: ArmingOrder, now: Instant) -> IntervalRearm<M> {
-        let (message, deadline) = {
-            let Some(entry) = self.entry_mut(arming_order) else {
-                return IntervalRearm::Missing;
-            };
-            let Some(period) = entry.period else {
-                return IntervalRearm::OneShot;
-            };
-            let deadline = crate::deadline::Deadline::after(now, period).instant();
-            let TimerMessage::Interval(message, clone_message) = &entry.message else {
-                unreachable!("an interval timer must own a message factory")
-            };
-            // Cloning is user code. Keep the entry's prior deadline intact
-            // until it succeeds so the fired batch can retry this arming if
-            // the panic escapes `recv` and the raw actor catches it.
-            let message = clone_message(message);
-            entry.deadline = deadline;
-            (message, deadline)
-        };
-        self.arm_deadline(arming_order, deadline);
-        IntervalRearm::Interval(message)
-    }
-
-    fn next_deadline(&self) -> Option<Instant> {
-        self.deadlines.first().map(|(deadline, _)| *deadline)
-    }
-}
-
-impl<M> Drop for TimerStore<M> {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
 struct ReadyBatch {
     phase: ReadyBatchPhase,
     mailbox_through: AcceptedSequence,
@@ -665,7 +353,6 @@ struct RawResources<M> {
     // continuations from leading while an external source remains eligible.
     continuation_needs_external: bool,
     timers: TimerStore<M>,
-    timer_orders: PoisonedCounter,
     ready_batch: Option<ReadyBatch>,
     events: Arc<EventQueue<M>>,
     disposal: RawDisposal,
@@ -685,7 +372,6 @@ impl<M> Default for RawResources<M> {
             continuations: ContinuationQueue::new(disposal.clone()),
             continuation_needs_external: false,
             timers: TimerStore::new(disposal.clone()),
-            timer_orders: PoisonedCounter::new(),
             ready_batch: None,
             events,
             disposal,
@@ -696,12 +382,11 @@ impl<M> Default for RawResources<M> {
 }
 
 impl<M> RawResources<M> {
-    fn freeze(&mut self) -> usize {
+    fn freeze(&mut self) {
         if !self.accepting {
-            return 0;
+            return;
         }
         self.accepting = false;
-        let dropped_continuations = self.continuations.len();
         // Treat the whole freeze as one cleanup transaction. Cancellation
         // contains each latch wake, future disposal and task abort
         // independently, while this outer accumulator keeps one failure from
@@ -728,7 +413,6 @@ impl<M> RawResources<M> {
             // synchronous cleanup has completed without losing the diagnostic.
             self.disposal.panic.restore_first(payload);
         }
-        dropped_continuations
     }
 
     /// Drops ledger entries for offloads that already finished, keeping a
@@ -742,7 +426,23 @@ impl<M> RawResources<M> {
     /// count, so a per-turn walk of it is proportional to work the actor
     /// itself has outstanding.
     fn reclaim_finished(&mut self) {
-        self.offloads.retain(|offload| !offload.finished.is_fired());
+        self.offloads.retain(|offload| {
+            if let Some(state) = &offload.state {
+                // Deliberately not the latch's fired bit: that is set before
+                // completion waiters are woken, so it would let this retire
+                // the entry — and with it the task handle teardown must join
+                // — while a caller's `Guard::finished()` waker is still
+                // running.
+                !state.finished_published()
+            } else {
+                // Only the zero-deadline short-circuit builds a resource with
+                // no shared state. It fires its latch while the `Guard` is
+                // still on the way back to the caller, so the waiter registry
+                // is provably empty: there is no wake for the fired bit to
+                // outrun, and no task handle to lose.
+                !offload.finished.is_fired()
+            }
+        });
     }
 
     fn resume_pending_panic(&self) {
@@ -755,6 +455,14 @@ impl<M> RawResources<M> {
         });
     }
 
+    /// Awaits every offload task the ledger still holds.
+    ///
+    /// Reclamation retires an entry only once its completion wake has
+    /// returned, so an offload whose caller-owned `Guard::finished()` waker
+    /// blocks is necessarily still here and is joined. That is the accepted
+    /// cost of never retiring work whose wake is in flight: caller code can
+    /// delay incarnation teardown, and therefore exit publication, for as
+    /// long as it blocks in that waker.
     async fn join_offloads(&mut self) {
         for offload in &mut self.offloads {
             if let Some(task) = offload.task.take() {
@@ -765,7 +473,6 @@ impl<M> RawResources<M> {
                             "library-owned offload task panicked without a string payload"
                                 .to_owned()
                         });
-                        tracing::error!(%message, "library-owned offload task panicked");
                         self.disposal.panic.record(Box::new(message));
                     }
                 }
@@ -778,10 +485,7 @@ impl<M> RawResources<M> {
 
 impl<M> Drop for RawResources<M> {
     fn drop(&mut self) {
-        let freeze_panic = catch_panic(|| {
-            let _ = self.freeze();
-        })
-        .err();
+        let freeze_panic = catch_panic(|| self.freeze()).err();
         let mut panics = PanicAccumulator::default();
         // `freeze` can transfer a destructor panic into the shared slot. Take
         // that retained application diagnostic after cleanup and preserve it
@@ -933,7 +637,7 @@ impl<M: Send + 'static> RawContext<M> {
     /// from the epilogue.
     pub fn stop(&mut self) {
         self.receiver.freeze();
-        self.freeze_and_report();
+        self.freeze_resources();
         self.local_stop.fire();
     }
 
@@ -949,7 +653,7 @@ impl<M: Send + 'static> RawContext<M> {
         // publishes it through the initializer context's Drop fallback.
         self.deferred_init_stop = true;
         self.receiver.freeze();
-        self.freeze_and_report();
+        self.freeze_resources();
     }
 
     /// Closes the callback initializer boundary. Consuming the pending bit
@@ -1108,15 +812,24 @@ impl<M: Send + 'static> RawContext<M> {
     ///
     /// Any incarnation-owned disposal panic retained by the time this path
     /// runs resumes here before another event is delivered or a stop is
-    /// reported: an offload-work panic, and — because the stop branches
-    /// freeze first — a destructor panic from the queued continuations,
-    /// armed timers, queued offload completions and offload futures that the
-    /// freeze releases, a waker panic from the `Guard::finished()` waiters
-    /// and cancellation latches that cancelling those offloads wakes, and a
-    /// panic raised by aborting an offload task. Retention is the guarantee,
-    /// not a join: a payload recorded after this check is still the
-    /// incarnation's exit, but is classified by the epilogue and cannot
-    /// suppress `on_stop`.
+    /// reported: an offload-work panic, a waker panic from the
+    /// `Guard::finished()` waiters that *ordinary* offload completion wakes,
+    /// and — because the stop branches freeze first — a destructor panic from
+    /// the queued continuations, armed timers, queued offload completions and
+    /// offload futures that the freeze releases, a waker panic from the
+    /// cancellation latches and completion notifications that cancelling
+    /// those offloads wakes, and a panic raised by aborting an offload task.
+    /// The completion-waiter class is not teardown-only: a third party
+    /// awaiting `Guard::finished()` with a panicking waker fails a live
+    /// incarnation here, and per SPEC §6.2 a failed incarnation skips
+    /// `on_stop`. Retention is the guarantee, not a join: a payload recorded
+    /// after this check is still the incarnation's exit, but is classified by
+    /// the epilogue and cannot suppress `on_stop`. The one exception is that
+    /// same completion wake: because retention has to be established before
+    /// the ledger may forget the work, a completion waker that *blocks*
+    /// instead of panicking pins its entry, and incarnation teardown then
+    /// joins it — an accepted trade against retiring work whose wake is still
+    /// in flight.
     ///
     /// A panic in an offload's continuation closure — the `FnOnce` that
     /// builds the message from the offload result, not a
@@ -1135,7 +848,7 @@ impl<M: Send + 'static> RawContext<M> {
         loop {
             if self.local_stop.is_fired() {
                 self.receiver.freeze();
-                self.freeze_and_report();
+                self.freeze_resources();
                 // `stop()` originates on this task, but the configured
                 // shutdown ladder is owned by the driver. The driver's helper
                 // only observes the local-stop latch and forwards
@@ -1152,7 +865,7 @@ impl<M: Send + 'static> RawContext<M> {
                 // also freezes before cancellation, but correctness of this
                 // receive boundary does not depend on that remote ordering.
                 self.receiver.freeze();
-                self.freeze_and_report();
+                self.freeze_resources();
                 self.resources.resume_pending_panic();
                 return None;
             }
@@ -1169,17 +882,24 @@ impl<M: Send + 'static> RawContext<M> {
     /// returning another event; a panic in an offload's continuation closure
     /// (the message-building `FnOnce`, not a
     /// [`continue_with`](Self::continue_with) continuation, which is a plain
-    /// stored message) surfaces directly from this call. During drain it
-    /// freezes first, then resumes any incarnation-owned disposal panic
-    /// retained by that point — an offload-work panic, a destructor panic
-    /// from the continuations, timers, queued completions and offload futures
-    /// the freeze releases, a waker panic from the `Guard::finished()`
-    /// waiters and cancellation latches that cancelling those offloads wakes,
-    /// or a panic raised by aborting an offload task — before reading the
-    /// frozen accepted mailbox
+    /// stored message) surfaces directly from this call. The outside-drain
+    /// class is not only offload work: a waker panic from the
+    /// `Guard::finished()` waiters that ordinary offload completion wakes is
+    /// retained the same way, so a third party awaiting `Guard::finished()`
+    /// with a panicking waker fails a live incarnation here and, per SPEC
+    /// §6.2, skips its `on_stop`. During drain it freezes first, then resumes
+    /// any incarnation-owned disposal panic retained by that point — those
+    /// two, plus a destructor panic from the continuations, timers, queued
+    /// completions and offload futures the freeze releases, a waker panic
+    /// from the cancellation latches and completion notifications that
+    /// cancelling those offloads wakes, or a panic raised by aborting an
+    /// offload task — before reading the frozen accepted mailbox
     /// prefix. Retention is the guarantee, not a join: a payload recorded
     /// after the check is still the incarnation's exit, but is classified by
-    /// the epilogue and cannot suppress `on_stop`.
+    /// the epilogue and cannot suppress `on_stop`. A completion waker that
+    /// blocks rather than panicking is the accepted exception: it pins its
+    /// ledger entry until it returns, so incarnation teardown joins that
+    /// completion.
     ///
     /// A panic escaping this call leaves the fired selection cut installed,
     /// so the next receive retries the same timer arming rather than
@@ -1194,7 +914,7 @@ impl<M: Send + 'static> RawContext<M> {
             // not rely on the driver's mailbox-freeze ordering relative to
             // the shutdown latch this call observes.
             self.receiver.freeze();
-            self.freeze_and_report();
+            self.freeze_resources();
             self.resources.resume_pending_panic();
             self.receiver.try_recv()
         } else {
@@ -1211,17 +931,11 @@ impl<M: Send + 'static> RawContext<M> {
     ) where
         K: Hash + Eq + Send + 'static,
     {
-        let arming_order = ArmingOrder(
-            self.resources
-                .timer_orders
-                .mint()
-                .expect("timer arming-order space exhausted"),
-        );
         let now = runtime::now();
         let deadline = crate::deadline::Deadline::after(now, after).instant();
         self.resources
             .timers
-            .replace(key, deadline, arming_order, message, period);
+            .replace(key, deadline, message, period);
     }
 
     fn start_offload<F, T, C>(
@@ -1261,6 +975,11 @@ impl<M: Send + 'static> RawContext<M> {
                 cancellation: cancellation.clone(),
                 make_message: Box::new(move || continuation.into_inner()(Err(DeadlineElapsed))),
             });
+            // The one uncontained completion fire in this file, and safe only
+            // because `guard` has not been handed back yet: no caller can hold
+            // this latch, so its waiter registry is empty and this wake runs
+            // nothing. Nothing structural enforces that — keep the fire ahead
+            // of the `return Ok(guard)` below.
             finished.fire();
             self.resources.offloads.push(OffloadResource {
                 cancellation,
@@ -1520,17 +1239,12 @@ impl<M: Send + 'static> RawContext<M> {
             IntervalRearm::Interval(message) => return Some(message),
         }
 
-        let entry = self
-            .resources
-            .timers
-            .remove_arming(arming)
-            .expect("a due one-shot timer remains registered");
-        let TimerEntry { key, message, .. } = entry;
-        self.resources.disposal.dispose(key);
-        let TimerMessage::Once(message) = message else {
-            unreachable!("a non-interval timer must own a one-shot message")
-        };
-        Some(message)
+        Some(
+            self.resources
+                .timers
+                .take_due_once(arming)
+                .expect("a due one-shot timer remains registered"),
+        )
     }
 
     fn next_timer_deadline(&self) -> Option<Instant> {
@@ -1565,22 +1279,10 @@ impl<M: Send + 'static> RawContext<M> {
         .await;
     }
 
+    /// Freezes incarnation resources on the exit path, discarding §6.2's
+    /// queued continuations.
     pub(crate) fn freeze_resources(&mut self) {
-        self.freeze_and_report();
-    }
-
-    /// Freezes incarnation resources, reporting §6.2's discarded
-    /// continuations on the exit path.
-    fn freeze_and_report(&mut self) {
-        let dropped = self.resources.freeze();
-        if dropped > 0 {
-            tracing::debug!(
-                id = %self.id,
-                incarnation = ?self.incarnation,
-                dropped_continuations = dropped,
-                "queued continuations discarded at the stop freeze"
-            );
-        }
+        self.resources.freeze();
     }
 
     pub(crate) async fn join_resources(&mut self) {
@@ -1596,11 +1298,12 @@ impl<M: Send + 'static> RawContext<M> {
 mod tests {
     use std::{
         future::Future,
-        panic::{AssertUnwindSafe, catch_unwind},
+        panic::{AssertUnwindSafe, catch_unwind, panic_any},
         pin::Pin,
         sync::{
-            Arc, Barrier,
+            Arc, Barrier, Mutex,
             atomic::{AtomicUsize, Ordering},
+            mpsc,
         },
         task::{Context, Poll, Wake, Waker},
         thread,
@@ -1608,9 +1311,8 @@ mod tests {
     };
 
     use super::{
-        ArmingOrder, EventQueue, OffloadPoll, OffloadResource, PanicSlot, QueuedEvent, RawContext,
-        RawDisposal, RawResources, RawRunContext, SharedOffloadFuture, SharedOffloadState,
-        TimerMessage,
+        EventQueue, OffloadPoll, OffloadResource, PanicSlot, QueuedEvent, RawContext, RawDisposal,
+        RawResources, RawRunContext, SharedOffloadFuture, SharedOffloadState, TimerMessage,
     };
     use crate::{
         ChildId, MailboxShutdown, Readiness,
@@ -1754,6 +1456,63 @@ mod tests {
 
     struct PanickingWake(&'static str);
 
+    /// How long a bounded handshake waits before failing its test.
+    ///
+    /// Generous enough to survive a loaded shared machine, finite so that a
+    /// mutation which suppresses the fire under test reports instead of
+    /// wedging the runner.
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A single-use, timeout-bounded signal between two threads.
+    ///
+    /// `Barrier` is the wrong oracle for these tests: a mutation that stops
+    /// the completion latch firing at all would block the waiting side
+    /// forever, turning a regression into a hang. Every wait here expires and
+    /// panics on the waiting thread instead, where nothing swallows it.
+    struct Gate {
+        sender: mpsc::SyncSender<()>,
+        receiver: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Gate {
+        fn new() -> Arc<Self> {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            Arc::new(Self {
+                sender,
+                receiver: Mutex::new(receiver),
+            })
+        }
+
+        fn open(&self) {
+            // A dropped peer means its wait already expired and failed the
+            // test; there is nothing left to report here.
+            let _ = self.sender.try_send(());
+        }
+
+        fn wait(&self, expected: &str) {
+            self.receiver
+                .lock()
+                .expect("gate receiver mutex poisoned")
+                .recv_timeout(HANDSHAKE_TIMEOUT)
+                .unwrap_or_else(|_| panic!("timed out waiting for {expected}"));
+        }
+    }
+
+    /// A wake panic payload that is deliberately not a string.
+    ///
+    /// An uncontained wake panic reaches the incarnation only as the offload
+    /// task's join result, which the framework can preserve solely as a
+    /// `String`. Panicking with an opaque payload is therefore what lets these
+    /// tests tell the caller's own payload apart from that stand-in.
+    #[derive(Debug, Eq, PartialEq)]
+    struct OpaqueWakePanic(&'static str);
+
+    struct BlockingPanickingWake {
+        entered: Arc<Gate>,
+        release: Arc<Gate>,
+        message: &'static str,
+    }
+
     impl Wake for PanickingWake {
         fn wake(self: Arc<Self>) {
             panic!("{}", self.0);
@@ -1761,6 +1520,24 @@ mod tests {
 
         fn wake_by_ref(self: &Arc<Self>) {
             panic!("{}", self.0);
+        }
+    }
+
+    impl BlockingPanickingWake {
+        fn block_then_panic(&self) {
+            self.entered.open();
+            self.release.wait("the test to release the completion wake");
+            panic_any(OpaqueWakePanic(self.message));
+        }
+    }
+
+    impl Wake for BlockingPanickingWake {
+        fn wake(self: Arc<Self>) {
+            self.block_then_panic();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.block_then_panic();
         }
     }
 
@@ -2054,6 +1831,160 @@ mod tests {
         assert!(!resources.offloads[0].finished.is_fired());
     }
 
+    /// The ordinary completion path — no freeze, no cancellation — retains a
+    /// `Guard::finished()` waiter's wake panic, and the ledger may not retire
+    /// the work until it has.
+    ///
+    /// The `Release` store that publishes completion is *not* pinned here:
+    /// `poller.join()` is a full fence, so weakening it to `Relaxed` would
+    /// still pass. Only the comment at that store constrains it. The
+    /// companion below covers the `task`-bearing chain this one omits.
+    #[test]
+    fn ordinary_offload_completion_retains_a_finished_waiter_wake_panic() {
+        let mut resources = RawResources::<()>::default();
+        let panic = Arc::clone(&resources.disposal.panic);
+        let finished = Latch::default();
+        let mut waiter = Box::pin(finished.fired());
+        let entered = Gate::new();
+        let release = Gate::new();
+        let hostile = Waker::from(Arc::new(BlockingPanickingWake {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            message: "ordinary finished wake panic",
+        }));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+
+        let state = SharedOffloadState::new(
+            Box::pin(async {}),
+            resources.disposal.clone(),
+            finished.clone(),
+        );
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished: finished.clone(),
+            state: Some(Arc::clone(&state)),
+            task: None,
+        });
+        let poller = thread::spawn(move || {
+            let mut work = SharedOffloadFuture(state);
+            assert!(
+                Pin::new(&mut work)
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready(),
+                "a caller wake panic does not escape through the offload task"
+            );
+        });
+        entered.wait("the completion wake to reach the hostile waiter");
+
+        // Sample the mid-wake state, then release before asserting on it: an
+        // assertion that fires while the wake is still parked would strand the
+        // peer on its timeout and report the expiry instead of the mismatch.
+        let fired_mid_wake = finished.is_fired();
+        resources.reclaim_finished();
+        let pinned_mid_wake = resources.offloads.len();
+        let recorded_mid_wake = panic.take();
+        release.open();
+
+        assert!(fired_mid_wake, "all completion waiters were released");
+        assert_eq!(
+            pinned_mid_wake, 1,
+            "the fired bit cannot retire work before its hostile wake is contained"
+        );
+        assert!(
+            recorded_mid_wake.is_none(),
+            "an actor turn can precede the blocked wake's panic"
+        );
+
+        poller.join().expect("the caller wake panic is contained");
+        resources.reclaim_finished();
+        assert!(
+            resources.offloads.is_empty(),
+            "the ledger retires work after notification publication"
+        );
+        let payload = panic
+            .take()
+            .expect("the caller wake panic survives ledger reclamation");
+        assert_eq!(
+            payload.downcast_ref::<OpaqueWakePanic>(),
+            Some(&OpaqueWakePanic("ordinary finished wake panic")),
+            "the caller's original payload is retained, not a stringified stand-in"
+        );
+    }
+
+    /// The chain the fix exists to protect, with a real task handle: the
+    /// ledger keeps the entry while the completion wake is in flight, so
+    /// teardown still owns the `ActorWork` it must join, and the caller's own
+    /// payload — not the task join's stringified panic — reaches the
+    /// post-join resource take.
+    ///
+    /// Multi-threaded on purpose: the test thread blocks on the handshake
+    /// while the offload task runs the hostile wake on a worker.
+    #[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_completion_wake_panic_survives_the_offload_task_join() {
+        let mut resources = RawResources::<()>::default();
+        let finished = Latch::default();
+        let mut waiter = Box::pin(finished.fired());
+        let entered = Gate::new();
+        let release = Gate::new();
+        let hostile = Waker::from(Arc::new(BlockingPanickingWake {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            message: "joined finished wake panic",
+        }));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+
+        let state = SharedOffloadState::new(
+            Box::pin(async {}),
+            resources.disposal.clone(),
+            finished.clone(),
+        );
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished: finished.clone(),
+            state: Some(Arc::clone(&state)),
+            task: Some(crate::runtime::spawn_actor_work(SharedOffloadFuture(state))),
+        });
+
+        entered.wait("the completion wake to reach the hostile waiter");
+        let fired_mid_wake = finished.is_fired();
+        resources.reclaim_finished();
+        let pinned_mid_wake = resources.offloads.len();
+        release.open();
+
+        assert!(fired_mid_wake, "all completion waiters were released");
+        assert_eq!(
+            pinned_mid_wake, 1,
+            "the ledger keeps the task handle teardown must join while the wake runs"
+        );
+
+        resources.join_offloads().await;
+        assert!(
+            resources.offloads.is_empty(),
+            "joining clears the ledger it pinned"
+        );
+
+        let payload = resources
+            .disposal
+            .panic
+            .take()
+            .expect("the caller wake panic reaches the post-join resource take");
+        assert_eq!(
+            payload.downcast_ref::<OpaqueWakePanic>(),
+            Some(&OpaqueWakePanic("joined finished wake panic")),
+            "the caller's original payload is retained, not the task join's stringified result"
+        );
+    }
+
     /// `freeze` is the drain that normally empties the continuation queue, but
     /// it is not a guaranteed one: `Drop for RawResources` skips it once the
     /// incarnation is already frozen, and runs it under `catch_panic` so an
@@ -2218,12 +2149,10 @@ mod tests {
     fn a_caught_interval_clone_panic_preserves_the_fired_batch_for_retry() {
         let clones = Arc::new(AtomicUsize::new(0));
         let mut context = bound_raw_context_for::<PanicOnceClone>().0;
-        let arming = ArmingOrder(1);
         let now = crate::runtime::now();
-        context.resources.timers.replace(
+        let arming = context.resources.timers.replace(
             "interval",
             Some(now),
-            arming,
             TimerMessage::Interval(
                 PanicOnceClone {
                     clones: Arc::clone(&clones),
@@ -2260,12 +2189,12 @@ mod tests {
     #[test]
     fn a_caught_offload_continuation_panic_preserves_later_fired_work() {
         let mut context = bound_raw_context_for::<u8>().0;
-        let arming = ArmingOrder(1);
         let now = crate::runtime::now();
-        context
-            .resources
-            .timers
-            .replace("timer", Some(now), arming, TimerMessage::Once(7), None);
+        let arming =
+            context
+                .resources
+                .timers
+                .replace("timer", Some(now), TimerMessage::Once(7), None);
         context.resources.events.push(QueuedEvent {
             cancellation: Latch::default(),
             make_message: Box::new(|| panic!("offload continuation panic")),
@@ -2293,20 +2222,14 @@ mod tests {
     fn clearing_an_elapsed_undelivered_timer_skips_its_captured_arming() {
         let mut context = bound_raw_context_for::<u8>().0;
         let now = crate::runtime::now();
-        context.resources.timers.replace(
-            "first",
-            Some(now),
-            ArmingOrder(1),
-            TimerMessage::Once(1),
-            None,
-        );
-        context.resources.timers.replace(
-            "second",
-            Some(now),
-            ArmingOrder(2),
-            TimerMessage::Once(2),
-            None,
-        );
+        context
+            .resources
+            .timers
+            .replace("first", Some(now), TimerMessage::Once(1), None);
+        context
+            .resources
+            .timers
+            .replace("second", Some(now), TimerMessage::Once(2), None);
 
         assert_eq!(context.try_recv(), Some(1));
         assert!(
@@ -2332,7 +2255,7 @@ mod tests {
         });
         resources
             .timers
-            .replace(7_u8, None, ArmingOrder(1), TimerMessage::Once(()), None);
+            .replace(7_u8, None, TimerMessage::Once(()), None);
 
         assert_eq!(
             Arc::strong_count(&resources.disposal.panic),
@@ -2437,7 +2360,7 @@ mod tests {
             task: None,
         });
 
-        assert_eq!(resources.freeze(), 1);
+        resources.freeze();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let payload = resources
             .disposal
@@ -2477,7 +2400,7 @@ mod tests {
             task: None,
         });
 
-        assert_eq!(resources.freeze(), 0);
+        resources.freeze();
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         let payload = resources
             .disposal
@@ -2498,9 +2421,13 @@ mod tests {
             .continuations
             .push_back(PanickingDrop(Arc::clone(&drops)));
 
-        assert_eq!(resources.freeze(), 1);
-        assert_eq!(resources.freeze(), 0, "the freeze transition is one-shot");
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        resources.freeze();
+        resources.freeze();
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the freeze transition is one-shot"
+        );
 
         let payload = catch_unwind(AssertUnwindSafe(|| drop(resources)))
             .expect_err("drop resumes the failure retained by the first freeze");
@@ -2535,12 +2462,11 @@ mod tests {
         resources.timers.replace(
             1_u8,
             None,
-            ArmingOrder(1),
             TimerMessage::Once(PanickingDrop(Arc::clone(&drops))),
             None,
         );
 
-        assert_eq!(resources.freeze(), 2);
+        resources.freeze();
         assert_eq!(
             drops.load(Ordering::SeqCst),
             4,
@@ -2594,417 +2520,5 @@ mod tests {
             .await
             .expect_err("initialization failure exits the incarnation");
         let _ = crate::RawActor::run(&mut handler, &mut context).await;
-    }
-}
-
-#[cfg(test)]
-mod timer_store_tests {
-    use std::{
-        collections::HashSet,
-        panic::{AssertUnwindSafe, catch_unwind},
-        sync::{
-            Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-        },
-        time::{Duration, Instant},
-    };
-
-    use super::{ArmingOrder, IntervalRearm, TimerMessage, TimerStore};
-
-    fn order(value: u64) -> ArmingOrder {
-        ArmingOrder(value)
-    }
-
-    #[derive(Eq, PartialEq)]
-    struct CollidingKey(u8);
-
-    impl std::hash::Hash for CollidingKey {
-        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-            0_u8.hash(state);
-        }
-    }
-
-    struct CountingHashKey {
-        value: u8,
-        hashes: Arc<AtomicUsize>,
-    }
-
-    impl PartialEq for CountingHashKey {
-        fn eq(&self, other: &Self) -> bool {
-            self.value == other.value
-        }
-    }
-
-    impl Eq for CountingHashKey {}
-
-    impl std::hash::Hash for CountingHashKey {
-        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-            self.hashes.fetch_add(1, Ordering::SeqCst);
-            std::hash::Hash::hash(&self.value, state);
-        }
-    }
-
-    struct PanickingEqKey {
-        value: u8,
-        panic_on_eq: Arc<AtomicBool>,
-    }
-
-    impl PartialEq for PanickingEqKey {
-        fn eq(&self, other: &Self) -> bool {
-            assert!(
-                !self.panic_on_eq.load(Ordering::SeqCst),
-                "timer key equality panic"
-            );
-            self.value == other.value
-        }
-    }
-
-    impl Eq for PanickingEqKey {}
-
-    impl std::hash::Hash for PanickingEqKey {
-        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-            self.value.hash(state);
-        }
-    }
-
-    struct PanickingHashKey(Arc<AtomicUsize>);
-
-    impl PartialEq for PanickingHashKey {
-        fn eq(&self, _other: &Self) -> bool {
-            true
-        }
-    }
-
-    impl Eq for PanickingHashKey {}
-
-    impl std::hash::Hash for PanickingHashKey {
-        fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {
-            panic!("timer key hash panic");
-        }
-    }
-
-    impl Drop for PanickingHashKey {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            panic!("timer key destructor panic");
-        }
-    }
-
-    struct PanickingTimerMessage(Arc<AtomicUsize>);
-
-    impl Drop for PanickingTimerMessage {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            panic!("timer message destructor panic");
-        }
-    }
-
-    fn once(entry: super::TimerEntry<&'static str>) -> &'static str {
-        let TimerMessage::Once(message) = entry.message else {
-            panic!("expected a live one-shot timer")
-        };
-        message
-    }
-
-    #[test]
-    fn timer_replacement_hashes_each_incoming_key_once() {
-        let hashes = Arc::new(AtomicUsize::new(0));
-        let mut timers = TimerStore::default();
-
-        for (order, message) in [(1, "first"), (2, "second")] {
-            timers.replace(
-                CountingHashKey {
-                    value: 7,
-                    hashes: Arc::clone(&hashes),
-                },
-                None,
-                super::ArmingOrder(order),
-                TimerMessage::Once(message),
-                None,
-            );
-        }
-
-        assert_eq!(hashes.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn heterogeneous_keys_keep_exact_identity_and_deadline_order() {
-        let start = Instant::now();
-        let mut timers = TimerStore::default();
-        timers.replace(
-            7_u8,
-            Some(start + Duration::from_secs(3)),
-            order(1),
-            TimerMessage::Once("old-u8"),
-            None,
-        );
-        timers.replace(
-            7_u16,
-            Some(start + Duration::from_secs(1)),
-            order(2),
-            TimerMessage::Once("u16"),
-            None,
-        );
-        timers.replace(
-            7_u8,
-            Some(start + Duration::from_secs(2)),
-            order(3),
-            TimerMessage::Once("new-u8"),
-            None,
-        );
-
-        assert_eq!(timers.next_deadline(), Some(start + Duration::from_secs(1)));
-        assert_eq!(
-            timers.take_due(start + Duration::from_secs(3)),
-            [order(2), order(3)],
-            "different key types coexist and replacement takes a fresh order"
-        );
-        assert_eq!(
-            once(timers.remove_arming(order(2)).expect("u16 timer remains")),
-            "u16"
-        );
-        assert_eq!(
-            once(timers.remove_arming(order(3)).expect("replacement remains")),
-            "new-u8"
-        );
-        assert!(timers.is_empty());
-    }
-
-    #[test]
-    fn interval_rearm_overflow_makes_the_live_entry_dormant() {
-        let now = Instant::now();
-        let arming = order(1);
-        let mut timers = TimerStore::default();
-        // Construct the delivery-time edge directly: the interval already
-        // fired at a representable deadline, but its next period does not fit
-        // in the clock domain.
-        timers.replace(
-            "interval",
-            Some(now),
-            arming,
-            TimerMessage::Interval("tick", Clone::clone),
-            Some(Duration::MAX),
-        );
-        assert_eq!(timers.take_due(now), [arming]);
-
-        assert!(matches!(
-            timers.rearm_interval(arming, now),
-            IntervalRearm::Interval("tick")
-        ));
-        assert_eq!(
-            timers
-                .entry_mut(arming)
-                .expect("the dormant interval remains clearable")
-                .deadline,
-            None
-        );
-        assert_eq!(
-            timers.next_deadline(),
-            None,
-            "overflow never substitutes an immediate delivery"
-        );
-        assert!(
-            timers.take(&"interval").is_some(),
-            "overflow dormancy does not erase the keyed interval"
-        );
-    }
-
-    #[test]
-    fn hash_collision_uses_exact_erased_key_equality() {
-        let mut timers = TimerStore::default();
-        timers.replace(
-            CollidingKey(1),
-            None,
-            order(1),
-            TimerMessage::Once("first"),
-            None,
-        );
-        timers.replace(
-            CollidingKey(2),
-            None,
-            order(2),
-            TimerMessage::Once("second"),
-            None,
-        );
-        timers.replace(
-            CollidingKey(1),
-            None,
-            order(3),
-            TimerMessage::Once("replacement"),
-            None,
-        );
-
-        assert_eq!(
-            once(
-                timers
-                    .take(&CollidingKey(2))
-                    .expect("colliding peer remains registered")
-            ),
-            "second"
-        );
-        assert_eq!(
-            once(
-                timers
-                    .take(&CollidingKey(1))
-                    .expect("replacement remains registered")
-            ),
-            "replacement"
-        );
-        assert!(timers.is_empty());
-    }
-
-    #[test]
-    fn equality_panic_leaves_timer_indexes_and_probe_count_coherent() {
-        let panic_on_eq = Arc::new(AtomicBool::new(false));
-        let start = Instant::now();
-        let deadline = start + Duration::from_secs(1);
-        let mut timers = TimerStore::default();
-        timers.replace(
-            PanickingEqKey {
-                value: 7,
-                panic_on_eq: Arc::clone(&panic_on_eq),
-            },
-            Some(deadline),
-            order(1),
-            TimerMessage::Once("message"),
-            None,
-        );
-        let query = PanickingEqKey {
-            value: 7,
-            panic_on_eq: Arc::clone(&panic_on_eq),
-        };
-
-        panic_on_eq.store(true, Ordering::SeqCst);
-        let panic = catch_unwind(AssertUnwindSafe(|| timers.take(&query)))
-            .err()
-            .expect("user equality panic escapes the timer lookup");
-        assert_eq!(
-            panic.downcast_ref::<&'static str>().copied(),
-            Some("timer key equality panic")
-        );
-        assert_eq!(timers.lookup_probes, 0, "a panicked scan is not committed");
-        assert_eq!(
-            timers.armings.get(&order(1)),
-            Some(&timers.hash_key(&query))
-        );
-        assert_eq!(timers.next_deadline(), Some(deadline));
-
-        panic_on_eq.store(false, Ordering::SeqCst);
-        assert_eq!(
-            once(timers.take(&query).expect("the timer remains linked")),
-            "message"
-        );
-        assert_eq!(timers.lookup_probes, 1);
-        assert!(timers.is_empty());
-        assert!(timers.deadlines.is_empty());
-    }
-
-    #[test]
-    fn timer_input_cleanup_stays_contained_when_hash_panics() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let mut timers = TimerStore::default();
-
-        let panic = catch_unwind(AssertUnwindSafe(|| {
-            timers.replace(
-                PanickingHashKey(Arc::clone(&drops)),
-                None,
-                order(1),
-                TimerMessage::Once(PanickingTimerMessage(Arc::clone(&drops))),
-                None,
-            );
-        }))
-        .expect_err("the user key hash panic escapes the timer operation");
-
-        assert_eq!(
-            panic.downcast_ref::<&'static str>().copied(),
-            Some("timer key hash panic"),
-            "the callback panic remains primary"
-        );
-        assert_eq!(
-            drops.load(Ordering::SeqCst),
-            2,
-            "both hostile incoming destructors run behind independent boundaries"
-        );
-        let cleanup = timers
-            .disposal
-            .panic
-            .take()
-            .expect("the first destructor panic is retained as cleanup evidence");
-        assert!(
-            matches!(
-                cleanup.downcast_ref::<&'static str>().copied(),
-                Some("timer message destructor panic" | "timer key destructor panic")
-            ),
-            "a hostile incoming destructor is recorded"
-        );
-        assert!(timers.is_empty());
-    }
-
-    #[test]
-    fn zero_period_timer_cleanup_stays_contained_when_hash_panics() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let mut timers = TimerStore::default();
-
-        let panic = catch_unwind(AssertUnwindSafe(|| {
-            timers.clear_and_dispose(
-                PanickingHashKey(Arc::clone(&drops)),
-                PanickingTimerMessage(Arc::clone(&drops)),
-            );
-        }))
-        .expect_err("the user key hash panic escapes the clear operation");
-
-        assert_eq!(
-            panic.downcast_ref::<&'static str>().copied(),
-            Some("timer key hash panic"),
-            "the callback panic remains primary"
-        );
-        assert_eq!(
-            drops.load(Ordering::SeqCst),
-            2,
-            "both zero-period inputs are destroyed behind containment"
-        );
-        assert!(
-            timers.disposal.panic.take().is_some(),
-            "a hostile input destructor is retained as cleanup evidence"
-        );
-        assert!(timers.is_empty());
-    }
-
-    #[test]
-    fn keyed_timer_churn_has_one_lookup_probe_per_removal() {
-        const TIMERS: usize = 16_384;
-
-        let start = Instant::now();
-        let mut timers = TimerStore::default();
-        let mut hashes = HashSet::with_capacity(TIMERS);
-        let mut keys = Vec::with_capacity(TIMERS);
-        let mut candidate = 0_usize;
-        while keys.len() < TIMERS {
-            if hashes.insert(timers.hash_key(&candidate)) {
-                keys.push(candidate);
-            }
-            candidate = candidate
-                .checked_add(1)
-                .expect("test key space must contain enough distinct hashes");
-        }
-        for (index, key) in keys.iter().copied().enumerate() {
-            timers.replace(
-                key,
-                Some(start + Duration::from_secs((TIMERS - index) as u64)),
-                order(index as u64),
-                TimerMessage::Once(()),
-                None,
-            );
-        }
-        for key in keys.into_iter().rev() {
-            assert!(timers.remove(&key));
-        }
-
-        assert!(timers.is_empty());
-        assert!(timers.deadlines.is_empty());
-        assert_eq!(
-            timers.lookup_probes, TIMERS,
-            "distinct hashes need one exact-key check each, not a vector scan"
-        );
     }
 }

@@ -17,8 +17,8 @@ use shelterwood::{
     Backoff, ChildState, DynamicScopeRef, DynamicTree, Intensity, Jitter, LifecycleEvent,
     LifecycleEventKind, LifecycleEvents, LifecycleItem, LifecycleSeq, LifecycleTryRecvError,
     MembershipStatus, RemoveOutcome, RestartCondition, RestartCount, RestartPolicy, Retention,
-    ScopeFlavor, ScopeRef, ScopeState, StopReason, Strategy, SubtreeDef, SubtreeOnceDef, TaskDef,
-    TaskOnceDef, TaskRef, TotalRestarts, Tree, WaitError,
+    ScopeFlavor, ScopeRef, ScopeState, SnapshotClosed, StopReason, Strategy, SubtreeDef,
+    SubtreeOnceDef, TaskDef, TaskOnceDef, TaskRef, TotalRestarts, Tree, WaitError,
 };
 
 // The ring width is an implementation choice, not façade API. This black-box
@@ -1484,4 +1484,28 @@ async fn state_predicates_hold_only_for_terminal_projections() {
     let stopped = scope.as_scope().snapshot().state.clone();
     assert!(matches!(stopped, ScopeState::Stopped { .. }));
     assert!(stopped.is_stopped());
+}
+
+#[tokio::test]
+async fn snapshot_subscription_yields_snapshot_closed_after_terminal_shutdown() {
+    let mut tree = Tree::new();
+    tree.add_task("worker", waiting_task())
+        .expect("valid waiting task");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("root starts");
+    let scope = system.scope();
+    let mut snapshots = scope.subscribe_snapshots();
+
+    system
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("root stops");
+
+    let terminal = snapshots
+        .changed()
+        .await
+        .expect("the final snapshot precedes closure");
+    assert!(terminal.state.is_stopped());
+    assert_eq!(snapshots.changed().await, Err(SnapshotClosed));
+    assert_eq!(snapshots.borrow_latest(), terminal);
 }

@@ -241,7 +241,13 @@ impl<R> System<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DynamicTree, Tree, sealed::Sealed};
+    use std::{
+        pin::pin,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+    };
+
+    use super::{DynamicTree, StopReason, Tree, sealed::Sealed};
     use crate::identity::ScopeIdentity;
 
     #[test]
@@ -257,5 +263,35 @@ mod tests {
         let core = <DynamicTree as Sealed>::into_core(tree);
         assert_eq!(ScopeIdentity::current_thread_creations(), after_tree);
         drop(core);
+    }
+
+    /// `SystemRun::drop` requests root shutdown so a dropped owner tears the
+    /// tree down. Once the driver has been joined that request has no
+    /// consumer, and writing it anyway would publish a live `ScopeRequest`
+    /// against the pending next incarnation and pulse the root member
+    /// record. The early return makes the drop inert instead; this pins it
+    /// through the pulse, which fires only when the request is published.
+    #[crate::runtime::test]
+    async fn joined_system_run_drop_publishes_no_root_scope_request() {
+        let mut system = Tree::new().spawn().expect("runtime is available");
+        let root = Arc::clone(&system.run.root);
+        system.scope().request_shutdown();
+        assert_eq!(system.run.wait().await, StopReason::ShutdownRequested);
+
+        // Subscribed after the join, so the only pulse it can observe is one
+        // the drop below publishes.
+        let mut watcher = root.signal().watcher();
+        drop(system);
+
+        let mut changed = pin!(watcher.changed());
+        assert!(
+            matches!(
+                changed
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ),
+            "a joined driver's SystemRun drop must not publish a root scope request"
+        );
     }
 }

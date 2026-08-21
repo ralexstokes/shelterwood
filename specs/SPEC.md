@@ -2860,22 +2860,28 @@ unlock.
 ### 15.5 Promises are owned completions
 
 Every cross-task promise — an admission or removal awaiting resolution,
-an exit report awaiting publication, a resident child awaiting its
-`Removed` edge, a member cell awaiting terminality, a waiter awaiting a
-wake — is held as an owned value whose destructor discharges it,
-fail-closed, with a **synchronous** fallback: complete with the terminal
-rejection, publish the coarse exit, emit the edge, pulse the signal —
-never an await, never a join. The event loop that services the orderly
-path is an optimization of these values' consumption, never the sole
-guarantor: when a driver future is destroyed at any await point —
+an exit report awaiting publication, a member cell awaiting terminality,
+a waiter awaiting a wake — is held as an owned value whose destructor
+discharges it, fail-closed, with a **synchronous** fallback: complete with
+the terminal rejection, publish the coarse exit, pulse the signal — never
+an await, never a join. The event loop that services the
+orderly path is an optimization of these values' consumption, never the
+sole guarantor: when a driver future is destroyed at any await point —
 hard-abort cascade, panic, natural return with events still queued —
 unwinding alone MUST discharge every outstanding promise (§11's
 driver-death rule, §16.17's test anchor). Two corollaries are normative.
-Residency in a scope's observed child set is itself such a value — its
-drop emits `Removed`, making §3.2's exact pairing structural rather than
-remembered. And each cell has exactly **one** change signal from which
-every compound wait derives — a second wake path is a lost wakeup
-waiting to be written.
+Residency in a scope's observed child set is the exception to a
+drop-emitted edge: a resident can own the last handle to a mailbox
+containing unread user messages, so its destructor is scheduled on a
+detached disposal worker (§5.5's venue) which has no observation
+transaction through which to publish. Each residency withdrawal MUST
+therefore emit `Removed` in the observation transaction that displaces
+it, and MUST emit it for exactly those residents whose `Added` the same
+scope already published — residency records which of the two it is, so
+§3.2's exact pairing survives a residency installed by an admission that
+then unwound. And each cell has exactly **one** change signal from which
+every compound wait derives — a second wake path is a lost wakeup waiting to
+be written.
 
 ### 15.6 Performance posture
 
@@ -3740,14 +3746,14 @@ ScopeSnapshot   { state: Unstarted                              // membership ex
                                            | IntensityTripped   // carries §10.2's structured trip data
                                            | StartupFailed      // nested rollback complete (§12);
                                                                 //   carries the startup-failure data
-                                           | NeverStarted },    // membership terminal, no incarnation
-                                                                //   ever spawned (§3.2): dropped-unspawned
-                                                                //   tree, rejected/withdrawn insertion,
-                                                                //   removal before first spawn, startup-
-                                                                //   aborted ordered sibling (§7) — the
-                                                                //   scope-state twin of §8's exit, an
-                                                                //   invariant the stop-reason lattice
-                                                                //   below preserves in either order
+                                           | NeverStarted },    // no scope incarnation ever began:
+                                                                //   dropped-unspawned tree, rejected/
+                                                                //   withdrawn insertion, removal before
+                                                                //   first spawn, startup-aborted ordered
+                                                                //   sibling (§7), or a spawned nested body
+                                                                //   dropped before first poll; this is a
+                                                                //   scope-plane verdict, not necessarily
+                                                                //   the membership exit's twin (below)
                   kind: Ordered | Dynamic, strategy (ordered only), intensity,
                   total_restarts: TotalRestarts,         // charges per §10.2 — group respawns count
                   lifecycle_seq: LifecycleSeq,           // aligns events with snapshots (§14)
@@ -3772,14 +3778,19 @@ order is severity-ascending: `Finished` is the weakest claim, since a
 drain that began on natural completion says nothing about how the
 teardown itself ended; `ShutdownRequested` supersedes the structured
 failures, matching §11's drain-upgrade rule, which joins through this
-same lattice; and `NeverStarted` is the top element because it is not a
-live incarnation's verdict but the membership-terminal twin of §8's
-`NeverStarted` exit, so the scope-state projection and the membership
-exit agree whichever publication lands first. The consequences are that
-`wait_stopped()`, the final snapshot, and the stream's last `ScopeState`
-event always report the same, highest-precedence verdict, and that a
-root driver that dies mid-drain reports the join monitor's
-`ShutdownRequested` rather than the abandoned drain's `Finished`.
+same lattice; and `NeverStarted` is the top element because it states that
+no scope incarnation ever began, rather than giving a live scope
+incarnation's verdict. This lattice and its agreement guarantee apply within
+the scope plane: `wait_stopped()`, the final snapshot, and the stream's last
+`ScopeState` event always report the same, highest-precedence verdict. They do
+not require the membership plane's exit kind to match. In particular, a
+nested scope body dropped before its first poll is the sanctioned
+cross-plane divergence: the scope projection is `Stopped { NeverStarted }`
+because no scope incarnation began, while the membership exit is
+`Aborted { WithinGrace }` with `last_incarnation: Some(1)` because an
+incarnation was spawned on the membership plane and then aborted. A root
+driver that dies mid-drain reports the join monitor's `ShutdownRequested`
+rather than the abandoned drain's `Finished`.
 
 ```text
 ActorStats (II §22)

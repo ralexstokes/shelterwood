@@ -395,7 +395,7 @@ async fn never_started_outranks_an_earlier_shutdown_requested() {
         ScopeState::Stopped {
             reason: StopReason::NeverStarted
         },
-        "the scope state must agree with a never-started membership exit"
+        "the stronger scope-plane verdict replaces the earlier state"
     );
     assert_eq!(
         states,

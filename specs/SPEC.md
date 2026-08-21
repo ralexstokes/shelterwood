@@ -725,8 +725,16 @@ starts) and closes at the intake freeze when the incarnation begins
 stopping (§6.2 — the freeze precedes drain and `on_stop`, which is what
 makes the drained log exactly the accepted prefix; under `latest()`, its
 surviving slot) or, for an incarnation that ends without a stop phase
-(panic, hard abort, plain return), at its exit publication (§8); outside
-that window sends park (`send`) or fail fast (`try_send`, `NotRunning`).
+(plain return, error return, or panic), at the raw incarnation boundary's
+mailbox freeze — taken the moment the incarnation body returns or
+unwinds, before its resources are joined and before the context and actor
+are destroyed (§6.5), and therefore strictly before exit publication (§8).
+A hard abort is reachable only as a grace-ladder escalation (§11) of a
+stop request that already froze intake, so its close point is that stop's
+freeze; abrupt driver teardown freezes and closes together. On every path
+acceptance is closed no later than exit publication. Outside the
+acceptance window sends park (`send`) or fail fast (`try_send`,
+`NotRunning`).
 
 Readiness (§7) never gates acceptance — a gated child's mailbox accepts
 during its handshake, which is what lets cross-wired siblings send to a
@@ -1057,6 +1065,23 @@ handlers non-blocking. Contracts:
   `StopContext::run_blocking` may therefore start work after the
   async-resource freeze. The mailbox binding outlives actor destruction
   on every path.
+- At the raw-decorator composition point, an inner `Handler` returning
+  `Err` has already frozen and joined its incarnation-owned resource half.
+  It touches **only** that half: the mailbox binding is left exactly as the
+  callback loop left it — still accepting when the error preceded any intake
+  freeze (an `init` or live-handler error with no stop request), already
+  frozen when the error was raised while draining the frozen prefix or after
+  a `ctx.stop()`, because the stop call and the `recv`/`try_recv` shutdown
+  boundary freeze intake themselves (§6.2). Continuing to drive that raw loop
+  is unsupported, and unenforced beyond a second `Handler` initialization
+  panicking: receives keep delivering whatever the mailbox state still
+  allows, while the incarnation-resource capabilities silently reject
+  instead of diagnosing. The framework performs neither teardown step
+  on a plain `RawActor`'s behalf, so its decorator observes whatever that
+  loop itself froze. On both paths the raw incarnation boundary freezes the
+  mailbox when the decorated stack returns, before joining resources and
+  destroying the context and actor — §5.4's close point for an incarnation
+  that ends without a stop phase.
 
 ## 7. Readiness
 

@@ -29,7 +29,7 @@ async fn successful_admission_never_parks_its_caller_waker_and_returns_the_exact
     let slot = scope.reserve_task("proxied-admission").expect("id is free");
     let expected = slot.task_ref();
     let mut admission = Box::pin(slot.define(waiting_task()));
-    let (hostile, _state) = hostile_waker("injected admission/removal caller-waker drop panic");
+    let hostile = hostile_waker("injected admission/removal caller-waker drop panic");
 
     assert!(matches!(
         admission.as_mut().poll(&mut Context::from_waker(&hostile)),
@@ -72,7 +72,7 @@ async fn exact_removal_never_parks_its_caller_waker_and_preserves_its_outcomes()
         .await
         .expect("task is admitted");
     let mut removal = Box::pin(scope.remove_task(&task));
-    let (hostile, _state) = hostile_waker("injected admission/removal caller-waker drop panic");
+    let hostile = hostile_waker("injected admission/removal caller-waker drop panic");
 
     assert!(matches!(
         removal.as_mut().poll(&mut Context::from_waker(&hostile)),

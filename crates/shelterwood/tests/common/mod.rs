@@ -21,7 +21,7 @@ pub(crate) use timing::{
     POLL_TIMEOUT, advance_time, assert_eventually_predicate, assert_quiet, poll_once, poll_until,
     poll_until_ready,
 };
-pub(crate) use waker::{HostileWakerState, hostile_waker};
+pub(crate) use waker::hostile_waker;
 
 macro_rules! assert_eventually {
     ($predicate:expr $(,)?) => {

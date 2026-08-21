@@ -87,7 +87,7 @@ async fn drive_run_blocking_delivery(panic_on_drop: bool) {
             .expect("the actor returns the public blocking future"),
     );
     operation.wait_entered();
-    let (hostile, _state) = hostile_waker("injected result caller-waker drop panic");
+    let hostile = hostile_waker("injected result caller-waker drop panic");
     assert!(matches!(
         work.as_mut().poll(&mut TaskContext::from_waker(&hostile)),
         Poll::Pending

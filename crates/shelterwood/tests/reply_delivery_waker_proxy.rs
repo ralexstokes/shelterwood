@@ -57,7 +57,7 @@ async fn successful_call_contains_reply_caller_waker_retirement() {
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
 
-    let (hostile, _state) = hostile_waker("injected reply caller-waker drop panic");
+    let hostile = hostile_waker("injected reply caller-waker drop panic");
     let mut call = Box::pin(actor.call(Message::Ask, Duration::from_secs(30)));
     assert!(matches!(
         call.as_mut().poll(&mut TaskContext::from_waker(&hostile)),
@@ -124,7 +124,7 @@ async fn successful_recv_cannot_double_panic_with_hostile_waker_and_value_drops(
         .add_actor_once("reply-waker-recv", ActorOnceDef::<ChannelSource>::new(()))
         .expect("valid actor");
     let (reply, receiver) = actor.reply_channel::<HostileReply>();
-    let (hostile, _state) = hostile_waker("injected reply caller-waker drop panic");
+    let hostile = hostile_waker("injected reply caller-waker drop panic");
     let mut receive = Box::pin(receiver.recv(Duration::from_secs(30)));
     assert!(matches!(
         receive

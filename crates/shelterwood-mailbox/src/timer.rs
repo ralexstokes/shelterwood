@@ -61,7 +61,9 @@ impl ProxiedSleep {
     /// Public only as a sibling-crate implementation seam. Runtime selection
     /// helpers call it when a non-timer branch wins, so that semantic poll
     /// path retains the synchronous-contained half of the venue split even
-    /// though the timer itself is the losing future.
+    /// though the timer itself is the losing future. Retirement fuses the
+    /// sleep: a later poll reports ready rather than reaching for the
+    /// emptied timer slot.
     #[doc(hidden)]
     pub fn cancel_inline(&mut self) {
         let mut panics = PanicAccumulator::default();
@@ -95,6 +97,10 @@ impl ProxiedSleep {
         panics.run(|| drop(timer));
         let timer_waker = self.timer_waker.take();
         panics.run(|| drop(timer_waker));
+        // Retirement is the single point that empties both slots, so it also
+        // fuses the future: without this, a poll after `cancel_inline` would
+        // panic on the emptied timer slot instead of reporting ready.
+        self.completed = true;
     }
 }
 
@@ -310,6 +316,16 @@ mod tests {
         );
         assert!(timer.timer.is_none());
         assert!(timer.timer_waker.is_none());
+
+        assert!(
+            Pin::new(&mut timer).poll(&mut context).is_ready(),
+            "a cancelled proxied timer is fused rather than reaching for its emptied slots"
+        );
+        assert_eq!(
+            state.clones.load(Ordering::SeqCst),
+            1,
+            "repolling a cancelled timer never reaches the caller vtable"
+        );
     }
 
     struct ThreadDrop(mpsc::Sender<ThreadId>);

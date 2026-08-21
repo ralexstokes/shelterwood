@@ -1,4 +1,5 @@
 use std::{
+    mem,
     sync::{Arc, Mutex},
     task::{Wake, Waker},
 };
@@ -11,14 +12,26 @@ use crate::cell::waker_slot::{WakerAction, WakerEffects, WakerSlot};
 /// `Arc` bookkeeping over framework-owned state. The caller's real waker stays
 /// in the private slot and every path that removes it queues the resulting
 /// user-code effect before releasing the slot mutex.
+///
+/// The proxy mutex is a **leaf**: [`Wake::wake_by_ref`] takes it from whatever
+/// thread drives the external primitive, so nothing this type does under it may
+/// take another framework lock.
 pub(crate) struct WakerProxy {
     proxy: Waker,
     state: Arc<WakerProxyState>,
 }
 
+/// The proxy's mutable half: the caller's waker beside the record of a wake
+/// that has not yet reached the caller who is polling now.
+#[derive(Default)]
+struct Registration {
+    caller: WakerSlot,
+    woken: bool,
+}
+
 #[derive(Default)]
 struct WakerProxyState {
-    caller: Mutex<WakerSlot>,
+    caller: Mutex<Registration>,
 }
 
 impl WakerProxy {
@@ -30,6 +43,31 @@ impl WakerProxy {
 
     /// Installs the current caller without cloning or dropping its waker
     /// while the proxy mutex is held.
+    ///
+    /// # The lost-wake handshake
+    ///
+    /// Cloning `current` dispatches a caller-owned vtable, so it has to happen
+    /// between two critical sections. A wake landing in that window finds
+    /// either an empty slot or the *previous* poll's waker, and once a future
+    /// has migrated between tasks that previous waker no longer wakes the task
+    /// polling now. Installing the fresh waker on top of that would leave no
+    /// record the wake ever happened, and the future would never be polled
+    /// again.
+    ///
+    /// So [`Wake::wake_by_ref`] records `woken` in the same critical section in
+    /// which it takes the slot, and every registration that installs a waker
+    /// reads-and-clears that flag: a set flag takes the just-installed waker
+    /// straight back out and hands it to the effects sink, which wakes it after
+    /// unlock. No waker vtable is invoked or cloned under the mutex, and no
+    /// wake is lost. The cost is a spurious re-poll, which the `Future`
+    /// contract permits — a lost wake is not.
+    ///
+    /// The `will_wake` short-circuit rides the same read-and-clear rather than
+    /// returning early. It cannot in fact observe a set flag: `wake_by_ref`
+    /// empties the slot in the critical section that sets the flag, so a slot
+    /// still holding a matching waker proves nothing has woken since that waker
+    /// was installed. Handling it anyway costs one branch and keeps the "no
+    /// wake is lost" claim from resting on that invariant.
     pub(crate) fn register(&self, current: &Waker) {
         let mut replacement = None;
         loop {
@@ -37,19 +75,25 @@ impl WakerProxy {
             // releases the mutex before a displaced RawWaker vtable runs.
             let mut effects = WakerEffects::default();
             let needs_clone = {
-                let mut caller = self
+                let mut registration = self
                     .state
                     .caller
                     .lock()
                     .expect("waker proxy mutex poisoned");
-                if caller.will_wake(current) {
-                    false
-                } else if let Some(replacement) = replacement.take() {
-                    caller.replace(replacement, &mut effects);
-                    false
-                } else {
+                let installed = if registration.caller.will_wake(current) {
                     true
+                } else if let Some(replacement) = replacement.take() {
+                    registration.caller.replace(replacement, &mut effects);
+                    true
+                } else {
+                    // Nothing was installed, so the flag stays set for the
+                    // registration that eventually succeeds.
+                    false
+                };
+                if installed && mem::take(&mut registration.woken) {
+                    registration.caller.take(WakerAction::Wake, &mut effects);
                 }
+                !installed
             };
             drop(effects);
 
@@ -68,18 +112,37 @@ impl WakerProxy {
         &self.proxy
     }
 
-    /// Moves the caller waker into an explicitly chosen post-unlock effect.
+    /// Moves the caller waker into an explicitly chosen post-unlock effect,
+    /// discarding any unconsumed wake record with it.
+    ///
+    /// `retire` tears the registration down rather than replacing it: its
+    /// callers have either observed the readiness the wake would have announced
+    /// or are abandoning the registration outright, so there is no later poll
+    /// for a retained flag to reach. Keeping the flag would only mean the next
+    /// caller to register on a reused proxy is woken once for an event that
+    /// predates it.
     pub(crate) fn retire(&self, action: WakerAction, effects: &mut WakerEffects) {
-        let mut caller = self
+        let mut registration = self
             .state
             .caller
             .lock()
             .expect("waker proxy mutex poisoned");
-        caller.take(action, effects);
+        registration.woken = false;
+        registration.caller.take(action, effects);
     }
 }
 
 impl Drop for WakerProxy {
+    /// Retires the stored caller waker **inline, on the dropping thread**: drop
+    /// glue has no effects sink to hand the disposition to, so the waker's drop
+    /// vtable runs here (contained, but synchronously).
+    ///
+    /// A caller whose retirement must reach the disposal lane — because the
+    /// waker's destructor may block, or because the dropping thread holds a
+    /// lock the destructor could re-enter — must call [`WakerProxy::retire`]
+    /// with the chosen [`WakerAction`] before the proxy is dropped. Reaching
+    /// this `Drop` with a waker still installed is the fallback, not the
+    /// contract.
     fn drop(&mut self) {
         let mut effects = WakerEffects::default();
         self.retire(WakerAction::DropInline, &mut effects);
@@ -94,8 +157,13 @@ impl Wake for WakerProxyState {
     fn wake_by_ref(self: &Arc<Self>) {
         let mut effects = WakerEffects::default();
         {
-            let mut caller = self.caller.lock().expect("waker proxy mutex poisoned");
-            caller.take(WakerAction::Wake, &mut effects);
+            let mut registration = self.caller.lock().expect("waker proxy mutex poisoned");
+            // Recorded whether or not a caller waker is installed: an empty
+            // slot means the wake landed in `register`'s clone window, and the
+            // flag is the only thing that will carry it to the caller polling
+            // now. See `WakerProxy::register`.
+            registration.woken = true;
+            registration.caller.take(WakerAction::Wake, &mut effects);
         }
     }
 }
@@ -106,12 +174,13 @@ mod tests {
         mem::ManuallyDrop,
         sync::{
             Arc, Weak,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{RawWaker, RawWakerVTable, Wake, Waker},
     };
 
     use super::{WakerProxy, WakerProxyState};
+    use crate::cell::waker_slot::{WakerAction, WakerEffects};
 
     #[derive(Default)]
     struct CountWake(AtomicUsize);
@@ -207,18 +276,151 @@ mod tests {
         unsafe { Waker::from_raw(raw) }
     }
 
+    /// A caller waker that wakes the proxy from inside its own `clone` vtable.
+    ///
+    /// `register` clones outside the proxy mutex, so this is a single-threaded
+    /// replica of a driver thread waking between `register`'s two critical
+    /// sections — the window the `woken` handshake exists to close.
+    struct WindowWake {
+        proxy: Weak<WakerProxyState>,
+        armed: AtomicBool,
+        wakes: Arc<AtomicUsize>,
+    }
+
+    unsafe fn clone_window(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the reference represented by
+        // `data`; the returned raw waker owns only the new clone.
+        let probe = ManuallyDrop::new(unsafe { Arc::<WindowWake>::from_raw(data.cast()) });
+        if probe.armed.swap(false, Ordering::SeqCst) {
+            let state = probe.proxy.upgrade().expect("the proxy remains live");
+            state.wake_by_ref();
+        }
+        RawWaker::new(Arc::into_raw(Arc::clone(&probe)).cast(), &WINDOW_VTABLE)
+    }
+
+    unsafe fn wake_window(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        let waker = unsafe { Arc::<WindowWake>::from_raw(data.cast()) };
+        waker.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe fn wake_by_ref_window(data: *const ()) {
+        // SAFETY: wake_by_ref borrows the Arc reference represented by this
+        // waker, which ManuallyDrop preserves.
+        let probe = ManuallyDrop::new(unsafe { Arc::<WindowWake>::from_raw(data.cast()) });
+        probe.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    unsafe fn drop_window(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<WindowWake>::from_raw(data.cast()) });
+    }
+
+    static WINDOW_VTABLE: RawWakerVTable =
+        RawWakerVTable::new(clone_window, wake_window, wake_by_ref_window, drop_window);
+
+    fn window_wake_waker(proxy: Weak<WakerProxyState>, wakes: Arc<AtomicUsize>) -> Waker {
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::new(WindowWake {
+                proxy,
+                armed: AtomicBool::new(true),
+                wakes,
+            }))
+            .cast(),
+            &WINDOW_VTABLE,
+        );
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
+
     #[test]
-    fn registration_preserves_the_proxy_identity_and_short_circuits_matching_callers() {
+    fn registration_keeps_a_stable_proxy_identity_across_replacements() {
         let proxy = WakerProxy::new();
+        // Minted before any registration: the identity an external primitive's
+        // own `will_wake` short-circuit keys on has to survive every later
+        // caller swap, which is the whole point of a stable proxy.
+        let minted = proxy.waker().clone();
+
+        let first = Arc::new(CountWake::default());
+        let second = Arc::new(CountWake::default());
+        proxy.register(&Waker::from(first));
+        proxy.register(&Waker::from(second));
+
+        assert!(minted.will_wake(proxy.waker()));
+    }
+
+    #[test]
+    fn re_registering_the_same_caller_never_reaches_its_clone_vtable() {
+        let proxy = WakerProxy::new();
+        let clones = Arc::new(AtomicUsize::new(0));
+        let caller = reentrant_clone_waker(Arc::downgrade(&proxy.state), Arc::clone(&clones));
+
+        proxy.register(&caller);
+        proxy.register(&caller);
+
+        // One clone for the initial install and none for the repeat: the
+        // `will_wake` short-circuit is what keeps the caller's vtable out of
+        // the second registration.
+        assert_eq!(clones.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_wake_in_the_registration_window_reaches_the_caller_registering_now() {
+        let proxy = WakerProxy::new();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let caller = window_wake_waker(Arc::downgrade(&proxy.state), Arc::clone(&wakes));
+
+        // The wake fires while the slot is still empty, so the `woken` record
+        // is the only thing that can carry it forward.
+        proxy.register(&caller);
+
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "a wake landing in the clone window must reach the waker that same registration installs"
+        );
+    }
+
+    #[test]
+    fn a_window_wake_consuming_the_previous_caller_still_reaches_the_new_one() {
+        let proxy = WakerProxy::new();
+        let previous = Arc::new(CountWake::default());
+        proxy.register(&Waker::from(Arc::clone(&previous)));
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let caller = window_wake_waker(Arc::downgrade(&proxy.state), Arc::clone(&wakes));
+        proxy.register(&caller);
+
+        // The window wake took the previous poll's waker, which after a future
+        // migrates between tasks belongs to a task that no longer holds it...
+        assert_eq!(previous.0.load(Ordering::SeqCst), 1);
+        // ...so the caller polling now has to be woken as well.
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "waking the previous caller does not discharge the wake for the current one"
+        );
+    }
+
+    #[test]
+    fn retirement_discards_an_unconsumed_wake_record() {
+        let proxy = WakerProxy::new();
+        proxy.waker().wake_by_ref();
+
+        let mut effects = WakerEffects::default();
+        proxy.retire(WakerAction::DropInline, &mut effects);
+        drop(effects);
+
         let target = Arc::new(CountWake::default());
-        let caller = Waker::from(Arc::clone(&target));
+        proxy.register(&Waker::from(Arc::clone(&target)));
 
-        proxy.register(&caller);
-        let registered_count = Arc::strong_count(&target);
-        proxy.register(&caller);
-
-        assert_eq!(Arc::strong_count(&target), registered_count);
-        assert!(proxy.waker().will_wake(proxy.waker()));
+        assert_eq!(
+            target.0.load(Ordering::SeqCst),
+            0,
+            "a retired registration leaves no wake for the next caller to inherit"
+        );
     }
 
     #[test]

@@ -887,15 +887,22 @@ any incarnation-owned disposal panic is observed at a receive boundary
 destroyed). Incarnation-owned disposal is §6.5's resource funnel — the
 offloaded future and its continuation closure, plus the queued
 continuations, armed timers and queued offload completions released at
-the intake freeze; the frozen mailbox prefix's own detached disposal
-above is not part of it and stays a disposal fault. A disposal panic
-**already retained when a receive boundary is reached** therefore fails
-the incarnation before any further delivery or `on_stop`. As with
-`Guard::finished()` (§6.5) this is not a join: a panic that lands after
-the last receive boundary is still the incarnation's exit, but cannot
-suppress `on_stop`. Grace bounds drain plus `on_stop` together (§11) —
-including after a local `ctx.stop()`, which arms the child's own
-configured ladder (§11).
+the intake freeze, plus the wakers of `Guard::finished()`'s own
+completion waiters, which are caller-owned but run by the incarnation on
+the ordinary completion path as well as at the freeze; the frozen
+mailbox prefix's own detached disposal above is not part of it and stays
+a disposal fault. A disposal panic **already retained when a receive
+boundary is reached** therefore fails the incarnation before any further
+delivery or `on_stop`. As with `Guard::finished()` (§6.5) this is not a
+join: a panic that lands after the last receive boundary is still the
+incarnation's exit, but cannot suppress `on_stop`. The completion
+notification of §6.5 is the one carve-out in the other direction:
+because its wake panic MUST be retained before the framework may forget
+the work, a completion waiter whose waker *blocks* rather than panicking
+holds that work in the incarnation's resource ledger, and teardown joins
+it — so caller code can delay teardown and exit publication there. Grace
+bounds drain plus `on_stop` together (§11) — including after a local
+`ctx.stop()`, which arms the child's own configured ladder (§11).
 
 ### 6.3 One timer facility
 
@@ -1023,7 +1030,14 @@ handlers non-blocking. Contracts:
   observed completion guarantees the panic is retained for §6.2's next
   receive boundary; a teardown cancellation fires the same notification
   without that ordering, which is why §6.2 conditions its guarantee on
-  retention rather than on the panic having happened.
+  retention rather than on the panic having happened. The notification's
+  own wake belongs to §6.2's funnel too: a completion waiter whose waker
+  panics has that payload retained as incarnation-owned disposal — on
+  the ordinary completion path, not only at the freeze — so a third
+  party awaiting `finished()` can fail the incarnation and suppress its
+  `on_stop`, and one whose waker blocks delays teardown as §6.2
+  describes. Callers are expected to await `finished()` from a task
+  whose waker neither panics nor blocks.
 - Any higher-level helper that composes `call` inside `offload` MUST
   preserve: incarnation ownership; completion through the actor loop; a
   total timeout continuation; and no await inside the handler.

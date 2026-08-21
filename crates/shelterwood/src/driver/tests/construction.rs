@@ -625,11 +625,13 @@ async fn dispatching_a_spent_one_shot_task_construction_panics() {
     let _epoch = root
         .begin_incarnation(ScopeState::Starting)
         .expect("test scope epoch is available");
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
+    assert!(
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        )
     );
     let defaults = plan.defaults.clone();
     let mut child = ChildRuntime::from_plan(plan.children.pop().expect("one child plan"), &root);

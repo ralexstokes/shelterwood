@@ -11,7 +11,7 @@ fn snapshot_rejects_a_resident_whose_options_were_never_resolved() {
             .expect("child membership available"),
     );
 
-    root.admit_child(ResidentProjection::new(member, None));
+    assert!(root.admit_child(ResidentProjection::new(member, None)));
     let _ = root.snapshot();
 }
 
@@ -232,7 +232,7 @@ async fn terminal_scope_waits_for_its_live_incarnation_to_stop() {
     let parent = isolated_scope("parent", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Ordered);
     let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-    parent.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(parent.set_admitted_children(vec![resident_projection(&slot)]));
 
     let epoch = nested
         .begin_incarnation(ScopeState::Starting)
@@ -318,7 +318,7 @@ async fn terminal_scope_in_drain_waits_for_its_live_incarnation_to_stop() {
     let parent = isolated_scope("parent", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Ordered);
     let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-    parent.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(parent.set_admitted_children(vec![resident_projection(&slot)]));
 
     let epoch = nested
         .begin_incarnation(ScopeState::Starting)
@@ -381,7 +381,7 @@ impl AbortedNestedDriverFixture {
         let parent = isolated_scope("parent", ScopeFlavor::Ordered);
         let nested = isolated_scope("nested", ScopeFlavor::Ordered);
         let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-        parent.set_admitted_children(vec![resident_projection(&slot)]);
+        assert!(parent.set_admitted_children(vec![resident_projection(&slot)]));
 
         let epoch = ScopeEpochGuard::begin(&nested).expect("nested scope epoch is available");
         let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
@@ -558,7 +558,7 @@ async fn wait_for_child_reloads_after_its_predicate_closes_the_snapshot_stream()
     let child = MemberCell::new(child_id, membership);
     resolve_fixture_options(&child);
     let slot = SlotCell::new(Arc::clone(&child), None);
-    scope.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(scope.set_admitted_children(vec![resident_projection(&slot)]));
     let scope_ref = ScopeRef {
         cell: Arc::clone(&scope),
     };
@@ -597,7 +597,7 @@ async fn terminality_fallback_preserves_restart_window_scope_reason() {
     let parent = isolated_scope("parent", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Ordered);
     let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-    parent.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(parent.set_admitted_children(vec![resident_projection(&slot)]));
 
     let mut incarnations = IncarnationCounter::fixture(nested.member.membership());
     let last_incarnation = incarnations.mint().expect("child incarnation is available");
@@ -927,7 +927,7 @@ fn admitted_subtrees_share_their_parent_observation_gate() {
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
     let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
 
-    root.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(root.set_admitted_children(vec![resident_projection(&slot)]));
 
     assert!(
         root.observation_gate()
@@ -949,10 +949,10 @@ fn admitted_subtree_rehomes_existing_descendants_to_one_gate() {
     );
     let leaf_slot = SlotCell::new(Arc::clone(&leaf.member), Some(Arc::clone(&leaf)));
     let raw_leaf_slot = SlotCell::new(Arc::clone(&raw_leaf), None);
-    nested.set_admitted_children(vec![
+    assert!(nested.set_admitted_children(vec![
         resident_projection(&leaf_slot),
         resident_projection(&raw_leaf_slot),
-    ]);
+    ]));
     assert!(
         nested
             .observation_gate()
@@ -965,7 +965,7 @@ fn admitted_subtree_rehomes_existing_descendants_to_one_gate() {
     );
 
     let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-    root.set_admitted_children(vec![resident_projection(&nested_slot)]);
+    assert!(root.set_admitted_children(vec![resident_projection(&nested_slot)]));
 
     let root_gate = root.observation_gate();
     assert!(root_gate.same_gate(&nested.observation_gate()));
@@ -1035,12 +1035,12 @@ fn snapshot_watch_batch_admission_is_one_committed_cut() {
 
     root.with_observation_gate(|txn| {
         root.clear_residents_locked(txn);
-        root.admit_child_locked(resident_projection(&first_slot), txn);
+        assert!(root.admit_child_locked(resident_projection(&first_slot), txn));
         assert!(
             snapshots.borrow_latest().children.is_empty(),
             "the first admission must remain staged until the batch commits"
         );
-        root.admit_child_locked(resident_projection(&second_slot), txn);
+        assert!(root.admit_child_locked(resident_projection(&second_slot), txn));
         assert!(
             snapshots.borrow_latest().children.is_empty(),
             "the complete batch must remain staged until its transaction commits"
@@ -1060,7 +1060,7 @@ fn snapshot_watch_batch_admission_mints_one_generation_per_hub() {
     resolve_fixture_options(&branch.member);
     let branch_slot = SlotCell::new(Arc::clone(&branch.member), Some(Arc::clone(&branch)));
     root.with_observation_gate(|txn| {
-        root.admit_child_locked(resident_projection(&branch_slot), txn);
+        assert!(root.admit_child_locked(resident_projection(&branch_slot), txn));
     });
 
     let first = isolated_scope("first", ScopeFlavor::Dynamic);
@@ -1080,8 +1080,8 @@ fn snapshot_watch_batch_admission_mints_one_generation_per_hub() {
     let branch_generation = branch_snapshots.current_generation();
 
     branch.with_observation_gate(|txn| {
-        branch.admit_child_locked(resident_projection(&first_slot), txn);
-        branch.admit_child_locked(resident_projection(&second_slot), txn);
+        assert!(branch.admit_child_locked(resident_projection(&first_slot), txn));
+        assert!(branch.admit_child_locked(resident_projection(&second_slot), txn));
     });
 
     assert_eq!(
@@ -1132,10 +1132,10 @@ fn plain_resident_state_is_released_before_recursive_removed_publication() {
     let mut events = root.subscribe_lifecycle();
     let snapshots = root.subscribe_snapshots();
 
-    root.set_admitted_children(vec![
+    assert!(root.set_admitted_children(vec![
         resident_projection(&first_slot),
         resident_projection(&second_slot),
-    ]);
+    ]));
     root.clear_residents();
 
     assert!(root.resident_projections().is_empty());
@@ -1159,12 +1159,12 @@ fn plain_parent_state_preserves_nested_snapshot_propagation() {
     let mut incarnations = IncarnationCounter::near_exhaustion(nested.member.membership());
     resolve_fixture_options(&nested.member);
     let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-    root.set_admitted_children(vec![resident_projection(&nested_slot)]);
+    assert!(root.set_admitted_children(vec![resident_projection(&nested_slot)]));
     // Start the nested member along the production admit-then-spawn order so
     // the transition-source assertions in `apply_transition` hold here too.
-    nested.member.transition(MemberTransition::Starting {
+    assert!(nested.member.transition(MemberTransition::Starting {
         incarnation: incarnations.mint().expect("incarnation available"),
-    });
+    }));
     let snapshots = root.subscribe_snapshots();
     let intensity = Intensity::new(7, Duration::from_secs(11)).expect("valid intensity");
 
@@ -1185,7 +1185,7 @@ fn lifecycle_emit_resolves_the_ancestor_chain_once() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
     let nested_slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-    root.set_admitted_children(vec![resident_projection(&nested_slot)]);
+    assert!(root.set_admitted_children(vec![resident_projection(&nested_slot)]));
     let mut root_events = root.subscribe_lifecycle();
 
     let _ = nested.take_ancestor_parent_reads();
@@ -1280,7 +1280,7 @@ fn gate_handoff_waits_for_an_in_flight_observation_edge() {
     let adopting_root = Arc::clone(&root);
     let (adopted, adopted_receiver) = std::sync::mpsc::sync_channel(0);
     let adoption = std::thread::spawn(move || {
-        adopting_root.set_admitted_children(vec![resident_projection(&slot)]);
+        assert!(adopting_root.set_admitted_children(vec![resident_projection(&slot)]));
         adopted.send(()).expect("test receiver remains available");
     });
 
@@ -1338,7 +1338,10 @@ fn gate_handoff_rejects_a_scope_with_an_unadmitted_dynamic_reservation_without_r
 
     // Public layering cannot reach this adoption: a reservation requires a
     // started driver, while a scope is parented before its driver starts.
-    root.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(
+        !root.set_admitted_children(vec![resident_projection(&slot)]),
+        "the reducer refuses an already-running member's admission"
+    );
     assert!(
         root.resident_projections().is_empty(),
         "the illegal running-to-admitted transition publishes no residency"
@@ -1385,7 +1388,7 @@ fn a_losing_supervised_terminal_exit_is_a_complete_noop_outside_the_gate() {
             .expect("child membership available"),
     );
     resolve_fixture_options(&member);
-    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     member.terminalize(
         Exit::completed(Cancellation::NotObserved),
         StartupDisposition::NotAborted,
@@ -1425,7 +1428,7 @@ fn a_retired_snapshot_payload_is_destroyed_outside_the_gate() {
             .expect("child membership available"),
     );
     resolve_fixture_options(&member);
-    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let subscription = root.subscribe_snapshots();
 
     let (exit, held_at_drop) = gate_probe_exit(&root);
@@ -1458,11 +1461,11 @@ fn a_superseded_restart_exit_payload_is_destroyed_outside_the_gate() {
     let (root, member, mut incarnations) = restarting_member_fixture();
 
     let (probe, held_at_drop) = gate_probe_exit(&root);
-    member.transition(MemberTransition::RestartScheduled {
+    assert!(member.transition(MemberTransition::RestartScheduled {
         exit: probe,
         restart_count: RestartCount::ZERO.bump(),
         restart_at: None,
-    });
+    }));
     assert_eq!(
         gate_probe_verdict(&held_at_drop),
         None,
@@ -1470,14 +1473,14 @@ fn a_superseded_restart_exit_payload_is_destroyed_outside_the_gate() {
     );
 
     let second = incarnations.mint().expect("restart incarnation available");
-    member.transition(MemberTransition::Starting {
+    assert!(member.transition(MemberTransition::Starting {
         incarnation: second,
-    });
-    member.transition(MemberTransition::RestartScheduled {
+    }));
+    assert!(member.transition(MemberTransition::RestartScheduled {
         exit: Exit::completed(Cancellation::NotObserved),
         restart_count: RestartCount::ZERO.bump().bump(),
         restart_at: None,
-    });
+    }));
     assert!(
         !wait_for_gate_probe(&held_at_drop),
         "a superseded restart exit payload must outlive the gate"
@@ -1491,11 +1494,11 @@ fn a_restart_exit_payload_superseded_by_terminalization_outlives_the_gate() {
     let (root, member, _incarnations) = restarting_member_fixture();
 
     let (probe, held_at_drop) = gate_probe_exit(&root);
-    member.transition(MemberTransition::RestartScheduled {
+    assert!(member.transition(MemberTransition::RestartScheduled {
         exit: probe,
         restart_count: RestartCount::ZERO.bump(),
         restart_at: None,
-    });
+    }));
     assert_eq!(
         gate_probe_verdict(&held_at_drop),
         None,
@@ -1524,7 +1527,7 @@ fn a_snapshot_retired_by_observation_closure_is_destroyed_outside_the_gate() {
             .expect("child membership available"),
     );
     resolve_fixture_options(&member);
-    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let subscription = root.subscribe_snapshots();
 
     let (exit, held_at_drop) = gate_probe_exit(&root);
@@ -1661,7 +1664,7 @@ fn residency_can_release_the_last_member_arc_with_a_failed_exit() {
             .expect("child membership available"),
     );
     resolve_fixture_options(&member);
-    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let weak = Arc::downgrade(&member);
     let (exit, held_at_drop) = gate_probe_exit(&root);
     member.terminalize(exit, StartupDisposition::Unchanged);

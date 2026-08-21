@@ -44,6 +44,37 @@ pub enum MemberTransition {
     },
 }
 
+impl MemberTransition {
+    /// The legality matrix for driver-requested stage transitions.
+    ///
+    /// This is the single definition of which source stages each event may
+    /// consume. [`MemberRecord::apply_transition`] enforces it, and
+    /// [`MemberCell::would_accept`] probes it ahead of an operation that must
+    /// commit other state before the transition itself lands.
+    fn is_legal_from(&self, stage: &MemberStage) -> bool {
+        matches!(
+            (stage, self),
+            (MemberStage::Reserved, MemberTransition::Admitted)
+                | (
+                    MemberStage::Admitted | MemberStage::Restarting,
+                    MemberTransition::Starting { .. }
+                )
+                | (
+                    MemberStage::Starting | MemberStage::Reserved,
+                    MemberTransition::Running
+                )
+                | (
+                    MemberStage::Starting | MemberStage::Running,
+                    MemberTransition::Stopping
+                )
+                | (
+                    MemberStage::Starting | MemberStage::Running | MemberStage::Stopping,
+                    MemberTransition::RestartScheduled { .. }
+                )
+        )
+    }
+}
+
 /// Whether a terminal child incarnation failed during aggregate startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupDisposition {
@@ -102,27 +133,7 @@ impl MemberRecord {
     /// set still covers the displaced value, and [`Self::refresh_retained_exits`]
     /// re-establishes that cover before the mutation returns.
     fn apply_transition(&mut self, transition: MemberTransition) -> Result<(), MemberTransition> {
-        let legal = matches!(
-            (&self.stage, &transition),
-            (MemberStage::Reserved, MemberTransition::Admitted)
-                | (
-                    MemberStage::Admitted | MemberStage::Restarting,
-                    MemberTransition::Starting { .. }
-                )
-                | (
-                    MemberStage::Starting | MemberStage::Reserved,
-                    MemberTransition::Running
-                )
-                | (
-                    MemberStage::Starting | MemberStage::Running,
-                    MemberTransition::Stopping
-                )
-                | (
-                    MemberStage::Starting | MemberStage::Running | MemberStage::Stopping,
-                    MemberTransition::RestartScheduled { .. }
-                )
-        );
-        if !legal {
+        if !transition.is_legal_from(&self.stage) {
             return Err(transition);
         }
 
@@ -389,7 +400,11 @@ impl MemberCell {
     /// The driver also treats this channel as its control-plane wake bus: any
     /// field read by a loop precondition must be changed through a pulsing path
     /// like this one, never by a silent write outside an observation gate.
+    ///
+    /// Returns whether the reducer accepted the event; see
+    /// [`Self::transition_locked`].
     #[cfg(any(test, feature = "test-util"))]
+    #[must_use = "an illegal member transition is rejected, not applied"]
     pub fn transition(&self, transition: MemberTransition) -> bool {
         self.with_observation_txn(|txn| self.transition_locked(txn, transition))
     }
@@ -465,44 +480,37 @@ impl MemberCell {
         );
     }
 
+    /// Adopts `gate` unconditionally, running `install` when it differs from
+    /// this member's current gate.
     pub(super) fn adopt_observation_gate_with(
         &self,
         gate: &ObservationGate,
-        mut report_capture: impl FnMut(),
+        report_capture: impl FnMut(),
         install: impl FnOnce(&ObservationGate),
     ) {
-        let mut install = Some(install);
-        loop {
-            let current = self.current_observation_gate();
-            if current.shares_gate(gate) {
-                return;
+        let adopted = self.with_handoff_gate(gate, report_capture, |current| {
+            if !current.shares_gate(gate) {
+                install(current);
             }
-            report_capture();
-            // An operation that passed the pointer check may finish its
-            // complete edge before handoff. One that merely captured this
-            // obsolete gate retries after acquiring it and observing the
-            // replacement.
-            let current_guard = current.lock();
-            if current.shares_gate(&self.current_observation_gate()) {
-                let install = install
-                    .take()
-                    .expect("observation gate adoption installs exactly once");
-                install(&current);
-                drop(current_guard);
-                return;
-            }
-            drop(current_guard);
-        }
+            true
+        });
+        debug_assert!(adopted, "unconditional adoption never refuses");
     }
 
-    /// Runs an admission attempt under this member's current observation gate.
+    /// Runs `attempt` with this member's current observation gate held.
     ///
-    /// The caller already holds the destination gate. When the gates differ,
-    /// this takes the current child gate in the one permitted parent-to-child
-    /// direction and keeps it held through `attempt`, allowing validation,
-    /// transition, and handoff to form one cut. The attempt installs the new
-    /// gate itself only after it has accepted the transition.
-    pub(super) fn try_adopt_observation_gate_with(
+    /// The caller already holds the destination `gate`. When the member is
+    /// already on it, `attempt` runs directly under the caller's guard.
+    /// Otherwise this takes the member's current gate in the one permitted
+    /// parent-to-child direction and holds it across `attempt`, so validation,
+    /// record mutation and the recursive handoff form a single cut; `attempt`
+    /// owns the decision to install `gate` and returns whether it accepted.
+    ///
+    /// An operation that passed the pointer check may finish its complete edge
+    /// before handoff. One that merely captured an obsolete gate retries after
+    /// acquiring it and observing the replacement, so `report_capture` fires
+    /// once per differing-gate iteration.
+    pub(super) fn with_handoff_gate(
         &self,
         gate: &ObservationGate,
         mut report_capture: impl FnMut(),
@@ -514,20 +522,20 @@ impl MemberCell {
             if current.shares_gate(gate) {
                 return attempt
                     .take()
-                    .expect("observation gate admission runs exactly once")(
+                    .expect("an observation gate handoff attempt runs exactly once")(
                     &current
                 );
             }
             report_capture();
             let current_guard = current.lock();
             if current.shares_gate(&self.current_observation_gate()) {
-                let admitted = attempt
+                let accepted = attempt
                     .take()
-                    .expect("observation gate admission runs exactly once")(
+                    .expect("an observation gate handoff attempt runs exactly once")(
                     &current
                 );
                 drop(current_guard);
-                return admitted;
+                return accepted;
             }
             drop(current_guard);
         }
@@ -548,6 +556,24 @@ impl MemberCell {
         txn.pulse(&self.record);
     }
 
+    /// Probes the legality matrix without mutating anything.
+    ///
+    /// The stage can only change through a gated writer, so a caller holding
+    /// this member's observation gate across the probe and the matching
+    /// [`Self::transition_locked`] sees no window between them. That lets an
+    /// operation which must commit other state first refuse before it starts.
+    pub(super) fn would_accept(&self, transition: &MemberTransition) -> bool {
+        self.record
+            .read_with(|record| transition.is_legal_from(&record.stage))
+    }
+
+    /// Applies `transition` and returns whether the reducer accepted it.
+    ///
+    /// A rejection is a total no-op *within the cell layer*: no record field
+    /// changes, no watch version advances, and no lifecycle event is emitted.
+    /// It says nothing about state the caller committed before calling — see
+    /// the driver call sites, each of which asserts legality in debug builds.
+    #[must_use = "an illegal member transition is rejected, not applied"]
     pub fn transition_locked(
         &self,
         txn: &mut ObservationTxn<'_>,
@@ -572,9 +598,9 @@ impl MemberCell {
                 Err(transition) => rejected = Some(transition),
             });
         if let Some(rejected) = rejected {
-            // Rejection is a total no-op. The rejected event may own a failed
-            // exit, so retire it with the transaction rather than under the
-            // observation gate or watch lock.
+            // Rejection leaves this cell exactly as it was. The rejected event
+            // may own a failed exit, so retire it with the transaction rather
+            // than under the observation gate or watch lock.
             txn.defer(move || runtime::dispose_detached(rejected));
             if let Some(retained_exit) = retained_exit {
                 // The deferred transition proves this clone cannot be last.

@@ -485,6 +485,13 @@ impl ScopeCell {
         );
     }
 
+    /// Admits this scope's subtree onto `gate`, or refuses without touching it.
+    ///
+    /// Legality is probed before anything is committed and applied only after
+    /// the recursive handoff has succeeded. Both halves run under the child's
+    /// own gate, held across the whole attempt, so no writer can change the
+    /// stage between them; and an unwind out of the handoff's `assert!` leaves
+    /// the record still reading its pre-admission stage.
     fn admit_observation_gate(
         &self,
         parent: &ScopeCell,
@@ -495,32 +502,39 @@ impl ScopeCell {
             !std::ptr::eq(self, parent),
             "a scope cannot be admitted into itself"
         );
+        // The caller holds `gate` through `parent.with_observation_gate`.
+        // Re-homing the parent would first have to acquire that same gate, so
+        // rereading its installed pointer here cannot race a parent handoff.
         debug_assert!(
             gate.shares_gate(&parent.current_observation_gate()),
             "observation gates are admitted only in the parent-to-child direction"
         );
-        self.member.try_adopt_observation_gate_with(
+        self.member.with_handoff_gate(
             gate,
             || {
                 #[cfg(any(test, feature = "test-util"))]
                 self.report_gate_capture(GateCapture::Adoption);
             },
             |current| {
-                if !self
-                    .member
-                    .transition_locked(txn, MemberTransition::Admitted)
-                {
+                if !self.member.would_accept(&MemberTransition::Admitted) {
                     return false;
                 }
                 if !current.shares_gate(gate) {
-                    debug_assert!(
-                        self.dynamic_route_in(txn).is_none(),
-                        "a scope with a live dynamic route is never re-homed"
-                    );
+                    // A live dynamic route needs a started driver, which needs
+                    // a stage past `Reserved`; the probe above already refused
+                    // every such stage, so re-homing one is unconstructible
+                    // rather than merely unreached.
                     self.member.install_observation_gate_locked(current, gate);
                     self.adopt_descendant_observation_gates_locked(current, gate, txn);
                 }
-                true
+                let admitted = self
+                    .member
+                    .transition_locked(txn, MemberTransition::Admitted);
+                debug_assert!(
+                    admitted,
+                    "the probed admission cannot be refused under the same held gate"
+                );
+                admitted
             },
         )
     }
@@ -682,6 +696,12 @@ impl ScopeCell {
         });
     }
 
+    /// Applies `transition` and publishes `event`, or refuses both.
+    ///
+    /// Returns whether the reducer accepted the transition. A refusal is a
+    /// no-op *for this scope*; the caller is responsible for whatever it
+    /// committed beforehand.
+    #[must_use = "an illegal member transition is rejected, not applied"]
     pub fn transition_child_stage(
         &self,
         member: &MemberCell,
@@ -707,6 +727,11 @@ impl ScopeCell {
         })
     }
 
+    /// Publishes one restart schedule, or refuses the whole publication.
+    ///
+    /// Returns whether the reducer accepted the transition. The restart
+    /// bookkeeping its caller already charged is not rolled back here.
+    #[must_use = "an illegal member transition is rejected, not applied"]
     pub fn publish_child_restart(
         &self,
         member: &MemberCell,
@@ -1214,20 +1239,32 @@ impl ScopeCell {
             || (self.membership_terminal() && self.joined())
     }
 
-    pub fn set_admitted_children(self: &Arc<Self>, children: Vec<ResidentProjection>) {
+    /// Replaces this scope's residency, returning whether every child was
+    /// admitted. A refused child is left out of the residency entirely.
+    #[must_use = "a refused admission leaves the child out of the residency"]
+    pub fn set_admitted_children(self: &Arc<Self>, children: Vec<ResidentProjection>) -> bool {
         self.with_observation_gate(|wakes| {
             self.clear_residents_locked(wakes);
+            let mut admitted = true;
             for child in children {
-                self.admit_child_locked(child, wakes);
+                admitted &= self.admit_child_locked(child, wakes);
             }
-        });
+            admitted
+        })
     }
 
     #[cfg(any(test, feature = "test-util"))]
+    #[must_use = "a refused admission leaves the child out of the residency"]
     pub fn admit_child(self: &Arc<Self>, child: ResidentProjection) -> bool {
         self.with_observation_gate(|wakes| self.admit_child_locked(child, wakes))
     }
 
+    /// Admits one projection, or refuses it whole.
+    ///
+    /// Returns whether the member's `Admitted` transition was legal. A refusal
+    /// publishes nothing: no gate handoff, no parent wiring, no residency push
+    /// and no `Added` event.
+    #[must_use = "a refused admission leaves the child out of the residency"]
     pub fn admit_child_locked(
         self: &Arc<Self>,
         child: ResidentProjection,
@@ -1246,14 +1283,12 @@ impl ScopeCell {
             }
             admitted
         } else {
-            projection.member.try_adopt_observation_gate_with(
+            // Same probe-handoff-apply order as the nested-scope path above.
+            projection.member.with_handoff_gate(
                 &gate,
                 || {},
                 |current| {
-                    if !projection
-                        .member
-                        .transition_locked(txn, MemberTransition::Admitted)
-                    {
+                    if !projection.member.would_accept(&MemberTransition::Admitted) {
                         return false;
                     }
                     if !current.shares_gate(&gate) {
@@ -1261,7 +1296,14 @@ impl ScopeCell {
                             .member
                             .install_observation_gate_locked(current, &gate);
                     }
-                    true
+                    let admitted = projection
+                        .member
+                        .transition_locked(txn, MemberTransition::Admitted);
+                    debug_assert!(
+                        admitted,
+                        "the probed admission cannot be refused under the same held gate"
+                    );
+                    admitted
                 },
             )
         };
@@ -1808,11 +1850,16 @@ mod tests {
         let destination = isolated_scope("destination", ScopeFlavor::Ordered);
         let nested = child_scope(&original, "nested", ScopeFlavor::Dynamic);
         let descendant = child_member(&nested, "descendant");
-        nested.set_admitted_children(vec![ResidentProjection::new(Arc::clone(&descendant), None)]);
-        original.set_admitted_children(vec![ResidentProjection::new(
+        assert!(
+            nested.set_admitted_children(vec![ResidentProjection::new(
+                Arc::clone(&descendant),
+                None
+            )])
+        );
+        assert!(original.set_admitted_children(vec![ResidentProjection::new(
             Arc::clone(&nested.member),
             Some(Arc::clone(&nested)),
-        )]);
+        )]));
         let original_gate = original.observation_gate();
         assert!(original_gate.same_gate(&nested.observation_gate()));
         assert!(original_gate.same_gate(&descendant.observation_gate()));
@@ -1873,6 +1920,33 @@ mod tests {
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
     }
 
+    #[cfg(debug_assertions)]
+    struct InertRoute;
+
+    #[cfg(debug_assertions)]
+    impl DynamicRoute for InertRoute {
+        fn close_admission(&self, _txn: &mut ObservationTxn<'_>) {}
+    }
+
+    /// Coverage for the surviving live-route assertion.
+    ///
+    /// `admit_observation_gate` no longer needs one: its legality probe
+    /// refuses every stage a started driver can present, so a re-homed live
+    /// route is unconstructible there. The reservation-time adoption path has
+    /// no such probe, and this is its regression.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a scope with a live dynamic route is never re-homed")]
+    fn plain_gate_adoption_rejects_a_scope_with_a_live_dynamic_route() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        nested.set_dynamic_route(Some(Arc::new(InertRoute)));
+
+        root.with_observation_gate(|txn| {
+            root.adopt_child_observation_gate(&nested.member, Some(&nested), txn);
+        });
+    }
+
     #[test]
     fn adoption_retries_when_the_captured_child_gate_has_already_been_replaced() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
@@ -1884,10 +1958,10 @@ mod tests {
         let adopting_root = Arc::clone(&root);
         let adopting_nested = Arc::clone(&nested);
         let adoption = std::thread::spawn(move || {
-            adopting_root.admit_child(ResidentProjection::new(
+            assert!(adopting_root.admit_child(ResidentProjection::new(
                 Arc::clone(&adopting_nested.member),
                 Some(adopting_nested),
-            ));
+            )));
         });
 
         assert_eq!(
@@ -1926,20 +2000,24 @@ mod tests {
         // a subtree of depth 1 cannot tell the loop from the recursion. Only
         // this grandchild is reachable exclusively through the recursive call.
         let grandchild = child_member(&leaf_scope, "grandchild");
-        leaf_scope
-            .set_admitted_children(vec![ResidentProjection::new(Arc::clone(&grandchild), None)]);
-        nested.set_admitted_children(vec![
+        assert!(
+            leaf_scope.set_admitted_children(vec![ResidentProjection::new(
+                Arc::clone(&grandchild),
+                None
+            )])
+        );
+        assert!(nested.set_admitted_children(vec![
             ResidentProjection::new(
                 Arc::clone(&leaf_scope.member),
                 Some(Arc::clone(&leaf_scope)),
             ),
             ResidentProjection::new(Arc::clone(&leaf_member), None),
-        ]);
+        ]));
 
-        root.admit_child(ResidentProjection::new(
+        assert!(root.admit_child(ResidentProjection::new(
             Arc::clone(&nested.member),
             Some(Arc::clone(&nested)),
-        ));
+        )));
 
         let root_gate = root.observation_gate();
         for gate in [
@@ -1967,7 +2045,9 @@ mod tests {
     fn drain_publication_installs_terminal_disposal_intent_with_the_state() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let child = child_member(&root, "child");
-        root.set_admitted_children(vec![ResidentProjection::new(Arc::clone(&child), None)]);
+        assert!(
+            root.set_admitted_children(vec![ResidentProjection::new(Arc::clone(&child), None)])
+        );
 
         root.publish_drain(ScopeState::Draining, None, &[Arc::clone(&child)]);
 
@@ -1984,10 +2064,10 @@ mod tests {
         let leaf_membership = leaf.membership();
         let mut lifecycle = root.subscribe_lifecycle();
 
-        root.set_admitted_children(vec![
+        assert!(root.set_admitted_children(vec![
             ResidentProjection::new(Arc::clone(&nested.member), Some(Arc::clone(&nested))),
             ResidentProjection::new(Arc::clone(&leaf), None),
-        ]);
+        ]));
         assert_eq!(root.resident_projections().len(), 2);
         assert!(root.has_resident_child(&nested.member));
         assert!(root.has_resident_child(&leaf));
@@ -2328,7 +2408,7 @@ mod tests {
                 release: release_drop,
             })
             .expect("bound mailbox accepts the probe");
-        scope.admit_child(ResidentProjection::new(Arc::clone(&child), None));
+        assert!(scope.admit_child(ResidentProjection::new(Arc::clone(&child), None)));
         drop(actor);
         drop(mailbox);
         drop(child);

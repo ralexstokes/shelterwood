@@ -697,11 +697,13 @@ mod tests {
             .lower(ResolvedDefaults::default(), None)
             .expect("the defined builder lowers");
         let root = Arc::clone(&plan.root);
-        root.set_admitted_children(
-            plan.children
-                .iter()
-                .map(|child| ResidentProjection::new(Arc::clone(&child.slot.member), None))
-                .collect(),
+        assert!(
+            root.set_admitted_children(
+                plan.children
+                    .iter()
+                    .map(|child| ResidentProjection::new(Arc::clone(&child.slot.member), None))
+                    .collect(),
+            )
         );
         let mut first_terminal = Box::pin(slots[0].member.wait_terminal());
         let hostile = Waker::from(Arc::new(PanicWake(PANIC)));

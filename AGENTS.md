@@ -116,11 +116,19 @@ rests on:
   gate is outermost: everything else is taken under it or standalone, never
   around it. Inside, the documented orders are cells' member mailbox →
   `MailboxCell::state`, and `MailboxCell::state` → `SendOperation::state`.
-  Gate-to-gate is the one exception to "outermost": `adopt_observation_gate`
-  takes the adoptee's *current* gate while the adopting parent's is held, in
-  the parent-to-child direction only, and re-reads the installed pointer
-  under the acquired guard so a concurrent handoff retries rather than
-  deadlocks.
+  Gate-to-gate is the one exception to "outermost":
+  `MemberCell::with_handoff_gate` takes the adoptee's *current* gate while the
+  adopting parent's is held, in the parent-to-child direction only, and
+  re-reads the installed pointer under the acquired guard so a concurrent
+  handoff retries rather than deadlocks. Both of its users — plain adoption
+  (`ScopeCell::adopt_observation_gate`) and admission
+  (`ScopeCell::admit_observation_gate`, `ScopeCell::admit_child_locked`) —
+  hold the exemption. Admission widens what runs inside the doubled section:
+  the member record's watch-value mutex is taken there, and admission's
+  `MemberTransition` reaches `RetainedExit` clone/drop under both gates. That
+  stays inside the rule — the record is framework-owned data and the retained
+  clone is provably non-last — but it is the deepest the exemption goes, so a
+  new operation added to the doubled section needs the same accounting.
 
 Two conventions that are not the rule itself but travel with it: panicking
 while holding a mutex the codebase `.expect()`s poisons it for every later

@@ -23,7 +23,7 @@ async fn reserve_error_identity_exhausted_maps_the_membership_domain() {
     let (events, _receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
     root.set_dynamic_route(Some(control));
-    root.set_admitted_children(Vec::new());
+    assert!(root.set_admitted_children(Vec::new()));
 
     root.mint_membership(&worker_id)
         .expect("the final membership is usable");
@@ -64,29 +64,29 @@ fn member_transitions_own_their_complete_record_projection() {
     let mut incarnations = member.take_incarnation_counter();
     let incarnation = incarnations.mint().expect("incarnation available");
 
-    member.transition(MemberTransition::Admitted);
+    assert!(member.transition(MemberTransition::Admitted));
     assert_eq!(member.record().stage, MemberStage::Admitted);
 
-    member.transition(MemberTransition::Starting { incarnation });
+    assert!(member.transition(MemberTransition::Starting { incarnation }));
     let record = member.record();
     assert_eq!(record.stage, MemberStage::Starting);
     assert_eq!(record.incarnation, Some(incarnation));
     assert_eq!(record.last_incarnation, Some(incarnation));
     assert_eq!(record.restart_at, None);
 
-    member.transition(MemberTransition::Running);
+    assert!(member.transition(MemberTransition::Running));
     assert_eq!(member.record().stage, MemberStage::Running);
-    member.transition(MemberTransition::Stopping);
+    assert!(member.transition(MemberTransition::Stopping));
     assert_eq!(member.record().stage, MemberStage::Stopping);
 
     let exit = Exit::completed(Cancellation::NotObserved);
     let restart_count = RestartCount::ZERO.bump();
     let restart_at = crate::runtime::now();
-    member.transition(MemberTransition::RestartScheduled {
+    assert!(member.transition(MemberTransition::RestartScheduled {
         exit: exit.clone(),
         restart_count,
         restart_at: Some(restart_at),
-    });
+    }));
     let record = member.record();
     assert_eq!(record.stage, MemberStage::Restarting);
     assert_eq!(record.incarnation, None);
@@ -96,9 +96,9 @@ fn member_transitions_own_their_complete_record_projection() {
     assert_eq!(record.restart_at, Some(restart_at));
 
     let second = incarnations.mint().expect("restart incarnation available");
-    member.transition(MemberTransition::Starting {
+    assert!(member.transition(MemberTransition::Starting {
         incarnation: second,
-    });
+    }));
     let record = member.record();
     assert_eq!(record.stage, MemberStage::Starting);
     assert_eq!(record.incarnation, Some(second));
@@ -127,13 +127,13 @@ fn incarnation_mint_exhaustion_has_no_terminal_side_effects() {
     let spent = setup_incarnations
         .mint()
         .expect("setup incarnation available");
-    member.transition(MemberTransition::Admitted);
-    member.transition(MemberTransition::Starting { incarnation: spent });
-    member.transition(MemberTransition::RestartScheduled {
+    assert!(member.transition(MemberTransition::Admitted));
+    assert!(member.transition(MemberTransition::Starting { incarnation: spent }));
+    assert!(member.transition(MemberTransition::RestartScheduled {
         exit: previous.clone(),
         restart_count: RestartCount::ZERO,
         restart_at: None,
-    });
+    }));
     let mut counter = IncarnationCounter::near_exhaustion(member.membership());
 
     assert!(counter.mint().is_some());
@@ -567,7 +567,7 @@ async fn scope_incarnation_exhaustion_closes_nested_observation() {
         ScopeIdentity::new(),
     );
     let slot = SlotCell::new(Arc::clone(&member), Some(Arc::clone(&scope)));
-    parent.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(parent.set_admitted_children(vec![resident_projection(&slot)]));
     let mut snapshots = scope.subscribe_snapshots();
     let mut events = scope.subscribe_lifecycle();
     let mut counter = IncarnationCounter::near_exhaustion(member.membership());
@@ -621,7 +621,7 @@ async fn never_started_nested_terminal_publishes_one_final_parent_snapshot() {
     let nested = isolated_scope("nested", ScopeFlavor::Ordered);
     resolve_fixture_options(&nested.member);
     let slot = SlotCell::new(Arc::clone(&nested.member), Some(Arc::clone(&nested)));
-    parent.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(parent.set_admitted_children(vec![resident_projection(&slot)]));
     let mut snapshots = parent.subscribe_snapshots();
 
     assert!(parent.terminalize_child(

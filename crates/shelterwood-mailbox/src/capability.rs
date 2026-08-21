@@ -205,6 +205,13 @@ impl<T> Drop for DisposingReceiver<T> {
             .expect("a live disposing receiver retains its channel");
         let mut value = None;
         let mut panics = crate::panic::PanicAccumulator::default();
+        // Tokio's one-shot close is atomics-only, so cancellation never
+        // required the timer path's blocking-disposal venue. The old ruling
+        // that this justified leaving the one-shot registration unproxied is
+        // nevertheless superseded by #398: reply polling registers a proxy
+        // uniformly because delivery, not cancellation, is the abort-class
+        // seam. Cancellation inherits that containment without retaining a
+        // special raw-waker path of its own.
         // Recovery runs first so an unclaimed value reaches isolated disposal
         // before the receiver -- and therefore before the waker clone it
         // registered -- is retired; a hostile waker destructor can neither

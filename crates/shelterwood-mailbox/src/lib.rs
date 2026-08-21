@@ -34,10 +34,6 @@ mod futures;
 mod reply;
 #[cfg(test)]
 mod test_support;
-#[allow(
-    dead_code,
-    reason = "the foundation primitive is wired into deadlines by the next stacked change"
-)]
 mod waker_proxy;
 
 #[doc(hidden)]

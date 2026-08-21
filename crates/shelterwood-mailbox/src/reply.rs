@@ -269,10 +269,17 @@ mod tests {
             .expect("staged reply publisher mutex")
             .take()
             .expect("reply channel installed its publisher");
+        // Measured as a delta, not an absolute. The expired timer already
+        // woke the *previous* poll's waker, and the waker proxy replays that
+        // record into whichever caller registers next -- a spurious wake the
+        // `Future` contract permits, and the price of never losing a real one.
+        // The property under test is that publishing the winning value wakes
+        // the deferred caller exactly once.
+        let woken_before_publish = wakes.load(Ordering::SeqCst);
         publisher
             .publish(Box::new(7_u8))
             .unwrap_or_else(|_| panic!("the staged receiver remains live"));
-        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(wakes.load(Ordering::SeqCst), woken_before_publish + 1);
         assert!(matches!(
             receive.as_mut().poll(&mut Context::from_waker(&waker)),
             Poll::Ready(Ok(7))

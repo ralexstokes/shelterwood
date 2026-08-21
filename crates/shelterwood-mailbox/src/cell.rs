@@ -108,7 +108,7 @@ pub(super) struct OperationState<M> {
     registration: Option<WaiterId>,
 }
 
-mod waker_slot;
+pub(crate) mod waker_slot;
 
 use waker_slot::{WakerAction, WakerEffects, WakerSlot};
 

@@ -152,7 +152,8 @@ where
 mod tests {
     use std::{
         future::Future,
-        task::{Context, Poll, Waker},
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
         time::Duration,
     };
 
@@ -307,12 +308,34 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn maximum_timeout_stays_unbounded() {
+        // Unique to this test: counts caller-waker clones so the assertion
+        // below can see whether a `ProxiedSleep` ever parked.
+        static CALLER_CLONES: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn clone_counting(data: *const ()) -> RawWaker {
+            CALLER_CLONES.fetch_add(1, Ordering::SeqCst);
+            RawWaker::new(data, &COUNTING_VTABLE)
+        }
+        unsafe fn noop(_data: *const ()) {}
+        static COUNTING_VTABLE: RawWakerVTable =
+            RawWakerVTable::new(clone_counting, noop, noop, noop);
+        // SAFETY: the vtable owns no state; every function is a no-op apart
+        // from the clone counter.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &COUNTING_VTABLE)) };
+
         let mut timed = std::pin::pin!(timeout(Duration::MAX, std::future::pending::<()>()));
-        let mut context = Context::from_waker(Waker::noop());
+        let mut context = Context::from_waker(&waker);
 
         assert!(timed.as_mut().poll(&mut context).is_pending());
         tokio::time::advance(MAX_TIMER_SLICE * 2).await;
         assert!(timed.as_mut().poll(&mut context).is_pending());
+        // The overflow guard constructs no timer and no proxy at all: a
+        // parked `ProxiedSleep` clones the caller waker on its first pending
+        // poll, so an armed path would be visible here.
+        assert_eq!(
+            CALLER_CLONES.load(Ordering::SeqCst),
+            0,
+            "an unrepresentable budget must never arm a timer or park a proxy"
+        );
     }
 
     #[test]

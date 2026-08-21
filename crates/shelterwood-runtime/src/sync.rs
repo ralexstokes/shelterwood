@@ -667,19 +667,21 @@ fn poll_one_shot_with_proxy<T, R>(
 }
 
 impl<T> DisposingReceiver<T> {
-    fn inner_mut(&mut self) -> &mut OneShotReceiver<T> {
-        self.inner
-            .as_mut()
-            .expect("a live disposing receiver retains its channel")
-    }
-
     /// Retires a caller waker only after selecting its post-unlock venue.
     ///
     /// Ready results use contained inline retirement: a result may own a user
     /// value (or a panic payload that owns one), so a hostile waker destructor
     /// is subordinate to returning that result intact. Drop glue uses the
-    /// detached lane because caller-waker destruction may block as well as
-    /// panic, and a holder's dropping thread is not an acceptable venue.
+    /// detached lane. That venue is a per-seam adjudication, not a universal
+    /// rule: the mailbox reply receiver retires cancellation inline
+    /// (`shelterwood-mailbox`'s `DisposingReceiver`), accepting that a slow
+    /// caller-waker destructor stalls the abandoning holder alone. This
+    /// receiver backs the one-shot task and blocking-offload seams — and,
+    /// downstream, the public admission, removal, and system-join futures —
+    /// where cancellation is cold, so one disposal-lane submission per
+    /// abandoned pending receiver buys drop glue that cannot block or stall
+    /// the holder's thread. A hot cancellation path added here should
+    /// revisit the reply receiver's ruling rather than inherit this one.
     fn retire_caller_waker(&mut self, retirement: WakerRetirement, panics: &mut PanicAccumulator) {
         let caller_waker = self.caller_waker.take();
         if let Some(caller_waker) = &caller_waker {
@@ -712,6 +714,13 @@ impl<T> DisposingReceiver<T> {
         result
     }
 
+    /// Staged parity with the mailbox receiver's timeout arbitration: no
+    /// production path closes a runtime `DisposingReceiver` today. It matters
+    /// to the venue split anyway, because a receiver-initiated close is the
+    /// one ready edge no sender wake precedes — the proxy can still hold an
+    /// installed caller clone when inline retirement runs, which every
+    /// sender-side completion consumes through the wake first. The
+    /// ready-edge containment test below is that path's pin.
     pub fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T> {
         let result = poll_one_shot_with_proxy(
             self.inner
@@ -729,13 +738,6 @@ impl<T> DisposingReceiver<T> {
         }
         result
     }
-
-    pub fn close(&mut self) {
-        self.inner_mut().close();
-        let mut panics = PanicAccumulator::default();
-        self.retire_caller_waker(WakerRetirement::Inline, &mut panics);
-        discard_panic(panics.take());
-    }
 }
 
 impl<T> Drop for DisposingReceiver<T> {
@@ -748,8 +750,13 @@ impl<T> Drop for DisposingReceiver<T> {
         let mut panics = PanicAccumulator::default();
 
         // Recover and dispatch an unclaimed value before either receiver or
-        // caller-waker retirement can fail. The receiver holds only a proxy
-        // clone, so Tokio's close/drop work below is framework-owned traffic.
+        // caller-waker retirement can fail. The waker Tokio's close/drop work
+        // below destroys is only ever a framework proxy clone. If recovery
+        // itself unwinds, the value stays in the channel and `inner`'s own
+        // drop glue destroys it inline rather than through `dispose`:
+        // accepted, because reaching it requires a destructor that has
+        // already panicked, and the alternative is retrying a step that just
+        // failed.
         panics.run(|| value = inner.close_and_take());
         panics.run(|| {
             if let Some(value) = value {
@@ -1434,6 +1441,37 @@ mod tests {
             destructor_name.as_deref(),
             Some(DISPOSAL_THREAD),
             "drop glue must not destroy a caller waker on the holder's thread"
+        );
+    }
+
+    #[test]
+    fn receiver_close_ready_edge_contains_the_installed_caller_waker() {
+        let closing_thread = std::thread::current().id();
+        let (_sender, receiver) = oneshot::<u8>();
+        let mut receiver = DisposingReceiver::new(receiver);
+        let (dropped, observed_drop) = mpsc::channel();
+        let caller = ManuallyDrop::new(record_panicking_drop_waker(dropped));
+
+        assert!(matches!(
+            receiver.poll_receive(&mut Context::from_waker(&caller)),
+            Poll::Pending
+        ));
+        // A receiver-initiated close reaches the ready edge with the caller
+        // clone still installed: no sender wake preceded it to consume the
+        // slot. Retirement must destroy that hostile clone synchronously on
+        // this thread and contain its panic so the close outcome is handed
+        // back intact.
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut Context::from_waker(&caller)),
+            OneShotClose::Empty
+        ));
+
+        let (destructor_thread, _destructor_name) = observed_drop
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the ready edge retires the installed caller clone");
+        assert_eq!(
+            destructor_thread, closing_thread,
+            "ready-path retirement is synchronous on the closing thread"
         );
     }
 

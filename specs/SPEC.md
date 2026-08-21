@@ -2863,24 +2863,23 @@ Every cross-task promise — an admission or removal awaiting resolution,
 an exit report awaiting publication, a member cell awaiting terminality,
 a waiter awaiting a wake — is held as an owned value whose destructor
 discharges it, fail-closed, with a **synchronous** fallback: complete with
-the terminal rejection, publish the coarse exit, emit the edge, pulse the
-signal — never an await, never a join. The event loop that services the
+the terminal rejection, publish the coarse exit, pulse the signal — never
+an await, never a join. The event loop that services the
 orderly path is an optimization of these values' consumption, never the
 sole guarantor: when a driver future is destroyed at any await point —
 hard-abort cascade, panic, natural return with events still queued —
 unwinding alone MUST discharge every outstanding promise (§11's
 driver-death rule, §16.17's test anchor). Two corollaries are normative.
 Residency in a scope's observed child set is the exception to a
-drop-emitted edge: the sites that remove it (`clear_residents_locked` /
-`prune_child_locked`) MUST publish `Removed` in the observation transaction
-that displaces it. The same transaction hands the displaced resident to
-detached disposal after unlock; residency's own drop does not emit the edge. A
-resident can own the last handle to a mailbox containing unread user messages,
-so removal schedules its destructor on a detached disposal worker rather than
-under the observation gate; that worker has no observation transaction through
-which to publish. These emission-site obligations enforce §3.2's exact pairing
-at the only residency-withdrawal transitions while preserving §5.5's required
-disposal venue. And each cell has exactly **one** change signal from which
+drop-emitted edge: a resident can own the last handle to a mailbox
+containing unread user messages, so its destructor is scheduled on a
+detached disposal worker (§5.5's venue) which has no observation
+transaction through which to publish. Each residency withdrawal MUST
+therefore emit `Removed` in the observation transaction that displaces
+it, and MUST emit it for exactly those residents whose `Added` the same
+scope already published — residency records which of the two it is, so
+§3.2's exact pairing survives a residency installed by an admission that
+then unwound. And each cell has exactly **one** change signal from which
 every compound wait derives — a second wake path is a lost wakeup waiting to
 be written.
 

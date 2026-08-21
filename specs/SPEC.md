@@ -875,20 +875,18 @@ the intake freeze, plus the wakers of `Guard::finished()`'s own
 completion waiters, which are caller-owned but run by the incarnation on
 the ordinary completion path as well as at the freeze; the frozen
 mailbox prefix's own detached disposal above is not part of it and stays
-a disposal fault. A disposal panic
-**already retained when a receive boundary is reached** therefore fails
-the incarnation before any further delivery or `on_stop`. As with
-`Guard::finished()` (§6.5) this is not a join: a panic that lands after
-the last receive boundary is still the incarnation's exit, but cannot
-suppress `on_stop`. The completion notification of §6.5 is the one
-carve-out in the other direction: because its wake panic MUST be
-retained before the framework may forget the work, a completion waiter
-whose waker *blocks* rather than panicking holds that work in the
-incarnation's resource ledger, and teardown joins it — so caller code
-can delay teardown and exit publication there. Grace bounds drain plus
-`on_stop` together (§11) —
-including after a local `ctx.stop()`, which arms the child's own
-configured ladder (§11).
+a disposal fault. A disposal panic **already retained when a receive
+boundary is reached** therefore fails the incarnation before any further
+delivery or `on_stop`. As with `Guard::finished()` (§6.5) this is not a
+join: a panic that lands after the last receive boundary is still the
+incarnation's exit, but cannot suppress `on_stop`. The completion
+notification of §6.5 is the one carve-out in the other direction:
+because its wake panic MUST be retained before the framework may forget
+the work, a completion waiter whose waker *blocks* rather than panicking
+holds that work in the incarnation's resource ledger, and teardown joins
+it — so caller code can delay teardown and exit publication there. Grace
+bounds drain plus `on_stop` together (§11) — including after a local
+`ctx.stop()`, which arms the child's own configured ladder (§11).
 
 ### 6.3 One timer facility
 

@@ -2871,11 +2871,17 @@ guarantor: when a driver future is destroyed at any await point —
 hard-abort cascade, panic, natural return with events still queued —
 unwinding alone MUST discharge every outstanding promise (§11's
 driver-death rule, §16.17's test anchor). Two corollaries are normative.
-Residency in a scope's observed child set is itself such a value — its
-drop emits `Removed`, making §3.2's exact pairing structural rather than
-remembered. And each cell has exactly **one** change signal from which
-every compound wait derives — a second wake path is a lost wakeup
-waiting to be written.
+Residency in a scope's observed child set is paired with `Removed` at the
+sites that remove it (`clear_residents_locked` / `prune_child_locked`),
+before the displaced resident is handed to detached disposal; residency's
+own drop does not emit the edge. A resident can own the last handle to a
+mailbox containing unread user messages, so its destructor runs on a detached
+disposal worker rather than under the observation gate and has no observation
+transaction through which to publish. Enforcing the pairing at the removal
+sites therefore makes §3.2's exact pairing structural at the transition that
+displaces the resident while preserving §5.5's required disposal venue. And
+each cell has exactly **one** change signal from which every compound wait
+derives — a second wake path is a lost wakeup waiting to be written.
 
 ### 15.6 Performance posture
 
@@ -3772,14 +3778,19 @@ order is severity-ascending: `Finished` is the weakest claim, since a
 drain that began on natural completion says nothing about how the
 teardown itself ended; `ShutdownRequested` supersedes the structured
 failures, matching §11's drain-upgrade rule, which joins through this
-same lattice; and `NeverStarted` is the top element because it is not a
-live incarnation's verdict but the membership-terminal twin of §8's
-`NeverStarted` exit, so the scope-state projection and the membership
-exit agree whichever publication lands first. The consequences are that
-`wait_stopped()`, the final snapshot, and the stream's last `ScopeState`
-event always report the same, highest-precedence verdict, and that a
-root driver that dies mid-drain reports the join monitor's
-`ShutdownRequested` rather than the abandoned drain's `Finished`.
+same lattice; and `NeverStarted` is the top element because it states that
+no scope incarnation ever began, rather than giving a live scope
+incarnation's verdict. This lattice and its agreement guarantee apply within
+the scope plane: `wait_stopped()`, the final snapshot, and the stream's last
+`ScopeState` event always report the same, highest-precedence verdict. They do
+not require the membership plane's exit kind to match. In particular, a
+nested scope body dropped before its first poll is the sanctioned
+cross-plane divergence: the scope projection is `Stopped { NeverStarted }`
+because no scope incarnation began, while the membership exit is
+`Aborted { WithinGrace }` with `last_incarnation: Some(1)` because an
+incarnation was spawned and then aborted. A root driver that dies mid-drain
+reports the join monitor's `ShutdownRequested` rather than the abandoned
+drain's `Finished`.
 
 ```text
 ActorStats (II §22)

@@ -158,41 +158,71 @@ pub(crate) fn dispose<T: Send + 'static>(runtime: &Arc<dyn MailboxRuntime>, valu
 
 /// Receive state that keeps an unclaimed user value out of holder drop glue.
 pub(crate) struct DisposingReceiver<T> {
-    inner: OneShotReceiver<T>,
+    inner: Option<OneShotReceiver<T>>,
     runtime: Arc<dyn MailboxRuntime>,
 }
 
 impl<T: Send + 'static> DisposingReceiver<T> {
     pub(crate) fn new(inner: OneShotReceiver<T>, runtime: Arc<dyn MailboxRuntime>) -> Self {
-        Self { inner, runtime }
+        Self {
+            inner: Some(inner),
+            runtime,
+        }
     }
 }
 
 impl<T> DisposingReceiver<T> {
+    fn inner_mut(&mut self) -> &mut OneShotReceiver<T> {
+        self.inner
+            .as_mut()
+            .expect("a live disposing receiver retains its channel")
+    }
+
     pub(crate) fn runtime(&self) -> Arc<dyn MailboxRuntime> {
         Arc::clone(&self.runtime)
     }
 
     pub(crate) fn close(&mut self) {
-        self.inner.close();
+        self.inner_mut().close();
     }
 }
 
 impl<T: Send + 'static> DisposingReceiver<T> {
     pub(crate) fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
-        self.inner.poll_receive(context)
+        self.inner_mut().poll_receive(context)
     }
 
     pub(crate) fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T> {
-        self.inner.close_and_poll_receive(context)
+        self.inner_mut().close_and_poll_receive(context)
     }
 }
 
 impl<T> Drop for DisposingReceiver<T> {
     fn drop(&mut self) {
-        if let Some(value) = self.inner.close_and_take_erased() {
-            self.runtime.dispose(value);
-        }
+        let mut inner = self
+            .inner
+            .take()
+            .expect("a live disposing receiver retains its channel");
+        let mut value = None;
+        let mut panics = crate::panic::PanicAccumulator::default();
+        // Recovery runs first so an unclaimed value reaches isolated disposal
+        // before the receiver -- and therefore before the waker clone it
+        // registered -- is retired; a hostile waker destructor can neither
+        // divert nor destroy it. If recovery itself unwinds, the value stays
+        // in the channel and `inner`'s own drop glue destroys it inline
+        // rather than through the isolated lane: accepted, because reaching
+        // it requires a destructor that has already panicked, and the
+        // alternative is retrying a step that just failed.
+        panics.run(|| value = inner.close_and_take_erased());
+        // `dispose` can fall back to destroying the value on this thread when
+        // task and native-thread creation are exhausted, so submission belongs
+        // inside the boundary too.
+        panics.run(|| {
+            if let Some(value) = value {
+                self.runtime.dispose(value);
+            }
+        });
+        panics.run(|| drop(inner));
     }
 }
 

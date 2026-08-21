@@ -469,6 +469,7 @@ impl Backoff {
                     half_duration(delay)
                 } else {
                     duration_from_nanos(duration_nanos(delay) * (0.5 + sample * 0.5))
+                        .max(half_duration(delay))
                 }
             }
         };
@@ -1363,6 +1364,18 @@ mod tests {
         assert_eq!(
             even.next_delay(RestartAttempt(1), JitterSample::new(0.0)),
             Duration::from_nanos(1 << 59)
+        );
+    }
+
+    #[test]
+    fn smallest_positive_sample_equal_jitter_respects_the_exact_half_delay() {
+        let odd = Duration::from_nanos((1 << 60) + 1);
+        let fixed = Backoff::fixed(odd, Jitter::Equal).expect("valid backoff");
+        let smallest_positive = JitterSample::new(f64::from_bits(1));
+        assert_ne!(smallest_positive, JitterSample::new(0.0));
+        assert_eq!(
+            fixed.next_delay(RestartAttempt(1), smallest_positive),
+            Duration::from_nanos((1 << 59) + 1)
         );
     }
 

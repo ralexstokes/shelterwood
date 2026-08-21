@@ -428,8 +428,9 @@ trait Actor: Sized + Send + 'static {
   classifies `Failed`; §8). Infallible handlers write `Ok(())`; there is
   no `IntoExitResult` conversion trait. There is deliberately no
   stop-outcome return type: clean self-stop is `ctx.stop()` alone (B.1 —
-  effective after the current callback, `Err` outcome wins, idempotent),
-  so the return channel carries errors only and stop has one mechanism
+  intake and incarnation-owned resources freeze at the call, terminal
+  publication follows the callback, `Err` outcome wins, idempotent), so
+  the return channel carries errors only and stop has one mechanism
   (§1 principle 2). Constraints that MUST hold:
   - The blanket loop applies its own `?` only after awaiting the
     callback's exact `ExitResult`.
@@ -750,10 +751,17 @@ surfaces on that task even though the replacement remains accepted.
 Framework-initiated disposal of externally submitted mailbox or
 reply-bearing payloads — including mailbox teardown, timeout/withdrawal
 cleanup, and accepted-prefix batch disposal — runs detached from the
-initiating task with per-element panic containment. Incarnation-owned
-continuations, timer messages, and offload state instead follow §6.5 and
-§8's incarnation teardown and verdict rules. No single disposal-thread
-identity is promised.
+initiating task with per-element panic containment. After extracting any
+string diagnostic, the framework likewise destroys an opaque user panic
+payload *carried by a child exit* on the detached disposal lane rather than
+on the executor publishing the exit (§6.5's thread-exhaustion exception
+applies), and that destruction is terminal: a payload whose own destructor
+panics has its replacement discarded, never requeued. A panic payload
+*displaced* by one that outranks it — a rejected panic-slot record, a losing
+cleanup panic — is still discarded inline, since it is already a spent
+diagnostic. Incarnation-owned continuations, timer messages, and offload
+state instead follow §6.5 and §8's incarnation teardown and verdict rules. No
+single disposal-thread identity is promised.
 
 (The synchronization discipline behind every mailbox transition — the
 effects sink paired with the state guard, and the structural waker slot —
@@ -772,7 +780,6 @@ fairness:
    message), with one fairness exception: immediately after a continuation
    runs, one ready mailbox/offload delivery gets a turn before the next
    continuation, so a continuation chain cannot starve external input;
-   dropped-continuation reporting on exit is preserved;
 3. mailbox and offload deliveries;
 4. keyed timers.
 
@@ -781,8 +788,8 @@ applied to the loop). Continuations form a FIFO queue: multiple
 `continue_with` calls from one callback are all retained, in call order —
 no last-wins replacement and no single-pending cap (the queue is unbounded
 and consumes no mailbox capacity, B.1; discard happens only at the stop
-freeze, reported on exit) — each running as a "next message" ahead of
-queued mail, with the fairness interleave above applying between
+freeze) — each running as a "next message" ahead of queued mail, with
+the fairness interleave above applying between
 successive continuations. Timers whose deadlines fire at the same instant
 deliver in **arming order** — the order their *current* armings were
 established; re-arming a key (§6.3's replacement) takes the new position —
@@ -851,8 +858,8 @@ at the freeze, in acceptance order; under `latest()`, the surviving slot
 *replaced* per §5.4's replacement ordering, and is never handled). At the
 freeze, outstanding offloads are cancelled (incarnation-owned work of a
 stopping incarnation — continuations suppressed per §6.5), queued
-continuations are discarded and reported on exit (priority item 2 above),
-and armed timers are dropped (§6.3) — so for a cooperative `Drain` that
+continuations are discarded (priority item 2 above), and armed timers
+are dropped (§6.3) — so for a cooperative `Drain` that
 runs to completion, "the handled log equals the accepted prefix" (§16.15)
 has no asterisks beyond the one conflation already states: under `queue`
 the two are identical; under `latest()` the handled log is the accepted
@@ -2095,15 +2102,20 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   accepted while the membership has *no live incarnation* (a restart
   window — B.9's `shutdown_and_wait` landing between incarnations) is
   held on the membership and armed onto the next incarnation at its
-  start, which then starts and immediately begins teardown. The two
-  rules partition by target and never conflict: fresh-restart-starts-
-  clear says a latch *consumed by* incarnation N never carries to N+1;
-  the pending latch holds a request that arrived with no incarnation to
-  consume it — it was never any incarnation's spent latch, and it waits
-  for its first. What cannot exist is a stop request silently dropped in
-  the window. Cancelling an awaited membership operation never rides the
-  channel either: it is a per-operation level latch on the operation's
-  cell (§9's linearization rule).
+  start, which then starts and immediately begins teardown. The
+  scope-level latch has its own version of that window: a stop latched
+  before the driver's first settlement is read only at the top of the
+  driver's first loop pass, after the initial incarnations are already
+  published, so it too constructs and then immediately tears down. The
+  two carry rules partition by target and never conflict:
+  fresh-restart-starts-clear says a latch *consumed by* incarnation N
+  never carries to N+1; the pending latch holds a request that arrived
+  with no incarnation to consume it — it was never any incarnation's
+  spent latch, and it waits for its first. What cannot exist is a stop
+  request silently dropped in the window. Cancelling an awaited
+  membership operation never rides the channel either: it is a
+  per-operation level latch on the operation's cell (§9's linearization
+  rule).
 - Rebinding-transparent `send` during teardown can park against an
   unbound sibling; teardown-window notifications use `try_send`. This
   tradeoff is prominent shutdown guidance, alongside the
@@ -2526,8 +2538,10 @@ final cut, never a partial batch. Watch conflation remains permitted only
 *between committed transaction cuts*; it is not permission to expose the
 transaction's internal publications.
 
-`tracing` spans emit from one choke point (the optional `metrics` surface
-is Part II §22). Everything else observational — peer monitoring, actor
+Diagnostic instrumentation is not one of these contracts and core
+requires none; where a conforming library adds it, §15.7 constrains how
+(the optional `metrics` surface is Part II §22, a second emitter over the
+same seam). Everything else observational — peer monitoring, actor
 statistics, the self-recovering child-observation reducer, the packaged
 restart-counter view — is Part II (§20, §22): all are adapters over these
 two streams and the §3 identity types, which is what makes them safely
@@ -2850,14 +2864,58 @@ publication skipped when no subscriber exists — a subscriber-channel
 optimization only: pull-side `snapshot()` is an on-demand projection and
 can never go stale from the skip, and a fresh subscription's initial
 value is computed at subscribe time (§14) — (the conflating watch already
-makes cost O(observations), not O(events)); per-message `tracing` built
-lazily and near-zero with no active subscriber. What stays unsanctioned
-even under measured pressure: clock reads or randomness inside decision
-modules (pass `now` and samples in — it costs nothing), dispatch paths
-that bypass the exit funnel, and per-call-site staleness shortcuts —
+makes cost O(observations), not O(events)); per-message diagnostic
+instrumentation, if §15.7 ever adds any, built lazily so that it costs
+approximately nothing with no active subscriber — the cached-interest
+check of a conventional instrumentation library already supplies this, so
+the requirement is the property, not a bespoke mechanism for it. What
+stays unsanctioned even under measured pressure: clock reads or
+randomness inside decision modules (pass `now` and samples in — it costs
+nothing), dispatch paths that bypass the exit funnel, and per-call-site
+staleness shortcuts —
 each of these is a known failure mode of impure supervision engines in a
 performance costume, and no supervision engine has been observed hot
 enough to justify one. Measure before relaxing anything else.
+
+### 15.7 Instrumentation
+
+Diagnostic instrumentation — trace events, spans, and the Part II
+`metrics` feature (§22) — is **not** part of the observable contract:
+nothing in §§1–14 may be stated in terms of what a trace prints, and a
+conforming library MAY ship none at all. What is normative is the shape
+instrumentation MUST take *when* it is added, because the alternative —
+emission written wherever it seemed useful — retracts the guarantees
+§15.4 makes structural, one call site at a time.
+
+- **One layer emits.** Emission is confined to the top (façade) layer and
+  the confinement is a dependency pin, checkable at the manifest: the
+  instrumentation library is nameable only there, the same shape as the
+  runtime adapter being the only layer allowed to name a concrete
+  executor. Layers below surface facts as *data*, on the effects and
+  event values they already carry, and let the façade decide whether that
+  data becomes an event. A pin is enforceable; a convention about where
+  macros get written is not.
+- **A typed vocabulary, not free-form call sites.** Events are built
+  through named constructors whose signatures admit only framework-owned
+  data — discriminants, the §3 identity types, sequence numbers, counts,
+  durations. A user `Debug`/`Display` appears in no signature, which
+  states §15.4's field constraint once, structurally, instead of
+  re-deciding it at each call site. An operator who wants a failed
+  incarnation's error reads it from the `Exit` (§8) and formats it on
+  their own thread.
+- **Emission rides the effects flush.** An event arising inside a
+  critical section is recorded in that transaction's deferred-effect list
+  and emitted after the guard is released. A subscriber is arbitrary user
+  code — it may panic, block, or re-enter the library — so it is exactly
+  what §15.4 forbids under a framework lock, and the flush is where such
+  work already belongs.
+- **Spans attach at one site.** Spans, when added, attach per
+  incarnation, at the single site that already owns the incarnation
+  boundary, rather than being opened per operation across the loop.
+
+The `metrics` feature is a second emitter over this same vocabulary, not
+a shared runtime funnel that both must be routed through: it consumes the
+same typed events and inherits all four rules above.
 
 ## 16. Conformance obligations
 
@@ -3280,7 +3338,7 @@ in `on_stop`. ✓ = available; **R** = MUST be `Rejected`-or-absent (§6.4);
 | `recv()` / `try_recv()` (the merged event source: mailbox, offload completions, fired timers, queued continuations, §6.1 priority; `recv` yields `None` on stop request, biased; `try_recv` ignores the stop token — the drain primitive for raw loops: under `Drain`, exhaust the frozen prefix via `try_recv` after `recv` yields `None`, §11's raw-loop obligation) | ✓ | — | — | — |
 | `mailbox_shutdown()` (the resolved §11 policy for this actor's mailbox — what a raw loop consults to honor `Drain` vs `Discard`) | ✓ | — | — | — |
 | `mark_ready()` (one-shot effect by construction; meaningful only under gated readiness, else a documented no-op — B.2's rule, uniformly; during drain always the no-op) | ✓ | ✓ | ✓ | — |
-| `stop()` (clean self-stop; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §11 ladder as the stop bound. Live/Drain: effective after the current callback; in a successful effective-`AfterInit` initializer, after its automatic readiness edge. Raw: freezes intake at the call — drain the frozen prefix via `try_recv` after `recv` yields `None`; §1 principle 5's public primitive for the blanket loop's `stop()`) | ✓ | ✓ | ✓ | — |
+| `stop()` (clean self-stop; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §11 ladder as the stop bound. Live: freezes intake and incarnation-owned resources at the call, so later same-callback work is rejected; the callback may finish before terminal publication. In a successful effective-`AfterInit` initializer, stop publication follows its automatic readiness edge, while the freeze remains immediate. Drain is already frozen. Raw: freezes intake at the call — drain the frozen prefix via `try_recv` after `recv` yields `None`; §1 principle 5's public primitive for the blanket loop's `stop()`) | ✓ | ✓ | ✓ | — |
 | `is_draining()` | — | ✓ | ✓ | — |
 | `continue_with(msg)` (next-message continuation; no mailbox capacity; anti-starvation per §6.1) | ✓ | ✓ | **R** | — |
 | Keyed timers: `set_timeout` / `set_interval` / `clear_timer` (§6.3) | ✓ | ✓ | **R** | — |

@@ -1,6 +1,5 @@
 use std::{
     future::Future,
-    process::Command,
     sync::Arc,
     task::{Context as TaskContext, Poll, Wake, Waker},
     time::Duration,
@@ -11,7 +10,6 @@ use shelterwood::{
     LifecycleItem, Reply, StopReason, Tree,
 };
 
-const CHILD_ENV: &str = "SHELTERWOOD_HOSTILE_REPLY_WAKER_CHILD";
 const HANDLER_PANIC: &str = "injected reply-owning handler panic";
 
 enum Message {
@@ -46,7 +44,19 @@ impl Wake for PanicWake {
     }
 }
 
-async fn run_hostile_reply_waker_child() {
+/// Drops an unanswered [`Reply`] while its owning handler unwinds, with a
+/// hostile waker registered on the matching receiver.
+///
+/// This runs in process rather than behind a subprocess harness. The failure
+/// this pins is an uncontained hostile wake: either the waker panic escapes
+/// onto the unwind path and double-panics into `abort`, or it replaces the
+/// handler panic that the actor must publish. Every test binary already runs
+/// under nextest's process-per-test isolation, so an abort surfaces as a
+/// signal on this test alone and *is* the failure signal — the harness that
+/// used to re-implement that isolation could only ever fail open, since
+/// libtest exits zero when its `--exact` filter matches nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn unanswered_reply_drop_during_handler_panic_contains_hostile_waker() {
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
@@ -103,33 +113,4 @@ async fn run_hostile_reply_waker_child() {
     // released sooner, Tokio would observe a closed receiver and skip the
     // hostile wake that this regression must exercise.
     drop(receive);
-}
-
-#[test]
-fn unanswered_reply_drop_during_handler_panic_contains_hostile_waker() {
-    if std::env::var_os(CHILD_ENV).is_some() {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime")
-            .block_on(run_hostile_reply_waker_child());
-        return;
-    }
-
-    let output = Command::new(std::env::current_exe().expect("integration-test executable"))
-        .arg("--exact")
-        .arg("unanswered_reply_drop_during_handler_panic_contains_hostile_waker")
-        .arg("--nocapture")
-        .arg("--test-threads=1")
-        .env(CHILD_ENV, "1")
-        .output()
-        .expect("hostile-waker subprocess starts");
-
-    assert!(
-        output.status.success(),
-        "hostile-waker subprocess must survive and publish the actor exit\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
 }

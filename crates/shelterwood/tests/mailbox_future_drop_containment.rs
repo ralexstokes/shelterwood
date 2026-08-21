@@ -134,7 +134,13 @@ async fn send_timeout_drop_contains_timer_waker_during_unwind() {
 }
 
 #[tokio::test]
-async fn call_drop_contains_reply_receiver_waker_during_unwind() {
+async fn call_acceptance_phase_drop_contains_timer_waker_during_unwind() {
+    let (_tree, actor) = actor_ref();
+    assert_pending_then_unwind(Box::pin(actor.call(Message::Hold, Duration::MAX)));
+}
+
+#[tokio::test]
+async fn call_reply_phase_drop_contains_caller_wakers_during_unwind() {
     let (tree, actor) = actor_ref();
     let system = tree.spawn().expect("runtime is available");
     system.wait_started().await.expect("actor starts");
@@ -152,15 +158,17 @@ async fn recv_drop_contains_receiver_waker_during_unwind() {
     assert_pending_then_unwind(Box::pin(receiver.recv(Duration::MAX)));
 }
 
-/// Numbers the clones a single poll hands out so the regression can aim at
-/// one of them. `Deadlined::poll` registers the operation's clone first and
-/// the timer's second, so ordinal two is the timer's.
+/// Numbers the caller-waker clones a single poll hands out so the regression
+/// can aim at one of them. `Deadlined::poll` registers the operation's clone
+/// first and the timer proxy's stored caller second. The timer itself sees
+/// only the stable framework-owned proxy, so it does not mint another clone
+/// through this hostile vtable.
 ///
 /// This counter is process-global but only this vtable bumps it, and only the
 /// one test below installs this vtable, so the ordinals stay dense under any
 /// runner.
 static CLONES_MINTED: AtomicUsize = AtomicUsize::new(0);
-const TIMER_WAKER_ORDINAL: usize = 2;
+const TIMER_CALLER_WAKER_ORDINAL: usize = 2;
 
 unsafe fn clone_ordinal_waker(_data: *const ()) -> RawWaker {
     let ordinal = CLONES_MINTED.fetch_add(1, Ordering::SeqCst) + 1;
@@ -172,8 +180,8 @@ unsafe fn wake_ordinal_waker(_data: *const ()) {}
 unsafe fn wake_by_ref_ordinal_waker(_data: *const ()) {}
 
 unsafe fn drop_ordinal_waker(data: *const ()) {
-    if data.addr() == TIMER_WAKER_ORDINAL {
-        panic!("injected timer waker drop panic");
+    if data.addr() == TIMER_CALLER_WAKER_ORDINAL {
+        panic!("injected timer-proxy caller-waker drop panic");
     }
 }
 
@@ -201,11 +209,11 @@ impl Drop for HostileReply {
     }
 }
 
-/// A deadline future that completes *after* parking still holds an armed
-/// timer carrying a clone of the caller's waker. Retiring that timer on the
-/// ready return runs a `RawWaker` destructor while the completed reply is a
-/// live local, so an unwinding one would destroy the delivered value and --
-/// with a hostile value destructor -- abort the process.
+/// A deadline future that completes *after* parking still holds a caller-waker
+/// clone behind its timer proxy. Retiring that clone on the ready return must
+/// use contained disposal while the completed reply is a live local; an
+/// escaping cleanup panic would destroy that value and -- with a hostile value
+/// destructor -- abort the process.
 #[tokio::test]
 async fn recv_ready_after_parking_contains_the_retired_timer_waker() {
     let (_tree, actor) = actor_ref();
@@ -215,8 +223,8 @@ async fn recv_ready_after_parking_contains_the_retired_timer_waker() {
     // public future registers are under test.
     let hostile = ManuallyDrop::new(ordinal_waker());
 
-    // Parking registers one clone in the reply channel and one in the timer;
-    // only the timer's destructor is hostile.
+    // Parking registers one clone in the reply channel and one behind the
+    // timer proxy; only the proxy-owned caller clone's destructor is hostile.
     assert!(matches!(
         future.as_mut().poll(&mut TaskContext::from_waker(&hostile)),
         Poll::Pending
@@ -224,8 +232,8 @@ async fn recv_ready_after_parking_contains_the_retired_timer_waker() {
 
     assert_eq!(
         CLONES_MINTED.load(Ordering::SeqCst),
-        TIMER_WAKER_ORDINAL,
-        "parking must register exactly the operation and timer clones"
+        TIMER_CALLER_WAKER_ORDINAL,
+        "parking must register exactly the operation and timer-proxy caller clones"
     );
 
     reply.send(HostileReply);

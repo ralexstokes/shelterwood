@@ -2,12 +2,17 @@ use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use shelterwood_core::DeadlineBudget;
 
-use crate::{BoxedSleep, MailboxRuntime};
+use crate::{
+    BoxedSleep, MailboxRuntime,
+    cell::waker_slot::{WakerAction, WakerEffects},
+    panic::PanicAccumulator,
+    waker_proxy::WakerProxy,
+};
 
 pub(crate) use shelterwood_core::deadline::Deadline;
 
@@ -59,6 +64,7 @@ pub(super) struct Deadlined<F> {
     budget_width: DeadlineBudget,
     budget: Option<crate::deadline::Deadline>,
     timer: Option<BoxedSleep>,
+    timer_waker: Option<WakerProxy>,
     pub(super) started: bool,
     phase: DeadlinePhase,
 }
@@ -77,9 +83,64 @@ impl<F> Deadlined<F> {
             budget_width: budget_width.into(),
             budget: None,
             timer: None,
+            timer_waker: None,
             started: false,
             phase: DeadlinePhase::InitialAttempt,
         }
+    }
+
+    /// Polls the timer with a stable framework-owned waker.
+    ///
+    /// The first probe uses the static no-op waker. An already-ready timer
+    /// therefore allocates nothing; only a timer that actually parks gets a
+    /// proxy and a clone of the caller waker. A completion racing the probe is
+    /// observed by the immediate second poll, so the no-op registration
+    /// cannot lose a wake.
+    fn poll_timer(&mut self, context: &mut Context<'_>) -> Poll<()> {
+        if self.timer_waker.is_none() {
+            let mut probe = Context::from_waker(Waker::noop());
+            if self
+                .timer
+                .as_mut()
+                .expect("an unelapsed deadline future retains its timer")
+                .as_mut()
+                .poll(&mut probe)
+                .is_ready()
+            {
+                return Poll::Ready(());
+            }
+            self.timer_waker = Some(WakerProxy::new());
+        }
+
+        let timer_waker = self
+            .timer_waker
+            .as_ref()
+            .expect("a parked timer retains its waker proxy");
+        timer_waker.register(context.waker());
+        let mut proxy_context = Context::from_waker(timer_waker.waker());
+        self.timer
+            .as_mut()
+            .expect("an unelapsed deadline future retains its timer")
+            .as_mut()
+            .poll(&mut proxy_context)
+    }
+
+    /// Retires the caller waker through the blocking disposal lane, then
+    /// synchronously removes the framework-only wheel registration.
+    fn retire_timer(&mut self, panics: &mut PanicAccumulator) {
+        let mut effects = WakerEffects::default();
+        if let Some(timer_waker) = &self.timer_waker {
+            timer_waker.retire(
+                WakerAction::Dispose(Arc::clone(&self.runtime)),
+                &mut effects,
+            );
+        }
+        effects.flush(panics);
+
+        let timer = self.timer.take();
+        panics.run(|| drop(timer));
+        let timer_waker = self.timer_waker.take();
+        panics.run(|| drop(timer_waker));
     }
 }
 
@@ -119,34 +180,26 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             // entry armed until a worker thread reaches it, which is the
             // spurious wake this exists to prevent.
             //
-            // A `RawWaker` vtable is caller code, and `result` -- which may
-            // own a user value -- is a live local across that destructor. A
-            // resuming boundary would destroy the completed output instead of
-            // returning it, and a hostile output destructor would turn that
-            // into a double panic and a process abort, so the panic is
-            // contained rather than resumed: a delivered result outranks a
-            // waker-cleanup diagnostic. This is the precedence
-            // `CatchUnwindFuture`'s completed-output arm already applies.
-            let timer = this.timer.take();
-            crate::panic::discard_panic(crate::panic::catch_panic(|| drop(timer)).err());
+            // Tokio now destroys only a framework-owned proxy under the time
+            // driver mutex. The caller waker may block, so move it to the
+            // disposal lane before synchronously removing the wheel entry.
+            // `result` may own a user value, so a failure to submit cleanup
+            // remains subordinate to returning the completed output.
+            let mut panics = PanicAccumulator::default();
+            this.retire_timer(&mut panics);
+            crate::panic::discard_panic(panics.take());
             return Poll::Ready(result);
         }
         if this.phase == DeadlinePhase::InitialAttempt {
-            if this
-                .timer
-                .as_mut()
-                .expect("an unelapsed deadline future retains its timer")
-                .as_mut()
-                .poll(context)
-                .is_pending()
-            {
+            if this.poll_timer(context).is_pending() {
                 return Poll::Pending;
             }
             // The timer is a one-shot future: polling it again after it
             // resolves panics. Latch the transition and release it, so an
             // elapsed poll that stays pending re-polls only the operation.
             this.phase = DeadlinePhase::TimeoutArbitration;
-            this.timer = None;
+            let mut panics = PanicAccumulator::default();
+            this.retire_timer(&mut panics);
         }
         this.operation
             .poll_deadlined(context, budget, DeadlinePhase::TimeoutArbitration)
@@ -156,16 +209,15 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
 impl<F> Drop for Deadlined<F> {
     /// Retires an unelapsed timer inside a boundary.
     ///
-    /// Cancelling an armed timer destroys the clone of the caller's waker it
-    /// registered, and a `RawWaker` vtable is caller code. There is no caller
-    /// left to surface a panic to here, and during an existing unwind a bare
-    /// destructor panic is a double panic and a process abort, so the
-    /// retirement runs through an accumulator: it resumes on an ordinary drop
-    /// and is contained while another unwind is already in progress.
+    /// Tokio's wheel holds only a framework-owned proxy. The real caller
+    /// waker retires through the blocking disposal lane before the wheel entry
+    /// is synchronously cancelled, so its destructor can neither hold the
+    /// global time-driver mutex nor run in this drop glue. The accumulator
+    /// still protects capability submission and framework retirement during
+    /// an existing unwind.
     fn drop(&mut self) {
-        let timer = self.timer.take();
-        let mut panics = crate::panic::PanicAccumulator::default();
-        panics.run(|| drop(timer));
+        let mut panics = PanicAccumulator::default();
+        self.retire_timer(&mut panics);
     }
 }
 
@@ -193,6 +245,23 @@ mod tests {
     #[derive(Default)]
     struct ReadyAfterParking {
         polls: usize,
+    }
+
+    struct ImmediatelyReady;
+
+    impl super::DeadlineOperation for ImmediatelyReady {
+        type Output = ();
+
+        fn poll_deadlined(
+            &mut self,
+            _context: &mut Context<'_>,
+            _budget: crate::deadline::Deadline,
+            _phase: super::DeadlinePhase,
+        ) -> Poll<()> {
+            Poll::Ready(())
+        }
+
+        fn short_circuit(&mut self) {}
     }
 
     impl super::DeadlineOperation for ReadyAfterParking {
@@ -305,6 +374,20 @@ mod tests {
             woken_before,
             "a completed but retained deadline future must not wake its caller when the deadline elapses"
         );
+    }
+
+    #[crate::runtime::test(start_paused = true)]
+    async fn an_immediately_ready_operation_never_allocates_a_timer_proxy() {
+        let mut future = Box::pin(super::Deadlined::no_attempt(
+            ImmediatelyReady,
+            std::time::Duration::from_secs(1),
+            crate::capability::tests::runtime(),
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(future.timer_waker.is_none());
+        assert!(future.as_mut().poll(&mut context).is_ready());
+        assert!(future.timer_waker.is_none());
     }
 
     #[test]

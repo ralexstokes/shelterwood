@@ -1787,7 +1787,7 @@ mod tests {
     /// Generous enough to survive a loaded shared machine, finite so that a
     /// mutation which suppresses the fire under test reports instead of
     /// wedging the runner.
-    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
     /// A single-use, timeout-bounded signal between two threads.
     ///
@@ -2207,18 +2207,25 @@ mod tests {
         });
         entered.wait("the completion wake to reach the hostile waiter");
 
-        assert!(finished.is_fired(), "all completion waiters were released");
+        // Sample the mid-wake state, then release before asserting on it: an
+        // assertion that fires while the wake is still parked would strand the
+        // peer on its timeout and report the expiry instead of the mismatch.
+        let fired_mid_wake = finished.is_fired();
         resources.reclaim_finished();
-        assert!(
-            !resources.offloads.is_empty(),
+        let pinned_mid_wake = resources.offloads.len();
+        let recorded_mid_wake = panic.take();
+        release.open();
+
+        assert!(fired_mid_wake, "all completion waiters were released");
+        assert_eq!(
+            pinned_mid_wake, 1,
             "the fired bit cannot retire work before its hostile wake is contained"
         );
         assert!(
-            panic.take().is_none(),
+            recorded_mid_wake.is_none(),
             "an actor turn can precede the blocked wake's panic"
         );
 
-        release.open();
         poller.join().expect("the caller wake panic is contained");
         resources.reclaim_finished();
         assert!(
@@ -2275,15 +2282,17 @@ mod tests {
         });
 
         entered.wait("the completion wake to reach the hostile waiter");
-        assert!(finished.is_fired(), "all completion waiters were released");
+        let fired_mid_wake = finished.is_fired();
         resources.reclaim_finished();
+        let pinned_mid_wake = resources.offloads.len();
+        release.open();
+
+        assert!(fired_mid_wake, "all completion waiters were released");
         assert_eq!(
-            resources.offloads.len(),
-            1,
+            pinned_mid_wake, 1,
             "the ledger keeps the task handle teardown must join while the wake runs"
         );
 
-        release.open();
         resources.join_offloads().await;
         assert!(
             resources.offloads.is_empty(),

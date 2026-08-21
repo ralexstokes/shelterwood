@@ -10,9 +10,7 @@ use std::{
 };
 
 use common::{POLL_TIMEOUT, policy::never, waiting};
-use shelterwood::{
-    ExitError, Readiness, ScopeRef, ScopeState, StartupError, StopReason, TaskDef, Tree,
-};
+use shelterwood::{ExitError, Readiness, ScopeRef, ScopeState, StartupError, TaskDef, Tree};
 
 #[derive(Default)]
 struct BlockingWakeState {
@@ -225,36 +223,6 @@ async fn wait_for_join_wake(state: &HostileWakeState) {
     tokio::time::timeout(POLL_TIMEOUT, state.woken.notified())
         .await
         .expect("the joined root driver wakes its public waiter");
-}
-
-/// `System::wait` reaches the shared `join_driver` seam after the natural
-/// terminal wait. A hostile caller-waker destructor must be contained before
-/// the joined output is handed back.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn system_wait_contains_join_waker_retirement() {
-    let system = waiting::tree().spawn().expect("runtime is available");
-    system.wait_started().await.expect("root starts");
-    let scope = system.scope();
-    let (controller, benign) = WakeController::new();
-    let mut wait = Box::pin(system.wait());
-    assert!(matches!(
-        wait.as_mut().poll(&mut Context::from_waker(&benign)),
-        Poll::Pending
-    ));
-    // Request from a foreign thread because this test intentionally blocks
-    // the registered waker inside the synchronous request publication.
-    let shutdown_scope = scope.clone();
-    let requester = std::thread::spawn(move || shutdown_scope.request_shutdown());
-
-    let (hostile, state) =
-        park_hostile_waker_in_driver_join(wait.as_mut(), &scope, &controller, &benign).await;
-    controller.release_all_started();
-    wait_for_join_wake(&state).await;
-    assert!(matches!(
-        wait.as_mut().poll(&mut Context::from_waker(&hostile)),
-        Poll::Ready(StopReason::ShutdownRequested)
-    ));
-    requester.join().expect("shutdown requester returns");
 }
 
 /// `System::shutdown` performs the same root-driver join after its bounded

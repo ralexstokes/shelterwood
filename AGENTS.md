@@ -73,8 +73,11 @@ rests on:
   `runtime::dispose_detached` after unlock: the last member owner can also be
   the last owner of a mailbox containing unread user messages, which
   `RetainedExit` does not cover. The first two displace an existing resident;
-  the third holds the *incoming* projection in a `ResidentAdmission` guard, so
-  a bookkeeping panic before installation retires the same graph the same way.
+  the third pushes the *incoming* projection into residency before its first
+  fallible step, so a bookkeeping panic leaves the graph owned by residency
+  and retires it the same way at scope clear. Such a resident stays
+  unannounced, which keeps SPEC §3.2's `Added`/`Removed` pairing exact and
+  keeps it out of the observed child set.
   Containment lives on `ResidentChild::drop` rather than on the displaced
   `Vec`, because `Vec`'s slice drop glue keeps going after an element panics
   and a second hostile mailbox destructor would then panic inside the first

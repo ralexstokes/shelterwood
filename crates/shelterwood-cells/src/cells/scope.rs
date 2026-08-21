@@ -1,8 +1,6 @@
 use std::{
     any::Any,
-    cell::{Ref, RefCell},
     collections::VecDeque,
-    rc::Rc,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicBool, Ordering},
@@ -56,49 +54,6 @@ impl ResidentProjection {
     }
 }
 
-/// By-value admission input protected until residency owns it.
-///
-/// A projection can be the last owner of a member and its mailbox. Any
-/// bookkeeping panic before installation therefore routes the whole graph to
-/// detached disposal instead of unwinding it through the observation gate.
-///
-/// The transaction holds the second `Rc` rather than this guard disposing
-/// from its own `Drop`: a bare guard would submit the disposal job with the
-/// observation gate still held. That is legal — a submission runs no user
-/// code — but the standing preference is that a caller already holding an
-/// effects sink flushes through it, because a submission can cost a native
-/// thread start. #390 tracks deleting the guard outright by letting residency
-/// own the projection across admission's fallible steps.
-struct ResidentAdmission(Rc<RefCell<Option<ResidentProjection>>>);
-
-impl ResidentAdmission {
-    fn new(projection: ResidentProjection, txn: &mut ObservationTxn<'_>) -> Self {
-        let projection = Rc::new(RefCell::new(Some(projection)));
-        let deferred = Rc::clone(&projection);
-        txn.defer(move || {
-            if let Some(projection) = deferred.borrow_mut().take() {
-                runtime::dispose_detached(projection);
-            }
-        });
-        Self(projection)
-    }
-
-    fn projection(&self) -> Ref<'_, ResidentProjection> {
-        Ref::map(self.0.borrow(), |projection| {
-            projection
-                .as_ref()
-                .expect("resident admission was already installed")
-        })
-    }
-
-    fn install(self) -> ResidentProjection {
-        self.0
-            .borrow_mut()
-            .take()
-            .expect("resident admission installs exactly once")
-    }
-}
-
 /// One slot of a scope's observed child set, with its own unwind boundary.
 ///
 /// A displaced set is disposed as a whole `Vec`, and `Vec`'s slice drop glue
@@ -118,12 +73,22 @@ impl ResidentAdmission {
 struct ResidentChild {
     /// `None` only while [`Drop`] is destroying the projection.
     projection: Option<ResidentProjection>,
+    /// Whether this scope published this resident's `Added` edge.
+    ///
+    /// Admission owns the residency slot across its fallible steps, so an
+    /// unwind can leave a resident installed that was never announced. SPEC
+    /// §3.2's pairing is exact — both edges or neither — so a withdrawal
+    /// mirrors this flag rather than emitting `Removed` unconditionally, and
+    /// the snapshot producer leaves an unannounced resident out of the
+    /// observed child set for the same reason.
+    announced: bool,
 }
 
 impl ResidentChild {
     fn new(projection: ResidentProjection) -> Self {
         Self {
             projection: Some(projection),
+            announced: false,
         }
     }
 
@@ -345,16 +310,20 @@ impl ScopeCell {
     }
 
     pub fn resident_projections(&self) -> Vec<ResidentProjection> {
-        self.current_children()
-            .iter()
-            .map(|resident| resident.projection().clone())
-            .collect()
+        self.with_observation_gate(|_| {
+            self.current_children()
+                .iter()
+                .map(|resident| resident.projection().clone())
+                .collect()
+        })
     }
 
     pub fn has_resident_child(&self, member: &MemberCell) -> bool {
-        self.current_children()
-            .iter()
-            .any(|resident| resident.projection().member.membership() == member.membership())
+        self.with_observation_gate(|_| {
+            self.current_children()
+                .iter()
+                .any(|resident| resident.projection().member.membership() == member.membership())
+        })
     }
 
     fn current_children(&self) -> MutexGuard<'_, Vec<ResidentChild>> {
@@ -837,6 +806,13 @@ impl ScopeCell {
         })
     }
 
+    /// Installs residency without announcing it, as an admission that
+    /// unwound between its residency push and its `Added` publication does.
+    #[cfg(test)]
+    fn push_unannounced_resident_for_test(&self, child: ResidentProjection) {
+        self.current_children().push(ResidentChild::new(child));
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub fn prune_child(&self, member: &MemberCell) -> bool {
         self.with_observation_gate(|wakes| self.prune_child_locked(member, wakes))
@@ -855,17 +831,22 @@ impl ScopeCell {
             return false;
         };
         debug_assert_eq!(resident.projection().member.membership(), membership);
-        let event = LifecycleEventKind::Removed {
+        // Mirror the announcement: a resident an unwound admission installed
+        // never published `Added`, and SPEC §3.2's pairing is both edges or
+        // neither. It is still withdrawn and disposed.
+        let event = resident.announced.then(|| LifecycleEventKind::Removed {
             id: resident.projection().member.id().clone(),
             membership,
             last_incarnation: resident.projection().member.record().last_incarnation,
-        };
+        });
         // The projection can carry the last member/mailbox owner. Put it in
         // the transaction before the fallible publication path so unwind also
         // retires it only after the observation gate is released. The detached
         // handoff deliberately makes final member teardown asynchronous.
         txn.defer(move || runtime::dispose_detached(resident));
-        self.emit_locked(txn, event);
+        if let Some(event) = event {
+            self.emit_locked(txn, event);
+        }
         true
     }
 
@@ -1262,19 +1243,39 @@ impl ScopeCell {
     /// Admits one projection, or refuses it whole.
     ///
     /// Returns whether the member's `Admitted` transition was legal. A refusal
-    /// publishes nothing: no gate handoff, no parent wiring, no residency push
-    /// and no `Added` event.
+    /// publishes nothing: no gate handoff, no parent wiring, no retained
+    /// residency and no `Added` event.
+    ///
+    /// A *panic* between the residency push and the `Added` publication is
+    /// different: residency keeps the resident so its possibly-last mailbox
+    /// owner retires through detached disposal at scope clear rather than
+    /// unwinding under the gate. Such a resident stays `announced == false`,
+    /// which keeps it out of the observed child set and out of the `Removed`
+    /// edge its withdrawal would otherwise publish — SPEC §3.2's pairing is
+    /// both edges or neither.
     #[must_use = "a refused admission leaves the child out of the residency"]
     pub fn admit_child_locked(
         self: &Arc<Self>,
         child: ResidentProjection,
         txn: &mut ObservationTxn<'_>,
     ) -> bool {
-        // Take protected ownership before gate adoption, parent wiring, and
-        // reducer validation. Until the final push succeeds this projection
-        // may be the last owner of a mailbox-bearing member.
-        let child = ResidentAdmission::new(child, txn);
-        let projection = child.projection();
+        // Residency takes ownership before every fallible step below. A panic
+        // can therefore leave this entry half-wired, but it cannot unwind the
+        // last owner of a mailbox-bearing member through the observation gate;
+        // scope teardown later routes the resident through detached disposal.
+        //
+        // Every reader of `current_children` is accounted for during this
+        // window. Snapshot construction, descendant handoff, terminal lookup,
+        // pruning and clearing already run under this observation gate. The
+        // public shutdown projection and driver terminality membership probe
+        // (`resident_projections` / `has_resident_child`) take the same gate
+        // themselves. The admission-local clone below is consequently the
+        // only code that can observe this entry before its transition lands.
+        // Publication readers additionally skip an unannounced entry, which is
+        // what makes a lingering half-wired resident invisible rather than a
+        // membership with only half its edges.
+        let projection = child.clone();
+        self.current_children().push(ResidentChild::new(child));
         let gate = self.current_observation_gate();
         let admitted = if let Some(scope) = &projection.scope {
             let admitted = scope.admit_observation_gate(self, &gate, txn);
@@ -1308,13 +1309,35 @@ impl ScopeCell {
             )
         };
         if !admitted {
+            // No other residency mutation can interleave under the gate, so
+            // the entry pushed above is still the last one. Refusal removes
+            // it without emitting either half of the Added/Removed pair and
+            // retires its potentially last mailbox owner after unlock.
+            let rejected = self.current_children().pop();
+            let rejected_is_admission = rejected.as_ref().is_some_and(|rejected| {
+                rejected.projection().member.membership() == projection.member.membership()
+            });
+            // Move both the resident and this function's lookup clone into
+            // the effect before diagnosing the structural pop-last
+            // invariant. If that diagnostic ever fires, neither possibly-last
+            // mailbox owner may unwind through the observation gate.
+            txn.defer(move || runtime::dispose_detached((projection, rejected)));
+            debug_assert!(
+                rejected_is_admission,
+                "refusal removes the admission-local resident"
+            );
             return false;
         }
         let id = projection.member.id().clone();
         let membership = projection.member.membership();
-        drop(projection);
-        self.current_children()
-            .push(ResidentChild::new(child.install()));
+        // Mark the resident announced before `emit_locked`: the Added
+        // publication schedules the commit-time snapshot, and that producer
+        // walks residency and skips whatever is still unannounced. This rests
+        // on the same "no residency mutation interleaves under the gate"
+        // invariant as the refusal pop above, which is where it is diagnosed.
+        if let Some(resident) = self.current_children().last_mut() {
+            resident.announced = true;
+        }
         self.emit_locked(txn, LifecycleEventKind::Added { id, membership });
         true
     }
@@ -1328,8 +1351,13 @@ impl ScopeCell {
             let mut children = self.current_children();
             std::mem::take(&mut *children)
         };
+        // An unannounced resident is one an admission installed and then
+        // unwound past. It never published `Added`, so SPEC §3.2's exact
+        // pairing forbids publishing its `Removed`; it is still displaced and
+        // disposed with the rest of the set.
         let removals = residents
             .iter()
+            .filter(|resident| resident.announced)
             .map(|resident| LifecycleEventKind::Removed {
                 id: resident.projection().member.id().clone(),
                 membership: resident.projection().member.membership(),
@@ -1808,6 +1836,7 @@ mod tests {
     #[test]
     fn rejected_resident_admission_detaches_its_last_mailbox_owner() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let mut lifecycle = root.subscribe_lifecycle();
         let member = child_member(&root, "invalid");
         let mut incarnations = member.take_incarnation_counter();
         let incarnation = incarnations.mint().expect("incarnation available");
@@ -1838,6 +1867,11 @@ mod tests {
             root.resident_projections().is_empty(),
             "a rejected admission publishes no residency"
         );
+        assert_eq!(
+            lifecycle.try_recv(),
+            Err(LifecycleTryRecvError::Empty),
+            "ordinary refusal emits neither Added nor Removed"
+        );
 
         assert_ne!(
             observed
@@ -1845,6 +1879,111 @@ mod tests {
                 .expect("mailbox payload disposal reports"),
             retiring_thread,
             "the by-value projection cannot unwind its mailbox through the observation gate"
+        );
+    }
+
+    #[test]
+    fn panicked_resident_admission_lingers_until_scope_clear() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let mut lifecycle = root.subscribe_lifecycle();
+        let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
+        let mut incarnations = nested.member.take_incarnation_counter();
+        let incarnation = incarnations.mint().expect("incarnation available");
+        let mailbox = MailboxCell::new(
+            nested.member.id().clone(),
+            shelterwood_runtime::mailbox_runtime(),
+        );
+        nested.member.attach_mailbox(mailbox.clone());
+        let actor = actor_ref_from_parts(Arc::clone(&nested.member), Arc::clone(&mailbox));
+        let mut effects = MailboxEffectQueue::default();
+        let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
+        MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
+        drop(effects);
+        let (dropped, observed) = mpsc::sync_channel(1);
+        actor
+            .try_send(ThreadProbe(dropped))
+            .expect("bound mailbox accepts the probe");
+
+        let poisoned = Arc::clone(&nested);
+        assert!(
+            catch_unwind(AssertUnwindSafe(move || {
+                let _control = poisoned.control.lock().expect("control starts healthy");
+                panic!("inject admission bookkeeping panic");
+            }))
+            .is_err(),
+            "the fixture poisons the post-transition parent-wiring step"
+        );
+
+        let membership = nested.member.membership();
+        let projection = ResidentProjection::new(Arc::clone(&nested.member), Some(nested));
+        drop(actor);
+        drop(mailbox);
+        let retiring_thread = std::thread::current().id();
+        catch_unwind(AssertUnwindSafe(|| root.admit_child(projection)))
+            .expect_err("poisoned parent wiring unwinds admission");
+
+        let residents = root.resident_projections();
+        assert_eq!(residents.len(), 1, "the half-wired resident remains owned");
+        assert_eq!(residents[0].member.membership(), membership);
+        assert!(matches!(
+            residents[0].member.record().stage,
+            MemberStage::Admitted
+        ));
+        drop(residents);
+        assert_eq!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "admission unwind does not destroy the resident mailbox"
+        );
+        assert_eq!(
+            lifecycle.try_recv(),
+            Err(LifecycleTryRecvError::Empty),
+            "the panic precedes Added publication"
+        );
+        assert!(
+            root.snapshot().children.is_empty(),
+            "an unannounced resident is owned residency, not an observed child"
+        );
+
+        root.clear_residents();
+        assert!(root.resident_projections().is_empty());
+        assert_eq!(
+            lifecycle.try_recv(),
+            Err(LifecycleTryRecvError::Empty),
+            "an unannounced resident publishes no Removed: SPEC §3.2 pairs both edges or neither"
+        );
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("scope clear disposes the lingering mailbox payload"),
+            retiring_thread,
+            "scope clear retains the detached disposal venue"
+        );
+    }
+
+    /// Withdrawal mirrors announcement at both removal sites, not just the
+    /// one `panicked_resident_admission_lingers_until_scope_clear` drives.
+    #[test]
+    fn pruning_an_unannounced_resident_publishes_no_removal_edge() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let member = child_member(&root, "half-wired");
+        let mut lifecycle = root.subscribe_lifecycle();
+
+        // Install residency exactly as an admission that unwound before its
+        // `Added` publication leaves it.
+        root.push_unannounced_resident_for_test(ResidentProjection::new(Arc::clone(&member), None));
+        assert_eq!(root.resident_projections().len(), 1);
+        assert!(root.snapshot().children.is_empty());
+
+        assert!(
+            root.prune_child(&member),
+            "an unannounced resident is still withdrawn"
+        );
+        assert!(root.resident_projections().is_empty());
+        assert_eq!(
+            lifecycle.try_recv(),
+            Err(LifecycleTryRecvError::Empty),
+            "neither edge is published for a membership that never announced"
         );
     }
 
@@ -1990,6 +2129,95 @@ mod tests {
         );
         assert!(root.has_resident_child(&nested.member));
         assert_eq!(captures.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn resident_readers_wait_out_a_half_wired_admission() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = isolated_scope("nested", ScopeFlavor::Dynamic);
+        let root_captures = root.probe_gate_captures();
+        let nested_captures = nested.probe_gate_captures();
+        let prior_gate = nested.observation_gate();
+        let held = prior_gate.lock();
+        let adopting_root = Arc::clone(&root);
+        let adopting_nested = Arc::clone(&nested);
+        let adoption = std::thread::spawn(move || {
+            assert!(adopting_root.admit_child(ResidentProjection::new(
+                Arc::clone(&adopting_nested.member),
+                Some(adopting_nested),
+            )));
+        });
+
+        assert_eq!(
+            root_captures
+                .recv_timeout(TEST_WAIT)
+                .expect("admission captures the parent gate"),
+            GateCapture::Observation
+        );
+        assert_eq!(
+            nested_captures
+                .recv_timeout(TEST_WAIT)
+                .expect("admission reaches the child handoff after its residency push"),
+            GateCapture::Adoption
+        );
+        assert!(matches!(
+            nested.member.record().stage,
+            MemberStage::Reserved
+        ));
+
+        let projecting_root = Arc::clone(&root);
+        let (projected, projected_receiver) = mpsc::sync_channel(1);
+        let projection_reader = std::thread::spawn(move || {
+            let residents = projecting_root.resident_projections();
+            projected
+                .send((residents.len(), residents[0].member.record().stage.clone()))
+                .expect("projection observation remains available");
+        });
+        let checking_root = Arc::clone(&root);
+        let checking_member = Arc::clone(&nested.member);
+        let (checked, checked_receiver) = mpsc::sync_channel(1);
+        let membership_reader = std::thread::spawn(move || {
+            checked
+                .send((
+                    checking_root.has_resident_child(&checking_member),
+                    checking_member.record().stage,
+                ))
+                .expect("membership observation remains available");
+        });
+        for _ in 0..2 {
+            assert_eq!(
+                root_captures
+                    .recv_timeout(TEST_WAIT)
+                    .expect("each resident reader captures the parent gate"),
+                GateCapture::Observation
+            );
+        }
+        assert_eq!(
+            projected_receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        );
+        assert_eq!(checked_receiver.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        drop(held);
+        adoption.join().expect("admission completes after handoff");
+        assert!(matches!(
+            projected_receiver
+                .recv_timeout(TEST_WAIT)
+                .expect("projection reader completes after admission"),
+            (1, MemberStage::Admitted)
+        ));
+        assert!(matches!(
+            checked_receiver
+                .recv_timeout(TEST_WAIT)
+                .expect("membership reader completes after admission"),
+            (true, MemberStage::Admitted)
+        ));
+        projection_reader
+            .join()
+            .expect("projection reader completes without panic");
+        membership_reader
+            .join()
+            .expect("membership reader completes without panic");
     }
 
     #[test]

@@ -346,10 +346,11 @@ impl MemberCell {
     /// `Acquire` pairs with the `Release` store in
     /// [`Self::set_terminal_disposal_pending`]. Two separate edges make a
     /// zero-budget straggler sample (the driver's `collect_stragglers`)
-    /// correct, and both rest on these atomics alone: the sample is *not*
-    /// incidentally serialized by the observation gate, because
-    /// [`ScopeCell::resident_projections`] takes `observation.current_children`
-    /// — a different mutex from the gate `publish_drain` holds.
+    /// correct. [`ScopeCell::resident_projections`] now serializes the
+    /// residency clone with `publish_drain` through the observation gate, but
+    /// releases that gate before the caller samples this marker and the member
+    /// record. Those following reads therefore still rest on the explicit
+    /// ordering below rather than incidental mutex overlap.
     ///
     /// This method owns the marker-before-record order so a caller cannot
     /// accidentally recreate the trailing gap by reversing two independent

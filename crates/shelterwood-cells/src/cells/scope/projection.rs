@@ -119,7 +119,13 @@ impl ScopeCell {
         let mut projected = Vec::with_capacity(children.len());
         let mut retained_exits = Vec::new();
         RetainedExit::retain_scope_state(&mut retained_exits, &record.state);
-        for resident in children.iter() {
+        // An admission that unwound past its residency push leaves a resident
+        // whose `Added` was never published. SPEC §3.2 keeps such a membership
+        // out of `children` / `child(id)` / `descendant(path)` exactly as it
+        // keeps it out of the event stream, so the cut skips it. Gate rehoming,
+        // terminality lookup and straggler collection still see it: it is
+        // owned residency, just not yet public.
+        for resident in children.iter().filter(|resident| resident.announced) {
             let (child, exits) = self.child_snapshot_locked(resident.projection());
             projected.push(child);
             for exit in exits {

@@ -73,12 +73,22 @@ impl ResidentProjection {
 struct ResidentChild {
     /// `None` only while [`Drop`] is destroying the projection.
     projection: Option<ResidentProjection>,
+    /// Whether this scope published this resident's `Added` edge.
+    ///
+    /// Admission owns the residency slot across its fallible steps, so an
+    /// unwind can leave a resident installed that was never announced. SPEC
+    /// §3.2's pairing is exact — both edges or neither — so a withdrawal
+    /// mirrors this flag rather than emitting `Removed` unconditionally, and
+    /// the snapshot producer leaves an unannounced resident out of the
+    /// observed child set for the same reason.
+    announced: bool,
 }
 
 impl ResidentChild {
     fn new(projection: ResidentProjection) -> Self {
         Self {
             projection: Some(projection),
+            announced: false,
         }
     }
 
@@ -814,17 +824,24 @@ impl ScopeCell {
             return false;
         };
         debug_assert_eq!(resident.projection().member.membership(), membership);
-        let event = LifecycleEventKind::Removed {
-            id: resident.projection().member.id().clone(),
-            membership,
-            last_incarnation: resident.projection().member.record().last_incarnation,
-        };
+        // Mirror the announcement: a resident an unwound admission installed
+        // never published `Added`, and SPEC §3.2's pairing is both edges or
+        // neither. It is still withdrawn and disposed.
+        let event = resident
+            .announced
+            .then(|| LifecycleEventKind::Removed {
+                id: resident.projection().member.id().clone(),
+                membership,
+                last_incarnation: resident.projection().member.record().last_incarnation,
+            });
         // The projection can carry the last member/mailbox owner. Put it in
         // the transaction before the fallible publication path so unwind also
         // retires it only after the observation gate is released. The detached
         // handoff deliberately makes final member teardown asynchronous.
         txn.defer(move || runtime::dispose_detached(resident));
-        self.emit_locked(txn, event);
+        if let Some(event) = event {
+            self.emit_locked(txn, event);
+        }
         true
     }
 
@@ -1223,6 +1240,14 @@ impl ScopeCell {
     /// Returns whether the member's `Admitted` transition was legal. A refusal
     /// publishes nothing: no gate handoff, no parent wiring, no retained
     /// residency and no `Added` event.
+    ///
+    /// A *panic* between the residency push and the `Added` publication is
+    /// different: residency keeps the resident so its possibly-last mailbox
+    /// owner retires through detached disposal at scope clear rather than
+    /// unwinding under the gate. Such a resident stays `announced == false`,
+    /// which keeps it out of the observed child set and out of the `Removed`
+    /// edge its withdrawal would otherwise publish — SPEC §3.2's pairing is
+    /// both edges or neither.
     #[must_use = "a refused admission leaves the child out of the residency"]
     pub fn admit_child_locked(
         self: &Arc<Self>,
@@ -1241,15 +1266,11 @@ impl ScopeCell {
         // (`resident_projections` / `has_resident_child`) take the same gate
         // themselves. The admission-local clone below is consequently the
         // only code that can observe this entry before its transition lands.
-        let projection = {
-            let mut children = self.current_children();
-            children.push(ResidentChild::new(child));
-            children
-                .last()
-                .expect("the just-pushed resident remains installed")
-                .projection()
-                .clone()
-        };
+        // Publication readers additionally skip an unannounced entry, which is
+        // what makes a lingering half-wired resident invisible rather than a
+        // membership with only half its edges.
+        let projection = child.clone();
+        self.current_children().push(ResidentChild::new(child));
         let gate = self.current_observation_gate();
         let admitted = if let Some(scope) = &projection.scope {
             let admitted = scope.admit_observation_gate(self, &gate, txn);
@@ -1304,9 +1325,12 @@ impl ScopeCell {
         }
         let id = projection.member.id().clone();
         let membership = projection.member.membership();
-        // This transition must precede `emit_locked`: the Added publication
-        // schedules the commit-time snapshot, and that producer now walks the
-        // resident installed above.
+        // Mark the resident announced before `emit_locked`: the Added
+        // publication schedules the commit-time snapshot, and that producer
+        // walks residency and skips whatever is still unannounced.
+        if let Some(resident) = self.current_children().last_mut() {
+            resident.announced = true;
+        }
         self.emit_locked(txn, LifecycleEventKind::Added { id, membership });
         true
     }
@@ -1320,8 +1344,13 @@ impl ScopeCell {
             let mut children = self.current_children();
             std::mem::take(&mut *children)
         };
+        // An unannounced resident is one an admission installed and then
+        // unwound past. It never published `Added`, so SPEC §3.2's exact
+        // pairing forbids publishing its `Removed`; it is still displaced and
+        // disposed with the rest of the set.
         let removals = residents
             .iter()
+            .filter(|resident| resident.announced)
             .map(|resident| LifecycleEventKind::Removed {
                 id: resident.projection().member.id().clone(),
                 membership: resident.projection().member.membership(),
@@ -1904,23 +1933,18 @@ mod tests {
             Err(LifecycleTryRecvError::Empty),
             "the panic precedes Added publication"
         );
+        assert!(
+            root.snapshot().children.is_empty(),
+            "an unannounced resident is owned residency, not an observed child"
+        );
 
         root.clear_residents();
         assert!(root.resident_projections().is_empty());
-        let removed = lifecycle
-            .try_recv()
-            .expect("clearing a half-wired resident emits its removal edge");
-        let LifecycleItem::Event(removed) = removed else {
-            panic!("scope clear publishes a lifecycle event")
-        };
-        assert!(matches!(
-            removed.kind,
-            LifecycleEventKind::Removed {
-                membership: removed_membership,
-                ..
-            } if removed_membership == membership
-        ));
-        assert_eq!(lifecycle.try_recv(), Err(LifecycleTryRecvError::Empty));
+        assert_eq!(
+            lifecycle.try_recv(),
+            Err(LifecycleTryRecvError::Empty),
+            "an unannounced resident publishes no Removed: SPEC §3.2 pairs both edges or neither"
+        );
         assert_ne!(
             observed
                 .recv_timeout(TEST_WAIT)

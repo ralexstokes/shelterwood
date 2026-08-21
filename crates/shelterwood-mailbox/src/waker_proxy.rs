@@ -103,11 +103,12 @@ impl Wake for WakerProxyState {
 #[cfg(test)]
 mod tests {
     use std::{
+        mem::ManuallyDrop,
         sync::{
             Arc, Weak,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Wake, Waker},
+        task::{RawWaker, RawWakerVTable, Wake, Waker},
     };
 
     use super::{WakerProxy, WakerProxyState};
@@ -155,6 +156,57 @@ mod tests {
         }
     }
 
+    struct ReentrantClone {
+        proxy: Weak<WakerProxyState>,
+        clones: Arc<AtomicUsize>,
+    }
+
+    unsafe fn clone_reentrant(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the reference represented by
+        // `data`; the returned raw waker owns only the new clone.
+        let probe = ManuallyDrop::new(unsafe { Arc::<ReentrantClone>::from_raw(data.cast()) });
+        let state = probe.proxy.upgrade().expect("the proxy remains live");
+        let _guard = state
+            .caller
+            .try_lock()
+            .expect("a caller waker clones after the proxy mutex is released");
+        probe.clones.fetch_add(1, Ordering::SeqCst);
+        RawWaker::new(
+            Arc::into_raw(Arc::clone(&probe)).cast(),
+            &REENTRANT_CLONE_VTABLE,
+        )
+    }
+
+    unsafe fn wake_reentrant(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<ReentrantClone>::from_raw(data.cast()) });
+    }
+
+    unsafe fn wake_by_ref_reentrant(_data: *const ()) {}
+
+    unsafe fn drop_reentrant(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<ReentrantClone>::from_raw(data.cast()) });
+    }
+
+    static REENTRANT_CLONE_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_reentrant,
+        wake_reentrant,
+        wake_by_ref_reentrant,
+        drop_reentrant,
+    );
+
+    fn reentrant_clone_waker(proxy: Weak<WakerProxyState>, clones: Arc<AtomicUsize>) -> Waker {
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::new(ReentrantClone { proxy, clones })).cast(),
+            &REENTRANT_CLONE_VTABLE,
+        );
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
+
     #[test]
     fn registration_preserves_the_proxy_identity_and_short_circuits_matching_callers() {
         let proxy = WakerProxy::new();
@@ -167,6 +219,18 @@ mod tests {
 
         assert_eq!(Arc::strong_count(&target), registered_count);
         assert!(proxy.waker().will_wake(proxy.waker()));
+    }
+
+    #[test]
+    fn registration_clones_the_caller_after_unlock() {
+        let proxy = WakerProxy::new();
+        let clones = Arc::new(AtomicUsize::new(0));
+        let caller = reentrant_clone_waker(Arc::downgrade(&proxy.state), Arc::clone(&clones));
+
+        proxy.register(&caller);
+        proxy.register(&caller);
+
+        assert_eq!(clones.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -193,5 +257,15 @@ mod tests {
         drop(caller);
 
         proxy.register(Waker::noop());
+    }
+
+    #[test]
+    fn proxy_drop_retires_the_caller_after_unlock() {
+        let proxy = WakerProxy::new();
+        let caller = Waker::from(Arc::new(ReentrantDrop(Arc::downgrade(&proxy.state))));
+        proxy.register(&caller);
+        drop(caller);
+
+        drop(proxy);
     }
 }

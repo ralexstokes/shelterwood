@@ -837,8 +837,9 @@ fn nested_scope_start(scope: &Arc<ScopeCell>) -> NestedScopeStart {
 }
 
 fn close_never_started_scope_body(scope: Arc<ScopeCell>) {
-    let mut panics = runtime::PanicAccumulator::default();
-    panics.run(|| scope.close_never_started_body());
+    // Bare like every sibling fallback: `Obligation::drop` is this
+    // obligation's only discharge path and contains the call itself.
+    scope.close_never_started_body();
 }
 
 impl ScopeEpochGuard {

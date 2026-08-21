@@ -218,7 +218,10 @@ mod tests {
         }
     }
 
-    struct DropCounter(Arc<AtomicUsize>);
+    struct DropCounter {
+        drops: Arc<AtomicUsize>,
+        hostile: bool,
+    }
 
     unsafe fn clone_counted_drop_waker(data: *const ()) -> RawWaker {
         // SAFETY: every pointer using this vtable came from an Arc of the
@@ -241,7 +244,8 @@ mod tests {
     unsafe fn drop_counted_drop_waker(data: *const ()) {
         // SAFETY: drop consumes the Arc reference represented by this waker.
         let state = unsafe { Arc::<DropCounter>::from_raw(data.cast()) };
-        state.0.fetch_add(1, Ordering::SeqCst);
+        state.drops.fetch_add(1, Ordering::SeqCst);
+        assert!(!state.hostile, "injected reply caller-waker drop panic");
     }
 
     static COUNTED_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -251,14 +255,22 @@ mod tests {
         drop_counted_drop_waker,
     );
 
-    fn counted_drop_waker(drops: Arc<AtomicUsize>) -> Waker {
+    fn drop_waker(drops: Arc<AtomicUsize>, hostile: bool) -> Waker {
         let raw = RawWaker::new(
-            Arc::into_raw(Arc::new(DropCounter(drops))).cast(),
+            Arc::into_raw(Arc::new(DropCounter { drops, hostile })).cast(),
             &COUNTED_DROP_WAKER_VTABLE,
         );
         // SAFETY: `raw` owns one Arc reference and its vtable maintains that
         // ownership across clone, wake, and drop.
         unsafe { Waker::from_raw(raw) }
+    }
+
+    fn counted_drop_waker(drops: Arc<AtomicUsize>) -> Waker {
+        drop_waker(drops, false)
+    }
+
+    fn hostile_drop_waker(drops: Arc<AtomicUsize>) -> Waker {
+        drop_waker(drops, true)
     }
 
     struct CountWake(Arc<AtomicUsize>);
@@ -371,6 +383,43 @@ mod tests {
             drops.load(Ordering::SeqCst),
             1,
             "timeout arbitration retires the proxy's caller clone before returning the value"
+        );
+    }
+
+    #[test]
+    fn close_retires_the_reply_caller_waker_and_contains_a_hostile_destructor() {
+        let runtime = Arc::new(
+            crate::capability::tests::TestRuntime::new().with_oneshot(|| {
+                (
+                    Box::new(RejectingSender),
+                    Box::pin(SeamReceiver {
+                        pending_polls: usize::MAX,
+                        value: None,
+                        value_on_close: false,
+                    }),
+                )
+            }),
+        );
+        let (_, inner) = oneshot::<u8>(&(runtime.clone() as Arc<dyn crate::MailboxRuntime>));
+        let mut receiver = DisposingReceiver::new(inner, runtime);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let caller = ManuallyDrop::new(hostile_drop_waker(Arc::clone(&drops)));
+        let mut context = Context::from_waker(&caller);
+
+        assert!(receiver.poll_receive(&mut context).is_pending());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        // Returning normally is the assertion: `close` is reached from frames
+        // that own a live user value (`CallOperation::fail_send` holds the
+        // recovered message), so a hostile caller-waker destructor has to be
+        // contained here rather than re-raised. A `catch_unwind` around this
+        // call would pass even if containment were removed.
+        receiver.close();
+
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "close retires the proxy's caller clone"
         );
     }
 

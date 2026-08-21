@@ -133,22 +133,38 @@ impl Drop for HostileReply {
     }
 }
 
+/// An actor handle is the only public route to a reply channel, and
+/// `reply_channel` reads nothing from it but the installed runtime. This actor
+/// therefore exists to be declared and never spawned, messaged, or stopped.
+struct ChannelSource;
+
+impl Actor for ChannelSource {
+    type Msg = ();
+    type Args = ();
+
+    async fn init(_: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, _: (), _: &mut Context<'_, Self>) -> ExitResult {
+        Ok(())
+    }
+}
+
 /// Combines the hostile registered-waker destructor with a delivered value
 /// whose own destructor panics. Before the proxy, Tokio 1.53.1 dropped the
 /// registered caller waker while its ready result owned this value; the two
 /// unwinds aborted the process. Nextest's process-per-test isolation makes
 /// that SIGABRT a failure of this exact regression.
+///
+/// The reply is sent directly rather than through an actor: this seam is the
+/// receiver's, and driving a live actor would add scheduling the test cannot
+/// pin without teaching it nothing about the retirement order.
 #[tokio::test]
 async fn successful_recv_cannot_double_panic_with_hostile_waker_and_value_drops() {
     let mut tree = Tree::new();
     let actor = tree
-        .add_actor_once(
-            "reply-waker-recv",
-            ActorOnceDef::<ReplyingActor>::new((
-                ReleaseGate::default(),
-                tokio::sync::mpsc::unbounded_channel().0,
-            )),
-        )
+        .add_actor_once("reply-waker-recv", ActorOnceDef::<ChannelSource>::new(()))
         .expect("valid actor");
     let (reply, receiver) = actor.reply_channel::<HostileReply>();
     let hostile = ManuallyDrop::new(panicking_drop_waker());

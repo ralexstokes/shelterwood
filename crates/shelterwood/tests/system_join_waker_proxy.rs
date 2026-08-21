@@ -13,11 +13,11 @@ use std::{
     mem::ManuallyDrop,
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
-    task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
+    task::{Context, Poll, Wake, Waker},
     time::Duration,
 };
 
-use common::{POLL_TIMEOUT, policy::never, waiting};
+use common::{HostileWakerState, POLL_TIMEOUT, hostile_waker, policy::never, waiting};
 use shelterwood::{ExitError, Readiness, ScopeRef, ScopeState, StartupError, TaskDef, Tree};
 
 #[derive(Default)]
@@ -135,65 +135,6 @@ impl Drop for WakeController {
     }
 }
 
-#[derive(Default)]
-struct HostileWakeState {
-    woken: tokio::sync::Notify,
-}
-
-impl HostileWakeState {
-    fn wake(&self) {
-        self.woken.notify_one();
-    }
-}
-
-unsafe fn clone_hostile_waker(data: *const ()) -> RawWaker {
-    // SAFETY: every pointer using this vtable came from an Arc of the
-    // matching type. ManuallyDrop preserves the reference represented by
-    // `data`; the returned raw waker owns only the new clone.
-    let state = ManuallyDrop::new(unsafe { Arc::<HostileWakeState>::from_raw(data.cast()) });
-    RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &HOSTILE_WAKER_VTABLE,
-    )
-}
-
-unsafe fn wake_hostile_waker(data: *const ()) {
-    // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    let state = unsafe { Arc::<HostileWakeState>::from_raw(data.cast()) };
-    state.wake();
-}
-
-unsafe fn wake_by_ref_hostile_waker(data: *const ()) {
-    // SAFETY: ManuallyDrop preserves the reference represented by `data`.
-    let state = ManuallyDrop::new(unsafe { Arc::<HostileWakeState>::from_raw(data.cast()) });
-    state.wake();
-}
-
-unsafe fn drop_hostile_waker(data: *const ()) {
-    // SAFETY: drop consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<HostileWakeState>::from_raw(data.cast()) });
-    panic!("injected system-join caller-waker drop panic");
-}
-
-static HOSTILE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_hostile_waker,
-    wake_hostile_waker,
-    wake_by_ref_hostile_waker,
-    drop_hostile_waker,
-);
-
-fn hostile_waker() -> (ManuallyDrop<Waker>, Arc<HostileWakeState>) {
-    let state = Arc::new(HostileWakeState::default());
-    let raw = RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &HOSTILE_WAKER_VTABLE,
-    );
-    // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-    // ownership across clone, wake, and drop.
-    let waker = unsafe { Waker::from_raw(raw) };
-    (ManuallyDrop::new(waker), state)
-}
-
 /// Drives a public system future to the narrow interval after its root scope
 /// has published Stopped but before its root driver can return. The benign
 /// waker is deliberately blocked inside that terminal publication. Wake calls
@@ -206,7 +147,7 @@ async fn park_hostile_waker_in_driver_join<F: Future>(
     scope: &ScopeRef,
     controller: &WakeController,
     benign: &Waker,
-) -> (ManuallyDrop<Waker>, Arc<HostileWakeState>) {
+) -> (ManuallyDrop<Waker>, Arc<HostileWakerState>) {
     for _ in 0..16 {
         controller.wait_until_wake_is_blocked().await;
         assert!(matches!(
@@ -214,7 +155,7 @@ async fn park_hostile_waker_in_driver_join<F: Future>(
             Poll::Pending
         ));
         if matches!(scope.snapshot().state, ScopeState::Stopped { .. }) {
-            let (hostile, state) = hostile_waker();
+            let (hostile, state) = hostile_waker("injected system-join caller-waker drop panic");
             assert!(matches!(
                 future.as_mut().poll(&mut Context::from_waker(&hostile)),
                 Poll::Pending
@@ -225,12 +166,6 @@ async fn park_hostile_waker_in_driver_join<F: Future>(
         controller.release_one();
     }
     panic!("the system did not publish its terminal scope state");
-}
-
-async fn wait_for_join_wake(state: &HostileWakeState) {
-    tokio::time::timeout(POLL_TIMEOUT, state.woken.notified())
-        .await
-        .expect("the joined root driver wakes its public waiter");
 }
 
 /// `System::shutdown` performs the same root-driver join after its bounded
@@ -251,7 +186,7 @@ async fn system_shutdown_never_parks_its_caller_waker_in_the_driver_join() {
     let (hostile, state) =
         park_hostile_waker_in_driver_join(shutdown.as_mut(), &scope, &controller, &benign).await;
     controller.release_all_started();
-    wait_for_join_wake(&state).await;
+    state.wait_until_woken(POLL_TIMEOUT).await;
     assert!(matches!(
         shutdown.as_mut().poll(&mut Context::from_waker(&hostile)),
         Poll::Ready(Ok(()))
@@ -284,7 +219,7 @@ async fn start_or_shutdown_never_parks_its_caller_waker_in_the_driver_join() {
     let (hostile, state) =
         park_hostile_waker_in_driver_join(rollback.as_mut(), &scope, &controller, &benign).await;
     controller.release_all_started();
-    wait_for_join_wake(&state).await;
+    state.wait_until_woken(POLL_TIMEOUT).await;
     let Poll::Ready(Err(error)) = rollback.as_mut().poll(&mut Context::from_waker(&hostile)) else {
         panic!("startup failure is returned after rollback")
     };

@@ -751,6 +751,11 @@ mod tests {
     use super::*;
     use crate::cells::test_support::{ThreadProbe, isolated_scope};
 
+    // The retention this pins only has an observable effect when the
+    // framework invariant it guards is checked, and that check is a
+    // `debug_assert!`. Release builds decline the panic entirely, so the test
+    // is gated on the profile it can hold in rather than left to fail there.
+    #[cfg(debug_assertions)]
     #[test]
     fn illegal_restart_transition_retires_its_user_error_off_thread() {
         let scope = isolated_scope("root", ScopeFlavor::Ordered);

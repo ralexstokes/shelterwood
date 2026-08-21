@@ -60,10 +60,19 @@ rests on:
   traffic and only the last clone submits disposal. Scope state and startup
   results need that protection too: a structured startup failure recursively
   owns the triggering child's `Exit`.
-  `ScopeCell::clear_residents_locked` and `prune_child_locked` route displaced
-  `Arc<MemberCell>`s through `runtime::dispose_detached` after unlock: the last
-  member owner can also be the last owner of a mailbox containing unread user
-  messages, which `RetainedExit` does not cover.
+  `ScopeCell::clear_residents_locked`, `prune_child_locked` and
+  `admit_child_locked` route `Arc<MemberCell>`s through
+  `runtime::dispose_detached` after unlock: the last member owner can also be
+  the last owner of a mailbox containing unread user messages, which
+  `RetainedExit` does not cover. The first two displace an existing resident;
+  the third holds the *incoming* projection in a `ResidentAdmission` guard, so
+  a bookkeeping panic before installation retires the same graph the same way.
+  Containment lives on `ResidentChild::drop` rather than on the displaced
+  `Vec`, because `Vec`'s slice drop glue keeps going after an element panics
+  and a second hostile mailbox destructor would then panic inside the first
+  one's unwind. Per-element containment therefore holds at every depth of a
+  nested residency and on `ScopeCell`'s own drop glue, which is what SPEC §5.5
+  asks of this lane.
 - **Framework `dyn` seams.** `MailboxControl`, `MailboxTermination`,
   `MailboxRuntime`, `MailboxEffectSink`, `ActorIdentity` and `DynamicRoute` are
   implementation seams
@@ -111,8 +120,8 @@ caller, so compute the verdict, release, *then* panic (`MailboxCell::bind` is
 the pattern; where releasing is impossible, `debug_assert!` instead, as
 `MailboxState::take_waiters` does). And a value that may block on destruction
 goes to `runtime::dispose_detached`, not merely past the unlock. That second
-convention is currently met for mailbox payloads, construction closures and
-offloads. Framework-retained `Exit` copies meet it through `RetainedExit`,
+convention is currently met for mailbox payloads, construction closures,
+offloads, displaced resident graphs and rejected admission projections. Framework-retained `Exit` copies meet it through `RetainedExit`,
 including driver completions and pending terminal disposal; exits handed to
 users keep ordinary drop timing. Its fail-safe under exhausted thread
 creation is an unreclaimed queued job — memory held for the life of the

@@ -1196,6 +1196,10 @@ impl ScopeRuntime {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) {
+        // Retain before every refusal and invariant verdict. A failed Exit can
+        // own hostile user error drop glue, so no path may unwind or return it
+        // directly on the driver thread.
+        let mut exit = Some(RetainedExit::new(exit));
         if !self.supervisor.contains(key)
             || self.supervisor.is_disposing(key)
             || self.supervisor.joined(key)
@@ -1218,7 +1222,9 @@ impl ScopeRuntime {
                 return;
             }
             child.pending_terminal = Some(PendingTerminal {
-                exit: RetainedExit::new(exit),
+                exit: exit
+                    .take()
+                    .expect("terminal disposal installs its retained exit once"),
                 exited_incarnation,
                 startup,
             });

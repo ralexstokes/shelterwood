@@ -684,8 +684,8 @@ impl<T> WatchShared<T> {
     /// `modify_silently` and `read_with` run a caller closure under this
     /// guard, and those closures do real work: a lifecycle publication sends
     /// on a broadcast channel here, and a snapshot installation mints a
-    /// generation. A panic in any of them would
-    /// would otherwise wedge every later read, publication, subscription and
+    /// generation. A panic in any of them would otherwise wedge every later
+    /// read, publication, subscription and
     /// terminal wait on the channel. The guarded data is plain framework
     /// state with no invariant spanning the closure, so the surviving value
     /// stays usable; this matches `ObservationGate::lock`, which tolerates

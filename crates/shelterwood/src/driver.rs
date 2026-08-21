@@ -576,11 +576,10 @@ impl ScopeRuntime {
     }
 
     fn stage_disposal_panic(&mut self, child: ChildKey, panic: Option<runtime::DisposalPanic>) {
-        let replaced = self.arrived_disposal_panics.insert(child, panic);
-        assert!(
-            replaced.is_none(),
-            "a terminal disposes its retained construction once, under a never-reused key"
-        );
+        // A terminal normally reports construction disposal exactly once.
+        // Preserve the first completion if that producer contract regresses:
+        // this also keeps driver teardown total when it is already unwinding.
+        self.arrived_disposal_panics.entry(child).or_insert(panic);
     }
 
     fn take_arrived_disposal_panic(&mut self, child: ChildKey) -> Option<runtime::DisposalPanic> {
@@ -597,20 +596,15 @@ impl ScopeRuntime {
     fn drain_arrived_disposal_events(&mut self, panics: &mut runtime::PanicAccumulator) {
         while let Some(event) = self.disposal_event_receiver.try_recv() {
             // The lane has one producer, which sends exactly one variant.
-            // Diagnostic-only: do not let a pattern-matching loop condition
-            // drop an unexpected event and silently abandon the rest of the
-            // drain. Teardown can run during an unwind, so this cannot become
-            // an always-on panic; the match below remains total, and no test
-            // depends on the diagnostic firing.
-            debug_assert!(
-                matches!(
-                    event,
-                    DriverEvent::Child(ChildEvent::ConstructionDisposed { .. })
-                ),
-                "the disposal lane carries only construction-disposal completions"
-            );
-            if let DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) = event {
-                self.stage_disposal_panic(child, panic);
+            // Keep the impossible foreign-event fallback total even during a
+            // driver unwind: an admission/removal request can retain user
+            // construction and response wakers, so contain its drop through
+            // the teardown accumulator instead of diagnosing on this stack.
+            match event {
+                DriverEvent::Child(ChildEvent::ConstructionDisposed { child, panic }) => {
+                    self.stage_disposal_panic(child, panic);
+                }
+                unexpected => panics.run(|| drop(unexpected)),
             }
         }
         // Folding empties the staging map, so the batch entries these
@@ -668,11 +662,14 @@ impl ScopeRuntime {
         let Some(key) = supervisor_admit(&mut self.supervisor, membership, initial) else {
             return Err(Box::new(child));
         };
-        let replaced = self.children.insert(key, child);
-        assert!(
-            replaced.is_none(),
-            "the reducer's monotonic child key is new to runtime resources"
-        );
+        // This method can run under both the observation gate and dynamic-
+        // state mutex. Probe before insertion so even a future key-domain
+        // regression returns the incoming user construction intact instead
+        // of displacing and unwinding a resident child through those locks.
+        if self.children.get(key).is_some() {
+            return Err(Box::new(child));
+        }
+        let _ = self.children.insert(key, child);
         Ok(key)
     }
 
@@ -1109,8 +1106,14 @@ async fn run_scope_incarnation(
         let Some(key) = supervisor_admit(&mut supervisor, membership, true) else {
             unreachable!("a fresh child-key domain accommodates an in-memory child collection")
         };
-        let replaced = children.insert(key, child);
-        assert!(replaced.is_none());
+        if children.get(key).is_some() {
+            // Keep both constructions out of the framework-panic unwind. The
+            // resident remains owned by `children`; this rejected incoming
+            // child is submitted before the invariant is raised.
+            runtime::dispose_detached(child);
+            panic!("the reducer's monotonic child key is new to runtime resources");
+        }
+        let _ = children.insert(key, child);
     }
     if let Some(control) = &dynamic {
         root.with_observation_gate(|txn| {

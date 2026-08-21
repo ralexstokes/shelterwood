@@ -44,10 +44,6 @@ impl WakerSlot {
             effects.push(waker, action);
         }
     }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.0.is_none()
-    }
 }
 
 impl WakerEffects {

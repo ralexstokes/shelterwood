@@ -505,12 +505,17 @@ impl<M> WaiterQueue<M> {
 
     fn push_back(&mut self, operation: Arc<SendOperation<M>>) -> Option<WaiterId> {
         let next = WaiterId(self.ids.mint()?);
-        let replaced = self.entries.insert(next, operation);
-        // Diagnostic-only under the mailbox mutex: the poisoned monotonic
-        // counter never reuses an identity. The insertion is authoritative,
-        // and no test expects this unreachable diagnostic to panic.
-        debug_assert!(replaced.is_none());
-        Some(next)
+        // Keep a counter regression total. `park` retains the caller's Arc,
+        // so declining this clone is refcount traffic and cannot destroy its
+        // user message under the mailbox mutex; the resident operation is not
+        // displaced at all.
+        match self.entries.entry(next) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(operation);
+                Some(next)
+            }
+            std::collections::btree_map::Entry::Occupied(_) => None,
+        }
     }
 
     fn park(&mut self, operation: &Arc<SendOperation<M>>) -> bool {
@@ -1281,12 +1286,18 @@ impl<M: Send + 'static> MailboxCell<M> {
                 OperationOutcome::Accepted(incarnation) => {
                     let incarnation = *incarnation;
                     // Acceptance took the waker in the same critical section
-                    // that published this outcome, so no registration survives
-                    // it for withdrawal to release.
-                    // Diagnostic-only under the operation mutex: withdrawal's
-                    // returned outcome is complete without this observation,
-                    // and no test expects the diagnostic panic.
-                    debug_assert!(state.waker.is_empty());
+                    // that published this outcome. Keep a future regression
+                    // total by transferring any leftover waker to the same
+                    // post-unlock effect set as an ordinary withdrawal.
+                    state.waker.take(
+                        match disposition {
+                            WithdrawalDisposition::Inline => WakerAction::DropInline,
+                            WithdrawalDisposition::Isolated => {
+                                WakerAction::Dispose(Arc::clone(&self.runtime))
+                            }
+                        },
+                        &mut waker_effects,
+                    );
                     Ok((
                         WithdrawalOutcome::Accepted(incarnation),
                         state.registration.take(),
@@ -1298,10 +1309,19 @@ impl<M: Send + 'static> MailboxCell<M> {
                 } => match message.take() {
                     Some(message) => {
                         let observed = *final_incarnation;
-                        // Termination likewise took the waker before publishing.
-                        // Diagnostic-only under the operation mutex: the total
-                        // outcome is unchanged, and no test expects a panic.
-                        debug_assert!(state.waker.is_empty());
+                        // Termination likewise normally took the waker before
+                        // publishing. Transfer a leftover instead of letting a
+                        // diagnostic unwind this by-value message under the
+                        // operation mutex.
+                        state.waker.take(
+                            match disposition {
+                                WithdrawalDisposition::Inline => WakerAction::DropInline,
+                                WithdrawalDisposition::Isolated => {
+                                    WakerAction::Dispose(Arc::clone(&self.runtime))
+                                }
+                            },
+                            &mut waker_effects,
+                        );
                         Ok((
                             WithdrawalOutcome::Terminated { message, observed },
                             state.registration.take(),
@@ -1339,14 +1359,27 @@ impl<M: Send + 'static> MailboxCell<M> {
             outcome: Some(outcome),
             _waker_effects: waker_effects,
         });
-        if let Some(unexpected_removed) = unexpected_removed {
-            self.dispose(unexpected_removed);
-            panic!("a waiter registration must identify its send operation");
+        let invariant = if unexpected_removed.is_some() {
+            Some("a waiter registration must identify its send operation")
+        } else if missing_nonterminal_registration {
+            Some("only terminal teardown may detach a live waiter registration")
+        } else {
+            None
+        };
+        if let Some(invariant) = invariant {
+            // Establish the framework diagnostic first, then submit both the
+            // unexpectedly removed operation and this withdrawal's by-value
+            // message/waker effects before resuming it. Neither can therefore
+            // be destroyed on the invariant panic's stack.
+            let mut panics = PanicAccumulator::default();
+            panics.run(|| panic!("{invariant}"));
+            if let Some(unexpected_removed) = unexpected_removed {
+                panics.run(|| self.dispose(unexpected_removed));
+            }
+            panics.run(|| self.dispose(withdrawal));
+            drop(panics);
+            unreachable!("the recorded mailbox invariant panic must resume");
         }
-        assert!(
-            !missing_nonterminal_registration,
-            "only terminal teardown may detach a live waiter registration"
-        );
         withdrawal
     }
 }
@@ -1439,10 +1472,10 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
             let MailboxKind::Queue(capacity) = kind else {
                 unreachable!("a latest mailbox finishes all waiting submissions")
             };
-            // Diagnostic-only under the mailbox mutex: promotion leaves
-            // waiters only after filling a configured queue. Binding Full is
-            // total without the check, and no test expects this panic.
-            debug_assert_eq!(transaction.queue.len(), capacity.get());
+            // Promotion leaves waiters only after filling a configured queue.
+            // Binding Full is the total fallback too: diagnosing here would
+            // unwind the waiter queue's user messages under the mailbox mutex.
+            let _ = capacity;
             transaction.bind_full(incarnation, waiters);
         }
         transaction.effects.pulse();
@@ -1537,20 +1570,14 @@ where
 {
     match &state.binding {
         MailboxBinding::Bound(BoundState::Available(current)) => {
-            // Diagnostic-only under the mailbox mutex: `incarnation` was read
-            // from this same binding by the surrounding transaction. The
-            // acceptance path is unchanged without the check, and no test
-            // expects the diagnostic panic.
-            debug_assert_eq!(*current, incarnation);
+            // `incarnation` was read from this same binding by the surrounding
+            // transaction. Keep a future mismatch total so the by-value user
+            // message returns through the caller's post-unlock path.
+            if *current != incarnation {
+                return AcceptTransition::Full(message);
+            }
         }
-        MailboxBinding::Bound(BoundState::Full {
-            incarnation: current,
-            ..
-        }) => {
-            // Diagnostic-only for the same single-transaction status sample
-            // as the Available arm. Full still returns the message intact,
-            // and no test expects the diagnostic panic.
-            debug_assert_eq!(*current, incarnation);
+        MailboxBinding::Bound(BoundState::Full { .. }) => {
             return AcceptTransition::Full(message);
         }
         MailboxBinding::Unbound(_)

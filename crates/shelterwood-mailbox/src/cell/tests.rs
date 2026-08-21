@@ -681,6 +681,85 @@ fn binding_replacement_invariant_panics_after_unlock() {
 }
 
 #[test]
+fn withdrawal_registration_invariant_disposes_messages_before_resuming() {
+    let mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    let (first_dropped, first_observed) = mpsc::channel();
+    let (second_dropped, second_observed) = mpsc::channel();
+    let first = match mailbox.submit(ThreadRecordingMessage(Some(first_dropped))) {
+        super::Submission::Parked(operation) => operation,
+        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+            panic!("an unbound mailbox parks its first send")
+        }
+    };
+    let second = match mailbox.submit(ThreadRecordingMessage(Some(second_dropped))) {
+        super::Submission::Parked(operation) => operation,
+        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+            panic!("an unbound mailbox parks its second send")
+        }
+    };
+    let second_registration = second
+        .state
+        .lock()
+        .expect("second operation mutex healthy")
+        .registration
+        .expect("the second operation is registered");
+    first
+        .state
+        .lock()
+        .expect("first operation mutex healthy")
+        .registration = Some(second_registration);
+    drop(second);
+    let caller = std::thread::current().id();
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _ = mailbox.withdraw(&first, super::WithdrawalDisposition::Inline);
+    }))
+    .expect_err("a registration cannot identify another operation");
+    assert_eq!(
+        panic.downcast_ref::<String>().map(String::as_str),
+        Some("a waiter registration must identify its send operation")
+    );
+    for observed in [first_observed, second_observed] {
+        assert_ne!(
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the invariant path submits every user message"),
+            caller,
+            "the framework panic cannot unwind a user message on its caller"
+        );
+    }
+    drop(
+        first
+            .state
+            .lock()
+            .expect("first operation mutex remains healthy"),
+    );
+    drop(mailbox.state.lock().expect("mailbox mutex remains healthy"));
+}
+
+#[test]
+fn waiter_identity_collision_preserves_the_resident_operation() {
+    let resident = super::SendOperation::new(1_u8);
+    let incoming = super::SendOperation::new(2_u8);
+    let mut waiters = super::WaiterQueue::default();
+    waiters
+        .entries
+        .insert(super::WaiterId(1), Arc::clone(&resident));
+
+    assert!(
+        !waiters.park(&incoming),
+        "a reused identity refuses the incoming operation"
+    );
+    assert!(Arc::ptr_eq(
+        waiters
+            .entries
+            .get(&super::WaiterId(1))
+            .expect("resident remains"),
+        &resident
+    ));
+}
+
+#[test]
 fn receive_modes_pin_live_cutoffs_and_frozen_drain() {
     let (mailbox, actor) = actor();
     let token = configure(

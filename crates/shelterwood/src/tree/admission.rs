@@ -22,10 +22,8 @@ use super::slots::AdmissionOwnership;
 /// Fused additions abort on drop; split definitions detach after their first
 /// poll starts admission. Reservation and that first poll require an ambient
 /// Tokio runtime. A first poll outside one returns [`ReserveError::NoRuntime`]
-/// and releases the reservation. If the driver's internal completion route is
-/// lost, release builds fail closed with [`ReserveError::NotAdmitting`] and a
-/// [`crate::NotAdmittingCause::Terminal`] cause. Debug builds additionally
-/// assert that the completion obligation regressed.
+/// and releases the reservation. Losing the driver's internal completion
+/// route is a framework invariant failure in every profile.
 /// Like a fused future, it remains pending if polled again after completion.
 #[must_use]
 pub struct Admission<H> {
@@ -209,9 +207,8 @@ impl<H> Drop for Admission<H> {
 }
 /// Observation future for a synchronously latched dynamic removal.
 ///
-/// If the driver's internal completion route is lost after the request is
-/// latched, release builds fail closed with [`RemoveOutcome::Removed`]; debug
-/// builds additionally assert that the completion obligation regressed.
+/// Losing the driver's internal completion route after the request is latched
+/// is a framework invariant failure in every profile.
 #[must_use]
 pub struct Removal {
     inner: Pin<Box<dyn Future<Output = RemoveOutcome> + Send + 'static>>,

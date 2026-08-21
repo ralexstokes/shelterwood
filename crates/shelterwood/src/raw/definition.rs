@@ -213,8 +213,11 @@ impl<R: RawActor> RawIncarnationOwner<R> {
     }
 
     fn record_primary_panic(&mut self, payload: PanicPayload) {
-        assert!(self.primary_panic.is_none());
-        self.primary_panic = Some(payload);
+        // The actor's first panic is authoritative. A second opaque payload
+        // may itself have hostile drop glue, so route the loser through the
+        // same contained precedence helper as teardown rather than asserting
+        // and destroying it during the assertion's unwind.
+        keep_first_panic(&mut self.primary_panic, Some(payload));
     }
 
     fn take_primary_panic(&mut self) -> Option<PanicPayload> {

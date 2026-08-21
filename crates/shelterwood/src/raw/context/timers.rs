@@ -241,14 +241,10 @@ impl<M> TimerStore<M> {
         // `replace` writes the key bucket and the arming index in one window
         // that cannot panic between them — the user `Hash`/`Eq` callbacks run
         // strictly before it — and an entry never migrates buckets except
-        // through this method. Their agreement is therefore structural, so
-        // check it where a broken invariant is cheap to see rather than
-        // paying two extra map lookups on every removal.
-        assert_eq!(
-            self.armings.get(&entry.arming_order),
-            Some(&location.hash),
-            "a timer's key and arming indexes must agree"
-        );
+        // through this method. Their agreement is structural. Do not diagnose
+        // a future regression here: `entry` already owns the user's key and
+        // message, so an assertion would destroy both on a framework-panic
+        // stack. The cleanup below is total for either recorded hash.
         if empty {
             self.keyed.remove(&location.hash);
         }
@@ -762,6 +758,26 @@ mod tests {
         assert_eq!(
             cleanup.downcast_ref::<&'static str>().copied(),
             Some("timer key destructor panic")
+        );
+        assert!(timers.is_empty());
+    }
+
+    #[test]
+    fn unlink_is_total_when_the_arming_hash_disagrees() {
+        let mut timers = TimerStore::default();
+        let arming = timers.replace(7_u8, None, TimerMessage::Once("message"), None);
+        let recorded = timers.armings[&arming];
+        timers
+            .armings
+            .insert(arming, super::KeyHash(recorded.0.wrapping_add(1)));
+
+        assert_eq!(
+            once(
+                timers
+                    .take(&7_u8)
+                    .expect("the keyed entry remains removable")
+            ),
+            "message"
         );
         assert!(timers.is_empty());
     }

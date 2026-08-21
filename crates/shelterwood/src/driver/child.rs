@@ -761,7 +761,7 @@ impl ScopeRuntime {
                 incarnation,
             }),
         );
-        debug_assert!(
+        assert!(
             started,
             "a spawn starts an admitted or restarting member's projection"
         );
@@ -866,7 +866,7 @@ impl ScopeRuntime {
                 MemberTransition::Stopping,
                 None,
             );
-            debug_assert!(
+            assert!(
                 stopping,
                 "a stop ladder begins on a starting or running member"
             );
@@ -1129,7 +1129,7 @@ impl ScopeRuntime {
                         delay: decision.delay(),
                     },
                 );
-                debug_assert!(
+                assert!(
                     published,
                     "a restart is scheduled from an active incarnation's exit"
                 );

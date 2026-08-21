@@ -547,7 +547,7 @@ impl ScopeRuntime {
                 .map(|child| resident_projection(&child.slot))
                 .collect(),
         );
-        debug_assert!(
+        assert!(
             admitted,
             "initial children are admitted from their reservation exactly once"
         );
@@ -747,7 +747,10 @@ impl ScopeRuntime {
         // so driver teardown can still close reservations and removals.
         let child = ChildRuntime::from_plan(plan, &self.root);
         enum AdmissionInstall {
-            Admitted(ChildKey),
+            Admitted {
+                key: ChildKey,
+                projection_admitted: bool,
+            },
             Rejected {
                 child: Box<ChildRuntime>,
                 removed: Option<DynamicEntry>,
@@ -798,14 +801,22 @@ impl ScopeRuntime {
             // refusal here would leave the entry promoted with no residency
             // behind it — see the partial-effect note on issue #392.
             let admitted = root.admit_child_locked(resident_projection(&request.slot), txn);
-            debug_assert!(
-                admitted,
-                "a promoted reservation is admitted from `Reserved` exactly once"
-            );
-            AdmissionInstall::Admitted(key)
+            AdmissionInstall::Admitted {
+                key,
+                projection_admitted: admitted,
+            }
         });
         let key = match installed {
-            AdmissionInstall::Admitted(key) => key,
+            AdmissionInstall::Admitted {
+                key,
+                projection_admitted,
+            } => {
+                assert!(
+                    projection_admitted,
+                    "a promoted reservation is admitted from `Reserved` exactly once"
+                );
+                key
+            }
             AdmissionInstall::Rejected {
                 mut child,
                 removed,
@@ -1043,17 +1054,16 @@ async fn run_scope_incarnation(
 ) -> StopReason {
     let root = Arc::clone(&plan.root);
     if role.is_root() {
-        root.with_observation_gate(|txn| {
+        let running = root.with_observation_gate(|txn| {
             // The root scope is never admitted, so its own reservation is the
             // documented `Reserved -> Running` source stage.
-            let running = root
-                .member
-                .transition_locked(txn, MemberTransition::Running);
-            debug_assert!(
-                running,
-                "a root incarnation promotes its own never-admitted reservation"
-            );
+            root.member
+                .transition_locked(txn, MemberTransition::Running)
         });
+        assert!(
+            running,
+            "a root incarnation promotes its own never-admitted reservation"
+        );
     }
     // Both lanes are unbounded so their producers can publish synchronously.
     // Keep child lifecycle events separate from externally generated dynamic

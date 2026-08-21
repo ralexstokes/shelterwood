@@ -75,7 +75,7 @@ impl ScopeRuntime {
                         incarnation,
                     }),
                 );
-                debug_assert!(ready, "readiness promotes a starting member");
+                assert!(ready, "readiness promotes a starting member");
                 true
             }
             ReadinessEffect::TimedOut { deadline } => {

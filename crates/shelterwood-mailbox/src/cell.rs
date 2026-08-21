@@ -333,8 +333,10 @@ impl<M> MailboxState<M> {
                 };
                 // Diagnostic-only under the mailbox mutex: `Available` parks
                 // only after the accepting transition filled this configured
-                // queue. The Full transition remains total without the check,
-                // and no test expects the diagnostic panic.
+                // queue, or after that transition's own incarnation-mismatch
+                // fallback, which has already recorded its invariant panic on
+                // the effects sink. The Full transition remains total without
+                // this check, and no test expects the diagnostic panic.
                 debug_assert_eq!(self.queue.len(), capacity.get());
                 let incarnation = *incarnation;
                 let mut waiters = WaiterQueue::default();
@@ -810,8 +812,11 @@ impl<'a, 's, M: Send + 'static> MailboxTxn<'a, 's, M> {
         let rejected = self.state_mut().replace_binding(replacement).err();
         if let Some(rejected) = rejected {
             self.effects.rejected_bindings.push(rejected);
-            self.effects.invariant_panic =
-                Some("mailbox binding replacement requires an empty waiter queue");
+            // First-wins, like every other precedence site: the earliest
+            // invariant failure in a transaction is the informative one.
+            self.effects
+                .invariant_panic
+                .get_or_insert("mailbox binding replacement requires an empty waiter queue");
         }
     }
 
@@ -1367,18 +1372,35 @@ impl<M: Send + 'static> MailboxCell<M> {
             None
         };
         if let Some(invariant) = invariant {
+            // `withdraw` is reached from `SendFuture`'s drop glue, so this can
+            // run on an already-unwinding stack. `PanicAccumulator` contains
+            // rather than resumes there -- raising the invariant would be a
+            // double panic and an abort, which is the outcome this whole lane
+            // exists to prevent -- so decide the disposition up front instead
+            // of assuming the accumulator will resume.
+            let unwinding = std::thread::panicking();
+            let mut panics = PanicAccumulator::default();
             // Establish the framework diagnostic first, then submit both the
             // unexpectedly removed operation and this withdrawal's by-value
             // message/waker effects before resuming it. Neither can therefore
-            // be destroyed on the invariant panic's stack.
-            let mut panics = PanicAccumulator::default();
-            panics.run(|| panic!("{invariant}"));
+            // be destroyed on the invariant panic's stack, and neither can
+            // displace the diagnostic: the accumulator keeps the first panic.
+            if !unwinding {
+                panics.run(|| panic!("{invariant}"));
+            }
             if let Some(unexpected_removed) = unexpected_removed {
                 panics.run(|| self.dispose(unexpected_removed));
             }
-            panics.run(|| self.dispose(withdrawal));
+            if !unwinding {
+                panics.run(|| self.dispose(withdrawal));
+                drop(panics);
+                unreachable!("a non-unwinding accumulator resumes its recorded panic");
+            }
+            // Contained: the caller is already unwinding and still owns this
+            // withdrawal's ordinary disposal path, so hand it back rather than
+            // taking it over.
             drop(panics);
-            unreachable!("the recorded mailbox invariant panic must resume");
+            return withdrawal;
         }
         withdrawal
     }
@@ -1571,9 +1593,14 @@ where
     match &state.binding {
         MailboxBinding::Bound(BoundState::Available(current)) => {
             // `incarnation` was read from this same binding by the surrounding
-            // transaction. Keep a future mismatch total so the by-value user
-            // message returns through the caller's post-unlock path.
+            // transaction, so a mismatch is a framework invariant failure.
+            // Keep it total -- the by-value user message returns through the
+            // caller's post-unlock path rather than being destroyed under the
+            // mailbox mutex -- and raise the diagnostic through the same
+            // effects sink, which flushes it after unlock.
             if *current != incarnation {
+                effects.invariant_panic =
+                    Some("an accepting transition observes its own binding's incarnation");
                 return AcceptTransition::Full(message);
             }
         }

@@ -826,11 +826,7 @@ impl ScopeCell {
             }
             Some(true)
         });
-        assert!(
-            terminalized.is_some(),
-            "a supervised terminal child must remain in parent residency"
-        );
-        terminalized.unwrap_or(false)
+        terminalized.expect("a supervised terminal child must remain in parent residency")
     }
 
     /// Installs residency without announcing it, as an admission that

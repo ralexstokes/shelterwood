@@ -374,6 +374,10 @@ impl SupervisorState {
                 spawned_once: false,
             },
         );
+        // No "one live membership maps to exactly one child key" assertion is
+        // written here any more: the `child_keys.contains_key` guard at the
+        // top of this function makes a displacing insert unwritable rather
+        // than merely unfired, which is the stronger form of the same claim.
         self.child_keys.insert(membership, child);
         if initial && self.flavor == ScopeFlavor::Ordered && self.next_ordered_start.is_none() {
             self.next_ordered_start = Some(child);

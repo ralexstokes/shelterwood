@@ -155,12 +155,11 @@ impl<M> EventQueue<M> {
                 .lock()
                 .expect("actor event queue mutex poisoned")
                 .pop_front();
+            // The guard is a temporary, so this is raised with the queue mutex
+            // already released. It replaces the release-profile clamp that
+            // used to zero the budget on a missing event.
             assert!(event.is_some(), "a timer watermark covers queued events");
-            if event.is_some() {
-                *remaining -= 1;
-            } else {
-                *remaining = 0;
-            }
+            *remaining -= 1;
             event
         }
     }

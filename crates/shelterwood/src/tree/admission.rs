@@ -22,8 +22,16 @@ use super::slots::AdmissionOwnership;
 /// Fused additions abort on drop; split definitions detach after their first
 /// poll starts admission. Reservation and that first poll require an ambient
 /// Tokio runtime. A first poll outside one returns [`ReserveError::NoRuntime`]
-/// and releases the reservation. Losing the driver's internal completion
-/// route is a framework invariant failure in every profile.
+/// and releases the reservation.
+///
+/// The driver's admission obligation publishes an outcome on every path,
+/// including its own drop fallback, so this future always resolves through
+/// [`ReserveError`]. If that obligation is ever destroyed without publishing,
+/// awaiting the admission **panics** rather than resolving: reporting a
+/// terminal scope would be a false outcome for a reservation that may still be
+/// live, and a caller that reconciles on it would be reconciling against a
+/// lie. The panic is a framework invariant failure in every profile, not a
+/// condition callers can encounter or handle.
 /// Like a fused future, it remains pending if polled again after completion.
 #[must_use]
 pub struct Admission<H> {
@@ -207,8 +215,12 @@ impl<H> Drop for Admission<H> {
 }
 /// Observation future for a synchronously latched dynamic removal.
 ///
-/// Losing the driver's internal completion route after the request is latched
-/// is a framework invariant failure in every profile.
+/// The driver publishes the latched outcome on every destruction path. If that
+/// obligation is ever destroyed without publishing, awaiting the removal
+/// **panics** rather than resolving, for the same reason as [`Admission`]: a
+/// synthesized `Removed` would report a completed withdrawal that no driver
+/// performed. It is a framework invariant failure in every profile, not a
+/// condition callers can encounter or handle.
 #[must_use]
 pub struct Removal {
     inner: Pin<Box<dyn Future<Output = RemoveOutcome> + Send + 'static>>,

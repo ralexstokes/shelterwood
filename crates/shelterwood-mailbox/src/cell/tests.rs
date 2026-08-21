@@ -737,6 +737,97 @@ fn withdrawal_registration_invariant_disposes_messages_before_resuming() {
     drop(mailbox.state.lock().expect("mailbox mutex remains healthy"));
 }
 
+/// `withdraw` is reached from `SendFuture`'s drop glue, so its invariant path
+/// can run on an already-unwinding stack. Raising there would be a double
+/// panic and a process abort -- exactly the outcome this lane exists to
+/// prevent -- so the diagnostic is contained and the withdrawal is handed back
+/// to its ordinary owner. Without the containment this test aborts the
+/// process rather than failing.
+#[test]
+fn withdrawal_registration_invariant_is_contained_during_an_unwind() {
+    struct WithdrawOnDrop<'a> {
+        mailbox: &'a MailboxCell<ThreadRecordingMessage>,
+        operation: Arc<super::SendOperation<ThreadRecordingMessage>>,
+    }
+
+    impl Drop for WithdrawOnDrop<'_> {
+        fn drop(&mut self) {
+            let mut withdrawal = self
+                .mailbox
+                .withdraw(&self.operation, super::WithdrawalDisposition::Isolated);
+            // The contained path returns the withdrawal intact, so its
+            // by-value message is still this caller's to retire.
+            match withdrawal.take_outcome() {
+                super::WithdrawalOutcome::Withdrawn { message, .. }
+                | super::WithdrawalOutcome::Terminated { message, .. } => {
+                    self.mailbox.dispose(message);
+                }
+                super::WithdrawalOutcome::Accepted(_) => {}
+            }
+        }
+    }
+
+    let mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    let (first_dropped, first_observed) = mpsc::channel();
+    let (second_dropped, second_observed) = mpsc::channel();
+    let first = match mailbox.submit(ThreadRecordingMessage(Some(first_dropped))) {
+        super::Submission::Parked(operation) => operation,
+        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+            panic!("an unbound mailbox parks its first send")
+        }
+    };
+    let second = match mailbox.submit(ThreadRecordingMessage(Some(second_dropped))) {
+        super::Submission::Parked(operation) => operation,
+        super::Submission::Accepted(_) | super::Submission::Terminated { .. } => {
+            panic!("an unbound mailbox parks its second send")
+        }
+    };
+    let second_registration = second
+        .state
+        .lock()
+        .expect("second operation mutex healthy")
+        .registration
+        .expect("the second operation is registered");
+    first
+        .state
+        .lock()
+        .expect("first operation mutex healthy")
+        .registration = Some(second_registration);
+    drop(second);
+    let caller = std::thread::current().id();
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _withdraw_on_drop = WithdrawOnDrop {
+            mailbox: &mailbox,
+            operation: Arc::clone(&first),
+        };
+        std::panic::panic_any("the caller's own unwind");
+    }))
+    .expect_err("the caller's unwind reaches its boundary");
+
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("the caller's own unwind"),
+        "the contained invariant cannot replace the unwind already in flight"
+    );
+    for observed in [first_observed, second_observed] {
+        assert_ne!(
+            observed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("every user message still leaves the caller"),
+            caller,
+            "containment does not strand a user message on the unwinding thread"
+        );
+    }
+    drop(
+        first
+            .state
+            .lock()
+            .expect("first operation mutex remains healthy"),
+    );
+    drop(mailbox.state.lock().expect("mailbox mutex remains healthy"));
+}
+
 #[test]
 fn waiter_identity_collision_preserves_the_resident_operation() {
     let resident = super::SendOperation::new(1_u8);

@@ -832,11 +832,18 @@ impl ScopeRuntime {
                     // framework diagnostic, so neither its wake nor its drop
                     // runs as ordinary panic-stack destruction and neither
                     // can replace the primary invariant.
+                    //
+                    // `PanicAccumulator` contains rather than resumes on an
+                    // already-unwinding stack, so record the diagnostic only
+                    // when there is a stack to raise it on. Assuming a resume
+                    // would turn a contained failure into a double panic.
                     let mut panics = runtime::PanicAccumulator::default();
-                    panics.run(|| panic!("{invariant}"));
+                    if !std::thread::panicking() {
+                        panics.run(|| panic!("{invariant}"));
+                    }
                     panics.run(|| request.complete_lost());
                     drop(panics);
-                    unreachable!("the admission invariant panic must resume");
+                    return;
                 }
                 key
             }
@@ -1089,12 +1096,23 @@ async fn run_scope_incarnation(
             // through contained ordinary calls before resuming it. Definitions,
             // response wakes, and resident projections therefore cannot run
             // as ordinary framework-panic stack destruction.
+            //
+            // `PanicAccumulator` contains rather than resumes on an
+            // already-unwinding stack, so record the diagnostic only when
+            // there is a stack to raise it on and fall through to the drain
+            // verdict otherwise. `begin_incarnation` already published
+            // `Starting`, so the epoch finishes as a requested stop rather
+            // than claiming no incarnation ever began.
             let mut panics = runtime::PanicAccumulator::default();
-            panics.run(|| panic!("a root incarnation promotes its own never-admitted reservation"));
+            if !std::thread::panicking() {
+                panics.run(|| {
+                    panic!("a root incarnation promotes its own never-admitted reservation")
+                });
+            }
             panics.run(|| drop(plan));
-            panics.run(|| epoch.finish(StopReason::NeverStarted));
+            panics.run(|| epoch.finish(StopReason::ShutdownRequested));
             drop(panics);
-            unreachable!("the root projection invariant panic must resume");
+            return StopReason::ShutdownRequested;
         }
     }
     // Both lanes are unbounded so their producers can publish synchronously.
@@ -1146,13 +1164,16 @@ async fn run_scope_incarnation(
         // A fresh domain cannot exhaust for an in-memory plan, but the total
         // fallback still owns real user constructions. Join their terminality
         // obligations on the ordinary path, let ScopePlan retire the suffix,
-        // and finish this never-started epoch without a framework unwind.
+        // and finish this epoch without a framework unwind. The verdict is
+        // `ShutdownRequested`, not `NeverStarted`: `begin_incarnation` already
+        // published `Starting`, and SPEC B.6's `NeverStarted` states that no
+        // scope incarnation ever began.
         let mut rejected = children.into_values().collect::<Vec<_>>();
         rejected.push(child);
         runtime::dispose_all(rejected).fired().await;
         drop(plan);
-        epoch.finish(StopReason::NeverStarted);
-        return StopReason::NeverStarted;
+        epoch.finish(StopReason::ShutdownRequested);
+        return StopReason::ShutdownRequested;
     }
     if let Some(control) = &dynamic {
         root.with_observation_gate(|txn| {

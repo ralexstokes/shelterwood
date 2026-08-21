@@ -1,6 +1,7 @@
 mod common;
 
 use std::{
+    fmt,
     future::{Future, poll_fn},
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -15,8 +16,8 @@ use std::{
 };
 
 use crate::common::{
-    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, assert_eventually,
-    assert_quiet, next_event, policy::never, poll_once,
+    DestructorBlocker, DestructorGate, POLL_TIMEOUT, PanicOnDrop, ReleaseGate, advance_time,
+    assert_eventually, assert_quiet, next_event, policy::never, poll_once,
 };
 use shelterwood::{
     Backoff, CallErrorKind, Cancellation, ChildId, ChildState, DynamicTree, ExitError, ExitKind,
@@ -48,6 +49,23 @@ impl DropProbe {
         }
     }
 }
+
+impl fmt::Debug for DropProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DropProbe")
+    }
+}
+
+impl fmt::Display for DropProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("drop probe")
+    }
+}
+
+/// Lets the probe stand in for an application error, so a losing
+/// `ExitKind::Failed` payload reports its destruction thread the same way
+/// every other user value in this file does.
+impl std::error::Error for DropProbe {}
 
 impl Drop for DropProbe {
     fn drop(&mut self) {
@@ -1264,6 +1282,61 @@ async fn abandoned_one_shot_completion_keeps_completed_verdict_through_destructo
     );
     assert_disposed_off_current(&mut drops, "abandoned result reports its disposal thread").await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+}
+
+/// A readiness timeout outranks the application failure the task then returns.
+/// The loser is a user value the framework never publishes, so its destruction
+/// venue is the only thing left to pin.
+#[tokio::test(start_paused = true)]
+async fn readiness_timeout_disposes_a_losing_application_error_off_the_driver() {
+    let (dropped, mut drops) = tokio::sync::mpsc::unbounded_channel();
+    let deadline_width = Duration::from_secs(10);
+    let started = ReleaseGate::default();
+    let mut tree = Tree::new();
+    let task = tree
+        .add_task(
+            "losing-error",
+            TaskDef::new({
+                let started = started.clone();
+                move |context| {
+                    let probe = DropProbe::reporting(dropped.clone());
+                    let started = started.clone();
+                    async move {
+                        started.release();
+                        context.shutdown_token().cancelled().await;
+                        Err(ExitError::from(probe))
+                    }
+                }
+            })
+            .restart(never())
+            .readiness(Readiness::Manual)
+            .expect("manual readiness")
+            .readiness_deadline(
+                ReadinessDeadline::bounded(deadline_width).expect("non-zero deadline"),
+            ),
+        )
+        .expect("valid task");
+    let system = tree.spawn().expect("runtime is available");
+
+    started.wait().await;
+    advance_time(deadline_width).await;
+    system
+        .wait_started()
+        .await
+        .expect_err("readiness timeout aborts startup");
+    assert!(matches!(
+        task.wait().await.kind(),
+        ExitKind::ReadinessTimedOut { .. }
+    ));
+    assert_disposed_off_current(
+        &mut drops,
+        "the losing application error reports its disposal thread",
+    )
+    .await;
+    system
+        .shutdown(Duration::ZERO)
+        .await
+        .expect("terminal child leaves no straggler");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

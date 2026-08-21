@@ -33,7 +33,7 @@ pub(super) use shelterwood_core::supervisor::{ChildKey, Event as SupervisorEvent
 pub(super) struct ObservedExit {
     pub(super) child: ChildKey,
     incarnation: Incarnation,
-    recorded: Option<RecordedOutcome>,
+    recorded: Option<RetainedRecordedOutcome>,
     join: crate::runtime::JoinOutcome<()>,
     cancellation: Cancellation,
     readiness_signal_seen: bool,
@@ -131,9 +131,9 @@ pub(super) use super::super::{
     AdmissionRequest, AncestorCommandLatches, ChildEvent, ChildRuntime, ChildTerminality,
     DriverEvent, DynamicControl, DynamicEntry, DynamicReservation, GateCapture, MemberCell,
     MemberStage, MemberTransition, NestedScopeLatches, Pending, RemovalRequest, RemovalResponses,
-    ResidentProjection, RuntimeStorage, ScopeCell, ScopeControlEvent, ScopeEpochGuard, ScopeFlavor,
-    ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring, StartupDisposition,
-    cancel_dynamic_reservation, child::dispatch_child_construction_for_test,
+    ResidentProjection, RetainedRecordedOutcome, RuntimeStorage, ScopeCell, ScopeControlEvent,
+    ScopeEpochGuard, ScopeFlavor, ScopeRole, ScopeRuntime, ScopeRuntimeTestWiring,
+    StartupDisposition, cancel_dynamic_reservation, child::dispatch_child_construction_for_test,
     discharge_child_terminality, events::collect_driver_events, monitor_root_driver, report_slot,
     reserve_dynamic, resident_projection, restart_shutdown_work, run_nested_factory,
     run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
@@ -620,6 +620,40 @@ impl Drop for GateProbeError {
         let ran_inline_under_gate =
             std::thread::current().id() == self.retiring_thread && self.gate.is_held();
         *self.held_at_drop.lock().expect("gate probe mutex poisoned") = Some(ran_inline_under_gate);
+    }
+}
+
+/// A user error payload that reports the thread its destructor ran on.
+///
+/// The venue probe for a *losing* application error: the framework selects a
+/// different verdict, so the loser is never published and its destruction
+/// thread is the only observable it leaves behind.
+pub(super) struct ThreadReportingError(std::sync::mpsc::SyncSender<std::thread::ThreadId>);
+
+/// Builds an application error paired with the receiver of its drop thread.
+pub(super) fn thread_reporting_error()
+-> (ExitError, std::sync::mpsc::Receiver<std::thread::ThreadId>) {
+    let (dropped, observed) = std::sync::mpsc::sync_channel(1);
+    (ExitError::from(ThreadReportingError(dropped)), observed)
+}
+
+impl std::fmt::Debug for ThreadReportingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ThreadReportingError")
+    }
+}
+
+impl std::fmt::Display for ThreadReportingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("thread reporting error")
+    }
+}
+
+impl std::error::Error for ThreadReportingError {}
+
+impl Drop for ThreadReportingError {
+    fn drop(&mut self) {
+        let _ = self.0.send(std::thread::current().id());
     }
 }
 

@@ -34,7 +34,9 @@ use crate::{
     admission::{NotAdmittingCause, ReserveError},
     cells::{
         MemberCell, MemberStage, MemberTransition, ResidentProjection, RetainedExit,
-        RetainedStopReason, ScopeCell, ScopeControlEvent, StartupDisposition,
+        RetainedRecordedOutcome, RetainedStopReason, ScopeCell, ScopeControlEvent,
+        StartupDisposition, classify_disposal_panic_retaining, classify_exit_retaining,
+        reconcile_recorded_outcomes_retaining,
     },
     deadline::Deadline,
     engine::{
@@ -44,9 +46,8 @@ use crate::{
         schedule_restart,
     },
     exit::{
-        RecordedOutcome, StartupError, StopReason, classify_disposal_panic, classify_exit,
-        reconcile_recorded_outcomes, stop_reason_into_nested_result, stop_reason_root_exit,
-        structured_startup_failure_error,
+        RecordedOutcome, StartupError, StopReason, stop_reason_into_nested_result,
+        stop_reason_root_exit, structured_startup_failure_error,
     },
     identity::IncarnationCounter,
     mailbox::{MailboxBindToken, MailboxControl, MailboxEffectQueue},
@@ -129,7 +130,7 @@ fn classify_retained_root_driver_join(
             (runtime::JoinOutcome::Cancelled, Cancellation::Observed)
         }
     };
-    Err(classify_exit(None, join, None, cancellation))
+    Err(classify_exit_retaining(None, join, None, cancellation))
 }
 
 impl Drop for SystemRun {

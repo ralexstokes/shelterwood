@@ -79,11 +79,11 @@ pub fn stop_reason_precedence(reason: &StopReason) -> u8 {
 /// that began on natural completion says nothing about how the teardown
 /// itself ended. `ShutdownRequested` outranks the structured failures because
 /// a requested stop supersedes whatever the incarnation would otherwise have
-/// reported. `NeverStarted` is the top element because it is not a live
-/// incarnation's verdict at all but the membership-terminal twin of §8's
-/// `Exit::never_started()` (SPEC B.6): whenever a membership terminalizes
-/// without ever spawning, the scope-state projection must agree with the
-/// membership exit, in either arrival order.
+/// reported. `NeverStarted` is the top element because it states that no scope
+/// incarnation ever began rather than giving a live scope incarnation's
+/// verdict. The precedence rule makes every scope-plane projection agree in
+/// either arrival order; it does not require the membership exit kind to match
+/// (SPEC B.6).
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum StopPrecedence {
     Finished,
@@ -1195,7 +1195,7 @@ mod tests {
         );
         assert!(
             StopPrecedence::ShutdownRequested < StopPrecedence::NeverStarted,
-            "a membership that never started is the top element"
+            "no begun scope incarnation is the top scope-plane verdict"
         );
 
         let trip = IntensityTrip {

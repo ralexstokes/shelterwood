@@ -1341,8 +1341,8 @@ impl ScopeCell {
         // untouched suffix after unlock. Detached disposal means final member
         // teardown may complete after this transaction returns -- and that a
         // resident's own destructor can never reach an `ObservationTxn`, so
-        // SPEC §15.5's structural `Removed`-on-drop is unavailable on this
-        // lane and the edge is emitted explicitly below instead (#389).
+        // SPEC §15.5 requires this removal site to emit the edge explicitly
+        // below instead (#389).
         wakes.defer(move || runtime::dispose_detached(residents));
         for removal in removals {
             self.emit_locked(wakes, removal);
@@ -1506,22 +1506,22 @@ impl ScopeCell {
     /// membership's terminal exit and, unless it already published that exit,
     /// closes observation after the terminal parent projection.
     ///
-    /// `Unstarted` is precisely SPEC B.6's "no incarnation has ever spawned"
-    /// in the scope plane, and `Stopped { NeverStarted }` is its terminal
+    /// `Unstarted` is precisely SPEC B.6's "no scope incarnation ever began"
+    /// state, and `Stopped { NeverStarted }` is its terminal
     /// twin; publishing that pair is what makes the record agree with
     /// `wait_stopped`'s own `Unstarted` answer. A body dropped before its
     /// *restart* incarnation began is a different case: that scope already
     /// published a real prior-incarnation reason, which is both its final
     /// verdict and terminal, so the fallback must leave it alone. Publishing
-    /// `NeverStarted` over it would contradict the shared membership's exit
-    /// (`Aborted` with `last_incarnation: Some(..)`) and — because the parent
-    /// path can terminalize and close first — would only land in one of two
-    /// arrival orders. The fallback therefore supplies a missing terminal
-    /// projection and never replaces a published one; closure is the only
-    /// effect it owns unconditionally. `total_restarts` and `startup` need no
-    /// reset under this gate: an `Unstarted` scope never charged a restart,
-    /// and a startup result installed without an incarnation (identity
-    /// exhaustion) is the structured cause `wait_started` must keep.
+    /// `NeverStarted` over it would falsely claim that no scope incarnation
+    /// ever began and — because the parent path can terminalize and close
+    /// first — would only land in one of two arrival orders. The fallback
+    /// therefore supplies a missing terminal projection and never replaces a
+    /// published one; closure is the only effect it owns unconditionally.
+    /// `total_restarts` and `startup` need no reset under this gate: an
+    /// `Unstarted` scope never charged a restart, and a startup result
+    /// installed without an incarnation (identity exhaustion) is the
+    /// structured cause `wait_started` must keep.
     pub fn close_never_started_body(&self) {
         self.with_observation_gate(|txn| {
             if self.observation.closed.load(Ordering::Acquire) {
@@ -1621,9 +1621,9 @@ mod tests {
     /// The parent path (`terminalize_child`) and the body fallback race on a
     /// current-thread runtime only by a few instructions, and on a
     /// multi-thread runtime genuinely. Publishing `NeverStarted` here would
-    /// both depend on that order and contradict the membership exit, which
-    /// carries `last_incarnation: Some(..)` — SPEC B.6's stop-reason lattice
-    /// requires the projection and the exit to agree in either order.
+    /// both depend on that order and falsely claim that no scope incarnation
+    /// ever began; SPEC B.6's stop-reason lattice instead preserves the real
+    /// prior-incarnation verdict within the scope plane in either order.
     #[test]
     fn never_polled_restart_body_keeps_its_prior_reason_in_either_arrival_order() {
         for parent_first in [true, false] {
@@ -1697,7 +1697,7 @@ mod tests {
             );
             assert!(
                 record.last_incarnation.is_some(),
-                "a restarted membership has spawned, so `NeverStarted` cannot describe it"
+                "a restarted membership has spawned, so `ExitKind::NeverStarted` cannot describe its exit"
             );
         }
     }

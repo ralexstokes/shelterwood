@@ -2860,28 +2860,29 @@ unlock.
 ### 15.5 Promises are owned completions
 
 Every cross-task promise — an admission or removal awaiting resolution,
-an exit report awaiting publication, a resident child awaiting its
-`Removed` edge, a member cell awaiting terminality, a waiter awaiting a
-wake — is held as an owned value whose destructor discharges it,
-fail-closed, with a **synchronous** fallback: complete with the terminal
-rejection, publish the coarse exit, emit the edge, pulse the signal —
-never an await, never a join. The event loop that services the orderly
-path is an optimization of these values' consumption, never the sole
-guarantor: when a driver future is destroyed at any await point —
+an exit report awaiting publication, a member cell awaiting terminality,
+a waiter awaiting a wake — is held as an owned value whose destructor
+discharges it, fail-closed, with a **synchronous** fallback: complete with
+the terminal rejection, publish the coarse exit, emit the edge, pulse the
+signal — never an await, never a join. The event loop that services the
+orderly path is an optimization of these values' consumption, never the
+sole guarantor: when a driver future is destroyed at any await point —
 hard-abort cascade, panic, natural return with events still queued —
 unwinding alone MUST discharge every outstanding promise (§11's
 driver-death rule, §16.17's test anchor). Two corollaries are normative.
-Residency in a scope's observed child set is paired with `Removed` at the
-sites that remove it (`clear_residents_locked` / `prune_child_locked`),
-before the displaced resident is handed to detached disposal; residency's
-own drop does not emit the edge. A resident can own the last handle to a
-mailbox containing unread user messages, so its destructor runs on a detached
-disposal worker rather than under the observation gate and has no observation
-transaction through which to publish. Enforcing the pairing at the removal
-sites therefore makes §3.2's exact pairing structural at the transition that
-displaces the resident while preserving §5.5's required disposal venue. And
-each cell has exactly **one** change signal from which every compound wait
-derives — a second wake path is a lost wakeup waiting to be written.
+Residency in a scope's observed child set is the exception to a
+drop-emitted edge: the sites that remove it (`clear_residents_locked` /
+`prune_child_locked`) MUST publish `Removed` in the observation transaction
+that displaces it. The same transaction hands the displaced resident to
+detached disposal after unlock; residency's own drop does not emit the edge. A
+resident can own the last handle to a mailbox containing unread user messages,
+so removal schedules its destructor on a detached disposal worker rather than
+under the observation gate; that worker has no observation transaction through
+which to publish. These emission-site obligations enforce §3.2's exact pairing
+at the only residency-withdrawal transitions while preserving §5.5's required
+disposal venue. And each cell has exactly **one** change signal from which
+every compound wait derives — a second wake path is a lost wakeup waiting to
+be written.
 
 ### 15.6 Performance posture
 
@@ -3746,14 +3747,14 @@ ScopeSnapshot   { state: Unstarted                              // membership ex
                                            | IntensityTripped   // carries §10.2's structured trip data
                                            | StartupFailed      // nested rollback complete (§12);
                                                                 //   carries the startup-failure data
-                                           | NeverStarted },    // membership terminal, no incarnation
-                                                                //   ever spawned (§3.2): dropped-unspawned
-                                                                //   tree, rejected/withdrawn insertion,
-                                                                //   removal before first spawn, startup-
-                                                                //   aborted ordered sibling (§7) — the
-                                                                //   scope-state twin of §8's exit, an
-                                                                //   invariant the stop-reason lattice
-                                                                //   below preserves in either order
+                                           | NeverStarted },    // no scope incarnation ever began:
+                                                                //   dropped-unspawned tree, rejected/
+                                                                //   withdrawn insertion, removal before
+                                                                //   first spawn, startup-aborted ordered
+                                                                //   sibling (§7), or a spawned nested body
+                                                                //   dropped before first poll; this is a
+                                                                //   scope-plane verdict, not necessarily
+                                                                //   the membership exit's twin (below)
                   kind: Ordered | Dynamic, strategy (ordered only), intensity,
                   total_restarts: TotalRestarts,         // charges per §10.2 — group respawns count
                   lifecycle_seq: LifecycleSeq,           // aligns events with snapshots (§14)
@@ -3788,9 +3789,9 @@ nested scope body dropped before its first poll is the sanctioned
 cross-plane divergence: the scope projection is `Stopped { NeverStarted }`
 because no scope incarnation began, while the membership exit is
 `Aborted { WithinGrace }` with `last_incarnation: Some(1)` because an
-incarnation was spawned and then aborted. A root driver that dies mid-drain
-reports the join monitor's `ShutdownRequested` rather than the abandoned
-drain's `Finished`.
+incarnation was spawned on the membership plane and then aborted. A root
+driver that dies mid-drain reports the join monitor's `ShutdownRequested`
+rather than the abandoned drain's `Finished`.
 
 ```text
 ActorStats (II §22)

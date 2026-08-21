@@ -428,8 +428,9 @@ trait Actor: Sized + Send + 'static {
   classifies `Failed`; §8). Infallible handlers write `Ok(())`; there is
   no `IntoExitResult` conversion trait. There is deliberately no
   stop-outcome return type: clean self-stop is `ctx.stop()` alone (B.1 —
-  effective after the current callback, `Err` outcome wins, idempotent),
-  so the return channel carries errors only and stop has one mechanism
+  intake and incarnation-owned resources freeze at the call, terminal
+  publication follows the callback, `Err` outcome wins, idempotent), so
+  the return channel carries errors only and stop has one mechanism
   (§1 principle 2). Constraints that MUST hold:
   - The blanket loop applies its own `?` only after awaiting the
     callback's exact `ExitResult`.
@@ -758,10 +759,17 @@ surfaces on that task even though the replacement remains accepted.
 Framework-initiated disposal of externally submitted mailbox or
 reply-bearing payloads — including mailbox teardown, timeout/withdrawal
 cleanup, and accepted-prefix batch disposal — runs detached from the
-initiating task with per-element panic containment. Incarnation-owned
-continuations, timer messages, and offload state instead follow §6.5 and
-§8's incarnation teardown and verdict rules. No single disposal-thread
-identity is promised.
+initiating task with per-element panic containment. After extracting any
+string diagnostic, the framework likewise destroys an opaque user panic
+payload *carried by a child exit* on the detached disposal lane rather than
+on the executor publishing the exit (§6.5's thread-exhaustion exception
+applies), and that destruction is terminal: a payload whose own destructor
+panics has its replacement discarded, never requeued. A panic payload
+*displaced* by one that outranks it — a rejected panic-slot record, a losing
+cleanup panic — is still discarded inline, since it is already a spent
+diagnostic. Incarnation-owned continuations, timer messages, and offload
+state instead follow §6.5 and §8's incarnation teardown and verdict rules. No
+single disposal-thread identity is promised.
 
 (The synchronization discipline behind every mailbox transition — the
 effects sink paired with the state guard, and the structural waker slot —
@@ -2119,15 +2127,20 @@ cooperative cancel → grace expiry → tidy-abort beat → hard abort
   accepted while the membership has *no live incarnation* (a restart
   window — B.9's `shutdown_and_wait` landing between incarnations) is
   held on the membership and armed onto the next incarnation at its
-  start, which then starts and immediately begins teardown. The two
-  rules partition by target and never conflict: fresh-restart-starts-
-  clear says a latch *consumed by* incarnation N never carries to N+1;
-  the pending latch holds a request that arrived with no incarnation to
-  consume it — it was never any incarnation's spent latch, and it waits
-  for its first. What cannot exist is a stop request silently dropped in
-  the window. Cancelling an awaited membership operation never rides the
-  channel either: it is a per-operation level latch on the operation's
-  cell (§9's linearization rule).
+  start, which then starts and immediately begins teardown. The
+  scope-level latch has its own version of that window: a stop latched
+  before the driver's first settlement is read only at the top of the
+  driver's first loop pass, after the initial incarnations are already
+  published, so it too constructs and then immediately tears down. The
+  two carry rules partition by target and never conflict:
+  fresh-restart-starts-clear says a latch *consumed by* incarnation N
+  never carries to N+1; the pending latch holds a request that arrived
+  with no incarnation to consume it — it was never any incarnation's
+  spent latch, and it waits for its first. What cannot exist is a stop
+  request silently dropped in the window. Cancelling an awaited
+  membership operation never rides the channel either: it is a
+  per-operation level latch on the operation's cell (§9's linearization
+  rule).
 - Rebinding-transparent `send` during teardown can park against an
   unbound sibling; teardown-window notifications use `try_send`. This
   tradeoff is prominent shutdown guidance, alongside the
@@ -3350,7 +3363,7 @@ in `on_stop`. ✓ = available; **R** = MUST be `Rejected`-or-absent (§6.4);
 | `recv()` / `try_recv()` (the merged event source: mailbox, offload completions, fired timers, queued continuations, §6.1 priority; `recv` yields `None` on stop request, biased; `try_recv` ignores the stop token — the drain primitive for raw loops: under `Drain`, exhaust the frozen prefix via `try_recv` after `recv` yields `None`, §11's raw-loop obligation) | ✓ | — | — | — |
 | `mailbox_shutdown()` (the resolved §11 policy for this actor's mailbox — what a raw loop consults to honor `Drain` vs `Discard`) | ✓ | — | — | — |
 | `mark_ready()` (one-shot effect by construction; meaningful only under gated readiness, else a documented no-op — B.2's rule, uniformly; during drain always the no-op) | ✓ | ✓ | ✓ | — |
-| `stop()` (clean self-stop; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §11 ladder as the stop bound. Live/Drain: effective after the current callback; in a successful effective-`AfterInit` initializer, after its automatic readiness edge. Raw: freezes intake at the call — drain the frozen prefix via `try_recv` after `recv` yields `None`; §1 principle 5's public primitive for the blanket loop's `stop()`) | ✓ | ✓ | ✓ | — |
+| `stop()` (clean self-stop; `Err` outcome wins; idempotent — during drain the already-stopping no-op; arms the child's configured §11 ladder as the stop bound. Live: freezes intake and incarnation-owned resources at the call, so later same-callback work is rejected; the callback may finish before terminal publication. In a successful effective-`AfterInit` initializer, stop publication follows its automatic readiness edge, while the freeze remains immediate. Drain is already frozen. Raw: freezes intake at the call — drain the frozen prefix via `try_recv` after `recv` yields `None`; §1 principle 5's public primitive for the blanket loop's `stop()`) | ✓ | ✓ | ✓ | — |
 | `is_draining()` | — | ✓ | ✓ | — |
 | `continue_with(msg)` (next-message continuation; no mailbox capacity; anti-starvation per §6.1) | ✓ | ✓ | **R** | — |
 | Keyed timers: `set_timeout` / `set_interval` / `clear_timer` (§6.3) | ✓ | ✓ | **R** | — |

@@ -133,6 +133,273 @@ async fn handler_actor_runs_init_handle_and_stop_through_the_raw_wrapper() {
     );
 }
 
+#[derive(Clone, Copy, Debug)]
+enum StopSurfaceMessage {
+    Stop,
+    Continuation,
+    Timer,
+    Offload,
+}
+
+const STOP_TIMER_ARMED_BEFORE: usize = 1 << 0;
+const STOP_CONTINUATION_REJECTED: usize = 1 << 1;
+const STOP_TIMEOUT_REJECTED: usize = 1 << 2;
+const STOP_INTERVAL_REJECTED: usize = 1 << 3;
+const STOP_CLEAR_REPORTS_EMPTY: usize = 1 << 4;
+const STOP_OFFLOAD_REJECTED: usize = 1 << 5;
+const STOP_SCOPED_OFFLOAD_REJECTED: usize = 1 << 6;
+const STOP_INTAKE_FROZEN: usize = 1 << 7;
+const ALL_STOP_RESULTS: usize = STOP_TIMER_ARMED_BEFORE
+    | STOP_CONTINUATION_REJECTED
+    | STOP_TIMEOUT_REJECTED
+    | STOP_INTERVAL_REJECTED
+    | STOP_CLEAR_REPORTS_EMPTY
+    | STOP_OFFLOAD_REJECTED
+    | STOP_SCOPED_OFFLOAD_REJECTED
+    | STOP_INTAKE_FROZEN;
+
+struct StopSurfaceActor(Arc<AtomicUsize>);
+
+impl Actor for StopSurfaceActor {
+    type Msg = StopSurfaceMessage;
+    type Args = Arc<AtomicUsize>;
+
+    async fn init(observed: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self(observed))
+    }
+
+    async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        if !matches!(message, StopSurfaceMessage::Stop) {
+            return Ok(());
+        }
+
+        // Arm a real timer first. Without it the post-stop retraction check
+        // below reads an empty store either way and cannot see the freeze.
+        let mut observed = 0;
+        if context
+            .set_timeout(
+                "armed",
+                StopSurfaceMessage::Timer,
+                Duration::from_secs(3600),
+            )
+            .is_ok()
+        {
+            observed |= STOP_TIMER_ARMED_BEFORE;
+        }
+        context.stop();
+        if context
+            .continue_with(StopSurfaceMessage::Continuation)
+            .is_err_and(|rejected| {
+                matches!(rejected.into_inner(), StopSurfaceMessage::Continuation)
+            })
+        {
+            observed |= STOP_CONTINUATION_REJECTED;
+        }
+        if context
+            .set_timeout("timeout", StopSurfaceMessage::Timer, Duration::ZERO)
+            .is_err_and(|rejected| {
+                matches!(
+                    rejected.into_inner(),
+                    ("timeout", StopSurfaceMessage::Timer)
+                )
+            })
+        {
+            observed |= STOP_TIMEOUT_REJECTED;
+        }
+        if context
+            .set_interval(
+                "interval",
+                StopSurfaceMessage::Timer,
+                Duration::from_secs(1),
+            )
+            .is_err_and(|rejected| {
+                matches!(
+                    rejected.into_inner(),
+                    ("interval", StopSurfaceMessage::Timer)
+                )
+            })
+        {
+            observed |= STOP_INTERVAL_REJECTED;
+        }
+        // Clearing does not queue work, so it is not rejected here. It
+        // observes the other half of the freeze instead: the timer armed
+        // before the stop is already gone, so there is nothing to retract.
+        if matches!(context.clear_timer(&"armed"), Ok(false)) {
+            observed |= STOP_CLEAR_REPORTS_EMPTY;
+        }
+        if context
+            .offload(
+                async {},
+                |_| StopSurfaceMessage::Offload,
+                Duration::from_secs(1),
+            )
+            .is_err_and(|rejected| {
+                let (work, continuation) = rejected.into_inner();
+                drop(work);
+                matches!(continuation(Ok(())), StopSurfaceMessage::Offload)
+            })
+        {
+            observed |= STOP_OFFLOAD_REJECTED;
+        }
+        if context
+            .offload_scoped(
+                async {},
+                |_| StopSurfaceMessage::Offload,
+                Duration::from_secs(1),
+            )
+            .is_err_and(|rejected| {
+                let (work, continuation) = rejected.into_inner();
+                drop(work);
+                matches!(continuation(Ok(())), StopSurfaceMessage::Offload)
+            })
+        {
+            observed |= STOP_SCOPED_OFFLOAD_REJECTED;
+        }
+        // External intake froze at the same call, so even this actor's own
+        // membership-addressed handle fails fast rather than queueing.
+        if context
+            .myself()
+            .try_send(StopSurfaceMessage::Continuation)
+            .is_err_and(|error| error.kind == SendErrorKind::NotRunning)
+        {
+            observed |= STOP_INTAKE_FROZEN;
+        }
+        self.0.store(observed, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn stop_immediately_rejects_every_public_local_work_submission() {
+    let observed = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    let actor = tree
+        .add_actor_once(
+            "stop-surface",
+            ActorOnceDef::<StopSurfaceActor>::new(Arc::clone(&observed)),
+        )
+        .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system.wait_started().await.expect("actor starts");
+    actor
+        .send(StopSurfaceMessage::Stop)
+        .await
+        .expect("stop message is accepted");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(observed.load(Ordering::SeqCst), ALL_STOP_RESULTS);
+}
+
+const INIT_STOP_TIMER_ARMED_BEFORE: usize = 1 << 0;
+const INIT_STOP_CONTINUATION_REJECTED: usize = 1 << 1;
+const INIT_STOP_TIMEOUT_REJECTED: usize = 1 << 2;
+const INIT_STOP_CLEAR_REPORTS_EMPTY: usize = 1 << 3;
+const INIT_STOP_OFFLOAD_REJECTED: usize = 1 << 4;
+const INIT_STOP_INTAKE_FROZEN: usize = 1 << 5;
+const ALL_INIT_STOP_RESULTS: usize = INIT_STOP_TIMER_ARMED_BEFORE
+    | INIT_STOP_CONTINUATION_REJECTED
+    | INIT_STOP_TIMEOUT_REJECTED
+    | INIT_STOP_CLEAR_REPORTS_EMPTY
+    | INIT_STOP_OFFLOAD_REJECTED
+    | INIT_STOP_INTAKE_FROZEN;
+
+struct StopInInitSurfaceActor;
+
+impl Actor for StopInInitSurfaceActor {
+    type Msg = StopSurfaceMessage;
+    type Args = Arc<AtomicUsize>;
+
+    async fn init(
+        observed: Self::Args,
+        context: &mut Context<'_, Self>,
+    ) -> Result<Self, ExitError> {
+        let mut seen = 0;
+        if context
+            .set_timeout(
+                "armed",
+                StopSurfaceMessage::Timer,
+                Duration::from_secs(3600),
+            )
+            .is_ok()
+        {
+            seen |= INIT_STOP_TIMER_ARMED_BEFORE;
+        }
+        // Effective readiness is the `Actor` default, `AfterInit`, so this
+        // stop is published only after the automatic readiness edge this
+        // initializer's `Ok` establishes. The freeze it performs is not
+        // deferred with it.
+        context.stop();
+        if context
+            .continue_with(StopSurfaceMessage::Continuation)
+            .is_err_and(|rejected| {
+                matches!(rejected.into_inner(), StopSurfaceMessage::Continuation)
+            })
+        {
+            seen |= INIT_STOP_CONTINUATION_REJECTED;
+        }
+        if context
+            .set_timeout("timeout", StopSurfaceMessage::Timer, Duration::ZERO)
+            .is_err_and(|rejected| {
+                matches!(
+                    rejected.into_inner(),
+                    ("timeout", StopSurfaceMessage::Timer)
+                )
+            })
+        {
+            seen |= INIT_STOP_TIMEOUT_REJECTED;
+        }
+        if matches!(context.clear_timer(&"armed"), Ok(false)) {
+            seen |= INIT_STOP_CLEAR_REPORTS_EMPTY;
+        }
+        if context
+            .offload(
+                async {},
+                |_| StopSurfaceMessage::Offload,
+                Duration::from_secs(1),
+            )
+            .is_err_and(|rejected| {
+                let (work, continuation) = rejected.into_inner();
+                drop(work);
+                matches!(continuation(Ok(())), StopSurfaceMessage::Offload)
+            })
+        {
+            seen |= INIT_STOP_OFFLOAD_REJECTED;
+        }
+        if context
+            .myself()
+            .try_send(StopSurfaceMessage::Continuation)
+            .is_err_and(|error| error.kind == SendErrorKind::NotRunning)
+        {
+            seen |= INIT_STOP_INTAKE_FROZEN;
+        }
+        observed.store(seen, Ordering::SeqCst);
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, _: Self::Msg, _: &mut Context<'_, Self>) -> ExitResult {
+        unreachable!("intake froze inside the initializer, so no delivery follows")
+    }
+}
+
+/// The effective-`AfterInit` initializer still publishes its readiness edge
+/// before the self-stop, but the intake and resource freeze is immediate.
+#[tokio::test]
+async fn stop_in_an_after_init_initializer_freezes_before_the_initializer_returns() {
+    let observed = Arc::new(AtomicUsize::new(0));
+    let mut tree = Tree::new();
+    tree.add_actor_once(
+        "stop-in-init-surface",
+        ActorOnceDef::<StopInInitSurfaceActor>::new(Arc::clone(&observed)),
+    )
+    .expect("valid actor");
+    let system = tree.spawn().expect("runtime is available");
+    system
+        .wait_started()
+        .await
+        .expect("a successful AfterInit initializer establishes readiness");
+    assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
+    assert_eq!(observed.load(Ordering::SeqCst), ALL_INIT_STOP_RESULTS);
+}
+
 #[tokio::test]
 async fn handler_decorator_reenters_the_inner_actor_context_across_callbacks() {
     let events = Arc::new(Mutex::new(Vec::new()));

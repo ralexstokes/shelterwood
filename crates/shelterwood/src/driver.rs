@@ -134,6 +134,9 @@ fn classify_retained_root_driver_join(
 
 impl Drop for SystemRun {
     fn drop(&mut self) {
+        if self.driver.is_none() {
+            return;
+        }
         // After a clean shutdown the root epochs are `Idle`, not `Exhausted`,
         // so this writes a real `ScopeRequest` — targeting the pending next
         // incarnation — into dead control state and pulses the member record.

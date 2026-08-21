@@ -654,6 +654,10 @@ impl ScopeRuntime {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
+        // Protect the raw user error before every resource lookup and reducer
+        // invariant. A malformed key may still be diagnosed, but it cannot
+        // unwind the Exit payload on the driver stack.
+        let mut exit = Some(RetainedExit::new(exit));
         // Production terminal publication follows joined construction
         // disposal.  A few structural test/fallback paths synthesize that
         // already-joined boundary directly, so normalize them through the
@@ -666,7 +670,14 @@ impl ScopeRuntime {
             .children
             .get_mut(key)
             .expect("terminalized child remains registered")
-            .terminalize(&self.root, exit, exited_incarnation, startup);
+            .terminalize(
+                &self.root,
+                exit.take()
+                    .expect("terminal publication consumes its retained exit once")
+                    .into_exit(),
+                exited_incarnation,
+                startup,
+            );
         self.reduce(SupervisorEvent::Terminalized { child: key });
         // The reducer drops an event whose predecessor never ran, which keeps
         // `step` total but leaves the shell no return channel. A child that

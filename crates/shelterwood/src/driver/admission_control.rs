@@ -590,6 +590,10 @@ impl AdmissionRequest {
             let _ = sender.send(result);
         });
     }
+
+    pub(super) fn complete_lost(&mut self) {
+        self.complete(Err(LOST_ADMISSION_RESPONSE_ERROR));
+    }
 }
 
 pub(super) fn reject_admission_after_disposal(

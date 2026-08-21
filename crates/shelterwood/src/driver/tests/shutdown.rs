@@ -288,6 +288,74 @@ async fn an_arrived_disposal_panic_disposes_its_losing_application_error_off_the
     );
 }
 
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_terminal_disposal_retires_its_exit_off_the_driver() {
+    let (mut scope, _events) = OrderedScopeFixture::new(Tree::new()).build();
+    let (error, disposed) = thread_reporting_error();
+    let driver_thread = std::thread::current().id();
+
+    scope.begin_terminal_disposal(
+        ChildKey::fixture(999),
+        Exit::failed(error, Cancellation::NotObserved),
+        None,
+        StartupDisposition::NotAborted,
+    );
+
+    assert_ne!(
+        disposed
+            .recv_timeout(DRIVER_PROGRESS_WAIT)
+            .expect("the refused terminal exit is disposed"),
+        driver_thread,
+        "a refusal cannot destroy the user error on the driver"
+    );
+}
+
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_terminal_resource_retires_its_exit_before_panicking() {
+    let (mut scope, _events) = OrderedScopeFixture::new(Tree::new()).build();
+    let (error, disposed) = thread_reporting_error();
+    let driver_thread = std::thread::current().id();
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        scope.terminalize_child(
+            ChildKey::fixture(999),
+            Exit::failed(error, Cancellation::NotObserved),
+            None,
+            StartupDisposition::NotAborted,
+        );
+    }))
+    .expect_err("a missing terminal resource remains a framework invariant");
+
+    assert_eq!(
+        panic.downcast_ref::<String>().map(String::as_str),
+        Some("terminalized child remains registered"),
+    );
+    assert_ne!(
+        disposed
+            .recv_timeout(DRIVER_PROGRESS_WAIT)
+            .expect("the rejected terminal exit is disposed"),
+        driver_thread,
+        "the framework panic cannot unwind the user error on the driver"
+    );
+}
+
+#[test]
+fn duplicate_disposal_completion_preserves_the_first_report() {
+    let (mut scope, _events) = OrderedScopeFixture::new(Tree::new()).build();
+    let child = ChildKey::fixture(999);
+    let first = crate::runtime::DisposalPanic {
+        message: Some("first disposal panic".to_owned()),
+    };
+    let second = crate::runtime::DisposalPanic {
+        message: Some("second disposal panic".to_owned()),
+    };
+
+    scope.stage_disposal_panic(child, Some(first.clone()));
+    scope.stage_disposal_panic(child, Some(second));
+
+    assert_eq!(scope.take_arrived_disposal_panic(child), Some(first));
+}
+
 fn assert_arrived_disposal_panic_published(member: &Arc<MemberCell>) {
     assert!(matches!(
         member.record().stage,

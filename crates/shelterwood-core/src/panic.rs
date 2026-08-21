@@ -70,20 +70,20 @@ pub fn resume_preferred_panic(panics: UnwindPanics) {
     }
 }
 
-/// Resumes exactly as [`resume_preferred_panic`], but never contains the
-/// payload.
+/// Resumes exactly as [`resume_preferred_panic`] on its ordinary non-unwinding
+/// call path.
 ///
 /// This is the variant for call sites that are not destructors and have
 /// already taken sole ownership of the panic. Silently discarding there would
 /// erase the authoritative diagnostic and let the caller continue past a
-/// failure it believes it re-raised, so the caller's non-unwinding precondition
-/// is asserted rather than absorbed.
+/// failure it believes it re-raised. A defensive unwinding call is nonetheless
+/// contained: asserting that precondition would itself be a double panic and
+/// could abort before either opaque payload was safely retired.
 pub fn resume_preferred_panic_outside_unwind(panics: UnwindPanics) {
+    if std::thread::panicking() {
+        return resume_preferred_panic(panics);
+    }
     let UnwindPanics { primary, cleanup } = panics;
-    assert!(
-        !std::thread::panicking(),
-        "an unwinding caller must contain its payloads with resume_preferred_panic"
-    );
     if let Some(payload) = primary {
         discard_panic(cleanup);
         resume_panic(payload);
@@ -172,6 +172,20 @@ mod tests {
         cleanup_drops: Arc<AtomicUsize>,
     }
 
+    struct OutsideResumeDuringUnwind {
+        primary_drops: Arc<AtomicUsize>,
+        cleanup_drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for OutsideResumeDuringUnwind {
+        fn drop(&mut self) {
+            resume_preferred_panic_outside_unwind(UnwindPanics {
+                primary: Some(Box::new(DropCount(Arc::clone(&self.primary_drops)))),
+                cleanup: Some(Box::new(DropCount(Arc::clone(&self.cleanup_drops)))),
+            });
+        }
+    }
+
     impl Drop for ResumeDuringUnwind {
         fn drop(&mut self) {
             resume_preferred_panic(UnwindPanics {
@@ -190,6 +204,28 @@ mod tests {
             let cleanup_drops = Arc::clone(&cleanup_drops);
             move || {
                 let _resume = ResumeDuringUnwind {
+                    primary_drops,
+                    cleanup_drops,
+                };
+                std::panic::panic_any("outer panic");
+            }
+        }))
+        .expect_err("the original unwind reaches its boundary");
+
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"outer panic"));
+        assert_eq!(primary_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanup_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn outside_unwind_variant_defensively_contains_a_reentrant_unwind() {
+        let primary_drops = Arc::new(AtomicUsize::new(0));
+        let cleanup_drops = Arc::new(AtomicUsize::new(0));
+        let payload = catch_unwind(AssertUnwindSafe({
+            let primary_drops = Arc::clone(&primary_drops);
+            let cleanup_drops = Arc::clone(&cleanup_drops);
+            move || {
+                let _resume = OutsideResumeDuringUnwind {
                     primary_drops,
                     cleanup_drops,
                 };

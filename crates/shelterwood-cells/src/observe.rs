@@ -827,6 +827,11 @@ pub struct LifecycleEvents {
     events: runtime::BroadcastReceiver<RetainedLifecycleEvent>,
     signal: runtime::WatchReceiver<LifecycleSignal>,
     seen_explicit_lag: u64,
+    // Total fallback for a broadcast implementation that returns an item
+    // despite reporting a length beyond its effective capacity. The explicit
+    // marker remains first and the retained event is not destroyed on an
+    // invariant-panic stack.
+    pending: Option<RetainedLifecycleEvent>,
 }
 
 impl LifecycleEvents {
@@ -857,17 +862,21 @@ impl LifecycleEvents {
             // evict the oldest unread event. Tokio guarantees the next read
             // reports lag when `len` exceeds the effective capacity; 128 is
             // already a power of two, so the effective capacity is exact.
-            if self.events.len() > LIFECYCLE_EVENT_CAPACITY {
-                let overflow = self.events.try_receive();
-                assert!(
-                    matches!(&overflow, runtime::BroadcastReceive::Lagged(_)),
-                    "a lagging broadcast receiver should report its dropped prefix"
-                );
-                if let runtime::BroadcastReceive::Lagged(overflow) = overflow {
-                    dropped = dropped.saturating_add(overflow);
+            if self.pending.is_none() && self.events.len() > LIFECYCLE_EVENT_CAPACITY {
+                match self.events.try_receive() {
+                    runtime::BroadcastReceive::Lagged(overflow) => {
+                        dropped = dropped.saturating_add(overflow);
+                    }
+                    runtime::BroadcastReceive::Item(event) => {
+                        self.pending = Some(event);
+                    }
+                    runtime::BroadcastReceive::Empty | runtime::BroadcastReceive::Closed => {}
                 }
             }
             return Ok(LifecycleItem::Lagged { dropped });
+        }
+        if let Some(event) = self.pending.take() {
+            return Ok(LifecycleItem::Event(event.into_public()));
         }
         match self.events.try_receive() {
             runtime::BroadcastReceive::Item(event) => Ok(LifecycleItem::Event(event.into_public())),
@@ -883,7 +892,10 @@ impl fmt::Debug for LifecycleEvents {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LifecycleEvents")
-            .field("queued", &self.events.len())
+            .field(
+                "queued",
+                &(self.events.len() + usize::from(self.pending.is_some())),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -922,6 +934,7 @@ impl LifecycleHub {
             events: self.events.subscribe(),
             signal,
             seen_explicit_lag,
+            pending: None,
         }
     }
 

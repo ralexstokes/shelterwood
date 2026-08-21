@@ -17,22 +17,28 @@ use shelterwood::{
 #[derive(Default)]
 struct BlockingWakeState {
     started: tokio::sync::Notify,
-    release: Mutex<(usize, bool)>,
+    release: Mutex<WakeRelease>,
     released: Condvar,
+}
+
+#[derive(Default)]
+struct WakeRelease {
+    started: usize,
+    released: usize,
+    shutdown: bool,
 }
 
 impl BlockingWakeState {
     fn run(&self) {
-        self.started.notify_one();
         let mut release = self.release.lock().expect("release mutex is not poisoned");
-        while release.0 == 0 && !release.1 {
+        release.started += 1;
+        let sequence = release.started;
+        self.started.notify_one();
+        while release.released < sequence && !release.shutdown {
             release = self
                 .released
                 .wait(release)
                 .expect("release mutex is not poisoned");
-        }
-        if !release.1 {
-            release.0 -= 1;
         }
     }
 }
@@ -56,9 +62,28 @@ impl WakeController {
     }
 
     async fn wait_until_wake_is_blocked(&self) {
-        tokio::time::timeout(POLL_TIMEOUT, self.0.started.notified())
-            .await
-            .expect("the system future is woken before the progress bound");
+        tokio::time::timeout(POLL_TIMEOUT, async {
+            loop {
+                // Register before sampling the counter so a wake starting
+                // between those operations leaves either a visible counter
+                // edge or a stored notification permit.
+                let started = self.0.started.notified();
+                {
+                    let release = self
+                        .0
+                        .release
+                        .lock()
+                        .expect("release mutex is not poisoned");
+                    assert!(!release.shutdown, "the wake gate remains live");
+                    if release.started > release.released {
+                        return;
+                    }
+                }
+                started.await;
+            }
+        })
+        .await
+        .expect("the system future is woken before the progress bound");
     }
 
     fn release_one(&self) {
@@ -67,8 +92,28 @@ impl WakeController {
             .release
             .lock()
             .expect("release mutex is not poisoned");
-        release.0 += 1;
-        self.0.released.notify_one();
+        assert!(
+            release.released < release.started,
+            "a blocked wake exists before it is released"
+        );
+        release.released += 1;
+        // Every waiter rechecks its own sequence, so only the earliest
+        // unreleased wake can leave even though all are notified.
+        self.0.released.notify_all();
+    }
+
+    fn release_all_started(&self) {
+        let mut release = self
+            .0
+            .release
+            .lock()
+            .expect("release mutex is not poisoned");
+        assert!(
+            release.released < release.started,
+            "a blocked wake exists before the blocked prefix is released"
+        );
+        release.released = release.started;
+        self.0.released.notify_all();
     }
 }
 
@@ -79,7 +124,7 @@ impl Drop for WakeController {
             .release
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        release.1 = true;
+        release.shutdown = true;
         self.0.released.notify_all();
     }
 }
@@ -145,8 +190,11 @@ fn hostile_waker() -> (ManuallyDrop<Waker>, Arc<HostileWakeState>) {
 
 /// Drives a public system future to the narrow interval after its root scope
 /// has published Stopped but before its root driver can return. The benign
-/// waker is deliberately blocked inside that terminal publication, making the
-/// following poll deterministically reach the still-pending Tokio join handle.
+/// waker is deliberately blocked inside that terminal publication. Wake calls
+/// are released strictly in arrival order, and each poll happens before the
+/// corresponding state sample. If that poll crosses into the join while
+/// Stopped is being published, the hostile replacement is therefore installed
+/// before the blocked publisher is released.
 async fn park_hostile_waker_in_driver_join<F: Future>(
     mut future: Pin<&mut F>,
     scope: &ScopeRef,
@@ -155,6 +203,10 @@ async fn park_hostile_waker_in_driver_join<F: Future>(
 ) -> (ManuallyDrop<Waker>, Arc<HostileWakeState>) {
     for _ in 0..16 {
         controller.wait_until_wake_is_blocked().await;
+        assert!(matches!(
+            future.as_mut().poll(&mut Context::from_waker(benign)),
+            Poll::Pending
+        ));
         if matches!(scope.snapshot().state, ScopeState::Stopped { .. }) {
             let (hostile, state) = hostile_waker();
             assert!(matches!(
@@ -164,10 +216,6 @@ async fn park_hostile_waker_in_driver_join<F: Future>(
             return (hostile, state);
         }
 
-        assert!(matches!(
-            future.as_mut().poll(&mut Context::from_waker(benign)),
-            Poll::Pending
-        ));
         controller.release_one();
     }
     panic!("the system did not publish its terminal scope state");
@@ -200,7 +248,7 @@ async fn system_wait_contains_join_waker_retirement() {
 
     let (hostile, state) =
         park_hostile_waker_in_driver_join(wait.as_mut(), &scope, &controller, &benign).await;
-    controller.release_one();
+    controller.release_all_started();
     wait_for_join_wake(&state).await;
     assert!(matches!(
         wait.as_mut().poll(&mut Context::from_waker(&hostile)),
@@ -226,7 +274,7 @@ async fn system_shutdown_contains_join_waker_retirement() {
 
     let (hostile, state) =
         park_hostile_waker_in_driver_join(shutdown.as_mut(), &scope, &controller, &benign).await;
-    controller.release_one();
+    controller.release_all_started();
     wait_for_join_wake(&state).await;
     assert!(matches!(
         shutdown.as_mut().poll(&mut Context::from_waker(&hostile)),
@@ -259,7 +307,7 @@ async fn start_or_shutdown_contains_join_waker_retirement() {
 
     let (hostile, state) =
         park_hostile_waker_in_driver_join(rollback.as_mut(), &scope, &controller, &benign).await;
-    controller.release_one();
+    controller.release_all_started();
     wait_for_join_wake(&state).await;
     let Poll::Ready(Err(error)) = rollback.as_mut().poll(&mut Context::from_waker(&hostile)) else {
         panic!("startup failure is returned after rollback")

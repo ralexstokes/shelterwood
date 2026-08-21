@@ -742,8 +742,18 @@ impl<M> RawResources<M> {
     fn reclaim_finished(&mut self) {
         self.offloads.retain(|offload| {
             if let Some(state) = &offload.state {
+                // Deliberately not the latch's fired bit: that is set before
+                // completion waiters are woken, so it would let this retire
+                // the entry — and with it the task handle teardown must join
+                // — while a caller's `Guard::finished()` waker is still
+                // running.
                 !state.finished_published()
             } else {
+                // Only the zero-deadline short-circuit builds a resource with
+                // no shared state. It fires its latch while the `Guard` is
+                // still on the way back to the caller, so the waiter registry
+                // is provably empty: there is no wake for the fired bit to
+                // outrun, and no task handle to lose.
                 !offload.finished.is_fired()
             }
         });
@@ -759,6 +769,14 @@ impl<M> RawResources<M> {
         });
     }
 
+    /// Awaits every offload task the ledger still holds.
+    ///
+    /// Reclamation retires an entry only once its completion wake has
+    /// returned, so an offload whose caller-owned `Guard::finished()` waker
+    /// blocks is necessarily still here and is joined. That is the accepted
+    /// cost of never retiring work whose wake is in flight: caller code can
+    /// delay incarnation teardown, and therefore exit publication, for as
+    /// long as it blocks in that waker.
     async fn join_offloads(&mut self) {
         for offload in &mut self.offloads {
             if let Some(task) = offload.task.take() {
@@ -1108,15 +1126,24 @@ impl<M: Send + 'static> RawContext<M> {
     ///
     /// Any incarnation-owned disposal panic retained by the time this path
     /// runs resumes here before another event is delivered or a stop is
-    /// reported: an offload-work panic, and — because the stop branches
-    /// freeze first — a destructor panic from the queued continuations,
-    /// armed timers, queued offload completions and offload futures that the
-    /// freeze releases, a waker panic from the `Guard::finished()` waiters
-    /// and cancellation latches that cancelling those offloads wakes, and a
-    /// panic raised by aborting an offload task. Retention is the guarantee,
-    /// not a join: a payload recorded after this check is still the
-    /// incarnation's exit, but is classified by the epilogue and cannot
-    /// suppress `on_stop`.
+    /// reported: an offload-work panic, a waker panic from the
+    /// `Guard::finished()` waiters that *ordinary* offload completion wakes,
+    /// and — because the stop branches freeze first — a destructor panic from
+    /// the queued continuations, armed timers, queued offload completions and
+    /// offload futures that the freeze releases, a waker panic from the
+    /// cancellation latches and completion notifications that cancelling
+    /// those offloads wakes, and a panic raised by aborting an offload task.
+    /// The completion-waiter class is not teardown-only: a third party
+    /// awaiting `Guard::finished()` with a panicking waker fails a live
+    /// incarnation here, and per SPEC §6.2 a failed incarnation skips
+    /// `on_stop`. Retention is the guarantee, not a join: a payload recorded
+    /// after this check is still the incarnation's exit, but is classified by
+    /// the epilogue and cannot suppress `on_stop`. The one exception is that
+    /// same completion wake: because retention has to be established before
+    /// the ledger may forget the work, a completion waker that *blocks*
+    /// instead of panicking pins its entry, and incarnation teardown then
+    /// joins it — an accepted trade against retiring work whose wake is still
+    /// in flight.
     ///
     /// A panic in an offload's continuation closure — the `FnOnce` that
     /// builds the message from the offload result, not a
@@ -1169,17 +1196,24 @@ impl<M: Send + 'static> RawContext<M> {
     /// returning another event; a panic in an offload's continuation closure
     /// (the message-building `FnOnce`, not a
     /// [`continue_with`](Self::continue_with) continuation, which is a plain
-    /// stored message) surfaces directly from this call. During drain it
-    /// freezes first, then resumes any incarnation-owned disposal panic
-    /// retained by that point — an offload-work panic, a destructor panic
-    /// from the continuations, timers, queued completions and offload futures
-    /// the freeze releases, a waker panic from the `Guard::finished()`
-    /// waiters and cancellation latches that cancelling those offloads wakes,
-    /// or a panic raised by aborting an offload task — before reading the
-    /// frozen accepted mailbox
+    /// stored message) surfaces directly from this call. The outside-drain
+    /// class is not only offload work: a waker panic from the
+    /// `Guard::finished()` waiters that ordinary offload completion wakes is
+    /// retained the same way, so a third party awaiting `Guard::finished()`
+    /// with a panicking waker fails a live incarnation here and, per SPEC
+    /// §6.2, skips its `on_stop`. During drain it freezes first, then resumes
+    /// any incarnation-owned disposal panic retained by that point — those
+    /// two, plus a destructor panic from the continuations, timers, queued
+    /// completions and offload futures the freeze releases, a waker panic
+    /// from the cancellation latches and completion notifications that
+    /// cancelling those offloads wakes, or a panic raised by aborting an
+    /// offload task — before reading the frozen accepted mailbox
     /// prefix. Retention is the guarantee, not a join: a payload recorded
     /// after the check is still the incarnation's exit, but is classified by
-    /// the epilogue and cannot suppress `on_stop`.
+    /// the epilogue and cannot suppress `on_stop`. A completion waker that
+    /// blocks rather than panicking is the accepted exception: it pins its
+    /// ledger entry until it returns, so incarnation teardown joins that
+    /// completion.
     ///
     /// A panic escaping this call leaves the fired selection cut installed,
     /// so the next receive retries the same timer arming rather than
@@ -1261,6 +1295,11 @@ impl<M: Send + 'static> RawContext<M> {
                 cancellation: cancellation.clone(),
                 make_message: Box::new(move || continuation.into_inner()(Err(DeadlineElapsed))),
             });
+            // The one uncontained completion fire in this file, and safe only
+            // because `guard` has not been handed back yet: no caller can hold
+            // this latch, so its waiter registry is empty and this wake runs
+            // nothing. Nothing structural enforces that — keep the fire ahead
+            // of the `return Ok(guard)` below.
             finished.fire();
             self.resources.offloads.push(OffloadResource {
                 cancellation,
@@ -1584,11 +1623,12 @@ impl<M: Send + 'static> RawContext<M> {
 mod tests {
     use std::{
         future::Future,
-        panic::{AssertUnwindSafe, catch_unwind},
+        panic::{AssertUnwindSafe, catch_unwind, panic_any},
         pin::Pin,
         sync::{
-            Arc, Barrier,
+            Arc, Barrier, Mutex,
             atomic::{AtomicUsize, Ordering},
+            mpsc,
         },
         task::{Context, Poll, Wake, Waker},
         thread,
@@ -1742,9 +1782,60 @@ mod tests {
 
     struct PanickingWake(&'static str);
 
+    /// How long a bounded handshake waits before failing its test.
+    ///
+    /// Generous enough to survive a loaded shared machine, finite so that a
+    /// mutation which suppresses the fire under test reports instead of
+    /// wedging the runner.
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// A single-use, timeout-bounded signal between two threads.
+    ///
+    /// `Barrier` is the wrong oracle for these tests: a mutation that stops
+    /// the completion latch firing at all would block the waiting side
+    /// forever, turning a regression into a hang. Every wait here expires and
+    /// panics on the waiting thread instead, where nothing swallows it.
+    struct Gate {
+        sender: mpsc::SyncSender<()>,
+        receiver: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl Gate {
+        fn new() -> Arc<Self> {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            Arc::new(Self {
+                sender,
+                receiver: Mutex::new(receiver),
+            })
+        }
+
+        fn open(&self) {
+            // A dropped peer means its wait already expired and failed the
+            // test; there is nothing left to report here.
+            let _ = self.sender.try_send(());
+        }
+
+        fn wait(&self, expected: &str) {
+            self.receiver
+                .lock()
+                .expect("gate receiver mutex poisoned")
+                .recv_timeout(HANDSHAKE_TIMEOUT)
+                .unwrap_or_else(|_| panic!("timed out waiting for {expected}"));
+        }
+    }
+
+    /// A wake panic payload that is deliberately not a string.
+    ///
+    /// An uncontained wake panic reaches the incarnation only as the offload
+    /// task's join result, which the framework can preserve solely as a
+    /// `String`. Panicking with an opaque payload is therefore what lets these
+    /// tests tell the caller's own payload apart from that stand-in.
+    #[derive(Debug, Eq, PartialEq)]
+    struct OpaqueWakePanic(&'static str);
+
     struct BlockingPanickingWake {
-        entered: Arc<Barrier>,
-        release: Arc<Barrier>,
+        entered: Arc<Gate>,
+        release: Arc<Gate>,
         message: &'static str,
     }
 
@@ -1760,9 +1851,9 @@ mod tests {
 
     impl BlockingPanickingWake {
         fn block_then_panic(&self) {
-            self.entered.wait();
-            self.release.wait();
-            panic!("{}", self.message);
+            self.entered.open();
+            self.release.wait("the test to release the completion wake");
+            panic_any(OpaqueWakePanic(self.message));
         }
     }
 
@@ -2066,14 +2157,22 @@ mod tests {
         assert!(!resources.offloads[0].finished.is_fired());
     }
 
+    /// The ordinary completion path — no freeze, no cancellation — retains a
+    /// `Guard::finished()` waiter's wake panic, and the ledger may not retire
+    /// the work until it has.
+    ///
+    /// The `Release` store that publishes completion is *not* pinned here:
+    /// `poller.join()` is a full fence, so weakening it to `Relaxed` would
+    /// still pass. Only the comment at that store constrains it. The
+    /// companion below covers the `task`-bearing chain this one omits.
     #[test]
     fn ordinary_offload_completion_retains_a_finished_waiter_wake_panic() {
         let mut resources = RawResources::<()>::default();
         let panic = Arc::clone(&resources.disposal.panic);
         let finished = Latch::default();
         let mut waiter = Box::pin(finished.fired());
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
+        let entered = Gate::new();
+        let release = Gate::new();
         let hostile = Waker::from(Arc::new(BlockingPanickingWake {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
@@ -2106,7 +2205,7 @@ mod tests {
                 "a caller wake panic does not escape through the offload task"
             );
         });
-        entered.wait();
+        entered.wait("the completion wake to reach the hostile waiter");
 
         assert!(finished.is_fired(), "all completion waiters were released");
         resources.reclaim_finished();
@@ -2119,7 +2218,7 @@ mod tests {
             "an actor turn can precede the blocked wake's panic"
         );
 
-        release.wait();
+        release.open();
         poller.join().expect("the caller wake panic is contained");
         resources.reclaim_finished();
         assert!(
@@ -2130,8 +2229,76 @@ mod tests {
             .take()
             .expect("the caller wake panic survives ledger reclamation");
         assert_eq!(
-            panic_message(&payload),
-            Some("ordinary finished wake panic")
+            payload.downcast_ref::<OpaqueWakePanic>(),
+            Some(&OpaqueWakePanic("ordinary finished wake panic")),
+            "the caller's original payload is retained, not a stringified stand-in"
+        );
+    }
+
+    /// The chain the fix exists to protect, with a real task handle: the
+    /// ledger keeps the entry while the completion wake is in flight, so
+    /// teardown still owns the `ActorWork` it must join, and the caller's own
+    /// payload — not the task join's stringified panic — reaches the
+    /// post-join resource take.
+    ///
+    /// Multi-threaded on purpose: the test thread blocks on the handshake
+    /// while the offload task runs the hostile wake on a worker.
+    #[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_completion_wake_panic_survives_the_offload_task_join() {
+        let mut resources = RawResources::<()>::default();
+        let finished = Latch::default();
+        let mut waiter = Box::pin(finished.fired());
+        let entered = Gate::new();
+        let release = Gate::new();
+        let hostile = Waker::from(Arc::new(BlockingPanickingWake {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            message: "joined finished wake panic",
+        }));
+        assert!(
+            waiter
+                .as_mut()
+                .poll(&mut Context::from_waker(&hostile))
+                .is_pending()
+        );
+
+        let state = SharedOffloadState::new(
+            Box::pin(async {}),
+            resources.disposal.clone(),
+            finished.clone(),
+        );
+        resources.offloads.push(OffloadResource {
+            cancellation: Latch::default(),
+            finished: finished.clone(),
+            state: Some(Arc::clone(&state)),
+            task: Some(crate::runtime::spawn_actor_work(SharedOffloadFuture(state))),
+        });
+
+        entered.wait("the completion wake to reach the hostile waiter");
+        assert!(finished.is_fired(), "all completion waiters were released");
+        resources.reclaim_finished();
+        assert_eq!(
+            resources.offloads.len(),
+            1,
+            "the ledger keeps the task handle teardown must join while the wake runs"
+        );
+
+        release.open();
+        resources.join_offloads().await;
+        assert!(
+            resources.offloads.is_empty(),
+            "joining clears the ledger it pinned"
+        );
+
+        let payload = resources
+            .disposal
+            .panic
+            .take()
+            .expect("the caller wake panic reaches the post-join resource take");
+        assert_eq!(
+            payload.downcast_ref::<OpaqueWakePanic>(),
+            Some(&OpaqueWakePanic("joined finished wake panic")),
+            "the caller's original payload is retained, not the task join's stringified result"
         );
     }
 

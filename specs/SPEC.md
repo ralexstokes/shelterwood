@@ -725,8 +725,16 @@ starts) and closes at the intake freeze when the incarnation begins
 stopping (§6.2 — the freeze precedes drain and `on_stop`, which is what
 makes the drained log exactly the accepted prefix; under `latest()`, its
 surviving slot) or, for an incarnation that ends without a stop phase
-(panic, hard abort, plain return), at its exit publication (§8); outside
-that window sends park (`send`) or fail fast (`try_send`, `NotRunning`).
+(plain return, error return, or panic), at the raw incarnation boundary's
+mailbox freeze — taken the moment the incarnation body returns or
+unwinds, before its resources are joined and before the context and actor
+are destroyed (§6.5), and therefore strictly before exit publication (§8).
+A hard abort is reachable only as a grace-ladder escalation (§11) of a
+stop request that already froze intake, so its close point is that stop's
+freeze; abrupt driver teardown freezes and closes together. On every path
+acceptance is closed no later than exit publication. Outside the
+acceptance window sends park (`send`) or fail fast (`try_send`,
+`NotRunning`).
 
 Readiness (§7) never gates acceptance — a gated child's mailbox accepts
 during its handshake, which is what lets cross-wired siblings send to a
@@ -879,15 +887,22 @@ any incarnation-owned disposal panic is observed at a receive boundary
 destroyed). Incarnation-owned disposal is §6.5's resource funnel — the
 offloaded future and its continuation closure, plus the queued
 continuations, armed timers and queued offload completions released at
-the intake freeze; the frozen mailbox prefix's own detached disposal
-above is not part of it and stays a disposal fault. A disposal panic
-**already retained when a receive boundary is reached** therefore fails
-the incarnation before any further delivery or `on_stop`. As with
-`Guard::finished()` (§6.5) this is not a join: a panic that lands after
-the last receive boundary is still the incarnation's exit, but cannot
-suppress `on_stop`. Grace bounds drain plus `on_stop` together (§11) —
-including after a local `ctx.stop()`, which arms the child's own
-configured ladder (§11).
+the intake freeze, plus the wakers of `Guard::finished()`'s own
+completion waiters, which are caller-owned but run by the incarnation on
+the ordinary completion path as well as at the freeze; the frozen
+mailbox prefix's own detached disposal above is not part of it and stays
+a disposal fault. A disposal panic **already retained when a receive
+boundary is reached** therefore fails the incarnation before any further
+delivery or `on_stop`. As with `Guard::finished()` (§6.5) this is not a
+join: a panic that lands after the last receive boundary is still the
+incarnation's exit, but cannot suppress `on_stop`. The completion
+notification of §6.5 is the one carve-out in the other direction:
+because its wake panic MUST be retained before the framework may forget
+the work, a completion waiter whose waker *blocks* rather than panicking
+holds that work in the incarnation's resource ledger, and teardown joins
+it — so caller code can delay teardown and exit publication there. Grace
+bounds drain plus `on_stop` together (§11) — including after a local
+`ctx.stop()`, which arms the child's own configured ladder (§11).
 
 ### 6.3 One timer facility
 
@@ -1015,7 +1030,14 @@ handlers non-blocking. Contracts:
   observed completion guarantees the panic is retained for §6.2's next
   receive boundary; a teardown cancellation fires the same notification
   without that ordering, which is why §6.2 conditions its guarantee on
-  retention rather than on the panic having happened.
+  retention rather than on the panic having happened. The notification's
+  own wake belongs to §6.2's funnel too: a completion waiter whose waker
+  panics has that payload retained as incarnation-owned disposal — on
+  the ordinary completion path, not only at the freeze — so a third
+  party awaiting `finished()` can fail the incarnation and suppress its
+  `on_stop`, and one whose waker blocks delays teardown as §6.2
+  describes. Callers are expected to await `finished()` from a task
+  whose waker neither panics nor blocks.
 - Any higher-level helper that composes `call` inside `offload` MUST
   preserve: incarnation ownership; completion through the actor loop; a
   total timeout continuation; and no await inside the handler.
@@ -1057,6 +1079,23 @@ handlers non-blocking. Contracts:
   `StopContext::run_blocking` may therefore start work after the
   async-resource freeze. The mailbox binding outlives actor destruction
   on every path.
+- At the raw-decorator composition point, an inner `Handler` returning
+  `Err` has already frozen and joined its incarnation-owned resource half.
+  It touches **only** that half: the mailbox binding is left exactly as the
+  callback loop left it — still accepting when the error preceded any intake
+  freeze (an `init` or live-handler error with no stop request), already
+  frozen when the error was raised while draining the frozen prefix or after
+  a `ctx.stop()`, because the stop call and the `recv`/`try_recv` shutdown
+  boundary freeze intake themselves (§6.2). Continuing to drive that raw loop
+  is unsupported, and unenforced beyond a second `Handler` initialization
+  panicking: receives keep delivering whatever the mailbox state still
+  allows, while the incarnation-resource capabilities silently reject
+  instead of diagnosing. The framework performs neither teardown step
+  on a plain `RawActor`'s behalf, so its decorator observes whatever that
+  loop itself froze. On both paths the raw incarnation boundary freezes the
+  mailbox when the decorated stack returns, before joining resources and
+  destroying the context and actor — §5.4's close point for an incarnation
+  that ends without a stop phase.
 
 ## 7. Readiness
 

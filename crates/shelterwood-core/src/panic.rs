@@ -135,8 +135,8 @@ mod tests {
     };
 
     use super::{
-        PanicAccumulator, PanicPayload, UnwindPanics, discard_panic, resume_preferred_panic,
-        resume_preferred_panic_outside_unwind,
+        PanicAccumulator, PanicPayload, UnwindPanics, discard_panic, keep_first_panic,
+        resume_preferred_panic, resume_preferred_panic_outside_unwind,
     };
 
     fn panic_message(payload: &PanicPayload) -> Option<&str> {
@@ -257,6 +257,28 @@ mod tests {
             tag,
             drops: Arc::clone(drops),
         })
+    }
+
+    #[test]
+    fn keep_first_panic_retains_the_initial_candidate() {
+        let first_drops = Arc::new(AtomicUsize::new(0));
+        let second_drops = Arc::new(AtomicUsize::new(0));
+        let mut retained = None;
+
+        keep_first_panic(&mut retained, Some(tagged_panic(1, &first_drops)));
+        keep_first_panic(&mut retained, Some(tagged_panic(2, &second_drops)));
+
+        assert_eq!(
+            retained
+                .as_ref()
+                .and_then(|payload| payload.downcast_ref::<TaggedPanic>())
+                .map(|panic| panic.tag),
+            Some(1)
+        );
+        assert_eq!(first_drops.load(Ordering::SeqCst), 0);
+        assert_eq!(second_drops.load(Ordering::SeqCst), 1);
+        drop(retained);
+        assert_eq!(first_drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]

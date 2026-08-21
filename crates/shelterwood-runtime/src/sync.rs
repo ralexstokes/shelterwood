@@ -524,6 +524,9 @@ impl<T> Drop for OneShotSender<T> {
         // caller-supplied waker from the sender's drop glue. Surface that panic
         // to an ordinary dropper, but contain it during an existing unwind so
         // an unanswered reply cannot abort the process with a double panic.
+        // This accumulator is single-candidate by construction: dropping the
+        // channel is its only fallible step, so `keep_first_panic` precedence
+        // is exercised by the multi-waiter registry cleanup instead.
         let channel = self.channel.take();
         let mut panics = PanicAccumulator::default();
         panics.run(|| drop(channel));
@@ -1029,6 +1032,8 @@ mod tests {
         broadcast, join, oneshot, oneshot_sending_for_test, spawn, timeout, yield_now,
     };
 
+    use super::{RegisteredWaker, WaiterRegistry};
+
     struct CountWake(Arc<AtomicUsize>);
 
     struct DebugProbe(Arc<AtomicUsize>);
@@ -1063,7 +1068,10 @@ mod tests {
         }
     }
 
-    struct LastWakerDropPanics;
+    struct LastWakerDropPanics {
+        drops: Arc<AtomicUsize>,
+        message: &'static str,
+    }
 
     unsafe fn clone_last_drop_panics(data: *const ()) -> RawWaker {
         // SAFETY: every pointer using this vtable came from an Arc of the
@@ -1087,9 +1095,13 @@ mod tests {
         // SAFETY: drop consumes the Arc reference represented by this waker.
         let probe = unsafe { Arc::<LastWakerDropPanics>::from_raw(data.cast()) };
         let last = Arc::strong_count(&probe) == 1;
+        if last {
+            probe.drops.fetch_add(1, Ordering::SeqCst);
+        }
+        let message = probe.message;
         drop(probe);
         if last {
-            panic!("injected registered waker drop panic");
+            std::panic::panic_any(message);
         }
     }
 
@@ -1100,9 +1112,9 @@ mod tests {
         drop_last_drop_panics,
     );
 
-    fn last_drop_panics_waker() -> Waker {
+    fn last_drop_panics_waker(message: &'static str, drops: Arc<AtomicUsize>) -> Waker {
         let raw = RawWaker::new(
-            Arc::into_raw(Arc::new(LastWakerDropPanics)).cast(),
+            Arc::into_raw(Arc::new(LastWakerDropPanics { drops, message })).cast(),
             &LAST_DROP_PANICS_VTABLE,
         );
         // SAFETY: `raw` owns one Arc reference and its vtable maintains that
@@ -1163,6 +1175,32 @@ mod tests {
             payload.downcast_ref::<&'static str>().copied(),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn registered_waker_cleanup_keeps_the_first_panic_and_attempts_every_drop() {
+        const FIRST: &str = "first registered waker drop panic";
+        const SECOND: &str = "second registered waker drop panic";
+
+        let first_drops = Arc::new(AtomicUsize::new(0));
+        let second_drops = Arc::new(AtomicUsize::new(0));
+        let first = RegisteredWaker {
+            identity: Arc::new(()),
+            waker: last_drop_panics_waker(FIRST, Arc::clone(&first_drops)),
+        };
+        let second = RegisteredWaker {
+            identity: Arc::new(()),
+            waker: last_drop_panics_waker(SECOND, Arc::clone(&second_drops)),
+        };
+
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            WaiterRegistry::drop_registered([Some(first), Some(second)]);
+        }))
+        .expect_err("registered-waker cleanup resumes its first panic");
+
+        assert_panic_message(&*payload, FIRST);
+        assert_eq!(first_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(second_drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1440,7 +1478,8 @@ mod tests {
         const PANIC: &str = "injected registered waker drop panic";
 
         let latch = Latch::default();
-        let hostile = last_drop_panics_waker();
+        let hostile_drops = Arc::new(AtomicUsize::new(0));
+        let hostile = last_drop_panics_waker(PANIC, Arc::clone(&hostile_drops));
         let mut waiting = Box::pin(latch.fired());
         assert!(
             waiting
@@ -1462,6 +1501,7 @@ mod tests {
         .expect_err("destroying the displaced waker still surfaces its panic");
 
         assert_panic_message(&*payload, PANIC);
+        assert_eq!(hostile_drops.load(Ordering::SeqCst), 1);
         assert!(latch.is_fired());
         assert_eq!(
             latch.state.waiters.len(),
@@ -1475,7 +1515,8 @@ mod tests {
         const PANIC: &str = "injected registered waker drop panic";
 
         let (sender, mut receiver) = super::watch(());
-        let hostile = last_drop_panics_waker();
+        let hostile_drops = Arc::new(AtomicUsize::new(0));
+        let hostile = last_drop_panics_waker(PANIC, Arc::clone(&hostile_drops));
         let mut waiting = Box::pin(receiver.changed());
         assert!(
             waiting
@@ -1498,6 +1539,7 @@ mod tests {
         .expect_err("destroying the displaced waker still surfaces its panic");
 
         assert_panic_message(&*payload, PANIC);
+        assert_eq!(hostile_drops.load(Ordering::SeqCst), 1);
         assert!(
             waiting
                 .as_mut()

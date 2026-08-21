@@ -1629,30 +1629,34 @@ mod tests {
         for parent_first in [true, false] {
             let root = isolated_scope("root", ScopeFlavor::Ordered);
             let nested = child_scope(&root, "nested", ScopeFlavor::Ordered);
-            root.admit_child(ResidentProjection::new(
+            assert!(root.admit_child(ResidentProjection::new(
                 Arc::clone(&nested.member),
                 Some(Arc::clone(&nested)),
-            ));
+            )));
             let mut incarnations = nested.member.take_incarnation_counter();
             let first = incarnations.mint().expect("first incarnation available");
-            nested
-                .member
-                .transition(MemberTransition::Starting { incarnation: first });
+            assert!(
+                nested
+                    .member
+                    .transition(MemberTransition::Starting { incarnation: first })
+            );
             let epoch = nested
                 .begin_incarnation(ScopeState::Starting)
                 .expect("first incarnation begins");
             nested.finish_incarnation(epoch, StopReason::Finished);
-            nested
-                .member
-                .transition(MemberTransition::RestartScheduled {
-                    exit: Exit::completed(Cancellation::NotObserved),
-                    restart_count: RestartCount::ZERO.bump(),
-                    restart_at: None,
-                });
+            assert!(
+                nested
+                    .member
+                    .transition(MemberTransition::RestartScheduled {
+                        exit: Exit::completed(Cancellation::NotObserved),
+                        restart_count: RestartCount::ZERO.bump(),
+                        restart_at: None,
+                    })
+            );
             let restarted = incarnations.mint().expect("restart incarnation available");
-            nested.member.transition(MemberTransition::Starting {
+            assert!(nested.member.transition(MemberTransition::Starting {
                 incarnation: restarted,
-            });
+            }));
             let snapshots = nested.subscribe_snapshots();
 
             // The restart body is dropped before its first poll, so it never

@@ -59,7 +59,15 @@ rests on:
   shared `Arc` placed after every raw projection, so a read is refcount
   traffic and only the last clone submits disposal. Scope state and startup
   results need that protection too: a structured startup failure recursively
-  owns the triggering child's `Exit`.
+  owns the triggering child's `Exit`. `RetainedRecordedOutcome` is the same
+  carrier one step earlier: a *provisional* `RecordedOutcome` owns the same
+  type-erased application error before any verdict is selected, so the child
+  task's report cell and the driver's exit event carry it retained and the
+  losing half of every fold retires through critical disposal. Framework code
+  reaches those folds through `classify_exit_retaining`,
+  `reconcile_recorded_outcomes_retaining` and
+  `classify_disposal_panic_retaining`; the raw `shelterwood-core` folds hand
+  both halves back and are for core's own tests.
   `ScopeCell::clear_residents_locked` and `prune_child_locked` still defer
   displaced `Arc<MemberCell>`s: the last member owner can also be the last
   owner of a mailbox containing unread user messages, which `RetainedExit`

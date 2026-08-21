@@ -589,7 +589,9 @@ impl RecordedOutcome {
 /// application failure while still allowing a readiness timeout to supersede
 /// ordinary completion; the final join uses the same rule when it contributes
 /// panic evidence. The second tuple field returns the discarded outcome so the
-/// runtime-owning caller can choose its destruction venue.
+/// runtime-owning caller can choose its destruction venue; framework callers
+/// use `shelterwood_cells::reconcile_recorded_outcomes_retaining`, which makes
+/// that choice isolated disposal.
 pub fn reconcile_recorded_outcomes(
     recorded: Option<RecordedOutcome>,
     forced: Option<RecordedOutcome>,
@@ -619,7 +621,8 @@ pub fn reconcile_recorded_outcomes(
 /// panic payload or abort provenance. A cancelled join uses the supervisor's
 /// hard-abort phase when one was recorded and otherwise fails closed to
 /// [`GracePhase::WithinGrace`]. The discarded exit is returned separately so
-/// framework callers never destroy a losing application error accidentally.
+/// framework callers never destroy a losing application error accidentally;
+/// they reach this fold through `shelterwood_cells::classify_exit_retaining`.
 pub fn classify_exit(
     recorded: Option<RecordedOutcome>,
     join: JoinOutcome<()>,
@@ -657,7 +660,9 @@ pub fn classify_exit(
 
 /// Adds a destructor panic to an already-classified exit without erasing an
 /// earlier panic, which has equal diagnostic precedence and happened first.
-/// The discarded exit remains owned by the caller for venue-safe retirement.
+/// The discarded exit remains owned by the caller for venue-safe retirement;
+/// framework callers use
+/// `shelterwood_cells::classify_disposal_panic_retaining`.
 pub fn classify_disposal_panic(exit: Exit, message: Option<String>) -> (Exit, Exit) {
     let Exit { kind, cancellation } = exit;
     let (selected, discarded) = prefer_earlier(kind, ExitKind::Panicked { message });

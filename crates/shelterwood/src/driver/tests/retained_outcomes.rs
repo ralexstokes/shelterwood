@@ -25,6 +25,9 @@ impl Drop for PanickingDrop {
     }
 }
 
+/// Drives the drain directly rather than `run_scope`'s dispatch loop: the fix
+/// is a type change on `ChildEvent::Exited`, so what needs pinning is the
+/// carrier's behaviour inside an unwind, not the driver's suffix guard.
 #[test]
 fn pending_drain_suffix_contains_failed_outcome_destruction_during_unwind() {
     let child = ChildKey::fixture(1);

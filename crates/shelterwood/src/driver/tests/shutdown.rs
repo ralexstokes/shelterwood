@@ -19,6 +19,19 @@ impl Drop for PanickingFactoryDrop {
 }
 
 async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey, Arc<MemberCell>) {
+    scope_with_arrived_factory_disposal_panic_over(ExitError::message("application failure")).await
+}
+
+/// Drives a child to a pending terminal carrying `recorded`, then parks an
+/// arrived construction-disposal panic against it.
+///
+/// The recorded failure is the *losing* half of `classify_disposal_panic`:
+/// `Failed` ranks below `Panicked`, so every published verdict below is the
+/// panic and the application error is discarded. Taking the error as a
+/// parameter is what lets one case probe the discard's destruction venue.
+async fn scope_with_arrived_factory_disposal_panic_over(
+    recorded: ExitError,
+) -> (ScopeRuntime, ChildKey, Arc<MemberCell>) {
     let mut tree = Tree::new();
     tree.add_task(
         "worker",
@@ -66,7 +79,7 @@ async fn scope_with_arrived_factory_disposal_panic() -> (ScopeRuntime, ChildKey,
         key,
         incarnation,
         Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
-            Err(ExitError::message("application failure")),
+            Err(recorded),
         ))),
         crate::runtime::JoinOutcome::Ok { value: () },
         Cancellation::NotObserved,
@@ -249,6 +262,30 @@ async fn runtime_teardown_folds_an_arrived_factory_disposal_panic() {
     drop(scope);
 
     assert_arrived_disposal_panic_published(&member);
+}
+
+/// The losing application error is the user value on this path, and nothing
+/// else observes it: the published verdict is the disposal panic. Pin its
+/// destruction venue directly, because a framework `String` error — what every
+/// other case here records — makes the venue unobservable.
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_arrived_disposal_panic_disposes_its_losing_application_error_off_the_driver() {
+    let (recorded, observed) = thread_reporting_error();
+    let (scope, _key, member) = scope_with_arrived_factory_disposal_panic_over(recorded).await;
+    // Sample after the last await: a multi-thread test task may migrate, and
+    // the fold below runs inline on whichever worker drops the driver.
+    let driver_thread = std::thread::current().id();
+
+    drop(scope);
+
+    assert_arrived_disposal_panic_published(&member);
+    assert_ne!(
+        observed
+            .recv_timeout(DRIVER_PROGRESS_WAIT)
+            .expect("the discarded application failure is disposed"),
+        driver_thread,
+        "the losing application error must not be destroyed on the driver"
+    );
 }
 
 fn assert_arrived_disposal_panic_published(member: &Arc<MemberCell>) {

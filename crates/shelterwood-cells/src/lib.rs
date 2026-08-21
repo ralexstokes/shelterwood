@@ -31,7 +31,8 @@ pub use cancellation::*;
 pub use cells::{
     DynamicRoute, MemberCell, MemberStage, MemberTransition, ObservationGate, ObservationTxn,
     ResidentProjection, RetainedExit, RetainedRecordedOutcome, RetainedStopReason, ScopeCell,
-    ScopeControlEvent, StartupDisposition,
+    ScopeControlEvent, StartupDisposition, classify_disposal_panic_retaining,
+    classify_exit_retaining, reconcile_recorded_outcomes_retaining,
 };
 #[cfg(any(test, feature = "test-util"))]
 #[doc(hidden)]

@@ -4,7 +4,9 @@ use shelterwood_core::{
     Exit,
     engine::ScopeState,
     exit::{
-        ExitKind, RecordedOutcome, StartupError, StartupFailure, StartupFailureCause, StopReason,
+        Cancellation, ExitKind, GracePhase, JoinOutcome, RecordedOutcome, StartupError,
+        StartupFailure, StartupFailureCause, StopReason, classify_disposal_panic, classify_exit,
+        reconcile_recorded_outcomes,
     },
 };
 use shelterwood_runtime as runtime;
@@ -171,6 +173,53 @@ impl Drop for RetainedRecordedOutcome {
             runtime::dispose_critical(outcome);
         }
     }
+}
+
+/// Reconciles a recorded outcome against a forced one, retaining the loser.
+///
+/// [`reconcile_recorded_outcomes`] hands both outcomes back so its caller can
+/// choose the losing outcome's destruction venue. Framework callers have no
+/// reason to choose anything but isolated disposal, so this is the shape they
+/// use: the raw fold is reached only from core's own unit tests.
+pub fn reconcile_recorded_outcomes_retaining(
+    recorded: Option<RetainedRecordedOutcome>,
+    forced: Option<RecordedOutcome>,
+) -> Option<RecordedOutcome> {
+    let (selected, discarded) =
+        reconcile_recorded_outcomes(recorded.map(RetainedRecordedOutcome::into_outcome), forced);
+    drop(discarded.map(RetainedRecordedOutcome::new));
+    selected
+}
+
+/// Classifies a child exit, retaining the losing evidence.
+///
+/// The counterpart of [`reconcile_recorded_outcomes_retaining`] for
+/// [`classify_exit`]. Returning only the selected exit is what keeps
+/// `let (exit, _) = classify_exit(..)` — which silently destroys a losing
+/// application error on the calling framework thread — out of driver code.
+pub fn classify_exit_retaining(
+    recorded: Option<RecordedOutcome>,
+    join: JoinOutcome<()>,
+    hard_abort_phase: Option<GracePhase>,
+    cancellation: Cancellation,
+) -> Exit {
+    let (exit, discarded) = classify_exit(recorded, join, hard_abort_phase, cancellation);
+    drop(discarded.map(RetainedExit::new));
+    exit
+}
+
+/// Folds a destructor panic into a retained exit, retaining the loser.
+///
+/// The carrier stays a [`RetainedExit`] across the fold: the losing half is
+/// the application error whenever one was recorded, because
+/// `Failed` ranks below `Panicked`.
+pub fn classify_disposal_panic_retaining(
+    exit: RetainedExit,
+    message: Option<String>,
+) -> RetainedExit {
+    let (selected, discarded) = classify_disposal_panic(exit.into_exit(), message);
+    drop(RetainedExit::new(discarded));
+    RetainedExit::new(selected)
 }
 
 /// A stop reason retained by driver state or a runtime completion.

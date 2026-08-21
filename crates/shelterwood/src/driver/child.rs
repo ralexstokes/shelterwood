@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) struct RecordedReport {
-    pub(super) outcome: Option<RecordedOutcome>,
+    pub(super) outcome: Option<RetainedRecordedOutcome>,
     pub(super) cancellation: Cancellation,
     pub(super) readiness_signal_seen: bool,
 }
@@ -55,6 +55,11 @@ pub(super) fn report_slot(
 
 impl ReportCompletion {
     fn fill(self, outcome: Option<RecordedOutcome>) {
+        // Retain here rather than at the send site. From `set` until the exit
+        // joiner's `receive`, the joiner's claim is the cell's sole owner; a
+        // joiner dropped un-polled at runtime teardown would otherwise run the
+        // application error's destructor inline on the teardown thread.
+        let outcome = outcome.map(RetainedRecordedOutcome::new);
         let cancellation =
             if self.shutdown.is_fired() || self.local_stop.as_ref().is_some_and(Latch::is_fired) {
                 Cancellation::Observed
@@ -122,16 +127,15 @@ pub(super) fn discharge_child_terminality(completion: ChildTerminality) {
     let (exit, exited_incarnation) = if never_started {
         (Exit::never_started(), None)
     } else {
-        {
-            let (exit, discarded) = classify_exit(
+        (
+            classify_exit_retaining(
                 None,
                 runtime::JoinOutcome::Cancelled,
                 None,
                 Cancellation::Observed,
-            );
-            drop(discarded.map(RetainedExit::new));
-            (exit, record.incarnation)
-        }
+            ),
+            record.incarnation,
+        )
     };
     // Initial-child conversion precedes residency publication. If a later
     // conversion unwinds, use the slot-owned gate for the converted prefix;
@@ -597,7 +601,7 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
         let _ = exit_sender.send(DriverEvent::Child(ChildEvent::Exited {
             child: key,
             incarnation,
-            recorded: report.outcome.map(RetainedRecordedOutcome::new),
+            recorded: report.outcome,
             join,
             cancellation: report.cancellation,
             readiness_signal_seen: report.readiness_signal_seen,
@@ -1020,13 +1024,8 @@ impl ScopeRuntime {
                 runtime::dispose_detached(teardown);
             }
         }
-        let recorded = recorded.map(RetainedRecordedOutcome::into_outcome);
-        let (recorded, discarded_recorded) =
-            reconcile_recorded_outcomes(recorded, active.forced_outcome);
-        drop(discarded_recorded.map(RetainedRecordedOutcome::new));
-        let (exit, discarded_exit) =
-            classify_exit(recorded, join, active.hard_abort_phase, cancellation);
-        drop(discarded_exit.map(RetainedExit::new));
+        let recorded = reconcile_recorded_outcomes_retaining(recorded, active.forced_outcome);
+        let exit = classify_exit_retaining(recorded, join, active.hard_abort_phase, cancellation);
         child.restarts.settle_if_stable(
             IncarnationRun {
                 started_at: active.started_at,
@@ -1240,9 +1239,7 @@ impl ScopeRuntime {
             // never-started child or a child between restart incarnations
             // keeps its already-authoritative verdict while disposal remains
             // ordered ahead of terminal routing.
-            let (selected, discarded) = classify_disposal_panic(exit.into_exit(), message);
-            exit = RetainedExit::new(selected);
-            drop(RetainedExit::new(discarded));
+            exit = classify_disposal_panic_retaining(exit, message);
         }
         // §7's `StartupAborted` is a startup-sequence property of a
         // membership that *ran* and failed before its initial readiness

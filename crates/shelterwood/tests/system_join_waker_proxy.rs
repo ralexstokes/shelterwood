@@ -1,3 +1,11 @@
+//! Public-path pins that a system join never parks the caller's raw waker in
+//! Tokio's join trailer: reverting `join_driver` to the raw `runtime::join`
+//! makes each fixture fail at hostile caller-waker destruction. On the fixed
+//! path every driver completion consumes the installed clone through the
+//! proxy wake, so the hostile drop vtable never fires here — contained
+//! ready-path destruction and the detached cancellation venue are pinned by
+//! `shelterwood-runtime`'s `spawn` unit tests instead.
+
 mod common;
 
 use std::{
@@ -229,7 +237,7 @@ async fn wait_for_join_wake(state: &HostileWakeState) {
 /// shutdown wait, so it must carry the proxy even though the public output is
 /// the timeout verdict rather than the root stop reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn system_shutdown_contains_join_waker_retirement() {
+async fn system_shutdown_never_parks_its_caller_waker_in_the_driver_join() {
     let system = waiting::tree().spawn().expect("runtime is available");
     system.wait_started().await.expect("root starts");
     let scope = system.scope();
@@ -252,9 +260,9 @@ async fn system_shutdown_contains_join_waker_retirement() {
 
 /// Startup rollback consumes the same system owner and reaches the same join
 /// seam only after preserving the startup error. This pins both pieces: proxy
-/// retirement cannot replace the error, and rollback remains successful.
+/// proxied join cannot displace the error, and rollback remains successful.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn start_or_shutdown_contains_join_waker_retirement() {
+async fn start_or_shutdown_never_parks_its_caller_waker_in_the_driver_join() {
     let mut tree = Tree::new();
     tree.add_task(
         "failure",

@@ -1,3 +1,11 @@
+//! Public-path pins that `Admission` and `Removal` never park the caller's
+//! raw waker in Tokio's one-shot: reverting either to the raw receive makes
+//! its fixture fail at hostile caller-waker destruction. On the fixed path
+//! response publication consumes the installed clone through the proxy wake,
+//! so the hostile drop vtable never fires here — contained ready-path
+//! destruction and the detached cancellation venue are pinned by
+//! `shelterwood-runtime`'s `sync` unit tests instead.
+
 mod common;
 
 use std::{
@@ -57,7 +65,7 @@ fn panicking_drop_waker() -> Waker {
 /// deterministic: no driver task can publish the response during that poll.
 /// The later Running projection is downstream of response publication.
 #[tokio::test]
-async fn successful_admission_contains_waker_retirement_and_returns_the_exact_handle() {
+async fn successful_admission_never_parks_its_caller_waker_and_returns_the_exact_handle() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("dynamic root starts");
     let scope = system.scope();
@@ -95,9 +103,10 @@ async fn successful_admission_contains_waker_retirement_and_returns_the_exact_ha
 /// Exact-handle removal is latched synchronously, so its first manual poll is
 /// pending before the current-thread driver can run. Once the Removed edge is
 /// visible, response publication follows in the same driver turn. The stale
-/// exact handle must still resolve AlreadyAbsent after the hostile retirement.
+/// exact handle must still resolve AlreadyAbsent with the hostile caller
+/// waker kept out of the one-shot.
 #[tokio::test]
-async fn exact_removal_contains_waker_retirement_and_preserves_its_outcomes() {
+async fn exact_removal_never_parks_its_caller_waker_and_preserves_its_outcomes() {
     let system = DynamicTree::new().spawn().expect("runtime is available");
     system.wait_started().await.expect("dynamic root starts");
     let scope = system.scope();

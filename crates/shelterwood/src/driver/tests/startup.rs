@@ -37,11 +37,13 @@ fn pre_admission_restart_shutdown_is_published_when_the_scope_gets_a_parent() {
         .request_shutdown()
         .expect("the pre-admission shutdown targets the first epoch");
     assert!(root.take_control_events().is_empty());
-    root.set_admitted_children(
-        plan.children
-            .iter()
-            .map(|child| resident_projection(&child.slot))
-            .collect(),
+    assert!(
+        root.set_admitted_children(
+            plan.children
+                .iter()
+                .map(|child| resident_projection(&child.slot))
+                .collect(),
+        )
     );
 
     assert_eq!(

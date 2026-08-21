@@ -155,7 +155,7 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
             .expect("child membership available"),
     );
     let slot = SlotCell::new(Arc::clone(&member), None);
-    root.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(root.set_admitted_children(vec![resident_projection(&slot)]));
     let (events, _receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
     let (sender, mut response) = crate::runtime::oneshot();
@@ -302,7 +302,7 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
             .expect("child membership available"),
     );
     let slot = SlotCell::new(Arc::clone(&member), None);
-    root.set_admitted_children(vec![resident_projection(&slot)]);
+    assert!(root.set_admitted_children(vec![resident_projection(&slot)]));
     let (events, _receiver) = crate::runtime::unbounded_mpsc();
     let control = DynamicControl::new(events);
     let key = ChildKey::fixture(1);

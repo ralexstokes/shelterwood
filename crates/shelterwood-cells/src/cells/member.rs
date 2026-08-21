@@ -29,20 +29,6 @@ pub enum MemberStage {
     Terminal(Exit),
 }
 
-impl MemberStage {
-    fn tag(&self) -> &'static str {
-        match self {
-            Self::Reserved => "Reserved",
-            Self::Admitted => "Admitted",
-            Self::Starting => "Starting",
-            Self::Running => "Running",
-            Self::Restarting => "Restarting",
-            Self::Stopping => "Stopping",
-            Self::Terminal(_) => "Terminal",
-        }
-    }
-}
-
 /// One non-terminal member-record transition owned by the cell layer.
 pub enum MemberTransition {
     Admitted,
@@ -56,6 +42,37 @@ pub enum MemberTransition {
         restart_count: RestartCount,
         restart_at: Option<Instant>,
     },
+}
+
+impl MemberTransition {
+    /// The legality matrix for driver-requested stage transitions.
+    ///
+    /// This is the single definition of which source stages each event may
+    /// consume. [`MemberRecord::apply_transition`] enforces it, and
+    /// [`MemberCell::would_accept`] probes it ahead of an operation that must
+    /// commit other state before the transition itself lands.
+    fn is_legal_from(&self, stage: &MemberStage) -> bool {
+        matches!(
+            (stage, self),
+            (MemberStage::Reserved, MemberTransition::Admitted)
+                | (
+                    MemberStage::Admitted | MemberStage::Restarting,
+                    MemberTransition::Starting { .. }
+                )
+                | (
+                    MemberStage::Starting | MemberStage::Reserved,
+                    MemberTransition::Running
+                )
+                | (
+                    MemberStage::Starting | MemberStage::Running,
+                    MemberTransition::Stopping
+                )
+                | (
+                    MemberStage::Starting | MemberStage::Running | MemberStage::Stopping,
+                    MemberTransition::RestartScheduled { .. }
+                )
+        )
+    }
 }
 
 /// Whether a terminal child incarnation failed during aggregate startup.
@@ -108,48 +125,32 @@ impl MemberRecord {
     /// Applies one driver-requested transition.
     ///
     /// Every watch-channel writer routes stage changes through here (see
-    /// [`MemberCell::transition`] for the wake-bus contract), so each arm
-    /// asserts the source stages its driver call sites can actually present.
+    /// [`MemberCell::transition`] for the wake-bus contract). The reducer
+    /// rejects an event whose source stage is not one its driver call sites
+    /// can present, including in release builds.
     ///
     /// Exits are safe to retire inside the watch mutation: the record's guard
     /// set still covers the displaced value, and [`Self::refresh_retained_exits`]
     /// re-establishes that cover before the mutation returns.
-    fn apply_transition(&mut self, transition: MemberTransition) {
+    fn apply_transition(&mut self, transition: MemberTransition) -> Result<(), MemberTransition> {
+        if !transition.is_legal_from(&self.stage) {
+            return Err(transition);
+        }
+
         match transition {
             MemberTransition::Admitted => {
-                debug_assert!(
-                    matches!(self.stage, MemberStage::Reserved),
-                    "admission must consume a fresh reservation, not {}",
-                    self.stage.tag()
-                );
                 self.stage = MemberStage::Admitted;
             }
             MemberTransition::Starting { incarnation } => {
-                debug_assert!(
-                    matches!(self.stage, MemberStage::Admitted | MemberStage::Restarting),
-                    "a spawn must start an admitted or restarting member, not {}",
-                    self.stage.tag()
-                );
                 self.stage = MemberStage::Starting;
                 self.incarnation = Some(incarnation);
                 self.last_incarnation = Some(incarnation);
                 self.restart_at = None;
             }
             MemberTransition::Running => {
-                debug_assert!(
-                    matches!(self.stage, MemberStage::Starting | MemberStage::Reserved),
-                    "readiness must promote a starting member (or the root scope's own \
-                     never-admitted reservation), not {}",
-                    self.stage.tag()
-                );
                 self.stage = MemberStage::Running;
             }
             MemberTransition::Stopping => {
-                debug_assert!(
-                    matches!(self.stage, MemberStage::Starting | MemberStage::Running),
-                    "a stop ladder must begin on a starting or running member, not {}",
-                    self.stage.tag()
-                );
                 self.stage = MemberStage::Stopping;
             }
             MemberTransition::RestartScheduled {
@@ -157,14 +158,6 @@ impl MemberRecord {
                 restart_count,
                 restart_at,
             } => {
-                debug_assert!(
-                    matches!(
-                        self.stage,
-                        MemberStage::Starting | MemberStage::Running | MemberStage::Stopping
-                    ),
-                    "a restart must be scheduled from an active incarnation's exit, not {}",
-                    self.stage.tag()
-                );
                 self.stage = MemberStage::Restarting;
                 self.incarnation = None;
                 self.last_exit = Some(exit);
@@ -172,6 +165,7 @@ impl MemberRecord {
                 self.restart_at = restart_at;
             }
         }
+        Ok(())
     }
 }
 
@@ -406,9 +400,13 @@ impl MemberCell {
     /// The driver also treats this channel as its control-plane wake bus: any
     /// field read by a loop precondition must be changed through a pulsing path
     /// like this one, never by a silent write outside an observation gate.
+    ///
+    /// Returns whether the reducer accepted the event; see
+    /// [`Self::transition_locked`].
     #[cfg(any(test, feature = "test-util"))]
-    pub fn transition(&self, transition: MemberTransition) {
-        self.with_observation_txn(|txn| self.transition_locked(txn, transition));
+    #[must_use = "an illegal member transition is rejected, not applied"]
+    pub fn transition(&self, transition: MemberTransition) -> bool {
+        self.with_observation_txn(|txn| self.transition_locked(txn, transition))
     }
 
     fn with_observation_txn<R>(&self, operation: impl FnOnce(&mut ObservationTxn<'_>) -> R) -> R {
@@ -482,31 +480,62 @@ impl MemberCell {
         );
     }
 
+    /// Adopts `gate` unconditionally, running `install` when it differs from
+    /// this member's current gate.
     pub(super) fn adopt_observation_gate_with(
         &self,
         gate: &ObservationGate,
-        mut report_capture: impl FnMut(),
+        report_capture: impl FnMut(),
         install: impl FnOnce(&ObservationGate),
     ) {
-        let mut install = Some(install);
+        let adopted = self.with_handoff_gate(gate, report_capture, |current| {
+            if !current.shares_gate(gate) {
+                install(current);
+            }
+            true
+        });
+        debug_assert!(adopted, "unconditional adoption never refuses");
+    }
+
+    /// Runs `attempt` with this member's current observation gate held.
+    ///
+    /// The caller already holds the destination `gate`. When the member is
+    /// already on it, `attempt` runs directly under the caller's guard.
+    /// Otherwise this takes the member's current gate in the one permitted
+    /// parent-to-child direction and holds it across `attempt`, so validation,
+    /// record mutation and the recursive handoff form a single cut; `attempt`
+    /// owns the decision to install `gate` and returns whether it accepted.
+    ///
+    /// An operation that passed the pointer check may finish its complete edge
+    /// before handoff. One that merely captured an obsolete gate retries after
+    /// acquiring it and observing the replacement, so `report_capture` fires
+    /// once per differing-gate iteration.
+    pub(super) fn with_handoff_gate(
+        &self,
+        gate: &ObservationGate,
+        mut report_capture: impl FnMut(),
+        attempt: impl FnOnce(&ObservationGate) -> bool,
+    ) -> bool {
+        let mut attempt = Some(attempt);
         loop {
             let current = self.current_observation_gate();
             if current.shares_gate(gate) {
-                return;
+                return attempt
+                    .take()
+                    .expect("an observation gate handoff attempt runs exactly once")(
+                    &current
+                );
             }
             report_capture();
-            // An operation that passed the pointer check may finish its
-            // complete edge before handoff. One that merely captured this
-            // obsolete gate retries after acquiring it and observing the
-            // replacement.
             let current_guard = current.lock();
             if current.shares_gate(&self.current_observation_gate()) {
-                let install = install
+                let accepted = attempt
                     .take()
-                    .expect("observation gate adoption installs exactly once");
-                install(&current);
+                    .expect("an observation gate handoff attempt runs exactly once")(
+                    &current
+                );
                 drop(current_guard);
-                return;
+                return accepted;
             }
             drop(current_guard);
         }
@@ -527,9 +556,31 @@ impl MemberCell {
         txn.pulse(&self.record);
     }
 
-    pub fn transition_locked(&self, txn: &mut ObservationTxn<'_>, transition: MemberTransition) {
+    /// Probes the legality matrix without mutating anything.
+    ///
+    /// The stage can only change through a gated writer, so a caller holding
+    /// this member's observation gate across the probe and the matching
+    /// [`Self::transition_locked`] sees no window between them. That lets an
+    /// operation which must commit other state first refuse before it starts.
+    pub(super) fn would_accept(&self, transition: &MemberTransition) -> bool {
+        self.record
+            .read_with(|record| transition.is_legal_from(&record.stage))
+    }
+
+    /// Applies `transition` and returns whether the reducer accepted it.
+    ///
+    /// A rejection is a total no-op *within the cell layer*: no record field
+    /// changes, no watch version advances, and no lifecycle event is emitted.
+    /// It says nothing about state the caller committed before calling — see
+    /// the driver call sites, each of which asserts legality in debug builds.
+    #[must_use = "an illegal member transition is rejected, not applied"]
+    pub fn transition_locked(
+        &self,
+        txn: &mut ObservationTxn<'_>,
+        transition: MemberTransition,
+    ) -> bool {
         // `RestartScheduled` carries a user error by value. Retain it before
-        // the watch lock and reducer assertions so an invariant panic can
+        // the watch lock and reducer validation so an unrelated panic can
         // unwind the raw transition as refcount traffic only.
         let retained_exit = match &transition {
             MemberTransition::RestartScheduled { exit, .. } => {
@@ -540,11 +591,29 @@ impl MemberCell {
             | MemberTransition::Running
             | MemberTransition::Stopping => None,
         };
-        self.update_locked(txn, |record| record.apply_transition(transition));
+        let mut rejected = None;
+        self.record
+            .modify_silently(|record| match record.apply_transition(transition) {
+                Ok(()) => record.refresh_retained_exits(),
+                Err(transition) => rejected = Some(transition),
+            });
+        if let Some(rejected) = rejected {
+            // Rejection leaves this cell exactly as it was. The rejected event
+            // may own a failed exit, so retire it with the transaction rather
+            // than under the observation gate or watch lock.
+            txn.defer(move || runtime::dispose_detached(rejected));
+            if let Some(retained_exit) = retained_exit {
+                // The deferred transition proves this clone cannot be last.
+                drop(retained_exit.into_exit());
+            }
+            return false;
+        }
+        txn.pulse(&self.record);
         if let Some(retained_exit) = retained_exit {
             // The record now owns an equivalent retained copy.
             drop(retained_exit.into_exit());
         }
+        true
     }
 
     pub fn set_options(&self, options: ResolvedCommonOptions) {
@@ -757,8 +826,9 @@ mod tests {
     // is gated on the profile it can hold in rather than left to fail there.
     #[cfg(debug_assertions)]
     #[test]
-    fn illegal_restart_transition_retires_its_user_error_off_thread() {
+    fn illegal_restart_transition_is_rejected_in_every_build() {
         let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let mut watcher = scope.member.record_watcher();
         let (dropped, observed) = mpsc::sync_channel(1);
         let retiring_thread = std::thread::current().id();
         let exit = Exit::failed(
@@ -766,21 +836,30 @@ mod tests {
             Cancellation::NotObserved,
         );
 
-        catch_unwind(AssertUnwindSafe(|| {
-            scope.member.transition(MemberTransition::RestartScheduled {
+        assert!(
+            !scope.member.transition(MemberTransition::RestartScheduled {
                 exit,
                 restart_count: RestartCount::ZERO.bump(),
                 restart_at: None,
-            });
-        }))
-        .expect_err("a reserved member cannot schedule a restart");
+            }),
+            "a reserved member cannot schedule a restart"
+        );
+        assert!(matches!(scope.member.record().stage, MemberStage::Reserved));
+        let mut changed = Box::pin(watcher.changed());
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "a rejected transition publishes no record edge"
+        );
 
         assert_ne!(
             observed
                 .recv_timeout(Duration::from_secs(10))
                 .expect("failed exit disposal reports"),
             retiring_thread,
-            "the incoming user error cannot unwind under the record and observation locks"
+            "a rejected user error retires on the detached lane"
         );
     }
 

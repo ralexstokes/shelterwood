@@ -64,7 +64,9 @@ impl ScopeRuntime {
                 if removing {
                     return false;
                 }
-                self.root.transition_child_stage(
+                // Readiness fires only for the live incarnation, whose
+                // projection is `Starting`.
+                let ready = self.root.transition_child_stage(
                     &child.slot.member,
                     MemberTransition::Running,
                     Some(LifecycleEventKind::Ready {
@@ -73,6 +75,7 @@ impl ScopeRuntime {
                         incarnation,
                     }),
                 );
+                debug_assert!(ready, "readiness promotes a starting member");
                 true
             }
             ReadinessEffect::TimedOut { deadline } => {

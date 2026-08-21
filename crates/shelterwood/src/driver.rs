@@ -538,11 +538,18 @@ impl ScopeRuntime {
         if let Some(control) = &self.dynamic {
             self.root.set_dynamic_route(Some(control.clone()));
         }
-        self.root.set_admitted_children(
+        // Every slot here is a fresh reservation, so the projection reducer
+        // accepts each `Admitted` edge. A refusal would leave the child out of
+        // the residency while its driver record still expects it.
+        let admitted = self.root.set_admitted_children(
             self.children
                 .values()
                 .map(|child| resident_projection(&child.slot))
                 .collect(),
+        );
+        debug_assert!(
+            admitted,
+            "initial children are admitted from their reservation exactly once"
         );
         #[cfg(test)]
         self.record_storage();
@@ -786,7 +793,15 @@ impl ScopeRuntime {
                 .entry_mut(id)
                 .expect("the matching reservation was just resolved");
             entry.promote(key, request.fused_cancel.take(), txn);
-            root.admit_child_locked(resident_projection(&request.slot), txn);
+            // The slot was minted `Reserved` by this reservation and nothing
+            // can have started it, so the projection reducer accepts. A
+            // refusal here would leave the entry promoted with no residency
+            // behind it — see the partial-effect note on issue #392.
+            let admitted = root.admit_child_locked(resident_projection(&request.slot), txn);
+            debug_assert!(
+                admitted,
+                "a promoted reservation is admitted from `Reserved` exactly once"
+            );
             AdmissionInstall::Admitted(key)
         });
         let key = match installed {
@@ -1029,8 +1044,15 @@ async fn run_scope_incarnation(
     let root = Arc::clone(&plan.root);
     if role.is_root() {
         root.with_observation_gate(|txn| {
-            root.member
+            // The root scope is never admitted, so its own reservation is the
+            // documented `Reserved -> Running` source stage.
+            let running = root
+                .member
                 .transition_locked(txn, MemberTransition::Running);
+            debug_assert!(
+                running,
+                "a root incarnation promotes its own never-admitted reservation"
+            );
         });
     }
     // Both lanes are unbounded so their producers can publish synchronously.

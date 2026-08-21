@@ -787,7 +787,7 @@ fn supervised_terminality_pulse_follows_mailbox_termination() {
         id.clone(),
         identity.mint_membership(&id).expect("membership available"),
     );
-    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);
@@ -851,7 +851,7 @@ fn supervised_mailbox_teardown_panic_precedes_terminal_pulse_panic() {
         id.clone(),
         identity.mint_membership(&id).expect("membership available"),
     );
-    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     member.attach_mailbox(mailbox);

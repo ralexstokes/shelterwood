@@ -747,7 +747,12 @@ impl ScopeRuntime {
                 .expect("configuration or close supplies each bind token");
             mailbox.bind(token, incarnation, &mut effects);
         }
-        self.root.transition_child_stage(
+        // A spawn reaches here only from `Admitted` (first incarnation) or
+        // `Restarting` (a scheduled restart), both accepted sources. The body
+        // and the mailbox bind above are already committed, so a refusal would
+        // run the incarnation with no `Started` edge — see the partial-effect
+        // note on issue #392.
+        let started = self.root.transition_child_stage(
             &child.slot.member,
             MemberTransition::Starting { incarnation },
             Some(LifecycleEventKind::Started {
@@ -755,6 +760,10 @@ impl ScopeRuntime {
                 membership: child.slot.member.membership(),
                 incarnation,
             }),
+        );
+        debug_assert!(
+            started,
+            "a spawn starts an admitted or restarting member's projection"
         );
 
         let mut readiness = ReadinessGate::new();
@@ -850,8 +859,17 @@ impl ScopeRuntime {
                 .active
                 .as_mut()
                 .expect("the stopped child remains active");
-            self.root
-                .transition_child_stage(&child.slot.member, MemberTransition::Stopping, None);
+            // The stop ladder is armed only for an active incarnation, whose
+            // projection is `Starting` or `Running`.
+            let stopping = self.root.transition_child_stage(
+                &child.slot.member,
+                MemberTransition::Stopping,
+                None,
+            );
+            debug_assert!(
+                stopping,
+                "a stop ladder begins on a starting or running member"
+            );
             if let Some(mailbox) = &child.mailbox {
                 let mut effects = MailboxEffectQueue::default();
                 mailbox.freeze(active.incarnation, &mut effects);
@@ -1080,7 +1098,14 @@ impl ScopeRuntime {
                     now,
                     sample,
                 );
-                self.root.publish_child_restart(
+                // The exiting incarnation's projection is `Starting`,
+                // `Running` or `Stopping`, all accepted sources.
+                // `schedule_restart` above has already charged this attempt
+                // against the child and the intensity window, so a refusal
+                // would restart the child with neither `Exited` nor
+                // `RestartScheduled` published — see the partial-effect note
+                // on issue #392.
+                let published = self.root.publish_child_restart(
                     &child.slot.member,
                     decision.total_restarts(),
                     MemberTransition::RestartScheduled {
@@ -1103,6 +1128,10 @@ impl ScopeRuntime {
                         attempt: decision.attempt(),
                         delay: decision.delay(),
                     },
+                );
+                debug_assert!(
+                    published,
+                    "a restart is scheduled from an active incarnation's exit"
                 );
                 let trip = decision.intensity_trip();
                 if trip.is_none()

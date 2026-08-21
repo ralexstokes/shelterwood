@@ -201,7 +201,7 @@ pub(super) fn insert_dynamic_fixture(
                     .expect("the promoted fixture resident transitions to Removing");
             }
         }
-        root.admit_child_locked(resident_projection(&reservation.slot), txn);
+        assert!(root.admit_child_locked(resident_projection(&reservation.slot), txn));
         key
     });
     (reservation, key)
@@ -577,9 +577,9 @@ pub(super) fn restarting_member_fixture() -> (Arc<ScopeCell>, Arc<MemberCell>, I
     );
     resolve_fixture_options(&member);
     let mut incarnations = member.take_incarnation_counter();
-    root.admit_child(ResidentProjection::new(Arc::clone(&member), None));
+    assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let first = incarnations.mint().expect("incarnation available");
-    member.transition(MemberTransition::Starting { incarnation: first });
+    assert!(member.transition(MemberTransition::Starting { incarnation: first }));
     (root, member, incarnations)
 }
 

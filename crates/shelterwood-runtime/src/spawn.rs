@@ -11,8 +11,8 @@ use tokio::{sync::mpsc, task};
 use shelterwood_core::exit::JoinOutcome;
 
 use super::{
-    DisposingReceiver, OneShotReceiver, OneShotSender, PanicPayload, catch_panic, discard_panic,
-    dispose_detached, oneshot, sleep_until_std,
+    DisposingReceiver, OneShotReceiver, OneShotSender, PanicPayload, Timeout, catch_panic,
+    discard_panic, dispose_detached, oneshot, timeout_at,
 };
 
 const BLOCKING_FALLBACK_THREAD: &str = "shelterwood-blocking";
@@ -559,31 +559,36 @@ where
         signal,
         parent_shutdown,
     } = wait;
-    tokio::pin!(signal);
-    tokio::pin!(parent_shutdown);
-    let deadline = async move {
-        if let Some(deadline) = deadline {
-            sleep_until_std(deadline).await;
-        } else {
-            std::future::pending::<()>().await;
+    let event = async move {
+        tokio::pin!(signal);
+        tokio::pin!(parent_shutdown);
+        let control_message = async move {
+            if let Some(receiver) = control_receiver {
+                receiver.recv().await
+            } else {
+                std::future::pending().await
+            }
+        };
+        tokio::pin!(control_message);
+        tokio::select! {
+            biased;
+            () = &mut signal => ScopeWake::Signal,
+            () = &mut parent_shutdown => ScopeWake::ParentShutdown,
+            message = receiver.recv() => ScopeWake::Message(message),
+            message = &mut control_message => ScopeWake::ControlMessage(message),
         }
     };
-    let control_message = async move {
-        if let Some(receiver) = control_receiver {
-            receiver.recv().await
-        } else {
-            std::future::pending().await
-        }
-    };
-    tokio::pin!(deadline);
-    tokio::pin!(control_message);
-    tokio::select! {
-        biased;
-        () = &mut signal => ScopeWake::Signal,
-        () = &mut parent_shutdown => ScopeWake::ParentShutdown,
-        message = receiver.recv() => ScopeWake::Message(message),
-        message = &mut control_message => ScopeWake::ControlMessage(message),
-        () = &mut deadline => ScopeWake::Deadline,
+    // The deadline stays outside the whole event selection so every event
+    // winner retires the timer through `timeout_at`'s synchronous poll-path
+    // boundary. Burying the sleep in a select arm would run its drop-glue
+    // disposal venue every time another arm won -- one blocking-lane
+    // submission per driver wakeup while any deadline is armed.
+    match deadline {
+        Some(deadline) => match timeout_at(deadline, event).await {
+            Timeout::Completed(wake) => wake,
+            Timeout::Elapsed => ScopeWake::Deadline,
+        },
+        None => event.await,
     }
 }
 

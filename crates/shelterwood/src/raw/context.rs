@@ -996,9 +996,14 @@ impl<M: Send + 'static> RawContext<M> {
             let completion = async move {
                 let work = CatchUnwindFuture::new(work.into_inner());
                 if let Some(expires_at) = expires_at {
-                    match runtime::select_two(work, runtime::sleep_until(expires_at)).await {
-                        runtime::Either::Left(result) => result.map(Ok),
-                        runtime::Either::Right(()) => Ok(Err(DeadlineElapsed)),
+                    // The deadline stays outside the work future so a
+                    // completing offload retires the timer through
+                    // `timeout_at`'s synchronous poll-path boundary instead
+                    // of paying the drop-glue disposal venue on every
+                    // deadlined completion.
+                    match runtime::timeout_at(expires_at, work).await {
+                        runtime::Timeout::Completed(result) => result.map(Ok),
+                        runtime::Timeout::Elapsed => Ok(Err(DeadlineElapsed)),
                     }
                 } else {
                     work.await.map(Ok)

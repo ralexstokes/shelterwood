@@ -328,11 +328,12 @@ impl<T: Send + 'static> OneShotTaskRef<T> {
 mod tests {
     use std::{
         future::Future,
+        mem::ManuallyDrop,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        task::{Context, Poll, Waker},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     };
 
     use crate::{
@@ -451,6 +452,95 @@ mod tests {
         let (sender, receiver) = runtime::oneshot();
         let claim = OneShotTaskRef::new(receiver, TaskRef::new(std::sync::Arc::clone(&member)));
         (sender, claim, member)
+    }
+
+    unsafe fn clone_panicking_drop_waker(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the represented reference;
+        // the returned raw waker owns only the new clone.
+        let state = ManuallyDrop::new(unsafe { Arc::<()>::from_raw(data.cast()) });
+        RawWaker::new(
+            Arc::into_raw(Arc::clone(&state)).cast(),
+            &PANICKING_DROP_WAKER_VTABLE,
+        )
+    }
+
+    unsafe fn wake_panicking_drop_waker(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<()>::from_raw(data.cast()) });
+    }
+
+    unsafe fn wake_by_ref_panicking_drop_waker(_data: *const ()) {}
+
+    unsafe fn drop_panicking_drop_waker(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<()>::from_raw(data.cast()) });
+        panic!("injected one-shot completion caller-waker drop panic");
+    }
+
+    static PANICKING_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_panicking_drop_waker,
+        wake_panicking_drop_waker,
+        wake_by_ref_panicking_drop_waker,
+        drop_panicking_drop_waker,
+    );
+
+    fn panicking_drop_waker() -> Waker {
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::new(())).cast(),
+            &PANICKING_DROP_WAKER_VTABLE,
+        );
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    struct PanickingCompletion;
+
+    impl Drop for PanickingCompletion {
+        fn drop(&mut self) {
+            panic!("injected one-shot completion value drop panic");
+        }
+    }
+
+    /// Exercises `OneShotTaskRef::wait` with the typed one-shot deliberately
+    /// held in its test-only `SENDING` window after terminal publication.
+    ///
+    /// Production ordering sends the value before publishing `Completed`, so
+    /// today's driver cannot expose this pending completion poll. The staged
+    /// boundary keeps `wait` hardened if that ordering grows another producer:
+    /// Tokio must see only the framework proxy, never the hostile caller waker
+    /// it otherwise destroys while its ready frame owns `PanickingCompletion`.
+    #[crate::runtime::test]
+    async fn staged_one_shot_wait_cannot_double_panic_at_completion_delivery() {
+        let mut identity = ScopeIdentity::new();
+        let id = ChildId::from("task");
+        let membership = identity.mint_membership(&id).expect("membership available");
+        let member = MemberCell::new(id, membership);
+        let (sending, receiver) = runtime::oneshot_sending_for_test();
+        let claim = OneShotTaskRef::new(receiver, TaskRef::new(Arc::clone(&member)));
+        member.terminalize(
+            Exit::completed(Cancellation::NotObserved),
+            crate::cells::StartupDisposition::Unchanged,
+        );
+
+        let hostile = ManuallyDrop::new(panicking_drop_waker());
+        let mut waiting = Box::pin(claim.wait());
+        assert!(matches!(
+            waiting.as_mut().poll(&mut Context::from_waker(&hostile)),
+            Poll::Pending
+        ));
+        sending
+            .publish(PanickingCompletion)
+            .unwrap_or_else(|_| panic!("the staged completion receiver remains live"));
+
+        let Poll::Ready(Ok(value)) = waiting.as_mut().poll(&mut Context::from_waker(&hostile))
+        else {
+            panic!("the staged typed completion is delivered")
+        };
+        // A passing receiver returns the value intact. Its destructor is the
+        // abort's second half, so intentionally leave it live.
+        std::mem::forget(value);
     }
 
     #[crate::runtime::test]

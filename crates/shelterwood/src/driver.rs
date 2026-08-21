@@ -112,7 +112,14 @@ impl SystemRun {
         let Some(driver) = self.driver.take() else {
             return;
         };
-        if let Err(exit) = classify_retained_root_driver_join(runtime::join(driver).await) {
+        // This is the sole production join polled directly by a public API
+        // caller: `System::wait`, `System::shutdown`, and startup rollback all
+        // converge here. The other joins are framework-task venues -- the
+        // root monitor below, child monitors, and raw offload reclamation --
+        // and therefore keep the ordinary runtime join path.
+        if let Err(exit) =
+            classify_retained_root_driver_join(runtime::join_user_polled(driver).await)
+        {
             self.root
                 .finish_live_root_incarnation(StopReason::ShutdownRequested, exit);
         }

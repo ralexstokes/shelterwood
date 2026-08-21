@@ -4,7 +4,10 @@ use std::{
     task::{Wake, Waker},
 };
 
-use crate::cell::waker_slot::{WakerAction, WakerEffects, WakerSlot};
+use crate::{
+    cell::waker_slot::{WakerAction, WakerEffects, WakerSlot},
+    panic::PanicAccumulator,
+};
 
 /// Stable framework-owned waker registered with an external primitive.
 ///
@@ -16,7 +19,8 @@ use crate::cell::waker_slot::{WakerAction, WakerEffects, WakerSlot};
 /// The proxy mutex is a **leaf**: [`Wake::wake_by_ref`] takes it from whatever
 /// thread drives the external primitive, so nothing this type does under it may
 /// take another framework lock.
-pub(crate) struct WakerProxy {
+#[doc(hidden)]
+pub struct WakerProxy {
     proxy: Waker,
     state: Arc<WakerProxyState>,
 }
@@ -35,7 +39,8 @@ struct WakerProxyState {
 }
 
 impl WakerProxy {
-    pub(crate) fn new() -> Self {
+    #[doc(hidden)]
+    pub fn new() -> Self {
         let state = Arc::new(WakerProxyState::default());
         let proxy = Waker::from(Arc::clone(&state));
         Self { proxy, state }
@@ -68,7 +73,8 @@ impl WakerProxy {
     /// still holding a matching waker proves nothing has woken since that waker
     /// was installed. Handling it anyway costs one branch and keeps the "no
     /// wake is lost" claim from resting on that invariant.
-    pub(crate) fn register(&self, current: &Waker) {
+    #[doc(hidden)]
+    pub fn register(&self, current: &Waker) {
         let mut replacement = None;
         loop {
             // Effects precede the guard, so a bookkeeping unwind still
@@ -108,8 +114,23 @@ impl WakerProxy {
         }
     }
 
-    pub(crate) fn waker(&self) -> &Waker {
+    #[doc(hidden)]
+    pub fn waker(&self) -> &Waker {
         &self.proxy
+    }
+
+    /// Retires the caller registration through a framework-selected effect.
+    ///
+    /// The function pointer is queued while the proxy mutex is held and is
+    /// invoked only after unlock. This is the cross-crate adapter seam used by
+    /// `shelterwood-runtime`: the runtime owns the detached-disposal venue,
+    /// while this runtime-neutral crate owns the slot that makes it impossible
+    /// to remove a caller waker without first choosing that post-unlock venue.
+    #[doc(hidden)]
+    pub fn retire_with(&self, effect: fn(Waker), panics: &mut PanicAccumulator) {
+        let mut effects = WakerEffects::default();
+        self.retire(WakerAction::Run(effect), &mut effects);
+        effects.flush(panics);
     }
 
     /// Moves the caller waker into an explicitly chosen post-unlock effect,

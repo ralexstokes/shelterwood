@@ -1,5 +1,7 @@
 //! Per-incarnation raw actor context and owned resources.
 
+mod timers;
+
 use std::{
     collections::VecDeque,
     fmt,
@@ -12,7 +14,6 @@ use std::{
 use crate::{
     ActorRef, ChildId, DeadlineBudget, Incarnation, MailboxShutdown, Readiness,
     cancellation::{CancellationToken, ParentCancellationToken},
-    identity::PoisonedCounter,
     mailbox::{AcceptedSequence, MailboxCell, MailboxReceiver},
     runtime::{
         self, CompletionGatedLatch, Latch, PanicAccumulator, PanicPayload, Signal, SignalWatcher,
@@ -32,9 +33,7 @@ use super::{
 #[cfg(test)]
 use super::offload::OffloadPoll;
 
-mod timers;
-
-use timers::{ArmingOrder, IntervalRearm, TimerEntry, TimerMessage, TimerStore};
+use timers::{ArmingOrder, IntervalRearm, TimerMessage, TimerStore};
 
 type DeferredMessage<M> = Box<dyn FnOnce() -> M + Send + 'static>;
 /// An operation rejected because the actor incarnation is already stopping.
@@ -354,7 +353,6 @@ struct RawResources<M> {
     // continuations from leading while an external source remains eligible.
     continuation_needs_external: bool,
     timers: TimerStore<M>,
-    timer_orders: PoisonedCounter,
     ready_batch: Option<ReadyBatch>,
     events: Arc<EventQueue<M>>,
     disposal: RawDisposal,
@@ -374,7 +372,6 @@ impl<M> Default for RawResources<M> {
             continuations: ContinuationQueue::new(disposal.clone()),
             continuation_needs_external: false,
             timers: TimerStore::new(disposal.clone()),
-            timer_orders: PoisonedCounter::new(),
             ready_batch: None,
             events,
             disposal,
@@ -894,17 +891,11 @@ impl<M: Send + 'static> RawContext<M> {
     ) where
         K: Hash + Eq + Send + 'static,
     {
-        let arming_order = ArmingOrder(
-            self.resources
-                .timer_orders
-                .mint()
-                .expect("timer arming-order space exhausted"),
-        );
         let now = runtime::now();
         let deadline = crate::deadline::Deadline::after(now, after).instant();
         self.resources
             .timers
-            .replace(key, deadline, arming_order, message, period);
+            .replace(key, deadline, message, period);
     }
 
     fn start_offload<F, T, C>(
@@ -1203,17 +1194,12 @@ impl<M: Send + 'static> RawContext<M> {
             IntervalRearm::Interval(message) => return Some(message),
         }
 
-        let entry = self
-            .resources
-            .timers
-            .remove_arming(arming)
-            .expect("a due one-shot timer remains registered");
-        let TimerEntry { key, message, .. } = entry;
-        self.resources.disposal.dispose(key);
-        let TimerMessage::Once(message) = message else {
-            unreachable!("a non-interval timer must own a one-shot message")
-        };
-        Some(message)
+        Some(
+            self.resources
+                .timers
+                .take_due_once(arming)
+                .expect("a due one-shot timer remains registered"),
+        )
     }
 
     fn next_timer_deadline(&self) -> Option<Instant> {
@@ -1279,9 +1265,8 @@ mod tests {
     };
 
     use super::{
-        ArmingOrder, EventQueue, OffloadPoll, OffloadResource, PanicSlot, QueuedEvent, RawContext,
-        RawDisposal, RawResources, RawRunContext, SharedOffloadFuture, SharedOffloadState,
-        TimerMessage,
+        EventQueue, OffloadPoll, OffloadResource, PanicSlot, QueuedEvent, RawContext, RawDisposal,
+        RawResources, RawRunContext, SharedOffloadFuture, SharedOffloadState, TimerMessage,
     };
     use crate::{
         ChildId, MailboxShutdown, Readiness,
@@ -1889,12 +1874,10 @@ mod tests {
     fn a_caught_interval_clone_panic_preserves_the_fired_batch_for_retry() {
         let clones = Arc::new(AtomicUsize::new(0));
         let mut context = bound_raw_context_for::<PanicOnceClone>().0;
-        let arming = ArmingOrder(1);
         let now = crate::runtime::now();
-        context.resources.timers.replace(
+        let arming = context.resources.timers.replace(
             "interval",
             Some(now),
-            arming,
             TimerMessage::Interval(
                 PanicOnceClone {
                     clones: Arc::clone(&clones),
@@ -1931,12 +1914,12 @@ mod tests {
     #[test]
     fn a_caught_offload_continuation_panic_preserves_later_fired_work() {
         let mut context = bound_raw_context_for::<u8>().0;
-        let arming = ArmingOrder(1);
         let now = crate::runtime::now();
-        context
-            .resources
-            .timers
-            .replace("timer", Some(now), arming, TimerMessage::Once(7), None);
+        let arming =
+            context
+                .resources
+                .timers
+                .replace("timer", Some(now), TimerMessage::Once(7), None);
         context.resources.events.push(QueuedEvent {
             cancellation: Latch::default(),
             make_message: Box::new(|| panic!("offload continuation panic")),
@@ -1964,20 +1947,14 @@ mod tests {
     fn clearing_an_elapsed_undelivered_timer_skips_its_captured_arming() {
         let mut context = bound_raw_context_for::<u8>().0;
         let now = crate::runtime::now();
-        context.resources.timers.replace(
-            "first",
-            Some(now),
-            ArmingOrder(1),
-            TimerMessage::Once(1),
-            None,
-        );
-        context.resources.timers.replace(
-            "second",
-            Some(now),
-            ArmingOrder(2),
-            TimerMessage::Once(2),
-            None,
-        );
+        context
+            .resources
+            .timers
+            .replace("first", Some(now), TimerMessage::Once(1), None);
+        context
+            .resources
+            .timers
+            .replace("second", Some(now), TimerMessage::Once(2), None);
 
         assert_eq!(context.try_recv(), Some(1));
         assert!(
@@ -2003,7 +1980,7 @@ mod tests {
         });
         resources
             .timers
-            .replace(7_u8, None, ArmingOrder(1), TimerMessage::Once(()), None);
+            .replace(7_u8, None, TimerMessage::Once(()), None);
 
         assert_eq!(
             Arc::strong_count(&resources.disposal.panic),
@@ -2210,7 +2187,6 @@ mod tests {
         resources.timers.replace(
             1_u8,
             None,
-            ArmingOrder(1),
             TimerMessage::Once(PanickingDrop(Arc::clone(&drops))),
             None,
         );

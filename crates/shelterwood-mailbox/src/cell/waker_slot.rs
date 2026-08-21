@@ -47,7 +47,7 @@ impl WakerSlot {
 }
 
 impl WakerEffects {
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
@@ -59,7 +59,7 @@ impl WakerEffects {
         });
     }
 
-    pub(crate) fn flush(&mut self, panics: &mut PanicAccumulator) {
+    pub(super) fn flush(&mut self, panics: &mut PanicAccumulator) {
         for effect in self.0.drain(..) {
             match effect {
                 WakerEffect::Wake(waker) => panics.run(|| waker.wake()),

@@ -132,6 +132,12 @@ rests on:
   stays inside the rule — the record is framework-owned data and the retained
   clone is provably non-last — but it is the deepest the exemption goes, so a
   new operation added to the doubled section needs the same accounting.
+  `WakerProxy`'s mutex (`shelterwood-mailbox/src/waker_proxy.rs`) sits at the
+  other end of that order: it is a **leaf**. `wake_by_ref` acquires it from
+  whatever thread drives the external primitive — the timer driver, a sender,
+  any executor — so no framework lock may be taken under it, and a wider lock
+  may sit above it only through the effects-sink shapes, which move every
+  caller-waker clone, wake and drop past the unlock.
 
 Two conventions that are not the rule itself but travel with it: panicking
 while holding a mutex the codebase `.expect()`s poisons it for every later

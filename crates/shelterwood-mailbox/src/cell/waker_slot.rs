@@ -9,9 +9,9 @@ use crate::{MailboxRuntime, capability::dispose, panic::PanicAccumulator};
 /// `Option<Waker>` and accidentally dropping it beside a guard does not
 /// type-check.
 #[derive(Default)]
-pub(super) struct WakerSlot(Option<Waker>);
+pub(crate) struct WakerSlot(Option<Waker>);
 
-pub(super) enum WakerAction {
+pub(crate) enum WakerAction {
     Wake,
     DropInline,
     Dispose(Arc<dyn MailboxRuntime>),
@@ -24,22 +24,22 @@ enum WakerEffect {
 }
 
 #[derive(Default)]
-pub(super) struct WakerEffects(Vec<WakerEffect>);
+pub(crate) struct WakerEffects(Vec<WakerEffect>);
 
 impl WakerSlot {
-    pub(super) fn will_wake(&self, waker: &Waker) -> bool {
+    pub(crate) fn will_wake(&self, waker: &Waker) -> bool {
         self.0
             .as_ref()
             .is_some_and(|registered| registered.will_wake(waker))
     }
 
-    pub(super) fn replace(&mut self, waker: Waker, effects: &mut WakerEffects) {
+    pub(crate) fn replace(&mut self, waker: Waker, effects: &mut WakerEffects) {
         if let Some(displaced) = self.0.replace(waker) {
             effects.push(displaced, WakerAction::DropInline);
         }
     }
 
-    pub(super) fn take(&mut self, action: WakerAction, effects: &mut WakerEffects) {
+    pub(crate) fn take(&mut self, action: WakerAction, effects: &mut WakerEffects) {
         if let Some(waker) = self.0.take() {
             effects.push(waker, action);
         }

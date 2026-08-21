@@ -2,17 +2,12 @@ use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
 use shelterwood_core::DeadlineBudget;
 
-use crate::{
-    BoxedSleep, MailboxRuntime,
-    cell::waker_slot::{WakerAction, WakerEffects},
-    panic::PanicAccumulator,
-    waker_proxy::WakerProxy,
-};
+use crate::{MailboxRuntime, ProxiedSleep, panic::PanicAccumulator};
 
 pub(crate) use shelterwood_core::deadline::Deadline;
 
@@ -63,8 +58,7 @@ pub(super) struct Deadlined<F> {
     runtime: Arc<dyn MailboxRuntime>,
     budget_width: DeadlineBudget,
     budget: Option<crate::deadline::Deadline>,
-    timer: Option<BoxedSleep>,
-    timer_waker: Option<WakerProxy>,
+    timer: Option<ProxiedSleep>,
     pub(super) started: bool,
     phase: DeadlinePhase,
 }
@@ -83,7 +77,6 @@ impl<F> Deadlined<F> {
             budget_width: budget_width.into(),
             budget: None,
             timer: None,
-            timer_waker: None,
             started: false,
             phase: DeadlinePhase::InitialAttempt,
         }
@@ -116,32 +109,12 @@ impl<F> Deadlined<F> {
             // so it stays as free as it was before the proxy.
             return Poll::Pending;
         }
-        if self.timer_waker.is_none() {
-            let mut probe = Context::from_waker(Waker::noop());
-            if self
-                .timer
+        Pin::new(
+            self.timer
                 .as_mut()
-                .expect("an unelapsed deadline future retains its timer")
-                .as_mut()
-                .poll(&mut probe)
-                .is_ready()
-            {
-                return Poll::Ready(());
-            }
-            self.timer_waker = Some(WakerProxy::new());
-        }
-
-        let timer_waker = self
-            .timer_waker
-            .as_ref()
-            .expect("a parked timer retains its waker proxy");
-        timer_waker.register(context.waker());
-        let mut proxy_context = Context::from_waker(timer_waker.waker());
-        self.timer
-            .as_mut()
-            .expect("an unelapsed deadline future retains its timer")
-            .as_mut()
-            .poll(&mut proxy_context)
+                .expect("an unelapsed deadline future retains its timer"),
+        )
+        .poll(context)
     }
 
     /// Retires the caller waker on this thread, then synchronously removes the
@@ -156,47 +129,13 @@ impl<F> Deadlined<F> {
     /// lane submission on every completed `send_timeout`/`call`/`recv` is real
     /// cost where a contained drop of a benign waker is nearly free. Only drop
     /// glue -- where the absorbing party is whatever is tearing the future down
-    /// -- keeps the lane, in [`Self::retire_timer_disposing`].
+    /// -- keeps the lane through `ProxiedSleep`'s drop implementation.
     fn retire_timer_inline(&mut self, panics: &mut PanicAccumulator) {
-        self.retire_timer(WakerAction::DropInline, panics);
-    }
-
-    /// Retires the caller waker through the blocking disposal lane, then
-    /// synchronously removes the framework-only wheel registration.
-    ///
-    /// The cancel venue, per #398 ruling 3. Drop glue runs on whatever thread
-    /// is discarding the future -- during an unwind, inside another future's
-    /// teardown, or on a runtime worker -- and has no result to trade the
-    /// diagnostic against, so a destructor that blocks goes to the lane rather
-    /// than stalling that thread.
-    fn retire_timer_disposing(&mut self, panics: &mut PanicAccumulator) {
-        self.retire_timer(WakerAction::Dispose(Arc::clone(&self.runtime)), panics);
-    }
-
-    fn retire_timer(&mut self, action: WakerAction, panics: &mut PanicAccumulator) {
-        let mut effects = WakerEffects::default();
-        let timer_waker = self.timer_waker.as_ref();
-        // Inside the boundary rather than beside it. The proxy mutex guards
-        // framework-owned data only and is documented unpoisonable, so nothing
-        // here is expected to unwind -- but this runs from drop glue too, and
-        // a cleanup step that escapes an accumulator during an unwind is the
-        // double panic the accumulator exists to prevent. Cheaper to contain
-        // than to make every reader re-derive the proof.
-        panics.run(|| {
-            if let Some(timer_waker) = timer_waker {
-                timer_waker.retire(action, &mut effects);
-            }
-        });
-        effects.flush(panics);
-
-        // Slot first, timer second: emptying the proxy before the wheel entry
-        // goes means the entry cannot deliver a wake to a caller that already
-        // has its answer, and dropping the timer synchronously means the entry
-        // is gone when this returns rather than whenever a worker reaches it.
-        let timer = self.timer.take();
+        let mut timer = self.timer.take();
+        if let Some(timer) = timer.as_mut() {
+            timer.retire_inline(panics);
+        }
         panics.run(|| drop(timer));
-        let timer_waker = self.timer_waker.take();
-        panics.run(|| drop(timer_waker));
     }
 }
 
@@ -210,8 +149,11 @@ impl<F: DeadlineOperation + Unpin> Future for Deadlined<F> {
             let budget =
                 crate::deadline::Deadline::after(this.runtime.now(), this.budget_width.duration());
             this.budget = Some(budget);
-            if !this.budget_width.is_zero() {
-                this.timer = Some(this.runtime.sleep_until(budget.instant()));
+            if !this.budget_width.is_zero()
+                && let Some(deadline) = budget.instant()
+            {
+                let timer = this.runtime.sleep_until(Some(deadline));
+                this.timer = Some(ProxiedSleep::new(timer, Arc::clone(&this.runtime)));
             }
         }
         // A zero budget short-circuits: the operation is never attempted, so
@@ -293,8 +235,7 @@ impl<F> Drop for Deadlined<F> {
     /// of its own to stall, so a destructor that blocks is handed off rather
     /// than run here.
     fn drop(&mut self) {
-        let mut panics = PanicAccumulator::default();
-        self.retire_timer_disposing(&mut panics);
+        drop(self.timer.take());
     }
 }
 
@@ -379,11 +320,9 @@ mod tests {
 
     /// Counts the clones a poll takes of the caller's waker.
     ///
-    /// A proxy allocation is not observable as a retained field: every path
-    /// that allocates one also retires it, emptying `timer_waker` again before
-    /// the poll returns. The artifact a lazy path must leave untouched is
-    /// therefore the caller's own `clone` vtable, which only
-    /// `WakerProxy::register` reaches.
+    /// A proxy allocation is not observable after retirement. The artifact a
+    /// lazy path must leave untouched is therefore the caller's own `clone`
+    /// vtable, which only `WakerProxy::register` reaches.
     #[derive(Default)]
     struct CloneCounter(AtomicUsize);
 
@@ -516,11 +455,16 @@ mod tests {
             std::time::Duration::from_secs(1),
             crate::capability::tests::runtime(),
         ));
-        let mut context = Context::from_waker(Waker::noop());
+        let counter = Arc::new(CloneCounter::default());
+        let waker = counting_waker(&counter);
+        let mut context = Context::from_waker(&waker);
 
-        assert!(future.timer_waker.is_none());
         assert!(future.as_mut().poll(&mut context).is_ready());
-        assert!(future.timer_waker.is_none());
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "an operation ready before the timer poll never clones the caller waker"
+        );
     }
 
     /// The documented lazy path: a timer that is *already* elapsed when the
@@ -583,8 +527,8 @@ mod tests {
         assert!(future.as_mut().poll(&mut context).is_pending());
 
         assert!(
-            future.timer_waker.is_none(),
-            "an unbounded deadline registers no waker proxy"
+            future.timer.is_none(),
+            "an unbounded deadline constructs no timer or waker proxy"
         );
         assert_eq!(
             counter.0.load(Ordering::SeqCst),

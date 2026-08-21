@@ -4,6 +4,9 @@ use tokio::time;
 
 use shelterwood_core::deadline::Deadline;
 pub use shelterwood_mailbox::BoxedSleep;
+use shelterwood_mailbox::ProxiedSleep;
+
+use crate::mailbox_runtime;
 
 /// Advances a paused test clock, keeping timer control in this module.
 #[cfg(any(test, feature = "test-util"))]
@@ -45,7 +48,26 @@ fn deadline(duration: Duration) -> Deadline {
 pub fn sleep_until(deadline: std::time::Instant) -> BoxedSleep {
     Box::pin(sleep_until_std(deadline))
 }
+
 pub async fn sleep_until_std(deadline: std::time::Instant) {
+    proxied_sleep_until(deadline).await;
+}
+
+fn proxied_sleep_until(deadline: std::time::Instant) -> ProxiedSleep {
+    ProxiedSleep::new(raw_sleep_until(deadline), mailbox_runtime())
+}
+
+/// Raw timer capability supplied to `shelterwood-mailbox`.
+///
+/// Public only as a sibling-crate implementation seam. User-polled façade
+/// futures must use [`sleep_until`] or [`sleep_until_std`], which install the
+/// caller-waker proxy.
+#[doc(hidden)]
+pub fn raw_sleep_until(deadline: std::time::Instant) -> BoxedSleep {
+    Box::pin(raw_sleep_until_std(deadline))
+}
+
+async fn raw_sleep_until_std(deadline: std::time::Instant) {
     // Every absolute-deadline arming crosses the runtime boundary here:
     // tokio rounds the deadline up to the next whole millisecond with a
     // panicking add before tick conversion, so a deadline flush against
@@ -68,6 +90,29 @@ pub async fn sleep_until_std(deadline: std::time::Instant) {
 pub enum Timeout<T> {
     Completed(T),
     Elapsed,
+}
+
+/// Selects a future against one absolute deadline with proxied timer
+/// registration.
+///
+/// Public only as a sibling-crate implementation seam for façade futures that
+/// already own an absolute deadline.
+#[doc(hidden)]
+pub async fn timeout_at<F>(deadline: std::time::Instant, future: F) -> Timeout<F::Output>
+where
+    F: Future,
+{
+    let mut future = std::pin::pin!(future);
+    let mut timer = std::pin::pin!(proxied_sleep_until(deadline));
+    std::future::poll_fn(|context| {
+        // Operation first preserves Tokio timeout's exact-boundary rule.
+        if let std::task::Poll::Ready(value) = future.as_mut().poll(context) {
+            timer.as_mut().get_mut().cancel_inline();
+            return std::task::Poll::Ready(Timeout::Completed(value));
+        }
+        timer.as_mut().poll(context).map(|()| Timeout::Elapsed)
+    })
+    .await
 }
 
 pub async fn timeout<F>(duration: Duration, future: F) -> Timeout<F::Output>
@@ -101,28 +146,14 @@ where
         })
         .await;
     }
-    if duration <= MAX_TIMER_SLICE {
-        return match time::timeout(duration, future).await {
-            Ok(value) => Timeout::Completed(value),
-            Err(_) => Timeout::Elapsed,
-        };
-    }
-    let sleep = sleep_until_std(deadline);
-    tokio::pin!(future);
-    tokio::pin!(sleep);
-    tokio::select! {
-        // Match tokio::time::timeout's boundary rule: the operation receives
-        // the first poll when it and a zero-duration timer are both ready.
-        biased;
-        value = &mut future => Timeout::Completed(value),
-        () = &mut sleep => Timeout::Elapsed,
-    }
+    timeout_at(deadline, future).await
 }
 #[cfg(test)]
 mod tests {
     use std::{
         future::Future,
-        task::{Context, Poll, Waker},
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
         time::Duration,
     };
 
@@ -240,6 +271,71 @@ mod tests {
             timed.as_mut().poll(&mut context),
             Poll::Ready(super::Timeout::Elapsed)
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_timeout_preserves_operation_first_arbitration() {
+        assert!(matches!(
+            timeout(Duration::ZERO, std::future::ready(7_u8)).await,
+            super::Timeout::Completed(7)
+        ));
+        assert!(matches!(
+            timeout(Duration::ZERO, std::future::pending::<()>()).await,
+            super::Timeout::Elapsed
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operation_ready_at_the_exact_deadline_wins() {
+        let deadline = super::now() + Duration::from_secs(1);
+        let operation = std::future::poll_fn(|_| {
+            if super::now() >= deadline {
+                Poll::Ready(7_u8)
+            } else {
+                Poll::Pending
+            }
+        });
+        let mut timed = std::pin::pin!(super::timeout_at(deadline, operation));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(timed.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(matches!(
+            timed.as_mut().poll(&mut context),
+            Poll::Ready(super::Timeout::Completed(7))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maximum_timeout_stays_unbounded() {
+        // Unique to this test: counts caller-waker clones so the assertion
+        // below can see whether a `ProxiedSleep` ever parked.
+        static CALLER_CLONES: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn clone_counting(data: *const ()) -> RawWaker {
+            CALLER_CLONES.fetch_add(1, Ordering::SeqCst);
+            RawWaker::new(data, &COUNTING_VTABLE)
+        }
+        unsafe fn noop(_data: *const ()) {}
+        static COUNTING_VTABLE: RawWakerVTable =
+            RawWakerVTable::new(clone_counting, noop, noop, noop);
+        // SAFETY: the vtable owns no state; every function is a no-op apart
+        // from the clone counter.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &COUNTING_VTABLE)) };
+
+        let mut timed = std::pin::pin!(timeout(Duration::MAX, std::future::pending::<()>()));
+        let mut context = Context::from_waker(&waker);
+
+        assert!(timed.as_mut().poll(&mut context).is_pending());
+        tokio::time::advance(MAX_TIMER_SLICE * 2).await;
+        assert!(timed.as_mut().poll(&mut context).is_pending());
+        // The overflow guard constructs no timer and no proxy at all: a
+        // parked `ProxiedSleep` clones the caller waker on its first pending
+        // poll, so an armed path would be visible here.
+        assert_eq!(
+            CALLER_CLONES.load(Ordering::SeqCst),
+            0,
+            "an unrepresentable budget must never arm a timer or park a proxy"
+        );
     }
 
     #[test]

@@ -996,9 +996,14 @@ impl<M: Send + 'static> RawContext<M> {
             let completion = async move {
                 let work = CatchUnwindFuture::new(work.into_inner());
                 if let Some(expires_at) = expires_at {
-                    match runtime::select_two(work, runtime::sleep_until(expires_at)).await {
-                        runtime::Either::Left(result) => result.map(Ok),
-                        runtime::Either::Right(()) => Ok(Err(DeadlineElapsed)),
+                    // The deadline stays outside the work future so a
+                    // completing offload retires the timer through
+                    // `timeout_at`'s synchronous poll-path boundary instead
+                    // of paying the drop-glue disposal venue on every
+                    // deadlined completion.
+                    match runtime::timeout_at(expires_at, work).await {
+                        runtime::Timeout::Completed(result) => result.map(Ok),
+                        runtime::Timeout::Elapsed => Ok(Err(DeadlineElapsed)),
                     }
                 } else {
                     work.await.map(Ok)
@@ -1255,26 +1260,28 @@ impl<M: Send + 'static> RawContext<M> {
         // backstop for the one case that reclaim could not have seen: an
         // offload finishing on another thread between the two calls.
         self.resources.reclaim_finished();
-        let sleep = self.next_timer_deadline().map_or_else(
-            || Box::pin(std::future::pending()) as runtime::BoxedSleep,
-            runtime::sleep_until,
-        );
+        let deadline = self.next_timer_deadline();
         let shutdown = self.shutdown.clone();
         let local_stop = self.local_stop.clone();
         let mailbox = &mut self.receiver;
         let event_watcher = &mut self.resources.event_watcher;
         let delivery = async move {
-            let _ = runtime::select_two(
-                mailbox.changed(),
-                runtime::select_two(event_watcher.changed(), sleep),
-            )
-            .await;
+            let _ = runtime::select_two(mailbox.changed(), event_watcher.changed()).await;
         };
-        let _ = runtime::select_two(
+        let event = runtime::select_two(
             shutdown.cancelled(),
             runtime::select_two(local_stop.fired(), delivery),
-        )
-        .await;
+        );
+        // The timer stays outside the whole event selection so every event
+        // winner -- especially the warm mailbox path -- retires its caller
+        // waker through timeout_at's synchronous poll-path boundary. Burying
+        // the sleep in a nested select would run its drop-glue disposal venue
+        // every time another arm won.
+        if let Some(deadline) = deadline {
+            let _ = runtime::timeout_at(deadline, event).await;
+        } else {
+            let _ = event.await;
+        }
     }
 
     /// Freezes incarnation resources on the exit path, discarding §6.2's

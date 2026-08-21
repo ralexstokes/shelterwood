@@ -45,6 +45,16 @@ impl ObservationGate {
     pub fn is_held(&self) -> bool {
         matches!(self.0.try_lock(), Err(std::sync::TryLockError::WouldBlock))
     }
+
+    /// Whether a panic crossed this gate while its mutex was held.
+    ///
+    /// This is test instrumentation for assertions that must resume only
+    /// after an observation transaction has released its guard.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.0.is_poisoned()
+    }
 }
 
 /// Capability for one observation-gate transaction.

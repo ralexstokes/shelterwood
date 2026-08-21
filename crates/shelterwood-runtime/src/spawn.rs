@@ -684,13 +684,13 @@ mod tests {
         mem::ManuallyDrop,
         panic,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
         task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use super::BlockingPoolJob;
@@ -721,32 +721,63 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct JoinWakeState(AtomicBool);
+    struct JoinWakeState {
+        woken: AtomicBool,
+        dropped: mpsc::Sender<crate::test_support::ThreadDescription>,
+        clone_action: Mutex<Option<CloneJoinAction>>,
+    }
+
+    struct CloneJoinAction {
+        release: tokio::sync::oneshot::Sender<()>,
+        finished: super::AbortHandle,
+    }
 
     unsafe fn clone_join_waker(data: *const ()) -> RawWaker {
         // SAFETY: every pointer using this vtable came from an Arc of the
         // matching type. ManuallyDrop preserves the reference represented by
         // `data`; the returned raw waker owns only the new clone.
         let state = ManuallyDrop::new(unsafe { Arc::<JoinWakeState>::from_raw(data.cast()) });
+        let action = state
+            .clone_action
+            .lock()
+            .expect("join clone-action mutex is not poisoned")
+            .take();
+        if let Some(CloneJoinAction { release, finished }) = action {
+            release
+                .send(())
+                .expect("the join task still awaits its release");
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !finished.0.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the released join task completes while its no-op waker is parked"
+                );
+                thread::yield_now();
+            }
+        }
         RawWaker::new(Arc::into_raw(Arc::clone(&state)).cast(), &JOIN_WAKER_VTABLE)
     }
 
     unsafe fn wake_join_waker(data: *const ()) {
         // SAFETY: wake consumes the Arc reference represented by this waker.
         let state = unsafe { Arc::<JoinWakeState>::from_raw(data.cast()) };
-        state.0.store(true, Ordering::SeqCst);
+        state.woken.store(true, Ordering::SeqCst);
     }
 
     unsafe fn wake_by_ref_join_waker(data: *const ()) {
         // SAFETY: ManuallyDrop preserves the reference represented by `data`.
         let state = ManuallyDrop::new(unsafe { Arc::<JoinWakeState>::from_raw(data.cast()) });
-        state.0.store(true, Ordering::SeqCst);
+        state.woken.store(true, Ordering::SeqCst);
     }
 
     unsafe fn drop_join_waker(data: *const ()) {
         // SAFETY: drop consumes the Arc reference represented by this waker.
-        drop(unsafe { Arc::<JoinWakeState>::from_raw(data.cast()) });
+        let state = unsafe { Arc::<JoinWakeState>::from_raw(data.cast()) };
+        let current = thread::current();
+        let _ = state
+            .dropped
+            .send((current.id(), current.name().map(str::to_owned)));
+        drop(state);
         panic!("hostile public-join waker destructor");
     }
 
@@ -757,13 +788,43 @@ mod tests {
         drop_join_waker,
     );
 
-    fn panicking_drop_join_waker() -> (ManuallyDrop<Waker>, Arc<JoinWakeState>) {
-        let state = Arc::new(JoinWakeState::default());
+    unsafe fn panic_clone_join_waker(_data: *const ()) -> RawWaker {
+        panic!("an already-ready join must not clone its caller waker")
+    }
+
+    unsafe fn no_op_join_waker(_data: *const ()) {}
+
+    static PANIC_CLONE_JOIN_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        panic_clone_join_waker,
+        no_op_join_waker,
+        no_op_join_waker,
+        no_op_join_waker,
+    );
+
+    fn panic_clone_join_waker_value() -> Waker {
+        let raw = RawWaker::new(std::ptr::null(), &PANIC_CLONE_JOIN_WAKER_VTABLE);
+        // SAFETY: the vtable never dereferences or owns its null data pointer.
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    fn panicking_drop_join_waker(
+        clone_action: Option<CloneJoinAction>,
+    ) -> (
+        ManuallyDrop<Waker>,
+        Arc<JoinWakeState>,
+        mpsc::Receiver<crate::test_support::ThreadDescription>,
+    ) {
+        let (dropped, observed_drop) = mpsc::channel();
+        let state = Arc::new(JoinWakeState {
+            woken: AtomicBool::new(false),
+            dropped,
+            clone_action: Mutex::new(clone_action),
+        });
         let raw = RawWaker::new(Arc::into_raw(Arc::clone(&state)).cast(), &JOIN_WAKER_VTABLE);
         // SAFETY: `raw` owns one Arc reference and its vtable maintains that
         // ownership across clone, wake, and drop.
         let waker = unsafe { Waker::from_raw(raw) };
-        (ManuallyDrop::new(waker), state)
+        (ManuallyDrop::new(waker), state, observed_drop)
     }
 
     #[tokio::test]
@@ -973,32 +1034,34 @@ mod tests {
     /// failure rather than taking the whole suite with it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn user_polled_join_separates_hostile_waker_and_panic_payload_destruction() {
+        let polling_thread = thread::current().id();
         let (release, released) = tokio::sync::oneshot::channel();
         let (payload_dropped, payload_dropped_rx) = mpsc::channel();
         let handle = super::spawn(async move {
             let _ = released.await;
             panic::panic_any(PanickingDrop(payload_dropped));
         });
+        let finished = handle.abort_handle();
         let mut join = Box::pin(super::join_user_polled(handle));
-        let (hostile, state) = panicking_drop_join_waker();
+        let (hostile, _state, observed_waker_drop) =
+            panicking_drop_join_waker(Some(CloneJoinAction { release, finished }));
 
-        assert!(matches!(
-            join.as_mut().poll(&mut Context::from_waker(&hostile)),
-            Poll::Pending
-        ));
-        release.send(()).expect("the panicking task is still live");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !state.0.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the completed task wakes its public join waiter");
-
+        // The first no-op probe parks Pending. Cloning the caller waker then
+        // releases the task and waits until Tokio marks it complete, so the
+        // second probe in the same poll returns Ready while the caller waker
+        // is still installed in the framework proxy. This pins the narrow
+        // ready-retirement path rather than relying on a scheduler race.
         assert!(matches!(
             join.as_mut().poll(&mut Context::from_waker(&hostile)),
             Poll::Ready(super::JoinOutcome::Panic { message: None })
         ));
+        let (waker_drop_thread, _) = observed_waker_drop
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ready joins retire the caller waker before returning");
+        assert_eq!(
+            waker_drop_thread, polling_thread,
+            "ready joins retire the caller waker synchronously before handle teardown"
+        );
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 match payload_dropped_rx.try_recv() {
@@ -1012,6 +1075,73 @@ mod tests {
         })
         .await
         .expect("the hostile panic payload reaches detached disposal");
+    }
+
+    #[tokio::test]
+    async fn already_ready_user_polled_join_never_clones_the_caller_waker() {
+        let handle = super::spawn(async { 17_u8 });
+        let finished = handle.abort_handle();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !finished.0.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the ready task completes before its first join poll");
+
+        let mut join = Box::pin(super::join_user_polled(handle));
+        let caller = panic_clone_join_waker_value();
+        assert!(matches!(
+            join.as_mut().poll(&mut Context::from_waker(&caller)),
+            Poll::Ready(super::JoinOutcome::Ok { value: 17 })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_polled_join_preserves_runtime_cancellation() {
+        let (runtime, handle) = super::DedicatedRuntime::spawn(std::future::pending::<()>());
+        let mut join = Box::pin(super::join_user_polled(handle));
+        assert!(matches!(
+            join.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+
+        runtime.shutdown().await;
+
+        assert!(matches!(
+            join.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(super::JoinOutcome::Cancelled)
+        ));
+    }
+
+    /// Cancelling a pending public join has no ready-result handoff point.
+    /// Its caller waker may block on destruction, so the future's drop glue
+    /// must transfer retirement to the detached disposal lane instead of
+    /// running it on the holder's thread.
+    #[tokio::test]
+    async fn dropping_pending_user_polled_join_detaches_caller_waker_retirement() {
+        let dropping_thread = thread::current().id();
+        let handle = super::spawn(std::future::pending::<()>());
+        let abort = handle.abort_handle();
+        let mut join = Box::pin(super::join_user_polled(handle));
+        let (hostile, _state, observed_drop) = panicking_drop_join_waker(None);
+
+        assert!(matches!(
+            join.as_mut().poll(&mut Context::from_waker(&hostile)),
+            Poll::Pending
+        ));
+        drop(join);
+
+        let (destructor_thread, destructor_name) = observed_drop
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the pending join caller waker reaches detached disposal");
+        assert_ne!(destructor_thread, dropping_thread);
+        assert!(
+            destructor_name.as_deref() == Some(DISPOSAL_THREAD)
+                || destructor_name.as_deref() == Some("tokio-rt-worker"),
+            "pending join drop uses either Tokio's blocking pool or the fallback disposal lane"
+        );
+        abort.abort();
     }
 
     #[test]

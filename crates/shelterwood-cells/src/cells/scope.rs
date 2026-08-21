@@ -426,17 +426,19 @@ impl ScopeCell {
         gate: &ObservationGate,
         txn: &mut ObservationTxn<'_>,
     ) {
-        debug_assert!(
-            !std::ptr::eq(self, parent),
-            "a scope cannot adopt from itself"
-        );
+        if std::ptr::eq(self, parent) {
+            txn.defer(|| panic!("a scope cannot adopt from itself"));
+            return;
+        }
         // The caller holds `gate` through `parent.with_observation_gate`.
         // Re-homing the parent would first have to acquire that same gate, so
         // rereading its installed pointer here cannot race a parent handoff.
-        debug_assert!(
-            gate.shares_gate(&parent.current_observation_gate()),
-            "observation gates are adopted only in the parent-to-child direction"
-        );
+        if !gate.shares_gate(&parent.current_observation_gate()) {
+            txn.defer(|| {
+                panic!("observation gates are adopted only in the parent-to-child direction")
+            });
+            return;
+        }
         self.member.adopt_observation_gate_with(
             gate,
             || {
@@ -444,10 +446,10 @@ impl ScopeCell {
                 self.report_gate_capture(GateCapture::Adoption);
             },
             |current| {
-                debug_assert!(
-                    self.dynamic_route_in(txn).is_none(),
-                    "a scope with a live dynamic route is never re-homed"
-                );
+                if self.dynamic_route_in(txn).is_some() {
+                    txn.defer(|| panic!("a scope with a live dynamic route is never re-homed"));
+                    return;
+                }
                 self.member.install_observation_gate_locked(current, gate);
                 self.adopt_descendant_observation_gates_locked(current, gate, txn);
             },
@@ -467,17 +469,19 @@ impl ScopeCell {
         gate: &ObservationGate,
         txn: &mut ObservationTxn<'_>,
     ) -> bool {
-        debug_assert!(
-            !std::ptr::eq(self, parent),
-            "a scope cannot be admitted into itself"
-        );
+        if std::ptr::eq(self, parent) {
+            txn.defer(|| panic!("a scope cannot be admitted into itself"));
+            return false;
+        }
         // The caller holds `gate` through `parent.with_observation_gate`.
         // Re-homing the parent would first have to acquire that same gate, so
         // rereading its installed pointer here cannot race a parent handoff.
-        debug_assert!(
-            gate.shares_gate(&parent.current_observation_gate()),
-            "observation gates are admitted only in the parent-to-child direction"
-        );
+        if !gate.shares_gate(&parent.current_observation_gate()) {
+            txn.defer(|| {
+                panic!("observation gates are admitted only in the parent-to-child direction")
+            });
+            return false;
+        }
         self.member.with_handoff_gate(
             gate,
             || {
@@ -499,10 +503,11 @@ impl ScopeCell {
                 let admitted = self
                     .member
                     .transition_locked(txn, MemberTransition::Admitted);
-                debug_assert!(
-                    admitted,
-                    "the probed admission cannot be refused under the same held gate"
-                );
+                if !admitted {
+                    txn.defer(|| {
+                        panic!("the probed admission cannot be refused under the same held gate")
+                    });
+                }
                 admitted
             },
         )
@@ -589,13 +594,32 @@ impl ScopeCell {
         startup: Option<Result<(), StartupError>>,
         terminal_disposals: &[Arc<MemberCell>],
     ) {
-        debug_assert!(matches!(state, ScopeState::Draining));
-        self.with_observation_gate(|txn| {
-            if let Some(startup) = startup {
+        assert!(matches!(state, ScopeState::Draining));
+        let mut state = Some(state);
+        let mut startup = startup;
+        let published = self.with_observation_gate(|txn| {
+            if !terminal_disposals.iter().all(|member| {
+                self.current_observation_gate()
+                    .shares_gate(&member.current_observation_gate())
+            }) {
+                return false;
+            }
+            if let Some(startup) = startup.take() {
                 self.set_startup_locked(startup, txn);
             }
-            self.set_state_locked(state, terminal_disposals, txn);
+            self.set_state_locked(
+                state
+                    .take()
+                    .expect("validated drain state is published once"),
+                terminal_disposals,
+                txn,
+            );
+            true
         });
+        assert!(
+            published,
+            "a drain entry may mark only a resident member on its observation gate"
+        );
     }
 
     fn set_state_locked(
@@ -609,11 +633,6 @@ impl ScopeCell {
         // stored before the `Draining` record write whose release edge makes
         // it visible to zero-budget shutdown samplers on other workers.
         for member in terminal_disposals {
-            debug_assert!(
-                self.current_observation_gate()
-                    .shares_gate(&member.current_observation_gate()),
-                "a drain entry may mark only a resident member on its observation gate"
-            );
             member.set_terminal_disposal_pending(true);
         }
         let mut transient_retained = Vec::new();
@@ -735,7 +754,7 @@ impl ScopeCell {
         // fallible cell lookup. If an invariant fails, the raw argument can
         // unwind under the gate only as refcount traffic.
         let exit = RetainedExit::new(exit);
-        self.with_observation_gate(move |wakes| {
+        let terminalized = self.with_observation_gate(move |wakes| {
             let record = member.record();
             if matches!(record.stage, MemberStage::Terminal(_)) {
                 // The outer guard defines losing supervised terminalization:
@@ -744,7 +763,7 @@ impl ScopeCell {
                 // losing direct terminalizer, and do not destroy it under the
                 // observation gate.
                 wakes.defer(move || drop(exit));
-                return false;
+                return Some(false);
             }
             // Nested publication and closure are reached only through this
             // residency lookup, so a supervised child must still be resident
@@ -760,11 +779,14 @@ impl ScopeCell {
                 .iter()
                 .find(|resident| resident.projection().member.membership() == member.membership())
                 .map(|resident| resident.projection().clone());
-            debug_assert!(
-                resident.is_some(),
-                "a supervised terminal child must remain in parent residency"
-            );
-            let nested = resident.and_then(|resident| resident.scope);
+            let Some(resident) = resident else {
+                // Retire the incoming failed exit before the post-unlock
+                // assertion resumes, preserving the retention-before-verdict
+                // ordering in every profile.
+                wakes.defer(move || drop(exit));
+                return None;
+            };
+            let nested = resident.scope;
             let terminal_exit = member.terminalize_locked(exit.as_exit().clone(), startup, wakes);
             // The terminal member record now owns the equivalent retained
             // copy, so surrender this transient guard as refcount traffic.
@@ -802,8 +824,13 @@ impl ScopeCell {
                 // terminal stream carrying Starting/Running as its payload.
                 scope.close_observation_locked(wakes);
             }
-            true
-        })
+            Some(true)
+        });
+        assert!(
+            terminalized.is_some(),
+            "a supervised terminal child must remain in parent residency"
+        );
+        terminalized.unwrap_or(false)
     }
 
     /// Installs residency without announcing it, as an admission that
@@ -830,7 +857,7 @@ impl ScopeCell {
         let Some(resident) = resident else {
             return false;
         };
-        debug_assert_eq!(resident.projection().member.membership(), membership);
+        let resident_matches = resident.projection().member.membership() == membership;
         // Mirror the announcement: a resident an unwound admission installed
         // never published `Added`, and SPEC §3.2's pairing is both edges or
         // neither. It is still withdrawn and disposed.
@@ -839,11 +866,22 @@ impl ScopeCell {
             membership,
             last_incarnation: resident.projection().member.record().last_incarnation,
         });
+        // Queue the framework diagnostic ahead of every other effect. The
+        // accumulator keeps the first panic, so this is the one ordering under
+        // which an invariant failure cannot be displaced by an effect that
+        // panics for an unrelated reason. Every deferred-diagnostic site in
+        // the tree uses it.
+        if !resident_matches {
+            txn.defer(|| panic!("pruning must remove the requested resident membership"));
+        }
         // The projection can carry the last member/mailbox owner. Put it in
         // the transaction before the fallible publication path so unwind also
         // retires it only after the observation gate is released. The detached
         // handoff deliberately makes final member teardown asynchronous.
         txn.defer(move || runtime::dispose_detached(resident));
+        if !resident_matches {
+            return false;
+        }
         if let Some(event) = event {
             self.emit_locked(txn, event);
         }
@@ -895,25 +933,27 @@ impl ScopeCell {
     }
 
     pub fn begin_incarnation(&self, state: ScopeState) -> Option<Epoch> {
-        debug_assert!(
+        assert!(
             matches!(state, ScopeState::Starting),
             "a fresh incarnation publishes its lifecycle machine's initial state"
         );
-        self.with_observation_gate(|wakes| {
+        let (epoch, projection_idle) = self.with_observation_gate(|wakes| {
+            let projection_idle = matches!(
+                self.record().state,
+                ScopeState::Unstarted | ScopeState::Stopped { .. }
+            );
+            if !projection_idle {
+                return (None, false);
+            }
             let mut control = self.control.lock().expect("scope control mutex poisoned");
-            let epoch = control.epochs.begin()?;
+            let Some(epoch) = control.epochs.begin() else {
+                return (None, true);
+            };
             // The idle epoch plane pairs only with a settled projection:
             // `Unstarted` before any mint, `Stopped` after every finish. That
             // pairing is what lets `settled` treat terminal membership
             // plus a settled projection as final without stranding a scope
             // that still owns a live incarnation.
-            debug_assert!(
-                matches!(
-                    self.record().state,
-                    ScopeState::Unstarted | ScopeState::Stopped { .. }
-                ),
-                "an idle scope projection is Unstarted or Stopped before a fresh incarnation mints"
-            );
             self.observation.record.modify_silently(|record| {
                 record.total_restarts = TotalRestarts::ZERO;
                 record.startup = None;
@@ -927,8 +967,13 @@ impl ScopeCell {
             wakes.pulse(&self.observation.record);
             wakes.pulse(&self.member.record);
             self.emit_locked(wakes, LifecycleEventKind::ScopeState { state });
-            Some(epoch)
-        })
+            (Some(epoch), true)
+        });
+        assert!(
+            projection_idle,
+            "an idle scope projection is Unstarted or Stopped before a fresh incarnation mints"
+        );
+        epoch
     }
 
     pub fn finish_incarnation(&self, epoch: Epoch, reason: StopReason) {
@@ -1300,10 +1345,13 @@ impl ScopeCell {
                     let admitted = projection
                         .member
                         .transition_locked(txn, MemberTransition::Admitted);
-                    debug_assert!(
-                        admitted,
-                        "the probed admission cannot be refused under the same held gate"
-                    );
+                    if !admitted {
+                        txn.defer(|| {
+                            panic!(
+                                "the probed admission cannot be refused under the same held gate"
+                            )
+                        });
+                    }
                     admitted
                 },
             )
@@ -1322,10 +1370,9 @@ impl ScopeCell {
             // invariant. If that diagnostic ever fires, neither possibly-last
             // mailbox owner may unwind through the observation gate.
             txn.defer(move || runtime::dispose_detached((projection, rejected)));
-            debug_assert!(
-                rejected_is_admission,
-                "refusal removes the admission-local resident"
-            );
+            if !rejected_is_admission {
+                txn.defer(|| panic!("refusal removes the admission-local resident"));
+            }
             return false;
         }
         let id = projection.member.id().clone();
@@ -1798,11 +1845,6 @@ mod tests {
         }
     }
 
-    // The retention this pins only has an observable effect when the
-    // framework invariant it guards is checked, and that check is a
-    // `debug_assert!`. Release builds decline the panic entirely, so the test
-    // is gated on the profile it can hold in rather than left to fail there.
-    #[cfg(debug_assertions)]
     #[test]
     fn nonresident_terminal_exit_is_retained_before_the_residency_assertion() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
@@ -1828,11 +1870,6 @@ mod tests {
         );
     }
 
-    // The retention this pins only has an observable effect when the
-    // framework invariant it guards is checked, and that check is a
-    // `debug_assert!`. Release builds decline the panic entirely, so the test
-    // is gated on the profile it can hold in rather than left to fail there.
-    #[cfg(debug_assertions)]
     #[test]
     fn rejected_resident_admission_detaches_its_last_mailbox_owner() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
@@ -2063,10 +2100,8 @@ mod tests {
         assert_eq!(events.try_recv(), Err(LifecycleTryRecvError::Empty));
     }
 
-    #[cfg(debug_assertions)]
     struct InertRoute;
 
-    #[cfg(debug_assertions)]
     impl DynamicRoute for InertRoute {
         fn close_admission(&self, _txn: &mut ObservationTxn<'_>) {}
     }
@@ -2077,7 +2112,6 @@ mod tests {
     /// refuses every stage a started driver can present, so a re-homed live
     /// route is unconstructible there. The reservation-time adoption path has
     /// no such probe, and this is its regression.
-    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "a scope with a live dynamic route is never re-homed")]
     fn plain_gate_adoption_rejects_a_scope_with_a_live_dynamic_route() {

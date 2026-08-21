@@ -673,7 +673,7 @@ impl ScopeRuntime {
         // published terminality without reaching `Joined` would never count
         // toward completion, so the scope would simply never finish. Assert
         // the transition landed rather than discovering it as a stall.
-        debug_assert!(
+        assert!(
             self.supervisor.joined(key),
             "terminal publication must leave the reducer's membership joined"
         );
@@ -1206,7 +1206,7 @@ impl ScopeRuntime {
         // Same reasoning as `terminalize_child`: a dropped `DisposalStarted`
         // would make the later `Terminalized` unreachable too, stranding the
         // membership short of `Joined` with no loud failure.
-        debug_assert!(
+        assert!(
             self.supervisor.is_disposing(key),
             "terminal disposal must leave the reducer's incarnation disposing"
         );

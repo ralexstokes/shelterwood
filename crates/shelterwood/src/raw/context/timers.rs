@@ -144,7 +144,7 @@ impl<M> TimerStore<M> {
             period,
         });
         let previous = self.armings.insert(arming_order, hash);
-        debug_assert!(previous.is_none());
+        assert!(previous.is_none());
         if let Some(deadline) = deadline {
             self.deadlines.insert((deadline, arming_order));
         }
@@ -244,7 +244,7 @@ impl<M> TimerStore<M> {
         // through this method. Their agreement is therefore structural, so
         // check it where a broken invariant is cheap to see rather than
         // paying two extra map lookups on every removal.
-        debug_assert_eq!(
+        assert_eq!(
             self.armings.get(&entry.arming_order),
             Some(&location.hash),
             "a timer's key and arming indexes must agree"

@@ -489,13 +489,12 @@ impl MemberCell {
         report_capture: impl FnMut(),
         install: impl FnOnce(&ObservationGate),
     ) {
-        let adopted = self.with_handoff_gate(gate, report_capture, |current| {
+        self.with_handoff_gate(gate, report_capture, |current| {
             if !current.shares_gate(gate) {
                 install(current);
             }
             true
         });
-        debug_assert!(adopted, "unconditional adoption never refuses");
     }
 
     /// Runs `attempt` with this member's current observation gate held.
@@ -652,23 +651,25 @@ impl MemberCell {
                         exit,
                         teardown,
                     } => {
-                        debug_assert!(teardown.is_none());
-                        *teardown = mailbox.prepare_termination(txn);
-                        *control = Some(mailbox);
-                        Some(exit.as_exit().clone())
+                        if teardown.is_some() {
+                            rejected = Some(mailbox);
+                            None
+                        } else {
+                            *teardown = mailbox.prepare_termination(txn);
+                            *control = Some(mailbox);
+                            Some(exit.as_exit().clone())
+                        }
                     }
                 }
             };
-            // Follow the mailbox layer's convention and release the lock before
-            // panicking, so a driver-contract violation stays on this thread
-            // instead of poisoning the mutex under every later mailbox lookup.
-            // The rejected mailbox still owns unread user messages, so the
-            // transaction destroys it after the gate is released -- during this
-            // panic's unwind, which is exactly when an inline destructor would
-            // be a double panic.
+            // Raise the contract failure as the first post-unlock effect so
+            // it keeps precedence over a hostile rejected-mailbox destructor.
+            // The transaction accumulator still runs the disposal effect
+            // before it resumes that panic.
             if let Some(rejected) = rejected {
-                txn.defer(move || drop(rejected));
-                panic!("a member can own only one mailbox");
+                txn.defer(|| panic!("a member can own only one mailbox"));
+                txn.defer(move || runtime::dispose_detached(rejected));
+                return;
             }
             if let Some(terminal_exit) = terminal_exit {
                 self.terminalize_locked(terminal_exit, StartupDisposition::Unchanged, txn);
@@ -775,10 +776,9 @@ impl MemberCell {
                 None
             }
         };
-        debug_assert!(
-            !nonterminal_mailbox,
-            "terminal publication requires terminal mailbox state"
-        );
+        if nonterminal_mailbox {
+            txn.defer(|| panic!("terminal publication requires terminal mailbox state"));
+        }
         if let Some(teardown) = teardown {
             txn.defer(move || {
                 runtime::dispose_detached(teardown.finish());
@@ -821,11 +821,6 @@ mod tests {
     use super::*;
     use crate::cells::test_support::{ThreadProbe, isolated_scope};
 
-    // The retention this pins only has an observable effect when the
-    // framework invariant it guards is checked, and that check is a
-    // `debug_assert!`. Release builds decline the panic entirely, so the test
-    // is gated on the profile it can hold in rather than left to fail there.
-    #[cfg(debug_assertions)]
     #[test]
     fn illegal_restart_transition_is_rejected_in_every_build() {
         let scope = isolated_scope("root", ScopeFlavor::Ordered);

@@ -103,11 +103,10 @@ pub struct ActorWork {
 
 impl ActorWork {
     pub fn abort(&self) {
-        // A handle is taken only by `join`, which consumes the work, so the
-        // slot is populated on every reachable call. Assert rather than
-        // panic: this shares its shape with the locked callers of
-        // `OneShotSender::is_closed`, and aborting nothing is the harmless
-        // reading of an already-joined handle.
+        // Diagnostic-only: a handle is taken only by `join`, which consumes
+        // the work, so the slot is populated on every reachable call. This
+        // can be sampled from a locked control path, so aborting nothing is
+        // the total release behavior and no test depends on the diagnostic.
         debug_assert!(
             self.handle.is_some(),
             "actor work retains its join handle until join"
@@ -417,7 +416,7 @@ pub async fn join<T>(handle: JoinHandle<T>) -> JoinOutcome<T> {
             message: contain_panic_payload(error.into_panic()),
         },
         Err(error) => {
-            debug_assert!(error.is_cancelled());
+            assert!(error.is_cancelled());
             JoinOutcome::Cancelled
         }
     }
@@ -429,7 +428,7 @@ pub async fn join_resuming<T>(handle: JoinHandle<T>) -> T {
         Ok(value) => value,
         Err(error) if error.is_panic() => resume_unwind(error.into_panic()),
         Err(error) => {
-            debug_assert!(error.is_cancelled());
+            assert!(error.is_cancelled());
             panic!("library-owned operation task was unexpectedly cancelled")
         }
     }

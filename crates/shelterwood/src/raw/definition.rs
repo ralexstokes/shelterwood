@@ -213,7 +213,7 @@ impl<R: RawActor> RawIncarnationOwner<R> {
     }
 
     fn record_primary_panic(&mut self, payload: PanicPayload) {
-        debug_assert!(self.primary_panic.is_none());
+        assert!(self.primary_panic.is_none());
         self.primary_panic = Some(payload);
     }
 

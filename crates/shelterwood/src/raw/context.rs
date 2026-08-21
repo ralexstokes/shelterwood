@@ -155,7 +155,7 @@ impl<M> EventQueue<M> {
                 .lock()
                 .expect("actor event queue mutex poisoned")
                 .pop_front();
-            debug_assert!(event.is_some(), "a timer watermark covers queued events");
+            assert!(event.is_some(), "a timer watermark covers queued events");
             if event.is_some() {
                 *remaining -= 1;
             } else {
@@ -275,8 +275,8 @@ impl ReadyBatch {
         mailbox_through: AcceptedSequence,
         offloads_remaining: usize,
     ) {
-        debug_assert!(!armings.is_empty());
-        debug_assert!(matches!(self.phase, ReadyBatchPhase::Steady { .. }));
+        assert!(!armings.is_empty());
+        assert!(matches!(self.phase, ReadyBatchPhase::Steady { .. }));
         self.phase = ReadyBatchPhase::Fired {
             armings,
             continuations_remaining,
@@ -316,14 +316,14 @@ impl ReadyBatch {
             ..
         } = &mut self.phase
         {
-            debug_assert!(*continuations_remaining > 0);
+            assert!(*continuations_remaining > 0);
             *continuations_remaining -= 1;
         }
     }
 
     fn record_mailbox_delivery(&mut self) {
         if let ReadyBatchPhase::Steady { mailbox_budget } = &mut self.phase {
-            debug_assert!(*mailbox_budget > 0);
+            assert!(*mailbox_budget > 0);
             *mailbox_budget -= 1;
         }
     }
@@ -337,11 +337,10 @@ impl ReadyBatch {
 
     fn commit_arming(&mut self, arming: ArmingOrder) {
         let ReadyBatchPhase::Fired { armings, .. } = &mut self.phase else {
-            debug_assert!(false, "only a fired batch delivers timer armings");
-            return;
+            panic!("only a fired batch delivers timer armings");
         };
         let removed = armings.pop_front();
-        debug_assert_eq!(removed, Some(arming));
+        assert_eq!(removed, Some(arming));
     }
 }
 
@@ -1179,7 +1178,7 @@ impl<M: Send + 'static> RawContext<M> {
         batch: ReadyBatch,
         operation: impl FnOnce(&mut Self) -> R,
     ) -> (ReadyBatch, R) {
-        debug_assert!(self.resources.ready_batch.is_none());
+        assert!(self.resources.ready_batch.is_none());
         self.resources.ready_batch = Some(batch);
         let result = operation(self);
         let batch = self

@@ -254,8 +254,7 @@ pub fn dispatch_exit(
     // SPEC §8: `NeverStarted` is a membership fact, not an incarnation
     // verdict — it "is never input to restart or intensity accounting".
     // Every supported producer terminalizes the membership directly and never
-    // reaches dispatch, so arriving here is a framework bug: the assert makes
-    // it loud in debug, and the return fails closed in release rather than
+    // reaches dispatch, so arriving here is a framework bug. Fail before
     // charging a restart for an incarnation that never ran.
     //
     // Failing closed is the lesser of two wrong outcomes, not a correct one:
@@ -263,10 +262,9 @@ pub fn dispatch_exit(
     // verdict here would publish a `NeverStarted` terminal paired with
     // `last_incarnation: Some(..)`, which SPEC §B.3 excludes. `ExitDispatch`
     // carries no incarnation, so the pairing is the caller's to choose and
-    // cannot be repaired from inside this function; an inconsistent terminal
-    // projection is still strictly better than an illegal restart, and the
-    // debug abort fires before any such projection can be published.
-    debug_assert!(
+    // cannot be repaired from inside this function, so every profile stops
+    // before publishing an inconsistent terminal projection.
+    assert!(
         !matches!(exit.kind(), ExitKind::NeverStarted),
         "NeverStarted is a membership outcome outside incarnation dispatch"
     );
@@ -309,7 +307,7 @@ struct IntensityCharge {
 impl IntensityTrip {
     fn new(charge: IntensityCharge) -> Self {
         let policy = charge.policy;
-        debug_assert_eq!(charge.tripped, charge.in_window > policy.max_restarts());
+        assert_eq!(charge.tripped, charge.in_window > policy.max_restarts());
         Self {
             max_restarts: policy.max_restarts(),
             observed_restarts: charge.in_window,
@@ -674,7 +672,7 @@ impl ScopeEpochs {
         // A shutdown wait settles on `finished(target)`, so a freshly minted
         // epoch must not already read as finished — that would settle a wait
         // against the incarnation it just started.
-        debug_assert!(
+        assert!(
             !self.finished(current),
             "a freshly minted epoch is not already finished"
         );
@@ -715,7 +713,7 @@ impl ScopeEpochs {
                 // every later `finished(epoch)` — including one asked across a
                 // subsequent incarnation — keeps reporting it. A waiter that
                 // missed the pulse can therefore never park forever.
-                debug_assert!(
+                assert!(
                     self.finished(epoch),
                     "a finished epoch stays observably finished"
                 );
@@ -902,7 +900,7 @@ impl ScopeLifecycle {
     /// exists only for the initial transition: upgrades change the eventual
     /// verdict without repeating teardown side effects.
     pub fn begin_drain(&mut self, reason: StopReason) -> Option<(bool, ScopeState)> {
-        debug_assert!(
+        assert!(
             !matches!(reason, StopReason::NeverStarted),
             "NeverStarted is not a live-incarnation drain reason"
         );
@@ -996,7 +994,7 @@ impl<K> DeadlineQueue<K> {
     pub fn push(&mut self, at: Instant, key: K) -> DeadlineHandle {
         let handle = self.next_handle();
         let replaced = self.registrations.insert(handle, key);
-        debug_assert!(
+        assert!(
             replaced.is_none(),
             "monotonic deadline keys are never reused"
         );
@@ -1458,8 +1456,6 @@ mod tests {
         }
     }
 
-    /// Debug half of the two-profile guard: the misuse aborts loudly.
-    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "NeverStarted is a membership outcome outside incarnation dispatch")]
     fn funnel_dispatch_rejects_the_membership_level_never_started_outcome() {
@@ -1469,25 +1465,6 @@ mod tests {
             RestartPolicy::new(RestartCondition::Always, Backoff::Immediate),
             ScopeMode::Running,
             MembershipStatus::Active,
-        );
-    }
-
-    /// Release half: with the assert compiled out the same input fails closed
-    /// on `Terminal` instead of charging a restart. `RestartCondition::Always`
-    /// is the one condition whose `should_restart` returns `true`
-    /// unconditionally, so removing the guard flips this assertion.
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn funnel_dispatch_treats_the_membership_level_never_started_outcome_as_terminal() {
-        let exit = Exit::never_started();
-        assert_eq!(
-            dispatch_exit(
-                &exit,
-                RestartPolicy::new(RestartCondition::Always, Backoff::Immediate),
-                ScopeMode::Running,
-                MembershipStatus::Active,
-            ),
-            ExitDispatch::Terminal,
         );
     }
 

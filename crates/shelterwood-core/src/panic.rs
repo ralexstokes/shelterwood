@@ -80,7 +80,7 @@ pub fn resume_preferred_panic(panics: UnwindPanics) {
 /// is asserted rather than absorbed.
 pub fn resume_preferred_panic_outside_unwind(panics: UnwindPanics) {
     let UnwindPanics { primary, cleanup } = panics;
-    debug_assert!(
+    assert!(
         !std::thread::panicking(),
         "an unwinding caller must contain its payloads with resume_preferred_panic"
     );

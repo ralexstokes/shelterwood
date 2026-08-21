@@ -367,7 +367,7 @@ impl SupervisorState {
                 spawned_once: false,
             },
         );
-        debug_assert!(replaced.is_none(), "monotonic child keys are never reused");
+        assert!(replaced.is_none(), "monotonic child keys are never reused");
         let replaced = self.child_keys.insert(membership, child);
         assert!(
             replaced.is_none(),
@@ -630,7 +630,7 @@ impl SupervisorState {
                 let membership = record.membership;
                 self.children.remove(&child);
                 let removed = self.child_keys.remove(&membership);
-                debug_assert_eq!(removed, Some(child));
+                assert_eq!(removed, Some(child));
             }
             Event::FailStartup => {
                 let _ = self.fail_startup();

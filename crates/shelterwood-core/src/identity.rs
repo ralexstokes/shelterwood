@@ -153,7 +153,7 @@ impl PoisonedCounter {
     }
 
     fn from_current(current: u64) -> Self {
-        debug_assert_ne!(current, u64::MAX);
+        assert_ne!(current, u64::MAX);
         Self { current }
     }
 
@@ -437,7 +437,7 @@ impl ScopeIdentity {
                 MembershipReconciliation::Minted(MintedMembership::new(membership))
             }
             Entry::Vacant(entry) => {
-                debug_assert_ne!(provisional.0.generation, Generation::POISON);
+                assert_ne!(provisional.0.generation, Generation::POISON);
                 entry.insert(FenceCounter::from_fence(provisional.0));
                 MembershipReconciliation::Adopted
             }

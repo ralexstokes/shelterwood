@@ -149,9 +149,10 @@ impl DynamicEntry {
         key: ChildKey,
         fused_cancel: Option<Latch>,
         _txn: &mut ObservationTxn<'_>,
-    ) {
-        debug_assert!(self.is_reserved(), "only a reservation can become resident");
+    ) -> bool {
+        let was_reserved = self.is_reserved();
         self.state = DynamicMembershipState::Resident { key, fused_cancel };
+        was_reserved
     }
 
     pub(super) fn mark_removing(&mut self, _txn: &mut ObservationTxn<'_>) -> Option<ChildKey> {
@@ -259,6 +260,10 @@ impl DynamicControl {
     fn in_scope(scope: &ScopeCell, txn: &ObservationTxn<'_>) -> Option<Arc<DynamicControl>> {
         let route: Arc<dyn Any + Send + Sync> = scope.dynamic_route_in(txn)?;
         let control = Arc::downcast(route).ok();
+        // Diagnostic-only: the façade is the sole route installer and always
+        // stores `DynamicControl`. The callers already treat a foreign route
+        // as absent, so no correctness decision relies on this check and no
+        // test expects its panic.
         debug_assert!(
             control.is_some(),
             "the façade installs only its concrete dynamic control"

@@ -627,9 +627,8 @@ fn termination_finish_completes_waiters_and_isolates_payload_after_signal_panic(
     }
 }
 
-#[cfg(debug_assertions)]
 #[test]
-fn binding_replacement_rejects_a_live_waiter_identity_domain() {
+fn binding_replacement_preserves_a_live_waiter_identity_domain() {
     let operation = super::SendOperation::new(1_u8);
     let mut waiters = super::WaiterQueue::default();
     waiters.park(&operation);
@@ -642,15 +641,41 @@ fn binding_replacement_rejects_a_live_waiter_identity_domain() {
         latest: None,
     };
 
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| {
-            state.replace_binding(super::MailboxBinding::Unbound(super::WaiterQueue::default()));
-        }))
-        .is_err(),
-        "a live waiter queue cannot be replaced"
-    );
+    let rejected =
+        state.replace_binding(super::MailboxBinding::Unbound(super::WaiterQueue::default()));
+    assert!(rejected.is_err(), "a live waiter queue cannot be replaced");
     assert!(matches!(
         &state.binding,
+        super::MailboxBinding::Unbound(waiters) if waiters.len() == 1
+    ));
+}
+
+#[test]
+fn binding_replacement_invariant_panics_after_unlock() {
+    let mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    let operation = super::SendOperation::new(1_u8);
+    let mut waiters = super::WaiterQueue::default();
+    assert!(waiters.park(&operation));
+    mailbox.state.lock().expect("mailbox mutex healthy").binding =
+        super::MailboxBinding::Unbound(waiters);
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let mut transaction = super::MailboxTxn::new(&mailbox);
+        transaction.bind_available(mint_actor_incarnation());
+        transaction.finish(())
+    }))
+    .expect_err("a live waiter identity domain refuses replacement");
+
+    assert_eq!(
+        panic.downcast_ref::<String>().map(String::as_str),
+        Some("mailbox binding replacement requires an empty waiter queue")
+    );
+    assert!(
+        mailbox.state.try_lock().is_ok(),
+        "the invariant resumes only after the mailbox guard is released"
+    );
+    assert!(matches!(
+        &mailbox.state.lock().expect("mailbox mutex remains healthy").binding,
         super::MailboxBinding::Unbound(waiters) if waiters.len() == 1
     ));
 }

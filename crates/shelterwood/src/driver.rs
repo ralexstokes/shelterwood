@@ -71,10 +71,12 @@ use admission_control::{
     reject_admission_after_disposal,
 };
 pub(crate) use admission_control::{
-    DynamicReservation, LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR, RemovalResponse,
-    cancel_dynamic_reservation, remove_dynamic, reserve_dynamic, signal_fused_cancel,
-    start_admission,
+    DynamicReservation, RemovalResponse, cancel_dynamic_reservation, remove_dynamic,
+    reserve_dynamic, signal_fused_cancel, start_admission,
 };
+
+#[cfg(test)]
+pub(crate) use admission_control::{LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR};
 
 #[cfg(test)]
 use crate::cells::{GateCapture, RuntimeStorage};
@@ -575,7 +577,7 @@ impl ScopeRuntime {
 
     fn stage_disposal_panic(&mut self, child: ChildKey, panic: Option<runtime::DisposalPanic>) {
         let replaced = self.arrived_disposal_panics.insert(child, panic);
-        debug_assert!(
+        assert!(
             replaced.is_none(),
             "a terminal disposes its retained construction once, under a never-reused key"
         );
@@ -595,10 +597,11 @@ impl ScopeRuntime {
     fn drain_arrived_disposal_events(&mut self, panics: &mut runtime::PanicAccumulator) {
         while let Some(event) = self.disposal_event_receiver.try_recv() {
             // The lane has one producer, which sends exactly one variant.
-            // Assert rather than let a pattern-matching loop condition drop
-            // an unexpected event and silently abandon the rest of the
-            // drain; teardown runs this during an unwind, where a panic
-            // would abort.
+            // Diagnostic-only: do not let a pattern-matching loop condition
+            // drop an unexpected event and silently abandon the rest of the
+            // drain. Teardown can run during an unwind, so this cannot become
+            // an always-on panic; the match below remains total, and no test
+            // depends on the diagnostic firing.
             debug_assert!(
                 matches!(
                     event,
@@ -666,7 +669,7 @@ impl ScopeRuntime {
             return Err(Box::new(child));
         };
         let replaced = self.children.insert(key, child);
-        debug_assert!(
+        assert!(
             replaced.is_none(),
             "the reducer's monotonic child key is new to runtime resources"
         );
@@ -749,6 +752,7 @@ impl ScopeRuntime {
         enum AdmissionInstall {
             Admitted {
                 key: ChildKey,
+                entry_promoted: bool,
                 projection_admitted: bool,
             },
             Rejected {
@@ -795,7 +799,7 @@ impl ScopeRuntime {
             let entry = state
                 .entry_mut(id)
                 .expect("the matching reservation was just resolved");
-            entry.promote(key, request.fused_cancel.take(), txn);
+            let entry_promoted = entry.promote(key, request.fused_cancel.take(), txn);
             // The slot was minted `Reserved` by this reservation and nothing
             // can have started it, so the projection reducer accepts. A
             // refusal here would leave the entry promoted with no residency
@@ -803,14 +807,17 @@ impl ScopeRuntime {
             let admitted = root.admit_child_locked(resident_projection(&request.slot), txn);
             AdmissionInstall::Admitted {
                 key,
+                entry_promoted,
                 projection_admitted: admitted,
             }
         });
         let key = match installed {
             AdmissionInstall::Admitted {
                 key,
+                entry_promoted,
                 projection_admitted,
             } => {
+                assert!(entry_promoted, "only a reservation can become resident");
                 assert!(
                     projection_admitted,
                     "a promoted reservation is admitted from `Reserved` exactly once"
@@ -1103,7 +1110,7 @@ async fn run_scope_incarnation(
             unreachable!("a fresh child-key domain accommodates an in-memory child collection")
         };
         let replaced = children.insert(key, child);
-        debug_assert!(replaced.is_none());
+        assert!(replaced.is_none());
     }
     if let Some(control) = &dynamic {
         root.with_observation_gate(|txn| {
@@ -1228,12 +1235,9 @@ async fn run_scope_incarnation(
                     // Every lane sender is retained by the scope runtime or
                     // one of its registered children until this loop exits.
                     // A closed receiver would otherwise make this select arm
-                    // permanently ready and spin, so diagnose any future
-                    // ownership change where it is first observable.
-                    debug_assert!(
-                        false,
-                        "a driver event lane closed before its receive loop exited"
-                    );
+                    // permanently ready and spin, so fail closed where the
+                    // ownership regression is first observable.
+                    panic!("a driver event lane closed before its receive loop exited");
                 }
                 runtime::ScopeWake::Deadline => {
                     // A producer becoming ready at the same instant owns the

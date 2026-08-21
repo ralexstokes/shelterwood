@@ -8,9 +8,12 @@ use std::{
 
 use crate::{
     admission::{RemoveOutcome, ReserveError},
-    driver::{DynamicReservation, LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR},
+    driver::DynamicReservation,
     runtime::Latch,
 };
+
+#[cfg(test)]
+use crate::driver::{LATCHED_REMOVAL_OUTCOME, LOST_ADMISSION_RESPONSE_ERROR};
 
 use super::slots::AdmissionOwnership;
 
@@ -49,10 +52,9 @@ impl<H> PendingAdmission<H> {
                 // The driver's admission `Obligation` publishes an outcome on
                 // every path, including its drop fallback. Treat a missing
                 // response as the scope having gone terminal so a caller is
-                // never stranded, but fail loudly in debug builds: silence
-                // here would mask an obligation regression.
-                debug_assert!(false, "admission response obligation must complete");
-                Err(LOST_ADMISSION_RESPONSE_ERROR)
+                // never stranded, but fail loudly: silence here would mask
+                // an obligation regression.
+                panic!("admission response obligation must complete");
             })
         }))
     }
@@ -230,9 +232,8 @@ impl Removal {
                     // on every destruction path. A missing response therefore
                     // means the terminal route vanished after removal latched:
                     // preserve the removal goal, but flag the invariant break
-                    // in debug builds just as admission does above.
-                    debug_assert!(false, "removal response obligation must complete");
-                    LATCHED_REMOVAL_OUTCOME
+                    // just as admission does above.
+                    panic!("removal response obligation must complete");
                 })
             }),
         }
@@ -302,9 +303,6 @@ mod tests {
 
     #[test]
     fn lost_removal_response_policy_fails_closed() {
-        // Profile-independent: the release fallback below is unreachable in
-        // the debug builds CI runs, so the policy itself is pinned here rather
-        // than only through the value a release build happens to observe.
         assert_eq!(
             super::LATCHED_REMOVAL_OUTCOME,
             crate::RemoveOutcome::Removed,
@@ -313,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_removal_response_fails_closed_after_debug_diagnostic() {
+    fn closed_removal_response_panics_in_every_profile() {
         let (sender, response) = crate::runtime::oneshot();
         drop(sender);
         let mut removal = Removal::new(response);
@@ -322,15 +320,9 @@ mod tests {
             Pin::new(&mut removal).poll(&mut context)
         }));
 
-        #[cfg(debug_assertions)]
         assert!(
             observed.is_err(),
-            "debug builds expose the broken removal response obligation"
-        );
-        #[cfg(not(debug_assertions))]
-        assert_eq!(
-            observed.expect("release fallback does not panic"),
-            std::task::Poll::Ready(super::LATCHED_REMOVAL_OUTCOME)
+            "every profile exposes the broken removal response obligation"
         );
     }
 

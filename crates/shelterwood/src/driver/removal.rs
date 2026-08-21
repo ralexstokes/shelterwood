@@ -119,13 +119,17 @@ impl ScopeRuntime {
     }
 
     pub(super) fn reclaim_child(&mut self, key: ChildKey) {
-        let Some(mut child) = self.children.remove(key) else {
+        if self.children.get(key).is_none() {
             return;
-        };
-        debug_assert!(
+        }
+        assert!(
             self.supervisor.joined(key),
             "reclaim runs only after joined terminal completion"
         );
+        let mut child = self
+            .children
+            .remove(key)
+            .expect("the just-observed child remains registered");
         if let Some(deadline) = child.restart_deadline.take() {
             self.deadlines.cancel(deadline);
         }

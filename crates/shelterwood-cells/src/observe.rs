@@ -580,8 +580,12 @@ impl SnapshotPublication {
     }
 
     pub(crate) fn coalesce(&mut self, newer: Self) -> SnapshotProjection {
-        debug_assert!(self.same_hub(&newer));
-        debug_assert!(!self.closed, "a closed snapshot hub cannot publish again");
+        // `ObservationTxn::stage_snapshot` selects this publication with
+        // `same_hub`, so hub identity is structural. Closure is total: once
+        // staged, it wins over every later publication in the transaction.
+        if self.closed {
+            return newer.projection;
+        }
         self.published |= newer.published;
         self.closed = newer.closed;
         std::mem::replace(&mut self.projection, newer.projection)
@@ -604,10 +608,9 @@ impl SnapshotPublication {
         let mut generation_exhausted = false;
         if snapshot.is_some() {
             self.sender.modify_silently(|state| {
-                debug_assert!(
-                    !state.closed,
-                    "the gate serializes closure against installation"
-                );
+                if state.closed {
+                    return;
+                }
                 retired = Some(std::mem::replace(
                     &mut state.snapshot,
                     snapshot
@@ -620,6 +623,12 @@ impl SnapshotPublication {
                 state.closed = self.closed;
                 modified = true;
             });
+        }
+        if let Some(uninstalled) = snapshot.take() {
+            // A prior committed close remains authoritative. The cut was
+            // already built, so retire its user-bearing snapshot after both
+            // the watch mutex and observation gate are released.
+            effects.push(Box::new(move || drop(uninstalled)));
         }
         if let Some(retired) = retired {
             effects.push(Box::new(move || drop(retired)));
@@ -850,7 +859,7 @@ impl LifecycleEvents {
             // already a power of two, so the effective capacity is exact.
             if self.events.len() > LIFECYCLE_EVENT_CAPACITY {
                 let overflow = self.events.try_receive();
-                debug_assert!(
+                assert!(
                     matches!(&overflow, runtime::BroadcastReceive::Lagged(_)),
                     "a lagging broadcast receiver should report its dropped prefix"
                 );

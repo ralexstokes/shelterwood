@@ -207,7 +207,7 @@ fn enqueue_fallback_disposal_with(
     // the job just appended even when older critical jobs are still queued.
     let rejected = state.queue.pop_back();
     drop(state);
-    debug_assert!(rejected.is_some());
+    assert!(rejected.is_some());
     drop(rejected);
     false
 }

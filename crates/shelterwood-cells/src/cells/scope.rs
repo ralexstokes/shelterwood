@@ -806,6 +806,13 @@ impl ScopeCell {
         })
     }
 
+    /// Installs residency without announcing it, as an admission that
+    /// unwound between its residency push and its `Added` publication does.
+    #[cfg(test)]
+    fn push_unannounced_resident_for_test(&self, child: ResidentProjection) {
+        self.current_children().push(ResidentChild::new(child));
+    }
+
     #[cfg(any(test, feature = "test-util"))]
     pub fn prune_child(&self, member: &MemberCell) -> bool {
         self.with_observation_gate(|wakes| self.prune_child_locked(member, wakes))
@@ -1951,6 +1958,35 @@ mod tests {
                 .expect("scope clear disposes the lingering mailbox payload"),
             retiring_thread,
             "scope clear retains the detached disposal venue"
+        );
+    }
+
+    /// Withdrawal mirrors announcement at both removal sites, not just the
+    /// one `panicked_resident_admission_lingers_until_scope_clear` drives.
+    #[test]
+    fn pruning_an_unannounced_resident_publishes_no_removal_edge() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let member = child_member(&root, "half-wired");
+        let mut lifecycle = root.subscribe_lifecycle();
+
+        // Install residency exactly as an admission that unwound before its
+        // `Added` publication leaves it.
+        root.push_unannounced_resident_for_test(ResidentProjection::new(
+            Arc::clone(&member),
+            None,
+        ));
+        assert_eq!(root.resident_projections().len(), 1);
+        assert!(root.snapshot().children.is_empty());
+
+        assert!(
+            root.prune_child(&member),
+            "an unannounced resident is still withdrawn"
+        );
+        assert!(root.resident_projections().is_empty());
+        assert_eq!(
+            lifecycle.try_recv(),
+            Err(LifecycleTryRecvError::Empty),
+            "neither edge is published for a membership that never announced"
         );
     }
 

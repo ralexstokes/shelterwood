@@ -2474,7 +2474,7 @@ mod tests {
                     id,
                 })
                 .expect("bound mailbox accepts the hostile payload");
-            scope.admit_child(ResidentProjection::new(Arc::clone(&child), None));
+            assert!(scope.admit_child(ResidentProjection::new(Arc::clone(&child), None)));
             drop(actor);
             drop(mailbox);
             drop(child);

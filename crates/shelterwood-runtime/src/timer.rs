@@ -4,6 +4,9 @@ use tokio::time;
 
 use shelterwood_core::deadline::Deadline;
 pub use shelterwood_mailbox::BoxedSleep;
+use shelterwood_mailbox::ProxiedSleep;
+
+use crate::mailbox_runtime;
 
 /// Advances a paused test clock, keeping timer control in this module.
 #[cfg(any(test, feature = "test-util"))]
@@ -45,7 +48,26 @@ fn deadline(duration: Duration) -> Deadline {
 pub fn sleep_until(deadline: std::time::Instant) -> BoxedSleep {
     Box::pin(sleep_until_std(deadline))
 }
+
 pub async fn sleep_until_std(deadline: std::time::Instant) {
+    proxied_sleep_until(deadline).await;
+}
+
+fn proxied_sleep_until(deadline: std::time::Instant) -> ProxiedSleep {
+    ProxiedSleep::new(raw_sleep_until(deadline), mailbox_runtime())
+}
+
+/// Raw timer capability supplied to `shelterwood-mailbox`.
+///
+/// Public only as a sibling-crate implementation seam. User-polled façade
+/// futures must use [`sleep_until`] or [`sleep_until_std`], which install the
+/// caller-waker proxy.
+#[doc(hidden)]
+pub fn raw_sleep_until(deadline: std::time::Instant) -> BoxedSleep {
+    Box::pin(raw_sleep_until_std(deadline))
+}
+
+async fn raw_sleep_until_std(deadline: std::time::Instant) {
     // Every absolute-deadline arming crosses the runtime boundary here:
     // tokio rounds the deadline up to the next whole millisecond with a
     // panicking add before tick conversion, so a deadline flush against
@@ -68,6 +90,29 @@ pub async fn sleep_until_std(deadline: std::time::Instant) {
 pub enum Timeout<T> {
     Completed(T),
     Elapsed,
+}
+
+/// Selects a future against one absolute deadline with proxied timer
+/// registration.
+///
+/// Public only as a sibling-crate implementation seam for façade futures that
+/// already own an absolute deadline.
+#[doc(hidden)]
+pub async fn timeout_at<F>(deadline: std::time::Instant, future: F) -> Timeout<F::Output>
+where
+    F: Future,
+{
+    let mut future = std::pin::pin!(future);
+    let mut timer = std::pin::pin!(proxied_sleep_until(deadline));
+    std::future::poll_fn(|context| {
+        // Operation first preserves Tokio timeout's exact-boundary rule.
+        if let std::task::Poll::Ready(value) = future.as_mut().poll(context) {
+            timer.as_mut().get_mut().cancel_inline();
+            return std::task::Poll::Ready(Timeout::Completed(value));
+        }
+        timer.as_mut().poll(context).map(|()| Timeout::Elapsed)
+    })
+    .await
 }
 
 pub async fn timeout<F>(duration: Duration, future: F) -> Timeout<F::Output>
@@ -101,22 +146,7 @@ where
         })
         .await;
     }
-    if duration <= MAX_TIMER_SLICE {
-        return match time::timeout(duration, future).await {
-            Ok(value) => Timeout::Completed(value),
-            Err(_) => Timeout::Elapsed,
-        };
-    }
-    let sleep = sleep_until_std(deadline);
-    tokio::pin!(future);
-    tokio::pin!(sleep);
-    tokio::select! {
-        // Match tokio::time::timeout's boundary rule: the operation receives
-        // the first poll when it and a zero-duration timer are both ready.
-        biased;
-        value = &mut future => Timeout::Completed(value),
-        () = &mut sleep => Timeout::Elapsed,
-    }
+    timeout_at(deadline, future).await
 }
 #[cfg(test)]
 mod tests {

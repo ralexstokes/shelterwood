@@ -374,7 +374,7 @@ pub(crate) mod tests {
 
     use crate::runtime::{
         OneShotClose, OneShotReceiver, OneShotSender, Signal, SignalWatcher, dispose_detached, now,
-        oneshot, sleep_until,
+        oneshot, raw_sleep_until,
     };
 
     use super::{
@@ -455,7 +455,7 @@ pub(crate) mod tests {
         fn sleep_until(&self, deadline: Option<Instant>) -> BoxedSleep {
             deadline.map_or_else(
                 || Box::pin(std::future::pending()) as BoxedSleep,
-                sleep_until,
+                raw_sleep_until,
             )
         }
     }

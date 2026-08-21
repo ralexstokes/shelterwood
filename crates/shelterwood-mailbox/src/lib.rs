@@ -34,6 +34,7 @@ mod futures;
 mod reply;
 #[cfg(test)]
 mod test_support;
+mod timer;
 mod waker_proxy;
 
 #[doc(hidden)]
@@ -45,6 +46,8 @@ pub use cell::*;
 pub use errors::*;
 pub use futures::*;
 pub use reply::*;
+#[doc(hidden)]
+pub use timer::ProxiedSleep;
 
 mod identity {
     pub(crate) use shelterwood_core::identity::*;

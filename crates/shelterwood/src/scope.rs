@@ -159,16 +159,20 @@ impl ScopeRef {
             if expires.is_due(crate::runtime::now()) {
                 return Err(WaitError::TimedOut);
             }
-            match crate::runtime::select_two(snapshots.changed(), async {
-                match expires.instant() {
-                    Some(expires) => crate::runtime::sleep_until_std(expires).await,
-                    None => std::future::pending().await,
+            // Keep the timer in `timeout_at` rather than a nested async sleep:
+            // when a snapshot wins, that helper retires the timer's caller
+            // waker synchronously on this poll path. Dropping a losing sleep
+            // future here would instead select the drop-glue disposal venue.
+            match expires.instant() {
+                Some(expires) => {
+                    match crate::runtime::timeout_at(expires, snapshots.changed()).await {
+                        crate::runtime::Timeout::Completed(Ok(_) | Err(_))
+                        | crate::runtime::Timeout::Elapsed => continue,
+                    }
                 }
-            })
-            .await
-            {
-                crate::runtime::Either::Left(Ok(_) | Err(_))
-                | crate::runtime::Either::Right(()) => continue,
+                None => {
+                    let _ = snapshots.changed().await;
+                }
             }
         }
     }

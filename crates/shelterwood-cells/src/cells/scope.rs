@@ -1,8 +1,6 @@
 use std::{
     any::Any,
-    cell::{Ref, RefCell},
     collections::VecDeque,
-    rc::Rc,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicBool, Ordering},
@@ -53,49 +51,6 @@ pub struct ResidentProjection {
 impl ResidentProjection {
     pub fn new(member: Arc<MemberCell>, scope: Option<Arc<ScopeCell>>) -> Self {
         Self { member, scope }
-    }
-}
-
-/// By-value admission input protected until residency owns it.
-///
-/// A projection can be the last owner of a member and its mailbox. Any
-/// bookkeeping panic before installation therefore routes the whole graph to
-/// detached disposal instead of unwinding it through the observation gate.
-///
-/// The transaction holds the second `Rc` rather than this guard disposing
-/// from its own `Drop`: a bare guard would submit the disposal job with the
-/// observation gate still held. That is legal — a submission runs no user
-/// code — but the standing preference is that a caller already holding an
-/// effects sink flushes through it, because a submission can cost a native
-/// thread start. #390 tracks deleting the guard outright by letting residency
-/// own the projection across admission's fallible steps.
-struct ResidentAdmission(Rc<RefCell<Option<ResidentProjection>>>);
-
-impl ResidentAdmission {
-    fn new(projection: ResidentProjection, txn: &mut ObservationTxn<'_>) -> Self {
-        let projection = Rc::new(RefCell::new(Some(projection)));
-        let deferred = Rc::clone(&projection);
-        txn.defer(move || {
-            if let Some(projection) = deferred.borrow_mut().take() {
-                runtime::dispose_detached(projection);
-            }
-        });
-        Self(projection)
-    }
-
-    fn projection(&self) -> Ref<'_, ResidentProjection> {
-        Ref::map(self.0.borrow(), |projection| {
-            projection
-                .as_ref()
-                .expect("resident admission was already installed")
-        })
-    }
-
-    fn install(self) -> ResidentProjection {
-        self.0
-            .borrow_mut()
-            .take()
-            .expect("resident admission installs exactly once")
     }
 }
 
@@ -345,16 +300,20 @@ impl ScopeCell {
     }
 
     pub fn resident_projections(&self) -> Vec<ResidentProjection> {
-        self.current_children()
-            .iter()
-            .map(|resident| resident.projection().clone())
-            .collect()
+        self.with_observation_gate(|_| {
+            self.current_children()
+                .iter()
+                .map(|resident| resident.projection().clone())
+                .collect()
+        })
     }
 
     pub fn has_resident_child(&self, member: &MemberCell) -> bool {
-        self.current_children()
-            .iter()
-            .any(|resident| resident.projection().member.membership() == member.membership())
+        self.with_observation_gate(|_| {
+            self.current_children()
+                .iter()
+                .any(|resident| resident.projection().member.membership() == member.membership())
+        })
     }
 
     fn current_children(&self) -> MutexGuard<'_, Vec<ResidentChild>> {
@@ -1262,19 +1221,35 @@ impl ScopeCell {
     /// Admits one projection, or refuses it whole.
     ///
     /// Returns whether the member's `Admitted` transition was legal. A refusal
-    /// publishes nothing: no gate handoff, no parent wiring, no residency push
-    /// and no `Added` event.
+    /// publishes nothing: no gate handoff, no parent wiring, no retained
+    /// residency and no `Added` event.
     #[must_use = "a refused admission leaves the child out of the residency"]
     pub fn admit_child_locked(
         self: &Arc<Self>,
         child: ResidentProjection,
         txn: &mut ObservationTxn<'_>,
     ) -> bool {
-        // Take protected ownership before gate adoption, parent wiring, and
-        // reducer validation. Until the final push succeeds this projection
-        // may be the last owner of a mailbox-bearing member.
-        let child = ResidentAdmission::new(child, txn);
-        let projection = child.projection();
+        // Residency takes ownership before every fallible step below. A panic
+        // can therefore leave this entry half-wired, but it cannot unwind the
+        // last owner of a mailbox-bearing member through the observation gate;
+        // scope teardown later routes the resident through detached disposal.
+        //
+        // Every reader of `current_children` is accounted for during this
+        // window. Snapshot construction, descendant handoff, terminal lookup,
+        // pruning and clearing already run under this observation gate. The
+        // public shutdown projection and driver terminality membership probe
+        // (`resident_projections` / `has_resident_child`) take the same gate
+        // themselves. The admission-local clone below is consequently the
+        // only code that can observe this entry before its transition lands.
+        let projection = {
+            let mut children = self.current_children();
+            children.push(ResidentChild::new(child));
+            children
+                .last()
+                .expect("the just-pushed resident remains installed")
+                .projection()
+                .clone()
+        };
         let gate = self.current_observation_gate();
         let admitted = if let Some(scope) = &projection.scope {
             let admitted = scope.admit_observation_gate(self, &gate, txn);
@@ -1308,13 +1283,30 @@ impl ScopeCell {
             )
         };
         if !admitted {
+            // No other residency mutation can interleave under the gate, so
+            // the entry pushed above is still the last one. Refusal removes
+            // it without emitting either half of the Added/Removed pair and
+            // retires its potentially last mailbox owner after unlock.
+            let rejected = self.current_children().pop();
+            if let Some(rejected) = &rejected {
+                debug_assert_eq!(
+                    rejected.projection().member.membership(),
+                    projection.member.membership(),
+                    "refusal removes the admission-local resident"
+                );
+            }
+            // Move both the resident and this function's lookup clone into
+            // the effect. The `None` arm is unreachable after the push, but
+            // even an invariant break cannot make the clone's last user value
+            // unwind through the observation gate.
+            txn.defer(move || runtime::dispose_detached((projection, rejected)));
             return false;
         }
         let id = projection.member.id().clone();
         let membership = projection.member.membership();
-        drop(projection);
-        self.current_children()
-            .push(ResidentChild::new(child.install()));
+        // This transition must precede `emit_locked`: the Added publication
+        // schedules the commit-time snapshot, and that producer now walks the
+        // resident installed above.
         self.emit_locked(txn, LifecycleEventKind::Added { id, membership });
         true
     }
@@ -1845,6 +1837,70 @@ mod tests {
                 .expect("mailbox payload disposal reports"),
             retiring_thread,
             "the by-value projection cannot unwind its mailbox through the observation gate"
+        );
+    }
+
+    #[test]
+    fn panicked_resident_admission_lingers_until_scope_clear() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let nested = child_scope(&root, "nested", ScopeFlavor::Dynamic);
+        let mut incarnations = nested.member.take_incarnation_counter();
+        let incarnation = incarnations.mint().expect("incarnation available");
+        let mailbox = MailboxCell::new(
+            nested.member.id().clone(),
+            shelterwood_runtime::mailbox_runtime(),
+        );
+        nested.member.attach_mailbox(mailbox.clone());
+        let actor = actor_ref_from_parts(Arc::clone(&nested.member), Arc::clone(&mailbox));
+        let mut effects = MailboxEffectQueue::default();
+        let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
+        MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
+        drop(effects);
+        let (dropped, observed) = mpsc::sync_channel(1);
+        actor
+            .try_send(ThreadProbe(dropped))
+            .expect("bound mailbox accepts the probe");
+
+        let poisoned = Arc::clone(&nested);
+        assert!(
+            catch_unwind(AssertUnwindSafe(move || {
+                let _control = poisoned.control.lock().expect("control starts healthy");
+                panic!("inject admission bookkeeping panic");
+            }))
+            .is_err(),
+            "the fixture poisons the post-transition parent-wiring step"
+        );
+
+        let membership = nested.member.membership();
+        let projection = ResidentProjection::new(Arc::clone(&nested.member), Some(nested));
+        drop(actor);
+        drop(mailbox);
+        let retiring_thread = std::thread::current().id();
+        catch_unwind(AssertUnwindSafe(|| root.admit_child(projection)))
+            .expect_err("poisoned parent wiring unwinds admission");
+
+        let residents = root.resident_projections();
+        assert_eq!(residents.len(), 1, "the half-wired resident remains owned");
+        assert_eq!(residents[0].member.membership(), membership);
+        assert!(matches!(
+            residents[0].member.record().stage,
+            MemberStage::Admitted
+        ));
+        drop(residents);
+        assert_eq!(
+            observed.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "admission unwind does not destroy the resident mailbox"
+        );
+
+        root.clear_residents();
+        assert!(root.resident_projections().is_empty());
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("scope clear disposes the lingering mailbox payload"),
+            retiring_thread,
+            "scope clear retains the detached disposal venue"
         );
     }
 

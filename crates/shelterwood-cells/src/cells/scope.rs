@@ -1,6 +1,8 @@
 use std::{
     any::Any,
+    cell::{Ref, RefCell},
     collections::VecDeque,
+    rc::Rc,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
         atomic::{AtomicBool, Ordering},
@@ -15,6 +17,7 @@ use shelterwood_core::{
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
     exit::{StartupError, StopReason, stop_reason_precedence},
     identity::{AtomicPoisonedCounter, MembershipReconciliation, MintedMembership, ScopeIdentity},
+    panic::{catch_panic, discard_panic},
     policy::ScopeFlavor,
 };
 use shelterwood_runtime as runtime;
@@ -53,13 +56,90 @@ impl ResidentProjection {
     }
 }
 
+/// By-value admission input protected until residency owns it.
+///
+/// A projection can be the last owner of a member and its mailbox. Any
+/// bookkeeping panic before installation therefore routes the whole graph to
+/// detached disposal instead of unwinding it through the observation gate.
+///
+/// The transaction holds the second `Rc` rather than this guard disposing
+/// from its own `Drop`: a bare guard would submit the disposal job with the
+/// observation gate still held. That is legal — a submission runs no user
+/// code — but the standing preference is that a caller already holding an
+/// effects sink flushes through it, because a submission can cost a native
+/// thread start. #390 tracks deleting the guard outright by letting residency
+/// own the projection across admission's fallible steps.
+struct ResidentAdmission(Rc<RefCell<Option<ResidentProjection>>>);
+
+impl ResidentAdmission {
+    fn new(projection: ResidentProjection, txn: &mut ObservationTxn<'_>) -> Self {
+        let projection = Rc::new(RefCell::new(Some(projection)));
+        let deferred = Rc::clone(&projection);
+        txn.defer(move || {
+            if let Some(projection) = deferred.borrow_mut().take() {
+                runtime::dispose_detached(projection);
+            }
+        });
+        Self(projection)
+    }
+
+    fn projection(&self) -> Ref<'_, ResidentProjection> {
+        Ref::map(self.0.borrow(), |projection| {
+            projection
+                .as_ref()
+                .expect("resident admission was already installed")
+        })
+    }
+
+    fn install(self) -> ResidentProjection {
+        self.0
+            .borrow_mut()
+            .take()
+            .expect("resident admission installs exactly once")
+    }
+}
+
+/// One slot of a scope's observed child set, with its own unwind boundary.
+///
+/// A displaced set is disposed as a whole `Vec`, and `Vec`'s slice drop glue
+/// keeps destroying the remaining elements after one of them panics. A
+/// resident can own the last handle to a mailbox still holding unread user
+/// messages, so without a boundary here a second hostile destructor in the
+/// same set panics *inside* the first one's unwind, which aborts the process
+/// rather than surfacing anywhere. SPEC §5.5 requires this lane to run with
+/// per-element panic containment; keeping the boundary on the element rather
+/// than on the collection is what makes it hold at every depth of a nested
+/// scope's residency, and on `ScopeCell`'s own drop glue, not merely at the
+/// displaced root.
+///
+/// The diagnostic is discarded rather than reported because every venue that
+/// destroys a resident already discards it: `dispose_detached` passes an
+/// empty completion, and plain drop glue has nobody to report to.
 struct ResidentChild {
-    projection: ResidentProjection,
+    /// `None` only while [`Drop`] is destroying the projection.
+    projection: Option<ResidentProjection>,
 }
 
 impl ResidentChild {
     fn new(projection: ResidentProjection) -> Self {
-        Self { projection }
+        Self {
+            projection: Some(projection),
+        }
+    }
+
+    fn projection(&self) -> &ResidentProjection {
+        self.projection
+            .as_ref()
+            .expect("a resident child owns its projection until it is dropped")
+    }
+}
+
+impl Drop for ResidentChild {
+    fn drop(&mut self) {
+        let Some(projection) = self.projection.take() else {
+            return;
+        };
+        discard_panic(catch_panic(|| drop(projection)).err());
     }
 }
 
@@ -267,14 +347,14 @@ impl ScopeCell {
     pub fn resident_projections(&self) -> Vec<ResidentProjection> {
         self.current_children()
             .iter()
-            .map(|resident| resident.projection.clone())
+            .map(|resident| resident.projection().clone())
             .collect()
     }
 
     pub fn has_resident_child(&self, member: &MemberCell) -> bool {
         self.current_children()
             .iter()
-            .any(|resident| resident.projection.member.membership() == member.membership())
+            .any(|resident| resident.projection().member.membership() == member.membership())
     }
 
     fn current_children(&self) -> MutexGuard<'_, Vec<ResidentChild>> {
@@ -434,7 +514,7 @@ impl ScopeCell {
         let descendants = self
             .current_children()
             .iter()
-            .map(|resident| resident.projection.clone())
+            .map(|resident| resident.projection().clone())
             .collect::<Vec<_>>();
         for descendant in descendants {
             descendant
@@ -607,7 +687,11 @@ impl ScopeCell {
         exited_incarnation: Option<Incarnation>,
         startup: StartupDisposition,
     ) -> bool {
-        self.with_observation_gate(|wakes| {
+        // Keep a retained owner across the residency assertion and every
+        // fallible cell lookup. If an invariant fails, the raw argument can
+        // unwind under the gate only as refcount traffic.
+        let exit = RetainedExit::new(exit);
+        self.with_observation_gate(move |wakes| {
             let record = member.record();
             if matches!(record.stage, MemberStage::Terminal(_)) {
                 // The outer guard defines losing supervised terminalization:
@@ -615,7 +699,6 @@ impl ScopeCell {
                 // failed exit behind the same isolated-disposal boundary as a
                 // losing direct terminalizer, and do not destroy it under the
                 // observation gate.
-                let exit = RetainedExit::new(exit);
                 wakes.defer(move || drop(exit));
                 return false;
             }
@@ -631,14 +714,17 @@ impl ScopeCell {
             let resident = self
                 .current_children()
                 .iter()
-                .find(|resident| resident.projection.member.membership() == member.membership())
-                .map(|resident| resident.projection.clone());
+                .find(|resident| resident.projection().member.membership() == member.membership())
+                .map(|resident| resident.projection().clone());
             debug_assert!(
                 resident.is_some(),
                 "a supervised terminal child must remain in parent residency"
             );
             let nested = resident.and_then(|resident| resident.scope);
-            let terminal_exit = member.terminalize_locked(exit, startup, wakes);
+            let terminal_exit = member.terminalize_locked(exit.as_exit().clone(), startup, wakes);
+            // The terminal member record now owns the equivalent retained
+            // copy, so surrender this transient guard as refcount traffic.
+            drop(exit.into_exit());
             self.evict_child_identity(member);
             if record.last_incarnation.is_none()
                 && let Some(scope) = &nested
@@ -687,22 +773,23 @@ impl ScopeCell {
             let mut children = self.current_children();
             let index = children
                 .iter()
-                .position(|child| child.projection.member.membership() == membership);
+                .position(|child| child.projection().member.membership() == membership);
             index.map(|index| children.remove(index))
         };
         let Some(resident) = resident else {
             return false;
         };
-        debug_assert_eq!(resident.projection.member.membership(), membership);
+        debug_assert_eq!(resident.projection().member.membership(), membership);
         let event = LifecycleEventKind::Removed {
-            id: resident.projection.member.id().clone(),
+            id: resident.projection().member.id().clone(),
             membership,
-            last_incarnation: resident.projection.member.record().last_incarnation,
+            last_incarnation: resident.projection().member.record().last_incarnation,
         };
         // The projection can carry the last member/mailbox owner. Put it in
         // the transaction before the fallible publication path so unwind also
-        // retires it only after the observation gate is released.
-        txn.defer(move || drop(resident));
+        // retires it only after the observation gate is released. The detached
+        // handoff deliberately makes final member teardown asynchronous.
+        txn.defer(move || runtime::dispose_detached(resident));
         self.emit_locked(txn, event);
         true
     }
@@ -789,20 +876,24 @@ impl ScopeCell {
     }
 
     pub fn finish_incarnation(&self, epoch: Epoch, reason: StopReason) {
-        self.finish_incarnation_with_terminal(epoch, reason, None);
+        self.finish_incarnation_with_terminal(epoch, RetainedStopReason::new(reason), None);
     }
 
     pub fn finish_root_incarnation(&self, epoch: Epoch, reason: StopReason, exit: Exit) {
-        self.finish_incarnation_with_terminal(epoch, reason, Some(exit));
+        self.finish_incarnation_with_terminal(
+            epoch,
+            RetainedStopReason::new(reason),
+            Some(RetainedExit::new(exit)),
+        );
     }
 
     fn finish_incarnation_with_terminal(
         &self,
         epoch: Epoch,
-        reason: StopReason,
-        terminal_exit: Option<Exit>,
+        reason: RetainedStopReason,
+        mut terminal_exit: Option<RetainedExit>,
     ) {
-        self.with_observation_gate(|wakes| {
+        self.with_observation_gate(move |wakes| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             if !control.epochs.finish(epoch) {
                 // A stale driver must not overwrite the observation
@@ -811,9 +902,13 @@ impl ScopeCell {
                 // terminal exit still publishes it exactly once, so declining
                 // the epoch can never strand `wait_terminal`.
                 drop(control);
-                if let Some(exit) = terminal_exit {
-                    self.member
-                        .terminalize_locked(exit, StartupDisposition::Unchanged, wakes);
+                if let Some(exit) = terminal_exit.take() {
+                    self.member.terminalize_locked(
+                        exit.as_exit().clone(),
+                        StartupDisposition::Unchanged,
+                        wakes,
+                    );
+                    drop(exit.into_exit());
                     wakes.pulse(&self.member.record);
                     wakes.pulse(&self.observation.record);
                     self.close_observation_locked(wakes);
@@ -824,7 +919,6 @@ impl ScopeCell {
                 // deferred drop sends a possibly-blocking or panicking user
                 // destructor to `dispose_critical` instead of running it
                 // inline on the committing thread once the gate is released.
-                let reason = RetainedStopReason::new(reason);
                 wakes.defer(move || drop(reason));
                 return;
             }
@@ -840,7 +934,12 @@ impl ScopeCell {
             let terminal = terminal_exit.is_some();
             let membership_terminal =
                 matches!(self.member.record().stage, MemberStage::Terminal(_));
-            self.publish_stopped_locked(wakes, reason, terminal_exit, Some(control));
+            self.publish_stopped_locked(
+                wakes,
+                reason.as_reason().clone(),
+                terminal_exit.as_ref().map(|exit| exit.as_exit().clone()),
+                Some(control),
+            );
             if terminal || membership_terminal {
                 // A parent-driver fallback may have terminalized this nested
                 // membership while its live scope epilogue was still
@@ -848,20 +947,35 @@ impl ScopeCell {
                 // closes observation only after publishing it.
                 self.close_observation_locked(wakes);
             }
+            drop(reason.into_public());
+            if let Some(exit) = terminal_exit.take() {
+                drop(exit.into_exit());
+            }
         });
     }
 
     pub fn finish_live_root_incarnation(&self, reason: StopReason, exit: Exit) {
+        // These wrappers precede the control lookup: a poisoned framework
+        // mutex must not retire either user-bearing input on this thread.
+        let reason = RetainedStopReason::new(reason);
+        let exit = RetainedExit::new(exit);
         let epoch = {
             let control = self.control.lock().expect("scope control mutex poisoned");
             control.epochs.live_epoch()
         };
         if let Some(epoch) = epoch {
-            self.finish_root_incarnation(epoch, reason, exit);
+            self.finish_incarnation_with_terminal(epoch, reason, Some(exit));
         } else {
-            self.with_observation_gate(|wakes| {
-                self.publish_stopped_locked(wakes, reason, Some(exit), None);
+            self.with_observation_gate(move |wakes| {
+                self.publish_stopped_locked(
+                    wakes,
+                    reason.as_reason().clone(),
+                    Some(exit.as_exit().clone()),
+                    None,
+                );
                 self.close_observation_locked(wakes);
+                drop(reason.into_public());
+                drop(exit.into_exit());
             });
         }
     }
@@ -1069,19 +1183,26 @@ impl ScopeCell {
         child: ResidentProjection,
         txn: &mut ObservationTxn<'_>,
     ) {
+        // Take protected ownership before gate adoption, parent wiring, and
+        // reducer assertions. Until the final push succeeds this projection
+        // may be the last owner of a mailbox-bearing member.
+        let child = ResidentAdmission::new(child, txn);
+        let projection = child.projection();
         let gate = self.current_observation_gate();
-        if let Some(scope) = &child.scope {
+        if let Some(scope) = &projection.scope {
             scope.adopt_observation_gate(self, &gate, txn);
             scope.set_parent(self, txn);
         } else {
-            child.member.adopt_observation_gate(&gate, txn);
+            projection.member.adopt_observation_gate(&gate, txn);
         }
-        let id = child.member.id().clone();
-        let membership = child.member.membership();
-        child
+        let id = projection.member.id().clone();
+        let membership = projection.member.membership();
+        projection
             .member
             .transition_locked(txn, MemberTransition::Admitted);
-        self.current_children().push(ResidentChild::new(child));
+        drop(projection);
+        self.current_children()
+            .push(ResidentChild::new(child.install()));
         self.emit_locked(txn, LifecycleEventKind::Added { id, membership });
     }
 
@@ -1097,15 +1218,19 @@ impl ScopeCell {
         let removals = residents
             .iter()
             .map(|resident| LifecycleEventKind::Removed {
-                id: resident.projection.member.id().clone(),
-                membership: resident.projection.member.membership(),
-                last_incarnation: resident.projection.member.record().last_incarnation,
+                id: resident.projection().member.id().clone(),
+                membership: resident.projection().member.membership(),
+                last_incarnation: resident.projection().member.record().last_incarnation,
             })
             .collect::<Vec<_>>();
         // Schedule the whole displaced set before emitting any edge. This
         // both preserves last-owner disposal and makes an unwind retire the
-        // untouched suffix after unlock.
-        wakes.defer(move || drop(residents));
+        // untouched suffix after unlock. Detached disposal means final member
+        // teardown may complete after this transaction returns -- and that a
+        // resident's own destructor can never reach an `ObservationTxn`, so
+        // SPEC §15.5's structural `Removed`-on-drop is unavailable on this
+        // lane and the edge is emitted explicitly below instead (#389).
+        wakes.defer(move || runtime::dispose_detached(residents));
         for removal in removals {
             self.emit_locked(wakes, removal);
         }
@@ -1499,15 +1624,105 @@ mod tests {
         }
     }
 
+    /// A user payload whose destructor panics, as SPEC §5.5's containment
+    /// clause anticipates.
+    struct HostileDropMessage {
+        entered: mpsc::SyncSender<&'static str>,
+        id: &'static str,
+    }
+
+    impl Drop for HostileDropMessage {
+        fn drop(&mut self) {
+            let _ = self.entered.send(self.id);
+            panic!("hostile resident payload destructor");
+        }
+    }
+
     struct GateDropMessage {
         gate: super::ObservationGate,
-        dropped: mpsc::SyncSender<bool>,
+        entered: mpsc::SyncSender<(bool, std::thread::ThreadId)>,
+        release: mpsc::Receiver<()>,
     }
 
     impl Drop for GateDropMessage {
         fn drop(&mut self) {
-            let _ = self.dropped.send(!self.gate.is_held());
+            let _ = self
+                .entered
+                .send((!self.gate.is_held(), std::thread::current().id()));
+            let _ = self.release.recv_timeout(TEST_WAIT);
         }
+    }
+
+    // The retention this pins only has an observable effect when the
+    // framework invariant it guards is checked, and that check is a
+    // `debug_assert!`. Release builds decline the panic entirely, so the test
+    // is gated on the profile it can hold in rather than left to fail there.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn nonresident_terminal_exit_is_retained_before_the_residency_assertion() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let member = child_member(&root, "missing");
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retiring_thread = std::thread::current().id();
+        let exit = Exit::failed(
+            ExitError::from(ThreadProbe(dropped)),
+            Cancellation::NotObserved,
+        );
+
+        catch_unwind(AssertUnwindSafe(|| {
+            root.terminalize_child(&member, exit, None, StartupDisposition::Unchanged);
+        }))
+        .expect_err("a supervised child must remain resident");
+
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("failed exit disposal reports"),
+            retiring_thread,
+            "the incoming error cannot unwind through the observation gate"
+        );
+    }
+
+    // The retention this pins only has an observable effect when the
+    // framework invariant it guards is checked, and that check is a
+    // `debug_assert!`. Release builds decline the panic entirely, so the test
+    // is gated on the profile it can hold in rather than left to fail there.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn rejected_resident_admission_detaches_its_last_mailbox_owner() {
+        let root = isolated_scope("root", ScopeFlavor::Ordered);
+        let member = child_member(&root, "invalid");
+        let mut incarnations = member.take_incarnation_counter();
+        let incarnation = incarnations.mint().expect("incarnation available");
+        let mailbox = MailboxCell::new(member.id().clone(), shelterwood_runtime::mailbox_runtime());
+        member.attach_mailbox(mailbox.clone());
+        let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
+        let mut effects = MailboxEffectQueue::default();
+        let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
+        MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
+        drop(effects);
+        // Admission below is intentionally illegal, but the projection is
+        // still the final owner of this mailbox-bearing member when it fails.
+        member.transition(MemberTransition::Admitted);
+        let (dropped, observed) = mpsc::sync_channel(1);
+        actor
+            .try_send(ThreadProbe(dropped))
+            .expect("bound mailbox accepts the probe");
+        let projection = ResidentProjection::new(member, None);
+        drop(actor);
+        drop(mailbox);
+        let retiring_thread = std::thread::current().id();
+
+        catch_unwind(AssertUnwindSafe(|| root.admit_child(projection)))
+            .expect_err("an admitted member cannot be admitted twice");
+
+        assert_ne!(
+            observed
+                .recv_timeout(TEST_WAIT)
+                .expect("mailbox payload disposal reports"),
+            retiring_thread,
+            "the by-value projection cannot unwind its mailbox through the observation gate"
+        );
     }
 
     #[test]
@@ -1839,6 +2054,56 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_finish_bookkeeping_retires_user_inputs_off_thread() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let epoch = scope
+            .begin_incarnation(ScopeState::Starting)
+            .expect("the fixture begins one incarnation");
+        let poison = Arc::clone(&scope);
+        assert!(
+            catch_unwind(AssertUnwindSafe(move || {
+                let _control = poison.control.lock().expect("control starts healthy");
+                panic!("inject control poison");
+            }))
+            .is_err()
+        );
+
+        let retiring_thread = std::thread::current().id();
+        let (reason_dropped, reason_observed) = mpsc::sync_channel(1);
+        let reason_exit = Exit::failed(
+            ExitError::from(ThreadProbe(reason_dropped)),
+            Cancellation::NotObserved,
+        );
+        let reason = StopReason::StartupFailed(StartupFailure {
+            cause: StartupFailureCause::Child {
+                id: ChildId::from("failed-child"),
+                membership: scope.member.membership(),
+                exit: reason_exit,
+            },
+        });
+        let (terminal_dropped, terminal_observed) = mpsc::sync_channel(1);
+        let terminal_exit = Exit::failed(
+            ExitError::from(ThreadProbe(terminal_dropped)),
+            Cancellation::NotObserved,
+        );
+
+        catch_unwind(AssertUnwindSafe(|| {
+            scope.finish_root_incarnation(epoch, reason, terminal_exit);
+        }))
+        .expect_err("the poisoned control mutex rejects finish bookkeeping");
+
+        for observed in [reason_observed, terminal_observed] {
+            assert_ne!(
+                observed
+                    .recv_timeout(TEST_WAIT)
+                    .expect("failed exit disposal reports"),
+                retiring_thread,
+                "scope-finish inputs cannot unwind through the observation gate"
+            );
+        }
+    }
+
+    #[test]
     fn mailbox_control_wakes_are_deferred_past_the_observation_gate() {
         let id = ChildId::from("root");
         let mut identity = ScopeIdentity::new();
@@ -1877,7 +2142,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_residents_releases_the_last_mailbox_owner_after_unlock() {
+    fn clearing_residents_detaches_the_last_mailbox_owner_after_unlock() {
         let root_id = ChildId::from("root");
         let mut root_identity = ScopeIdentity::new();
         let root_member = MemberCell::new(
@@ -1906,22 +2171,111 @@ mod tests {
         let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
         MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
         drop(effects);
-        let (dropped, observed) = mpsc::sync_channel(1);
+        let (entered, observed) = mpsc::sync_channel(1);
+        let (release, release_drop) = mpsc::sync_channel(1);
         actor
-            .try_send(GateDropMessage { gate, dropped })
+            .try_send(GateDropMessage {
+                gate,
+                entered,
+                release: release_drop,
+            })
             .expect("bound mailbox accepts the probe");
         scope.admit_child(ResidentProjection::new(Arc::clone(&child), None));
         drop(actor);
         drop(mailbox);
         drop(child);
 
-        scope.clear_residents();
+        let (cleared, clear_observed) = mpsc::sync_channel(1);
+        let clearing = std::thread::spawn(move || {
+            let thread = std::thread::current().id();
+            scope.clear_residents();
+            cleared
+                .send(thread)
+                .expect("clear observer remains available");
+        });
+        let (unlocked, drop_thread) = observed
+            .recv_timeout(TEST_WAIT)
+            .expect("resident mailbox payload destructor reports");
+        let clear_before_release = clear_observed.recv_timeout(Duration::from_millis(100)).ok();
+        let returned_before_release = clear_before_release.is_some();
+        release
+            .send(())
+            .expect("the blocking destructor remains parked");
+        let clear_thread = clear_before_release.unwrap_or_else(|| {
+            clear_observed
+                .recv_timeout(TEST_WAIT)
+                .expect("resident clearing eventually returns")
+        });
+        clearing.join().expect("resident clearing thread joins");
 
         assert!(
-            observed
-                .recv_timeout(Duration::from_secs(10))
-                .expect("resident mailbox payload destructor reports"),
+            unlocked,
             "the displaced resident owner is released after the gate unlocks"
         );
+        assert!(
+            returned_before_release,
+            "resident clearing must not wait for a blocking user destructor"
+        );
+        assert_ne!(
+            drop_thread, clear_thread,
+            "last-owner resident disposal runs on the detached lane"
+        );
+    }
+
+    #[test]
+    fn clearing_residents_contains_every_hostile_payload_destructor() {
+        let scope = isolated_scope("root", ScopeFlavor::Dynamic);
+        let (entered, observed) = mpsc::sync_channel(2);
+        let mut counters = Vec::new();
+        for id in ["first", "second"] {
+            let child = child_member(&scope, id);
+            let mut incarnations = child.take_incarnation_counter();
+            let incarnation = incarnations.mint().expect("incarnation available");
+            counters.push(incarnations);
+            let mailbox =
+                MailboxCell::new(child.id().clone(), shelterwood_runtime::mailbox_runtime());
+            child.attach_mailbox(mailbox.clone());
+            let actor = actor_ref_from_parts(Arc::clone(&child), Arc::clone(&mailbox));
+            let mut effects = MailboxEffectQueue::default();
+            let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
+            MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
+            drop(effects);
+            actor
+                .try_send(HostileDropMessage {
+                    entered: entered.clone(),
+                    id,
+                })
+                .expect("bound mailbox accepts the hostile payload");
+            scope.admit_child(ResidentProjection::new(Arc::clone(&child), None));
+            drop(actor);
+            drop(mailbox);
+            drop(child);
+        }
+        drop(entered);
+
+        scope.clear_residents();
+
+        // Park behind a job queued after the displaced set. Without a
+        // per-resident boundary the second destructor panics inside the first
+        // one's unwind through `Vec`'s slice drop glue, and the disposal
+        // worker aborts the process before this sentinel can run -- the
+        // sequencing is what makes the regression deterministic rather than a
+        // race against the test's own return.
+        let (sentinel, sequenced) = mpsc::sync_channel(1);
+        runtime::dispose_detached(ThreadProbe(sentinel));
+        sequenced
+            .recv_timeout(TEST_WAIT)
+            .expect("the disposal worker survives every hostile resident");
+
+        let mut reported = Vec::new();
+        for _ in 0..2 {
+            reported.push(
+                observed
+                    .recv_timeout(TEST_WAIT)
+                    .expect("every hostile resident destructor runs"),
+            );
+        }
+        reported.sort_unstable();
+        assert_eq!(reported, ["first", "second"]);
     }
 }

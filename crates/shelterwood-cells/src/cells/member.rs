@@ -528,7 +528,23 @@ impl MemberCell {
     }
 
     pub fn transition_locked(&self, txn: &mut ObservationTxn<'_>, transition: MemberTransition) {
+        // `RestartScheduled` carries a user error by value. Retain it before
+        // the watch lock and reducer assertions so an invariant panic can
+        // unwind the raw transition as refcount traffic only.
+        let retained_exit = match &transition {
+            MemberTransition::RestartScheduled { exit, .. } => {
+                Some(RetainedExit::new(exit.clone()))
+            }
+            MemberTransition::Admitted
+            | MemberTransition::Starting { .. }
+            | MemberTransition::Running
+            | MemberTransition::Stopping => None,
+        };
         self.update_locked(txn, |record| record.apply_transition(transition));
+        if let Some(retained_exit) = retained_exit {
+            // The record now owns an equivalent retained copy.
+            drop(retained_exit.into_exit());
+        }
     }
 
     pub fn set_options(&self, options: ResolvedCommonOptions) {
@@ -734,6 +750,39 @@ mod tests {
 
     use super::*;
     use crate::cells::test_support::{ThreadProbe, isolated_scope};
+
+    // The retention this pins only has an observable effect when the
+    // framework invariant it guards is checked, and that check is a
+    // `debug_assert!`. Release builds decline the panic entirely, so the test
+    // is gated on the profile it can hold in rather than left to fail there.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn illegal_restart_transition_retires_its_user_error_off_thread() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let (dropped, observed) = mpsc::sync_channel(1);
+        let retiring_thread = std::thread::current().id();
+        let exit = Exit::failed(
+            ExitError::from(ThreadProbe(dropped)),
+            Cancellation::NotObserved,
+        );
+
+        catch_unwind(AssertUnwindSafe(|| {
+            scope.member.transition(MemberTransition::RestartScheduled {
+                exit,
+                restart_count: RestartCount::ZERO.bump(),
+                restart_at: None,
+            });
+        }))
+        .expect_err("a reserved member cannot schedule a restart");
+
+        assert_ne!(
+            observed
+                .recv_timeout(Duration::from_secs(10))
+                .expect("failed exit disposal reports"),
+            retiring_thread,
+            "the incoming user error cannot unwind under the record and observation locks"
+        );
+    }
 
     #[test]
     fn attaching_a_second_mailbox_panics_without_replacing_or_poisoning_the_first() {

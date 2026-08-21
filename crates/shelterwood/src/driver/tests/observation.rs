@@ -1662,10 +1662,14 @@ fn residency_can_release_the_last_member_arc_with_a_failed_exit() {
 
     root.clear_residents();
 
-    assert!(
-        weak.upgrade().is_none(),
-        "residency held the final member Arc"
-    );
+    let deadline = std::time::Instant::now() + CAPTURE_PROBE_WAIT;
+    while weak.upgrade().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for detached resident disposal"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert!(
         !wait_for_gate_probe(&held_at_drop),
         "retiring the member record must not run its payload under the observation gate"

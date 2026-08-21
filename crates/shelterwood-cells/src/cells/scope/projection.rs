@@ -120,7 +120,7 @@ impl ScopeCell {
         let mut retained_exits = Vec::new();
         RetainedExit::retain_scope_state(&mut retained_exits, &record.state);
         for resident in children.iter() {
-            let (child, exits) = self.child_snapshot_locked(&resident.projection);
+            let (child, exits) = self.child_snapshot_locked(resident.projection());
             projected.push(child);
             for exit in exits {
                 RetainedExit::retain_owned(&mut retained_exits, exit);

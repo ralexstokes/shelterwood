@@ -519,8 +519,9 @@ struct SnapshotHubState {
 ///
 /// The producer is `FnMut` rather than `FnOnce` so that running it does not
 /// also destroy it: it captures an `Arc<ScopeCell>` whose release belongs
-/// after the gate is unlocked, like every other user-bearing drop. `install`
-/// hands the spent producer to the effect list rather than dropping it.
+/// after the gate is unlocked, like every other user-bearing drop. The
+/// transaction hands the whole spent publication to its effect list after
+/// each attempted install, including one that trips an invariant.
 pub(crate) struct SnapshotProjection(Box<dyn FnMut() -> Option<RetainedScopeSnapshot>>);
 
 impl SnapshotProjection {
@@ -593,25 +594,16 @@ impl SnapshotPublication {
     /// displaces, and the generation-exhaustion panic. The producer runs
     /// before the watch's own lock is taken, so building a cut — which walks
     /// the resident tree — never nests that tree's locks inside the watch.
-    pub(crate) fn install(self, effects: &mut Vec<Box<dyn FnOnce()>>) {
-        let Self {
-            sender,
-            mut projection,
-            published,
-            closed,
-        } = self;
+    pub(crate) fn install(&mut self, effects: &mut Vec<Box<dyn FnOnce()>>) {
         // A hub closed by an earlier transaction keeps the authoritative
         // terminal projection `close` installed; this cut is never built.
-        let mut snapshot = (!sender.read_with(|state| state.closed)).then(|| projection.build());
-        // Retire the producer first: until the effect list owns it, the
-        // publishing scope has no provable owner here, and every drop below
-        // reaches it through that scope.
-        effects.push(Box::new(move || drop(projection)));
+        let mut snapshot =
+            (!self.sender.read_with(|state| state.closed)).then(|| self.projection.build());
         let mut retired = None;
         let mut modified = false;
         let mut generation_exhausted = false;
         if snapshot.is_some() {
-            sender.modify_silently(|state| {
+            self.sender.modify_silently(|state| {
                 debug_assert!(
                     !state.closed,
                     "the gate serializes closure against installation"
@@ -622,10 +614,10 @@ impl SnapshotPublication {
                         .take()
                         .expect("a staged snapshot is installed exactly once"),
                 ));
-                if published && state.generation.mint().is_none() {
+                if self.published && state.generation.mint().is_none() {
                     generation_exhausted = true;
                 }
-                state.closed = closed;
+                state.closed = self.closed;
                 modified = true;
             });
         }
@@ -636,6 +628,7 @@ impl SnapshotPublication {
             effects.push(Box::new(|| panic!("snapshot generation space exhausted")));
         }
         if modified {
+            let sender = self.sender.clone();
             effects.push(Box::new(move || sender.pulse()));
         }
     }
@@ -1137,6 +1130,44 @@ mod tests {
             "an ungated borrow taken mid-transaction reads the preceding cut"
         );
         assert_eq!(receiver.borrow_latest().state, ScopeState::Running);
+    }
+
+    #[test]
+    fn panicking_snapshot_install_does_not_strand_later_cuts_or_effects() {
+        let failing = SnapshotHub::default();
+        let succeeding = SnapshotHub::default();
+        let mut txn = crate::cells::ObservationTxn::detached();
+        let _failing_receiver = failing.subscribe(snapshot(ScopeState::Unstarted), &mut txn);
+        let succeeding_receiver = succeeding.subscribe(snapshot(ScopeState::Unstarted), &mut txn);
+        drop(txn);
+
+        let effects = Arc::new(AtomicUsize::new(0));
+        let payload = catch_unwind(AssertUnwindSafe({
+            let effects = Arc::clone(&effects);
+            move || {
+                let mut txn = crate::cells::ObservationTxn::detached();
+                failing.publish(&mut txn, || panic!("injected snapshot installation panic"));
+                succeeding.publish(&mut txn, || snapshot(ScopeState::Running));
+                txn.defer(move || {
+                    effects.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        }))
+        .expect_err("the first installation panic resumes after commit drains");
+
+        assert_eq!(
+            payload.downcast_ref::<&str>(),
+            Some(&"injected snapshot installation panic")
+        );
+        assert_eq!(
+            succeeding_receiver.borrow_latest().state,
+            ScopeState::Running
+        );
+        assert_eq!(
+            effects.load(Ordering::SeqCst),
+            1,
+            "installation failure cannot suppress the queued effect suffix"
+        );
     }
 
     #[test]

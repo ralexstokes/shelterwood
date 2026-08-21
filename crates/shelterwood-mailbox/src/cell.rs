@@ -108,7 +108,6 @@ pub(super) struct OperationState<M> {
     registration: Option<WaiterId>,
 }
 
-#[path = "cell/waker_slot.rs"]
 mod waker_slot;
 
 use waker_slot::{WakerAction, WakerEffects, WakerSlot};
@@ -372,6 +371,25 @@ impl<M> MailboxState<M> {
                 debug_assert!(false, "a terminal mailbox has no live transition");
                 WaiterQueue::default()
             }
+        }
+    }
+
+    /// Dequeues the next envelope this receive mode is willing to observe.
+    fn take_next(&mut self, mode: ReceiveMode) -> Option<Envelope<M>> {
+        match self.kind {
+            Some(MailboxKind::Queue(_)) => self
+                .queue
+                .front()
+                .is_some_and(|item| mode.accepts(item.accepted_sequence))
+                .then(|| self.queue.pop_front())
+                .flatten(),
+            Some(MailboxKind::Latest) => self
+                .latest
+                .as_ref()
+                .is_some_and(|item| mode.accepts(item.accepted_sequence))
+                .then(|| self.latest.take())
+                .flatten(),
+            None => None,
         }
     }
 
@@ -658,11 +676,7 @@ impl<M: Send + 'static> MailboxEffectBatch<M> {
             panics.run(|| {
                 dispose_value(
                     self.runtime.as_ref(),
-                    MailboxPayload {
-                        queue: Some(isolated.into()),
-                        latest: None,
-                        retired: Vec::new(),
-                    },
+                    MailboxPayload::unread(isolated.into(), None),
                 );
             });
         }
@@ -683,10 +697,10 @@ impl<M: Send + 'static> MailboxEffectBatch<M> {
 
 /// A mailbox transition guard paired with its mandatory post-unlock effects.
 ///
-/// It exposes immutable state through `Deref`, but every mutation is a named
-/// operation on the transaction. This keeps binding, waiter-domain, payload,
-/// and bind-token transitions coupled to the effects sink instead of exposing
-/// a broad mutable state escape hatch.
+/// It exposes immutable state through `Deref`. Mutation is either a named
+/// transition on the transaction or a `parts()` pairing that hands the state
+/// out beside its sink, so no mutation happens without the effects sink in
+/// scope. That is what the removed `DerefMut` used to allow.
 struct MailboxTxn<'a, 's, M: Send + 'static> {
     state: Option<MutexGuard<'a, MailboxState<M>>>,
     effects: MailboxEffects<'a, 's, M>,
@@ -722,11 +736,14 @@ impl<'a, 's, M: Send + 'static> MailboxTxn<'a, 's, M> {
         )
     }
 
+    /// The guarded state alone, for transitions whose effects are queued by
+    /// the transaction rather than by the caller.
+    fn state_mut(&mut self) -> &mut MailboxState<M> {
+        self.parts().0
+    }
+
     fn configure_kind(&mut self, kind: MailboxKind) -> Option<MailboxKind> {
-        let state = self
-            .state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard");
+        let state = self.state_mut();
         match state.kind {
             Some(existing) => (existing != kind).then_some(existing),
             None => {
@@ -737,66 +754,35 @@ impl<'a, 's, M: Send + 'static> MailboxTxn<'a, 's, M> {
     }
 
     fn park(&mut self, operation: &Arc<SendOperation<M>>) -> bool {
-        self.state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard")
-            .park(operation)
+        self.state_mut().park(operation)
     }
 
+    #[must_use]
     fn remove_waiter(&mut self, registration: WaiterId) -> Option<Arc<SendOperation<M>>> {
-        self.state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard")
-            .remove_waiter(registration)
+        self.state_mut().remove_waiter(registration)
     }
 
+    #[must_use]
     fn take_next(&mut self, mode: ReceiveMode) -> Option<Envelope<M>> {
-        let state = self
-            .state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard");
-        match state.kind {
-            Some(MailboxKind::Queue(_)) => state
-                .queue
-                .front()
-                .is_some_and(|item| mode.accepts(item.accepted_sequence))
-                .then(|| state.queue.pop_front())
-                .flatten(),
-            Some(MailboxKind::Latest) => state
-                .latest
-                .as_ref()
-                .is_some_and(|item| mode.accepts(item.accepted_sequence))
-                .then(|| state.latest.take())
-                .flatten(),
-            None => None,
-        }
+        self.state_mut().take_next(mode)
     }
 
+    #[must_use]
     fn take_waiters(&mut self) -> WaiterQueue<M> {
-        self.state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard")
-            .take_waiters()
+        self.state_mut().take_waiters()
     }
 
     fn set_last_bound(&mut self, incarnation: Incarnation) {
-        self.state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard")
-            .last_bound = Some(incarnation);
+        self.state_mut().last_bound = Some(incarnation);
     }
 
     fn bind_available(&mut self, incarnation: Incarnation) {
-        self.state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard")
+        self.state_mut()
             .replace_binding(MailboxBinding::Bound(BoundState::Available(incarnation)));
     }
 
     fn bind_full(&mut self, incarnation: Incarnation, waiters: WaiterQueue<M>) {
-        self.state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard")
+        self.state_mut()
             .replace_binding(MailboxBinding::Bound(BoundState::Full {
                 incarnation,
                 waiters,
@@ -804,56 +790,48 @@ impl<'a, 's, M: Send + 'static> MailboxTxn<'a, 's, M> {
     }
 
     fn freeze_binding(&mut self, incarnation: Incarnation, waiters: WaiterQueue<M>) {
-        self.state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard")
-            .replace_binding(MailboxBinding::Frozen {
-                incarnation,
-                waiters,
-            });
+        self.state_mut().replace_binding(MailboxBinding::Frozen {
+            incarnation,
+            waiters,
+        });
     }
 
     fn freeze_after_exhaustion(&mut self, incarnation: Incarnation, waiters: WaiterQueue<M>) {
         // This transition carries the waiter identity domain forward, so it
         // deliberately bypasses `replace_binding`'s empty-domain check.
-        self.state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard")
-            .binding = MailboxBinding::Frozen {
+        self.state_mut().binding = MailboxBinding::Frozen {
             incarnation,
             waiters,
         };
     }
 
     fn unbind(&mut self, waiters: WaiterQueue<M>) {
-        self.state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard")
+        self.state_mut()
             .replace_binding(MailboxBinding::Unbound(waiters));
     }
 
     fn terminalize(&mut self, final_incarnation: Option<Incarnation>) {
-        self.state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard")
+        self.state_mut()
             .replace_binding(MailboxBinding::Terminal(final_incarnation));
     }
 
     fn reset_bind_permit(&mut self) -> MailboxBindToken {
-        let state = self
-            .state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard");
+        let state = self.state_mut();
         state.bind_permit = Arc::new(AtomicBool::new(false));
         MailboxBindToken::new(Arc::clone(&state.bind_permit))
     }
 
-    fn take_payload(&mut self) -> (VecDeque<Envelope<M>>, Option<Envelope<M>>) {
-        let state = self
-            .state
-            .as_deref_mut()
-            .expect("a live mailbox transaction retains its guard");
-        (std::mem::take(&mut state.queue), state.latest.take())
+    /// Detaches the unread payload into the carrier that owns its destruction.
+    ///
+    /// Naming `MailboxPayload` in the signature keeps the envelopes from ever
+    /// being loose: wherever they are finally destroyed, its `Drop` runs each
+    /// user destructor through a `PanicAccumulator` instead of letting one
+    /// hostile destructor abandon the rest. `#[must_use]` keeps a dropped
+    /// temporary from destroying them here, still under the mailbox mutex.
+    #[must_use]
+    fn take_payload(&mut self) -> MailboxPayload<M> {
+        let state = self.state_mut();
+        MailboxPayload::unread(std::mem::take(&mut state.queue), state.latest.take())
     }
 
     fn finish<R>(mut self, output: R) -> R {
@@ -917,6 +895,17 @@ struct MailboxPayload<M> {
     queue: Option<VecDeque<Envelope<M>>>,
     latest: Option<Envelope<M>>,
     retired: Vec<Arc<SendOperation<M>>>,
+}
+
+impl<M> MailboxPayload<M> {
+    /// Carries unread messages, with no retired operations yet.
+    fn unread(queue: VecDeque<Envelope<M>>, latest: Option<Envelope<M>>) -> Self {
+        Self {
+            queue: Some(queue),
+            latest,
+            retired: Vec::new(),
+        }
+    }
 }
 
 impl<M> Drop for MailboxPayload<M> {
@@ -1432,13 +1421,9 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         let waiters = transaction.take_waiters();
         transaction.unbind(waiters);
         let token = transaction.reset_bind_permit();
-        let (queue, latest) = transaction.take_payload();
+        let payload = transaction.take_payload();
         transaction.effects.pulse();
-        let disposal = Box::new(MailboxPayload {
-            queue: Some(queue),
-            latest,
-            retired: Vec::new(),
-        }) as MailboxDisposal;
+        let disposal = Box::new(payload) as MailboxDisposal;
         // The close result outlives this transaction's effect flush at every
         // caller, so it carries the disposal capability that isolates the
         // unread payload if that flush unwinds.
@@ -1461,7 +1446,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         // transition, so an already-expired withdrawal may beat the deferred
         // discharge even after this mailbox-wide transition.
         transaction.terminalize(final_incarnation);
-        let (queue, latest) = transaction.take_payload();
+        let payload = transaction.take_payload();
         let termination = Termination {
             waiters,
             final_incarnation,
@@ -1469,11 +1454,7 @@ impl<M: Send + 'static> MailboxControl for MailboxCell<M> {
         let teardown = Some(Box::new(MailboxTeardown {
             runtime: Arc::clone(&self.runtime),
             changed: Some(Arc::clone(&self.changed)),
-            payload: Some(MailboxPayload {
-                queue: Some(queue),
-                latest,
-                retired: Vec::new(),
-            }),
+            payload: Some(payload),
             termination: Some(termination),
         }) as Box<dyn MailboxTermination>);
         transaction.finish(teardown)
@@ -1710,5 +1691,4 @@ impl<M: Send + 'static> MailboxReceiver<M> {
 }
 
 #[cfg(test)]
-#[path = "cell/tests.rs"]
 pub(super) mod tests;

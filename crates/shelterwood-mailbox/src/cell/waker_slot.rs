@@ -15,12 +15,14 @@ pub(crate) enum WakerAction {
     Wake,
     DropInline,
     Dispose(Arc<dyn MailboxRuntime>),
+    Run(fn(Waker)),
 }
 
 enum WakerEffect {
     Wake(Waker),
     DropInline(Waker),
     Dispose(Arc<dyn MailboxRuntime>, Waker),
+    Run(fn(Waker), Waker),
 }
 
 #[derive(Default)]
@@ -56,6 +58,7 @@ impl WakerEffects {
             WakerAction::Wake => WakerEffect::Wake(waker),
             WakerAction::DropInline => WakerEffect::DropInline(waker),
             WakerAction::Dispose(runtime) => WakerEffect::Dispose(runtime, waker),
+            WakerAction::Run(effect) => WakerEffect::Run(effect, waker),
         });
     }
 
@@ -67,6 +70,7 @@ impl WakerEffects {
                 WakerEffect::Dispose(runtime, waker) => {
                     panics.run(|| dispose(&runtime, waker));
                 }
+                WakerEffect::Run(effect, waker) => panics.run(|| effect(waker)),
             }
         }
     }

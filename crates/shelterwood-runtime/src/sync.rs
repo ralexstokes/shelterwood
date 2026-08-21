@@ -11,7 +11,10 @@ use std::{
 
 use tokio::sync::{broadcast, oneshot};
 
-use super::{PanicAccumulator, dispose_detached};
+use super::{
+    PanicAccumulator, discard_panic, dispose_detached,
+    waker_proxy::{WakerProxy, WakerRetirement},
+};
 
 /// A caller-waker registry whose lock protects only inert storage changes.
 ///
@@ -624,44 +627,137 @@ impl<T> OneShotReceiver<T> {
 /// boundary types preserve the same constructor-only bound. Execution bounds
 /// belong on constructors and operational impls here.
 pub struct DisposingReceiver<T> {
-    inner: OneShotReceiver<T>,
+    inner: Option<OneShotReceiver<T>>,
     dispose: fn(T),
+    caller_waker: Option<WakerProxy>,
 }
 
 impl<T: Send + 'static> DisposingReceiver<T> {
     pub fn new(inner: OneShotReceiver<T>) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             dispose: dispose_detached::<T>,
+            caller_waker: None,
         }
     }
 }
 
-impl<T> DisposingReceiver<T> {
-    pub fn poll_receive(
-        &mut self,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<T>> {
-        self.inner.poll_receive(context)
+fn poll_one_shot_with_proxy<T, R>(
+    inner: &mut OneShotReceiver<T>,
+    caller_waker: &mut Option<WakerProxy>,
+    context: &mut Context<'_>,
+    mut poll: impl FnMut(&mut OneShotReceiver<T>, &mut Context<'_>) -> R,
+    is_pending: impl Fn(&R) -> bool,
+) -> R {
+    if caller_waker.is_none() {
+        let mut probe = Context::from_waker(Waker::noop());
+        let result = poll(inner, &mut probe);
+        if !is_pending(&result) {
+            return result;
+        }
+        *caller_waker = Some(WakerProxy::new());
     }
 
-    pub fn close_and_poll_receive(
-        &mut self,
-        context: &mut std::task::Context<'_>,
-    ) -> OneShotClose<T> {
-        self.inner.close_and_poll_receive(context)
+    let caller_waker = caller_waker
+        .as_ref()
+        .expect("a parked disposing receiver retains its waker proxy");
+    caller_waker.register(context);
+    let mut proxy_context = Context::from_waker(caller_waker.waker());
+    poll(inner, &mut proxy_context)
+}
+
+impl<T> DisposingReceiver<T> {
+    fn inner_mut(&mut self) -> &mut OneShotReceiver<T> {
+        self.inner
+            .as_mut()
+            .expect("a live disposing receiver retains its channel")
+    }
+
+    /// Retires a caller waker only after selecting its post-unlock venue.
+    ///
+    /// Ready results use contained inline retirement: a result may own a user
+    /// value (or a panic payload that owns one), so a hostile waker destructor
+    /// is subordinate to returning that result intact. Drop glue uses the
+    /// detached lane because caller-waker destruction may block as well as
+    /// panic, and a holder's dropping thread is not an acceptable venue.
+    fn retire_caller_waker(&mut self, retirement: WakerRetirement, panics: &mut PanicAccumulator) {
+        let caller_waker = self.caller_waker.take();
+        if let Some(caller_waker) = &caller_waker {
+            caller_waker.retire(retirement, panics);
+        }
+        panics.run(|| drop(caller_waker));
+    }
+
+    pub fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
+        // In pinned Tokio 1.53.1, `Receiver::poll` obtains the result before
+        // clearing its `Inner`; the last `Inner::drop` then calls
+        // `rx_task.drop_task` while that result can own the delivered value.
+        // Probe with a framework waker, then leave only the stable proxy
+        // registered across a pending return so Tokio never destroys the raw
+        // caller waker at that delivery seam.
+        let result = poll_one_shot_with_proxy(
+            self.inner
+                .as_mut()
+                .expect("a live disposing receiver retains its channel"),
+            &mut self.caller_waker,
+            context,
+            OneShotReceiver::poll_receive,
+            Poll::is_pending,
+        );
+        if result.is_ready() {
+            let mut panics = PanicAccumulator::default();
+            self.retire_caller_waker(WakerRetirement::Inline, &mut panics);
+            discard_panic(panics.take());
+        }
+        result
+    }
+
+    pub fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T> {
+        let result = poll_one_shot_with_proxy(
+            self.inner
+                .as_mut()
+                .expect("a live disposing receiver retains its channel"),
+            &mut self.caller_waker,
+            context,
+            OneShotReceiver::close_and_poll_receive,
+            |result| matches!(result, OneShotClose::Pending),
+        );
+        if !matches!(result, OneShotClose::Pending) {
+            let mut panics = PanicAccumulator::default();
+            self.retire_caller_waker(WakerRetirement::Inline, &mut panics);
+            discard_panic(panics.take());
+        }
+        result
     }
 
     pub fn close(&mut self) {
-        self.inner.close();
+        self.inner_mut().close();
+        let mut panics = PanicAccumulator::default();
+        self.retire_caller_waker(WakerRetirement::Inline, &mut panics);
+        discard_panic(panics.take());
     }
 }
 
 impl<T> Drop for DisposingReceiver<T> {
     fn drop(&mut self) {
-        if let Some(value) = self.inner.close_and_take() {
-            (self.dispose)(value);
-        }
+        let mut inner = self
+            .inner
+            .take()
+            .expect("a live disposing receiver retains its channel");
+        let mut value = None;
+        let mut panics = PanicAccumulator::default();
+
+        // Recover and dispatch an unclaimed value before either receiver or
+        // caller-waker retirement can fail. The receiver holds only a proxy
+        // clone, so Tokio's close/drop work below is framework-owned traffic.
+        panics.run(|| value = inner.close_and_take());
+        panics.run(|| {
+            if let Some(value) = value {
+                (self.dispose)(value);
+            }
+        });
+        panics.run(|| drop(inner));
+        self.retire_caller_waker(WakerRetirement::Detached, &mut panics);
     }
 }
 
@@ -1030,14 +1126,17 @@ mod tests {
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
+            mpsc,
         },
         task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
+        thread::ThreadId,
         time::Duration,
     };
 
     use crate::{
-        BroadcastReceive, CompletionGatedLatch, JoinOutcome, Latch, OneShotClose, Signal, Timeout,
-        broadcast, join, oneshot, oneshot_sending_for_test, spawn, timeout, yield_now,
+        BroadcastReceive, CompletionGatedLatch, DisposingReceiver, JoinOutcome, Latch,
+        OneShotClose, Signal, Timeout, broadcast, join, oneshot, oneshot_sending_for_test, spawn,
+        test_support::DISPOSAL_THREAD, timeout, yield_now,
     };
 
     use super::{RegisteredWaker, WaiterRegistry};
@@ -1124,6 +1223,54 @@ mod tests {
         let raw = RawWaker::new(
             Arc::into_raw(Arc::new(LastWakerDropPanics { drops, message })).cast(),
             &LAST_DROP_PANICS_VTABLE,
+        );
+        // SAFETY: `raw` owns one Arc reference and its vtable maintains that
+        // ownership across clone, wake, and drop.
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    struct RecordPanickingDrop(mpsc::Sender<(ThreadId, Option<String>)>);
+
+    unsafe fn clone_record_panicking_drop(data: *const ()) -> RawWaker {
+        // SAFETY: every pointer using this vtable came from an Arc of the
+        // matching type. ManuallyDrop preserves the represented reference;
+        // the returned raw waker owns only the new clone.
+        let probe = ManuallyDrop::new(unsafe { Arc::<RecordPanickingDrop>::from_raw(data.cast()) });
+        RawWaker::new(
+            Arc::into_raw(Arc::clone(&probe)).cast(),
+            &RECORD_PANICKING_DROP_VTABLE,
+        )
+    }
+
+    unsafe fn wake_record_panicking_drop(data: *const ()) {
+        // SAFETY: wake consumes the Arc reference represented by this waker.
+        drop(unsafe { Arc::<RecordPanickingDrop>::from_raw(data.cast()) });
+    }
+
+    unsafe fn wake_by_ref_record_panicking_drop(_data: *const ()) {}
+
+    unsafe fn drop_record_panicking_drop(data: *const ()) {
+        // SAFETY: drop consumes the Arc reference represented by this waker.
+        let probe = unsafe { Arc::<RecordPanickingDrop>::from_raw(data.cast()) };
+        let _ = probe.0.send((
+            std::thread::current().id(),
+            std::thread::current().name().map(str::to_owned),
+        ));
+        drop(probe);
+        panic!("injected disposing-receiver caller-waker drop panic");
+    }
+
+    static RECORD_PANICKING_DROP_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_record_panicking_drop,
+        wake_record_panicking_drop,
+        wake_by_ref_record_panicking_drop,
+        drop_record_panicking_drop,
+    );
+
+    fn record_panicking_drop_waker(dropped: mpsc::Sender<(ThreadId, Option<String>)>) -> Waker {
+        let raw = RawWaker::new(
+            Arc::into_raw(Arc::new(RecordPanickingDrop(dropped))).cast(),
+            &RECORD_PANICKING_DROP_VTABLE,
         );
         // SAFETY: `raw` owns one Arc reference and its vtable maintains that
         // ownership across clone, wake, and drop.
@@ -1263,6 +1410,31 @@ mod tests {
 
         assert_eq!(sending.publish(7_u8), Err(7));
         assert_eq!(receiver.try_receive(), None);
+    }
+
+    #[test]
+    fn dropping_disposing_receiver_detaches_caller_waker_retirement() {
+        let dropping_thread = std::thread::current().id();
+        let (_sender, receiver) = oneshot::<u8>();
+        let mut receiver = DisposingReceiver::new(receiver);
+        let (dropped, observed_drop) = mpsc::channel();
+        let caller = ManuallyDrop::new(record_panicking_drop_waker(dropped));
+
+        assert!(matches!(
+            receiver.poll_receive(&mut Context::from_waker(&caller)),
+            Poll::Pending
+        ));
+        drop(receiver);
+
+        let (destructor_thread, destructor_name) = observed_drop
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the caller waker reaches detached disposal");
+        assert_ne!(destructor_thread, dropping_thread);
+        assert_eq!(
+            destructor_name.as_deref(),
+            Some(DISPOSAL_THREAD),
+            "drop glue must not destroy a caller waker on the holder's thread"
+        );
     }
 
     #[test]

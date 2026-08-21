@@ -12,6 +12,7 @@ mod sync;
 #[cfg(test)]
 mod test_support;
 mod timer;
+mod waker_proxy;
 
 pub use disposal::*;
 pub use mailbox::*;

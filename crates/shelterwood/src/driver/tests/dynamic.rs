@@ -1,5 +1,56 @@
 use super::support::*;
 
+#[crate::runtime::test]
+async fn refused_dynamic_admission_panics_after_control_plane_unlock() {
+    let (mut scope, _events, mut dynamic_events, control) = running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    let member = Arc::clone(&reservation.slot.member);
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
+    let (_response, request) = begin_admission(&reservation, &mut dynamic_events, None).await;
+
+    // Corrupt only the projection source stage. Admission still commits its
+    // arena insertion and dynamic-entry promotion before the cell reducer
+    // refuses Running -> Admitted, reaching the driver invariant exactly.
+    member.update(|record| record.stage = MemberStage::Running);
+    let refusal = catch_unwind(AssertUnwindSafe(|| scope.handle_admission(request)));
+
+    assert!(
+        refusal.is_err(),
+        "a refused dynamic admission fails closed in every profile"
+    );
+    assert!(
+        !root.observation_gate().is_poisoned(),
+        "the admission verdict is asserted after ObservationTxn releases the gate"
+    );
+    assert!(
+        !control.state.is_poisoned(),
+        "the admission verdict is asserted after the dynamic-state guard is released"
+    );
+    assert!(
+        !scope.children.is_empty(),
+        "the fixture reaches the committing admission site after arena insertion"
+    );
+    assert!(
+        control
+            .state
+            .lock()
+            .expect("dynamic-state mutex remains healthy")
+            .entries
+            .get(member.id())
+            .is_some_and(|entry| !entry.is_reserved()),
+        "the fixture reaches the committing admission site after entry promotion"
+    );
+
+    // Restore the source stage and missing residency so ScopeRuntime's normal
+    // fail-closed epilogue can discharge this deliberately corrupted fixture.
+    member.update(|record| record.stage = MemberStage::Reserved);
+    assert!(root.admit_child(resident_projection(&reservation.slot)));
+}
+
 #[crate::runtime::test(start_paused = true)]
 async fn dynamic_high_cycle_add_remove_keeps_only_live_runtime_storage() {
     const CYCLES: usize = 1_000;

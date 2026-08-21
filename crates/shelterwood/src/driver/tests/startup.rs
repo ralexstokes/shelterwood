@@ -1,6 +1,30 @@
 use super::support::*;
 
 #[test]
+fn refused_root_running_transition_panics_after_the_observation_transaction() {
+    let plan = Tree::new().lower_for_test();
+    let root = Arc::clone(&plan.root);
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+
+    let mut driver = Box::pin(run_scope(plan, ScopeRole::Root));
+    let refusal = catch_unwind(AssertUnwindSafe(|| {
+        let mut context = Context::from_waker(Waker::noop());
+        let _ = driver.as_mut().poll(&mut context);
+    }));
+
+    assert!(
+        refusal.is_err(),
+        "a refused root Running transition fails closed in every profile"
+    );
+    assert!(
+        !root.observation_gate().is_poisoned(),
+        "the transition verdict is asserted after ObservationTxn releases the gate"
+    );
+    drop(driver);
+}
+
+#[test]
 fn empty_control_peeks_skip_the_tree_observation_gate() {
     let root = isolated_scope("root", ScopeFlavor::Ordered);
     let epoch = root

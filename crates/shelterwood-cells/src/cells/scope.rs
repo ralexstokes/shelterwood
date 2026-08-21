@@ -834,13 +834,11 @@ impl ScopeCell {
         // Mirror the announcement: a resident an unwound admission installed
         // never published `Added`, and SPEC §3.2's pairing is both edges or
         // neither. It is still withdrawn and disposed.
-        let event = resident
-            .announced
-            .then(|| LifecycleEventKind::Removed {
-                id: resident.projection().member.id().clone(),
-                membership,
-                last_incarnation: resident.projection().member.record().last_incarnation,
-            });
+        let event = resident.announced.then(|| LifecycleEventKind::Removed {
+            id: resident.projection().member.id().clone(),
+            membership,
+            last_incarnation: resident.projection().member.record().last_incarnation,
+        });
         // The projection can carry the last member/mailbox owner. Put it in
         // the transaction before the fallible publication path so unwind also
         // retires it only after the observation gate is released. The detached
@@ -1334,7 +1332,9 @@ impl ScopeCell {
         let membership = projection.member.membership();
         // Mark the resident announced before `emit_locked`: the Added
         // publication schedules the commit-time snapshot, and that producer
-        // walks residency and skips whatever is still unannounced.
+        // walks residency and skips whatever is still unannounced. This rests
+        // on the same "no residency mutation interleaves under the gate"
+        // invariant as the refusal pop above, which is where it is diagnosed.
         if let Some(resident) = self.current_children().last_mut() {
             resident.announced = true;
         }
@@ -1971,10 +1971,7 @@ mod tests {
 
         // Install residency exactly as an admission that unwound before its
         // `Added` publication leaves it.
-        root.push_unannounced_resident_for_test(ResidentProjection::new(
-            Arc::clone(&member),
-            None,
-        ));
+        root.push_unannounced_resident_for_test(ResidentProjection::new(Arc::clone(&member), None));
         assert_eq!(root.resident_projections().len(), 1);
         assert!(root.snapshot().children.is_empty());
 

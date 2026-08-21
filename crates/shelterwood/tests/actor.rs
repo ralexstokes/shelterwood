@@ -409,6 +409,11 @@ struct ErrorReturnCapabilities {
     continuation_rejected: bool,
     timer_rejected: bool,
     offload_rejected: bool,
+    /// Outcome of a self-`try_send` at the moment the decorator resumes:
+    /// `Ok` while the mailbox binding is still accepting, `Err(NotRunning)`
+    /// once intake has been frozen. This is the half `fail_after_teardown`
+    /// must leave exactly as the inner loop left it.
+    mailbox_send: Result<(), SendErrorKind>,
 }
 
 struct ErrorReturnProbe<R> {
@@ -432,6 +437,11 @@ impl<R: RawActor<Msg = ()>> RawActor for ErrorReturnProbe<R> {
                 .set_timeout("after-inner-error", (), Duration::from_secs(1))
                 .is_err(),
             offload_rejected: context.offload(async {}, |_| (), Duration::MAX).is_err(),
+            mailbox_send: context
+                .myself()
+                .try_send(())
+                .map(|_| ())
+                .map_err(|error| error.kind),
         };
         *self
             .observed
@@ -470,10 +480,43 @@ impl RawActor for PlainRawError {
     }
 }
 
+/// Self-sends two messages during `init`, stops on the first live delivery so
+/// the second becomes the frozen accepted prefix, then fails while draining
+/// that prefix. This is the default-configuration path (`MailboxShutdown` is
+/// `Drain`) on which the error reaches the decorator with intake *already*
+/// frozen — by `ctx.stop()` and the `recv`/`try_recv` shutdown boundary, not
+/// by the error teardown.
+struct DrainErrorActor;
+
+impl Actor for DrainErrorActor {
+    type Msg = ();
+    type Args = ();
+
+    async fn init((): (), context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        let myself = context.myself();
+        myself
+            .try_send(())
+            .expect("a spawned incarnation accepts sends during init");
+        myself
+            .try_send(())
+            .expect("a spawned incarnation accepts sends during init");
+        Ok(Self)
+    }
+
+    async fn handle(&mut self, (): Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
+        if context.is_draining() {
+            Err(ExitError::message("injected drain error"))
+        } else {
+            context.stop();
+            Ok(())
+        }
+    }
+}
+
 async fn capabilities_after_inner_error<R: RawActor<Msg = ()>>(
     inner: R,
 ) -> ErrorReturnCapabilities {
-    let observed = Arc::new(Mutex::new(None));
+    let observed: Arc<Mutex<Option<ErrorReturnCapabilities>>> = Arc::new(Mutex::new(None));
     let mut tree = Tree::new();
     tree.add_raw_once(
         "error-return",
@@ -484,10 +527,14 @@ async fn capabilities_after_inner_error<R: RawActor<Msg = ()>>(
     )
     .expect("valid decorated actor");
     let system = tree.spawn().expect("runtime is available");
-    system
-        .wait_started()
-        .await
-        .expect_err("the pre-readiness error aborts startup");
+    // Startup either fails (pre-readiness errors) or succeeds and the child
+    // fails afterwards, so wait on the observation itself rather than on a
+    // readiness verdict that differs per case.
+    assert_eventually!(|| observed
+        .lock()
+        .expect("error-return observation mutex poisoned")
+        .is_some())
+    .await;
     let capabilities = observed
         .lock()
         .expect("error-return observation mutex poisoned")
@@ -495,20 +542,26 @@ async fn capabilities_after_inner_error<R: RawActor<Msg = ()>>(
     system
         .shutdown(Duration::from_secs(1))
         .await
-        .expect("failed-startup tree shuts down");
+        .expect("the tree shuts down after the failed child");
     capabilities
 }
 
+/// `fail_after_teardown` owns the resource half and only the resource half.
+/// The pre-readiness cases pin both directions of that split: a `Handler`
+/// error returns with resources frozen and the mailbox binding untouched —
+/// still accepting, because nothing in this path froze intake — while a plain
+/// `RawActor` error reaches its decorator before any framework teardown.
 #[tokio::test]
-async fn handler_error_freezes_resources_while_plain_raw_error_leaves_them_live() {
+async fn handler_error_freezes_resources_while_leaving_an_unfrozen_mailbox_alone() {
     assert_eq!(
         capabilities_after_inner_error(Handler::<InitErrorActor>::new(())).await,
         ErrorReturnCapabilities {
             continuation_rejected: true,
             timer_rejected: true,
             offload_rejected: true,
+            mailbox_send: Ok(()),
         },
-        "Handler errors return only after their resource half is frozen"
+        "Handler errors return with the resource half frozen and the mailbox half as found"
     );
     assert_eq!(
         capabilities_after_inner_error(PlainRawError).await,
@@ -516,8 +569,26 @@ async fn handler_error_freezes_resources_while_plain_raw_error_leaves_them_live(
             continuation_rejected: false,
             timer_rejected: false,
             offload_rejected: false,
+            mailbox_send: Ok(()),
         },
         "plain RawActor errors reach their decorator before raw-boundary teardown"
+    );
+}
+
+/// The mailbox half in the other direction: on the normative default drain
+/// path the binding the decorator observes is already frozen. "Left as found"
+/// is the guarantee, not "left live".
+#[tokio::test]
+async fn handler_drain_error_returns_with_intake_already_frozen() {
+    assert_eq!(
+        capabilities_after_inner_error(Handler::<DrainErrorActor>::new(())).await,
+        ErrorReturnCapabilities {
+            continuation_rejected: true,
+            timer_rejected: true,
+            offload_rejected: true,
+            mailbox_send: Err(SendErrorKind::NotRunning),
+        },
+        "a drain-phase Handler error returns to its decorator with intake already frozen"
     );
 }
 

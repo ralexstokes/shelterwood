@@ -164,8 +164,8 @@ impl Signal {
     }
 
     #[cfg(test)]
-    fn watcher_count(&self) -> usize {
-        self.inner.receiver_count()
+    fn waiter_count(&self) -> usize {
+        self.inner.shared.waiter_count()
     }
 }
 
@@ -759,6 +759,11 @@ struct WatchShared<T> {
 }
 
 impl<T> WatchShared<T> {
+    #[cfg(test)]
+    fn waiter_count(&self) -> usize {
+        self.waiters.len()
+    }
+
     /// Acquires the retained value, tolerating poisoning.
     ///
     /// `modify_silently` and `read_with` run a caller closure under this
@@ -1579,17 +1584,18 @@ mod tests {
     }
 
     #[test]
-    fn quiet_signal_wait_cancellation_keeps_one_watch_registration() {
+    fn quiet_signal_wait_cancellation_removes_waiter_registration() {
         let signal = Signal::default();
         let mut watcher = signal.watcher();
-        assert_eq!(signal.watcher_count(), 1);
+        assert_eq!(signal.waiter_count(), 0);
 
         for _ in 0..10_000 {
             let mut changed = Box::pin(watcher.changed());
             let mut context = Context::from_waker(Waker::noop());
             assert!(changed.as_mut().poll(&mut context).is_pending());
+            assert_eq!(signal.waiter_count(), 1);
             drop(changed);
-            assert_eq!(signal.watcher_count(), 1);
+            assert_eq!(signal.waiter_count(), 0);
         }
     }
 
@@ -2045,14 +2051,18 @@ mod tests {
             let first_poll =
                 std::future::poll_fn(|context| Poll::Ready(fired.as_mut().poll(context))).await;
             assert!(first_poll.is_pending());
+            assert_eq!(latch.state.waiters.len(), 1);
             drop(fired);
+            assert_eq!(latch.state.waiters.len(), 0);
         }
 
         let mut live_waiter = Box::pin(latch.fired());
         let first_poll =
             std::future::poll_fn(|context| Poll::Ready(live_waiter.as_mut().poll(context))).await;
         assert!(first_poll.is_pending());
+        assert_eq!(latch.state.waiters.len(), 1);
         assert!(latch.fire());
+        assert_eq!(latch.state.waiters.len(), 0);
         assert!(matches!(
             timeout(Duration::from_secs(1), live_waiter).await,
             Timeout::Completed(())

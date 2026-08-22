@@ -11,13 +11,12 @@ use serde_json::Value;
 const FORBIDDEN_ROOTS: &[&str] = &["fastrand", "shelterwood_runtime", "tokio", "tokio_util"];
 const SUPPORTED_FORMAT_VERSION: u64 = 61;
 
-// This walk is scoped to the items one document actually contains. Rustdoc
-// JSON does not inline cross-crate re-exports: an item the façade re-exports
-// from a sibling crate appears only as a `use` whose target lives in that
-// sibling's document, so its signature is invisible here even though rustdoc
-// renders it as part of the façade's public API. Covering the façade surface
-// therefore means running this check once per crate that contributes public
-// items to it, not once on the façade — see the `runtime-api-check` recipe.
+// This walk is scoped to the items one document actually contains. Mailbox and
+// cell items now live in the façade, so its document covers those signatures
+// directly. Rustdoc JSON still does not inline the remaining cross-crate core
+// re-exports: they appear only as `use` items whose target signatures are
+// invisible here. Core's runtime-free dependency graph is the structural proof
+// for that opaque residue; see the `runtime-api-check` recipe and SPEC §16.13.
 
 fn main() -> Result<(), Box<dyn Error>> {
     let path = env::args_os()

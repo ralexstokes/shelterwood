@@ -40,7 +40,7 @@ if ! grep -Fq 'no `LIFECYCLE_EVENT_CAPACITY` in the root' "$diagnostics"; then
 fi
 
 if cargo check --locked --manifest-path "$manifest" --features installable-seams >"$diagnostics" 2>&1; then
-    echo "the supported façade exports lower-crate installation seams" >&2
+    echo "the supported façade exports private installation seams" >&2
     exit 1
 fi
 for seam in \

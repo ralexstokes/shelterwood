@@ -69,14 +69,18 @@ impl ObservationGate {
 /// from stranding already-committed wakes.
 pub(crate) struct ObservationTxn<'a> {
     guard: Option<MutexGuard<'a, ()>>,
+    #[cfg(debug_assertions)]
+    gate: Option<&'a ObservationGate>,
     effects: Vec<Box<dyn FnOnce()>>,
     snapshots: Vec<SnapshotPublication>,
 }
 
 impl<'a> ObservationTxn<'a> {
-    pub(super) fn new(guard: MutexGuard<'a, ()>) -> Self {
+    pub(super) fn new(gate: &'a ObservationGate, guard: MutexGuard<'a, ()>) -> Self {
         Self {
             guard: Some(guard),
+            #[cfg(debug_assertions)]
+            gate: Some(gate),
             effects: Vec::new(),
             snapshots: Vec::new(),
         }
@@ -86,9 +90,28 @@ impl<'a> ObservationTxn<'a> {
     pub(crate) fn detached() -> Self {
         Self {
             guard: None,
+            #[cfg(debug_assertions)]
+            gate: None,
             effects: Vec::new(),
             snapshots: Vec::new(),
         }
+    }
+
+    /// Checks that a locked cell writer received the transaction for its
+    /// current resident-tree gate.
+    ///
+    /// Unit tests for isolated hub mechanics use [`Self::detached`], which
+    /// deliberately carries no identity and therefore opts out.
+    pub(crate) fn debug_assert_gate(&self, gate: &ObservationGate) {
+        #[cfg(debug_assertions)]
+        if let Some(held) = self.gate {
+            debug_assert!(
+                held.shares_gate(gate),
+                "a locked observation writer requires its current tree gate"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = gate;
     }
 
     pub(crate) fn defer(&mut self, operation: impl FnOnce() + 'static) {
@@ -215,7 +238,7 @@ mod tests {
     fn observation_txn_commit_unlocks_before_effects_and_drains_once() {
         let gate = ObservationGate::new();
         let order = Arc::new(Mutex::new(Vec::new()));
-        let mut txn = ObservationTxn::new(gate.lock());
+        let mut txn = ObservationTxn::new(&gate, gate.lock());
         for value in [1, 2] {
             let gate = gate.clone();
             let order = Arc::clone(&order);
@@ -266,7 +289,7 @@ mod tests {
         );
 
         let payload = catch_unwind(AssertUnwindSafe(|| {
-            let mut txn = ObservationTxn::new(gate.lock());
+            let mut txn = ObservationTxn::new(&gate, gate.lock());
             txn.pulse(&hostile_sender);
             txn.pulse(&later_sender);
         }))
@@ -295,7 +318,7 @@ mod tests {
             let effects = Arc::clone(&effects);
             let gate = gate.clone();
             move || {
-                let mut txn = ObservationTxn::new(gate.lock());
+                let mut txn = ObservationTxn::new(&gate, gate.lock());
                 let first = Arc::clone(&effects);
                 let first_gate = gate.clone();
                 // An assertion here would be inert: `PanicAccumulator`

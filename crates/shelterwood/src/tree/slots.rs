@@ -2,7 +2,7 @@ use std::{fmt, marker::PhantomData, sync::Arc};
 
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId,
-    cells::ReserveError,
+    cells::{ReserveError, StaticReserveError},
     driver::DynamicReservation,
     mailbox::{MailboxCell, actor_ref_from_parts},
     plan::{BuilderCore, ChildConstruction, SlotCell},
@@ -161,7 +161,7 @@ impl<E: SlotEndpoint, K: SlotKind> SlotCore<E, K> {
 pub(super) fn reserve_static<K: SlotKind>(
     core: &mut BuilderCore,
     id: impl Into<ChildId>,
-) -> Result<SlotCore<StaticSlotEndpoint, K>, ReserveError> {
+) -> Result<SlotCore<StaticSlotEndpoint, K>, StaticReserveError> {
     core.reserve(id, K::SCOPE_FLAVOR)
         .map(|slot| SlotCore::new(StaticSlotEndpoint(slot)))
 }
@@ -335,6 +335,7 @@ macro_rules! impl_slot_debug {
         }
     };
 }
+
 /// An owned pre-spawn actor slot with a stable mailbox binding.
 pub struct ActorSlot<M> {
     pub(super) core: SlotCore<StaticSlotEndpoint, ActorKind<M>>,
@@ -415,6 +416,7 @@ impl TaskSlot {
         self.core.define(definition)
     }
 }
+
 /// A split dynamic actor reservation with a stable mailbox binding.
 pub struct DynamicActorSlot<M> {
     pub(super) core: SlotCore<DynamicSlotEndpoint, ActorKind<M>>,
@@ -514,6 +516,7 @@ impl<T: Subtree> DynamicSubtreeSlot<T> {
         self.core.define(definition)
     }
 }
+
 /// A typed pre-spawn subtree slot.
 pub struct SubtreeSlot<T: Subtree> {
     pub(super) core: SlotCore<StaticSlotEndpoint, SubtreeKind<T>>,

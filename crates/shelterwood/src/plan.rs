@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     ChildId, DefaultsInheritance, Exit, Intensity, Readiness, ScopeDefaults,
-    cells::{MemberCell, ObservationTxn, ReserveError, ScopeCell},
+    cells::{MemberCell, ObservationTxn, ReserveError, ScopeCell, StaticReserveError},
     definition::DefinitionSource,
     identity::{MembershipReconciliation, ScopeIdentity},
     policy::{CommonOptions, ResolvedCommonOptions, ResolvedDefaults, ScopeFlavor, resolve_common},
@@ -33,15 +33,21 @@ pub(crate) fn mint_reserved_slot(
     id: &ChildId,
     child_scope: Option<ScopeFlavor>,
 ) -> Result<Arc<SlotCell>, ReserveError> {
-    let membership = parent
-        .mint_membership(id)
-        .ok_or(ReserveError::IdentityExhausted)?;
+    mint_reserved_slot_inner(parent, id, child_scope).ok_or(ReserveError::IdentityExhausted)
+}
+
+fn mint_reserved_slot_inner(
+    parent: &ScopeCell,
+    id: &ChildId,
+    child_scope: Option<ScopeFlavor>,
+) -> Option<Arc<SlotCell>> {
+    let membership = parent.mint_membership(id)?;
     let member = MemberCell::new(id.clone(), membership);
     let scope = child_scope.map(|flavor| {
         let identity = ScopeIdentity::new();
         ScopeCell::new(Arc::clone(&member), flavor, identity)
     });
-    Ok(SlotCell::new(member, scope))
+    Some(SlotCell::new(member, scope))
 }
 
 /// Installs a valid option set for a manually constructed resident fixture,
@@ -342,12 +348,16 @@ impl BuilderCore {
         &mut self,
         id: impl Into<ChildId>,
         scope: Option<ScopeFlavor>,
-    ) -> Result<Arc<SlotCell>, ReserveError> {
-        let id = checked_id(id)?;
-        if self.ids.contains(&id) {
-            return Err(ReserveError::DuplicateId(id));
+    ) -> Result<Arc<SlotCell>, StaticReserveError> {
+        let id = id.into();
+        if id.as_str().is_empty() {
+            return Err(StaticReserveError::EmptyId);
         }
-        let slot = mint_reserved_slot(&self.root, &id, scope)?;
+        if self.ids.contains(&id) {
+            return Err(StaticReserveError::DuplicateId(id));
+        }
+        let slot = mint_reserved_slot_inner(&self.root, &id, scope)
+            .ok_or(StaticReserveError::IdentityExhausted)?;
         self.ids.insert(id);
         self.slots.push(Arc::clone(&slot));
         Ok(slot)

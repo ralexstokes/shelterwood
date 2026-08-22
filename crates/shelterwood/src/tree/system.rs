@@ -21,6 +21,7 @@ pub struct StartOrShutdownError {
     /// Stragglers forced down after the rollback bound, if any.
     pub rollback_timeout: Option<ShutdownTimeout>,
 }
+
 /// A restartable subtree definition.
 pub struct SubtreeDef<T: Subtree> {
     factory: Arc<dyn Fn() -> BuilderCore + Send + Sync + 'static>,
@@ -117,6 +118,8 @@ impl<T: Subtree> SubtreeOnceDef<T> {
         }
     }
 }
+
+/// Private dispatch that seals subtree flavor conversion inside the façade.
 #[allow(private_interfaces)]
 pub(super) mod sealed {
     use super::{BuilderCore, DynamicScopeRef, ScopeFlavor, ScopeRef};
@@ -161,7 +164,7 @@ pub trait Subtree: sealed::Sealed + fmt::Debug + Send + 'static {}
 impl Subtree for Tree {}
 
 impl Subtree for DynamicTree {}
-#[must_use = "dropping the sole system owner requests graceful shutdown"]
+
 /// The sole owning handle for a running root system.
 ///
 /// [`Tree::spawn`] and [`DynamicTree::spawn`] return exactly one `System`;
@@ -186,6 +189,7 @@ impl Subtree for DynamicTree {}
 /// it before tearing down the async runtime. The escalation ladder, what a
 /// completed shutdown does and does not guarantee, and runtime-lifetime
 /// obligations are documented in [`crate::guides::shutdown_and_resources`].
+#[must_use = "dropping the sole system owner requests graceful shutdown"]
 pub struct System<R = ScopeRef> {
     pub(super) root: R,
     pub(super) run: crate::driver::SystemRun,

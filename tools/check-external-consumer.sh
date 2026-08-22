@@ -56,6 +56,8 @@ for seam in \
     ErasedOneShotSender \
     MailboxCell \
     MailboxControl \
+    MailboxEffectQueue \
+    MailboxEffectSink \
     MailboxRuntime \
     MailboxSignal \
     MailboxSignalWatcher \

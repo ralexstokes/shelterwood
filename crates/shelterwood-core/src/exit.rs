@@ -26,6 +26,13 @@ pub enum StopReason {
     /// A nested scope could not complete startup.
     StartupFailed(StartupFailure),
     /// The membership terminalized without an incarnation.
+    ///
+    /// A *nested scope* that stops for this reason surfaces at its parent as
+    /// `ExitKind::Failed` carrying a message-only application error
+    /// ("nested scope never started") with no structured accessor — unlike
+    /// `IntensityTripped` and `StartupFailed`, whose projections stay
+    /// structured. A membership that never spawned surfaces as
+    /// `ExitKind::NeverStarted`.
     NeverStarted,
 }
 

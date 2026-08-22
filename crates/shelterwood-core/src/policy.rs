@@ -170,6 +170,9 @@ impl JitterSample {
     }
 
     /// Normalizes an integer ratio and clamps it into `[0, 1)`.
+    ///
+    /// A zero denominator — or any ratio that is not finite — maps to zero,
+    /// the bottom of the range, not the ceiling.
     #[must_use]
     pub fn from_u64_ratio(numerator: u64, denominator: u64) -> Self {
         Self::new(numerator as f64 / denominator as f64)
@@ -425,6 +428,8 @@ impl Backoff {
     /// Derives the delay for a one-origin restart attempt.
     ///
     /// Randomness is deliberately supplied as external, range-checked data.
+    /// `RestartAttempt::ZERO` is coerced to the first attempt and yields the
+    /// same delay as attempt 1.
     #[must_use]
     pub fn next_delay(self, attempt: RestartAttempt, jitter_sample: JitterSample) -> Duration {
         let attempt = attempt.get().max(1);

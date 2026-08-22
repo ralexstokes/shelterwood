@@ -30,6 +30,9 @@ pub struct SendError<M> {
     pub kind: SendErrorKind,
 }
 
+// Manual impl so no `M: Debug` bound is demanded and no user payload leaks
+// into logs; the placeholder stands in for the recoverable message. Debug
+// output stays non-contractual either way.
 impl<M> fmt::Debug for SendError<M> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -124,6 +127,8 @@ pub struct Replied<T> {
     pub incarnation: Incarnation,
 }
 
+// Manual impl so no `T: Debug` bound is demanded and no user reply value
+// leaks into logs; Debug output stays non-contractual either way.
 impl<T> fmt::Debug for Replied<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

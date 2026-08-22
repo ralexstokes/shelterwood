@@ -87,6 +87,11 @@ macro_rules! context_common_forwarders {
 
         /// Starts blocking work tied to actor shutdown and returned-future drop.
         ///
+        /// Available from [`StopContext`] too — deliberately, unlike
+        /// continuations, timers, and offloads. Awaiting the returned
+        /// [`Blocking`] resumes a panic raised inside the closure at the
+        /// await point.
+        ///
         /// Cancellation is cooperative; a hard-aborted operation's OS thread
         /// detaches and may outlive this actor incarnation.
         /// A blocking-pool rejection during runtime teardown uses a detached
@@ -440,7 +445,9 @@ impl<'a, A: Actor> StopContext<'a, A> {
 ///
 /// This is the composition point for raw decorators around callback-oriented
 /// actors. It also encapsulates the callback loop's error-path resource
-/// teardown, so decorators need no framework-internal teardown operations.
+/// teardown, so decorators need no framework-internal teardown operations;
+/// the post-error context capabilities a resuming decorator may rely on are
+/// documented on this type's [`RawActor::run`] implementation below.
 /// Its declared readiness is read before [`RawActor::run`] is polled.
 ///
 /// Like every [`RawActor`], one `Handler` value owns exactly one call to

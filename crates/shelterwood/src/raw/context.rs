@@ -784,6 +784,13 @@ impl<M: Send + 'static> RawContext<M> {
 
     /// Starts blocking work with cancellation tied to shutdown and future drop.
     ///
+    /// Unlike `continue_with`, timers, and offloads, this operation has no
+    /// stopping gate: it deliberately keeps working from stop paths, because
+    /// it is the one resource operation teardown code may still need.
+    /// Awaiting the returned [`Blocking`] resumes a panic raised inside the
+    /// closure at the await point (distinct from the runtime-teardown
+    /// cancellation panic below).
+    ///
     /// Cancellation is cooperative. If this future is dropped or its actor is
     /// hard-aborted, the OS thread detaches and can outlive the incarnation.
     /// A blocking-pool rejection during runtime teardown uses a detached

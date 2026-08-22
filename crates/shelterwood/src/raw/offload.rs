@@ -96,6 +96,9 @@ impl Drop for Guard {
 
 /// A blocking operation whose thread cooperatively observes actor cancellation.
 ///
+/// Awaiting it returns the closure's value; a panic raised inside the
+/// closure is resumed at the await point.
+///
 /// Cancellation cannot forcibly stop a blocking thread. Dropping this future
 /// or hard-aborting its actor detaches the thread after requesting cooperative
 /// cancellation; Shelterwood does not join it, and any later value or panic is

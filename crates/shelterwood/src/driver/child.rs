@@ -618,6 +618,9 @@ fn spawn_child_tasks(launch: ChildTaskLaunch) -> runtime::AbortHandle {
     if watch_readiness {
         let ready_sender = events.clone();
         let ready_completion = ready.clone();
+        // The latch publishes state before wake, so a child that fired and
+        // completed may deliver both wakes together; select_two's left bias
+        // is what keeps the fired edge winning that tie.
         runtime::spawn(async move {
             if matches!(
                 runtime::select_two(ready.fired(), ready_completion.completed()).await,

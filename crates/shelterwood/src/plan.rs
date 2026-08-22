@@ -522,6 +522,11 @@ pub(crate) struct ChildPlan {
 }
 
 impl ChildPlan {
+    /// Builds the plan and, as a deliberate side effect, publishes the
+    /// resolved options onto the slot's member cell. Options resolve exactly
+    /// once and must be resolved before the member's first snapshot
+    /// publication; routing every plan through this constructor is what
+    /// upholds that ordering.
     pub(crate) fn with_options(
         slot: Arc<SlotCell>,
         construction: Isolated<ChildConstruction>,

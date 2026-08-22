@@ -83,6 +83,8 @@ impl ScopeCell {
 
     pub(crate) fn subscribe_snapshots(&self) -> SnapshotReceiver {
         let (receiver, closed_consistent) = self.with_observation_gate(|wakes| {
+            #[cfg(debug_assertions)]
+            wakes.debug_assert_gate(&self.current_observation_gate());
             let receiver = self
                 .observation
                 .snapshots
@@ -100,6 +102,8 @@ impl ScopeCell {
 
     pub(crate) fn subscribe_lifecycle(&self) -> LifecycleEvents {
         let (events, closed_consistent) = self.with_observation_gate(|txn| {
+            #[cfg(debug_assertions)]
+            txn.debug_assert_gate(&self.current_observation_gate());
             let events = self.observation.lifecycle.subscribe(txn);
             let closed_consistent = !self.observation.closed.load(Ordering::Acquire)
                 || self.observation.lifecycle.is_closed();
@@ -238,6 +242,8 @@ impl ScopeCell {
         wakes: &mut ObservationTxn<'_>,
         ancestors: &[Arc<ScopeCell>],
     ) {
+        #[cfg(debug_assertions)]
+        wakes.debug_assert_gate(&self.current_observation_gate());
         // Each producer owns the scope it projects: the cut is built at
         // commit, once per hub, after every publication in this transaction
         // has been coalesced onto it.
@@ -246,6 +252,8 @@ impl ScopeCell {
             .snapshots
             .publish(wakes, move || scope.snapshot_locked());
         for ancestor in ancestors {
+            #[cfg(debug_assertions)]
+            wakes.debug_assert_gate(&ancestor.current_observation_gate());
             let scope = Arc::clone(ancestor);
             ancestor
                 .observation
@@ -260,6 +268,8 @@ impl ScopeCell {
     }
 
     pub(super) fn emit_locked(&self, wakes: &mut ObservationTxn<'_>, kind: LifecycleEventKind) {
+        #[cfg(debug_assertions)]
+        wakes.debug_assert_gate(&self.current_observation_gate());
         // Mint the retention guards before any fallible framework bookkeeping.
         // A sequence-exhaustion path can then defer a *guarded* edge instead
         // of destroying a raw `Exit` under the observation gate.
@@ -311,6 +321,8 @@ impl ScopeCell {
     }
 
     pub(super) fn close_observation_locked(&self, wakes: &mut ObservationTxn<'_>) {
+        #[cfg(debug_assertions)]
+        wakes.debug_assert_gate(&self.current_observation_gate());
         if self.observation.closed.load(Ordering::Acquire) {
             return;
         }

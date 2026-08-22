@@ -68,6 +68,11 @@ rests on:
   `reconcile_recorded_outcomes_retaining` and
   `classify_disposal_panic_retaining`; the raw `shelterwood-core` folds hand
   both halves back and are for core's own tests.
+  `RetainedExitResult` closes the earlier raw-incarnation window: the completed
+  callback result stays in that carrier across the fallible teardown epilogue,
+  so an epilogue panic transfers a failed result to critical disposal instead
+  of destroying its application error during the unwind. The normal path takes
+  the result back before returning it to the driver.
   `ScopeCell::clear_residents_locked`, `prune_child_locked` and
   `admit_child_locked` route `Arc<MemberCell>`s through
   `runtime::dispose_detached` after unlock: the last member owner can also be

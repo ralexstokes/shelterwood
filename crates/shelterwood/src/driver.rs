@@ -770,6 +770,12 @@ impl ScopeRuntime {
         }
         let root = Arc::clone(&self.root);
         let installed = root.with_observation_gate(|txn| {
+            // The dynamic-state mutex rides inside the root gate here. Every
+            // reservation was adopted onto this same gate before publication,
+            // and a root with a live dynamic route cannot be re-homed. Thus
+            // `admit_child_locked`'s handoff check below short-circuits on gate
+            // identity: it never acquires a second gate under `state`. This is
+            // the install half of the admission exemption in AGENTS.md.
             let mut state = control.state.lock().expect("dynamic-state mutex poisoned");
             let id = request.slot.member.id();
             let matches_reservation = state.entry(id).is_some_and(|entry| {

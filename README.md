@@ -23,32 +23,59 @@ the current checkout, including when invoked from a worktree:
 ./tools/dev just ci-nix
 ```
 
-A task-first application needs no actor merely to obtain supervision:
+A counter actor with a request/reply protocol, spawned under an ordered
+tree — quoted from [`examples/quickstart.rs`](crates/shelterwood/examples/quickstart.rs),
+which CI compiles and runs:
 
 ```rust
-use std::time::Duration;
+struct Counter {
+    count: u64,
+}
 
-use shelterwood::{ExitError, TaskOnceDef, Tree};
+enum Msg {
+    Add(u64),
+    Total(Reply<u64>),
+}
+
+impl Actor for Counter {
+    type Msg = Msg;
+    type Args = ();
+
+    async fn init(_args: (), _context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+        Ok(Self { count: 0 })
+    }
+
+    async fn handle(&mut self, message: Msg, _context: &mut Context<'_, Self>) -> ExitResult {
+        match message {
+            Msg::Add(n) => self.count += n,
+            Msg::Total(reply) => reply.send(self.count),
+        }
+        Ok(())
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = Tree::new();
-    let (_worker, _completion) = tree.add_task_once(
-        "worker",
-        TaskOnceDef::new(|context| async move {
-            context.shutdown_token().cancelled().await;
-            Ok::<_, ExitError>(())
-        }),
-    )?;
+    let counter = tree.add_actor("counter", ActorDef::<Counter>::cloned(()))?;
 
     let system = tree.spawn()?;
     system.wait_started().await?;
 
-    // The owner drives bounded teardown and waits for every child to join.
+    counter.send(Msg::Add(2)).await?;
+    let replied = counter.call(Msg::Total, Duration::from_secs(1)).await?;
+    assert_eq!(replied.value, 2);
+
     system.shutdown(Duration::from_secs(5)).await?;
     Ok(())
 }
 ```
+
+The remaining runnable behaviors live in
+[`crates/shelterwood/examples/`](crates/shelterwood/examples/) — request/reply,
+supervision and restart, ordered startup, dynamic scopes, graceful shutdown,
+observation, cyclic wiring, and host embedding — each an asserting smoke test
+run by CI (`just examples`).
 
 Use `Tree` when declaration order should also be startup order and reverse
 shutdown order. Use `DynamicTree` for concurrently started membership that can

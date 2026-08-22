@@ -37,6 +37,20 @@ runtime-api-check:
     cargo run --locked -p shelterwood-api-reachability -- target/doc/shelterwood.json
     ./tools/check-core-manifest.sh
 
+# Examples are smoke tests: each ends in assertions and a nonzero exit fails
+# the recipe. Keep the list in sync with crates/shelterwood/examples/ and the
+# flake's examples-run check.
+examples:
+    cargo run --locked -p shelterwood --example quickstart
+    cargo run --locked -p shelterwood --example request_reply
+    cargo run --locked -p shelterwood --example supervision_restart
+    cargo run --locked -p shelterwood --example ordered_startup
+    cargo run --locked -p shelterwood --example dynamic_scope
+    cargo run --locked -p shelterwood --example graceful_shutdown
+    cargo run --locked -p shelterwood --example observation
+    cargo run --locked -p shelterwood --example cyclic_wiring
+    cargo run --locked -p shelterwood --example embedding
+
 external-consumer-check:
     ./tools/check-external-consumer.sh
 
@@ -45,7 +59,7 @@ nixfmt-check:
 
 # Fast local CI mirror — reuses the local cargo cache and incremental builds.
 # The clean Nix lane retains the explicit all-target build for non-test codegen coverage.
-ci: fmt lint lint-default test doc-check runtime-api-check external-consumer-check nixfmt-check
+ci: fmt lint lint-default test examples doc-check runtime-api-check external-consumer-check nixfmt-check
 
 # Full clean Nix CI lane; use before pushing or when touching Nix files.
 ci-nix:

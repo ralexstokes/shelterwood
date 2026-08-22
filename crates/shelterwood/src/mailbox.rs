@@ -167,7 +167,9 @@ pub(crate) trait MailboxTermination: Send {
 pub(crate) trait MailboxControl: fmt::Debug + Send + Sync {
     /// Installs the declaration-time mailbox policy before the first bind.
     /// Reconfiguration may only repeat the same resolved policy; a mismatch
-    /// panics after the mailbox lock has been released.
+    /// panics after the mailbox lock has been released. Tokens returned by
+    /// repeated compatible configuration share one one-shot permit, so only
+    /// the first token presented can bind; later aliases are rejected.
     fn configure(
         &self,
         mailbox: ResolvedMailbox,

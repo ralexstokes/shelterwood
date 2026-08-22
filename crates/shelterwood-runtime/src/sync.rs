@@ -163,9 +163,14 @@ impl Signal {
         }
     }
 
+    /// The channel-wide waiter-registry length.
+    ///
+    /// This is deliberately not the endpoint count: `changed()` never clones
+    /// its receiver, so an endpoint probe cannot observe a registration a
+    /// cancelled wait failed to remove.
     #[cfg(test)]
     fn waiter_count(&self) -> usize {
-        self.inner.shared.waiter_count()
+        self.inner.shared.waiters.len()
     }
 }
 
@@ -759,11 +764,6 @@ struct WatchShared<T> {
 }
 
 impl<T> WatchShared<T> {
-    #[cfg(test)]
-    fn waiter_count(&self) -> usize {
-        self.waiters.len()
-    }
-
     /// Acquires the retained value, tolerating poisoning.
     ///
     /// `modify_silently` and `read_with` run a caller closure under this
@@ -1593,9 +1593,17 @@ mod tests {
             let mut changed = Box::pin(watcher.changed());
             let mut context = Context::from_waker(Waker::noop());
             assert!(changed.as_mut().poll(&mut context).is_pending());
-            assert_eq!(signal.waiter_count(), 1);
+            assert_eq!(
+                signal.waiter_count(),
+                1,
+                "a parked wait holds exactly one registration"
+            );
             drop(changed);
-            assert_eq!(signal.waiter_count(), 0);
+            assert_eq!(
+                signal.waiter_count(),
+                0,
+                "cancelling the wait removes its registration"
+            );
         }
     }
 
@@ -2051,18 +2059,34 @@ mod tests {
             let first_poll =
                 std::future::poll_fn(|context| Poll::Ready(fired.as_mut().poll(context))).await;
             assert!(first_poll.is_pending());
-            assert_eq!(latch.state.waiters.len(), 1);
+            assert_eq!(
+                latch.state.waiters.len(),
+                1,
+                "a parked wait holds exactly one registration"
+            );
             drop(fired);
-            assert_eq!(latch.state.waiters.len(), 0);
+            assert_eq!(
+                latch.state.waiters.len(),
+                0,
+                "cancelling the wait removes its registration"
+            );
         }
 
         let mut live_waiter = Box::pin(latch.fired());
         let first_poll =
             std::future::poll_fn(|context| Poll::Ready(live_waiter.as_mut().poll(context))).await;
         assert!(first_poll.is_pending());
-        assert_eq!(latch.state.waiters.len(), 1);
+        assert_eq!(
+            latch.state.waiters.len(),
+            1,
+            "the surviving wait is still registered"
+        );
         assert!(latch.fire());
-        assert_eq!(latch.state.waiters.len(), 0);
+        assert_eq!(
+            latch.state.waiters.len(),
+            0,
+            "the fire drains every registration before waking"
+        );
         assert!(matches!(
             timeout(Duration::from_secs(1), live_waiter).await,
             Timeout::Completed(())

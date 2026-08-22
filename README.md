@@ -57,8 +57,10 @@ scope, and subtrees compose both recursively.
 
 ## Operational guides
 
-- [Calls, retries, and message ordering](docs/retry-and-ordering.md)
-- [Shutdown and resource ownership](docs/shutdown-and-resources.md)
+- [Calls, retries, and message ordering](crates/shelterwood/docs/retry-and-ordering.md)
+  (rendered as a rustdoc guide page)
+- [Shutdown and resource ownership](crates/shelterwood/docs/shutdown-and-resources.md)
+  (rendered as a rustdoc guide page)
 - [Snapshots and lifecycle events](docs/observation.md)
 - [Embedding Shelterwood in a host process](docs/embedding.md)
 

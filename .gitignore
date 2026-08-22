@@ -13,3 +13,6 @@ target
 result
 
 .worktrees/*
+
+# mdbook build output
+/book/book/

@@ -1,0 +1,16 @@
+[book]
+title = "The Shelterwood Book"
+description = "The narrative on-ramp to Shelterwood: structured supervision and actors for asynchronous Rust."
+authors = ["Alex Stokes"]
+language = "en"
+src = "src"
+
+[build]
+# Book code blocks are {{#include}}s of anchored regions from
+# crates/shelterwood/examples/, which CI compiles and runs; the book itself
+# has no test lane and must not acquire one.
+create-missing = false
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"

@@ -19,6 +19,10 @@ use super::{PanicAccumulator, dispose_detached, waker_proxy::ProxiedPoll};
 /// draining only move wakers out; their vtables run after unlock, one behind
 /// each accumulator boundary. The opaque identity is retained by its waiter,
 /// so its `Arc` traffic under the lock cannot destroy even framework data.
+/// Cancellation destroys a removed caller-waker clone inline on the thread
+/// dropping `LatchWait` or `WatchWait`: unlike the external-primitive proxy
+/// family, the registry owns the waker directly and has no foreign drop seam
+/// that requires detached retirement.
 #[derive(Default)]
 struct WaiterRegistry {
     waiters: Mutex<Vec<RegisteredWaker>>,
@@ -393,6 +397,7 @@ pub struct OneShotSender<T> {
 pub struct OneShotReceiver<T> {
     channel: oneshot::Receiver<T>,
     state: Arc<AtomicU8>,
+    delivered: bool,
 }
 
 /// Outcome after atomically closing a single-delivery receive side.
@@ -418,6 +423,7 @@ pub fn oneshot<T>() -> (OneShotSender<T>, OneShotReceiver<T>) {
         OneShotReceiver {
             channel: channel_receiver,
             state,
+            delivered: false,
         },
     )
 }
@@ -445,6 +451,7 @@ pub fn oneshot_sending_for_test<T>() -> (OneShotSending<T>, OneShotReceiver<T>) 
         OneShotReceiver {
             channel: receiver,
             state,
+            delivered: false,
         },
     )
 }
@@ -542,11 +549,23 @@ impl<T> Drop for OneShotSender<T> {
 }
 
 impl<T> OneShotReceiver<T> {
+    fn assert_not_delivered(&self) {
+        assert!(
+            !self.delivered,
+            "shelterwood one-shot receiver polled after completion"
+        );
+    }
+
     pub fn poll_receive(
         &mut self,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<T>> {
-        Pin::new(&mut self.channel).poll(context).map(Result::ok)
+        self.assert_not_delivered();
+        let result = Pin::new(&mut self.channel).poll(context).map(Result::ok);
+        if result.is_ready() {
+            self.delivered = true;
+        }
+        result
     }
 
     /// Closes the receive side unless send or sender-drop won first.
@@ -559,7 +578,8 @@ impl<T> OneShotReceiver<T> {
         &mut self,
         context: &mut std::task::Context<'_>,
     ) -> OneShotClose<T> {
-        match self.state.compare_exchange(
+        self.assert_not_delivered();
+        let result = match self.state.compare_exchange(
             ONESHOT_OPEN,
             ONESHOT_RECEIVER_CLOSED,
             Ordering::AcqRel,
@@ -579,7 +599,11 @@ impl<T> OneShotReceiver<T> {
             }
             Err(ONESHOT_RECEIVER_CLOSED) => OneShotClose::Empty,
             Err(other) => unreachable!("unknown one-shot transition state {other}"),
+        };
+        if !matches!(&result, OneShotClose::Pending) {
+            self.delivered = true;
         }
+        result
     }
 
     pub fn close(&mut self) {
@@ -622,12 +646,23 @@ impl<T> OneShotReceiver<T> {
 /// only for plain framework enums and their compositions; a type that can
 /// own user data — an `Exit`, a message, a type-erased error — must go
 /// through [`DisposingReceiver::new`] instead.
+///
+/// # Safety
+///
+/// Every value of the implementing type must be plain framework-owned data:
+/// dropping it must not invoke user code, block, panic, or re-enter the
+/// framework. The trait is unsafe because its intentional implementations
+/// live on both sides of the runtime/façade crate boundary, which rules out a
+/// private Rust sealing trait; a foreign implementation must therefore make
+/// the same safety claim explicitly.
 #[doc(hidden)]
-pub trait FrameworkPlain: Send + 'static {}
+pub unsafe trait FrameworkPlain: Send + 'static {}
 
-impl FrameworkPlain for () {}
+// SAFETY: `()` has no drop glue.
+unsafe impl FrameworkPlain for () {}
 
-impl<T: FrameworkPlain, E: FrameworkPlain> FrameworkPlain for Result<T, E> {}
+// SAFETY: both possible payloads satisfy the same no-user-code drop contract.
+unsafe impl<T: FrameworkPlain, E: FrameworkPlain> FrameworkPlain for Result<T, E> {}
 
 /// One-shot receive state that keeps user value destruction off framework and
 /// holder drop glue.
@@ -860,7 +895,10 @@ impl<T> WatchSender<T> {
     ///
     /// This is only for compound publication that must finish another
     /// synchronous state transition before receivers are notified. The caller
-    /// must follow a successful logical mutation with [`Self::pulse`].
+    /// must follow a successful logical mutation with [`Self::pulse`]. The
+    /// closure runs under the watch value mutex and therefore may only move
+    /// plain framework-owned data: it must not call user code, drop user
+    /// values, block, panic, or re-enter the framework.
     pub fn modify_silently(&self, update: impl FnOnce(&mut T)) {
         let mut value = self.shared.value();
         update(&mut value);
@@ -868,8 +906,9 @@ impl<T> WatchSender<T> {
 
     /// Reads a projection of the retained value without cloning it.
     ///
-    /// `project` runs under the watch's value guard, so it must stay cheap and
-    /// must not touch the same channel.
+    /// `project` runs under the watch's value guard, so it may only inspect
+    /// plain framework-owned data. It must not call user code, drop user
+    /// values, block, panic, re-enter the framework, or touch this channel.
     pub fn read_with<R>(&self, project: impl FnOnce(&T) -> R) -> R {
         let value = self.shared.value();
         project(&value)
@@ -1131,7 +1170,9 @@ mod tests {
 
     struct FrameworkDropProbe(mpsc::Sender<ThreadId>);
 
-    impl super::FrameworkPlain for FrameworkDropProbe {}
+    // SAFETY: this test-only probe performs one nonblocking channel send on
+    // drop and cannot reach application code or framework locks.
+    unsafe impl super::FrameworkPlain for FrameworkDropProbe {}
 
     impl Drop for FrameworkDropProbe {
         fn drop(&mut self) {
@@ -1375,6 +1416,49 @@ mod tests {
             OneShotClose::Empty
         ));
         assert_eq!(sender.send(1), Err(1));
+    }
+
+    #[test]
+    fn oneshot_repoll_uses_a_framework_owned_diagnostic() {
+        const REPOLL: &str = "shelterwood one-shot receiver polled after completion";
+
+        let mut context = Context::from_waker(Waker::noop());
+        let (sender, mut receiver) = oneshot();
+        sender.send(1_u8).expect("receiver is live");
+        assert!(matches!(
+            receiver.poll_receive(&mut context),
+            Poll::Ready(Some(1))
+        ));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.poll_receive(&mut context);
+        }))
+        .expect_err("a completed one-shot cannot be polled twice");
+        assert_panic_message(&*payload, REPOLL);
+
+        let (sender, receiver) = oneshot();
+        sender.send(2_u8).expect("receiver is live");
+        let mut receiver = DisposingReceiver::new(receiver);
+        assert!(matches!(
+            receiver.poll_receive(&mut context),
+            Poll::Ready(Some(2))
+        ));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.poll_receive(&mut context);
+        }))
+        .expect_err("a completed disposing receiver cannot be polled twice");
+        assert_panic_message(&*payload, REPOLL);
+
+        let (sender, mut receiver) = oneshot();
+        sender.send(3_u8).expect("receiver is live");
+        assert!(matches!(
+            receiver.close_and_poll_receive(&mut context),
+            OneShotClose::Value(3)
+        ));
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.close_and_poll_receive(&mut context);
+        }))
+        .expect_err("a completed close poll cannot be repeated");
+        assert_panic_message(&*payload, REPOLL);
     }
 
     #[test]

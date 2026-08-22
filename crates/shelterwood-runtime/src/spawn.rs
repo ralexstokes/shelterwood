@@ -3,7 +3,7 @@ use std::{
     future::{Future, poll_fn},
     ops::RangeBounds,
     panic::resume_unwind,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
     task::Poll,
 };
 
@@ -233,6 +233,16 @@ where
             pending: Mutex::new(Some((operation, completion))),
         })
     }
+
+    /// Recovers the pending slot even after an injected or future panic.
+    ///
+    /// `Drop` can run during an unrelated unwind, so poisoning must not turn
+    /// its capture-disposal fallback into a double panic. The mutex protects
+    /// only an ownership move; recovery never observes a partially-mutated
+    /// user value.
+    fn lock_pending(&self) -> MutexGuard<'_, Option<(F, BlockingCompletion<T>)>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl<F, T> BlockingPoolJob for BlockingJob<F, T>
@@ -241,12 +251,7 @@ where
     T: Send + 'static,
 {
     fn run(&self) {
-        let Some((operation, completion)) = self
-            .pending
-            .lock()
-            .expect("blocking job mutex poisoned")
-            .take()
-        else {
+        let Some((operation, completion)) = self.lock_pending().take() else {
             return;
         };
         let outcome = catch_panic(operation);
@@ -269,10 +274,7 @@ where
     }
 
     fn is_pending(&self) -> bool {
-        self.pending
-            .lock()
-            .expect("blocking job mutex poisoned")
-            .is_some()
+        self.lock_pending().is_some()
     }
 }
 
@@ -282,12 +284,7 @@ where
     T: Send + 'static,
 {
     fn drop(&mut self) {
-        let Some((operation, completion)) = self
-            .pending
-            .lock()
-            .expect("blocking job mutex poisoned")
-            .take()
-        else {
+        let Some((operation, completion)) = self.lock_pending().take() else {
             return;
         };
         // A cancelled or unstartable job must wake its waiter, but a hostile
@@ -701,6 +698,14 @@ mod tests {
         }
     }
 
+    struct ActorDropNotice(mpsc::Sender<()>);
+
+    impl Drop for ActorDropNotice {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
     struct PanicWake(Arc<AtomicUsize>);
 
     impl Wake for PanicWake {
@@ -818,6 +823,81 @@ mod tests {
         // ownership across clone, wake, and drop.
         let waker = unsafe { Waker::from_raw(raw) };
         (ManuallyDrop::new(waker), state, observed_drop)
+    }
+
+    #[tokio::test]
+    async fn dropping_actor_work_aborts_its_task() {
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped, dropped_rx) = mpsc::channel();
+        let work = super::spawn_actor_work(async move {
+            let _notice = ActorDropNotice(dropped);
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("the actor work starts");
+
+        drop(work);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match dropped_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        panic!("the aborted actor work did not drop its task state")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("actor-work drop cancellation completes");
+    }
+
+    #[tokio::test]
+    async fn actor_work_abort_is_idempotent_and_join_reports_cancelled() {
+        let work = super::spawn_actor_work(std::future::pending::<()>());
+        work.abort();
+        work.abort();
+
+        assert!(matches!(work.join().await, super::JoinOutcome::Cancelled));
+    }
+
+    #[test]
+    fn unbounded_sender_returns_the_value_after_receiver_close() {
+        let (sender, receiver) = super::unbounded_mpsc();
+        drop(receiver);
+
+        assert_eq!(
+            sender.send(String::from("returned")),
+            Err(String::from("returned"))
+        );
+    }
+
+    #[test]
+    fn jitter_rng_respects_requested_bounds() {
+        let mut rng = super::JitterRng::new();
+        for _ in 0..128 {
+            assert!((7..11).contains(&rng.sample(7..11)));
+        }
+    }
+
+    #[test]
+    fn blocking_job_recovers_poison_for_pending_checks_and_drop() {
+        let (completion, _receiver) = super::oneshot();
+        let job = super::BlockingJob::new(|| (), completion);
+        let injected = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let _guard = job.pending.lock().expect("fresh blocking-job mutex");
+            panic!("inject blocking-job mutex poison");
+        }));
+        assert!(injected.is_err());
+        assert!(
+            job.is_pending(),
+            "poison recovery preserves the pending job"
+        );
+        assert!(
+            panic::catch_unwind(panic::AssertUnwindSafe(|| drop(job))).is_ok(),
+            "blocking-job drop stays panic-free after poison"
+        );
     }
 
     #[tokio::test]

@@ -31,11 +31,9 @@ pub enum WakerAction {
     Run(fn(Waker)),
 }
 
-enum WakerEffect {
-    Wake(Waker),
-    DropInline(Waker),
-    Dispose(Arc<dyn MailboxRuntime>, Waker),
-    Run(fn(Waker), Waker),
+struct WakerEffect {
+    waker: Waker,
+    action: WakerAction,
 }
 
 /// Deferred waker effects, flushed only with no framework mutex held.
@@ -72,23 +70,18 @@ impl WakerEffects {
     }
 
     fn push(&mut self, waker: Waker, action: WakerAction) {
-        self.0.push(match action {
-            WakerAction::Wake => WakerEffect::Wake(waker),
-            WakerAction::DropInline => WakerEffect::DropInline(waker),
-            WakerAction::Dispose(runtime) => WakerEffect::Dispose(runtime, waker),
-            WakerAction::Run(effect) => WakerEffect::Run(effect, waker),
-        });
+        self.0.push(WakerEffect { waker, action });
     }
 
     pub fn flush(&mut self, panics: &mut PanicAccumulator) {
-        for effect in self.0.drain(..) {
-            match effect {
-                WakerEffect::Wake(waker) => panics.run(|| waker.wake()),
-                WakerEffect::DropInline(waker) => panics.run(|| drop(waker)),
-                WakerEffect::Dispose(runtime, waker) => {
+        for WakerEffect { waker, action } in self.0.drain(..) {
+            match action {
+                WakerAction::Wake => panics.run(|| waker.wake()),
+                WakerAction::DropInline => panics.run(|| drop(waker)),
+                WakerAction::Dispose(runtime) => {
                     panics.run(|| runtime.dispose(Box::new(waker)));
                 }
-                WakerEffect::Run(effect, waker) => panics.run(|| effect(waker)),
+                WakerAction::Run(effect) => panics.run(|| effect(waker)),
             }
         }
     }

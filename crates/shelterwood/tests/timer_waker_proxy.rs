@@ -444,8 +444,10 @@ fn raw_recv_timer_cancellation_does_not_stall_unrelated_timer_traffic() {
     let runtime = runtime();
     let gate = DestructorGate::default();
     let (entered_tx, entered_rx) = mpsc::channel();
-    // shutdown, local stop, mailbox, offload event, then the raw timer.
-    let (hostile, state) = ordinal_waker(5, &gate, entered_tx);
+    // shutdown, mailbox, offload event, then the raw timer. Local stop is
+    // actor-task-only, so `recv` checks it before parking rather than
+    // registering a waiter in this selection.
+    let (hostile, state) = ordinal_waker(4, &gate, entered_tx);
     let (polled_tx, polled_rx) = mpsc::channel();
     let (cancelled_tx, cancelled_rx) = mpsc::channel();
     let mut tree = Tree::new();
@@ -468,8 +470,8 @@ fn raw_recv_timer_cancellation_does_not_stall_unrelated_timer_traffic() {
         polled_rx
             .recv_timeout(POLL_TIMEOUT)
             .expect("the raw actor manually parks recv"),
-        5,
-        "the fifth caller clone belongs to the armed raw timer"
+        4,
+        "the fourth caller clone belongs to the armed raw timer"
     );
     let destructor_thread = entered_rx
         .recv_timeout(POLL_TIMEOUT)

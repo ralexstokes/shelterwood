@@ -88,9 +88,11 @@ macro_rules! context_common_forwarders {
         /// Starts blocking work tied to actor shutdown and returned-future drop.
         ///
         /// Available from [`StopContext`] too — deliberately, unlike
-        /// continuations, timers, and offloads. Awaiting the returned
-        /// [`Blocking`] resumes a panic raised inside the closure at the
-        /// await point.
+        /// continuations, timers, and offloads. The returned [`Blocking`] is
+        /// caller-owned rather than tracked in the incarnation resource
+        /// ledger, so intake freeze and teardown never depend on its
+        /// completion. Awaiting it resumes a panic raised inside the closure
+        /// at the await point.
         ///
         /// Cancellation is cooperative; a hard-aborted operation's OS thread
         /// detaches and may outlive this actor incarnation.

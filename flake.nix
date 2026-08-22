@@ -41,6 +41,23 @@
             }
           );
 
+          # Examples are asserting smoke tests; running them is the check.
+          # Keep the list in sync with the justfile's `examples` recipe.
+          examples-run = craneLibNightly.mkCargoDerivation (
+            commonArgs
+            // {
+              cargoArtifacts = cargoArtifactsNightly;
+              buildPhaseCargoCommand = ''
+                for example in quickstart request_reply supervision_restart \
+                  ordered_startup dynamic_scope graceful_shutdown observation \
+                  cyclic_wiring embedding; do
+                  cargo run --locked -p shelterwood --example "$example"
+                done
+              '';
+              doInstallCargoArtifacts = false;
+            }
+          );
+
           api-enforcement = craneLibNightly.mkCargoDerivation (
             commonArgs
             // {

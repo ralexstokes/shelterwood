@@ -272,9 +272,6 @@ pub mod guides {
 // never resolve them.
 #[cfg(doctest)]
 mod repository_docs {
-    #[doc = include_str!("../../../README.md")]
-    mod readme {}
-
     #[doc = include_str!("../../../docs/embedding.md")]
     mod embedding {}
 

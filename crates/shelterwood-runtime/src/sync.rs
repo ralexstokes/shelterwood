@@ -22,7 +22,10 @@ use super::{PanicAccumulator, dispose_detached, waker_proxy::ProxiedPoll};
 /// Cancellation destroys a removed caller-waker clone inline on the thread
 /// dropping `LatchWait` or `WatchWait`: unlike the external-primitive proxy
 /// family, the registry owns the waker directly and has no foreign drop seam
-/// that requires detached retirement.
+/// that requires detached retirement. That inherits the reply receiver's
+/// ruling rather than the proxy wrapper's — a slow caller-waker destructor
+/// stalls the abandoning waiter alone, and a hostile one is contained by the
+/// accumulator above.
 #[derive(Default)]
 struct WaiterRegistry {
     waiters: Mutex<Vec<RegisteredWaker>>,
@@ -387,7 +390,8 @@ const ONESHOT_SENT: u8 = 2;
 const ONESHOT_SENDER_CLOSED: u8 = 3;
 const ONESHOT_RECEIVER_CLOSED: u8 = 4;
 #[cfg(test)]
-const ONESHOT_REPOLL_PANIC: &str = "shelterwood one-shot receiver polled after completion";
+pub(crate) const ONESHOT_REPOLL_PANIC: &str =
+    "shelterwood one-shot receiver polled after completion";
 
 /// Sending half of a runtime-backed single-delivery channel.
 pub struct OneShotSender<T> {
@@ -399,6 +403,14 @@ pub struct OneShotSender<T> {
 pub struct OneShotReceiver<T> {
     channel: oneshot::Receiver<T>,
     state: Arc<AtomicU8>,
+    /// Whether a receive edge has already consumed Tokio's receiver.
+    ///
+    /// In the pinned Tokio 1.53.1, `Receiver::poll` clears its `Inner` once it
+    /// yields `Ready`, and `try_recv` clears it on every outcome but `Empty`;
+    /// a later `poll` then panics with a message naming neither Shelterwood
+    /// nor this seam. Every terminal edge here records that instead, so the
+    /// re-poll diagnostic is framework-owned. A bare [`Self::close`] is not
+    /// terminal — Tokio keeps the receiver pollable — so it does not set this.
     completed: bool,
 }
 
@@ -576,6 +588,10 @@ impl<T> OneShotReceiver<T> {
     /// close, which Tokio's post-close `try_recv` result alone cannot do. A
     /// send that wins but is preempted before publishing returns `Pending`;
     /// the channel poll in that branch registers the wake for its completion.
+    ///
+    /// Every outcome but `Pending` is terminal for this receiver: the close
+    /// has been arbitrated, so a later receive edge is a caller bug and gets
+    /// the framework diagnostic rather than a fresh arbitration.
     pub fn close_and_poll_receive(
         &mut self,
         context: &mut std::task::Context<'_>,
@@ -1513,6 +1529,19 @@ mod tests {
         .expect_err("try-receive terminality prevents a later close poll");
         assert_panic_message(&*payload, ONESHOT_REPOLL_PANIC);
 
+        // Tokio's `try_recv` consumes its receiver on every outcome but
+        // `Empty`, so an empty sender-closed take is terminal too.
+        let (sender, mut receiver) = oneshot::<u8>();
+        drop(sender);
+        assert_eq!(receiver.try_receive(), None);
+        let payload = catch_unwind(AssertUnwindSafe(|| {
+            let _ = receiver.poll_receive(&mut context);
+        }))
+        .expect_err("an exhausted try-receive prevents a later poll");
+        assert_panic_message(&*payload, ONESHOT_REPOLL_PANIC);
+
+        // A bare close is not a receive edge: the receiver stays pollable and
+        // reports the sender-closed result.
         let (sender, mut receiver) = oneshot::<u8>();
         receiver.close();
         drop(sender);

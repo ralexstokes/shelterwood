@@ -698,14 +698,6 @@ mod tests {
         }
     }
 
-    struct ActorDropNotice(mpsc::Sender<()>);
-
-    impl Drop for ActorDropNotice {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
-
     struct PanicWake(Arc<AtomicUsize>);
 
     impl Wake for PanicWake {
@@ -830,7 +822,7 @@ mod tests {
         let (started, started_rx) = tokio::sync::oneshot::channel();
         let (dropped, dropped_rx) = mpsc::channel();
         let work = super::spawn_actor_work(async move {
-            let _notice = ActorDropNotice(dropped);
+            let _notice = RecordingDrop(dropped);
             let _ = started.send(());
             std::future::pending::<()>().await;
         });
@@ -841,7 +833,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 match dropped_rx.try_recv() {
-                    Ok(()) => break,
+                    Ok(_) => break,
                     Err(mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         panic!("the aborted actor work did not drop its task state")
@@ -884,7 +876,7 @@ mod tests {
     #[test]
     fn blocking_job_recovers_poison_for_pending_checks_and_drop() {
         let (captured_dropped, captured_dropped_rx) = mpsc::channel();
-        let captured = ActorDropNotice(captured_dropped);
+        let captured = RecordingDrop(captured_dropped);
         let (completion, _receiver) = super::oneshot();
         let job = super::BlockingJob::new(move || drop(captured), completion);
         let injected = panic::catch_unwind(panic::AssertUnwindSafe(|| {

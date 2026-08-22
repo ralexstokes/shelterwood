@@ -133,6 +133,8 @@ mod tests {
 
     use shelterwood_core::{ErasedOneShotClose, ErasedOneShotReceiver, ErasedValue};
 
+    use crate::sync::ONESHOT_REPOLL_PANIC;
+
     use super::{TokioOneShotReceiver, mailbox_runtime};
 
     struct CountWake(Arc<AtomicUsize>);
@@ -222,8 +224,6 @@ mod tests {
 
     #[test]
     fn adapter_oneshot_rejects_poll_after_close_and_take_with_framework_diagnostic() {
-        const REPOLL: &str = "shelterwood one-shot receiver polled after completion";
-
         let runtime = mailbox_runtime();
         let (sender, mut receiver) = runtime.oneshot();
         sender
@@ -245,7 +245,7 @@ mod tests {
         .expect_err("an erased receiver cannot poll after terminal take");
         assert_eq!(
             payload.downcast_ref::<&'static str>().copied(),
-            Some(REPOLL)
+            Some(ONESHOT_REPOLL_PANIC)
         );
     }
 

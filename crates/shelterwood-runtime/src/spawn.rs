@@ -883,8 +883,10 @@ mod tests {
 
     #[test]
     fn blocking_job_recovers_poison_for_pending_checks_and_drop() {
+        let (captured_dropped, captured_dropped_rx) = mpsc::channel();
+        let captured = ActorDropNotice(captured_dropped);
         let (completion, _receiver) = super::oneshot();
-        let job = super::BlockingJob::new(|| (), completion);
+        let job = super::BlockingJob::new(move || drop(captured), completion);
         let injected = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             let _guard = job.pending.lock().expect("fresh blocking-job mutex");
             panic!("inject blocking-job mutex poison");
@@ -898,6 +900,9 @@ mod tests {
             panic::catch_unwind(panic::AssertUnwindSafe(|| drop(job))).is_ok(),
             "blocking-job drop stays panic-free after poison"
         );
+        captured_dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("poison recovery still retires the captured operation");
     }
 
     #[tokio::test]

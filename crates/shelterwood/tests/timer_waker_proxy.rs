@@ -4,17 +4,16 @@ use std::{
     future::Future,
     mem::ManuallyDrop,
     pin::Pin,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc,
-    },
-    task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker},
+    sync::{Arc, mpsc},
+    task::{Context as TaskContext, Poll, Waker},
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
 
-use common::{DestructorBlocker, DestructorGate, POLL_TIMEOUT};
+use common::{
+    DestructorGate, LiveWakerCounter, OrdinalWakerState, POLL_TIMEOUT, counting_waker,
+    ordinal_drop_waker as action_ordinal_drop_waker, ordinal_waker as action_ordinal_waker,
+};
 use shelterwood::{
     Actor, ActorOnceDef, Context, DynamicTree, ExitError, ExitResult, RawActor, RawContext,
     RawOnceDef, ScopeRef, Shutdown, TaskDef, Tree,
@@ -35,208 +34,34 @@ impl Actor for IdleActor {
     }
 }
 
-struct BlockingDropWaker {
-    blocked: AtomicBool,
-    blocker: Mutex<Option<DestructorBlocker>>,
-    entered: mpsc::Sender<ThreadId>,
-}
+/// The ordinal `Deadlined::poll` hands the timer proxy's stored caller waker.
+/// The operation registers its own clone first, so the timer's is second; the
+/// timer itself only ever sees the stable framework-owned proxy and mints no
+/// further clone through this vtable.
+const TIMER_CALLER_WAKER_ORDINAL: usize = 2;
 
-unsafe fn clone_blocking_drop_waker(data: *const ()) -> RawWaker {
-    // SAFETY: every pointer using this vtable came from an Arc of the
-    // matching type. ManuallyDrop preserves the reference represented by
-    // `data`; the returned raw waker owns only the new clone.
-    let state = ManuallyDrop::new(unsafe { Arc::<BlockingDropWaker>::from_raw(data.cast()) });
-    RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &BLOCKING_DROP_WAKER_VTABLE,
-    )
-}
-
-unsafe fn wake_blocking_drop_waker(data: *const ()) {
-    // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<BlockingDropWaker>::from_raw(data.cast()) });
-}
-
-unsafe fn wake_by_ref_blocking_drop_waker(_data: *const ()) {}
-
-unsafe fn drop_blocking_drop_waker(data: *const ()) {
-    // SAFETY: drop consumes the Arc reference represented by this raw waker.
-    let state = unsafe { Arc::<BlockingDropWaker>::from_raw(data.cast()) };
-    if !state.blocked.swap(true, Ordering::SeqCst) {
-        let blocker = state
-            .blocker
-            .lock()
-            .expect("blocking waker mutex poisoned")
-            .take()
-            .expect("the first framework clone owns the blocker");
-        let _ = state.entered.send(thread::current().id());
-        drop(blocker);
-    }
-}
-
-static BLOCKING_DROP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_blocking_drop_waker,
-    wake_blocking_drop_waker,
-    wake_by_ref_blocking_drop_waker,
-    drop_blocking_drop_waker,
-);
-
+/// A caller waker whose timer-proxy clone blocks when the framework retires
+/// it. Naming the ordinal rather than blocking on whichever clone retires
+/// first keeps the fixture aimed at the timer seam the tests below describe.
 fn blocking_drop_waker(gate: &DestructorGate, entered: mpsc::Sender<ThreadId>) -> Waker {
-    let raw = RawWaker::new(
-        Arc::into_raw(Arc::new(BlockingDropWaker {
-            blocked: AtomicBool::new(false),
-            blocker: Mutex::new(Some(gate.blocker())),
-            entered,
-        }))
-        .cast(),
-        &BLOCKING_DROP_WAKER_VTABLE,
-    );
-    // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-    // ownership across clone, wake, and drop.
-    unsafe { Waker::from_raw(raw) }
-}
-
-#[derive(Default)]
-struct LiveWakerCounter(AtomicUsize);
-
-unsafe fn clone_counting_waker(data: *const ()) -> RawWaker {
-    // SAFETY: every pointer using this vtable came from an Arc of the
-    // matching type. ManuallyDrop preserves the reference represented by
-    // `data`; the returned raw waker owns only the new clone.
-    let state = ManuallyDrop::new(unsafe { Arc::<LiveWakerCounter>::from_raw(data.cast()) });
-    state.0.fetch_add(1, Ordering::SeqCst);
-    RawWaker::new(
-        Arc::into_raw(Arc::clone(&state)).cast(),
-        &COUNTING_WAKER_VTABLE,
-    )
-}
-
-unsafe fn wake_counting_waker(data: *const ()) {
-    // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    let state = unsafe { Arc::<LiveWakerCounter>::from_raw(data.cast()) };
-    state.0.fetch_sub(1, Ordering::SeqCst);
-}
-
-unsafe fn wake_by_ref_counting_waker(_data: *const ()) {}
-
-unsafe fn drop_counting_waker(data: *const ()) {
-    // SAFETY: drop consumes the Arc reference represented by this raw waker.
-    let state = unsafe { Arc::<LiveWakerCounter>::from_raw(data.cast()) };
-    state.0.fetch_sub(1, Ordering::SeqCst);
-}
-
-static COUNTING_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_counting_waker,
-    wake_counting_waker,
-    wake_by_ref_counting_waker,
-    drop_counting_waker,
-);
-
-fn counting_waker(counter: &Arc<LiveWakerCounter>) -> Waker {
-    // Include the caller-owned waker in the live count so every handle using
-    // this vtable has the same balanced clone/drop accounting.
-    counter.0.fetch_add(1, Ordering::SeqCst);
-    let raw = RawWaker::new(
-        Arc::into_raw(Arc::clone(counter)).cast(),
-        &COUNTING_WAKER_VTABLE,
-    );
-    // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-    // ownership across clone, wake, and drop.
-    unsafe { Waker::from_raw(raw) }
-}
-
-struct OrdinalWaker {
-    ordinal: usize,
-    shared: Arc<OrdinalWakerState>,
-}
-
-struct OrdinalWakerState {
-    clones: AtomicUsize,
-    target: AtomicUsize,
-    blocked: AtomicBool,
-    blocker: Mutex<Option<DestructorBlocker>>,
-    entered: mpsc::Sender<ThreadId>,
-}
-
-unsafe fn clone_ordinal_waker(data: *const ()) -> RawWaker {
-    // SAFETY: every pointer using this vtable came from an Arc of the
-    // matching type. ManuallyDrop preserves the reference represented by
-    // `data`; the returned raw waker owns only the new clone.
-    let current = ManuallyDrop::new(unsafe { Arc::<OrdinalWaker>::from_raw(data.cast()) });
-    let ordinal = current.shared.clones.fetch_add(1, Ordering::SeqCst) + 1;
-    RawWaker::new(
-        Arc::into_raw(Arc::new(OrdinalWaker {
-            ordinal,
-            shared: Arc::clone(&current.shared),
-        }))
-        .cast(),
-        &ORDINAL_WAKER_VTABLE,
-    )
-}
-
-unsafe fn wake_ordinal_waker(data: *const ()) {
-    // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    unsafe { drop_ordinal_waker(data) };
-}
-
-unsafe fn wake_by_ref_ordinal_waker(_data: *const ()) {}
-
-unsafe fn drop_ordinal_waker(data: *const ()) {
-    // SAFETY: drop consumes the Arc reference represented by this raw waker.
-    let current = unsafe { Arc::<OrdinalWaker>::from_raw(data.cast()) };
-    if current.ordinal == current.shared.target.load(Ordering::SeqCst)
-        && !current.shared.blocked.swap(true, Ordering::SeqCst)
-    {
-        let blocker = current
-            .shared
-            .blocker
-            .lock()
-            .expect("ordinal waker mutex poisoned")
-            .take()
-            .expect("the targeted framework clone owns the blocker");
-        let _ = current.shared.entered.send(thread::current().id());
+    let blocker = gate.blocker();
+    action_ordinal_drop_waker(TIMER_CALLER_WAKER_ORDINAL, move || {
+        let _ = entered.send(thread::current().id());
         drop(blocker);
-    }
+    })
+    .0
 }
-
-static ORDINAL_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    clone_ordinal_waker,
-    wake_ordinal_waker,
-    wake_by_ref_ordinal_waker,
-    drop_ordinal_waker,
-);
 
 fn ordinal_waker(
     target: usize,
     gate: &DestructorGate,
     entered: mpsc::Sender<ThreadId>,
 ) -> (Waker, Arc<OrdinalWakerState>) {
-    let shared = Arc::new(OrdinalWakerState {
-        clones: AtomicUsize::new(0),
-        target: AtomicUsize::new(target),
-        blocked: AtomicBool::new(false),
-        blocker: Mutex::new(Some(gate.blocker())),
-        entered,
-    });
-    let raw = RawWaker::new(
-        Arc::into_raw(Arc::new(OrdinalWaker {
-            ordinal: 0,
-            shared: Arc::clone(&shared),
-        }))
-        .cast(),
-        &ORDINAL_WAKER_VTABLE,
-    );
-    // SAFETY: `raw` owns one Arc reference and its vtable maintains that
-    // ownership across clone, wake, and drop.
-    (unsafe { Waker::from_raw(raw) }, shared)
-}
-
-impl OrdinalWakerState {
-    fn target_latest_clone(&self, path: &str) {
-        let target = self.clones.load(Ordering::SeqCst);
-        assert_ne!(target, 0, "{path} registers a caller waker");
-        self.target.store(target, Ordering::SeqCst);
-    }
+    let blocker = gate.blocker();
+    action_ordinal_waker(target, move || {
+        let _ = entered.send(thread::current().id());
+        drop(blocker);
+    })
 }
 
 fn poll_until_registered<F>(runtime: &tokio::runtime::Runtime, future: Pin<&mut F>, path: &str)
@@ -261,7 +86,7 @@ where
         // The caller owns one live handle. Two additional handles prove the
         // operation and timer are both parked; repeatedly replacing one
         // registration can no longer satisfy the preparation condition.
-        if counter.0.load(Ordering::SeqCst) >= 3 {
+        if counter.live() >= 3 {
             return;
         }
         assert!(
@@ -607,7 +432,7 @@ impl RawActor for RawRecvTimerProbe {
                 .poll(&mut TaskContext::from_waker(&hostile))
                 .is_pending()
         );
-        let _ = self.polled.send(self.clones.clones.load(Ordering::SeqCst));
+        let _ = self.polled.send(self.clones.clones());
         drop(receive);
         let _ = self.cancelled.send(thread::current().id());
         Ok(())

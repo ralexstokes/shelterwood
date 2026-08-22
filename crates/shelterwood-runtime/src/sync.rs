@@ -289,6 +289,12 @@ const COMPLETION_GATE_CLOSED_FIRED: u8 = 3;
 /// gate and reports whether the signal won first, so a capability retained by
 /// another task cannot publish after completion or disappear between a sample
 /// and the completion notification.
+///
+/// The wake lags the state: both transitions publish their state CAS before
+/// firing the corresponding latch, so `is_fired`/`is_completed` can read
+/// true while the matching waiter's wake is still in flight. A waiter racing
+/// `fired()` against `completed()` must resolve the tie by state or by
+/// left-biased selection (`select_two`), never by wake arrival order.
 #[derive(Clone, Debug)]
 pub struct CompletionGatedLatch {
     state: Arc<AtomicU8>,

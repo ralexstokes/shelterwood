@@ -1534,6 +1534,12 @@ impl ScopeCell {
     /// streams; a subscriber attaching after the final event and before that
     /// closure therefore resolves by closure alone, as it already does on the
     /// stale-epoch path above.
+    ///
+    /// Reachability note: in production the upgrade arm's only visitor is
+    /// `ShutdownRequested` outranking an already-recorded weaker reason —
+    /// the SPEC §11 stop-precedence order stands. The synthetic lattice
+    /// tests below (and `begin_drain`'s twin in `shelterwood-core`) drive
+    /// the full precedence table directly.
     fn publish_stopped_locked(
         &self,
         wakes: &mut ObservationTxn<'_>,

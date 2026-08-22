@@ -374,6 +374,12 @@ pub enum Either<L, R> {
     Right(R),
 }
 
+/// Polls two futures and resolves with the first to become ready.
+///
+/// Ties are contractual, not incidental: when both are ready in the same
+/// poll, `Left` always wins. Callers order a "won" edge before a
+/// "closed"/"completed" edge on exactly this bias — a latch that fired and
+/// completed must still report the fired side.
 pub async fn select_two<A, B>(left: A, right: B) -> Either<A::Output, B::Output>
 where
     A: Future + Send,

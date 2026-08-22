@@ -163,6 +163,29 @@ impl Subtree for Tree {}
 impl Subtree for DynamicTree {}
 #[must_use = "dropping the sole system owner requests graceful shutdown"]
 /// The sole owning handle for a running root system.
+///
+/// [`Tree::spawn`] and [`DynamicTree::spawn`] return exactly one `System`;
+/// it is not cloneable, and non-owning handles come from [`System::scope`].
+/// The owner sequences the root lifecycle:
+///
+/// - [`System::wait_started`] reports the startup outcome but deliberately
+///   leaves the successfully started prefix running and supervised, so the
+///   caller decides what a partial start means.
+/// - [`System::start_or_shutdown`] is the rollback form: on startup failure
+///   it consumes the owner and drives full shutdown of the started prefix,
+///   preserving the original cause beside any rollback timeout report.
+/// - [`System::shutdown`] consumes the owner, bounds the cooperative
+///   teardown phase with its timeout, and joins the root driver before
+///   returning.
+/// - [`System::wait`] consumes the owner and resolves at natural or
+///   externally requested terminal state.
+///
+/// Dropping a `System` requests graceful shutdown, but only an awaited
+/// [`System::shutdown`] joins the root driver and returns straggler
+/// evidence ([`ShutdownTimeout`]); an embedding host should normally await
+/// it before tearing down the async runtime. The escalation ladder, what a
+/// completed shutdown does and does not guarantee, and runtime-lifetime
+/// obligations are documented in [`crate::guides::shutdown_and_resources`].
 pub struct System<R = ScopeRef> {
     pub(super) root: R,
     pub(super) run: crate::driver::SystemRun,
@@ -187,6 +210,20 @@ impl<R: Clone> System<R> {
 
 impl<R> System<R> {
     /// Waits until the declared tree is ready or startup terminally fails.
+    ///
+    /// Resolves `Ok` once every declared child is ready — gated one child at
+    /// a time in an ordered [`Tree`], concurrently and counting initial
+    /// members only in a [`DynamicTree`]. A startup failure is reported here
+    /// but deliberately leaves the successfully started prefix running and
+    /// supervised: the caller chooses between a host-specific response and
+    /// rollback. Use [`Self::start_or_shutdown`] when a failed startup
+    /// should tear the prefix down.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`StartupError`] recorded by the root startup barrier: a
+    /// terminal child failure during startup, a restart-intensity trip, or a
+    /// shutdown requested before startup completed.
     pub async fn wait_started(&self) -> Result<(), StartupError> {
         self.run.root.wait_started().await
     }
@@ -198,6 +235,12 @@ impl<R> System<R> {
     /// preserves both the original startup cause and any rollback timeout.
     /// A zero rollback budget requests cooperative cancellation and then
     /// enters the ordinary escalation tail without a cooperative wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StartOrShutdownError`] carrying the original
+    /// [`StartupError`] beside any [`ShutdownTimeout`] the rollback
+    /// produced; rollback never masks the startup cause.
     pub async fn start_or_shutdown(
         mut self,
         timeout: impl Into<DeadlineBudget>,
@@ -226,6 +269,15 @@ impl<R> System<R> {
     /// past hard abort independently of that fallback.
     /// A zero budget still requests cooperative cancellation, then skips its
     /// wait and enters the ordinary escalation tail immediately.
+    /// [`crate::guides::shutdown_and_resources`] documents the full
+    /// escalation ladder and the runtime-lifetime obligations around this
+    /// call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShutdownTimeout`] when cooperative teardown exceeded
+    /// `timeout` and stragglers were escalated; the root driver is joined
+    /// before the report returns.
     pub async fn shutdown(
         mut self,
         timeout: impl Into<DeadlineBudget>,

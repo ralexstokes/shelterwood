@@ -55,8 +55,16 @@ pub enum LifecycleItem {
     /// One ordered lifecycle edge.
     Event(LifecycleEvent),
     /// Older events were dropped from this subscriber's private queue.
+    ///
+    /// The marker *leads* its overflow episode: it arrives before the
+    /// retained events, which may be older than the aligned resync snapshot
+    /// and may themselves still be evicted by further overflow. Resynchronize
+    /// with the subscribe-then-[`snapshot`](crate::ScopeRef::snapshot)
+    /// protocol instead of reasoning about what follows the marker.
     Lagged {
-        /// Exact number of events dropped in this overflow episode.
+        /// Number of drops accounted when this marker was produced.
+        ///
+        /// A later marker may report further drops from the same episode.
         dropped: u64,
     },
 }
@@ -1020,6 +1028,11 @@ impl fmt::Debug for LifecycleHub {
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum WaitError {
     /// The trailing deadline elapsed before a matching child appeared.
+    ///
+    /// Termination is observable once published: a bounded wait racing that
+    /// publication honestly reports `TimedOut` even though the child's end
+    /// may already have logically happened. The published stream is the
+    /// waiter's sole authority.
     #[error("child wait timed out")]
     TimedOut,
     /// The observed scope membership terminalized before a match.

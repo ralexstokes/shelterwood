@@ -118,6 +118,10 @@ pub struct NonZeroDuration(Duration);
 
 impl NonZeroDuration {
     /// Validates and constructs a non-zero duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::ZeroDuration`] when `duration` is zero.
     pub fn new(duration: Duration) -> Result<Self, PolicyError> {
         if duration.is_zero() {
             Err(PolicyError::ZeroDuration)
@@ -170,6 +174,9 @@ impl JitterSample {
     }
 
     /// Normalizes an integer ratio and clamps it into `[0, 1)`.
+    ///
+    /// A zero denominator — or any ratio that is not finite — maps to zero,
+    /// the bottom of the range, not the ceiling.
     #[must_use]
     pub fn from_u64_ratio(numerator: u64, denominator: u64) -> Self {
         Self::new(numerator as f64 / denominator as f64)
@@ -182,6 +189,11 @@ pub struct BackoffFactor(f64);
 
 impl BackoffFactor {
     /// Validates and constructs a factor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::InvalidBackoffFactor`] when `value` is not
+    /// finite or is below `1.0`.
     pub fn new(value: f64) -> Result<Self, PolicyError> {
         let factor = Self(value);
         factor.validate()?;
@@ -252,6 +264,35 @@ impl std::hash::Hash for BackoffFactor {
 ///     max: Duration::from_secs(1),
 ///     jitter: Jitter::None,
 /// });
+/// ```
+///
+/// # Examples
+///
+/// Validated payloads come from [`Backoff::fixed`] and
+/// [`Backoff::exponential`]; [`Backoff::next_delay`] then derives each
+/// attempt's delay, clamped to the configured maximum:
+///
+/// ```
+/// # use std::time::Duration;
+/// # use shelterwood_core::{
+/// #     Backoff, BackoffFactor, Jitter, JitterSample, RestartAttempt,
+/// # };
+/// let backoff = Backoff::exponential(
+///     Duration::from_millis(10),
+///     BackoffFactor::new(2.0)?,
+///     Duration::from_millis(35),
+///     Jitter::None,
+/// )?;
+///
+/// let sample = JitterSample::new(0.0);
+/// let first = RestartAttempt::ZERO.bump();
+/// let second = first.bump();
+/// let third = second.bump();
+/// assert_eq!(backoff.next_delay(first, sample), Duration::from_millis(10));
+/// assert_eq!(backoff.next_delay(second, sample), Duration::from_millis(20));
+/// // The doubled third delay would exceed the maximum, so it clamps.
+/// assert_eq!(backoff.next_delay(third, sample), Duration::from_millis(35));
+/// # Ok::<(), shelterwood_core::PolicyError>(())
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Backoff {
@@ -388,6 +429,10 @@ impl ExponentialBackoff {
 
 impl Backoff {
     /// Constructs a validated fixed backoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::ZeroDuration`] when `delay` is zero.
     pub fn fixed(delay: Duration, jitter: Jitter) -> Result<Self, PolicyError> {
         if delay.is_zero() {
             return Err(PolicyError::ZeroDuration);
@@ -397,8 +442,11 @@ impl Backoff {
 
     /// Constructs a validated exponential backoff.
     ///
-    /// Only [`PolicyError::ZeroDuration`] and
-    /// [`PolicyError::BackoffMaximumBeforeBase`] are reachable here: the
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::ZeroDuration`] when `base` or `max` is zero,
+    /// and [`PolicyError::BackoffMaximumBeforeBase`] when `max` is shorter
+    /// than `base`. Only those two variants are reachable here: the
     /// multiplier carries its own invariant, so
     /// [`PolicyError::InvalidBackoffFactor`] is spent at
     /// [`BackoffFactor::new`] before this call can be written.
@@ -425,6 +473,8 @@ impl Backoff {
     /// Derives the delay for a one-origin restart attempt.
     ///
     /// Randomness is deliberately supplied as external, range-checked data.
+    /// `RestartAttempt::ZERO` is coerced to the first attempt and yields the
+    /// same delay as attempt 1.
     #[must_use]
     pub fn next_delay(self, attempt: RestartAttempt, jitter_sample: JitterSample) -> Duration {
         let attempt = attempt.get().max(1);
@@ -510,6 +560,37 @@ fn duration_from_nanos(nanos: f64) -> Duration {
 }
 
 /// Restart condition and delay policy for one child.
+///
+/// The [`Default`] policy restarts on failure with [`Backoff::Immediate`].
+///
+/// # Examples
+///
+/// Build a policy from validated parts and carry it as a scope default:
+///
+/// ```
+/// # use std::time::Duration;
+/// # use shelterwood_core::{
+/// #     Backoff, BackoffFactor, Jitter, RestartCondition, RestartPolicy,
+/// #     ScopeDefaults,
+/// # };
+/// let backoff = Backoff::exponential(
+///     Duration::from_millis(100),
+///     BackoffFactor::new(2.0)?,
+///     Duration::from_secs(5),
+///     Jitter::Equal,
+/// )?;
+/// let policy = RestartPolicy::new(RestartCondition::OnFailure, backoff);
+/// assert_eq!(policy.condition(), RestartCondition::OnFailure);
+/// assert_eq!(policy.backoff(), backoff);
+/// assert!(!policy.is_never());
+///
+/// let defaults = ScopeDefaults {
+///     child_restart: Some(policy),
+///     ..ScopeDefaults::default()
+/// };
+/// assert_eq!(defaults.child_restart, Some(policy));
+/// # Ok::<(), shelterwood_core::PolicyError>(())
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RestartPolicy {
     condition: RestartCondition,
@@ -578,6 +659,10 @@ impl Default for Shutdown {
 
 impl Shutdown {
     /// Constructs a graceful policy with a validated non-zero grace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::ZeroDuration`] when `grace` is zero.
     pub fn graceful(grace: Duration) -> Result<Self, PolicyError> {
         Ok(Self::Graceful {
             grace: NonZeroDuration::new(grace)?,
@@ -610,6 +695,10 @@ pub enum ReadinessDeadline {
 
 impl ReadinessDeadline {
     /// Constructs a validated bounded deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::ZeroDuration`] when `duration` is zero.
     pub fn bounded(duration: Duration) -> Result<Self, PolicyError> {
         Ok(Self::Bounded(NonZeroDuration::new(duration)?))
     }
@@ -643,6 +732,21 @@ impl ReadinessDeadline {
 /// let intensity = Intensity::new(1, Duration::from_secs(1)).unwrap();
 /// let _ = intensity.within;
 /// ```
+///
+/// # Examples
+///
+/// Every budget passes through the validating constructor — the [`Default`]
+/// budget of five restarts within thirty seconds included — and the
+/// accessors return what it accepted:
+///
+/// ```
+/// # use std::time::Duration;
+/// # use shelterwood_core::Intensity;
+/// let budget = Intensity::new(5, Duration::from_secs(30))?;
+/// assert_eq!(budget.max_restarts(), 5);
+/// assert_eq!(budget.within(), Duration::from_secs(30));
+/// # Ok::<(), shelterwood_core::PolicyError>(())
+/// ```
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Intensity {
     // Maximum restart charges allowed inside the rolling window.
@@ -653,6 +757,12 @@ pub struct Intensity {
 
 impl Intensity {
     /// Constructs a validated intensity budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::ZeroDuration`] when `within` is zero. A
+    /// `max_restarts` of zero is a valid budget that admits no restart
+    /// charge: the first charge trips the scope.
     pub fn new(max_restarts: u64, within: Duration) -> Result<Self, PolicyError> {
         if within.is_zero() {
             return Err(PolicyError::ZeroDuration);
@@ -698,6 +808,10 @@ pub enum Mailbox {
 
 impl Mailbox {
     /// Constructs a FIFO mailbox with an explicit capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PolicyError::ZeroCapacity`] when `capacity` is zero.
     pub fn queue(capacity: usize) -> Result<Self, PolicyError> {
         NonZeroUsize::new(capacity)
             .map(|capacity| Self::Queue(Some(capacity)))

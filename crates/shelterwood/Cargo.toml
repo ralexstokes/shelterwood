@@ -13,6 +13,10 @@ repository = "https://github.com/ralexstokes/shelterwood"
 [lints]
 workspace = true
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--generate-link-to-definition"]
+
 [dependencies]
 shelterwood-core.workspace = true
 shelterwood-runtime.workspace = true

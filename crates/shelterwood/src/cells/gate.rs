@@ -77,6 +77,8 @@ pub(crate) struct ObservationTxn<'a> {
 
 impl<'a> ObservationTxn<'a> {
     pub(super) fn new(gate: &'a ObservationGate, guard: MutexGuard<'a, ()>) -> Self {
+        #[cfg(not(debug_assertions))]
+        let _ = gate;
         Self {
             guard: Some(guard),
             #[cfg(debug_assertions)]
@@ -102,16 +104,14 @@ impl<'a> ObservationTxn<'a> {
     ///
     /// Unit tests for isolated hub mechanics use [`Self::detached`], which
     /// deliberately carries no identity and therefore opts out.
+    #[cfg(debug_assertions)]
     pub(crate) fn debug_assert_gate(&self, gate: &ObservationGate) {
-        #[cfg(debug_assertions)]
         if let Some(held) = self.gate {
             debug_assert!(
                 held.shares_gate(gate),
                 "a locked observation writer requires its current tree gate"
             );
         }
-        #[cfg(not(debug_assertions))]
-        let _ = gate;
     }
 
     pub(crate) fn defer(&mut self, operation: impl FnOnce() + 'static) {

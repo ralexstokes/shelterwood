@@ -820,6 +820,7 @@ mod tests {
     use super::*;
     use crate::cells::test_support::{ThreadProbe, isolated_scope};
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "a locked observation writer requires its current tree gate")]
     fn locked_member_writer_checks_transaction_gate_identity() {

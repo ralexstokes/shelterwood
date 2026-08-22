@@ -12,9 +12,12 @@ use std::{
 };
 
 use crate::{
-    ActorIdentity, ActorRef, ChildId, Incarnation, MailboxControl, MailboxReceiver, SendErrorKind,
+    mailbox::{
+        ActorIdentity, ActorRef, ChildId, Incarnation, MailboxControl, MailboxReceiver,
+        SendErrorKind,
+        test_support::{mint_actor_incarnation, mint_actor_membership},
+    },
     policy::{ResolvedDefaults, ResolvedMailbox},
-    test_support::{mint_actor_incarnation, mint_actor_membership},
 };
 
 use super::MailboxCell;
@@ -84,21 +87,21 @@ enum BindEffectEvent {
 }
 
 struct BindOrderingRuntime {
-    inner: Arc<dyn crate::MailboxRuntime>,
+    inner: Arc<dyn crate::mailbox::MailboxRuntime>,
     events: Arc<Mutex<Vec<BindEffectEvent>>>,
 }
 
-impl crate::MailboxRuntime for BindOrderingRuntime {
+impl crate::mailbox::MailboxRuntime for BindOrderingRuntime {
     fn oneshot(
         &self,
     ) -> (
-        Box<dyn crate::ErasedOneShotSender>,
-        Pin<Box<dyn crate::ErasedOneShotReceiver>>,
+        Box<dyn crate::mailbox::ErasedOneShotSender>,
+        Pin<Box<dyn crate::mailbox::ErasedOneShotReceiver>>,
     ) {
         self.inner.oneshot()
     }
 
-    fn signal(&self) -> Arc<dyn crate::MailboxSignal> {
+    fn signal(&self) -> Arc<dyn crate::mailbox::MailboxSignal> {
         Arc::new(BindOrderingSignal {
             inner: self.inner.signal(),
             events: Arc::clone(&self.events),
@@ -117,7 +120,7 @@ impl crate::MailboxRuntime for BindOrderingRuntime {
         self.inner.now()
     }
 
-    fn sleep_until(&self, deadline: Option<Instant>) -> crate::BoxedSleep {
+    fn sleep_until(&self, deadline: Option<Instant>) -> crate::mailbox::BoxedSleep {
         self.inner.sleep_until(deadline)
     }
 }
@@ -125,22 +128,22 @@ impl crate::MailboxRuntime for BindOrderingRuntime {
 /// Runtime whose change signal panics once armed, so a mailbox effect
 /// flush can be made to unwind on demand.
 struct PanickingPulseRuntime {
-    inner: Arc<dyn crate::MailboxRuntime>,
+    inner: Arc<dyn crate::mailbox::MailboxRuntime>,
     armed: Arc<AtomicBool>,
     disposals: Arc<AtomicUsize>,
 }
 
-impl crate::MailboxRuntime for PanickingPulseRuntime {
+impl crate::mailbox::MailboxRuntime for PanickingPulseRuntime {
     fn oneshot(
         &self,
     ) -> (
-        Box<dyn crate::ErasedOneShotSender>,
-        Pin<Box<dyn crate::ErasedOneShotReceiver>>,
+        Box<dyn crate::mailbox::ErasedOneShotSender>,
+        Pin<Box<dyn crate::mailbox::ErasedOneShotReceiver>>,
     ) {
         self.inner.oneshot()
     }
 
-    fn signal(&self) -> Arc<dyn crate::MailboxSignal> {
+    fn signal(&self) -> Arc<dyn crate::mailbox::MailboxSignal> {
         Arc::new(PanickingPulseSignal {
             inner: self.inner.signal(),
             armed: Arc::clone(&self.armed),
@@ -156,17 +159,17 @@ impl crate::MailboxRuntime for PanickingPulseRuntime {
         self.inner.now()
     }
 
-    fn sleep_until(&self, deadline: Option<Instant>) -> crate::BoxedSleep {
+    fn sleep_until(&self, deadline: Option<Instant>) -> crate::mailbox::BoxedSleep {
         self.inner.sleep_until(deadline)
     }
 }
 
 struct PanickingPulseSignal {
-    inner: Arc<dyn crate::MailboxSignal>,
+    inner: Arc<dyn crate::mailbox::MailboxSignal>,
     armed: Arc<AtomicBool>,
 }
 
-impl crate::MailboxSignal for PanickingPulseSignal {
+impl crate::mailbox::MailboxSignal for PanickingPulseSignal {
     fn pulse(&self) {
         assert!(
             !self.armed.load(Ordering::SeqCst),
@@ -175,7 +178,7 @@ impl crate::MailboxSignal for PanickingPulseSignal {
         self.inner.pulse();
     }
 
-    fn watcher(&self) -> Box<dyn crate::MailboxSignalWatcher> {
+    fn watcher(&self) -> Box<dyn crate::mailbox::MailboxSignalWatcher> {
         self.inner.watcher()
     }
 }
@@ -192,11 +195,11 @@ impl Drop for ThreadRecordingMessage {
 }
 
 struct BindOrderingSignal {
-    inner: Arc<dyn crate::MailboxSignal>,
+    inner: Arc<dyn crate::mailbox::MailboxSignal>,
     events: Arc<Mutex<Vec<BindEffectEvent>>>,
 }
 
-impl crate::MailboxSignal for BindOrderingSignal {
+impl crate::mailbox::MailboxSignal for BindOrderingSignal {
     fn pulse(&self) {
         self.events
             .lock()
@@ -205,7 +208,7 @@ impl crate::MailboxSignal for BindOrderingSignal {
         self.inner.pulse();
     }
 
-    fn watcher(&self) -> Box<dyn crate::MailboxSignalWatcher> {
+    fn watcher(&self) -> Box<dyn crate::mailbox::MailboxSignalWatcher> {
         self.inner.watcher()
     }
 }
@@ -283,7 +286,7 @@ impl ActorIdentity for TestIdentity {
 }
 
 pub(crate) fn actor_for_with_runtime<M: Send + 'static>(
-    runtime: Arc<dyn crate::MailboxRuntime>,
+    runtime: Arc<dyn crate::mailbox::MailboxRuntime>,
 ) -> (Arc<MailboxCell<M>>, ActorRef<M>) {
     let id = ChildId::from("actor");
     let (membership, _) = mint_actor_membership();
@@ -294,12 +297,12 @@ pub(crate) fn actor_for_with_runtime<M: Send + 'static>(
     let mailbox = MailboxCell::new(id, runtime);
     (
         Arc::clone(&mailbox),
-        crate::actor_ref_from_parts(member, mailbox),
+        crate::mailbox::actor_ref_from_parts(member, mailbox),
     )
 }
 
 pub(crate) fn actor_for<M: Send + 'static>() -> (Arc<MailboxCell<M>>, ActorRef<M>) {
-    actor_for_with_runtime(crate::capability::tests::runtime())
+    actor_for_with_runtime(crate::mailbox::capability::tests::runtime())
 }
 
 pub(crate) fn actor() -> (Arc<MailboxCell<u8>>, ActorRef<u8>) {
@@ -309,24 +312,24 @@ pub(crate) fn actor() -> (Arc<MailboxCell<u8>>, ActorRef<u8>) {
 pub(crate) fn configure<M: Send + 'static>(
     mailbox: &MailboxCell<M>,
     policy: ResolvedMailbox,
-) -> crate::MailboxBindToken {
-    let mut effects = crate::MailboxEffectQueue::default();
+) -> crate::mailbox::MailboxBindToken {
+    let mut effects = crate::mailbox::MailboxEffectQueue::default();
     MailboxControl::configure(mailbox, policy, &mut effects)
 }
 
 pub(crate) fn bind<M: Send + 'static>(
     mailbox: &MailboxCell<M>,
-    token: crate::MailboxBindToken,
+    token: crate::mailbox::MailboxBindToken,
     incarnation: Incarnation,
 ) {
-    let mut effects = crate::MailboxEffectQueue::default();
+    let mut effects = crate::mailbox::MailboxEffectQueue::default();
     MailboxControl::bind(mailbox, token, incarnation, &mut effects);
 }
 
 pub(crate) fn prepare_termination<M: Send + 'static>(
     mailbox: &MailboxCell<M>,
-) -> Option<Box<dyn crate::MailboxTermination>> {
-    let mut effects = crate::MailboxEffectQueue::default();
+) -> Option<Box<dyn crate::mailbox::MailboxTermination>> {
+    let mut effects = crate::mailbox::MailboxEffectQueue::default();
     MailboxControl::prepare_termination(mailbox, &mut effects)
 }
 
@@ -336,7 +339,7 @@ fn park_with(future: &mut std::pin::Pin<Box<crate::SendFuture<u8>>>, waker: &Wak
 }
 
 pub(crate) fn freeze<M: Send + 'static>(mailbox: &MailboxCell<M>, incarnation: Incarnation) {
-    let mut effects = crate::MailboxEffectQueue::default();
+    let mut effects = crate::mailbox::MailboxEffectQueue::default();
     MailboxControl::freeze(mailbox, incarnation, &mut effects);
 }
 
@@ -345,8 +348,8 @@ pub(crate) fn freeze<M: Send + 'static>(mailbox: &MailboxCell<M>, incarnation: I
 pub(crate) fn close<M: Send + 'static>(
     mailbox: &MailboxCell<M>,
     incarnation: Incarnation,
-) -> Option<crate::MailboxClose> {
-    let mut effects = crate::MailboxEffectQueue::default();
+) -> Option<crate::mailbox::MailboxClose> {
+    let mut effects = crate::mailbox::MailboxEffectQueue::default();
     MailboxControl::close(mailbox, incarnation, &mut effects)
 }
 
@@ -373,7 +376,10 @@ impl Drop for TrackedMessage {
 fn freeze_and_close_preserve_waiters_payloads_and_incarnation_boundaries() {
     let drops = Arc::new(AtomicUsize::new(0));
     let (first, second) = two_incarnations();
-    let mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    let mailbox = MailboxCell::new(
+        ChildId::from("actor"),
+        crate::mailbox::capability::tests::runtime(),
+    );
     let token = configure(
         &mailbox,
         ResolvedMailbox::Queue(std::num::NonZeroUsize::new(1).expect("non-zero queue capacity")),
@@ -471,7 +477,10 @@ fn freeze_and_close_preserve_waiters_payloads_and_incarnation_boundaries() {
     assert!(close(&mailbox, second).is_none());
 
     let latest_drops = Arc::new(AtomicUsize::new(0));
-    let latest = MailboxCell::new(ChildId::from("latest"), crate::capability::tests::runtime());
+    let latest = MailboxCell::new(
+        ChildId::from("latest"),
+        crate::mailbox::capability::tests::runtime(),
+    );
     let latest_token = configure(&latest, ResolvedMailbox::Latest);
     bind(&latest, latest_token, first);
     assert!(matches!(
@@ -582,7 +591,7 @@ fn termination_finish_completes_waiters_and_isolates_payload_after_signal_panic(
     let armed = Arc::new(AtomicBool::new(false));
     let disposals = Arc::new(AtomicUsize::new(0));
     let runtime = Arc::new(PanickingPulseRuntime {
-        inner: crate::capability::tests::runtime(),
+        inner: crate::mailbox::capability::tests::runtime(),
         armed: Arc::clone(&armed),
         disposals: Arc::clone(&disposals),
     });
@@ -652,7 +661,10 @@ fn binding_replacement_preserves_a_live_waiter_identity_domain() {
 
 #[test]
 fn binding_replacement_invariant_panics_after_unlock() {
-    let mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    let mailbox = MailboxCell::new(
+        ChildId::from("actor"),
+        crate::mailbox::capability::tests::runtime(),
+    );
     let operation = super::SendOperation::new(1_u8);
     let mut waiters = super::WaiterQueue::default();
     assert!(waiters.park(&operation));
@@ -682,7 +694,10 @@ fn binding_replacement_invariant_panics_after_unlock() {
 
 #[test]
 fn withdrawal_registration_invariant_disposes_messages_before_resuming() {
-    let mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    let mailbox = MailboxCell::new(
+        ChildId::from("actor"),
+        crate::mailbox::capability::tests::runtime(),
+    );
     let (first_dropped, first_observed) = mpsc::channel();
     let (second_dropped, second_observed) = mpsc::channel();
     let first = match mailbox.submit(ThreadRecordingMessage(Some(first_dropped))) {
@@ -767,7 +782,10 @@ fn withdrawal_registration_invariant_is_contained_during_an_unwind() {
         }
     }
 
-    let mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    let mailbox = MailboxCell::new(
+        ChildId::from("actor"),
+        crate::mailbox::capability::tests::runtime(),
+    );
     let (first_dropped, first_observed) = mpsc::channel();
     let (second_dropped, second_observed) = mpsc::channel();
     let first = match mailbox.submit(ThreadRecordingMessage(Some(first_dropped))) {
@@ -1324,7 +1342,7 @@ fn promotion_wakes_every_sender_when_multiple_wakers_panic() {
 fn bind_submits_displaced_payloads_for_disposal_before_waking_senders() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let runtime = Arc::new(BindOrderingRuntime {
-        inner: crate::capability::tests::runtime(),
+        inner: crate::mailbox::capability::tests::runtime(),
         events: Arc::clone(&events),
     });
     let mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
@@ -1523,7 +1541,10 @@ fn accepted_sequence_exhaustion_poison_is_never_minted() {
 
 #[test]
 fn waiter_identity_exhaustion_drops_the_message_after_unlock() {
-    let mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    let mailbox = MailboxCell::new(
+        ChildId::from("actor"),
+        crate::mailbox::capability::tests::runtime(),
+    );
     mailbox.state.lock().expect("mailbox state").binding =
         super::MailboxBinding::Unbound(super::WaiterQueue {
             ids: crate::identity::PoisonedCounter::near_exhaustion(),
@@ -1556,7 +1577,10 @@ fn waiter_identity_exhaustion_drops_the_message_after_unlock() {
 
 #[test]
 fn accepted_sequence_exhaustion_drops_the_message_after_unlock() {
-    let mut mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    let mut mailbox = MailboxCell::new(
+        ChildId::from("actor"),
+        crate::mailbox::capability::tests::runtime(),
+    );
     Arc::get_mut(&mut mailbox)
         .expect("mailbox is uniquely owned")
         .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();
@@ -1591,7 +1615,7 @@ fn accepted_sequence_exhaustion_drops_the_message_after_unlock() {
 fn promotion_sequence_exhaustion_isolates_the_received_message_before_panicking() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let runtime = Arc::new(BindOrderingRuntime {
-        inner: crate::capability::tests::runtime(),
+        inner: crate::mailbox::capability::tests::runtime(),
         events: Arc::clone(&events),
     });
     let mut mailbox = MailboxCell::new(ChildId::from("actor"), runtime);
@@ -1656,7 +1680,7 @@ fn promotion_sequence_exhaustion_isolates_the_received_message_before_panicking(
 fn a_panicking_close_flush_isolates_the_unread_payload() {
     let armed = Arc::new(AtomicBool::new(false));
     let runtime = Arc::new(PanickingPulseRuntime {
-        inner: crate::capability::tests::runtime(),
+        inner: crate::mailbox::capability::tests::runtime(),
         armed: Arc::clone(&armed),
         disposals: Arc::new(AtomicUsize::new(0)),
     });
@@ -1675,7 +1699,7 @@ fn a_panicking_close_flush_isolates_the_unread_payload() {
     // effects flush, which wakes registered wakers synchronously and can
     // therefore unwind on user code.
     let panic = catch_unwind(AssertUnwindSafe(|| {
-        let mut effects = crate::MailboxEffectQueue::default();
+        let mut effects = crate::mailbox::MailboxEffectQueue::default();
         let closed = MailboxControl::close(&*mailbox, incarnation, &mut effects);
         drop(effects);
         if let Some(closed) = closed {
@@ -1697,7 +1721,10 @@ fn a_panicking_close_flush_isolates_the_unread_payload() {
 
 #[test]
 fn bind_sequence_exhaustion_retains_parked_senders_after_unlock() {
-    let mut mailbox = MailboxCell::new(ChildId::from("actor"), crate::capability::tests::runtime());
+    let mut mailbox = MailboxCell::new(
+        ChildId::from("actor"),
+        crate::mailbox::capability::tests::runtime(),
+    );
     Arc::get_mut(&mut mailbox)
         .expect("mailbox is uniquely owned")
         .accepted = crate::identity::AtomicPoisonedCounter::near_exhaustion();

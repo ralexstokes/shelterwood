@@ -1,6 +1,6 @@
 //! Read-only cancellation capabilities shared by supervised children and work.
 
-use shelterwood_runtime::{self as runtime, Latch};
+use crate::runtime::{self, Latch};
 
 /// A library-owned cancellation token.
 #[derive(Clone, Debug)]
@@ -36,31 +36,31 @@ impl CancellationToken {
 /// Internal capability that alone may derive a locally cancellable token.
 #[derive(Clone, Debug)]
 #[doc(hidden)]
-pub struct ParentCancellationToken {
+pub(crate) struct ParentCancellationToken {
     primary: Latch,
 }
 
 impl ParentCancellationToken {
-    pub fn from_latch(primary: Latch) -> Self {
+    pub(crate) fn from_latch(primary: Latch) -> Self {
         Self { primary }
     }
 
-    pub fn token(&self) -> CancellationToken {
+    pub(crate) fn token(&self) -> CancellationToken {
         CancellationToken::from_latch(self.primary.clone())
     }
 
-    pub fn child(&self, cancellation: Latch) -> CancellationToken {
+    pub(crate) fn child(&self, cancellation: Latch) -> CancellationToken {
         CancellationToken {
             primary: self.primary.clone(),
             secondary: Some(cancellation),
         }
     }
 
-    pub fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         self.primary.is_fired()
     }
 
-    pub async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         self.primary.fired().await;
     }
 }
@@ -69,11 +69,11 @@ impl ParentCancellationToken {
 mod tests {
     use std::time::Duration;
 
-    use shelterwood_runtime::{self as runtime, JoinOutcome, Latch, Timeout};
+    use crate::runtime::{self, JoinOutcome, Latch, Timeout};
 
     use super::ParentCancellationToken;
 
-    #[shelterwood_runtime::test]
+    #[crate::runtime::test]
     async fn local_cancellation_cancels_only_the_derived_token() {
         let primary = Latch::default();
         let local = Latch::default();
@@ -90,7 +90,7 @@ mod tests {
         assert!(!primary.is_fired());
     }
 
-    #[shelterwood_runtime::test]
+    #[crate::runtime::test]
     async fn supervisor_cancellation_cancels_the_derived_token() {
         let primary = Latch::default();
         let local = Latch::default();
@@ -107,7 +107,7 @@ mod tests {
         assert!(!local.is_fired());
     }
 
-    #[shelterwood_runtime::test(flavor = "multi_thread", worker_threads = 4)]
+    #[crate::runtime::test(flavor = "multi_thread", worker_threads = 4)]
     async fn simultaneous_supervisor_and_local_cancellation_wake_the_operation() {
         for _ in 0..128 {
             let primary = Latch::default();

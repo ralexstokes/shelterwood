@@ -7,9 +7,10 @@ use std::{
     },
 };
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 
+use crate::runtime;
 use shelterwood_core::{
     ChildId, Exit, Incarnation, Membership, TotalRestarts,
     engine::{Epoch, MembershipStatus, RequestTarget, ScopeEpochs, ScopeState},
@@ -18,9 +19,8 @@ use shelterwood_core::{
     panic::{catch_panic, discard_panic},
     policy::ScopeFlavor,
 };
-use shelterwood_runtime as runtime;
 
-use crate::observe::{LifecycleEventKind, LifecycleHub, SnapshotHub};
+use crate::cells::observe::{LifecycleEventKind, LifecycleHub, SnapshotHub};
 
 use super::{
     MemberCell, MemberRecord, MemberStage, MemberTransition, ObservationGate, ObservationTxn,
@@ -36,20 +36,20 @@ use super::{
 /// owns its observation gate, so a foreign implementation invalidates the
 /// framework's lock-rule guarantees. Requiring the transaction capability in
 /// the signature keeps that critical-section boundary explicit.
-pub trait DynamicRoute: Any + Send + Sync {
+pub(crate) trait DynamicRoute: Any + Send + Sync {
     fn close_admission(&self, txn: &mut ObservationTxn<'_>);
 }
 
 /// Driver-independent view of one declaration slot while its membership is
 /// resident in a running scope.
 #[derive(Clone)]
-pub struct ResidentProjection {
+pub(crate) struct ResidentProjection {
     pub member: Arc<MemberCell>,
     pub scope: Option<Arc<ScopeCell>>,
 }
 
 impl ResidentProjection {
-    pub fn new(member: Arc<MemberCell>, scope: Option<Arc<ScopeCell>>) -> Self {
+    pub(crate) fn new(member: Arc<MemberCell>, scope: Option<Arc<ScopeCell>>) -> Self {
         Self { member, scope }
     }
 }
@@ -150,7 +150,7 @@ impl ScopeRequestSlot {
 /// The driver resolves it through its incrementally maintained membership
 /// index, so stale events miss instead of addressing a replacement child.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScopeControlEvent {
+pub(crate) enum ScopeControlEvent {
     RestartShutdown {
         membership: Membership,
         target: Epoch,
@@ -184,7 +184,7 @@ struct ScopeObservation {
     closed: AtomicBool,
 }
 
-pub struct ScopeCell {
+pub(crate) struct ScopeCell {
     pub member: Arc<MemberCell>,
     pub flavor: ScopeFlavor,
     /// This cell's own handle, for work it defers past the current borrow.
@@ -197,11 +197,11 @@ pub struct ScopeCell {
     control: Mutex<ScopeControl>,
     dynamic_route: Mutex<Option<Arc<dyn DynamicRoute>>>,
     observation: ScopeObservation,
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     ancestor_parent_reads: AtomicUsize,
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     runtime_storage: Mutex<RuntimeStorage>,
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     gate_capture_probe: Mutex<Option<std::sync::mpsc::Sender<GateCapture>>>,
 }
 
@@ -212,18 +212,18 @@ pub struct ScopeCell {
 /// reports as explicit barriers in place of scheduler or strong-count
 /// polling: receiving a capture proves the reporting thread committed to the
 /// gate that was current at that instant.
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GateCapture {
+pub(crate) enum GateCapture {
     /// [`ScopeCell::with_observation_gate`] captured its current gate.
     Observation,
     /// Gate adoption captured an obsolete gate it must acquire to hand off.
     Adoption,
 }
 
-#[cfg(any(test, feature = "test-util"))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RuntimeStorage {
+pub(crate) struct RuntimeStorage {
     pub children: usize,
     pub child_slots: usize,
     pub deadlines: usize,
@@ -233,17 +233,17 @@ pub struct RuntimeStorage {
 mod projection;
 
 use projection::ObservationConfig;
-pub use projection::ScopeRecord;
+pub(crate) use projection::ScopeRecord;
 
 impl ScopeCell {
-    pub fn mint_membership(&self, id: &ChildId) -> Option<MintedMembership> {
+    pub(crate) fn mint_membership(&self, id: &ChildId) -> Option<MintedMembership> {
         self.child_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .mint_membership(id)
     }
 
-    pub fn adopt_or_mint_membership(
+    pub(crate) fn adopt_or_mint_membership(
         &self,
         id: &ChildId,
         provisional: Membership,
@@ -254,14 +254,14 @@ impl ScopeCell {
             .adopt_or_mint_membership(id, provisional)
     }
 
-    pub fn evict_child_identity(&self, member: &MemberCell) {
+    pub(crate) fn evict_child_identity(&self, member: &MemberCell) {
         self.child_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .evict(member.id(), member.membership());
     }
 
-    pub fn new(
+    pub(crate) fn new(
         member: Arc<MemberCell>,
         flavor: ScopeFlavor,
         child_identity: ScopeIdentity,
@@ -289,11 +289,11 @@ impl ScopeCell {
                 snapshots: SnapshotHub::default(),
                 closed: AtomicBool::new(false),
             },
-            #[cfg(any(test, feature = "test-util"))]
+            #[cfg(test)]
             ancestor_parent_reads: AtomicUsize::new(0),
-            #[cfg(any(test, feature = "test-util"))]
+            #[cfg(test)]
             runtime_storage: Mutex::new(RuntimeStorage::default()),
-            #[cfg(any(test, feature = "test-util"))]
+            #[cfg(test)]
             gate_capture_probe: Mutex::new(None),
         })
     }
@@ -309,7 +309,7 @@ impl ScopeCell {
             .expect("a live scope cell owns a handle to itself")
     }
 
-    pub fn resident_projections(&self) -> Vec<ResidentProjection> {
+    pub(crate) fn resident_projections(&self) -> Vec<ResidentProjection> {
         self.with_observation_gate(|_| {
             self.current_children()
                 .iter()
@@ -318,7 +318,7 @@ impl ScopeCell {
         })
     }
 
-    pub fn has_resident_child(&self, member: &MemberCell) -> bool {
+    pub(crate) fn has_resident_child(&self, member: &MemberCell) -> bool {
         self.with_observation_gate(|_| {
             self.current_children()
                 .iter()
@@ -334,7 +334,7 @@ impl ScopeCell {
     }
 
     fn parent(&self) -> Option<Arc<ScopeCell>> {
-        #[cfg(any(test, feature = "test-util"))]
+        #[cfg(test)]
         self.ancestor_parent_reads.fetch_add(1, Ordering::Relaxed);
         self.observation
             .parent
@@ -344,8 +344,8 @@ impl ScopeCell {
             .and_then(Weak::upgrade)
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn take_ancestor_parent_reads(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn take_ancestor_parent_reads(&self) -> usize {
         self.ancestor_parent_reads.swap(0, Ordering::Relaxed)
     }
 
@@ -371,30 +371,30 @@ impl ScopeCell {
         }
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn runtime_storage(&self) -> RuntimeStorage {
+    #[cfg(test)]
+    pub(crate) fn runtime_storage(&self) -> RuntimeStorage {
         *self
             .runtime_storage
             .lock()
             .expect("runtime-storage mutex poisoned")
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn record_runtime_storage(&self, storage: RuntimeStorage) {
+    #[cfg(test)]
+    pub(crate) fn record_runtime_storage(&self, storage: RuntimeStorage) {
         *self
             .runtime_storage
             .lock()
             .expect("runtime-storage mutex poisoned") = storage;
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn observation_gate(&self) -> ObservationGate {
+    #[cfg(test)]
+    pub(crate) fn observation_gate(&self) -> ObservationGate {
         self.current_observation_gate()
     }
 
     /// Installs a probe reporting every gate capture made through this scope.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn probe_gate_captures(&self) -> std::sync::mpsc::Receiver<GateCapture> {
+    #[cfg(test)]
+    pub(crate) fn probe_gate_captures(&self) -> std::sync::mpsc::Receiver<GateCapture> {
         let (sender, receiver) = std::sync::mpsc::channel();
         *self
             .gate_capture_probe
@@ -403,7 +403,7 @@ impl ScopeCell {
         receiver
     }
 
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     fn report_gate_capture(&self, capture: GateCapture) {
         if let Some(probe) = &*self
             .gate_capture_probe
@@ -442,7 +442,7 @@ impl ScopeCell {
         self.member.adopt_observation_gate_with(
             gate,
             || {
-                #[cfg(any(test, feature = "test-util"))]
+                #[cfg(test)]
                 self.report_gate_capture(GateCapture::Adoption);
             },
             |current| {
@@ -485,7 +485,7 @@ impl ScopeCell {
         self.member.with_handoff_gate(
             gate,
             || {
-                #[cfg(any(test, feature = "test-util"))]
+                #[cfg(test)]
                 self.report_gate_capture(GateCapture::Adoption);
             },
             |current| {
@@ -513,7 +513,7 @@ impl ScopeCell {
         )
     }
 
-    pub fn adopt_child_observation_gate(
+    pub(crate) fn adopt_child_observation_gate(
         self: &Arc<Self>,
         member: &MemberCell,
         child: Option<&ScopeCell>,
@@ -557,24 +557,29 @@ impl ScopeCell {
     /// Runs against the current resident-tree observation gate. Adoption can
     /// race an early pre-start observer, so an obsolete-gate acquisition is
     /// detected and retried before the operation enters its critical section.
-    pub fn with_observation_gate<R>(
+    pub(crate) fn with_observation_gate<R>(
         &self,
         operation: impl FnOnce(&mut ObservationTxn<'_>) -> R,
     ) -> R {
         self.member.with_observation_txn_probed(
             || {
-                #[cfg(any(test, feature = "test-util"))]
+                #[cfg(test)]
                 self.report_gate_capture(GateCapture::Observation);
             },
             operation,
         )
     }
 
-    pub fn set_state(&self, state: ScopeState) {
+    #[cfg(test)]
+    pub(crate) fn set_state(&self, state: ScopeState) {
         self.with_observation_gate(|txn| self.set_state_locked(state, &[], txn));
     }
 
-    pub fn set_state_and_startup(&self, state: ScopeState, startup: Result<(), StartupError>) {
+    pub(crate) fn set_state_and_startup(
+        &self,
+        state: ScopeState,
+        startup: Result<(), StartupError>,
+    ) {
         self.with_observation_gate(|txn| {
             self.set_startup_locked(startup, txn);
             self.set_state_locked(state, &[], txn);
@@ -588,7 +593,7 @@ impl ScopeCell {
     /// immediately samples descendants. Installing these markers under the
     /// shared observation gate keeps that sample from splitting drain entry
     /// between the scope transition and an inactive child's cleanup.
-    pub fn publish_drain(
+    pub(crate) fn publish_drain(
         &self,
         state: ScopeState,
         startup: Option<Result<(), StartupError>>,
@@ -657,7 +662,11 @@ impl ScopeCell {
         self.emit_locked(txn, LifecycleEventKind::ScopeState { state });
     }
 
-    pub fn set_child_removing_locked(&self, member: &MemberCell, txn: &mut ObservationTxn<'_>) {
+    pub(crate) fn set_child_removing_locked(
+        &self,
+        member: &MemberCell,
+        txn: &mut ObservationTxn<'_>,
+    ) {
         if member.record().membership_status == MembershipStatus::Removing {
             return;
         }
@@ -667,8 +676,8 @@ impl ScopeCell {
         self.publish_snapshot_chain_locked(txn);
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn transition_child(
+    #[cfg(test)]
+    pub(crate) fn transition_child(
         &self,
         member: &MemberCell,
         update: impl FnOnce(&mut MemberRecord),
@@ -690,7 +699,7 @@ impl ScopeCell {
     /// no-op *for this scope*; the caller is responsible for whatever it
     /// committed beforehand.
     #[must_use = "an illegal member transition is rejected, not applied"]
-    pub fn transition_child_stage(
+    pub(crate) fn transition_child_stage(
         &self,
         member: &MemberCell,
         transition: MemberTransition,
@@ -720,7 +729,7 @@ impl ScopeCell {
     /// Returns whether the reducer accepted the transition. The restart
     /// bookkeeping its caller already charged is not rolled back here.
     #[must_use = "an illegal member transition is rejected, not applied"]
-    pub fn publish_child_restart(
+    pub(crate) fn publish_child_restart(
         &self,
         member: &MemberCell,
         total_restarts: TotalRestarts,
@@ -743,7 +752,7 @@ impl ScopeCell {
         })
     }
 
-    pub fn terminalize_child(
+    pub(crate) fn terminalize_child(
         &self,
         member: &MemberCell,
         exit: Exit,
@@ -836,12 +845,16 @@ impl ScopeCell {
         self.current_children().push(ResidentChild::new(child));
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn prune_child(&self, member: &MemberCell) -> bool {
+    #[cfg(test)]
+    pub(crate) fn prune_child(&self, member: &MemberCell) -> bool {
         self.with_observation_gate(|wakes| self.prune_child_locked(member, wakes))
     }
 
-    pub fn prune_child_locked(&self, member: &MemberCell, txn: &mut ObservationTxn<'_>) -> bool {
+    pub(crate) fn prune_child_locked(
+        &self,
+        member: &MemberCell,
+        txn: &mut ObservationTxn<'_>,
+    ) -> bool {
         let membership = member.membership();
         let resident = {
             let mut children = self.current_children();
@@ -884,8 +897,8 @@ impl ScopeCell {
         true
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn replace_observation_gate(&self, gate: ObservationGate) {
+    #[cfg(test)]
+    pub(crate) fn replace_observation_gate(&self, gate: ObservationGate) {
         *self
             .member
             .observation_gate
@@ -893,7 +906,7 @@ impl ScopeCell {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = gate;
     }
 
-    pub fn set_startup(&self, startup: Result<(), StartupError>) {
+    pub(crate) fn set_startup(&self, startup: Result<(), StartupError>) {
         self.with_observation_gate(|txn| self.set_startup_locked(startup, txn));
     }
 
@@ -928,7 +941,7 @@ impl ScopeCell {
         }
     }
 
-    pub fn begin_incarnation(&self, state: ScopeState) -> Option<Epoch> {
+    pub(crate) fn begin_incarnation(&self, state: ScopeState) -> Option<Epoch> {
         assert!(
             matches!(state, ScopeState::Starting),
             "a fresh incarnation publishes its lifecycle machine's initial state"
@@ -972,11 +985,11 @@ impl ScopeCell {
         epoch
     }
 
-    pub fn finish_incarnation(&self, epoch: Epoch, reason: StopReason) {
+    pub(crate) fn finish_incarnation(&self, epoch: Epoch, reason: StopReason) {
         self.finish_incarnation_with_terminal(epoch, RetainedStopReason::new(reason), None);
     }
 
-    pub fn finish_root_incarnation(&self, epoch: Epoch, reason: StopReason, exit: Exit) {
+    pub(crate) fn finish_root_incarnation(&self, epoch: Epoch, reason: StopReason, exit: Exit) {
         self.finish_incarnation_with_terminal(
             epoch,
             RetainedStopReason::new(reason),
@@ -1051,7 +1064,7 @@ impl ScopeCell {
         });
     }
 
-    pub fn finish_live_root_incarnation(&self, reason: StopReason, exit: Exit) {
+    pub(crate) fn finish_live_root_incarnation(&self, reason: StopReason, exit: Exit) {
         // These wrappers precede the control lookup: a poisoned framework
         // mutex must not retire either user-bearing input on this thread.
         let reason = RetainedStopReason::new(reason);
@@ -1077,7 +1090,7 @@ impl ScopeCell {
         }
     }
 
-    pub fn request_shutdown(&self) -> Option<Epoch> {
+    pub(crate) fn request_shutdown(&self) -> Option<Epoch> {
         self.with_observation_gate(|txn| {
             let control = self.control.lock().expect("scope control mutex poisoned");
             self.request_shutdown_locked(control, txn)
@@ -1089,7 +1102,7 @@ impl ScopeCell {
     /// thread that is already unwinding. Control holds plain request state,
     /// so overwriting a poisoner's partial update is no worse than any other
     /// racing request.
-    pub fn request_shutdown_ignoring_poison(&self) -> Option<Epoch> {
+    pub(crate) fn request_shutdown_ignoring_poison(&self) -> Option<Epoch> {
         self.with_observation_gate(|txn| {
             let control = self
                 .control
@@ -1142,7 +1155,7 @@ impl ScopeCell {
         txn.pulse(&self.member.record);
     }
 
-    pub fn take_control_events(&self) -> Vec<ScopeControlEvent> {
+    pub(crate) fn take_control_events(&self) -> Vec<ScopeControlEvent> {
         if self
             .control
             .lock()
@@ -1162,7 +1175,7 @@ impl ScopeCell {
         })
     }
 
-    pub fn has_pending_incarnation_shutdown(&self, target: Epoch) -> bool {
+    pub(crate) fn has_pending_incarnation_shutdown(&self, target: Epoch) -> bool {
         let control = self.control.lock().expect("scope control mutex poisoned");
         control.shutdown.is_some_and(|request| {
             request.epoch == target
@@ -1171,7 +1184,7 @@ impl ScopeCell {
         })
     }
 
-    pub fn has_stop_request(&self, epoch: Epoch) -> bool {
+    pub(crate) fn has_stop_request(&self, epoch: Epoch) -> bool {
         let control = self.control.lock().expect("scope control mutex poisoned");
         control
             .shutdown
@@ -1179,11 +1192,11 @@ impl ScopeCell {
             || control.force.is_some_and(|request| request.epoch == epoch)
     }
 
-    pub fn take_shutdown_request(&self, epoch: Epoch) -> bool {
+    pub(crate) fn take_shutdown_request(&self, epoch: Epoch) -> bool {
         self.take_request(ScopeRequestSlot::Shutdown, epoch)
     }
 
-    pub fn force_shutdown(&self, epoch: Epoch) {
+    pub(crate) fn force_shutdown(&self, epoch: Epoch) {
         self.with_observation_gate(|txn| {
             let mut control = self.control.lock().expect("scope control mutex poisoned");
             if control.epochs.is_current(epoch) {
@@ -1197,7 +1210,7 @@ impl ScopeCell {
         });
     }
 
-    pub fn take_force_request(&self, epoch: Epoch) -> bool {
+    pub(crate) fn take_force_request(&self, epoch: Epoch) -> bool {
         self.take_request(ScopeRequestSlot::Force, epoch)
     }
 
@@ -1256,7 +1269,7 @@ impl ScopeCell {
     /// `Unstarted` (never begun) or `Stopped`. Together they mean the
     /// terminal-membership arm can never be the *only* reachable settlement
     /// for a scope that still owns work.
-    pub fn settled(&self, epoch: Option<Epoch>) -> bool {
+    pub(crate) fn settled(&self, epoch: Option<Epoch>) -> bool {
         epoch.is_some_and(|epoch| self.incarnation_complete(epoch))
             || (self.membership_terminal() && self.joined())
     }
@@ -1264,7 +1277,10 @@ impl ScopeCell {
     /// Replaces this scope's residency, returning whether every child was
     /// admitted. A refused child is left out of the residency entirely.
     #[must_use = "a refused admission leaves the child out of the residency"]
-    pub fn set_admitted_children(self: &Arc<Self>, children: Vec<ResidentProjection>) -> bool {
+    pub(crate) fn set_admitted_children(
+        self: &Arc<Self>,
+        children: Vec<ResidentProjection>,
+    ) -> bool {
         self.with_observation_gate(|wakes| {
             self.clear_residents_locked(wakes);
             let mut admitted = true;
@@ -1275,9 +1291,9 @@ impl ScopeCell {
         })
     }
 
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     #[must_use = "a refused admission leaves the child out of the residency"]
-    pub fn admit_child(self: &Arc<Self>, child: ResidentProjection) -> bool {
+    pub(crate) fn admit_child(self: &Arc<Self>, child: ResidentProjection) -> bool {
         self.with_observation_gate(|wakes| self.admit_child_locked(child, wakes))
     }
 
@@ -1295,7 +1311,7 @@ impl ScopeCell {
     /// edge its withdrawal would otherwise publish — SPEC §3.2's pairing is
     /// both edges or neither.
     #[must_use = "a refused admission leaves the child out of the residency"]
-    pub fn admit_child_locked(
+    pub(crate) fn admit_child_locked(
         self: &Arc<Self>,
         child: ResidentProjection,
         txn: &mut ObservationTxn<'_>,
@@ -1385,11 +1401,11 @@ impl ScopeCell {
         true
     }
 
-    pub fn clear_residents(&self) {
+    pub(crate) fn clear_residents(&self) {
         self.with_observation_gate(|wakes| self.clear_residents_locked(wakes));
     }
 
-    pub fn clear_residents_locked(&self, wakes: &mut ObservationTxn<'_>) {
+    pub(crate) fn clear_residents_locked(&self, wakes: &mut ObservationTxn<'_>) {
         let residents = {
             let mut children = self.current_children();
             std::mem::take(&mut *children)
@@ -1420,13 +1436,13 @@ impl ScopeCell {
         }
     }
 
-    pub fn set_dynamic_route(&self, route: Option<Arc<dyn DynamicRoute>>) {
+    pub(crate) fn set_dynamic_route(&self, route: Option<Arc<dyn DynamicRoute>>) {
         self.with_observation_gate(|txn| {
             self.set_dynamic_route_locked(route, txn);
         });
     }
 
-    pub fn set_dynamic_route_locked(
+    pub(crate) fn set_dynamic_route_locked(
         &self,
         route: Option<Arc<dyn DynamicRoute>>,
         txn: &mut ObservationTxn<'_>,
@@ -1442,23 +1458,26 @@ impl ScopeCell {
         txn.pulse(&self.member.record);
     }
 
-    pub fn dynamic_route_in(&self, _txn: &ObservationTxn<'_>) -> Option<Arc<dyn DynamicRoute>> {
+    pub(crate) fn dynamic_route_in(
+        &self,
+        _txn: &ObservationTxn<'_>,
+    ) -> Option<Arc<dyn DynamicRoute>> {
         self.dynamic_route
             .lock()
             .expect("scope dynamic-route mutex poisoned")
             .clone()
     }
 
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn dynamic_route(&self) -> Option<Arc<dyn DynamicRoute>> {
+    #[cfg(test)]
+    pub(crate) fn dynamic_route(&self) -> Option<Arc<dyn DynamicRoute>> {
         self.with_observation_gate(|txn| self.dynamic_route_in(txn))
     }
 
-    pub fn signal(&self) -> &runtime::WatchSender<MemberRecord> {
+    pub(crate) fn signal(&self) -> &runtime::WatchSender<MemberRecord> {
         &self.member.record
     }
 
-    pub async fn wait_started(&self) -> Result<(), StartupError> {
+    pub(crate) async fn wait_started(&self) -> Result<(), StartupError> {
         let mut watcher = self.observation.record.watcher();
         loop {
             if let Some(result) = watcher.borrow_and_update_cloned().startup {
@@ -1468,7 +1487,7 @@ impl ScopeCell {
         }
     }
 
-    pub async fn wait_stopped(&self) -> StopReason {
+    pub(crate) async fn wait_stopped(&self) -> StopReason {
         self.member.wait_terminal().await;
         // Parent-driver destruction can terminalize a nested membership
         // synchronously before the aborted nested driver runs its own scope
@@ -1568,7 +1587,7 @@ impl ScopeCell {
         }
     }
 
-    pub fn terminalize_never_started(&self) {
+    pub(crate) fn terminalize_never_started(&self) {
         self.with_observation_gate(|txn| self.terminalize_never_started_locked(txn));
     }
 
@@ -1593,7 +1612,7 @@ impl ScopeCell {
     /// `Unstarted` scope never charged a restart, and a startup result
     /// installed without an incarnation (identity exhaustion) is the
     /// structured cause `wait_started` must keep.
-    pub fn close_never_started_body(&self) {
+    pub(crate) fn close_never_started_body(&self) {
         self.with_observation_gate(|txn| {
             if self.observation.closed.load(Ordering::Acquire) {
                 return;
@@ -1612,7 +1631,7 @@ impl ScopeCell {
         });
     }
 
-    pub fn terminalize_never_started_locked(&self, txn: &mut ObservationTxn<'_>) {
+    pub(crate) fn terminalize_never_started_locked(&self, txn: &mut ObservationTxn<'_>) {
         if self.observation.closed.load(Ordering::Acquire) {
             return;
         }
@@ -1635,13 +1654,13 @@ mod tests {
         time::Duration,
     };
 
+    use crate::mailbox::{
+        MailboxCell, MailboxControl, MailboxEffectQueue, MailboxReceiver, actor_ref_from_parts,
+    };
     use shelterwood_core::{
         Cancellation, ExitError, GracePhase, IntensityTrip, StartupFailure, StartupFailureCause,
         identity::ScopeIdentity,
         policy::{ResolvedMailbox, RestartCount, ScopeFlavor},
-    };
-    use shelterwood_mailbox::{
-        MailboxCell, MailboxControl, MailboxEffectQueue, MailboxReceiver, actor_ref_from_parts,
     };
 
     use super::*;
@@ -1873,7 +1892,7 @@ mod tests {
         let member = child_member(&root, "invalid");
         let mut incarnations = member.take_incarnation_counter();
         let incarnation = incarnations.mint().expect("incarnation available");
-        let mailbox = MailboxCell::new(member.id().clone(), shelterwood_runtime::mailbox_runtime());
+        let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
         member.attach_mailbox(mailbox.clone());
         let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
         let mut effects = MailboxEffectQueue::default();
@@ -1924,7 +1943,7 @@ mod tests {
         let incarnation = incarnations.mint().expect("incarnation available");
         let mailbox = MailboxCell::new(
             nested.member.id().clone(),
-            shelterwood_runtime::mailbox_runtime(),
+            crate::runtime::mailbox_runtime(),
         );
         nested.member.attach_mailbox(mailbox.clone());
         let actor = actor_ref_from_parts(Arc::clone(&nested.member), Arc::clone(&mailbox));
@@ -2607,7 +2626,7 @@ mod tests {
         let incarnation = incarnations.mint().expect("incarnation available");
         let scope = ScopeCell::new(member, ScopeFlavor::Dynamic, ScopeIdentity::new());
         let gate = scope.observation_gate();
-        let mailbox = MailboxCell::<u8>::new(id, shelterwood_runtime::mailbox_runtime());
+        let mailbox = MailboxCell::<u8>::new(id, crate::runtime::mailbox_runtime());
         let mut effects = MailboxEffectQueue::default();
         let token = MailboxControl::configure(&*mailbox, ResolvedMailbox::Latest, &mut effects);
         MailboxControl::bind(&*mailbox, token, incarnation, &mut effects);
@@ -2654,7 +2673,7 @@ mod tests {
         );
         let mut incarnations = child.take_incarnation_counter();
         let incarnation = incarnations.mint().expect("incarnation available");
-        let mailbox = MailboxCell::new(child_id, shelterwood_runtime::mailbox_runtime());
+        let mailbox = MailboxCell::new(child_id, crate::runtime::mailbox_runtime());
         child.attach_mailbox(mailbox.clone());
         let actor = actor_ref_from_parts(Arc::clone(&child), Arc::clone(&mailbox));
         let mut effects = MailboxEffectQueue::default();
@@ -2722,8 +2741,7 @@ mod tests {
             let mut incarnations = child.take_incarnation_counter();
             let incarnation = incarnations.mint().expect("incarnation available");
             counters.push(incarnations);
-            let mailbox =
-                MailboxCell::new(child.id().clone(), shelterwood_runtime::mailbox_runtime());
+            let mailbox = MailboxCell::new(child.id().clone(), crate::runtime::mailbox_runtime());
             child.attach_mailbox(mailbox.clone());
             let actor = actor_ref_from_parts(Arc::clone(&child), Arc::clone(&mailbox));
             let mut effects = MailboxEffectQueue::default();

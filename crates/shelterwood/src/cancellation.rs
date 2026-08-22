@@ -1,2 +1,2 @@
-pub use shelterwood_cells::CancellationToken;
-pub(crate) use shelterwood_cells::ParentCancellationToken;
+pub use crate::cells::CancellationToken;
+pub(crate) use crate::cells::ParentCancellationToken;

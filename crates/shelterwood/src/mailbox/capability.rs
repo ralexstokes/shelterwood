@@ -13,7 +13,7 @@ use shelterwood_core::{
     waker::{WakerAction, WakerEffects},
 };
 
-use crate::panic::PanicAccumulator;
+use crate::mailbox::panic::PanicAccumulator;
 
 fn downcast<T: Send + 'static>(value: ErasedValue) -> T {
     *value
@@ -135,7 +135,7 @@ impl<T> DisposingReceiver<T> {
         // to remove.
         let mut panics = PanicAccumulator::default();
         self.retire_reply_waker(&mut panics);
-        crate::panic::discard_panic(panics.take());
+        crate::mailbox::panic::discard_panic(panics.take());
     }
 
     /// Takes the caller waker out of the proxy and queues its destructor into

@@ -1,5 +1,6 @@
 use std::{fmt, sync::Arc};
 
+use crate::runtime;
 use shelterwood_core::{
     Exit,
     engine::ScopeState,
@@ -9,7 +10,6 @@ use shelterwood_core::{
         reconcile_recorded_outcomes,
     },
 };
-use shelterwood_runtime as runtime;
 
 /// An exit copy retained by framework state.
 ///
@@ -18,18 +18,18 @@ use shelterwood_runtime as runtime;
 /// a count probe would race every other owner and could still leave one
 /// framework thread running the last user destructor inline.
 #[derive(Clone)]
-pub struct RetainedExit(Option<Exit>);
+pub(crate) struct RetainedExit(Option<Exit>);
 
 impl RetainedExit {
-    pub fn new(exit: Exit) -> Self {
+    pub(crate) fn new(exit: Exit) -> Self {
         Self(Some(exit))
     }
 
-    pub fn as_exit(&self) -> &Exit {
+    pub(crate) fn as_exit(&self) -> &Exit {
         self.0.as_ref().expect("retained exit was already taken")
     }
 
-    pub fn into_exit(mut self) -> Exit {
+    pub(crate) fn into_exit(mut self) -> Exit {
         self.0.take().expect("retained exit was already taken")
     }
 
@@ -45,7 +45,7 @@ impl RetainedExit {
         }
     }
 
-    pub fn retain_stop_reason(exits: &mut Vec<Self>, reason: &StopReason) {
+    pub(crate) fn retain_stop_reason(exits: &mut Vec<Self>, reason: &StopReason) {
         if let StopReason::StartupFailed(failure) = reason {
             Self::retain_startup_failure(exits, failure);
         }
@@ -138,20 +138,20 @@ impl Drop for RetainedExit {
 /// The failed variant owns a type-erased application error just like a failed
 /// [`Exit`]. If framework control flow retires the carrier without selecting
 /// that outcome, its user value is transferred to critical disposal.
-pub struct RetainedRecordedOutcome(Option<RecordedOutcome>);
+pub(crate) struct RetainedRecordedOutcome(Option<RecordedOutcome>);
 
 impl RetainedRecordedOutcome {
-    pub fn new(outcome: RecordedOutcome) -> Self {
+    pub(crate) fn new(outcome: RecordedOutcome) -> Self {
         Self(Some(outcome))
     }
 
-    pub fn as_outcome(&self) -> &RecordedOutcome {
+    pub(crate) fn as_outcome(&self) -> &RecordedOutcome {
         self.0
             .as_ref()
             .expect("retained recorded outcome was already taken")
     }
 
-    pub fn into_outcome(mut self) -> RecordedOutcome {
+    pub(crate) fn into_outcome(mut self) -> RecordedOutcome {
         self.0
             .take()
             .expect("retained recorded outcome was already taken")
@@ -181,7 +181,7 @@ impl Drop for RetainedRecordedOutcome {
 /// choose the losing outcome's destruction venue. Framework callers have no
 /// reason to choose anything but isolated disposal, so this is the shape they
 /// use: the raw fold is reached only from core's own unit tests.
-pub fn reconcile_recorded_outcomes_retaining(
+pub(crate) fn reconcile_recorded_outcomes_retaining(
     recorded: Option<RetainedRecordedOutcome>,
     forced: Option<RecordedOutcome>,
 ) -> Option<RecordedOutcome> {
@@ -197,7 +197,7 @@ pub fn reconcile_recorded_outcomes_retaining(
 /// [`classify_exit`]. Returning only the selected exit is what keeps
 /// `let (exit, _) = classify_exit(..)` — which silently destroys a losing
 /// application error on the calling framework thread — out of driver code.
-pub fn classify_exit_retaining(
+pub(crate) fn classify_exit_retaining(
     recorded: Option<RecordedOutcome>,
     join: JoinOutcome<()>,
     hard_abort_phase: Option<GracePhase>,
@@ -213,7 +213,7 @@ pub fn classify_exit_retaining(
 /// The carrier stays a [`RetainedExit`] across the fold: the losing half is
 /// the application error whenever one was recorded, because
 /// `Failed` ranks below `Panicked`.
-pub fn classify_disposal_panic_retaining(
+pub(crate) fn classify_disposal_panic_retaining(
     exit: RetainedExit,
     message: Option<String>,
 ) -> RetainedExit {
@@ -228,13 +228,13 @@ pub fn classify_disposal_panic_retaining(
 /// `Exit`. Keeping the public reason before its guards gives the same
 /// raw-projection-first retirement order as `RetainedScopeSnapshot`.
 #[derive(Clone, Debug)]
-pub struct RetainedStopReason {
+pub(crate) struct RetainedStopReason {
     reason: Option<StopReason>,
     retained_exits: Vec<RetainedExit>,
 }
 
 impl RetainedStopReason {
-    pub fn new(reason: StopReason) -> Self {
+    pub(crate) fn new(reason: StopReason) -> Self {
         let mut retained_exits = Vec::new();
         RetainedExit::retain_stop_reason(&mut retained_exits, &reason);
         Self {
@@ -243,13 +243,13 @@ impl RetainedStopReason {
         }
     }
 
-    pub fn as_reason(&self) -> &StopReason {
+    pub(crate) fn as_reason(&self) -> &StopReason {
         self.reason
             .as_ref()
             .expect("retained stop reason was already taken")
     }
 
-    pub fn into_public(mut self) -> StopReason {
+    pub(crate) fn into_public(mut self) -> StopReason {
         let reason = self
             .reason
             .take()

@@ -1,4 +1,4 @@
-pub use shelterwood_core::ProxiedSleep;
+pub(super) use shelterwood_core::ProxiedSleep;
 
 #[cfg(test)]
 mod tests {
@@ -84,8 +84,11 @@ mod tests {
         let state = Arc::new(WakerCounts::default());
         let waker = ManuallyDrop::new(counting_waker(&state));
         let mut context = Context::from_waker(&waker);
-        let raw: crate::BoxedSleep = Box::pin(std::future::ready(()));
-        let mut timer = Box::pin(ProxiedSleep::new(raw, crate::capability::tests::runtime()));
+        let raw: crate::mailbox::BoxedSleep = Box::pin(std::future::ready(()));
+        let mut timer = Box::pin(ProxiedSleep::new(
+            raw,
+            crate::mailbox::capability::tests::runtime(),
+        ));
 
         assert!(timer.as_mut().poll(&mut context).is_ready());
         assert_eq!(state.clones.load(Ordering::SeqCst), 0);
@@ -106,11 +109,14 @@ mod tests {
         let state = Arc::new(WakerCounts::default());
         let waker = ManuallyDrop::new(counting_waker(&state));
         let mut context = Context::from_waker(&waker);
-        let raw: crate::BoxedSleep = Box::pin(ParkThenReady {
+        let raw: crate::mailbox::BoxedSleep = Box::pin(ParkThenReady {
             polls: 0,
             registered: None,
         });
-        let mut timer = Box::pin(ProxiedSleep::new(raw, crate::capability::tests::runtime()));
+        let mut timer = Box::pin(ProxiedSleep::new(
+            raw,
+            crate::mailbox::capability::tests::runtime(),
+        ));
 
         assert!(timer.as_mut().poll(&mut context).is_pending());
         assert_eq!(state.clones.load(Ordering::SeqCst), 1);
@@ -129,8 +135,8 @@ mod tests {
         let state = Arc::new(WakerCounts::default());
         let waker = ManuallyDrop::new(counting_waker(&state));
         let mut context = Context::from_waker(&waker);
-        let raw: crate::BoxedSleep = Box::pin(std::future::pending());
-        let mut timer = ProxiedSleep::new(raw, crate::capability::tests::runtime());
+        let raw: crate::mailbox::BoxedSleep = Box::pin(std::future::pending());
+        let mut timer = ProxiedSleep::new(raw, crate::mailbox::capability::tests::runtime());
 
         assert!(Pin::new(&mut timer).poll(&mut context).is_pending());
         assert_eq!(state.clones.load(Ordering::SeqCst), 1);
@@ -202,8 +208,11 @@ mod tests {
         let caller_thread = thread::current().id();
         let waker = ManuallyDrop::new(thread_drop_waker(dropped_tx));
         let mut context = Context::from_waker(&waker);
-        let raw: crate::BoxedSleep = Box::pin(std::future::pending());
-        let mut timer = Box::pin(ProxiedSleep::new(raw, crate::capability::tests::runtime()));
+        let raw: crate::mailbox::BoxedSleep = Box::pin(std::future::pending());
+        let mut timer = Box::pin(ProxiedSleep::new(
+            raw,
+            crate::mailbox::capability::tests::runtime(),
+        ));
 
         assert!(timer.as_mut().poll(&mut context).is_pending());
         drop(timer);

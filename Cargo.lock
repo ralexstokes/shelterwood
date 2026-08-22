@@ -90,9 +90,7 @@ dependencies = [
 name = "shelterwood"
 version = "0.1.0"
 dependencies = [
- "shelterwood-cells",
  "shelterwood-core",
- "shelterwood-mailbox",
  "shelterwood-runtime",
  "thiserror",
  "tokio",
@@ -106,30 +104,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "shelterwood-cells"
-version = "0.1.0"
-dependencies = [
- "shelterwood-core",
- "shelterwood-mailbox",
- "shelterwood-runtime",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "shelterwood-core"
 version = "0.1.0"
 dependencies = [
  "thiserror",
-]
-
-[[package]]
-name = "shelterwood-mailbox"
-version = "0.1.0"
-dependencies = [
- "shelterwood-core",
- "shelterwood-runtime",
- "tokio",
 ]
 
 [[package]]

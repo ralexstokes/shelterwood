@@ -6,7 +6,7 @@ use std::{
 
 use shelterwood_core::DeadlineBudget;
 
-use crate::{
+use crate::mailbox::{
     MailboxRuntime,
     capability::{DisposingReceiver, OneShotClose, OneShotSender, dispose, oneshot},
 };
@@ -164,7 +164,7 @@ mod tests {
         time::Duration,
     };
 
-    use crate::{
+    use crate::mailbox::{
         ErasedOneShotClose, ErasedOneShotReceiver, ErasedOneShotSender, ErasedValue,
         capability::{DisposingReceiver, OneShotClose, oneshot},
     };
@@ -325,7 +325,7 @@ mod tests {
     #[crate::runtime::test]
     async fn ready_race_retires_the_reply_caller_waker_before_returning() {
         let runtime = Arc::new(
-            crate::capability::tests::TestRuntime::new().with_oneshot(|| {
+            crate::mailbox::capability::tests::TestRuntime::new().with_oneshot(|| {
                 (
                     Box::new(RejectingSender),
                     Box::pin(SeamReceiver {
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn timeout_arbitration_value_retires_the_reply_caller_waker_before_returning() {
         let runtime = Arc::new(
-            crate::capability::tests::TestRuntime::new().with_oneshot(|| {
+            crate::mailbox::capability::tests::TestRuntime::new().with_oneshot(|| {
                 (
                     Box::new(RejectingSender),
                     Box::pin(SeamReceiver {
@@ -367,7 +367,8 @@ mod tests {
                 )
             }),
         );
-        let (_, inner) = oneshot::<u8>(&(runtime.clone() as Arc<dyn crate::MailboxRuntime>));
+        let (_, inner) =
+            oneshot::<u8>(&(runtime.clone() as Arc<dyn crate::mailbox::MailboxRuntime>));
         let mut receiver = DisposingReceiver::new(inner, runtime);
         let drops = Arc::new(AtomicUsize::new(0));
         let caller = ManuallyDrop::new(counted_drop_waker(Arc::clone(&drops)));
@@ -389,7 +390,7 @@ mod tests {
     #[test]
     fn close_retires_the_reply_caller_waker_and_contains_a_hostile_destructor() {
         let runtime = Arc::new(
-            crate::capability::tests::TestRuntime::new().with_oneshot(|| {
+            crate::mailbox::capability::tests::TestRuntime::new().with_oneshot(|| {
                 (
                     Box::new(RejectingSender),
                     Box::pin(SeamReceiver {
@@ -400,7 +401,8 @@ mod tests {
                 )
             }),
         );
-        let (_, inner) = oneshot::<u8>(&(runtime.clone() as Arc<dyn crate::MailboxRuntime>));
+        let (_, inner) =
+            oneshot::<u8>(&(runtime.clone() as Arc<dyn crate::mailbox::MailboxRuntime>));
         let mut receiver = DisposingReceiver::new(inner, runtime);
         let drops = Arc::new(AtomicUsize::new(0));
         let caller = ManuallyDrop::new(hostile_drop_waker(Arc::clone(&drops)));
@@ -427,8 +429,8 @@ mod tests {
     async fn timeout_arbitration_waits_for_a_winning_send_to_publish() {
         let publisher = Arc::new(Mutex::new(None));
         let staged_publisher = Arc::clone(&publisher);
-        let runtime = Arc::new(crate::capability::tests::TestRuntime::new().with_oneshot(
-            move || {
+        let runtime = Arc::new(
+            crate::mailbox::capability::tests::TestRuntime::new().with_oneshot(move || {
                 let (publisher, receiver) = crate::runtime::oneshot_sending_for_test();
                 let displaced = staged_publisher
                     .lock()
@@ -437,12 +439,12 @@ mod tests {
                 assert!(displaced.is_none(), "the test creates one reply channel");
                 (
                     Box::new(RejectingSender),
-                    Box::pin(crate::capability::tests::AdapterOneShotReceiver::new(
-                        receiver,
-                    )),
+                    Box::pin(
+                        crate::mailbox::capability::tests::AdapterOneShotReceiver::new(receiver),
+                    ),
                 )
-            },
-        ));
+            }),
+        );
         let (_, actor) = actor_for_with_runtime::<()>(runtime.clone());
         let (reply, receiver) = actor.reply_channel::<u8>();
         let width = Duration::from_secs(1);

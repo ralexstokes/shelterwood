@@ -282,8 +282,11 @@ macro_rules! impl_common_builder_surface {
 /// # Examples
 ///
 /// A task and an actor under one ordered tree. The task is declared first,
-/// so it starts first, its readiness gates the actor's start, and it stops
-/// last:
+/// so it starts first and stops last. A task is
+/// [`Readiness::Immediate`](crate::Readiness::Immediate) by default, so its
+/// gate opens at launch and the actor follows without waiting; declare
+/// [`Readiness::Manual`](crate::Readiness::Manual) where a task must really
+/// gate its successor:
 ///
 /// ```rust
 /// # use std::time::Duration;

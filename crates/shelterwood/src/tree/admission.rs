@@ -53,7 +53,10 @@ impl<H> PendingAdmission<H> {
             Arc::clone(&self.reservation.slot),
             self.fused_cancel.clone(),
         )?;
-        let mut response = crate::runtime::DisposingReceiver::new_framework(response);
+        // The runtime's inline-disposal marker is deliberately sealed in its
+        // own crate. Cross-crate response types take the detached lane even
+        // when their current variants are plain framework data.
+        let mut response = crate::runtime::DisposingReceiver::new(response);
         Ok(Box::pin(async move {
             poll_fn(|context| response.poll_receive(context))
                 .await
@@ -243,7 +246,9 @@ impl fmt::Debug for Removal {
 
 impl Removal {
     pub(super) fn new(response: crate::driver::RemovalResponse) -> Self {
-        let mut response = crate::runtime::DisposingReceiver::new_framework(response);
+        // Keep cross-crate response destruction on the detached lane; only
+        // runtime-owned sealed types may select inline disposal.
+        let mut response = crate::runtime::DisposingReceiver::new(response);
         Self {
             inner: Box::pin(async move {
                 poll_fn(|context| response.poll_receive(context))

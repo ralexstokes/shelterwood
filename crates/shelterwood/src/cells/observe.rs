@@ -442,8 +442,8 @@ impl SnapshotReceiver {
     }
 
     /// Borrows the newest snapshot and terminal flag from one retained state.
-    // This method bridges the lower cell crate to the downstream façade's
-    // `ScopeRef` implementation. It remains callable on the façade-public
+    // This method bridges the internal cell module to the façade's `ScopeRef`
+    // implementation. It remains callable on the façade-public
     // receiver, but its signature is entirely supported façade data and grants
     // no construction or implementation capability. Hiding it from generated
     // docs is the explicit boundary ruling; the rustdoc-JSON walk deliberately

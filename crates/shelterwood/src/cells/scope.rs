@@ -27,14 +27,13 @@ use super::{
     RetainedExit, RetainedStopReason, StartupDisposition,
 };
 
-/// Cross-crate close-admission hook retained by a restart-stable scope cell.
+/// Crate-private close-admission hook retained by a restart-stable scope cell.
 ///
 /// # Implementation boundary
 ///
-/// This is not a user extension point. Only Shelterwood's façade implements
-/// and installs this trait. The callback runs while the restart-stable tree
-/// owns its observation gate, so a foreign implementation invalidates the
-/// framework's lock-rule guarantees. Requiring the transaction capability in
+/// This is not a user extension point. Its crate visibility makes a foreign
+/// implementation unrepresentable. The callback runs while the restart-stable
+/// tree owns its observation gate, and requiring the transaction capability in
 /// the signature keeps that critical-section boundary explicit.
 pub(crate) trait DynamicRoute: Any + Send + Sync {
     fn close_admission(&self, txn: &mut ObservationTxn<'_>);

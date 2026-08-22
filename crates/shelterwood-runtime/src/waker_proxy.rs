@@ -17,7 +17,7 @@ use crate::{PanicAccumulator, discard_panic, dispose_detached};
 /// disposal lane.
 ///
 /// That venue is a per-seam adjudication, not a universal rule: the mailbox
-/// reply receiver retires cancellation inline (`shelterwood-mailbox`'s
+/// reply receiver retires cancellation inline (the façade mailbox's
 /// `DisposingReceiver`), accepting that a slow caller-waker destructor stalls
 /// the abandoning holder alone. This wrapper backs the one-shot task and
 /// blocking-offload seams — and, downstream, the public admission, removal,

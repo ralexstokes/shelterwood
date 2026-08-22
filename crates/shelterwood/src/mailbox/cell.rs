@@ -1041,11 +1041,8 @@ impl<M> fmt::Debug for MailboxCell<M> {
 }
 
 impl<M: Send + 'static> MailboxCell<M> {
-    // This constructor bridges the lower mailbox crate to the downstream
-    // façade and therefore cannot be crate-private. Direct construction is
-    // outside the supported API; the façade does not export either this type
-    // or the `MailboxRuntime` capability in its signature.
-    #[doc(hidden)]
+    // Only the façade can pair a mailbox with the runtime capability object
+    // selected by its private adapter.
     pub(crate) fn new(actor_id: ChildId, runtime: Arc<dyn MailboxRuntime>) -> Arc<Self> {
         let changed = runtime.signal();
         Arc::new(Self {
@@ -1795,8 +1792,8 @@ impl<M: Send + 'static> MailboxReceiver<M> {
 
     /// Waits for mailbox activity in the façade's merged raw-actor event loop.
     ///
-    /// This remains public only as the cross-crate receiver seam used by
-    /// `RawContext`; it is not reachable from Shelterwood's supported API.
+    /// This crate-private receiver seam is used by `RawContext`; it is not
+    /// reachable from Shelterwood's supported API.
     pub(crate) async fn changed(&mut self) {
         self.watcher.changed().await;
     }

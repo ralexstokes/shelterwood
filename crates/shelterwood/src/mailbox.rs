@@ -48,7 +48,7 @@ pub(crate) type MailboxDisposal = Box<dyn Send>;
 ///
 /// Configuration mints the initial permission and a successful close returns
 /// the next one. The token is intentionally neither `Clone` nor constructible
-/// outside the mailbox crate.
+/// outside the mailbox module.
 #[must_use = "binding permission must be consumed by the next mailbox bind"]
 pub(crate) struct MailboxBindToken {
     permit: Arc<AtomicBool>,

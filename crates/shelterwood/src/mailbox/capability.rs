@@ -252,8 +252,8 @@ impl<T> Drop for DisposingReceiver<T> {
 /// passing test. The wrapper exists because focused mailbox tests need to
 /// replace one capability while every other operation keeps the real adapter.
 ///
-/// The dev-dependency does not weaken the inversion, which is a claim about
-/// the production graph. Core itself retains no dev-dependencies.
+/// These adapter-integration tests stay in the façade so core itself retains
+/// no dev-dependencies.
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{

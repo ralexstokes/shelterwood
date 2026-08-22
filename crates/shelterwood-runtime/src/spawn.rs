@@ -13,8 +13,7 @@ use shelterwood_core::exit::JoinOutcome;
 
 use super::{
     DisposingReceiver, OneShotReceiver, OneShotSender, PanicPayload, Timeout, catch_panic,
-    discard_panic, dispose_detached, oneshot, timeout_at,
-    waker_proxy::{ProxiedPoll, WakerRetirement},
+    discard_panic, dispose_detached, oneshot, timeout_at, waker_proxy::ProxiedPoll,
 };
 
 const BLOCKING_FALLBACK_THREAD: &str = "shelterwood-blocking";
@@ -446,7 +445,6 @@ async fn poll_join_user_waker<T>(mut inner: task::JoinHandle<T>) -> Result<T, ta
             context,
             |inner, context| std::pin::Pin::new(inner).poll(context),
             Poll::is_pending,
-            WakerRetirement::Inline,
         )
     })
     .await;

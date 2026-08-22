@@ -99,8 +99,12 @@ rests on:
   public doc-hidden cross-crate type whose `retire_with` takes a
   caller-supplied `fn(Waker)`, but the effect is queued under the proxy's
   leaf mutex and invoked only after unlock, so no foreign code runs under
-  the lock, and the supported façade re-exports neither the type nor
-  anything that could install one.
+  the lock. `ProxiedPoll`, the probe/register/re-poll state machine that
+  wraps it, rides under the same ruling: its `poll` takes caller-supplied
+  closures, but they are invoked only with no proxy mutex held, and its
+  ready-edge retirement flushes the stored caller waker through the same
+  post-unlock effects path. The supported façade re-exports neither type
+  nor anything that could install one.
   `MailboxEffectSink` is the sharpest case: the framework calls
   `defer_mailbox_effect` while holding both the resident-tree observation gate
   and `MemberCell::mailbox`, and its `MailboxEffectQueue` implementation is

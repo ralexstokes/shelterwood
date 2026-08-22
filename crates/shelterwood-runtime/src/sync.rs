@@ -11,10 +11,7 @@ use std::{
 
 use tokio::sync::{broadcast, oneshot};
 
-use super::{
-    PanicAccumulator, dispose_detached,
-    waker_proxy::{ProxiedPoll, WakerRetirement},
-};
+use super::{PanicAccumulator, dispose_detached, waker_proxy::ProxiedPoll};
 
 /// A caller-waker registry whose lock protects only inert storage changes.
 ///
@@ -609,6 +606,23 @@ impl<T> OneShotReceiver<T> {
     }
 }
 
+/// Marker for framework-owned response values whose destructor runs no user
+/// code.
+///
+/// [`DisposingReceiver::new_framework`] drops an abandoned published value
+/// inline in holder drop glue instead of submitting it to the blocking
+/// disposal lane, so this bound is what keeps that fast path from ever
+/// reaching a destructor that can block, panic, or re-enter. Implement it
+/// only for plain framework enums and their compositions; a type that can
+/// own user data — an `Exit`, a message, a type-erased error — must go
+/// through [`DisposingReceiver::new`] instead.
+#[doc(hidden)]
+pub trait FrameworkPlain: Send + 'static {}
+
+impl FrameworkPlain for () {}
+
+impl<T: FrameworkPlain, E: FrameworkPlain> FrameworkPlain for Result<T, E> {}
+
 /// One-shot receive state that keeps user value destruction off framework and
 /// holder drop glue.
 ///
@@ -638,6 +652,20 @@ impl<T: Send + 'static> DisposingReceiver<T> {
     }
 }
 
+impl<T: FrameworkPlain> DisposingReceiver<T> {
+    /// Creates a receiver whose abandoned value is plain framework data.
+    ///
+    /// This is an implementation seam for internal response enums. Unlike
+    /// [`Self::new`], dropping a published but unclaimed value does not
+    /// submit work to the blocking disposal lane; the [`FrameworkPlain`]
+    /// bound is what keeps that inline drop from ever reaching a user-owned
+    /// destructor.
+    #[doc(hidden)]
+    pub fn new_framework(inner: OneShotReceiver<T>) -> Self {
+        Self::with_dispose(inner, drop)
+    }
+}
+
 impl<T> DisposingReceiver<T> {
     fn with_dispose(inner: OneShotReceiver<T>, dispose: fn(T)) -> Self {
         Self {
@@ -645,16 +673,6 @@ impl<T> DisposingReceiver<T> {
             dispose,
             caller_poll: ProxiedPoll::new(),
         }
-    }
-
-    /// Creates a receiver whose abandoned value is plain framework data.
-    ///
-    /// This is an implementation seam for internal response enums with no
-    /// user-owned destructor. Unlike [`Self::new`], dropping a published but
-    /// unclaimed value does not submit work to the blocking disposal lane.
-    #[doc(hidden)]
-    pub fn new_framework(inner: OneShotReceiver<T>) -> Self {
-        Self::with_dispose(inner, drop)
     }
 
     pub fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
@@ -671,7 +689,6 @@ impl<T> DisposingReceiver<T> {
             context,
             OneShotReceiver::poll_receive,
             Poll::is_pending,
-            WakerRetirement::Inline,
         )
     }
 
@@ -690,7 +707,6 @@ impl<T> DisposingReceiver<T> {
             context,
             OneShotReceiver::close_and_poll_receive,
             |result| matches!(result, OneShotClose::Pending),
-            WakerRetirement::Inline,
         )
     }
 }
@@ -719,8 +735,7 @@ impl<T> Drop for DisposingReceiver<T> {
             }
         });
         panics.run(|| drop(inner));
-        self.caller_poll
-            .retire(WakerRetirement::Detached, &mut panics);
+        self.caller_poll.retire_detached(&mut panics);
     }
 }
 
@@ -1109,6 +1124,8 @@ mod tests {
     struct DebugProbe(Arc<AtomicUsize>);
 
     struct FrameworkDropProbe(mpsc::Sender<ThreadId>);
+
+    impl super::FrameworkPlain for FrameworkDropProbe {}
 
     impl Drop for FrameworkDropProbe {
         fn drop(&mut self) {

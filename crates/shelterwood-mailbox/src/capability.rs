@@ -237,44 +237,32 @@ impl<T: Send + 'static> DisposingReceiver<T> {
         // Probe with a framework waker, then leave only the proxy registered
         // across a pending return so Tokio never destroys a caller waker at
         // that seam.
-        let result = self.reply_poll.poll(
+        // A ready result may own a user value; `ProxiedPoll::poll` retires
+        // the caller registration synchronously and contains any hostile
+        // destructor panic before returning it. See `retire_reply_waker` for
+        // the two costs that ride on the discard.
+        self.reply_poll.poll(
             self.inner
                 .as_mut()
                 .expect("a live disposing receiver retains its channel"),
             context,
             OneShotReceiver::poll_receive,
             Poll::is_pending,
-        );
-        if result.is_ready() {
-            // `result` may own a user value. The caller-waker diagnostic is
-            // subordinate to delivering it, so retire synchronously but
-            // contain any hostile destructor panic before returning. See
-            // `retire_reply_waker` for the two costs that ride on the discard.
-            let mut panics = PanicAccumulator::default();
-            self.retire_reply_waker(&mut panics);
-            crate::panic::discard_panic(panics.take());
-        }
-        result
+        )
     }
 
     pub(crate) fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T> {
-        let result = self.reply_poll.poll(
+        // Timeout arbitration can return a concurrently delivered user value,
+        // so its ready edge uses the same synchronous contained retirement as
+        // the ordinary delivery path, and accepts the same two costs.
+        self.reply_poll.poll(
             self.inner
                 .as_mut()
                 .expect("a live disposing receiver retains its channel"),
             context,
             OneShotReceiver::close_and_poll_receive,
             |result| matches!(result, OneShotClose::Pending),
-        );
-        if !matches!(result, OneShotClose::Pending) {
-            // Timeout arbitration can return a concurrently delivered user
-            // value, so it uses the same synchronous contained precedence as
-            // the ordinary ready path, and accepts the same two costs.
-            let mut panics = PanicAccumulator::default();
-            self.retire_reply_waker(&mut panics);
-            crate::panic::discard_panic(panics.take());
-        }
-        result
+        )
     }
 }
 

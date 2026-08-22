@@ -46,6 +46,74 @@ impl<T: Send + 'static> Future for ReplyReceive<T> {
     }
 }
 /// A cheap membership-addressed actor handle.
+///
+/// The handle addresses one [`Membership`] and follows every incarnation of
+/// it across restarts. It never retargets: after remove and re-add under the
+/// same child id, the replacement has a new membership and needs a new
+/// handle, while this one stays pinned to the removed membership and reports
+/// [`SendErrorKind::Terminated`]. Cloning is reference-count work; every
+/// clone addresses the same membership.
+///
+/// # Choosing a send flavor
+///
+/// - [`send`](Self::send) waits through rebind windows and backpressure and
+///   fails only when the membership is terminal
+///   ([`SendErrorKind::Terminated`]).
+/// - [`try_send`](Self::try_send) is fail-fast: it never parks and reports
+///   [`NotRunning`](SendErrorKind::NotRunning), [`Full`](SendErrorKind::Full),
+///   or [`Terminated`](SendErrorKind::Terminated) immediately.
+/// - [`send_timeout`](Self::send_timeout) bounds the wait and recovers the
+///   message on expiry; a [`TimedOut`](SendErrorKind::TimedOut) message is
+///   guaranteed never to have been accepted.
+/// - [`call`](Self::call) is request/reply under one deadline covering
+///   message construction, mailbox acceptance, and the reply.
+///
+/// Which failures prove the message was never accepted, and when a resend is
+/// safe, is the subject of [`crate::guides::errors`] and
+/// [`crate::guides::retry_and_ordering`].
+///
+/// # Examples
+///
+/// Send and call against a counter actor (the actor and system scaffolding
+/// are hidden; see the crate front page for the full form):
+///
+/// ```rust
+/// # use std::time::Duration;
+/// # use shelterwood::{Actor, ActorDef, Context, ExitError, ExitResult, Reply, Tree};
+/// # struct Counter {
+/// #     count: u64,
+/// # }
+/// enum Msg {
+///     Add(u64),
+///     Total(Reply<u64>),
+/// }
+/// # impl Actor for Counter {
+/// #     type Msg = Msg;
+/// #     type Args = ();
+/// #     async fn init(_args: (), _context: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+/// #         Ok(Self { count: 0 })
+/// #     }
+/// #     async fn handle(&mut self, message: Msg, _context: &mut Context<'_, Self>) -> ExitResult {
+/// #         match message {
+/// #             Msg::Add(n) => self.count += n,
+/// #             Msg::Total(reply) => reply.send(self.count),
+/// #         }
+/// #         Ok(())
+/// #     }
+/// # }
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let mut tree = Tree::new();
+/// let counter = tree.add_actor("counter", ActorDef::<Counter>::cloned(()))?;
+/// # let system = tree.spawn()?;
+/// # system.wait_started().await?;
+/// counter.send(Msg::Add(2)).await?;
+/// let replied = counter.call(Msg::Total, Duration::from_secs(1)).await?;
+/// assert_eq!(replied.value, 2);
+/// # system.shutdown(Duration::from_secs(5)).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct ActorRef<M> {
     member: Arc<dyn ActorIdentity>,
     mailbox: Arc<MailboxCell<M>>,
@@ -88,31 +156,73 @@ where
 impl<M: Send + 'static> ActorRef<M> {
     /// Sends with backpressure and transparently waits through rebind windows.
     ///
+    /// Acceptance resolves to the accepting [`Incarnation`]. The future is
+    /// lazy: constructing it submits nothing until it is first polled, and
+    /// dropping it before acceptance withdraws the message.
+    ///
     /// On a live latest-value mailbox, acceptance can replace the previous
     /// message. The displaced message is dropped inline on the task polling
     /// this send, after the new message's acceptance is visible; a panicking
     /// displaced-message destructor therefore resumes on that task.
+    ///
+    /// # Errors
+    ///
+    /// The only failure is [`SendErrorKind::Terminated`]: the membership is
+    /// terminal and can never accept again. Rebind windows and a full queue
+    /// are waited through, not reported. The unaccepted message is recovered
+    /// in the error's `message` field; see [`crate::guides::errors`].
     pub fn send(&self, message: M) -> SendFuture<M> {
         SendFuture::new(Arc::clone(&self.mailbox), message)
     }
 
     /// Attempts immediate acceptance without parking.
     ///
+    /// Success returns the accepting [`Incarnation`]. Every failure is
+    /// guaranteed-never-accepted and recovers the message in the error's
+    /// `message` field, so a fail-fast send loses nothing.
+    ///
     /// On a live latest-value mailbox, acceptance can replace the previous
     /// message. The displaced message is dropped inline on the calling task,
     /// after the new message's acceptance is visible; a panicking
     /// displaced-message destructor therefore resumes on that task.
+    ///
+    /// # Errors
+    ///
+    /// - [`SendErrorKind::NotRunning`] — the membership is not currently
+    ///   accepting: pre-spawn, a restart rebind window, or intake frozen at
+    ///   stop.
+    /// - [`SendErrorKind::Full`] — a queue mailbox is at capacity (a live
+    ///   latest-value mailbox accepts by replacement instead).
+    /// - [`SendErrorKind::Terminated`] — the membership is terminal.
+    ///
+    /// See [`crate::guides::errors`] for the per-kind identity evidence.
     pub fn try_send(&self, message: M) -> Result<Incarnation, SendError<M>> {
         self.mailbox.try_send(message)
     }
 
     /// Sends within one acceptance budget, recovering an unaccepted message.
     ///
+    /// The budget starts when the returned future is first polled and bounds
+    /// only acceptance. Within it the send behaves exactly like
+    /// [`send`](Self::send): rebind windows and backpressure are waited
+    /// through, and success resolves to the accepting [`Incarnation`].
+    ///
     /// Live latest-value displacement follows [`send`](Self::send): the
     /// displaced message is dropped inline on the task polling this send,
     /// after acceptance of the replacement is visible.
     /// A zero budget makes no acceptance attempt and returns the unaccepted
     /// message with [`SendErrorKind::TimedOut`].
+    ///
+    /// # Errors
+    ///
+    /// - [`SendErrorKind::TimedOut`] — the budget elapsed before acceptance;
+    ///   the message was withdrawn, guaranteed never to have been accepted.
+    /// - [`SendErrorKind::Terminated`] — the membership terminalized before
+    ///   acceptance.
+    ///
+    /// Both recover the message in the error's `message` field. `NotRunning`
+    /// and `Full` are waited through, never reported; see
+    /// [`crate::guides::errors`].
     pub fn send_timeout(&self, message: M, deadline: impl Into<DeadlineBudget>) -> SendTimeout<M> {
         let runtime = self.mailbox.runtime();
         SendTimeout {
@@ -121,6 +231,14 @@ impl<M: Send + 'static> ActorRef<M> {
     }
 
     /// Creates a reply capability using this actor handle's installed runtime.
+    ///
+    /// Use it to await a reply separately from its send: embed the [`Reply`]
+    /// in a message, submit it with any send flavor, and await the
+    /// [`ReplyReceiver`](crate::ReplyReceiver). This method is infallible.
+    /// Acceptance evidence belongs to the accompanying send's result; the
+    /// receiver's own deadline bounds only the response wait, whose failures
+    /// are [`ReplyError`]. [`call`](Self::call) packages the same pieces
+    /// under one deadline.
     #[must_use]
     pub fn reply_channel<T: Send + 'static>(&self) -> (Reply<T>, crate::ReplyReceiver<T>) {
         Reply::channel(self.runtime())
@@ -149,6 +267,21 @@ impl<M: Send + 'static> ActorRef<M> {
     /// through isolated disposal, as cancelling a parked [`send`](Self::send)
     /// does. A panicking waker destructor is contained there rather than
     /// resuming on the awaiting task.
+    ///
+    /// # Errors
+    ///
+    /// - [`CallErrorKind::Terminated`] — the membership terminalized before
+    ///   acceptance; the request was never accepted.
+    /// - [`CallErrorKind::AcceptanceTimedOut`] — the deadline elapsed before
+    ///   acceptance; the request was withdrawn, guaranteed never to have
+    ///   been accepted.
+    /// - [`CallErrorKind::ResponseTimedOut`] — the deadline elapsed after
+    ///   acceptance; the request's effect and reply are unknown.
+    /// - [`CallErrorKind::ReplyDropped`] — the request was accepted but its
+    ///   [`Reply`] was dropped unanswered.
+    ///
+    /// The per-kind retry discipline lives in
+    /// [`crate::guides::retry_and_ordering`].
     pub fn call<T: Send + 'static>(
         &self,
         make_msg: impl FnOnce(Reply<T>) -> M + Send + 'static,

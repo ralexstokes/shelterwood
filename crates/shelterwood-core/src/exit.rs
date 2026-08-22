@@ -121,6 +121,38 @@ pub type ExitResult = Result<(), ExitError>;
 ///
 /// This type deliberately does not implement [`std::error::Error`], allowing
 /// the blanket `From<E>` conversion without overlap.
+///
+/// There are two construction forms: [`ExitError::message`] wraps a plain
+/// displayable message, and the blanket [`From`] impl erases any
+/// `E: Error + Send + Sync + 'static`, which is what lets child code use `?`
+/// in a function returning [`ExitResult`]. Cloning is shallow: every clone
+/// shares one erased allocation, and that shared provenance is what
+/// [`Exit`]'s failed-payload equality compares.
+///
+/// Three accessors observe the payload: [`ExitError::as_error`] views the
+/// erased source error, while [`ExitError::intensity_trip`] and
+/// [`ExitError::startup_failure`] return the framework-authenticated
+/// structured payloads. The structured accessors answer `Some` only for
+/// errors the framework itself minted; converting an [`IntensityTrip`] or a
+/// [`StartupFailure`] through the blanket impl yields an ordinary
+/// application error for which both return `None`.
+///
+/// # Examples
+///
+/// ```
+/// # use shelterwood_core::ExitError;
+/// // From a displayable message.
+/// let error = ExitError::message("shard offline");
+/// assert_eq!(error.as_error().to_string(), "shard offline");
+///
+/// // From any std error via the blanket conversion.
+/// let error = ExitError::from(std::io::Error::other("disk full"));
+/// assert_eq!(error.as_error().to_string(), "disk full");
+///
+/// // User conversions never carry structured framework provenance.
+/// assert!(error.intensity_trip().is_none());
+/// assert!(error.startup_failure().is_none());
+/// ```
 #[derive(Clone)]
 pub struct ExitError(Arc<ExitErrorInner>);
 
@@ -414,6 +446,42 @@ pub enum GracePhase {
 /// publishes through snapshots and lifecycle events — compare equal,
 /// while two independently constructed errors with identical messages do
 /// not. Compare failure content through [`ExitError::as_error`] instead.
+///
+/// # Examples
+///
+/// Classification is an exhaustive match on [`Exit::kind`]; a
+/// [`ExitKind::Failed`] exit carries its application error in the variant
+/// payload:
+///
+/// ```
+/// # use shelterwood_core::{Cancellation, Exit, ExitError, ExitKind};
+/// fn describe(exit: &Exit) -> String {
+///     match exit.kind() {
+///         ExitKind::Completed => "completed".to_owned(),
+///         ExitKind::Failed(error) => {
+///             format!("failed: {}", error.as_error())
+///         }
+///         ExitKind::Panicked { message: Some(message) } => {
+///             format!("panicked: {message}")
+///         }
+///         ExitKind::Panicked { message: None } => "panicked".to_owned(),
+///         ExitKind::ReadinessTimedOut { deadline } => {
+///             format!("readiness deadline expired at {deadline:?}")
+///         }
+///         ExitKind::Aborted { phase } => format!("aborted: {phase:?}"),
+///         ExitKind::NeverStarted => "never started".to_owned(),
+///     }
+/// }
+///
+/// let failed =
+///     Exit::failed(ExitError::message("boom"), Cancellation::NotObserved);
+/// assert_eq!(describe(&failed), "failed: boom");
+/// assert!(failed.is_failure());
+///
+/// let completed = Exit::completed(Cancellation::Observed);
+/// assert_eq!(describe(&completed), "completed");
+/// assert!(!completed.is_failure());
+/// ```
 #[derive(Clone, Debug)]
 pub struct Exit {
     kind: ExitKind,

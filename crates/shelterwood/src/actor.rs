@@ -118,6 +118,11 @@ macro_rules! actor_context_forwarders {
         /// Absent from [`StopContext`]. Capture it during [`Actor::init`] or
         /// [`Actor::handle`] if [`Actor::on_stop`] needs the handle itself;
         /// for identity alone the stop context keeps `incarnation()`.
+        ///
+        /// Never `call` and await this handle from inside a handler — the
+        /// reply can be produced only by the actor loop that handler is
+        /// blocking. [`crate::guides::retry_and_ordering`] catalogs the
+        /// supported shapes.
         #[must_use]
         pub fn myself(&self) -> ActorRef<$actor::Msg> {
             self.raw.myself()
@@ -134,6 +139,128 @@ enum DeliveryStage {
 }
 
 /// Callback context used by both live and frozen-prefix handler deliveries.
+///
+/// One `Context` is lent to [`Actor::init`] and to each [`Actor::handle`]
+/// call; it is the whole capability surface a callback has. The capabilities
+/// group as:
+///
+/// - **Identity** — [`id`](Context::id),
+///   [`incarnation`](Context::incarnation), and [`scope`](Context::scope)
+///   name this child, this run of it, and its supervising scope.
+/// - **Self-handle** — [`myself`](Context::myself) returns the
+///   membership-addressed [`ActorRef`] other tasks use to reach this actor.
+/// - **Protocol steps** — [`continue_with`](Context::continue_with) queues an
+///   actor-local message ahead of external input, the shape for splitting
+///   one request into steps without a handler awaiting itself.
+/// - **Timers** — [`set_timeout`](Context::set_timeout) and
+///   [`set_interval`](Context::set_interval) arm keyed deliveries;
+///   [`clear_timer`](Context::clear_timer) retracts one.
+/// - **Offloads** — [`offload`](Context::offload) and
+///   [`offload_scoped`](Context::offload_scoped) start incarnation-owned
+///   async work whose completion re-enters [`Actor::handle`] as a message.
+/// - **Blocking work** — [`run_blocking`](Context::run_blocking) moves a
+///   closure to a blocking thread with shutdown-tied cancellation.
+/// - **Readiness** — [`mark_ready`](Context::mark_ready) releases the
+///   incarnation's readiness gate, the completing move under an effective
+///   [`Readiness::Manual`].
+/// - **Stop and shutdown** — [`stop`](Context::stop) requests a clean local
+///   stop, [`is_draining`](Context::is_draining) reports the delivery
+///   regime, [`shutdown_token`](Context::shutdown_token) and
+///   [`abort_token`](Context::abort_token) expose the cooperative and
+///   escalation cancellation tokens, and
+///   [`request_scope_shutdown`](Context::request_scope_shutdown) asks the
+///   supervising scope to shut down.
+/// - **Decoration** — [`for_actor`](Context::for_actor) re-projects the
+///   context for a same-message wrapped actor.
+///
+/// # Delivery regimes
+///
+/// A context serves two regimes. **Live** deliveries — `init` and every
+/// `handle` call before a stop — have the full surface. Once the incarnation
+/// is **stopping** — after [`stop`](Context::stop), once cooperative
+/// shutdown is requested, or while draining the frozen mailbox prefix under
+/// [`MailboxShutdown::Drain`] — every operation that would queue new work
+/// for this incarnation ([`continue_with`](Context::continue_with),
+/// [`set_timeout`](Context::set_timeout),
+/// [`set_interval`](Context::set_interval), [`offload`](Context::offload),
+/// and [`offload_scoped`](Context::offload_scoped)) returns [`Rejected`]
+/// carrying its inputs back, and during frozen-prefix drain
+/// [`clear_timer`](Context::clear_timer) is rejected as well.
+/// [`run_blocking`](Context::run_blocking) is deliberately not gated because
+/// teardown code may still need it, and [`mark_ready`](Context::mark_ready)
+/// and [`stop`](Context::stop) degrade to documented no-ops while draining
+/// rather than rejecting.
+///
+/// # Never call and await `myself()`
+///
+/// Awaiting `context.myself().call(...)` from a handler deadlocks: the reply
+/// can be produced only by the actor loop the handler itself is blocking.
+/// [`crate::guides::retry_and_ordering`] catalogs the supported shapes —
+/// continuations, offloads, and split reply channels.
+///
+/// # Examples
+///
+/// A handler splitting one request into protocol steps with
+/// [`continue_with`](Context::continue_with) instead of awaiting itself:
+///
+/// ```
+/// use shelterwood::{Actor, Context, ExitError, ExitResult, Reply};
+/// # use std::time::Duration;
+/// # use shelterwood::{ActorDef, Tree};
+///
+/// struct Pipeline {
+///     staged: Option<u64>,
+/// }
+///
+/// enum Msg {
+///     Begin(u64),
+///     Finish,
+///     Result(Reply<Option<u64>>),
+/// }
+///
+/// impl Actor for Pipeline {
+///     type Msg = Msg;
+///     type Args = ();
+///
+///     async fn init(_args: (), _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
+///         Ok(Self { staged: None })
+///     }
+///
+///     async fn handle(&mut self, message: Msg, context: &mut Context<'_, Self>) -> ExitResult {
+///         match message {
+///             Msg::Begin(n) => {
+///                 self.staged = Some(n * 2);
+///                 // Queue the next protocol step; it is delivered ahead of
+///                 // external input instead of this handler awaiting itself.
+///                 if context.continue_with(Msg::Finish).is_err() {
+///                     // Stopping incarnation: the step will not run.
+///                     self.staged = None;
+///                 }
+///             }
+///             Msg::Finish => {
+///                 if let Some(n) = self.staged.as_mut() {
+///                     *n += 1;
+///                 }
+///             }
+///             Msg::Result(reply) => reply.send(self.staged),
+///         }
+///         Ok(())
+///     }
+/// }
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let mut tree = Tree::new();
+/// # let pipeline = tree.add_actor("pipeline", ActorDef::<Pipeline>::cloned(()))?;
+/// # let system = tree.spawn()?;
+/// # system.wait_started().await?;
+/// pipeline.send(Msg::Begin(20)).await?;
+/// let replied = pipeline.call(Msg::Result, Duration::from_secs(1)).await?;
+/// assert_eq!(replied.value, Some(41));
+/// # system.shutdown(Duration::from_secs(5)).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Context<'a, A: Actor> {
     raw: &'a mut RawContext<A::Msg>,
     stage: DeliveryStage,
@@ -222,6 +349,10 @@ impl<'a, A: Actor> Context<'a, A> {
     }
 
     /// Queues an actor-local continuation ahead of external input.
+    ///
+    /// Returns [`Rejected`] carrying the message back once this incarnation
+    /// is stopping: after [`Context::stop`], once cooperative shutdown is
+    /// requested, or during frozen-prefix drain.
     pub fn continue_with(&mut self, message: A::Msg) -> Result<(), Rejected<A::Msg>> {
         if self.stage == DeliveryStage::DrainingFrozenPrefix {
             Err(Rejected::new(message))
@@ -231,6 +362,10 @@ impl<'a, A: Actor> Context<'a, A> {
     }
 
     /// Arms or replaces a one-shot keyed timer.
+    ///
+    /// Returns [`Rejected`] carrying the key and message back once this
+    /// incarnation is stopping: after [`Context::stop`], once cooperative
+    /// shutdown is requested, or during frozen-prefix drain.
     pub fn set_timeout<K>(
         &mut self,
         key: K,
@@ -248,6 +383,10 @@ impl<'a, A: Actor> Context<'a, A> {
     }
 
     /// Arms or replaces a keyed interval; a zero period clears the key.
+    ///
+    /// Returns [`Rejected`] carrying the key and message back once this
+    /// incarnation is stopping: after [`Context::stop`], once cooperative
+    /// shutdown is requested, or during frozen-prefix drain.
     pub fn set_interval<K>(
         &mut self,
         key: K,
@@ -266,6 +405,11 @@ impl<'a, A: Actor> Context<'a, A> {
     }
 
     /// Retracts a keyed timer or rejects the operation while draining.
+    ///
+    /// `Ok(true)` reports that a timer was armed for the key, including one
+    /// that had elapsed but was not yet delivered. [`Rejected`] is returned
+    /// only during frozen-prefix drain; unlike the queueing operations, a
+    /// retraction stays available to a live handler after [`Context::stop`].
     pub fn clear_timer<K>(&mut self, key: &K) -> Result<bool, Rejected<()>>
     where
         K: Hash + Eq + Send + 'static,
@@ -280,6 +424,10 @@ impl<'a, A: Actor> Context<'a, A> {
     /// Starts incarnation-owned async work with one total deadline budget.
     /// A zero budget never polls `work` and re-enters with
     /// [`DeadlineElapsed`].
+    ///
+    /// Returns [`Rejected`] handing the work and continuation back once this
+    /// incarnation is stopping: after [`Context::stop`], once cooperative
+    /// shutdown is requested, or during frozen-prefix drain.
     pub fn offload<F, T, C>(
         &mut self,
         work: F,
@@ -301,6 +449,10 @@ impl<'a, A: Actor> Context<'a, A> {
     /// Starts guarded incarnation-owned async work with one deadline budget.
     /// A zero budget never polls `work` and re-enters with
     /// [`DeadlineElapsed`].
+    ///
+    /// Returns [`Rejected`] handing the work and continuation back once this
+    /// incarnation is stopping: after [`Context::stop`], once cooperative
+    /// shutdown is requested, or during frozen-prefix drain.
     pub fn offload_scoped<F, T, C>(
         &mut self,
         work: F,
@@ -407,6 +559,14 @@ impl<A: Actor> Drop for Context<'_, A> {
 ///
 /// Capture [`Context::myself`] during [`Actor::init`] or [`Actor::handle`]
 /// only when teardown needs the handle itself.
+///
+/// What remains is the common surface: identity ([`StopContext::id`],
+/// [`StopContext::incarnation`], [`StopContext::scope`]), the
+/// [`shutdown`](StopContext::shutdown_token) and
+/// [`abort`](StopContext::abort_token) tokens,
+/// [`StopContext::request_scope_shutdown`], and
+/// [`StopContext::run_blocking`] — the one resource operation teardown code
+/// may still need.
 pub struct StopContext<'a, A: Actor> {
     raw: &'a mut RawContext<A::Msg>,
     actor: PhantomData<fn() -> A>,

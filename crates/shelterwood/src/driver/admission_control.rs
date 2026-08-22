@@ -178,13 +178,15 @@ impl DynamicEntry {
 
 pub(super) struct DynamicState {
     accepting: bool,
-    #[cfg(not(test))]
     entries: HashMap<ChildId, DynamicEntry>,
-    #[cfg(test)]
-    pub(super) entries: HashMap<ChildId, DynamicEntry>,
 }
 
 impl DynamicState {
+    #[cfg(test)]
+    pub(super) fn entries_mut(&mut self) -> &mut HashMap<ChildId, DynamicEntry> {
+        &mut self.entries
+    }
+
     pub(super) fn entry(&self, id: &ChildId) -> Option<&DynamicEntry> {
         self.entries.get(id)
     }

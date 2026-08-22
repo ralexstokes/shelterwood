@@ -51,7 +51,7 @@ async fn refused_dynamic_admission_panics_after_control_plane_unlock() {
             .state
             .lock()
             .expect("dynamic-state mutex remains healthy")
-            .entries
+            .entries_mut()
             .get(member.id())
             .is_some_and(|entry| !entry.is_reserved()),
         "the fixture reaches the committing admission site after entry promotion"
@@ -236,7 +236,7 @@ fn dynamic_close_holds_removal_completion_through_observation_cleanup() {
         .state
         .lock()
         .expect("dynamic-state mutex poisoned")
-        .entries
+        .entries_mut()
         .insert(
             ChildId::from("worker"),
             DynamicEntry::removing(slot, ChildKey::fixture(1), responses),
@@ -381,7 +381,7 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
         .state
         .lock()
         .expect("dynamic-state mutex poisoned")
-        .entries
+        .entries_mut()
         .insert(child_id.clone(), DynamicEntry::resident(slot, key, None));
     root.set_dynamic_route(Some(control.clone()));
 
@@ -402,12 +402,12 @@ fn dynamic_removal_waits_for_the_observation_gate_before_mutating_state() {
             .expect("removal reports its gate capture within the bound"),
         GateCapture::Observation
     );
-    let state = control
+    let mut state = control
         .state
         .try_lock()
         .expect("a removal waiting on observation has not acquired or mutated dynamic state");
     let entry = state
-        .entries
+        .entries_mut()
         .get(&child_id)
         .expect("the removal keeps its resident registration");
     assert!(!entry.is_removing());
@@ -464,7 +464,7 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
                 .state
                 .lock()
                 .expect("dynamic-state mutex remains available")
-                .entries
+                .entries_mut()
                 .contains_key(member.id()),
             "the old id remains claimed until residency withdrawal can commit"
         );
@@ -478,7 +478,7 @@ async fn final_removal_holds_the_id_until_removed_publication_commits() {
             .state
             .lock()
             .expect("dynamic-state mutex remains healthy")
-            .entries
+            .entries_mut()
             .contains_key(member.id()),
         "id release follows the Removed publication"
     );
@@ -601,7 +601,7 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
         .state
         .lock()
         .expect("dynamic-state mutex poisoned")
-        .entries
+        .entries_mut()
         .insert(
             child_id,
             DynamicEntry::resident(Arc::clone(&slot), key, Some(Latch::default())),
@@ -686,7 +686,7 @@ async fn admission_conversion_panic_does_not_poison_dynamic_cleanup() {
             .state
             .lock()
             .expect("dynamic-state mutex remains healthy")
-            .entries
+            .entries_mut()
             .is_empty(),
         "cleanup discharges the stranded reservation"
     );
@@ -779,7 +779,7 @@ async fn annulment_before_admission_owns_never_started_terminality() {
             .state
             .lock()
             .expect("dynamic-state mutex remains healthy")
-            .entries
+            .entries_mut()
             .is_empty()
     );
     assert_eq!(
@@ -849,7 +849,7 @@ async fn annulment_after_promotion_is_inert_and_supervision_owns_the_exit() {
             .state
             .lock()
             .expect("dynamic-state mutex remains healthy")
-            .entries
+            .entries_mut()
             .get(member.id())
             .is_some_and(|entry| !entry.is_reserved()),
         "the resident registration survives the inert annul"
@@ -982,7 +982,7 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
                         .state
                         .lock()
                         .expect("dynamic-state mutex remains healthy")
-                        .entries
+                        .entries_mut()
                         .get(member.id())
                         .is_some_and(|entry| !entry.is_reserved())
                 );
@@ -999,7 +999,7 @@ async fn annulment_racing_admission_resolves_to_one_terminalization_owner() {
                         .state
                         .lock()
                         .expect("dynamic-state mutex remains healthy")
-                        .entries
+                        .entries_mut()
                         .is_empty()
                 );
             }
@@ -1069,7 +1069,7 @@ async fn fused_cancellation_overtaking_admission_rejects_before_conversion() {
             .state
             .lock()
             .expect("dynamic-state mutex remains healthy")
-            .entries
+            .entries_mut()
             .is_empty()
     );
     assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
@@ -1156,7 +1156,7 @@ async fn fused_cancellation_during_conversion_is_rejected_by_the_under_lock_rech
             .state
             .lock()
             .expect("dynamic-state mutex remains healthy")
-            .entries
+            .entries_mut()
             .is_empty()
     );
     assert!(matches!(member.record().stage, MemberStage::Terminal(_)));
@@ -1209,7 +1209,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
         .state
         .lock()
         .expect("dynamic-state mutex poisoned")
-        .entries
+        .entries_mut()
         .get(member.id())
         .and_then(DynamicEntry::key)
         .expect("the admission installs its child key");
@@ -1319,7 +1319,7 @@ async fn exercise_coalesced_removal(source: RemovalSource) {
             .state
             .lock()
             .expect("dynamic-state mutex poisoned")
-            .entries
+            .entries_mut()
             .contains_key(member.id())
     );
     if let Some(response) = removal_response {
@@ -1434,7 +1434,7 @@ pub(crate) async fn exercise_queued_fused_drop_before_exit_dispatch<A>(
             .state
             .lock()
             .expect("dynamic-state mutex poisoned")
-            .entries
+            .entries_mut()
             .get(member.id())
             .is_some_and(|entry| entry.is_removing() && entry.matches_key(key)),
         "fused drop marks the indexed membership removing before its queued edge advances"

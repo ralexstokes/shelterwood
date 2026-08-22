@@ -11,7 +11,7 @@ use std::{
     },
     task::{Context as TaskContext, Poll, RawWaker, RawWakerVTable, Waker},
     thread::{self, ThreadId},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use common::{DestructorBlocker, DestructorGate, POLL_TIMEOUT};
@@ -97,13 +97,13 @@ fn blocking_drop_waker(gate: &DestructorGate, entered: mpsc::Sender<ThreadId>) -
 }
 
 #[derive(Default)]
-struct CloneCounter(AtomicUsize);
+struct LiveWakerCounter(AtomicUsize);
 
 unsafe fn clone_counting_waker(data: *const ()) -> RawWaker {
     // SAFETY: every pointer using this vtable came from an Arc of the
     // matching type. ManuallyDrop preserves the reference represented by
     // `data`; the returned raw waker owns only the new clone.
-    let state = ManuallyDrop::new(unsafe { Arc::<CloneCounter>::from_raw(data.cast()) });
+    let state = ManuallyDrop::new(unsafe { Arc::<LiveWakerCounter>::from_raw(data.cast()) });
     state.0.fetch_add(1, Ordering::SeqCst);
     RawWaker::new(
         Arc::into_raw(Arc::clone(&state)).cast(),
@@ -113,14 +113,16 @@ unsafe fn clone_counting_waker(data: *const ()) -> RawWaker {
 
 unsafe fn wake_counting_waker(data: *const ()) {
     // SAFETY: wake consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<CloneCounter>::from_raw(data.cast()) });
+    let state = unsafe { Arc::<LiveWakerCounter>::from_raw(data.cast()) };
+    state.0.fetch_sub(1, Ordering::SeqCst);
 }
 
 unsafe fn wake_by_ref_counting_waker(_data: *const ()) {}
 
 unsafe fn drop_counting_waker(data: *const ()) {
     // SAFETY: drop consumes the Arc reference represented by this raw waker.
-    drop(unsafe { Arc::<CloneCounter>::from_raw(data.cast()) });
+    let state = unsafe { Arc::<LiveWakerCounter>::from_raw(data.cast()) };
+    state.0.fetch_sub(1, Ordering::SeqCst);
 }
 
 static COUNTING_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -130,7 +132,10 @@ static COUNTING_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     drop_counting_waker,
 );
 
-fn counting_waker(counter: &Arc<CloneCounter>) -> Waker {
+fn counting_waker(counter: &Arc<LiveWakerCounter>) -> Waker {
+    // Include the caller-owned waker in the live count so every handle using
+    // this vtable has the same balanced clone/drop accounting.
+    counter.0.fetch_add(1, Ordering::SeqCst);
     let raw = RawWaker::new(
         Arc::into_raw(Arc::clone(counter)).cast(),
         &COUNTING_WAKER_VTABLE,
@@ -147,7 +152,7 @@ struct OrdinalWaker {
 
 struct OrdinalWakerState {
     clones: AtomicUsize,
-    target: usize,
+    target: AtomicUsize,
     blocked: AtomicBool,
     blocker: Mutex<Option<DestructorBlocker>>,
     entered: mpsc::Sender<ThreadId>,
@@ -179,7 +184,7 @@ unsafe fn wake_by_ref_ordinal_waker(_data: *const ()) {}
 unsafe fn drop_ordinal_waker(data: *const ()) {
     // SAFETY: drop consumes the Arc reference represented by this raw waker.
     let current = unsafe { Arc::<OrdinalWaker>::from_raw(data.cast()) };
-    if current.ordinal == current.shared.target
+    if current.ordinal == current.shared.target.load(Ordering::SeqCst)
         && !current.shared.blocked.swap(true, Ordering::SeqCst)
     {
         let blocker = current
@@ -208,7 +213,7 @@ fn ordinal_waker(
 ) -> (Waker, Arc<OrdinalWakerState>) {
     let shared = Arc::new(OrdinalWakerState {
         clones: AtomicUsize::new(0),
-        target,
+        target: AtomicUsize::new(target),
         blocked: AtomicBool::new(false),
         blocker: Mutex::new(Some(gate.blocker())),
         entered,
@@ -226,18 +231,23 @@ fn ordinal_waker(
     (unsafe { Waker::from_raw(raw) }, shared)
 }
 
-fn poll_until_registered<F>(
-    runtime: &tokio::runtime::Runtime,
-    future: Pin<&mut F>,
-    minimum_clones: usize,
-    path: &str,
-) where
+impl OrdinalWakerState {
+    fn target_latest_clone(&self, path: &str) {
+        let target = self.clones.load(Ordering::SeqCst);
+        assert_ne!(target, 0, "{path} registers a caller waker");
+        self.target.store(target, Ordering::SeqCst);
+    }
+}
+
+fn poll_until_registered<F>(runtime: &tokio::runtime::Runtime, future: Pin<&mut F>, path: &str)
+where
     F: Future,
 {
-    let counter = Arc::new(CloneCounter::default());
+    let counter = Arc::new(LiveWakerCounter::default());
     let waker = counting_waker(&counter);
+    let deadline = Instant::now() + POLL_TIMEOUT;
     let mut future = future;
-    for _ in 0..100 {
+    loop {
         {
             let _runtime = runtime.handle().enter();
             assert!(
@@ -248,32 +258,39 @@ fn poll_until_registered<F>(
                 "{path} must park before its timeout"
             );
         }
-        if counter.0.load(Ordering::SeqCst) >= minimum_clones {
+        // The caller owns one live handle. Two additional handles prove the
+        // operation and timer are both parked; repeatedly replacing one
+        // registration can no longer satisfy the preparation condition.
+        if counter.0.load(Ordering::SeqCst) >= 3 {
             return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "{path} never reached its timer registration"
+        );
         runtime.block_on(tokio::task::yield_now());
     }
-    panic!("{path} never reached its timer registration");
 }
 
 /// Parks a public future with an ordinal waker, cancels it while the timer's
 /// caller-waker destructor blocks, and proves unrelated wheel traffic stays
-/// live. Earlier registrations use a benign counting waker so lifecycle
-/// transitions can settle without making the timer's ordinal unstable.
+/// live. Public timeouts poll their operation before their timer, so the final
+/// caller-waker clone belongs to the timer even when an in-flight lifecycle
+/// edge makes the number of earlier registrations vary.
 fn assert_public_timer_cancellation_isolated<F>(
     runtime: &tokio::runtime::Runtime,
     mut future: Pin<Box<F>>,
-    prepare_clones: usize,
-    timer_ordinal: usize,
     path: &str,
 ) where
     F: Future + Send + 'static,
 {
-    poll_until_registered(runtime, future.as_mut(), prepare_clones, path);
+    poll_until_registered(runtime, future.as_mut(), path);
 
     let gate = DestructorGate::default();
     let (entered_tx, entered_rx) = mpsc::channel();
-    let (hostile, state) = ordinal_waker(timer_ordinal, &gate, entered_tx);
+    // Zero leaves every clone inert until the completed poll identifies the
+    // timer's actual ordinal.
+    let (hostile, state) = ordinal_waker(0, &gate, entered_tx);
     let hostile = ManuallyDrop::new(hostile);
     {
         let _runtime = runtime.handle().enter();
@@ -285,11 +302,7 @@ fn assert_public_timer_cancellation_isolated<F>(
             "{path} stays pending after replacing its registrations"
         );
     }
-    assert_eq!(
-        state.clones.load(Ordering::SeqCst),
-        timer_ordinal,
-        "{path} registers the timer at the documented caller-clone ordinal"
-    );
+    state.target_latest_clone(path);
 
     let cancel_handle = runtime.handle().clone();
     let (cancelled_tx, cancelled_rx) = mpsc::channel();
@@ -518,8 +531,7 @@ fn wait_for_child_timer_cancellation_does_not_stall_unrelated_timer_traffic() {
             .await
     });
 
-    // Snapshot change is clone one; the timer proxy's caller is clone two.
-    assert_public_timer_cancellation_isolated(&runtime, future, 2, 2, "wait-for-child");
+    assert_public_timer_cancellation_isolated(&runtime, future, "wait-for-child");
 
     runtime
         .block_on(system.shutdown(Duration::ZERO))
@@ -547,9 +559,7 @@ fn scope_shutdown_timer_cancellation_does_not_stall_unrelated_timer_traffic() {
     });
     request_shutdown_and_wait_for_draining(&runtime, future.as_mut(), &scope);
 
-    // At the stable timeout cut the two live registrations are incarnation
-    // change, then timer.
-    assert_public_timer_cancellation_isolated(&runtime, future, 2, 2, "scope-shutdown");
+    assert_public_timer_cancellation_isolated(&runtime, future, "scope-shutdown");
 
     let _ = runtime.block_on(system.shutdown(Duration::ZERO));
 }
@@ -570,7 +580,7 @@ fn system_shutdown_timer_cancellation_does_not_stall_unrelated_timer_traffic() {
     let mut future = Box::pin(async move { system.shutdown(Duration::from_secs(30)).await });
     request_shutdown_and_wait_for_draining(&runtime, future.as_mut(), &cleanup_scope);
 
-    assert_public_timer_cancellation_isolated(&runtime, future, 2, 2, "system-shutdown");
+    assert_public_timer_cancellation_isolated(&runtime, future, "system-shutdown");
 
     let _ = runtime.block_on(cleanup_scope.shutdown_and_wait(Duration::ZERO));
 }

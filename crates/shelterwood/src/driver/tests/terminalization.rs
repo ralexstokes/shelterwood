@@ -957,7 +957,7 @@ fn mailbox_wake_observes_terminal_record_and_reentrant_terminality_is_idempotent
 }
 
 #[test]
-fn attach_during_terminal_publication_finishes_record_before_mailbox_wake() {
+fn attach_to_a_terminal_member_finishes_record_before_mailbox_wake() {
     let mut identity = ScopeIdentity::new();
     let id = ChildId::from("worker");
     let member = MemberCell::new(
@@ -967,7 +967,7 @@ fn attach_during_terminal_publication_finishes_record_before_mailbox_wake() {
     let mailbox = MailboxCell::new(member.id().clone(), crate::runtime::mailbox_runtime());
     let actor = actor_ref_from_parts(Arc::clone(&member), Arc::clone(&mailbox));
     let first_exit = Exit::never_started();
-    member.stage_terminal_before_mailbox(first_exit.clone());
+    member.terminalize(first_exit.clone(), StartupDisposition::Unchanged);
     let probe = Arc::new(ObserveMemberOnMailboxWake {
         member: Arc::clone(&member),
         competing_exit: Exit::completed(Cancellation::NotObserved),

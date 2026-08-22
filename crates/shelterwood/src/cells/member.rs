@@ -332,17 +332,6 @@ impl MemberCell {
         self.record.watcher()
     }
 
-    #[cfg(test)]
-    pub(crate) fn stage_terminal_before_mailbox(&self, exit: Exit) {
-        let mut mailbox = self.mailbox.lock().expect("member mailbox mutex poisoned");
-        assert!(matches!(*mailbox, MemberMailbox::Unattached));
-        *mailbox = MemberMailbox::Terminal {
-            control: None,
-            exit: RetainedExit::new(exit),
-            teardown: None,
-        };
-    }
-
     /// Reports terminality or drain-entry terminal-disposal intent.
     ///
     /// `Acquire` pairs with the `Release` store in
@@ -427,7 +416,7 @@ impl MemberCell {
             report_capture();
             let guard = gate.lock();
             if gate.shares_gate(&self.current_observation_gate()) {
-                let mut txn = ObservationTxn::new(guard);
+                let mut txn = ObservationTxn::new(&gate, guard);
                 return operation
                     .take()
                     .expect("member observation operation runs exactly once")(
@@ -548,6 +537,8 @@ impl MemberCell {
         txn: &mut ObservationTxn<'_>,
         update: impl FnOnce(&mut MemberRecord),
     ) {
+        #[cfg(debug_assertions)]
+        txn.debug_assert_gate(&self.current_observation_gate());
         // Refreshing here rather than in each writer keeps the guard-set
         // invariant on every record mutation, including the test-only escape
         // hatch that writes fields directly.
@@ -581,6 +572,8 @@ impl MemberCell {
         txn: &mut ObservationTxn<'_>,
         transition: MemberTransition,
     ) -> bool {
+        #[cfg(debug_assertions)]
+        txn.debug_assert_gate(&self.current_observation_gate());
         // `RestartScheduled` carries a user error by value. Retain it before
         // the watch lock and reducer validation so an unrelated panic can
         // unwind the raw transition as refcount traffic only.
@@ -634,7 +627,7 @@ impl MemberCell {
     pub(crate) fn attach_mailbox(&self, mailbox: Arc<dyn MailboxControl>) {
         self.with_observation_txn(|txn| {
             let mut rejected = None;
-            let terminal_exit = {
+            let terminal_teardown = {
                 let mut state = self.mailbox.lock().expect("member mailbox mutex poisoned");
                 match &mut *state {
                     MemberMailbox::Unattached => {
@@ -649,17 +642,22 @@ impl MemberCell {
                         None
                     }
                     MemberMailbox::Terminal {
-                        control,
-                        exit,
-                        teardown,
+                        control, teardown, ..
                     } => {
+                        // Unreachable under the gate — `terminalize_locked`
+                        // only stores a teardown alongside a control, which the
+                        // arm above already rejects — and kept as total
+                        // defense against ever draining one twice.
                         if teardown.is_some() {
                             rejected = Some(mailbox);
                             None
                         } else {
-                            *teardown = mailbox.prepare_termination(txn);
+                            // The stored `teardown` field stays empty: the
+                            // drain below is the only reader this one can have,
+                            // and it owns it before the mailbox guard drops.
+                            let drained = mailbox.prepare_termination(txn);
                             *control = Some(mailbox);
-                            Some(exit.as_exit().clone())
+                            drained
                         }
                     }
                 }
@@ -673,8 +671,10 @@ impl MemberCell {
                 txn.defer(move || runtime::dispose_detached(rejected));
                 return;
             }
-            if let Some(terminal_exit) = terminal_exit {
-                self.terminalize_locked(terminal_exit, StartupDisposition::Unchanged, txn);
+            if let Some(teardown) = terminal_teardown {
+                txn.defer(move || {
+                    runtime::dispose_detached(teardown.finish());
+                });
             }
         });
     }
@@ -699,6 +699,8 @@ impl MemberCell {
         startup: StartupDisposition,
         txn: &mut ObservationTxn<'_>,
     ) -> Exit {
+        #[cfg(debug_assertions)]
+        txn.debug_assert_gate(&self.current_observation_gate());
         // A losing terminalizer's exit is destroyed here, and an
         // `ExitKind::Failed` payload owns a type-erased user error whose
         // destructor may block, panic, or re-enter observation. Hand it to the
@@ -825,6 +827,17 @@ mod tests {
     use super::*;
     use crate::cells::test_support::{ThreadProbe, isolated_scope};
 
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a locked observation writer requires its current tree gate")]
+    fn locked_member_writer_checks_transaction_gate_identity() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        let wrong_gate = ObservationGate::new();
+        let mut txn = ObservationTxn::new(&wrong_gate, wrong_gate.lock());
+
+        scope.member.update_locked(&mut txn, |_| {});
+    }
+
     #[test]
     fn illegal_restart_transition_is_rejected_in_every_build() {
         let scope = isolated_scope("root", ScopeFlavor::Ordered);
@@ -894,6 +907,34 @@ mod tests {
         assert!(
             scope.member.mailbox().is_some(),
             "the rejected attach did not poison the mailbox mutex"
+        );
+    }
+
+    /// Pins the invariant the direct teardown drain has to keep, not the
+    /// rewrite itself: the losing `terminalize_locked` it replaced published
+    /// no record edge either, so no test can separate the two shapes. The
+    /// teardown half is pinned by
+    /// `attach_to_a_terminal_member_finishes_record_before_mailbox_wake`.
+    #[test]
+    fn attaching_to_a_terminal_member_does_not_republish_its_record() {
+        let scope = isolated_scope("root", ScopeFlavor::Ordered);
+        scope.member.terminalize(
+            Exit::completed(Cancellation::NotObserved),
+            StartupDisposition::Unchanged,
+        );
+        let mut watcher = scope.member.record_watcher();
+        watcher.borrow_and_update_cloned();
+        let mailbox = MailboxCell::<u8>::new(scope.member.id().clone(), runtime::mailbox_runtime());
+
+        scope.member.attach_mailbox(mailbox);
+
+        let mut changed = Box::pin(watcher.changed());
+        assert!(
+            changed
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "attaching to an already-terminal member publishes no second record edge"
         );
     }
 

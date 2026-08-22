@@ -189,6 +189,15 @@ impl StopLadder {
                 } else {
                     grace
                 };
+                // Unlike an unrepresentable cooperative grace, an
+                // unrepresentable tidy beat has no force rescue: `force`
+                // only expedites `Cooperative`, and this ladder is already
+                // `Escalated`. The same applies to the framework tidy beat
+                // below once the ladder reaches `AbortingFramework`. This can
+                // park either phase only when `now` is within
+                // `Deadline::ARMING_HEADROOM` of `Instant`'s ceiling; accept
+                // that theoretical clock-boundary asymmetry rather than
+                // substituting an earlier public deadline.
                 self.deadline = Deadline::after(now, tidy_abort_beat(beat)).instant();
                 Some(StopAction::Escalate)
             }
@@ -255,22 +264,12 @@ pub fn dispatch_exit(
     // verdict — it "is never input to restart or intensity accounting".
     // Every supported producer terminalizes the membership directly and never
     // reaches dispatch, so arriving here is a framework bug. Fail before
-    // charging a restart for an incarnation that never ran.
-    //
-    // Failing closed is the lesser of two wrong outcomes, not a correct one:
-    // the sole dispatch caller holds a real incarnation, so a `Terminal`
-    // verdict here would publish a `NeverStarted` terminal paired with
-    // `last_incarnation: Some(..)`, which SPEC §B.3 excludes. `ExitDispatch`
-    // carries no incarnation, so the pairing is the caller's to choose and
-    // cannot be repaired from inside this function, so every profile stops
-    // before publishing an inconsistent terminal projection.
+    // charging a restart for an incarnation that never ran or publishing the
+    // inconsistent terminal projection that SPEC §B.3 excludes.
     assert!(
         !matches!(exit.kind(), ExitKind::NeverStarted),
         "NeverStarted is a membership outcome outside incarnation dispatch"
     );
-    if matches!(exit.kind(), ExitKind::NeverStarted) {
-        return ExitDispatch::Terminal;
-    }
     if scope == ScopeMode::Draining || membership == MembershipStatus::Removing {
         return ExitDispatch::Terminal;
     }
@@ -283,6 +282,10 @@ pub fn dispatch_exit(
 
 #[derive(Debug)]
 pub struct IntensityState {
+    // This is deliberately one entry per restart still inside the policy
+    // window. `Intensity::new(u64::MAX, Duration::MAX)` can therefore retain
+    // charges without bound; that degenerate configuration is accepted as
+    // operator self-harm rather than adding a second, lossy accounting mode.
     charges: VecDeque<Instant>,
     total_restarts: TotalRestarts,
 }
@@ -1670,6 +1673,21 @@ mod tests {
             Some(ReadinessEffect::Disarmed)
         );
         assert!(!unsignaled_exit.needs_signal_watch());
+
+        let mut unbounded = ReadinessGate::new();
+        unbounded.step(ReadinessEvent::Configure {
+            readiness: crate::Readiness::Manual,
+            deadline: None,
+        });
+        assert_eq!(
+            unbounded.step(ReadinessEvent::Deadline {
+                now: deadline,
+                signal_seen: false,
+            }),
+            None,
+            "a spurious deadline cannot resolve an unbounded readiness wait"
+        );
+        assert!(unbounded.needs_signal_watch());
 
         let mut timed_out = ReadinessGate::new();
         assert_eq!(

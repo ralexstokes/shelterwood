@@ -2265,6 +2265,10 @@ mod tests {
     fn rejected_restart_publication_disposes_its_lifecycle_exit_off_thread() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let member = child_member(&root, "invalid");
+        // Residency is what puts the member on the root's observation gate, so
+        // a restart publication reaches it the way production does.
+        assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
+        member.update(|record| record.stage = MemberStage::Reserved);
         let mut events = root.subscribe_lifecycle();
         let incarnation = member
             .take_incarnation_counter()

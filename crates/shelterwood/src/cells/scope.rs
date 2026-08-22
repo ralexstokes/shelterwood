@@ -2094,7 +2094,9 @@ mod tests {
     fn rejected_stage_transition_suppresses_its_lifecycle_publication() {
         let root = isolated_scope("root", ScopeFlavor::Ordered);
         let member = child_member(&root, "invalid");
-        assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None,)));
+        // Residency is what puts the member on the root's observation gate, so
+        // a projection transition reaches it the way production does.
+        assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
         member.update(|record| record.stage = MemberStage::Reserved);
         let mut events = root.subscribe_lifecycle();
 

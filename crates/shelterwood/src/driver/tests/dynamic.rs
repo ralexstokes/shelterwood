@@ -592,7 +592,7 @@ async fn removal_from_a_foreign_thread_reaches_the_driver() {
         .mint_membership(&child_id)
         .expect("membership available");
     let member = MemberCell::new(child_id.clone(), membership);
-    assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None,)));
+    assert!(root.admit_child(ResidentProjection::new(Arc::clone(&member), None)));
     let slot = SlotCell::new(Arc::clone(&member), None);
     let key = ChildKey::fixture(1);
     let (events, mut event_receiver) = crate::runtime::unbounded_mpsc();

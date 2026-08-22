@@ -17,13 +17,6 @@ use shelterwood_core::{
 
 use super::{ObservationTxn, RetainedExit};
 
-fn unwrap_or_clone<T: Clone>(shared: Arc<T>) -> T {
-    match Arc::try_unwrap(shared) {
-        Ok(value) => value,
-        Err(shared) => shared.as_ref().clone(),
-    }
-}
-
 /// Number of lifecycle events retained independently for each subscriber.
 pub(crate) const LIFECYCLE_EVENT_CAPACITY: usize = 128;
 
@@ -169,7 +162,7 @@ impl RetainedLifecycleEvent {
         // the guard allocation first matters: a broadcast receive is often the
         // last owner, and letting the arc drop the guards would route a live
         // user error through isolated disposal for nothing.
-        let guards = unwrap_or_clone(guards);
+        let guards = Arc::unwrap_or_clone(guards);
         for guard in guards {
             drop(guard.into_exit());
         }
@@ -419,7 +412,7 @@ impl RetainedScopeSnapshot {
     }
 
     pub(crate) fn into_parts(self) -> (Arc<ScopeSnapshot>, Vec<RetainedExit>) {
-        let exits = unwrap_or_clone(self.exits);
+        let exits = Arc::unwrap_or_clone(self.exits);
         (self.snapshot, exits)
     }
 }
@@ -523,6 +516,13 @@ struct SnapshotInstallPolicy {
     pulse: bool,
 }
 
+/// Installs one cut and returns the effects its caller owes after unlock.
+///
+/// A hub already closed by a committed transaction keeps the authoritative
+/// terminal projection `close` installed, so every branch below refuses it and
+/// hands the uninstalled cut back through the effect list. `closed` is
+/// therefore only ever written onto an *open* hub: a refresh that passes
+/// `false` re-asserts the flag it just read rather than clearing a closure.
 fn install_snapshot(
     sender: &runtime::WatchSender<SnapshotHubState>,
     mut snapshot: Option<RetainedScopeSnapshot>,

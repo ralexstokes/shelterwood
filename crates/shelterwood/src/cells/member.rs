@@ -644,13 +644,20 @@ impl MemberCell {
                     MemberMailbox::Terminal {
                         control, teardown, ..
                     } => {
+                        // Unreachable under the gate — `terminalize_locked`
+                        // only stores a teardown alongside a control, which the
+                        // arm above already rejects — and kept as total
+                        // defense against ever draining one twice.
                         if teardown.is_some() {
                             rejected = Some(mailbox);
                             None
                         } else {
-                            let teardown = mailbox.prepare_termination(txn);
+                            // The stored `teardown` field stays empty: the
+                            // drain below is the only reader this one can have,
+                            // and it owns it before the mailbox guard drops.
+                            let drained = mailbox.prepare_termination(txn);
                             *control = Some(mailbox);
-                            teardown
+                            drained
                         }
                     }
                 }
@@ -903,6 +910,11 @@ mod tests {
         );
     }
 
+    /// Pins the invariant the direct teardown drain has to keep, not the
+    /// rewrite itself: the losing `terminalize_locked` it replaced published
+    /// no record edge either, so no test can separate the two shapes. The
+    /// teardown half is pinned by
+    /// `attach_to_a_terminal_member_finishes_record_before_mailbox_wake`.
     #[test]
     fn attaching_to_a_terminal_member_does_not_republish_its_record() {
         let scope = isolated_scope("root", ScopeFlavor::Ordered);
@@ -922,7 +934,7 @@ mod tests {
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending(),
-            "terminal attachment drains teardown without a synthetic losing transition"
+            "attaching to an already-terminal member publishes no second record edge"
         );
     }
 

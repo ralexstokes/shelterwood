@@ -82,9 +82,12 @@ impl ScopeCell {
     }
 
     pub(crate) fn subscribe_snapshots(&self) -> SnapshotReceiver {
+        // No gate-identity check here or in `subscribe_lifecycle`: both acquire
+        // the gate themselves, and `with_observation_gate` already retries
+        // until the guard it hands the closure is this scope's installed one.
+        // Only a `*_locked` writer that receives someone else's transaction has
+        // an identity left to verify.
         let (receiver, closed_consistent) = self.with_observation_gate(|wakes| {
-            #[cfg(debug_assertions)]
-            wakes.debug_assert_gate(&self.current_observation_gate());
             let receiver = self
                 .observation
                 .snapshots
@@ -102,8 +105,6 @@ impl ScopeCell {
 
     pub(crate) fn subscribe_lifecycle(&self) -> LifecycleEvents {
         let (events, closed_consistent) = self.with_observation_gate(|txn| {
-            #[cfg(debug_assertions)]
-            txn.debug_assert_gate(&self.current_observation_gate());
             let events = self.observation.lifecycle.subscribe(txn);
             let closed_consistent = !self.observation.closed.load(Ordering::Acquire)
                 || self.observation.lifecycle.is_closed();

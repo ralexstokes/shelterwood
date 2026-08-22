@@ -291,12 +291,12 @@ impl Wake for WakerProxyState {
             // empty slot can mean the wake landed in `register`'s clone
             // window; an occupied slot can hold the previous task's waker
             // after migration. This leaf state cannot distinguish either case
-            // from an ordinary wake of the current caller, so it conservatively
-            // leaves the flag set after delivering that wake too. The next
-            // registration installs and immediately wakes its fresh caller,
-            // costing one extra clone and spurious poll per delivered wake in
-            // exchange for making staleness indistinguishable from safety.
-            // See `WakerProxy::register`.
+            // from an ordinary wake of the caller polling now, so it leaves
+            // the flag set after delivering that wake too. The next
+            // registration therefore installs, reads the flag, and takes its
+            // fresh waker straight back out: one extra clone and one spurious
+            // poll per delivered wake, which the `Future` contract permits —
+            // a lost wake is not. See `WakerProxy::register`.
             registration.woken = true;
             registration.caller.take(WakerAction::Wake, &mut effects);
         }
@@ -631,6 +631,33 @@ mod tests {
             wakes.load(Ordering::SeqCst),
             1,
             "waking the previous caller does not discharge the wake for the current one"
+        );
+    }
+
+    #[test]
+    fn a_delivered_wake_leaves_its_record_set_for_the_next_registration() {
+        let proxy = WakerProxy::new();
+        let delivered = Arc::new(CountWake::default());
+        proxy.register(&Waker::from(Arc::clone(&delivered)));
+
+        // An ordinary delivered wake: the caller polling now is installed, so
+        // nothing raced the registration and nothing is stale.
+        proxy.waker().wake_by_ref();
+        assert_eq!(delivered.0.load(Ordering::SeqCst), 1);
+
+        let next = Arc::new(CountWake::default());
+        proxy.register(&Waker::from(Arc::clone(&next)));
+
+        // The record is nonetheless left set, because this leaf state cannot
+        // tell that delivery apart from the racing one
+        // `a_window_wake_consuming_the_previous_caller_still_reaches_the_new_one`
+        // covers. That indistinguishability is what forces the spurious wake
+        // onto the ordinary path too, so the common case is pinned beside the
+        // race rather than left to the comment.
+        assert_eq!(
+            next.0.load(Ordering::SeqCst),
+            1,
+            "a delivered wake still wakes the caller that registers after it"
         );
     }
 

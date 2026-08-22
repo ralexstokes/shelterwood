@@ -319,16 +319,23 @@ impl<M> MailboxState<M> {
                 return waiters.park(operation);
             }
             MailboxBinding::Bound(BoundState::Available(incarnation)) => {
-                let Some(ResolvedMailbox::Queue(capacity)) = self.kind else {
-                    unreachable!("only a capacity-bound queue can park while bound")
-                };
                 // Diagnostic-only under the mailbox mutex: `Available` parks
                 // only after the accepting transition filled this configured
-                // queue, or after that transition's own incarnation-mismatch
-                // fallback, which has already recorded its invariant panic on
-                // the effects sink. The Full transition remains total without
-                // this check, and no test expects the diagnostic panic.
-                debug_assert_eq!(self.queue.len(), capacity.get());
+                // queue, so a latest mailbox never arrives here -- its
+                // incarnation mismatch now leaves through its own non-parking
+                // transition instead. Releasing the guard to raise the verdict
+                // is impossible mid-transition and an always-on panic would
+                // poison the mailbox for every later caller, so record it and
+                // keep the transition total: parking preserves the operation's
+                // user message under either mailbox kind. No test expects this
+                // diagnostic.
+                debug_assert!(
+                    matches!(
+                        self.kind,
+                        Some(ResolvedMailbox::Queue(capacity)) if self.queue.len() == capacity.get()
+                    ),
+                    "only a filled capacity-bound queue can park while bound"
+                );
                 let incarnation = *incarnation;
                 let mut waiters = WaiterQueue::default();
                 if !waiters.park(operation) {
@@ -579,15 +586,28 @@ impl<M> Default for MailboxEffectPayload<M> {
 
 impl<M> MailboxEffectPayload<M> {
     fn is_empty(&self) -> bool {
-        // `isolate_displaced` only selects how a nonempty displaced set is
-        // flushed; by itself it represents no work.
-        !self.pulse
-            && self.displaced.is_empty()
-            && self.wakers.is_empty()
-            && self.returned.is_none()
-            && !self.accepted_sequence_exhausted
-            && self.rejected_bindings.is_empty()
-            && self.invariant_panic.is_none()
+        // Destructured rather than field-accessed: a new effect field is then
+        // a compile error here instead of an effect silently discarded
+        // whenever it is the only one this transition set.
+        let Self {
+            pulse,
+            displaced,
+            // `isolate_displaced` only selects how a nonempty displaced set is
+            // flushed; by itself it represents no work.
+            isolate_displaced: _,
+            wakers,
+            returned,
+            accepted_sequence_exhausted,
+            rejected_bindings,
+            invariant_panic,
+        } = self;
+        !pulse
+            && displaced.is_empty()
+            && wakers.is_empty()
+            && returned.is_none()
+            && !accepted_sequence_exhausted
+            && rejected_bindings.is_empty()
+            && invariant_panic.is_none()
     }
 }
 
@@ -736,6 +756,11 @@ impl<M: Send + 'static> MailboxEffectBatch<M> {
         }
         payload.wakers.flush(&mut panics);
         if !payload.isolate_displaced {
+            // A live latest transition displaces at most the one value it
+            // replaced, so per-element containment here is totality for a
+            // future multi-displacement caller rather than a tested behavior;
+            // `bind`, the only caller that can accumulate several, isolates
+            // them into a `MailboxPayload` above instead.
             for envelope in payload.displaced.drain(..) {
                 panics.run(|| drop(envelope));
             }
@@ -1748,7 +1773,7 @@ pub(super) enum WithdrawalDisposition {
 }
 
 impl WithdrawalDisposition {
-    fn action(&self, runtime: &Arc<dyn MailboxRuntime>) -> WakerAction {
+    fn action(self, runtime: &Arc<dyn MailboxRuntime>) -> WakerAction {
         match self {
             Self::Inline => WakerAction::DropInline,
             Self::Isolated => WakerAction::Dispose(Arc::clone(runtime)),

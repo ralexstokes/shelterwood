@@ -9,7 +9,9 @@ use std::{
 };
 
 use crate::common::{ReleaseGate, assert_quiet};
-use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Tree};
+use shelterwood::{Actor, ActorOnceDef, Context, ExitError, ExitResult, Rejected, Tree};
+
+type ClearTimerResults = Arc<Mutex<Vec<Result<bool, Rejected<()>>>>>;
 
 #[derive(Clone, Copy, Debug)]
 enum PriorityMessage {
@@ -509,15 +511,23 @@ enum RetractionMessage {
 
 struct RetractionActor {
     log: Arc<Mutex<Vec<&'static str>>>,
+    clear_timer_results: ClearTimerResults,
 }
 
 impl Actor for RetractionActor {
     type Msg = RetractionMessage;
-    type Args = (ReleaseGate, Arc<Mutex<Vec<&'static str>>>);
+    type Args = (
+        ReleaseGate,
+        Arc<Mutex<Vec<&'static str>>>,
+        ClearTimerResults,
+    );
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
         args.0.wait().await;
-        Ok(Self { log: args.1 })
+        Ok(Self {
+            log: args.1,
+            clear_timer_results: args.2,
+        })
     }
 
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
@@ -530,7 +540,11 @@ impl Actor for RetractionActor {
             }
             RetractionMessage::Cancel => {
                 self.log.lock().expect("log mutex poisoned").push("cancel");
-                assert_eq!(context.clear_timer(&"deadline"), Ok(true));
+                let result = context.clear_timer(&"deadline");
+                self.clear_timer_results
+                    .lock()
+                    .expect("clear-timer result mutex poisoned")
+                    .push(result);
                 context.stop();
             }
             RetractionMessage::Fired => {
@@ -546,11 +560,16 @@ impl Actor for RetractionActor {
 async fn mailbox_work_queued_at_fire_can_retract_an_elapsed_timer() {
     let gate = ReleaseGate::default();
     let log = Arc::new(Mutex::new(Vec::new()));
+    let clear_timer_results = Arc::new(Mutex::new(Vec::new()));
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "retraction",
-            ActorOnceDef::<RetractionActor>::new((gate.clone(), Arc::clone(&log))),
+            ActorOnceDef::<RetractionActor>::new((
+                gate.clone(),
+                Arc::clone(&log),
+                Arc::clone(&clear_timer_results),
+            )),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -565,6 +584,13 @@ async fn mailbox_work_queued_at_fire_can_retract_an_elapsed_timer() {
     gate.release();
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(*log.lock().expect("log mutex poisoned"), ["arm", "cancel"]);
+    assert_eq!(
+        *clear_timer_results
+            .lock()
+            .expect("clear-timer result mutex poisoned"),
+        [Ok(true)],
+        "the elapsed-but-undelivered timer remains retractable"
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -823,17 +849,24 @@ struct IntervalActor {
     ticks: Arc<AtomicUsize>,
     armed: ReleaseGate,
     ticked: ReleaseGate,
+    clear_timer_results: ClearTimerResults,
 }
 
 impl Actor for IntervalActor {
     type Msg = IntervalMessage;
-    type Args = (Arc<AtomicUsize>, ReleaseGate, ReleaseGate);
+    type Args = (
+        Arc<AtomicUsize>,
+        ReleaseGate,
+        ReleaseGate,
+        ClearTimerResults,
+    );
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
         Ok(Self {
             ticks: args.0,
             armed: args.1,
             ticked: args.2,
+            clear_timer_results: args.3,
         })
     }
 
@@ -849,7 +882,11 @@ impl Actor for IntervalActor {
                 let prior = self.ticks.fetch_add(1, Ordering::SeqCst);
                 self.ticked.release();
                 if prior == 1 {
-                    assert_eq!(context.clear_timer(&"interval"), Ok(true));
+                    let result = context.clear_timer(&"interval");
+                    self.clear_timer_results
+                        .lock()
+                        .expect("clear-timer result mutex poisoned")
+                        .push(result);
                     context.stop();
                 }
             }
@@ -863,11 +900,17 @@ async fn intervals_start_after_one_period_and_skip_missed_ticks() {
     let ticks = Arc::new(AtomicUsize::new(0));
     let armed = ReleaseGate::default();
     let ticked = ReleaseGate::default();
+    let clear_timer_results = Arc::new(Mutex::new(Vec::new()));
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "interval",
-            ActorOnceDef::<IntervalActor>::new((Arc::clone(&ticks), armed.clone(), ticked.clone())),
+            ActorOnceDef::<IntervalActor>::new((
+                Arc::clone(&ticks),
+                armed.clone(),
+                ticked.clone(),
+                Arc::clone(&clear_timer_results),
+            )),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -882,6 +925,13 @@ async fn intervals_start_after_one_period_and_skip_missed_ticks() {
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(system.wait().await, shelterwood::StopReason::Finished);
     assert_eq!(ticks.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *clear_timer_results
+            .lock()
+            .expect("clear-timer result mutex poisoned"),
+        [Ok(true)],
+        "the interval is still armed when the actor stops it"
+    );
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -894,27 +944,29 @@ enum ClearedIntervalMessage {
 struct ClearedIntervalActor {
     ticks: Arc<AtomicUsize>,
     armed: ReleaseGate,
+    clear_timer_results: ClearTimerResults,
 }
 
 impl Actor for ClearedIntervalActor {
     type Msg = ClearedIntervalMessage;
-    type Args = (Arc<AtomicUsize>, ReleaseGate);
+    type Args = (Arc<AtomicUsize>, ReleaseGate, ClearTimerResults);
 
     async fn init(args: Self::Args, _: &mut Context<'_, Self>) -> Result<Self, ExitError> {
         Ok(Self {
             ticks: args.0,
             armed: args.1,
+            clear_timer_results: args.2,
         })
     }
 
     async fn handle(&mut self, message: Self::Msg, context: &mut Context<'_, Self>) -> ExitResult {
         match message {
             ClearedIntervalMessage::Arm => {
-                assert_eq!(
-                    context.clear_timer(&"interval"),
-                    Ok(false),
-                    "a never-armed key has nothing to retract"
-                );
+                let result = context.clear_timer(&"interval");
+                self.clear_timer_results
+                    .lock()
+                    .expect("clear-timer result mutex poisoned")
+                    .push(result);
                 context
                     .set_interval(
                         "interval",
@@ -929,11 +981,11 @@ impl Actor for ClearedIntervalActor {
                 context
                     .set_interval("interval", ClearedIntervalMessage::Tick, Duration::ZERO)
                     .expect("a zero period clears the key");
-                assert_eq!(
-                    context.clear_timer(&"interval"),
-                    Ok(false),
-                    "the zero-period arm already cleared the key"
-                );
+                let result = context.clear_timer(&"interval");
+                self.clear_timer_results
+                    .lock()
+                    .expect("clear-timer result mutex poisoned")
+                    .push(result);
                 // The probe fires long after every deadline the cleared
                 // interval would have had, so a surviving interval must
                 // deliver again before the probe stops the actor.
@@ -955,11 +1007,16 @@ impl Actor for ClearedIntervalActor {
 async fn a_zero_period_interval_arming_clears_the_key_and_stops_ticks() {
     let ticks = Arc::new(AtomicUsize::new(0));
     let armed = ReleaseGate::default();
+    let clear_timer_results = Arc::new(Mutex::new(Vec::new()));
     let mut tree = Tree::new();
     let actor = tree
         .add_actor_once(
             "cleared-interval",
-            ActorOnceDef::<ClearedIntervalActor>::new((Arc::clone(&ticks), armed.clone())),
+            ActorOnceDef::<ClearedIntervalActor>::new((
+                Arc::clone(&ticks),
+                armed.clone(),
+                Arc::clone(&clear_timer_results),
+            )),
         )
         .expect("valid actor");
     let system = tree.spawn().expect("runtime is available");
@@ -981,6 +1038,13 @@ async fn a_zero_period_interval_arming_clears_the_key_and_stops_ticks() {
         ticks.load(Ordering::SeqCst),
         1,
         "a cleared interval must never tick again"
+    );
+    assert_eq!(
+        *clear_timer_results
+            .lock()
+            .expect("clear-timer result mutex poisoned"),
+        [Ok(false), Ok(false)],
+        "both the never-armed key and zero-period-cleared key are absent"
     );
 }
 

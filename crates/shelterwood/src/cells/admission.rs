@@ -1,8 +1,25 @@
-//! Dynamic membership admission errors and removal outcomes.
+//! Static declaration and dynamic admission errors, plus removal outcomes.
 
 use std::fmt;
 
 use shelterwood_core::ChildId;
+
+/// A pre-spawn child declaration or reservation error.
+///
+/// Static builders cannot observe runtime admission state: only id validation,
+/// duplicate detection, and membership identity exhaustion are reachable.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum StaticReserveError {
+    /// The child id was empty.
+    #[error("child id must not be empty")]
+    EmptyId,
+    /// A declared membership already occupies the id.
+    #[error("child id `{0}` is already declared")]
+    DuplicateId(ChildId),
+    /// The scope can mint no further membership identities.
+    #[error("membership identity space is exhausted")]
+    IdentityExhausted,
+}
 
 /// A child reservation or dynamic admission error.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]

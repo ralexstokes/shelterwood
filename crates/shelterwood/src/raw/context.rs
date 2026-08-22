@@ -33,7 +33,7 @@ use super::{
 #[cfg(test)]
 use super::offload::OffloadPoll;
 
-use timers::{ArmingOrder, IntervalRearm, TimerMessage, TimerStore};
+use timers::{ArmingOrder, TimerMessage, TimerStore};
 
 type DeferredMessage<M> = Box<dyn FnOnce() -> M + Send + 'static>;
 /// An operation rejected because the actor incarnation is already stopping.
@@ -694,7 +694,7 @@ impl<M: Send + 'static> RawContext<M> {
         if self.is_stopping() || !self.resources.accepting {
             return Err(Rejected::new((key, message)));
         }
-        self.replace_timer(key, TimerMessage::Once(message), after, None);
+        self.replace_timer(key, TimerMessage::Once(message), after);
         Ok(())
     }
 
@@ -718,9 +718,12 @@ impl<M: Send + 'static> RawContext<M> {
         }
         self.replace_timer(
             key,
-            TimerMessage::Interval(message, Clone::clone),
+            TimerMessage::Interval {
+                message,
+                clone: Clone::clone,
+                period,
+            },
             period,
-            Some(period),
         );
         Ok(())
     }
@@ -786,7 +789,10 @@ impl<M: Send + 'static> RawContext<M> {
     ///
     /// Unlike `continue_with`, timers, and offloads, this operation has no
     /// stopping gate: it deliberately keeps working from stop paths, because
-    /// it is the one resource operation teardown code may still need.
+    /// it is the one resource operation teardown code may still need. The
+    /// returned [`Blocking`] is caller-owned rather than tracked in the
+    /// incarnation resource ledger, so intake freeze and teardown never wait
+    /// on it or depend on its completion.
     /// Awaiting the returned [`Blocking`] resumes a panic raised inside the
     /// closure at the await point (distinct from the runtime-teardown
     /// cancellation panic below).
@@ -927,20 +933,13 @@ impl<M: Send + 'static> RawContext<M> {
         }
     }
 
-    fn replace_timer<K>(
-        &mut self,
-        key: K,
-        message: TimerMessage<M>,
-        after: Duration,
-        period: Option<Duration>,
-    ) where
+    fn replace_timer<K>(&mut self, key: K, message: TimerMessage<M>, after: Duration)
+    where
         K: Hash + Eq + Send + 'static,
     {
         let now = runtime::now();
         let deadline = crate::deadline::Deadline::after(now, after).instant();
-        self.resources
-            .timers
-            .replace(key, deadline, message, period);
+        self.resources.timers.replace(key, deadline, message);
     }
 
     fn start_offload<F, T, C>(
@@ -1254,18 +1253,7 @@ impl<M: Send + 'static> RawContext<M> {
     }
 
     fn deliver_timer(&mut self, arming: ArmingOrder) -> Option<M> {
-        match self.resources.timers.rearm_interval(arming, runtime::now()) {
-            IntervalRearm::Missing => return None,
-            IntervalRearm::OneShot => {}
-            IntervalRearm::Interval(message) => return Some(message),
-        }
-
-        Some(
-            self.resources
-                .timers
-                .take_due_once(arming)
-                .expect("a due one-shot timer remains registered"),
-        )
+        self.resources.timers.deliver_due(arming, runtime::now())
     }
 
     fn next_timer_deadline(&self) -> Option<Instant> {
@@ -1280,16 +1268,15 @@ impl<M: Send + 'static> RawContext<M> {
         self.resources.reclaim_finished();
         let deadline = self.next_timer_deadline();
         let shutdown = self.shutdown.clone();
-        let local_stop = self.local_stop.clone();
         let mailbox = &mut self.receiver;
         let event_watcher = &mut self.resources.event_watcher;
         let delivery = async move {
             let _ = runtime::select_two(mailbox.changed(), event_watcher.changed()).await;
         };
-        let event = runtime::select_two(
-            shutdown.cancelled(),
-            runtime::select_two(local_stop.fired(), delivery),
-        );
+        // `local_stop` can only be fired by this actor task, and `recv`
+        // checks it before parking here. No other task can make it a wakeup
+        // source while this future is pending.
+        let event = runtime::select_two(shutdown.cancelled(), delivery);
         // The timer stays outside the whole event selection so every event
         // winner -- especially the warm mailbox path -- retires its caller
         // waker through timeout_at's synchronous poll-path boundary. Burying
@@ -1858,10 +1845,10 @@ mod tests {
     /// `Guard::finished()` waiter's wake panic, and the ledger may not retire
     /// the work until it has.
     ///
-    /// The `Release` store that publishes completion is *not* pinned here:
-    /// `poller.join()` is a full fence, so weakening it to `Relaxed` would
-    /// still pass. Only the comment at that store constrains it. The
-    /// companion below covers the `task`-bearing chain this one omits.
+    /// The publication ordering itself is pinned by
+    /// `offload::tests::finished_publication_releases_wake_effect_to_reclaimer`;
+    /// this test covers panic retention, while the companion below covers the
+    /// `task`-bearing chain this one omits.
     #[test]
     fn ordinary_offload_completion_retains_a_finished_waiter_wake_panic() {
         let mut resources = RawResources::<()>::default();
@@ -2176,14 +2163,14 @@ mod tests {
         let arming = context.resources.timers.replace(
             "interval",
             Some(now),
-            TimerMessage::Interval(
-                PanicOnceClone {
+            TimerMessage::Interval {
+                message: PanicOnceClone {
                     clones: Arc::clone(&clones),
                     value: 7,
                 },
-                Clone::clone,
-            ),
-            Some(Duration::from_secs(1)),
+                clone: Clone::clone,
+                period: Duration::from_secs(1),
+            },
         );
 
         let panic = catch_unwind(AssertUnwindSafe(|| context.try_recv()))
@@ -2213,11 +2200,10 @@ mod tests {
     fn a_caught_offload_continuation_panic_preserves_later_fired_work() {
         let mut context = bound_raw_context_for::<u8>().0;
         let now = crate::runtime::now();
-        let arming =
-            context
-                .resources
-                .timers
-                .replace("timer", Some(now), TimerMessage::Once(7), None);
+        let arming = context
+            .resources
+            .timers
+            .replace("timer", Some(now), TimerMessage::Once(7));
         context.resources.events.push(QueuedEvent {
             cancellation: Latch::default(),
             make_message: Box::new(|| panic!("offload continuation panic")),
@@ -2248,11 +2234,11 @@ mod tests {
         context
             .resources
             .timers
-            .replace("first", Some(now), TimerMessage::Once(1), None);
+            .replace("first", Some(now), TimerMessage::Once(1));
         context
             .resources
             .timers
-            .replace("second", Some(now), TimerMessage::Once(2), None);
+            .replace("second", Some(now), TimerMessage::Once(2));
 
         assert_eq!(context.try_recv(), Some(1));
         assert!(
@@ -2276,9 +2262,7 @@ mod tests {
             cancellation: Latch::default(),
             make_message: Box::new(|| ()),
         });
-        resources
-            .timers
-            .replace(7_u8, None, TimerMessage::Once(()), None);
+        resources.timers.replace(7_u8, None, TimerMessage::Once(()));
 
         assert_eq!(
             Arc::strong_count(&resources.disposal.panic),
@@ -2486,7 +2470,6 @@ mod tests {
             1_u8,
             None,
             TimerMessage::Once(PanickingDrop(Arc::clone(&drops))),
-            None,
         );
 
         resources.freeze();

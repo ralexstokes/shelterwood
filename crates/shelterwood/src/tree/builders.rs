@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use crate::{
     ActorDef, ActorOnceDef, ActorRef, ChildId, Intensity, ScopeDefaults,
-    cells::ReserveError,
+    cells::StaticReserveError,
     plan::{BuilderCore, LowerError},
     policy::{ResolvedDefaults, ScopeFlavor},
     raw::{RawDef, RawOnceDef},
@@ -29,19 +29,20 @@ pub enum BuildError {
         paths: Vec<ChildId>,
     },
 }
+
 /// Routes a definition rejected before admission through isolated disposal.
 ///
 /// Builder and dynamic-add entry points wrap the definition before evaluating
 /// the caller's `Into<ChildId>` hook or raw readiness metadata. A failed
 /// reservation therefore arrives here already isolated, and dropping the
 /// wrapper cannot run a possibly blocking or panicking user destructor on the
-/// caller instead of producing an ordinary [`ReserveError`]. This guarantee
+/// caller instead of producing an ordinary reservation error. This guarantee
 /// covers the supplied definition only; Rust's ordinary unwind rules still
 /// govern every other caller-owned local.
-pub(super) fn dispose_rejected<D: Send + 'static>(
+pub(super) fn dispose_rejected<D: Send + 'static, E>(
     definition: runtime::Isolated<D>,
-    error: ReserveError,
-) -> ReserveError {
+    error: E,
+) -> E {
     drop(definition);
     error
 }
@@ -50,7 +51,7 @@ fn add_definition<D: Definition>(
     core: &mut BuilderCore,
     id: impl Into<ChildId>,
     definition: D,
-) -> Result<D::Handles, ReserveError> {
+) -> Result<D::Handles, StaticReserveError> {
     let mut definition = runtime::Isolated::new(definition);
     match reserve_static::<D::Kind>(core, id) {
         Ok(slot) => Ok(slot.define(definition.take().expect("isolated definition is available"))),
@@ -84,14 +85,13 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
         pub fn reserve_actor<M: Send + 'static>(
             &mut self,
             id: impl Into<ChildId>,
-        ) -> Result<ActorSlot<M>, ReserveError> {
+        ) -> Result<ActorSlot<M>, StaticReserveError> {
             reserve_static::<ActorKind<M>>(&mut self.core, id).map(|core| ActorSlot { core })
         }
 
@@ -100,15 +100,14 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
         pub fn add_actor<A: crate::Actor>(
             &mut self,
             id: impl Into<ChildId>,
             definition: ActorDef<A>,
-        ) -> Result<ActorRef<A::Msg>, ReserveError> {
+        ) -> Result<ActorRef<A::Msg>, StaticReserveError> {
             add_definition(&mut self.core, id, definition)
         }
 
@@ -117,15 +116,14 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
         pub fn add_actor_once<A: crate::Actor>(
             &mut self,
             id: impl Into<ChildId>,
             definition: ActorOnceDef<A>,
-        ) -> Result<ActorRef<A::Msg>, ReserveError> {
+        ) -> Result<ActorRef<A::Msg>, StaticReserveError> {
             add_definition(&mut self.core, id, definition)
         }
 
@@ -134,15 +132,14 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
         pub fn add_raw<R: crate::RawActor>(
             &mut self,
             id: impl Into<ChildId>,
             definition: RawDef<R>,
-        ) -> Result<ActorRef<R::Msg>, ReserveError> {
+        ) -> Result<ActorRef<R::Msg>, StaticReserveError> {
             add_definition(&mut self.core, id, definition)
         }
 
@@ -151,15 +148,14 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
         pub fn add_raw_once<R: crate::RawActor>(
             &mut self,
             id: impl Into<ChildId>,
             definition: RawOnceDef<R>,
-        ) -> Result<ActorRef<R::Msg>, ReserveError> {
+        ) -> Result<ActorRef<R::Msg>, StaticReserveError> {
             add_definition(&mut self.core, id, definition)
         }
 
@@ -168,11 +164,13 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
-        pub fn reserve_task(&mut self, id: impl Into<ChildId>) -> Result<TaskSlot, ReserveError> {
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
+        pub fn reserve_task(
+            &mut self,
+            id: impl Into<ChildId>,
+        ) -> Result<TaskSlot, StaticReserveError> {
             reserve_static::<TaskKind>(&mut self.core, id).map(|core| TaskSlot { core })
         }
 
@@ -181,15 +179,14 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
         pub fn add_task(
             &mut self,
             id: impl Into<ChildId>,
             definition: TaskDef,
-        ) -> Result<TaskRef, ReserveError> {
+        ) -> Result<TaskRef, StaticReserveError> {
             add_definition(&mut self.core, id, definition)
         }
 
@@ -198,15 +195,14 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
         pub fn add_task_once<T: Send + 'static>(
             &mut self,
             id: impl Into<ChildId>,
             definition: TaskOnceDef<T>,
-        ) -> Result<(TaskRef, OneShotTaskRef<T>), ReserveError> {
+        ) -> Result<(TaskRef, OneShotTaskRef<T>), StaticReserveError> {
             add_definition(&mut self.core, id, definition)
         }
 
@@ -215,14 +211,13 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
         pub fn reserve_subtree<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
-        ) -> Result<SubtreeSlot<T>, ReserveError> {
+        ) -> Result<SubtreeSlot<T>, StaticReserveError> {
             reserve_static::<SubtreeKind<T>>(&mut self.core, id).map(|core| SubtreeSlot { core })
         }
 
@@ -231,15 +226,14 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
         pub fn add_subtree<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
             definition: SubtreeDef<T>,
-        ) -> Result<T::Ref, ReserveError> {
+        ) -> Result<T::Ref, StaticReserveError> {
             add_definition(&mut self.core, id, definition)
         }
 
@@ -248,15 +242,14 @@ macro_rules! impl_common_builder_surface {
         ///
         /// # Errors
         ///
-        /// Fails with [`ReserveError::EmptyId`] or
-        /// [`ReserveError::DuplicateId`] when the id is unusable, or with
-        /// [`ReserveError::IdentityExhausted`]; no other variant is
-        /// reachable from a pre-spawn builder.
+        /// Fails with [`StaticReserveError::EmptyId`] or
+        /// [`StaticReserveError::DuplicateId`] when the id is unusable, or
+        /// with [`StaticReserveError::IdentityExhausted`].
         pub fn add_subtree_once<T: Subtree>(
             &mut self,
             id: impl Into<ChildId>,
             definition: SubtreeOnceDef<T>,
-        ) -> Result<T::Ref, ReserveError> {
+        ) -> Result<T::Ref, StaticReserveError> {
             add_definition(&mut self.core, id, definition)
         }
     };

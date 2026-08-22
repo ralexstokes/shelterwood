@@ -698,20 +698,21 @@ impl ScopeRuntime {
             request.complete(Err(ReserveError::NotAdmitting(NotAdmittingCause::Terminal)));
             return;
         };
-        if self
+        let lifecycle = self.supervisor.lifecycle();
+        let not_admitting = if lifecycle.is_draining() {
+            Some(NotAdmittingCause::Draining)
+        } else if lifecycle.startup_failed() {
+            Some(NotAdmittingCause::StartupFailed)
+        } else if self
             .dynamic
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &control))
-            || self.supervisor.lifecycle().is_draining()
-            || self.supervisor.lifecycle().startup_failed()
         {
-            let cause = if self.supervisor.lifecycle().is_draining() {
-                NotAdmittingCause::Draining
-            } else if self.supervisor.lifecycle().startup_failed() {
-                NotAdmittingCause::StartupFailed
-            } else {
-                NotAdmittingCause::NoLiveIncarnation
-            };
+            Some(NotAdmittingCause::NoLiveIncarnation)
+        } else {
+            None
+        };
+        if let Some(cause) = not_admitting {
             let (definition, removed) = self.root.with_observation_gate(|txn| {
                 cancel_dynamic_reservation_parts(&self.root, &control, &request.slot, txn)
             });
@@ -1091,6 +1092,89 @@ async fn run_scope(plan: ScopePlan, role: ScopeRole) -> RetainedStopReason {
     RetainedStopReason::new(run_scope_incarnation(plan, role, epoch).await)
 }
 
+/// Blocks the driver loop until one lane wakes it, returning `Some` only when
+/// the wake staged a scope completion the loop must return.
+#[must_use = "a staged fail-closed completion must end the driver loop"]
+async fn wait_for_scope_wake(
+    scope: &mut ScopeRuntime,
+    signal: &mut runtime::WatchReceiver<crate::cells::MemberRecord>,
+    event_receiver: &mut runtime::UnboundedMpscReceiver<DriverEvent>,
+    dynamic_event_receiver: Option<&mut runtime::UnboundedMpscReceiver<DriverEvent>>,
+    pending: &mut Vec<(ArbitrationClass, Pending)>,
+) -> Option<StopReason> {
+    let ancestor_shutdown = scope
+        .role
+        .ancestor()
+        .filter(|_| !scope.ancestor_shutdown_seen)
+        .map(|latches| latches.framework_shutdown.clone());
+    let ancestor_abort = scope
+        .role
+        .ancestor()
+        .filter(|_| !scope.ancestor_abort_seen)
+        .map(|latches| latches.abort.clone());
+    let ancestor_command = async move {
+        let shutdown = async move {
+            if let Some(shutdown) = ancestor_shutdown {
+                shutdown.fired().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let abort = async move {
+            if let Some(abort) = ancestor_abort {
+                abort.fired().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        let _ = runtime::select_two(shutdown, abort).await;
+    };
+    match runtime::wait_scope(
+        runtime::ScopeWait {
+            signal: signal.changed(),
+            parent_shutdown: ancestor_command,
+        },
+        event_receiver,
+        dynamic_event_receiver,
+        scope.deadlines.next_deadline(),
+    )
+    .await
+    {
+        runtime::ScopeWake::Signal | runtime::ScopeWake::ParentShutdown => {}
+        runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
+            // Every lane sender is retained by the scope runtime or one of its
+            // registered children until the driver loop exits. A closed
+            // receiver would otherwise make this select arm permanently ready
+            // and spin. Fail closed by returning a retained shutdown
+            // completion: a framework panic here would unwind the other
+            // receiver and any queued admission response wakers outside
+            // ScopeRuntime's contained epilogue.
+            let reason = StopReason::ShutdownRequested;
+            let root_exit = scope
+                .role
+                .is_root()
+                .then(|| RetainedExit::new(stop_reason_root_exit(&reason)));
+            scope.completion = Some(ScopeCompletion {
+                reason: RetainedStopReason::new(reason.clone()),
+                root_exit,
+            });
+            return Some(reason);
+        }
+        runtime::ScopeWake::Deadline => {
+            // A producer becoming ready at the same instant owns the tie over
+            // its deadline. Give tasks woken by that clock edge one turn to
+            // publish their retained readiness latch before collecting due
+            // registrations.
+            runtime::yield_now().await;
+        }
+        runtime::ScopeWake::Message(Some(event))
+        | runtime::ScopeWake::ControlMessage(Some(event)) => {
+            retain_woken_event(event, pending);
+        }
+    }
+    None
+}
+
 async fn run_scope_incarnation(
     mut plan: ScopePlan,
     role: ScopeRole,
@@ -1269,75 +1353,16 @@ async fn run_scope_incarnation(
         }
 
         if pending.is_empty() {
-            let ancestor_shutdown = scope
-                .role
-                .ancestor()
-                .filter(|_| !scope.ancestor_shutdown_seen)
-                .map(|latches| latches.framework_shutdown.clone());
-            let ancestor_abort = scope
-                .role
-                .ancestor()
-                .filter(|_| !scope.ancestor_abort_seen)
-                .map(|latches| latches.abort.clone());
-            let ancestor_command = async move {
-                let shutdown = async move {
-                    if let Some(shutdown) = ancestor_shutdown {
-                        shutdown.fired().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                };
-                let abort = async move {
-                    if let Some(abort) = ancestor_abort {
-                        abort.fired().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                };
-                let _ = runtime::select_two(shutdown, abort).await;
-            };
-            match runtime::wait_scope(
-                runtime::ScopeWait {
-                    signal: signal.changed(),
-                    parent_shutdown: ancestor_command,
-                },
+            if let Some(reason) = wait_for_scope_wake(
+                &mut scope,
+                &mut signal,
                 &mut event_receiver,
                 dynamic_event_receiver.as_mut(),
-                scope.deadlines.next_deadline(),
+                &mut pending,
             )
             .await
             {
-                runtime::ScopeWake::Signal | runtime::ScopeWake::ParentShutdown => {}
-                runtime::ScopeWake::Message(None) | runtime::ScopeWake::ControlMessage(None) => {
-                    // Every lane sender is retained by the scope runtime or
-                    // one of its registered children until this loop exits.
-                    // A closed receiver would otherwise make this select arm
-                    // permanently ready and spin. Fail closed by returning a
-                    // retained shutdown completion: a framework panic here
-                    // would unwind the other receiver and any queued admission
-                    // response wakers outside ScopeRuntime's contained epilogue.
-                    let reason = StopReason::ShutdownRequested;
-                    let root_exit = scope
-                        .role
-                        .is_root()
-                        .then(|| RetainedExit::new(stop_reason_root_exit(&reason)));
-                    scope.completion = Some(ScopeCompletion {
-                        reason: RetainedStopReason::new(reason.clone()),
-                        root_exit,
-                    });
-                    return reason;
-                }
-                runtime::ScopeWake::Deadline => {
-                    // A producer becoming ready at the same instant owns the
-                    // tie over its deadline. Give tasks woken by that clock
-                    // edge one turn to publish their retained readiness
-                    // latch before collecting due registrations.
-                    runtime::yield_now().await;
-                }
-                runtime::ScopeWake::Message(Some(event))
-                | runtime::ScopeWake::ControlMessage(Some(event)) => {
-                    retain_woken_event(event, &mut pending);
-                }
+                return reason;
             }
             // Every wake re-enters the collection site above. Nothing is
             // dispatched from this arm.
@@ -1354,6 +1379,12 @@ async fn run_scope_incarnation(
                 Pending::Shutdown => {
                     if let ScopeRole::Nested(nested) = &scope.role {
                         nested.child_shutdown.fire();
+                        // The ancestor arm's sole action is the same
+                        // `begin_drain(ShutdownRequested)` call immediately
+                        // below, so consuming its observation here suppresses
+                        // only a duplicate idempotent transition. Construction
+                        // suppression still reads the ancestor latch itself
+                        // rather than this consumption flag.
                         scope.ancestor_shutdown_seen = true;
                     }
                     scope.begin_drain(StopReason::ShutdownRequested);

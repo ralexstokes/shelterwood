@@ -4,6 +4,7 @@ use std::{
     ops::RangeBounds,
     panic::resume_unwind,
     sync::{Arc, Mutex},
+    task::Poll,
 };
 
 use tokio::{sync::mpsc, task};
@@ -12,8 +13,7 @@ use shelterwood_core::exit::JoinOutcome;
 
 use super::{
     DisposingReceiver, OneShotReceiver, OneShotSender, PanicPayload, Timeout, catch_panic,
-    discard_panic, dispose_detached, oneshot, timeout_at,
-    waker_proxy::{WakerProxy, WakerRetirement},
+    discard_panic, dispose_detached, oneshot, timeout_at, waker_proxy::ProxiedPoll,
 };
 
 const BLOCKING_FALLBACK_THREAD: &str = "shelterwood-blocking";
@@ -438,29 +438,14 @@ pub async fn join_user_polled<T>(handle: JoinHandle<T>) -> JoinOutcome<T> {
 }
 
 async fn poll_join_user_waker<T>(mut inner: task::JoinHandle<T>) -> Result<T, task::JoinError> {
-    let mut caller_waker = None;
+    let mut caller_poll = ProxiedPoll::new();
     let result = poll_fn(|context| {
-        if caller_waker.is_none() {
-            // Preserve the already-ready fast path: a framework no-op probe
-            // avoids cloning a caller waker that Tokio never needs to park.
-            let mut probe = std::task::Context::from_waker(std::task::Waker::noop());
-            let result = std::pin::Pin::new(&mut inner).poll(&mut probe);
-            if result.is_ready() {
-                return result;
-            }
-            caller_waker = Some(WakerProxy::new());
-        }
-
-        let proxy = caller_waker
-            .as_ref()
-            .expect("a pending public join retains its waker proxy");
-        proxy.register(context);
-        let mut proxy_context = std::task::Context::from_waker(proxy.waker());
-        let result = std::pin::Pin::new(&mut inner).poll(&mut proxy_context);
-        if result.is_ready() {
-            retire_join_caller_waker(&mut caller_waker);
-        }
-        result
+        caller_poll.poll(
+            &mut inner,
+            context,
+            |inner, context| std::pin::Pin::new(inner).poll(context),
+            Poll::is_pending,
+        )
     })
     .await;
 
@@ -469,16 +454,6 @@ async fn poll_join_user_waker<T>(mut inner: task::JoinHandle<T>) -> Result<T, ta
     // framework proxy vtables while that payload is live.
     drop(inner);
     result
-}
-
-fn retire_join_caller_waker(caller_waker: &mut Option<WakerProxy>) {
-    let caller_waker = caller_waker.take();
-    let mut panics = super::PanicAccumulator::default();
-    if let Some(caller_waker) = &caller_waker {
-        caller_waker.retire(WakerRetirement::Inline, &mut panics);
-    }
-    panics.run(|| drop(caller_waker));
-    discard_panic(panics.take());
 }
 
 fn classify_join_result<T>(result: Result<T, task::JoinError>) -> JoinOutcome<T> {

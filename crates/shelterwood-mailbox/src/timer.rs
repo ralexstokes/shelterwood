@@ -2,14 +2,14 @@ use std::{
     future::Future,
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
 use crate::{
     BoxedSleep, MailboxRuntime,
     cell::waker_slot::{WakerAction, WakerEffects},
     panic::PanicAccumulator,
-    waker_proxy::WakerProxy,
+    waker_proxy::ProxiedPoll,
 };
 
 /// Timer future that keeps a caller-owned waker out of the runtime's wheel.
@@ -27,7 +27,7 @@ use crate::{
 pub struct ProxiedSleep {
     runtime: Arc<dyn MailboxRuntime>,
     timer: Option<BoxedSleep>,
-    timer_waker: Option<WakerProxy>,
+    timer_poll: ProxiedPoll,
     completed: bool,
 }
 
@@ -42,7 +42,7 @@ impl ProxiedSleep {
         Self {
             runtime,
             timer: Some(timer),
-            timer_waker: None,
+            timer_poll: ProxiedPoll::new(),
             completed: false,
         }
     }
@@ -77,16 +77,12 @@ impl ProxiedSleep {
 
     fn retire(&mut self, action: WakerAction, panics: &mut PanicAccumulator) {
         let mut effects = WakerEffects::default();
-        let timer_waker = self.timer_waker.as_ref();
+        let timer_poll = &mut self.timer_poll;
         // The proxy mutex guards framework-owned data and is documented
         // unpoisonable, but this path also runs during unwind. Keep every
         // cleanup step inside the accumulator so a bookkeeping defect cannot
         // turn a caller panic into an abort.
-        panics.run(|| {
-            if let Some(timer_waker) = timer_waker {
-                timer_waker.retire(action, &mut effects);
-            }
-        });
+        panics.run(|| timer_poll.retire(action, &mut effects));
         effects.flush(panics);
 
         // Slot first, timer second: once the caller waker is gone, cancelling
@@ -95,8 +91,6 @@ impl ProxiedSleep {
         // gone when retirement returns.
         let timer = self.timer.take();
         panics.run(|| drop(timer));
-        let timer_waker = self.timer_waker.take();
-        panics.run(|| drop(timer_waker));
         // Retirement is the single point that empties both slots, so it also
         // fuses the future: without this, a poll after `cancel_inline` would
         // panic on the emptied timer slot instead of reporting ready.
@@ -112,47 +106,23 @@ impl Future for ProxiedSleep {
         if this.completed {
             return Poll::Ready(());
         }
-        if this.timer_waker.is_none() {
-            let mut probe = Context::from_waker(Waker::noop());
-            if this
-                .timer
+        // `ProxiedPoll::poll` retires the caller slot inline on the ready
+        // edge; `retire_inline` below then finds it empty and only cancels
+        // the wheel entry, preserving the slot-first, timer-second order.
+        let result = this.timer_poll.poll(
+            this.timer
                 .as_mut()
-                .expect("an incomplete proxied sleep retains its timer")
-                .as_mut()
-                .poll(&mut probe)
-                .is_ready()
-            {
-                this.completed = true;
-                let mut panics = PanicAccumulator::default();
-                this.retire_inline(&mut panics);
-                crate::panic::discard_panic(panics.take());
-                return Poll::Ready(());
-            }
-            this.timer_waker = Some(WakerProxy::new());
+                .expect("an incomplete proxied sleep retains its timer"),
+            context,
+            |timer, context| timer.as_mut().poll(context),
+            Poll::is_pending,
+        );
+        if result.is_ready() {
+            let mut panics = PanicAccumulator::default();
+            this.retire_inline(&mut panics);
+            crate::panic::discard_panic(panics.take());
         }
-
-        let timer_waker = this
-            .timer_waker
-            .as_ref()
-            .expect("a parked proxied sleep retains its waker proxy");
-        timer_waker.register(context.waker());
-        let mut proxy_context = Context::from_waker(timer_waker.waker());
-        if this
-            .timer
-            .as_mut()
-            .expect("an incomplete proxied sleep retains its timer")
-            .as_mut()
-            .poll(&mut proxy_context)
-            .is_pending()
-        {
-            return Poll::Pending;
-        }
-
-        this.completed = true;
-        let mut panics = PanicAccumulator::default();
-        this.retire_inline(&mut panics);
-        crate::panic::discard_panic(panics.take());
-        Poll::Ready(())
+        result
     }
 }
 
@@ -258,7 +228,7 @@ mod tests {
             "the already-ready raw timer leaves no wheel entry to cancel"
         );
         assert!(
-            timer.timer_waker.is_none(),
+            !timer.timer_poll.is_parked(),
             "the no-op probe allocates no proxy on the ready path"
         );
 
@@ -315,7 +285,7 @@ mod tests {
             "a sibling branch returning Ready retires the timer caller before handing its value back"
         );
         assert!(timer.timer.is_none());
-        assert!(timer.timer_waker.is_none());
+        assert!(!timer.timer_poll.is_parked());
 
         assert!(
             Pin::new(&mut timer).poll(&mut context).is_ready(),

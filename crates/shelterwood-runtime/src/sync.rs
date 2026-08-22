@@ -11,10 +11,7 @@ use std::{
 
 use tokio::sync::{broadcast, oneshot};
 
-use super::{
-    PanicAccumulator, discard_panic, dispose_detached,
-    waker_proxy::{WakerProxy, WakerRetirement},
-};
+use super::{PanicAccumulator, dispose_detached, waker_proxy::ProxiedPoll};
 
 /// A caller-waker registry whose lock protects only inert storage changes.
 ///
@@ -609,6 +606,23 @@ impl<T> OneShotReceiver<T> {
     }
 }
 
+/// Marker for framework-owned response values whose destructor runs no user
+/// code.
+///
+/// [`DisposingReceiver::new_framework`] drops an abandoned published value
+/// inline in holder drop glue instead of submitting it to the blocking
+/// disposal lane, so this bound is what keeps that fast path from ever
+/// reaching a destructor that can block, panic, or re-enter. Implement it
+/// only for plain framework enums and their compositions; a type that can
+/// own user data — an `Exit`, a message, a type-erased error — must go
+/// through [`DisposingReceiver::new`] instead.
+#[doc(hidden)]
+pub trait FrameworkPlain: Send + 'static {}
+
+impl FrameworkPlain for () {}
+
+impl<T: FrameworkPlain, E: FrameworkPlain> FrameworkPlain for Result<T, E> {}
+
 /// One-shot receive state that keeps user value destruction off framework and
 /// holder drop glue.
 ///
@@ -629,65 +643,36 @@ impl<T> OneShotReceiver<T> {
 pub struct DisposingReceiver<T> {
     inner: Option<OneShotReceiver<T>>,
     dispose: fn(T),
-    caller_waker: Option<WakerProxy>,
+    caller_poll: ProxiedPoll,
 }
 
 impl<T: Send + 'static> DisposingReceiver<T> {
     pub fn new(inner: OneShotReceiver<T>) -> Self {
-        Self {
-            inner: Some(inner),
-            dispose: dispose_detached::<T>,
-            caller_waker: None,
-        }
+        Self::with_dispose(inner, dispose_detached::<T>)
     }
 }
 
-fn poll_one_shot_with_proxy<T, R>(
-    inner: &mut OneShotReceiver<T>,
-    caller_waker: &mut Option<WakerProxy>,
-    context: &mut Context<'_>,
-    mut poll: impl FnMut(&mut OneShotReceiver<T>, &mut Context<'_>) -> R,
-    is_pending: impl Fn(&R) -> bool,
-) -> R {
-    if caller_waker.is_none() {
-        let mut probe = Context::from_waker(Waker::noop());
-        let result = poll(inner, &mut probe);
-        if !is_pending(&result) {
-            return result;
-        }
-        *caller_waker = Some(WakerProxy::new());
+impl<T: FrameworkPlain> DisposingReceiver<T> {
+    /// Creates a receiver whose abandoned value is plain framework data.
+    ///
+    /// This is an implementation seam for internal response enums. Unlike
+    /// [`Self::new`], dropping a published but unclaimed value does not
+    /// submit work to the blocking disposal lane; the [`FrameworkPlain`]
+    /// bound is what keeps that inline drop from ever reaching a user-owned
+    /// destructor.
+    #[doc(hidden)]
+    pub fn new_framework(inner: OneShotReceiver<T>) -> Self {
+        Self::with_dispose(inner, drop)
     }
-
-    let caller_waker = caller_waker
-        .as_ref()
-        .expect("a parked disposing receiver retains its waker proxy");
-    caller_waker.register(context);
-    let mut proxy_context = Context::from_waker(caller_waker.waker());
-    poll(inner, &mut proxy_context)
 }
 
 impl<T> DisposingReceiver<T> {
-    /// Retires a caller waker only after selecting its post-unlock venue.
-    ///
-    /// Ready results use contained inline retirement: a result may own a user
-    /// value (or a panic payload that owns one), so a hostile waker destructor
-    /// is subordinate to returning that result intact. Drop glue uses the
-    /// detached lane. That venue is a per-seam adjudication, not a universal
-    /// rule: the mailbox reply receiver retires cancellation inline
-    /// (`shelterwood-mailbox`'s `DisposingReceiver`), accepting that a slow
-    /// caller-waker destructor stalls the abandoning holder alone. This
-    /// receiver backs the one-shot task and blocking-offload seams — and,
-    /// downstream, the public admission, removal, and system-join futures —
-    /// where cancellation is cold, so one disposal-lane submission per
-    /// abandoned pending receiver buys drop glue that cannot block or stall
-    /// the holder's thread. A hot cancellation path added here should
-    /// revisit the reply receiver's ruling rather than inherit this one.
-    fn retire_caller_waker(&mut self, retirement: WakerRetirement, panics: &mut PanicAccumulator) {
-        let caller_waker = self.caller_waker.take();
-        if let Some(caller_waker) = &caller_waker {
-            caller_waker.retire(retirement, panics);
+    fn with_dispose(inner: OneShotReceiver<T>, dispose: fn(T)) -> Self {
+        Self {
+            inner: Some(inner),
+            dispose,
+            caller_poll: ProxiedPoll::new(),
         }
-        panics.run(|| drop(caller_waker));
     }
 
     pub fn poll_receive(&mut self, context: &mut Context<'_>) -> Poll<Option<T>> {
@@ -697,21 +682,14 @@ impl<T> DisposingReceiver<T> {
         // Probe with a framework waker, then leave only the stable proxy
         // registered across a pending return so Tokio never destroys the raw
         // caller waker at that delivery seam.
-        let result = poll_one_shot_with_proxy(
+        self.caller_poll.poll(
             self.inner
                 .as_mut()
                 .expect("a live disposing receiver retains its channel"),
-            &mut self.caller_waker,
             context,
             OneShotReceiver::poll_receive,
             Poll::is_pending,
-        );
-        if result.is_ready() {
-            let mut panics = PanicAccumulator::default();
-            self.retire_caller_waker(WakerRetirement::Inline, &mut panics);
-            discard_panic(panics.take());
-        }
-        result
+        )
     }
 
     /// Staged parity with the mailbox receiver's timeout arbitration: no
@@ -722,21 +700,14 @@ impl<T> DisposingReceiver<T> {
     /// sender-side completion consumes through the wake first. The
     /// ready-edge containment test below is that path's pin.
     pub fn close_and_poll_receive(&mut self, context: &mut Context<'_>) -> OneShotClose<T> {
-        let result = poll_one_shot_with_proxy(
+        self.caller_poll.poll(
             self.inner
                 .as_mut()
                 .expect("a live disposing receiver retains its channel"),
-            &mut self.caller_waker,
             context,
             OneShotReceiver::close_and_poll_receive,
             |result| matches!(result, OneShotClose::Pending),
-        );
-        if !matches!(result, OneShotClose::Pending) {
-            let mut panics = PanicAccumulator::default();
-            self.retire_caller_waker(WakerRetirement::Inline, &mut panics);
-            discard_panic(panics.take());
-        }
-        result
+        )
     }
 }
 
@@ -764,7 +735,7 @@ impl<T> Drop for DisposingReceiver<T> {
             }
         });
         panics.run(|| drop(inner));
-        self.retire_caller_waker(WakerRetirement::Detached, &mut panics);
+        self.caller_poll.retire_detached(&mut panics);
     }
 }
 
@@ -1152,6 +1123,16 @@ mod tests {
 
     struct DebugProbe(Arc<AtomicUsize>);
 
+    struct FrameworkDropProbe(mpsc::Sender<ThreadId>);
+
+    impl super::FrameworkPlain for FrameworkDropProbe {}
+
+    impl Drop for FrameworkDropProbe {
+        fn drop(&mut self) {
+            let _ = self.0.send(std::thread::current().id());
+        }
+    }
+
     impl std::fmt::Debug for DebugProbe {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -1417,6 +1398,24 @@ mod tests {
 
         assert_eq!(sending.publish(7_u8), Err(7));
         assert_eq!(receiver.try_receive(), None);
+    }
+
+    #[test]
+    fn framework_disposing_receiver_drops_abandoned_values_inline() {
+        let dropping_thread = std::thread::current().id();
+        let (dropped, observed_drop) = mpsc::channel();
+        let (sender, receiver) = oneshot();
+        assert!(sender.send(FrameworkDropProbe(dropped)).is_ok());
+
+        drop(DisposingReceiver::new_framework(receiver));
+
+        assert_eq!(
+            observed_drop
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the abandoned framework value is destroyed"),
+            dropping_thread,
+            "plain framework responses do not use the blocking disposal lane"
+        );
     }
 
     #[test]

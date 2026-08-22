@@ -63,6 +63,15 @@ pub enum RemoveOutcome {
     AlreadyAbsent,
 }
 
+// The admission and removal response receivers drop these inline when a
+// caller abandons them (`DisposingReceiver::new_framework`); the marker is
+// the claim that no variant can ever own a user destructor. A variant that
+// grows one must lose the marker and move its receivers back to the
+// disposal-lane constructor.
+impl shelterwood_runtime::FrameworkPlain for ReserveError {}
+
+impl shelterwood_runtime::FrameworkPlain for RemoveOutcome {}
+
 #[cfg(test)]
 mod tests {
     use super::{NotAdmittingCause, ReserveError};

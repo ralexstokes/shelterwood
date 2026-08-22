@@ -37,12 +37,6 @@ runtime-api-check:
     cargo run --locked -p shelterwood-api-reachability -- target/doc/shelterwood.json
     ./tools/check-core-manifest.sh
 
-packaged-docs-sync:
-    ./tools/sync-packaged-docs.sh --write
-
-packaged-docs-check:
-    ./tools/sync-packaged-docs.sh --check
-
 external-consumer-check:
     ./tools/check-external-consumer.sh
 
@@ -51,7 +45,7 @@ nixfmt-check:
 
 # Fast local CI mirror — reuses the local cargo cache and incremental builds.
 # The clean Nix lane retains the explicit all-target build for non-test codegen coverage.
-ci: fmt lint lint-default test doc-check runtime-api-check packaged-docs-check external-consumer-check nixfmt-check
+ci: fmt lint lint-default test doc-check runtime-api-check external-consumer-check nixfmt-check
 
 # Full clean Nix CI lane; use before pushing or when touching Nix files.
 ci-nix:

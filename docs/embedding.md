@@ -68,6 +68,7 @@ each fresh tree or actor incarnation.
 
 Dropping `System` also requests graceful shutdown, but awaiting explicit
 shutdown is the only way for the host to join the root driver and receive
-straggler evidence. See [shutdown and resource ownership](shutdown-and-resources.md)
+straggler evidence. See
+[shutdown and resource ownership](../crates/shelterwood/docs/shutdown-and-resources.md)
 for the recursive hard-abort boundary, grace, blocking-work, and
 teardown-notification rules.

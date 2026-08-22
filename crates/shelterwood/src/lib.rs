@@ -55,24 +55,32 @@ pub use tree::{
     System, TaskSlot, Tree,
 };
 
-// Keep the repository-facing examples in the same rustdoc compilation lane as
-// the crate API without adding documentation-only modules to the public surface.
-// These synchronized copies live inside the crate so packaged doctests use the
-// same sources as repository doctests.
+/// Long-form operational guides, rendered with the API reference.
+///
+/// Each page documents a contract that spans many items — the material that
+/// does not fit a single type's documentation. The modules under this one
+/// exist only to carry the pages; they export nothing.
+pub mod guides {
+    #[doc = include_str!("../docs/retry-and-ordering.md")]
+    pub mod retry_and_ordering {}
+
+    #[doc = include_str!("../docs/shutdown-and-resources.md")]
+    pub mod shutdown_and_resources {}
+}
+
+// Keep the repository-root narrative documents in the doctest compilation lane
+// so their examples stay compiled against the current API. The paths reach
+// outside the package directory, which is fine here: `cfg(doctest)` is active
+// only for repository-local `cargo test --doc`, so packaged builds and docs.rs
+// never resolve them.
 #[cfg(doctest)]
 mod repository_docs {
-    #[doc = include_str!("../doctests/README.md")]
+    #[doc = include_str!("../../../README.md")]
     mod readme {}
 
-    #[doc = include_str!("../doctests/docs/embedding.md")]
+    #[doc = include_str!("../../../docs/embedding.md")]
     mod embedding {}
 
-    #[doc = include_str!("../doctests/docs/observation.md")]
+    #[doc = include_str!("../../../docs/observation.md")]
     mod observation {}
-
-    #[doc = include_str!("../doctests/docs/retry-and-ordering.md")]
-    mod retry_and_ordering {}
-
-    #[doc = include_str!("../doctests/docs/shutdown-and-resources.md")]
-    mod shutdown_and_resources {}
 }

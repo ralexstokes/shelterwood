@@ -11,10 +11,9 @@
     { rust-env, ... }:
     rust-env.lib.mkRustProject {
       src = ./.;
-      # Repository docs and their packaged doctest copies are compared in the
-      # clean build sandbox, so keep Markdown alongside Cargo sources; the
-      # the documentation script under tools/ runs there too, and nextest
-      # reads its timeout config.
+      # Markdown rides along for `include_str!` doc pages and the repo-root
+      # doctest lane; scripts under tools/ run in the clean build sandbox, and
+      # nextest reads its timeout config.
       extraSourceFilter =
         path: type:
         type == "regular"
@@ -55,7 +54,6 @@
                   target/doc/shelterwood.json
                 ${pkgs.bash}/bin/bash ./tools/check-core-manifest.sh
                 ${pkgs.bash}/bin/bash ./tools/check-external-consumer.sh
-                ${pkgs.bash}/bin/bash ./tools/sync-packaged-docs.sh --check
               '';
               doInstallCargoArtifacts = false;
             }

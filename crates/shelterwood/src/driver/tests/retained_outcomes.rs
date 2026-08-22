@@ -131,3 +131,83 @@ async fn a_join_panic_disposes_the_recorded_application_failure_off_the_driver()
         "the losing application error must not be destroyed on the driver"
     );
 }
+
+/// The selected failure must stay behind `RetainedExit` after classification,
+/// not only while the losing half of the fold is discarded. Poisoning the
+/// dynamic membership mutex injects the first fallible operation in that
+/// window and proves unwind drop glue transfers the selected user error to
+/// critical disposal instead of destroying it on the driver thread.
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handle_exit_retains_the_selected_failure_across_dispatch_panics() {
+    let (mut scope, mut event_receiver, mut dynamic_events, control) = running_dynamic_fixture();
+    let root = Arc::clone(&scope.root);
+    let reservation = super::super::reserve_dynamic(&root, ChildId::from("worker"), None)
+        .expect("running dynamic scope reserves the child");
+    reservation.slot.define(ChildConstruction::Task(
+        TaskDef::new(|_| future::pending()).erase(),
+    ));
+    let (mut response, request) = begin_admission(&reservation, &mut dynamic_events, None).await;
+    scope.handle_admission(request);
+    assert!(matches!(response.try_receive(), Some(Ok(()))));
+
+    let (key, incarnation) = scope
+        .children
+        .iter()
+        .find_map(|(key, child)| {
+            child
+                .active
+                .as_ref()
+                .map(|active| (key, active.incarnation))
+        })
+        .expect("admission starts one child incarnation");
+    scope.children[key]
+        .active
+        .as_ref()
+        .expect("the child remains active")
+        .abort_handle
+        .abort();
+    let _joined = recv_child_exit(
+        &mut event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the aborted fixture task to join",
+    )
+    .await;
+
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            let _state = control
+                .state
+                .lock()
+                .expect("dynamic-state mutex starts healthy");
+            panic!("inject membership dispatch panic");
+        }))
+        .is_err()
+    );
+    let (recorded, observed) = thread_reporting_error();
+    let driver_thread = std::thread::current().id();
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            scope.handle_exit(
+                key,
+                incarnation,
+                Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+                    Err(recorded),
+                ))),
+                crate::runtime::JoinOutcome::Ok { value: () },
+                Cancellation::NotObserved,
+                false,
+            );
+        }))
+        .is_err(),
+        "the poisoned membership lock injects a post-classification panic"
+    );
+    assert_ne!(
+        observed
+            .recv_timeout(DRIVER_PROGRESS_WAIT)
+            .expect("the retained selected failure is disposed"),
+        driver_thread,
+        "post-classification unwind must not destroy the user error on the driver"
+    );
+
+    control.state.clear_poison();
+}

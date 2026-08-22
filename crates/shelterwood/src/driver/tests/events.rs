@@ -11,6 +11,80 @@ fn disposed_child(pending: &Pending) -> ChildKey {
     }
 }
 
+async fn assert_closed_lane_fails_closed(closed_control: bool) {
+    let flavor = if closed_control {
+        ScopeFlavor::Dynamic
+    } else {
+        ScopeFlavor::Ordered
+    };
+    let root = isolated_scope("root", flavor);
+    let epoch = ScopeEpochGuard::begin(&root).expect("test scope epoch is available");
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state_and_startup(ScopeState::Running, Ok(()));
+
+    let (events, mut primary_receiver) = crate::runtime::unbounded_mpsc();
+    let (dynamic, mut dynamic_receiver) = if closed_control {
+        let (dynamic_events, dynamic_receiver) = crate::runtime::unbounded_mpsc();
+        (
+            Some(DynamicControl::new(dynamic_events)),
+            Some(dynamic_receiver),
+        )
+    } else {
+        (None, None)
+    };
+    let mut scope = ScopeRuntimeBuilder::new(Arc::clone(&root), epoch, events)
+        .with_lifecycle(ScopeLifecycle::running())
+        .with_dynamic(dynamic)
+        .build();
+    let (dead_sender, dead_receiver) = crate::runtime::unbounded_mpsc();
+    drop(dead_receiver);
+    if closed_control {
+        let replacement = DynamicControl::new(dead_sender);
+        root.set_dynamic_route(Some(replacement.clone()));
+        scope.dynamic = Some(replacement);
+    } else {
+        drop(std::mem::replace(&mut scope.events, dead_sender));
+    }
+
+    let mut signal = root.signal().watcher();
+    let mut pending = Vec::new();
+    let reason = wait_for_scope_wake(
+        &mut scope,
+        &mut signal,
+        &mut primary_receiver,
+        dynamic_receiver.as_mut(),
+        &mut pending,
+    )
+    .await;
+
+    assert_eq!(reason, Some(StopReason::ShutdownRequested));
+    assert!(pending.is_empty());
+    assert!(matches!(
+        scope
+            .completion
+            .as_ref()
+            .map(|completion| completion.reason.as_reason()),
+        Some(StopReason::ShutdownRequested)
+    ));
+    drop(scope);
+    assert!(matches!(
+        root.snapshot().state,
+        ScopeState::Stopped {
+            reason: StopReason::ShutdownRequested
+        }
+    ));
+}
+
+/// Sender retention makes both closed-lane wakes unreachable in production,
+/// but if that wiring invariant regresses the driver must take the contained
+/// shutdown epilogue instead of panicking or spinning on an always-ready lane.
+#[crate::runtime::test]
+async fn closed_event_lanes_publish_a_retained_shutdown_completion() {
+    assert_closed_lane_fails_closed(false).await;
+    assert_closed_lane_fails_closed(true).await;
+}
+
 /// Pins the post-blocking-wake gap: removal is queued on the control lane
 /// before readiness reaches the primary lane, but the biased wait returns the
 /// primary head. Retaining that head and re-entering the common collection

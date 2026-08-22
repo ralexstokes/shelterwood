@@ -1063,7 +1063,12 @@ impl ScopeRuntime {
             }
         }
         let recorded = reconcile_recorded_outcomes_retaining(recorded, active.forced_outcome);
-        let exit = classify_exit_retaining(recorded, join, active.hard_abort_phase, cancellation);
+        let exit = RetainedExit::new(classify_exit_retaining(
+            recorded,
+            join,
+            active.hard_abort_phase,
+            cancellation,
+        ));
         child.restarts.settle_if_stable(
             IncarnationRun {
                 started_at: active.started_at,
@@ -1096,9 +1101,14 @@ impl ScopeRuntime {
         } else {
             ScopeMode::Running
         };
-        match dispatch_exit(&exit, child.options.restart, mode, membership_status) {
+        match dispatch_exit(
+            exit.as_exit(),
+            child.options.restart,
+            mode,
+            membership_status,
+        ) {
             ExitDispatch::Terminal => {
-                self.begin_terminal_disposal(key, exit, Some(incarnation), startup);
+                self.begin_terminal_disposal(key, exit.into_exit(), Some(incarnation), startup);
             }
             ExitDispatch::ScheduleRestart => {
                 let sample =
@@ -1123,7 +1133,7 @@ impl ScopeRuntime {
                     &child.slot.member,
                     decision.total_restarts(),
                     MemberTransition::RestartScheduled {
-                        exit: exit.clone(),
+                        exit: exit.as_exit().clone(),
                         restart_count: decision.restart_count(),
                         // Publish the derived schedule even when intensity prevents spawning it.
                         // `None` means the exact clock point cannot be represented and armed; no
@@ -1134,7 +1144,7 @@ impl ScopeRuntime {
                         id: child.slot.member.id().clone(),
                         membership: child.slot.member.membership(),
                         incarnation,
-                        exit: exit.clone(),
+                        exit: exit.as_exit().clone(),
                     },
                     LifecycleEventKind::RestartScheduled {
                         id: child.slot.member.id().clone(),
@@ -1147,6 +1157,10 @@ impl ScopeRuntime {
                     published,
                     "a restart is scheduled from an active incarnation's exit"
                 );
+                // Successful publication installed retained copies in the
+                // member record and lifecycle event. Releasing the local raw
+                // copy is therefore provably refcount traffic.
+                drop(exit.into_exit());
                 let trip = decision.intensity_trip();
                 if trip.is_none()
                     && let Some(restart_at) = decision.restart_at()

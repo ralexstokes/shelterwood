@@ -137,6 +137,7 @@ pub(super) use super::super::{
     discharge_child_terminality, events::collect_driver_events, monitor_root_driver,
     nested_scope_start, report_slot, reserve_dynamic, resident_projection, restart_shutdown_work,
     run_nested_factory, run_nested_tree, run_scope, run_scope_incarnation, storage::Obligation,
+    wait_for_scope_wake,
 };
 
 pub(super) async fn begin_admission(
@@ -191,7 +192,7 @@ pub(super) fn insert_dynamic_fixture(
         {
             let mut dynamic = control.state.lock().expect("dynamic-state mutex poisoned");
             let entry = dynamic
-                .entries
+                .entries_mut()
                 .get_mut(reservation.slot.member.id())
                 .expect("the fixture reservation remains registered");
             entry.promote(key, None, txn);

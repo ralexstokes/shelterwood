@@ -211,3 +211,83 @@ async fn handle_exit_retains_the_selected_failure_across_dispatch_panics() {
 
     control.state.clear_poison();
 }
+
+/// The other consumption point of the same window. Restart dispatch clones
+/// through the retained carrier and asserts that publication landed, so the
+/// selected failure must still be retained when that invariant fails — the
+/// local raw copy is released only once the member record owns an equivalent
+/// one.
+#[crate::runtime::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_restart_publication_retains_the_selected_failure() {
+    let mut tree = Tree::new();
+    tree.add_task(
+        "worker",
+        TaskDef::new(|_| future::pending::<crate::ExitResult>()).restart(RestartPolicy::new(
+            RestartCondition::Always,
+            Backoff::Immediate,
+        )),
+    )
+    .expect("valid task");
+    let fixture = OrderedScopeFixture::new(tree);
+    let root = Arc::clone(&fixture.root);
+    root.member
+        .update(|record| record.stage = MemberStage::Running);
+    root.set_state_and_startup(ScopeState::Running, Ok(()));
+    let key = fixture.children.keys().next().expect("one child plan");
+    let (mut scope, mut event_receiver) = fixture.with_lifecycle(ScopeLifecycle::running()).build();
+
+    scope.spawn_child(key);
+    let active = scope.children[key]
+        .active
+        .as_ref()
+        .expect("worker is active");
+    let incarnation = active.incarnation;
+    active.abort_handle.abort();
+    let _joined = recv_child_exit(
+        &mut event_receiver,
+        DRIVER_PROGRESS_WAIT,
+        "the aborted fixture task to join",
+    )
+    .await;
+
+    // Corrupt only the projection source stage. `RestartScheduled` is legal
+    // from `Starting`, `Running` and `Stopping`, so an `Admitted` source makes
+    // the cell reducer refuse and reaches the driver's publication invariant
+    // exactly.
+    let member = Arc::clone(&scope.children[key].slot.member);
+    member.update(|record| record.stage = MemberStage::Admitted);
+
+    let (recorded, observed) = thread_reporting_error();
+    // Sample after the last await: the dispatch below runs inline on whichever
+    // worker this multi-thread test task currently occupies.
+    let driver_thread = std::thread::current().id();
+    let refusal = catch_unwind(AssertUnwindSafe(|| {
+        scope.handle_exit(
+            key,
+            incarnation,
+            Some(RetainedRecordedOutcome::new(RecordedOutcome::returned(
+                Err(recorded),
+            ))),
+            crate::runtime::JoinOutcome::Ok { value: () },
+            Cancellation::NotObserved,
+            false,
+        );
+    }))
+    .expect_err("a refused restart publication remains a framework invariant");
+    assert_eq!(
+        refusal.downcast_ref::<&'static str>().copied(),
+        Some("a restart is scheduled from an active incarnation's exit"),
+        "the framework invariant is the primary failure"
+    );
+    assert_ne!(
+        observed
+            .recv_timeout(DRIVER_PROGRESS_WAIT)
+            .expect("the retained selected failure is disposed"),
+        driver_thread,
+        "a refused restart publication must not destroy the user error on the driver"
+    );
+
+    // Restore the source stage so ScopeRuntime's normal fail-closed epilogue
+    // can discharge this deliberately corrupted fixture.
+    member.update(|record| record.stage = MemberStage::Running);
+}

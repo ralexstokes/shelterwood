@@ -5,7 +5,8 @@ restart — the supervision loop that is the library's reason to exist. The
 through-line is SPEC §15.3's pure-decision-core rule: every decision on
 this path is made by a synchronous reducer in `shelterwood-core` fed with
 sampled events, and the driver shell merely executes the effects the
-reducer returns.
+reducer returns — the contract the
+[previous chapter](internals-reducer.md) maps.
 
 ## Declaration
 

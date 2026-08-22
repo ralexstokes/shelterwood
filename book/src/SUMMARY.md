@@ -18,6 +18,7 @@
 # For maintainers
 
 - [The shape of the implementation](internals-shape.md)
+- [The decision core and its effects](internals-reducer.md)
 - [The life of a message](internals-message.md)
 - [The life of a child](internals-child.md)
 - [Shutdown from the inside](internals-shutdown.md)

@@ -143,6 +143,7 @@ names a runtime type; the one un-walkable residue is structurally safe
 because core has no runtime dependency; and an actual external consumer
 cannot import the seams anyway.
 
-The next chapters follow the two central data flows through this
-structure: [a message](internals-message.md) from `send` to handler, and
-[a child](internals-child.md) from declaration to restart.
+The next chapter maps [the decision core](internals-reducer.md) that
+sits at the center of this structure; the two after it follow the central
+data flows through it: [a message](internals-message.md) from `send` to
+handler, and [a child](internals-child.md) from declaration to restart.

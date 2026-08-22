@@ -769,9 +769,10 @@ panics has its replacement discarded, never requeued. A panic payload
 cleanup panic — is still discarded inline, since it is already a spent
 diagnostic. Application errors carried by framework-retained failed exits and
 provisional failed outcomes likewise retire through critical isolated
-disposal after the framework releases its guard; if that lane cannot preserve
-the job, it retains the value for the process lifetime rather than destroy it
-in a critical section. Exits handed to users retain ordinary Rust drop timing.
+disposal, never inline on the framework stack that retires the carrier. If no
+worker can be started, the job stays queued for a later attempt — potentially
+for the process lifetime — rather than destroy the value in a critical
+section. Exits handed to users retain ordinary Rust drop timing.
 Incarnation-owned continuations, timer messages, and offload state instead
 follow §6.5 and §8's incarnation teardown and verdict rules. No single
 disposal-thread identity is promised.
@@ -3269,11 +3270,12 @@ fixtures for the driver shell and end-to-end invariants.
     be destroyed after the guard. The lock-held probe is the direct
     oracle: a payload destructor that asks whether the framework lock is
     held must answer no, on every path that retires one. What this item does
-    *not* assert is where the destructor then runs: §5.5 separately assigns
-    mailbox payloads and framework-retained failed-exit application errors to
-    isolated disposal while user-held `Exit` copies retain ordinary Rust drop
-    timing. Those venue rules are independent of this item's after-unlock
-    requirement.
+    *not* assert is one common destructor venue: §5.5 separately assigns
+    framework-initiated mailbox/reply disposal and framework-retained
+    failed-exit application errors to isolated lanes, while live `latest()`
+    displacement and user-held `Exit` copies retain their documented ordinary
+    Rust drop timing. Those venue rules are independent of this item's
+    after-unlock requirement.
 
 ---
 

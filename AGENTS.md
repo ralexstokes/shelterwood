@@ -144,14 +144,17 @@ rests on:
   new operation added to the doubled section needs the same accounting.
   Dynamic admission has two further, narrowly accounted shapes around this
   order. `DynamicControl::reserve` holds its state mutex while
-  `mint_reserved_slot` takes the child-identity mutex and adoption acquires the
-  new child's gate; both belong to a member minted inside that critical
-  section and are unpublished, hence uncontended. Admission install holds the
-  same state mutex inside the root gate while calling `admit_child_locked`, but
-  the reserved member was already adopted onto that root gate and the root
-  cannot be re-homed while its dynamic route is live, so the handoff check
-  short-circuits without a second gate acquisition. Changing either
-  publication or re-homing invariant requires re-deriving this exception.
+  `mint_reserved_slot` briefly takes the already-published parent scope's
+  child-identity mutex, then adoption acquires the new child's gate. The
+  identity API releases its guard before returning and cannot call back into
+  dynamic control, so no reverse edge can be held; the child gate belongs to a
+  member minted inside the state critical section and remains unpublished,
+  hence uncontended. Admission install holds the same state mutex inside the
+  root gate while calling `admit_child_locked`, but the reserved member was
+  already adopted onto that root gate and the root cannot be re-homed while
+  its dynamic route is live, so the handoff check short-circuits without a
+  second gate acquisition. Changing either publication or re-homing invariant
+  requires re-deriving this exception.
   `WakerProxy`'s mutex (`crates/shelterwood-core/src/waker_proxy.rs`) sits at the
   other end of that order: it is a **leaf**. `wake_by_ref` acquires it from
   whatever thread drives the external primitive — the timer driver, a sender,
@@ -184,12 +187,13 @@ struct, or the caller.
 
 ## Runtime naming
 
-Non-test façade code names only the runtime capability layer, never Tokio.
-After the crate fold, façade tests, doctests and examples may use the pinned
-Tokio dev-dependency when executor control or runnable example syntax is the
-subject; internal unit tests still prefer `crate::runtime` when it exposes the
-needed operation. This dev-only allowance does not widen the public API or the
-core crate's dependency boundary.
+Non-test façade implementation imports and invokes only the runtime capability
+layer, never a concrete Tokio API. After the crate fold, façade tests, doctests
+and examples may use the pinned Tokio dev-dependency for executor control,
+test-only synchronization or runnable example syntax; internal unit tests
+still prefer `crate::runtime` when it exposes the behavior under test. This
+dev-only allowance does not widen the public API or the core crate's dependency
+boundary.
 
 ## Running anything
 

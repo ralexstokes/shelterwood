@@ -290,13 +290,14 @@ impl DynamicControl {
             }
             return Err(ReserveError::DuplicateId(id));
         }
-        // This is the one admission-lane exception to the observation gate's
-        // usual outermost position. `mint_reserved_slot` creates both the
-        // member and its gate while `state` is held, so the child-identity
-        // mutex and the new gate are unpublished and uncontended here. The
-        // adoption below may therefore acquire only that fresh gate under the
-        // dynamic-state mutex; no other thread can hold it or acquire
-        // `state` from it. AGENTS.md records this lock-order exemption.
+        // This is the reservation half of the admission-lane lock-order
+        // exception. `mint_reserved_slot` briefly takes the already-published
+        // parent scope's child-identity mutex; that API releases its guard
+        // before returning and cannot call back into dynamic control, so it
+        // introduces no reverse edge. The member and its gate are then minted
+        // while `state` is held and remain unpublished until `state.insert`.
+        // Adoption below therefore acquires only that fresh, uncontended gate
+        // under the dynamic-state mutex. AGENTS.md records both edges.
         let slot = mint_reserved_slot(scope, &id, child_scope)?;
         scope.adopt_child_observation_gate(&slot.member, slot.scope.as_deref(), _txn);
         state.insert(id, DynamicEntry::reserved(Arc::clone(&slot)), _txn);
